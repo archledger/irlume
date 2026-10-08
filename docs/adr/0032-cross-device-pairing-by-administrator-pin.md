@@ -1287,7 +1287,7 @@ amendments of 2026-10-04 and the retained-runtime reply-preservation statement o
 outcome kinds/causes and password fallback are unchanged.
 
 An ordinary-only entry cannot open a split pair even when split trust is admitted.
-When a valid selected split meets generic preparation with no valid explicit
+When a valid selected split meets generic preparation with no explicit
 ordinary override, the reply names that request limitation:
 
 ```text
@@ -1295,9 +1295,9 @@ this request uses the ordinary camera path, which never opens a split camera pai
 ```
 
 Generic enrollment, add-scan, identify, positioning and the support probe use this
-preparation refusal. A non-routing authentication context, such as a proven
-ordinary override or ordinary enrollment choice, also uses that reason when its
-account binding requires a split pair. It is not an activation refusal.
+preparation refusal. A non-routing dual-sensor authentication context, such as a
+proven ordinary override or ordinary enrollment choice, also uses that reason
+when its account binding requires a split pair. It is not an activation refusal.
 
 Automatic or saved-pin authentication is split-capable. With Authentication
 admission closed, a selected split or split-bound primary keeps "split enrollment
@@ -1311,6 +1311,18 @@ selection. Both environment endpoints, or an explicit ordinary enrollment choice
 must prove a unique Current ordinary pair under the combined external-camera
 policy. Invalid or unreadable selection is refused before that override. A saved
 split selection does not imply every request refuses when such an override exists.
+An explicit override that fails ordinary-pair proof or external-camera policy
+reports that validation or policy error rather than the ordinary-path split
+reason. Both environment endpoints are needed to supply an environment pair.
+
+The IR-only exception from the retained-runtime amendment (D9) is unchanged.
+Non-routing ordinary overrides use the configured-target readiness and binding
+checks; a split-bound primary reports `BindingMismatch` after target validation,
+not the dual-sensor ordinary-path message. Target availability can refuse earlier.
+An admitted automatic or pinned IR-only split choice reports "split camera IR-only
+authentication is not supported; use your password" before installation, admission
+hook or lease. That refusal stays `SetupUnavailable`, spends no account strike and
+does not replenish one; readiness remains read-only `BindingMismatch`.
 
 The configuration refusal does not add account-binding checks to ordinary
 commands. Without a saved selected split, add-scan has no split-primary binding

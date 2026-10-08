@@ -100,7 +100,7 @@ do not enable split-pair enrollment or authentication.
 
 Ordinary-only requests and split-capable authentication have different refusal
 reasons. A valid saved split selection is refused by an ordinary-only entry
-when it has no valid explicit ordinary override. Account-routed authentication
+when it has no explicit ordinary override. Account-routed authentication
 can use a split pair after admission, so its closed refusal names activation.
 Each refusal occurs before camera work and never falls back to another camera.
 
@@ -108,10 +108,11 @@ Each refusal occurs before camera work and never falls back to another camera.
 policy: this request uses the ordinary camera path, which never opens a split camera pair; explicit split enrollment uses `irlume enroll --split-camera-choice`
 ```
 
-With a saved split selection and no valid explicit ordinary override, the
+With a saved split selection and no explicit ordinary override, the
 ordinary-path refusal covers `enroll` without a split choice, `profiles add-scan`,
-`identify`, positioning and the support probe. An authentication request with a
-proven ordinary override also uses this reason if its primary is split-bound:
+`identify`, positioning and the support probe. A dual-sensor authentication
+request with a proven ordinary override also uses this reason if its primary
+is split-bound:
 that explicit ordinary context cannot route a split, even after activation.
 
 Both `IRLUME_RGB_DEVICE` and `IRLUME_IR_DEVICE`, or an explicit ordinary
@@ -119,6 +120,17 @@ enrollment choice, can select a unique Current ordinary pair instead. The
 combined external-camera policy still applies. An invalid or unreadable saved
 selection refuses before considering an override. A valid saved split selection
 alone therefore does not guarantee refusal when such an override is present.
+An explicit override that cannot prove a unique ordinary pair reports
+`ordinary camera override is not a unique Current ordinary pair`; a forbidden
+external override reports its own policy error. Neither uses the ordinary-path
+split refusal shown above.
+
+IR-only experimental authentication keeps its existing exceptions. Ordinary
+overrides use the configured-target readiness and binding checks, including
+`BindingMismatch` for a split-bound primary once the target is available, rather
+than the dual-sensor ordinary-path message. An admitted automatic or pinned split
+choice refuses with `split camera IR-only authentication is not supported; use
+your password` before installation or camera acquisition (ADR-0032 D9).
 
 These statements describe request configuration and authentication binding
 checks. They do not promise a split-primary binding gate for every ordinary
@@ -282,7 +294,7 @@ malformed values are usage errors before a request is sent; and an older
 daemon reports that split enrollment needs an upgrade, with no retry as
 another operation. The two choice flags cannot be combined. The daemon refuses
 split enrollment until activation, and the client prints its reply as is. An
-ordinary `enroll` against a saved split selection, without a valid explicit
+ordinary `enroll` against a saved split selection, without an explicit
 ordinary override, refuses for the ordinary-path reason described under
 [Two different refusals](#two-different-refusals). This flag names the explicit
 split-enrollment entry point, which still refuses while activation is closed.

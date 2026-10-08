@@ -7,10 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
-- Ordinary-only requests with a saved split selection and no valid ordinary
-  override report the ordinary camera path's limitation. Authentication with a
-  proven ordinary override uses that reason for a split-bound primary too.
-  Automatic and saved-pin split authentication retain the activation refusal.
+- Ordinary-only requests with a saved split selection and no explicit ordinary
+  override report the ordinary camera path's limitation. Dual-sensor
+  authentication with a proven ordinary override uses that reason for a
+  split-bound primary too.
+  Automatic and saved-pin split authentication retain the activation refusal;
+  admitted IR-only split choices retain their unsupported-path refusal.
   The ordinary reason names the explicit split-enrollment entry point without
   presenting it as a remedy for every operation (ADR-0032 refusal-context
   amendment 2026-10-08; #1030).

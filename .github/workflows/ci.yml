@@ -188,6 +188,17 @@ jobs:
           cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
           cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
           cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference identity_arms
+          # Synthetic published state and sandboxed config only; these exact
+          # tests need neither model loading nor the token-delivery CLI helper.
+          # Require every name so a renamed or ignored regression fails CI.
+          ./scripts/run-tests-guarded.sh --min 3 \
+            --require tests::administrator_provider_selection_reads_machine_config_and_environment_only \
+            --require tests::health_reports_the_published_engine_bits \
+            --require tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
+            -- cargo test --locked -p irlume-daemon --features npu --bin irlumed -- --exact \
+            tests::administrator_provider_selection_reads_machine_config_and_environment_only \
+            tests::health_reports_the_published_engine_bits \
+            tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail
 
       # Optional ONNX Runtime execution providers are compile-time APIs. The
       # default CPU build cannot catch an upstream rename in one of these paths

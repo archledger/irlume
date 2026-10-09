@@ -116,6 +116,17 @@ pub(crate) mod test_support {
             }
         }
     }
+
+    /// The stored completion instant for a key, so a test can show an entry
+    /// was (not) renewed by an exact instant comparison instead of sleeping
+    /// out the staleness bound.
+    pub(crate) fn completion_instant(key: &Key) -> Option<Instant> {
+        cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+    }
 }
 
 #[cfg(test)]

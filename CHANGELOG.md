@@ -139,6 +139,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Concurrent pair capture no longer renews ADR-0021 rate-evidence reuse
+  from a probe-admitted partial window, and a continuity probe on either
+  fill path never admits below the full five deltas, so a run of
+  error-marked dequeues can no longer pass the floor check on an empty
+  window. A held pair re-pays the full 30-delta fill at least once every
+  24 hours of daemon uptime, as the bound promises (ADR-0021, #1034).
+
 - An RGB or IR burst captured after an in-place stream recovery no longer
   fails as an invalid aggregate. Its first frame keeps the recovery marker
   and is accepted only after a discarded frame of the new stream, so the

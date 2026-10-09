@@ -2459,11 +2459,18 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 {
                     self.next_discarded()?;
                 }
-                if self.rate_window.meets_floor(
-                    policy.floor_num(),
-                    policy.floor_den(),
-                    policy.tolerance_percent(),
-                ) {
+                // Admission consumes at least `CONTINUITY_PROBE_DELTAS`
+                // sound deltas: error-marked dequeues contribute nothing and
+                // an empty window meets the floor vacuously, so the delta
+                // count is the floor of the evidence a probe may admit on
+                // (#1034).
+                if self.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
+                    && self.rate_window.meets_floor(
+                        policy.floor_num(),
+                        policy.floor_den(),
+                        policy.tolerance_percent(),
+                    )
+                {
                     self.health_admitted = true;
                     return Ok(());
                 }
@@ -3064,7 +3071,12 @@ fn drain_until_both_ready<S: ValidatedStream>(
                 return Err(error);
             }
         }
+        // Same delta-count floor as the single-stream admission: a window
+        // below `CONTINUITY_PROBE_DELTAS` carries no continuity evidence (an
+        // empty window meets the floor vacuously when every dequeue was
+        // driver-marked error), so it must never admit (#1034).
         if *parked_startup == 0
+            && stream.rate_window.count() >= rate_amortization::CONTINUITY_PROBE_DELTAS
             && stream.rate_window.meets_floor(
                 policy.floor_num(),
                 policy.floor_den(),
@@ -3128,14 +3140,21 @@ fn drain_until_both_ready<S: ValidatedStream>(
     // A completed floor-passing window is reusable evidence for the NEXT
     // session's probe (ADR-0021, same rule as the single-stream fill): the
     // concurrent path used to never record, so its keys never amortized -
-    // every attempt re-owed the full fill.
+    // every attempt re-owed the full fill. Completion means the FULL 30-delta
+    // window: a probe-admitted partial window must never renew the entry, or
+    // the staleness bound would attest a full shape the process never
+    // observed (#1034). A side whose trailing drain slid the admitted window
+    // to full capacity does record: that ring is exactly the evidence the
+    // next session's probe consumes.
     if let Some(key) = &stream.amort_key {
         let policy = stream.rate_config.policy();
-        if stream.rate_window.meets_floor(
-            policy.floor_num(),
-            policy.floor_den(),
-            policy.tolerance_percent(),
-        ) {
+        if stream.rate_window.ready()
+            && stream.rate_window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            )
+        {
             rate_amortization::record_completion(key.clone());
         }
     }
@@ -13508,6 +13527,54 @@ mod tests {
     }
 
     #[test]
+    fn an_all_corrupt_probe_never_admits_the_single_stream_fill() {
+        // #1034: corrupt dequeues add no delta, and an empty window meets
+        // the floor vacuously (0 >= 0), so a probe must never admit with
+        // fewer than `CONTINUITY_PROBE_DELTAS` deltas: the miss path
+        // invalidates the cached evidence and re-pays the full fill.
+        let node = "/dev/video-amort-corrupt-probe";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
+        let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+        let key = rate_amortization::Key::new(node, contracts::StreamRole::Rgb);
+        rate_amortization::test_support::force_completion(
+            key.clone(),
+            Some(std::time::Instant::now()),
+        );
+        // The whole probe budget dequeues driver-marked ERROR buffers; sound
+        // frames follow so the full fill can complete.
+        let mut stream = rate_fill_fixture(contracts::StreamRole::Rgb, 16 + 40, 66_667)
+            .with_rate_amortization(node);
+        for metadata in stream
+            .stream_mut()
+            .unwrap()
+            .metadata
+            .iter_mut()
+            .take(MAX_PROBE_FILL_ATTEMPTS)
+        {
+            metadata.flags |= v4l::buffer::Flags::ERROR;
+        }
+        stream
+            .fill_rate_evidence()
+            .expect("full fill after the missed probe");
+        assert!(
+            !stream.health_admitted,
+            "zero deltas never admit the single-stream probe"
+        );
+        assert!(
+            stream.rate_window.ready(),
+            "the miss re-paid the full window ({} deltas)",
+            stream.rate_window.count()
+        );
+        assert!(
+            rate_amortization::amortizable(&key),
+            "the completed full floor-passing window records again"
+        );
+        rate_amortization::test_support::force_completion(key, None);
+    }
+
+    #[test]
     fn the_kill_switch_forces_the_full_fill_despite_a_fresh_completion() {
         let node = "/dev/video-amort-off";
         // Same lock as the `rate_amortization` tests: they read this variable.
@@ -22069,6 +22136,169 @@ mod tests {
         // The latency win is a consequence of admission itself - the fill
         // owed drops from 31 deltas to seed + 5 per side - and is verified
         // on hardware.
+    }
+
+    #[test]
+    fn a_probe_admitted_partial_window_never_renews_the_cached_completion() {
+        // #1034: ADR-0021 decision items 1 and 2 bound reuse by the age of
+        // a FULL 30-delta window. If the concurrent record site renewed the
+        // entry from a 5-delta probe window, a held pair used at least once
+        // every 24 hours would never re-pay the full fill while `irlumed`
+        // runs, and the bound would no longer state when the stream's full
+        // shape was last observed.
+        let node = "/dev/video-pair-renew";
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
+        let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+        let rgb_key = rate_amortization::Key::new(node, contracts::StreamRole::Rgb);
+        let ir_key = rate_amortization::Key::new(node, contracts::StreamRole::Ir);
+        // An entry forced near the staleness bound makes any renewal visible
+        // as an exact instant change, without sleeping out the bound.
+        let aged = std::time::Instant::now() - rate_amortization::MAX_STALENESS
+            + std::time::Duration::from_secs(2);
+        rate_amortization::test_support::force_completion(rgb_key.clone(), Some(aged));
+        rate_amortization::test_support::force_completion(ir_key.clone(), Some(aged));
+        let mut rgb =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 260, 66_667).with_rate_amortization(node);
+        let mut ir =
+            rate_fill_fixture(contracts::StreamRole::Ir, 260, 66_667).with_rate_amortization(node);
+        // The twin already reported, so each probe admission deterministically
+        // keeps a partial window: no trailing drain can complete the ring.
+        for stream in [&mut rgb, &mut ir] {
+            drain_until_both_ready(
+                stream,
+                &std::sync::atomic::AtomicUsize::new(1),
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut 0,
+            )
+            .expect("probe admission");
+            assert!(stream.health_admitted, "the probe admitted this side");
+            assert!(
+                stream.rate_window.count() < rate_gate::RATE_WINDOW_CAPACITY,
+                "the admitted window stays partial ({} deltas)",
+                stream.rate_window.count()
+            );
+        }
+        assert_eq!(
+            rate_amortization::test_support::completion_instant(&rgb_key),
+            Some(aged),
+            "a partial probe window must not renew the rgb entry"
+        );
+        assert_eq!(
+            rate_amortization::test_support::completion_instant(&ir_key),
+            Some(aged),
+            "a partial probe window must not renew the ir entry"
+        );
+        rate_amortization::test_support::force_completion(rgb_key, None);
+        rate_amortization::test_support::force_completion(ir_key, None);
+    }
+
+    #[test]
+    fn a_probe_admitted_side_whose_trailing_drain_filled_the_ring_still_records() {
+        // #1034 acceptance: the record gate is the completed window, not the
+        // absence of a probe admission. A side admitted on its probe whose
+        // trailing drain (because its twin needed a cold fill) later
+        // completes the 30-delta floor-passing ring holds exactly the
+        // evidence the next session's probe consumes, so it records.
+        let node = "/dev/video-pair-full-ring";
+        let _guard = crate::testenv::env_lock();
+        let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+        let key = rate_amortization::Key::new(node, contracts::StreamRole::Rgb);
+        let aged = std::time::Instant::now() - rate_amortization::MAX_STALENESS
+            + std::time::Duration::from_secs(2);
+        rate_amortization::test_support::force_completion(key.clone(), Some(aged));
+        let mut rgb =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 260, 66_667).with_rate_amortization(node);
+        // The twin never reports (the count stays below 2), so the trailing
+        // drain runs to its bounded budget and slides the admitted side's
+        // ring to a full window.
+        drain_until_both_ready(
+            &mut rgb,
+            &std::sync::atomic::AtomicUsize::new(0),
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut 0,
+        )
+        .expect("bounded fill succeeds");
+        assert!(rgb.health_admitted, "the probe admitted this side");
+        assert!(
+            rgb.rate_window.ready(),
+            "the trailing drain completed the ring ({} deltas)",
+            rgb.rate_window.count()
+        );
+        let renewed = rate_amortization::test_support::completion_instant(&key);
+        assert!(
+            renewed.is_some() && renewed != Some(aged),
+            "a completed floor-passing window records"
+        );
+        rate_amortization::test_support::force_completion(key, None);
+    }
+
+    #[test]
+    fn an_all_corrupt_probe_never_admits_the_concurrent_fill() {
+        // #1034: the concurrent probe shares the single-stream loop shape; a
+        // run of driver-marked ERROR dequeues adds no delta, and an empty
+        // window meets the floor vacuously. Admission below
+        // `CONTINUITY_PROBE_DELTAS` deltas must be impossible here too: the
+        // miss invalidates the cached evidence and both sides re-pay the
+        // full fill.
+        let node = "/dev/video-pair-corrupt-probe";
+        let _guard = crate::testenv::env_lock();
+        let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+        let rgb_key = rate_amortization::Key::new(node, contracts::StreamRole::Rgb);
+        let ir_key = rate_amortization::Key::new(node, contracts::StreamRole::Ir);
+        rate_amortization::test_support::force_completion(
+            rgb_key.clone(),
+            Some(std::time::Instant::now()),
+        );
+        rate_amortization::test_support::force_completion(
+            ir_key.clone(),
+            Some(std::time::Instant::now()),
+        );
+        // RGB: the whole probe budget is corrupt. IR: its startup flush
+        // frames are sound, then the whole probe budget is corrupt. Sound
+        // frames follow so both full fills can complete.
+        let mut rgb =
+            rate_fill_fixture(contracts::StreamRole::Rgb, 160, 66_667).with_rate_amortization(node);
+        for metadata in rgb
+            .stream_mut()
+            .unwrap()
+            .metadata
+            .iter_mut()
+            .take(MAX_PROBE_FILL_ATTEMPTS)
+        {
+            metadata.flags |= v4l::buffer::Flags::ERROR;
+        }
+        let mut ir =
+            rate_fill_fixture(contracts::StreamRole::Ir, 160, 66_667).with_rate_amortization(node);
+        for metadata in ir
+            .stream_mut()
+            .unwrap()
+            .metadata
+            .iter_mut()
+            .skip(rate_gate::startup_flush(contracts::StreamRole::Ir))
+            .take(MAX_PROBE_FILL_ATTEMPTS)
+        {
+            metadata.flags |= v4l::buffer::Flags::ERROR;
+        }
+        establish_concurrent_rate(&mut rgb, &mut ir).expect("full fills after both missed probes");
+        for stream in [&rgb, &ir] {
+            assert!(
+                !stream.health_admitted,
+                "zero deltas never admit the concurrent probe"
+            );
+            assert!(
+                stream.rate_window.ready(),
+                "the miss re-paid the full window ({} deltas)",
+                stream.rate_window.count()
+            );
+        }
+        assert!(
+            rate_amortization::amortizable(&rgb_key) && rate_amortization::amortizable(&ir_key),
+            "the completed full windows record again"
+        );
+        rate_amortization::test_support::force_completion(rgb_key, None);
+        rate_amortization::test_support::force_completion(ir_key, None);
     }
 
     #[test]

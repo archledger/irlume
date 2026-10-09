@@ -63,6 +63,42 @@ the evidence available to the decision and remains subject to the separate
 [qualification protocol](IR_ONLY_QUALIFICATION.md); local development observations
 do not establish deployment assurance.
 
+## NPU provider selection and loading admission
+
+Native OpenVINO loading is closed. No installation/launch profile is admitted,
+no setting bypasses refusal before the first native entry, and `CERTIFIED`
+remains empty. CPU authentication remains authoritative. Upstream, distro and
+administrator-installed source runtimes follow the same admission requirements;
+`intel-npu-stack` is an optional reference installation.
+
+Selection validates the absolute C API path, symlinks, canonical target and
+ancestors as a root-managed installation. It preserves the selected alias for
+the legacy identity and uses the canonical endpoint for the prospective native
+load. A loading profile must separately cover effective loader/plugin/driver
+search, compiler/frontend configuration, trusted code locations and the launch
+environment, with one provider per process lifetime. File ownership and
+post-load hashes do not admit that profile. Loading-profile implementation and
+enforcing AppArmor validation remain future work.
+
+Portable qualification uses a separate v2 execution inventory of all observed
+absolute file-backed executable mappings plus known compiler/frontends. It
+conservatively includes unrelated shared native code. The executable identified
+by `/proc/self/exe` is excluded only from the portable key to avoid self-reference
+with the compiled certification table; it remains mapped-file/inode checked.
+Anonymous executable mappings and non-executable data files are excluded.
+Unknown executable files mapped later, deleted/replaced mapped files and
+ambiguous duplicate basenames refuse portable use. This inventory does not
+establish native dependency closure or a sandbox.
+
+The portable key omits directory prefixes but binds basenames, content hashes
+and hardware/firmware/runtime/compiler/configuration fields. The frozen legacy
+manifest stays separate; exact keys keep their semantics. Model and CPU-consumer
+bindings, decision qualification and live CPU/NPU reference checks still apply
+under ADR-0022. Engine placement does not authorize NPU probes for an enrollment
+whose matchable scans lack the certified CPU producer. Non-root Health replies
+carry fixed fallback categories; native error details remain with root peers
+and privileged journal diagnostics. See [NPU provider selection](NPU.md).
+
 ## Known Windows Hello bypass classes → our defenses
 
 | Bypass | Root cause | irlume defense |

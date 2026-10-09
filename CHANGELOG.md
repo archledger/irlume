@@ -34,12 +34,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- NPU provider selection and reporting groundwork: an administrator can select
+  an absolute C API file with `npu_library` or `IRLUME_NPU_LIBRARY`; automatic
+  selection checks standard system and `/usr/local` roots, preferring
+  `libopenvino_c.so.2621` before the retained `.2620` soname. Exact identities
+  stay path-based, while a separate v2 execution key supports qualification
+  matching across equivalent layouts. Doctor and status JSON distinguish runtime
+  discovery from current model placement, with fixed fallback categories for
+  non-root peers. Native loading remains closed, no loading profile is admitted,
+  and no setting bypasses that refusal. `CERTIFIED` stays empty and CPU remains
+  authoritative (ADR-0022 provider-selection amendment 2026-10-09).
+
 - `irlume doctor` reports where the daemon's recognizer computes
   authentication probes (`recognizer-device`: NPU, or CPU with the reason)
   and the NPU platform it read (`npu-platform`), and `irlume status --json`
-  gains an optional `recognizer` object. irlumed built with the default-off
-  `npu` feature can place the recognizer on a certified Intel NPU; no
-  platform is certified yet, so it runs on CPU everywhere. New face scans
+  gains an optional `recognizer` object. The default-off `npu` feature has
+  placement support behind loading admission and per-model certification;
+  both gates remain closed, so it runs on CPU everywhere. New face scans
   record the CPU reference that embedded them, an optional field older
   releases ignore (ADR-0022).
 

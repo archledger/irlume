@@ -795,6 +795,25 @@ renumbered), then auto-detection. There is no node-number default: when no
 pair is found, the RGB-only convenience tier uses the first RGB camera
 discovered.
 
+### Optional NPU provider selection
+
+Native NPU loading is closed: no installation/launch profile is admitted, no
+setting bypasses native-entry refusal, and the `CERTIFIED` table is empty.
+Authentication remains on CPU, including builds with the default-off `npu`
+feature.
+
+The `npu_library` key in `/etc/irlume/settings.conf` selects an absolute OpenVINO
+C API file from an administrator-managed installation. `IRLUME_NPU_LIBRARY` on
+the daemon overrides that key. Without either, selection checks standard system
+and `/usr/local` library directories. Files and installation ancestors must be
+root-owned without group/other writes; symlinks and their targets are checked
+too. Invalid authoritative selection keeps CPU rather than choosing another
+provider. The separate `npu` key and `IRLUME_NPU` are kill switches, not admission
+overrides. Restart the daemon after changing its provider selection. See
+[NPU provider selection](NPU.md) for accepted filenames, identity rules and
+status fields. Loading-profile admission and enforcing AppArmor validation
+remain future work.
+
 ### Daemon environment variables
 
 Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
@@ -806,6 +825,8 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_PRIVILEGED_FACE_CONSENT` | same switch as `privileged_face_consent` in `settings.conf`; the env var wins. `0` waives the literal `yes` on privileged services | on |
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
+| `IRLUME_NPU` | NPU kill switch alongside the machine `npu` key; either source disabling wins. Empty, unknown or non-UTF-8 switch values and unreadable settings disable it. On values cannot bypass loading admission or certification | leaves admission and certification to decide; currently CPU |
+| `IRLUME_NPU_LIBRARY` | absolute C API file; overrides machine `npu_library`, with root-managed installation checks. Selects a file without admitting native loading | standard system and `/usr/local` library roots |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` (packaged units set `/usr/share/irlume/models/…`) |
 | `IRLUME_VIT_PAD_MODEL` / `IRLUME_PAD_IR_MODEL` | paths to the shipped PAD weights (ViT RGB / FLIR IR) | `/etc/irlume/liveness_vit.onnx`, `/etc/irlume/flir.onnx` (packaged units set `/usr/share/irlume/models/…`) |
 | `IRLUME_IR_ADAPTER` | path to an optional IR-adapter model (none ships; see ADR-0004) | `/etc/irlume/ir_adapter.onnx` |

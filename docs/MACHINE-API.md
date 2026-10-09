@@ -178,11 +178,36 @@ false, the retained `fingerprint: false` boolean is an unobserved fallback rathe
 than confirmed absence. These added fields are optional for older contract-1
 producers; consumers should not infer an observation when they are absent.
 
-`recognizer` says where the daemon's recognizer computes authentication probes
+`recognizer` reports the daemon's engine placement for authentication probes
 (ADR-0022): `device` is `npu` or `cpu`, with `reason` on CPU and `platform`, the
 NPU platform identity digest, when one was read. `known` is false, with no other
 field, when the daemon did not answer or predates the report. It is optional for
 older contract-1 producers.
+
+Optional `recognizer.runtime_available` is `true` when discovery completed with
+a runtime/platform identity, or `false` when discovery returned an error other
+than loading-admission refusal. It is omitted when discovery is unreported,
+including a loading-admission refusal or a cache/marker preparation failure
+before discovery runs. Successful discovery retains availability and `platform`
+across later marker-cleanup, cache or placement errors.
+
+Optional `recognizer.qualified` is reported only when `runtime_available` is
+`true`: it is `true` for current NPU placement after qualification and placement
+checks, and `false` when the recognizer stays on or retires to CPU. Missing
+fields from older peers remain absent; clients must not infer `false`.
+
+These are engine facts, not a per-account guarantee. Matchable scans with
+missing or different CPU-producer tags, including legacy enrollments, require
+CPU probes even if the engine reports NPU placement. Non-root Health replies
+expose fixed CPU-fallback categories (discovery not reported, runtime unavailable,
+or recognizer unavailable). Only root peers receive bounded native error details;
+the privileged journal also retains detailed reasons. Reason text is diagnostic,
+not a stable value for clients to match.
+
+Native loading is currently closed, no installation/launch profile is admitted,
+and the `CERTIFIED` table is empty. No setting bypasses native-entry refusal;
+CPU remains authoritative. These fields describe selection/reporting groundwork,
+not enabled generic NPU runtime support. See [NPU provider selection](NPU.md).
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
@@ -256,8 +281,10 @@ reused for a different meaning. The registry as of this contract:
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
-| `recognizer-device` | where the daemon's recognizer computes authentication probes (ADR-0022): `NPU`, or `CPU:` with the reason (not built with NPU support, disabled, not certified for this platform and reference, no NPU runtime, and so on). `info`; `unknown` when the daemon did not answer or predates the report |
+| `recognizer-device` | the daemon's engine placement for authentication probes (ADR-0022): `NPU`, or `CPU:` with a peer-appropriate reason. Enrollment producer checks can still require CPU probes. `info`; `unknown` when the daemon did not answer or predates the report |
 | `npu-platform` | the NPU platform identity digest the daemon read for the recognizer, or that none was read. `info`; `unknown` as for `recognizer-device` |
+| `npu-runtime` | the engine's runtime discovery observation. `info` for reported availability or failure; `unknown` for unreported discovery, loading-admission refusal, or an older/non-answering daemon |
+| `npu-qualification` | whether the recognizer is currently placed on NPU after qualification/placement checks. `info` for a reported fact; `unknown` when runtime availability is not `true` or qualification is unreported. Discovery alone never implies NPU authentication |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |

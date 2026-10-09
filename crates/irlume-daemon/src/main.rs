@@ -268,7 +268,7 @@ mod npu_placement {
             .map_or(true, |progress| progress.is_some());
         super::note_worker_progress();
         let mut context = if switch_allows() {
-            engine.open_npu_context(&cache_base())
+            engine.open_npu_context_with_runtime(&cache_base(), &runtime_selection())
         } else {
             irlume_auth::npu::Context::disabled()
         };
@@ -329,6 +329,24 @@ mod npu_placement {
             Ok(bytes) => irlume_auth::npu::settings_conf_value(bytes),
         };
         irlume_auth::npu::switch_allows(std::env::var_os("IRLUME_NPU").as_deref(), setting)
+    }
+
+    /// The administrator picks the installed provider by an absolute library
+    /// file. This startup read cannot be supplied by a socket/status peer.
+    #[cfg(feature = "npu")]
+    pub(super) fn runtime_selection() -> irlume_auth::npu::RuntimeSelection {
+        let file = std::fs::read(irlume_common::config::config_path("settings.conf"));
+        let setting = match &file {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                irlume_auth::npu::LibrarySetting::Absent
+            }
+            Err(_) => irlume_auth::npu::LibrarySetting::Unreadable,
+            Ok(bytes) => irlume_auth::npu::library_setting(bytes),
+        };
+        irlume_auth::npu::RuntimeSelection::read(
+            std::env::var_os("IRLUME_NPU_LIBRARY").as_deref(),
+            setting,
+        )
     }
 }
 
@@ -4725,6 +4743,31 @@ fn publish_engine_bits_raw(bits: EngineBits) {
     *engine_bits().lock().unwrap_or_else(|e| e.into_inner()) = bits;
 }
 
+/// Native provider errors remain privileged diagnostics. A bounded line can
+/// still contain paths or device identifiers, so non-root Health uses only
+/// categories derived from the published observation, never native text.
+fn recognizer_for_peer(
+    placement: &irlume_common::RecognizerPlacement,
+    uid: u32,
+) -> irlume_common::RecognizerPlacement {
+    let mut projected = placement.clone();
+    if uid != 0 {
+        projected.reason = if placement.device == "npu" {
+            None
+        } else {
+            Some(
+                match placement.runtime_available {
+                    None => "NPU discovery not reported; using CPU",
+                    Some(false) => "NPU runtime unavailable; using CPU",
+                    Some(true) => "NPU recognizer unavailable; using CPU",
+                }
+                .into(),
+            )
+        };
+    }
+    projected
+}
+
 /// Publish the engine's changed selection without discovering or opening any
 /// device. Physical connection state belongs to the passive inventory.
 fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
@@ -6097,7 +6140,10 @@ fn dispatch_status_with_diagnostics(
                 ir_pad: bits.ir_pad,
                 version: env!("CARGO_PKG_VERSION").into(),
                 apparmor: apparmor_confinement(),
-                recognizer: bits.recognizer.clone(),
+                recognizer: bits
+                    .recognizer
+                    .as_ref()
+                    .map(|placement| recognizer_for_peer(placement, peer.uid)),
             }
         }
         // The peer's right to ask about this account was settled by the
@@ -16997,6 +17043,8 @@ mod tests {
                 device: "cpu".into(),
                 reason: Some("not certified".into()),
                 platform: Some("ab12".into()),
+                runtime_available: Some(true),
+                qualified: Some(false),
             }),
         });
         let peer = Peer {
@@ -17021,10 +17069,60 @@ mod tests {
                 assert_eq!(recognizer.device, "cpu");
                 assert_eq!(recognizer.reason.as_deref(), Some("not certified"));
                 assert_eq!(recognizer.platform.as_deref(), Some("ab12"));
+                assert_eq!(recognizer.runtime_available, Some(true));
+                assert_eq!(recognizer.qualified, Some(false));
             }
             other => panic!("expected Health, got {other:?}"),
         }
         publish_engine_bits_raw(EngineBits::default());
+    }
+
+    #[test]
+    fn health_projects_provider_errors_for_non_root_and_preserves_root_detail() {
+        let _g = env_lock();
+        let detail = "runtime unavailable: /home/private/provider.so /dev/accel/accel0 serial=fixture-private";
+        publish_engine_bits_raw(EngineBits {
+            recognizer: Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some(detail.into()),
+                platform: Some("ab12".into()),
+                runtime_available: Some(false),
+                qualified: None,
+            }),
+            ..Default::default()
+        });
+        let root = dispatch_status(&Request::Health, &peer(0)).unwrap();
+        let ordinary = dispatch_status(&Request::Health, &peer(NOBODY)).unwrap();
+        publish_engine_bits_raw(EngineBits::default());
+        let Response::Health {
+            recognizer: Some(root),
+            ..
+        } = root
+        else {
+            panic!("root Health");
+        };
+        let Response::Health {
+            recognizer: Some(ordinary),
+            ..
+        } = ordinary
+        else {
+            panic!("ordinary Health");
+        };
+        assert_eq!(root.reason.as_deref(), Some(detail));
+        assert_eq!(ordinary.device, "cpu");
+        assert_eq!(ordinary.runtime_available, Some(false));
+        assert_eq!(ordinary.platform, root.platform);
+        let wire = serde_json::to_string(&ordinary).unwrap();
+        for private in ["/home/", "/dev/", "fixture-private", "provider.so"] {
+            assert!(
+                !wire.contains(private),
+                "private provider detail in Health: {wire}"
+            );
+        }
+        assert_eq!(
+            ordinary.reason.as_deref(),
+            Some("NPU runtime unavailable; using CPU")
+        );
     }
 
     #[test]
@@ -18355,6 +18453,70 @@ mod tests {
             event.kind,
             ShareSafeEventKind::CaptureScheduleSelected { .. }
         )));
+    }
+
+    #[cfg(feature = "npu")]
+    #[test]
+    fn administrator_provider_selection_reads_machine_config_and_environment_only() {
+        let _g = env_lock();
+        let _sb = sandbox("npu-provider-selection");
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("IRLUME_NPU_LIBRARY", value),
+                    None => std::env::remove_var("IRLUME_NPU_LIBRARY"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("IRLUME_NPU_LIBRARY"));
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        let settings = irlume_common::config::config_path("settings.conf");
+        std::fs::write(
+            &settings,
+            "npu=on\nnpu_library=/opt/source/libopenvino_c.so.2621\n",
+        )
+        .unwrap();
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library("/opt/source/libopenvino_c.so.2621".into())
+        );
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            )
+        );
+        std::env::set_var("IRLUME_NPU_LIBRARY", "");
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        for malformed in [
+            "npu_library",
+            "npu_library: /one",
+            "npu_library /one",
+            "npu_library=/one\nnpu_library",
+        ] {
+            std::fs::write(&settings, malformed).unwrap();
+            assert!(matches!(
+                npu_placement::runtime_selection(),
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ));
+        }
+        std::fs::write(&settings, "npu_library=/one\nnpu_library=/two\n").unwrap();
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
+        std::fs::remove_file(&settings).unwrap();
+        std::fs::create_dir(&settings).unwrap();
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
     }
 
     /// Isolated state/config/keyring/template-key/recovery dirs plus a method

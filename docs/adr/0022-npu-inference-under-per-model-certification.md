@@ -12,6 +12,12 @@ availability); amends neither. Replaces the experimental design for one
 globally resolved inference device explored in #647, which merged only into
 an experimental branch and never reached `main`.
 
+Amended 2026-10-09 by the [provider-selection and closed-loading
+record](#amendment-2026-10-09-provider-selection-and-closed-native-loading)
+below. Native loading is closed and the certification table is empty. The
+earlier design and measurement history below does not admit a loading profile
+or certify a model for authentication.
+
 ## Context
 
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
@@ -600,6 +606,103 @@ then the removal) costs 47.6 µs per inference on the qualified laptop's
 `/var/cache` and 52 µs on its home filesystem, both btrfs (median of five
 runs of 1,000; #1042). That is under 1% of a 7 ms recognizer inference, so
 section 10's marker around every inference stands.
+
+## Amendment 2026-10-09: provider selection and closed native loading
+
+This amends sections 3, 4, 5 and 13. Provider selection, portable identity
+matching and reporting remain groundwork: no installation/launch profile is
+admitted, native entry is refused, and `CERTIFIED` remains empty. CPU
+authentication remains authoritative. Settings cannot bypass either gate.
+
+### Provider selection
+
+Upstream distributions, distro builds, root-managed source installations and
+intel-npu-stack follow the same rules. The reference stack is optional. The
+resolver checks `libopenvino_c.so.2621` before `libopenvino_c.so.2620`, using the
+fixed system directories from section 5 followed by `/usr/local/lib64`,
+`/usr/local/lib/x86_64-linux-gnu` and `/usr/local/lib` for each soname.
+An absolute `npu_library` machine setting selects a file in another prefix;
+`IRLUME_NPU_LIBRARY` on the daemon takes precedence. Canonical targets also
+accept the full filenames `libopenvino_c.so.2026.2.0` and
+`libopenvino_c.so.2026.2.1`. Filename acceptance grants no model certification.
+
+Invalid authoritative values, malformed assignments to the exact key, duplicate
+keys, unreadable settings and untrusted paths refuse selection rather than
+choose another provider. Automatic lookup advances only on absence; other
+lookup errors refuse. Files and installation ancestors must be root-owned
+without group/other writes, with root-owned symlinks and trusted targets.
+The selected alias remains the legacy identity input; the validated canonical
+endpoint is the prospective native loading path. C API selection uses neither
+a bare loader name nor user library-search environment variables.
+
+### Closed native loading
+
+Loading admission refuses before `dlopen`, binding loading or device
+enumeration for automatic and explicit selection alike. A future profile
+must establish effective native dependency/plugin/driver loading routes,
+compiler/frontend configuration, trusted code locations and the process
+launch environment. It must keep one provider for the process lifetime and
+require a daemon restart when that provider changes. Root ownership of a
+C API file and later content hashing do not establish this contract.
+
+Opening the gate requires a separately reviewed implementation and conformance
+evidence for the installation and launch arrangement. Enforcing AppArmor
+validation and any required rules remain future work. This amendment admits
+no profile, enables no package feature and adds no certification entry.
+
+### Separate exact and portable identities
+
+The full section 4 identity retains the selected C API alias and original
+path-based manifest membership. Its digest continues to name diagnostics,
+caches, identity-specific markers and exact-key entries. Expanded inventory
+coverage does not rewrite legacy digests or widen exact entries.
+
+Portable qualification requires a separate v2 execution manifest containing all
+observed absolute file-backed executable mappings plus the known compiler
+loader, compiler, IR frontend and ONNX frontend hashed before compile. This
+conservatively binds unrelated shared native libraries too. The process
+executable identified by `/proc/self/exe` remains in mapped-file/inode checks
+but is excluded only from the portable key, avoiding self-reference when an
+entry is compiled into that executable. Failure to identify it in the inventory
+refuses construction. All observed shared native code stays keyed; anonymous
+executable mappings and non-executable data files are outside this inventory.
+Executable files mapped later without an entry and deleted/replaced mapped
+files refuse placement. Distinct paths with duplicate basenames refuse portable
+qualification even when their content matches.
+
+The versioned execution key omits directory prefixes but retains basenames,
+content hashes and the hardware/firmware/runtime/compiler/configuration fields.
+An entry using that key can match equivalent layouts only when those fields
+match. Model and CPU producer/consumer bindings, thresholds, decision
+fingerprints and live reference parity checks remain required. Section 7's
+certification requirements are unchanged. The inventory is a content identity
+check, not loading admission or proof of native dependency closure.
+
+### Discovery reporting and peer privacy
+
+Discovery observations are separate from context/cache readiness and model
+placement. A failure before discovery runs reports no observation; native
+loading-admission refusal also reports none. A discovery error otherwise records
+unavailability. Completed discovery retains availability and its platform digest
+across later marker-cleanup, cache-preparation or placement errors.
+
+Optional status fields distinguish runtime availability and current qualified
+placement, preserving absence for older peers. Engine placement is not a
+per-account guarantee: matchable scans with absent or different CPU-producer
+tags require CPU probes, including legacy scans. Non-root Health replies use
+fixed fallback categories; only root peers receive native error details, which
+also remain in bounded privileged journal diagnostics. The user-facing contract
+is [NPU provider selection](../NPU.md).
+
+### Acceptance criteria
+
+Software checks cover malformed/duplicate settings, environment precedence,
+nonabsence lookup errors, selected-alias continuity, legacy-manifest preservation,
+sibling/external executable inventory, prefix normalization, duplicate ambiguity,
+content/inode changes, executable-key exclusion, pre-native refusal,
+discovery/cache transitions and root/non-root Health projection. These checks
+do not admit a native profile, establish real installation relocation, validate
+enforcing AppArmor or certify a model.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

@@ -26,16 +26,36 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// The certified OpenVINO C API, by the soname of its release (2026.2.0).
-/// Another release carries another soname, so it reads as absent rather
-/// than as an unknown runtime (ADR-0022 §5).
+mod identity;
+mod maps;
+mod runtime;
+pub use runtime::{library_setting, LibrarySetting, RuntimeSelection};
+
+/// The original reviewed OpenVINO C API soname (2026.2.0), retained for
+/// callers and the legacy runtime. The resolver also accepts the reviewed
+/// patch release in `REVIEWED_OPENVINO_C_SONAMES` (ADR-0022 section 5).
 pub const OPENVINO_C_SONAME: &str = "libopenvino_c.so.2620";
 
-/// The only directories [`OPENVINO_C_SONAME`] is loaded from: Fedora,
-/// Debian and Ubuntu, Arch. The loader is always handed an absolute path,
-/// so neither `LD_LIBRARY_PATH` nor the loader cache can substitute another
-/// library (ADR-0022 §5), as `tflite.rs` finds its runtime.
-pub const OPENVINO_LIBRARY_DIRS: &[&str] = &["/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/lib"];
+/// Reviewed C declarations, not certified model/platform triples. Prefer
+/// 2026.2.1 when both releases are installed. Its whole C-header directory
+/// (20 file/tree entries) is Git-object-identical to 2026.2.0:
+/// https://github.com/openvinotoolkit/openvino/tree/2026.2.1/src/bindings/c/include/openvino/c
+/// Runtime/library hashes still produce a new identity and require a new
+/// certification; accepting a soname never places a model on the NPU.
+const REVIEWED_OPENVINO_C_SONAMES: &[&str] = &["libopenvino_c.so.2621", OPENVINO_C_SONAME];
+
+/// Standard system and administrator source-install roots. An explicit
+/// [`RuntimeSelection`] supports other root-managed provider locations.
+/// The loader always receives a validated absolute file, never a bare
+/// loader name or the user's library-search environment (ADR-0022 section 5).
+pub const OPENVINO_LIBRARY_DIRS: &[&str] = &[
+    "/usr/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib",
+    "/usr/local/lib64",
+    "/usr/local/lib/x86_64-linux-gnu",
+    "/usr/local/lib",
+];
 
 /// How every model is compiled for the NPU (ADR-0022 §6). It changes
 /// outputs, so it is part of [`Identity`]: editing it moves the digest and
@@ -68,7 +88,8 @@ struct Sources<'a> {
 /// kernel every few days, and §10 bounds a crash it might cause.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
-    /// The absolute path of the OpenVINO C API that was loaded.
+    /// The selected absolute OpenVINO C API path, preserving the legacy
+    /// soname alias. Native loading uses its validated canonical endpoint.
     pub library: String,
     /// OpenVINO's runtime build string.
     pub openvino_build: String,
@@ -143,7 +164,9 @@ pub struct Certification {
     pub model_sha256: &'static str,
     /// Which model it is.
     pub role: Role,
-    /// [`Identity::digest`] of the certified platform.
+    /// The qualified execution key from [`Identity::execution_digest`], or
+    /// a legacy exact [`Identity::digest`]. Both bind all numerical content;
+    /// only execution keys can cover equivalent installation relocations.
     pub identity_digest: &'static str,
     /// The ONNX Runtime version of the CPU reference.
     pub onnx_runtime: &'static str,
@@ -194,13 +217,32 @@ pub struct Consumer<'a> {
 }
 
 /// The entry certifying `model_sha256` for `identity` and `consumer`, if
-/// any (ADR-0022 §3).
+/// any (ADR-0022 §3). This legacy API matches only exact identities; portable
+/// matching additionally requires a platform's complete execution inventory.
 pub fn certification(
     model_sha256: &str,
     identity: &Identity,
     consumer: &Consumer<'_>,
 ) -> Option<&'static Certification> {
-    certification_in(CERTIFIED, model_sha256, &identity.digest(), consumer)
+    certification_for_identity(CERTIFIED, model_sha256, identity, None, consumer)
+}
+
+fn certification_for_identity<'t>(
+    table: &'t [Certification],
+    model_sha256: &str,
+    identity: &Identity,
+    execution_manifest: Option<&str>,
+    consumer: &Consumer<'_>,
+) -> Option<&'t Certification> {
+    // Preserve already reviewed exact keys; a new execution key is an
+    // explicitly qualified alternative, not an automatic widening of them.
+    if let Some(entry) = certification_in(table, model_sha256, &identity.digest(), consumer) {
+        return Some(entry);
+    }
+    let execution = identity
+        .execution_digest_from_manifest(execution_manifest?)
+        .ok()?;
+    certification_in(table, model_sha256, &execution, consumer)
 }
 
 fn certification_in<'t>(
@@ -300,6 +342,9 @@ pub enum CpuReason {
     /// NPU use is switched off, or the model was loaded without an NPU
     /// context.
     Disabled,
+    /// No reviewed installation/launch profile admits native loading. This
+    /// is independent of model certification and is checked before dlopen.
+    LoadingNotAdmitted,
     /// The OpenVINO C API, the ONNX Runtime reference or the NPU is not
     /// there.
     RuntimeAbsent(String),
@@ -324,6 +369,9 @@ impl fmt::Display for CpuReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("NPU use is disabled"),
+            Self::LoadingNotAdmitted => {
+                f.write_str("the NPU loading profile has not been admitted; using CPU")
+            }
             Self::RuntimeAbsent(why) => write!(f, "no NPU runtime: {why}"),
             Self::IdentityUnreadable(why) => write!(f, "NPU identity unreadable: {why}"),
             Self::NotCertified => {
@@ -827,15 +875,18 @@ fn catch_binding<T>(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or(Err(on_panic))
 }
 
-/// The first of `dirs` holding [`OPENVINO_C_SONAME`] as a regular file, as
-/// an absolute path.
+/// A reviewed soname from a listed directory, always an absolute path.
+/// Newer reviewed patch releases precede the legacy runtime.
+#[cfg(test)]
 fn resolve_library(dirs: &[&str]) -> Result<PathBuf, CpuReason> {
-    dirs.iter()
-        .map(|dir| Path::new(dir).join(OPENVINO_C_SONAME))
+    REVIEWED_OPENVINO_C_SONAMES
+        .iter()
+        .flat_map(|soname| dirs.iter().map(move |dir| Path::new(dir).join(soname)))
         .find(|path| path.is_absolute() && path.is_file())
         .ok_or_else(|| {
             CpuReason::RuntimeAbsent(format!(
-                "{OPENVINO_C_SONAME} is in none of {}",
+                "{} is in none of {}",
+                REVIEWED_OPENVINO_C_SONAMES.join(" or "),
                 dirs.join(", ")
             ))
         })
@@ -939,28 +990,64 @@ struct HashedLibrary {
 }
 
 fn is_runtime_library(path: &str) -> bool {
+    // Frozen legacy identity membership. Never use this path-spelling rule
+    // for portable qualification or the complete loaded-code check.
     path.starts_with('/') && (path.contains("openvino") || path.contains("/libze_"))
+}
+
+#[derive(Clone, Copy)]
+enum InventoryScope {
+    Legacy,
+    Execution,
+}
+
+impl InventoryScope {
+    fn includes(self, mapping: &maps::Mapping<'_>) -> bool {
+        match self {
+            Self::Legacy => is_runtime_library(mapping.path),
+            // Conservatively bind ALL file-backed executable mappings,
+            // including the process binary and unrelated native libraries.
+            // This avoids guessing the transitive dependency/plugin closure.
+            Self::Execution => mapping.executable && Path::new(mapping.path).is_absolute(),
+        }
+    }
 }
 
 /// Every OpenVINO and Level Zero library the process has mapped must be one
 /// the identity hashed and still the same file, by inode (ADR-0022 §4), so
 /// a package update between hashing and loading cannot run bytes the
 /// identity does not name.
+#[cfg(test)]
 fn loaded_as_hashed(maps: &str, hashed: &[HashedLibrary]) -> Result<(), String> {
+    verify_mappings(maps, hashed, InventoryScope::Legacy)
+}
+
+fn execution_loaded_as_hashed(maps: &str, hashed: &[HashedLibrary]) -> Result<(), String> {
+    verify_mappings(maps, hashed, InventoryScope::Execution)
+}
+
+fn verify_mappings(
+    maps: &str,
+    hashed: &[HashedLibrary],
+    scope: InventoryScope,
+) -> Result<(), String> {
     for line in maps.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let (Some(inode), Some(path)) = (fields.get(4), fields.get(5)) else {
+        let Some(mapping) = maps::mapping(line) else {
             continue;
         };
-        if !is_runtime_library(path) {
+        let path = mapping.path;
+        if !scope.includes(&mapping)
+            && !hashed
+                .iter()
+                .any(|library| library.path.as_os_str() == OsStr::new(path))
+        {
             continue;
         }
         let library = hashed
             .iter()
             .find(|library| library.path.as_os_str() == OsStr::new(path))
             .ok_or_else(|| format!("{path} is mapped but was not hashed"))?;
-        // A seventh field is "(deleted)": the mapped file was replaced.
-        if inode.parse::<u64>().ok() != Some(library.inode) || fields.len() > 6 {
+        if mapping.inode.parse::<u64>().ok() != Some(library.inode) || mapping.deleted {
             return Err(format!("{path} is not the file that was hashed"));
         }
     }
@@ -975,11 +1062,48 @@ fn loaded_as_hashed(maps: &str, hashed: &[HashedLibrary]) -> Result<(), String> 
 /// loader and the NPU user-mode driver must all be there, and every mapped
 /// one must be the file that was hashed.
 fn runtime_libraries(maps: &str) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
+    library_inventory(maps, InventoryScope::Legacy)
+}
+
+fn execution_libraries(
+    maps: &str,
+    executable: &Path,
+) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
+    let (manifest, hashed) = library_inventory(maps, InventoryScope::Execution)?;
+    let mut libraries = String::new();
+    let mut found_executable = false;
+    for line in manifest.lines() {
+        let (path, _) = line.rsplit_once(' ').ok_or_else(|| {
+            CpuReason::IdentityUnreadable("malformed executable inventory".into())
+        })?;
+        if Path::new(path) == executable {
+            found_executable = true;
+        } else {
+            libraries.push_str(line);
+            libraries.push('\n');
+        }
+    }
+    if !found_executable {
+        return Err(CpuReason::IdentityUnreadable(
+            "the process executable is absent from the mapped inventory".into(),
+        ));
+    }
+    // Keep the main executable's mapping/inode check, but not its content in
+    // a key compiled into that same executable. CPU producer/decision/parity
+    // bindings still apply; every shared native library remains in this key.
+    Ok((libraries, hashed))
+}
+
+fn library_inventory(
+    maps: &str,
+    scope: InventoryScope,
+) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
     let unreadable = |why: String| CpuReason::IdentityUnreadable(why);
     let mut paths: Vec<PathBuf> = maps
         .lines()
-        .filter_map(|line| line.split_whitespace().nth(5))
-        .filter(|path| is_runtime_library(path))
+        .filter_map(maps::mapping)
+        .filter(|mapping| scope.includes(mapping))
+        .map(|mapping| mapping.path)
         .map(PathBuf::from)
         .collect();
     let named = |prefix: &str| {
@@ -1035,7 +1159,7 @@ fn runtime_libraries(maps: &str) -> Result<(String, Vec<HashedLibrary>), CpuReas
             inode: metadata.ino(),
         });
     }
-    loaded_as_hashed(maps, &hashed).map_err(unreadable)?;
+    verify_mappings(maps, &hashed, scope).map_err(unreadable)?;
     Ok((lines, hashed))
 }
 
@@ -1044,6 +1168,7 @@ pub struct Platform {
     core: openvino::Core,
     identity: Identity,
     libraries: Vec<HashedLibrary>,
+    execution_manifest: String,
     maps: PathBuf,
 }
 
@@ -1056,18 +1181,43 @@ impl Platform {
     /// NPU device is missing; [`CpuReason::IdentityUnreadable`] when a
     /// field of [`Identity`] cannot be read.
     pub fn open() -> Result<Self, CpuReason> {
-        Self::open_with(&Sources {
+        Self::open_with_runtime(&RuntimeSelection::Automatic)
+    }
+
+    /// Open an administrator-selected upstream, distro or source runtime.
+    /// Provider branding is not an eligibility field.
+    ///
+    /// # Errors
+    ///
+    /// A rejected/untrusted selection, an absent reviewed C API or NPU, or
+    /// unreadable platform identity fields. A rejected explicit selection
+    /// never falls through to another installed provider.
+    pub fn open_with_runtime(selection: &RuntimeSelection) -> Result<Self, CpuReason> {
+        let sources = Sources {
             library_dirs: OPENVINO_LIBRARY_DIRS,
             accel_class: Path::new("/sys/class/accel"),
             debugfs_accel: Path::new("/sys/kernel/debug/accel"),
             maps: Path::new("/proc/self/maps"),
             force_compiler: true,
-        })
+        };
+        let library =
+            runtime::resolve_library(selection, sources.library_dirs, &runtime::Trust::default())?;
+        Self::open_library(&sources, library.canonical, library.selected)
     }
 
+    #[cfg(test)]
     fn open_with(sources: &Sources<'_>) -> Result<Self, CpuReason> {
-        use openvino::{DeviceType, PropertyKey, RwPropertyKey};
         let library = resolve_library(sources.library_dirs)?;
+        Self::open_library(sources, library.clone(), library)
+    }
+
+    fn open_library(
+        sources: &Sources<'_>,
+        library: PathBuf,
+        selected: PathBuf,
+    ) -> Result<Self, CpuReason> {
+        use openvino::{DeviceType, PropertyKey, RwPropertyKey};
+        runtime::admit_loading()?;
         probe_library(&library)?;
         let (pci_id, bus_address) = accelerator(sources.accel_class)?;
         let firmware = firmware_build(sources.debugfs_accel, &bus_address)?;
@@ -1096,11 +1246,15 @@ impl Platform {
                     .map(|(_, version)| version.build_number)
                     .next()
                     .ok_or_else(|| CpuReason::IdentityUnreadable("no NPU plugin version".into()))?;
-                let (libraries, hashed) = fs::read_to_string(sources.maps)
-                    .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))
-                    .and_then(|maps| runtime_libraries(&maps))?;
+                let maps = fs::read_to_string(sources.maps)
+                    .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))?;
+                let (libraries, _) = runtime_libraries(&maps)?;
+                let executable = fs::read_link("/proc/self/exe").map_err(|error| {
+                    CpuReason::IdentityUnreadable(format!("process executable: {error}"))
+                })?;
+                let (execution_manifest, hashed) = execution_libraries(&maps, &executable)?;
                 let identity = Identity {
-                    library: library.display().to_string(),
+                    library: selected.display().to_string(),
                     openvino_build: openvino::version().build_number,
                     npu_plugin,
                     driver_version: property("NPU_DRIVER_VERSION")?,
@@ -1144,6 +1298,7 @@ impl Platform {
                     core,
                     identity,
                     libraries: hashed,
+                    execution_manifest,
                     maps: sources.maps.to_path_buf(),
                 })
             },
@@ -1198,6 +1353,20 @@ impl Platform {
         &self.identity
     }
 
+    /// Portable key from the full observed file-backed executable inventory,
+    /// plus the known compiler/frontends loaded during compilation. This
+    /// conservatively binds unrelated native libraries too. The main executable
+    /// is omitted from this key to avoid self-reference with the compiled table,
+    /// but remains in the mapped-file verification inventory.
+    ///
+    /// # Errors
+    ///
+    /// Empty, malformed or duplicate-basename inventory entries.
+    pub fn execution_digest(&self) -> Result<String, &'static str> {
+        self.identity
+            .execution_digest_from_manifest(&self.execution_manifest)
+    }
+
     /// Compile `model` for the NPU with the batch fixed to 1, into `cache`,
     /// behind its marker; every inference of the result is bracketed by the
     /// same marker (ADR-0022 §6, §10, §11).
@@ -1243,7 +1412,7 @@ impl Platform {
             // hashed (ADR-0022 §4).
             let loaded = fs::read_to_string(&self.maps)
                 .map_err(|error| format!("maps: {error}"))
-                .and_then(|maps| loaded_as_hashed(&maps, &self.libraries));
+                .and_then(|maps| execution_loaded_as_hashed(&maps, &self.libraries));
             if let Err(why) = loaded {
                 drop(inner);
                 return match discard_blobs(&cache.blobs()) {
@@ -1403,6 +1572,7 @@ impl Infer for NpuModel {
 /// the CPU reference's ONNX Runtime version, or why there are none.
 pub struct Context {
     state: Result<Open, CpuReason>,
+    discovery: Option<Result<Identity, CpuReason>>,
 }
 
 struct Open {
@@ -1418,6 +1588,7 @@ impl Context {
     pub fn disabled() -> Self {
         Self {
             state: Err(CpuReason::Disabled),
+            discovery: None,
         }
     }
 
@@ -1425,33 +1596,23 @@ impl Context {
     /// caller that consumes the recognizer's output as `consumer` says. A
     /// failure is kept as the reason every model then runs on CPU.
     pub fn open(cache_base: &Path, consumer: &Consumer<'_>) -> Self {
-        Self {
-            state: Self::open_state(cache_base, consumer),
-        }
+        Self::open_with_runtime(cache_base, consumer, &RuntimeSelection::Automatic)
     }
 
-    fn open_state(cache_base: &Path, consumer: &Consumer<'_>) -> Result<Open, CpuReason> {
-        let boot = boot_id()
-            .map_err(|error| CpuReason::IdentityUnreadable(format!("boot id: {error}")))?;
-        // Discovery loads the plugin and queries the device before there
-        // is an identity to name a model marker, so it has its own marker
-        // (ADR-0022 §10): a discovery that crashed or hung earlier in this
-        // boot is not repeated.
-        let markers = cache_base.join("markers");
-        private_dir(cache_base)
-            .and_then(|()| private_dir(&markers))
-            .map_err(|error| {
-                CpuReason::CompileFailed(format!("cache {}: {error}", cache_base.display()))
-            })?;
-        let discovery = MarkerFile {
-            path: markers.join("discovery"),
-            boot_id: boot.clone(),
-        };
-        let platform = compile_guarded(&discovery, Platform::open)?;
-        let cache = Cache::prepare(cache_base, platform.identity(), &boot).map_err(|error| {
-            CpuReason::CompileFailed(format!("cache {}: {error}", cache_base.display()))
-        })?;
-        Ok(Open {
+    /// Open the selected root-managed runtime with this CPU consumer.
+    /// Discovery is separate from model qualification; failures preserve CPU.
+    pub fn open_with_runtime(
+        cache_base: &Path,
+        consumer: &Consumer<'_>,
+        selection: &RuntimeSelection,
+    ) -> Self {
+        let mut discovery = None;
+        let state = prepare_runtime(cache_base, &mut discovery, || {
+            let platform = Platform::open_with_runtime(selection)?;
+            let identity = platform.identity().clone();
+            Ok((platform, identity))
+        })
+        .map(|(platform, cache)| Open {
             platform,
             cache,
             onnx_runtime: consumer.onnx_runtime.to_owned(),
@@ -1461,16 +1622,27 @@ impl Context {
                 .map(|(name, value)| ((*name).to_owned(), *value))
                 .collect(),
             decision_fingerprint: consumer.decision_fingerprint.to_owned(),
-        })
+        });
+        Self { state, discovery }
     }
 
-    /// The platform identity, or why there is none.
+    /// Whether discovery was attempted and completed successfully. Missing
+    /// means no runtime observation, independently of model placement.
+    pub fn runtime_available(&self) -> Option<bool> {
+        self.discovery.as_ref().map(Result::is_ok)
+    }
+
+    /// The observed platform identity, or why there is none. A later cache or
+    /// marker-cleanup failure does not discard an already observed identity.
     ///
     /// # Errors
     ///
     /// The reason every model runs on CPU.
     pub fn identity(&self) -> Result<&Identity, &CpuReason> {
-        self.state.as_ref().map(|open| open.platform.identity())
+        match &self.discovery {
+            Some(Ok(identity)) => Ok(identity),
+            _ => self.state.as_ref().map(|open| open.platform.identity()),
+        }
     }
 
     /// Place one model: on the NPU when it is certified for this platform
@@ -1491,7 +1663,13 @@ impl Context {
             thresholds: &thresholds,
             decision_fingerprint: &open.decision_fingerprint,
         };
-        let Some(entry) = certification(model_sha256, open.platform.identity(), &consumer) else {
+        let Some(entry) = certification_for_identity(
+            CERTIFIED,
+            model_sha256,
+            open.platform.identity(),
+            Some(&open.platform.execution_manifest),
+            &consumer,
+        ) else {
             return Slot::cpu(CpuReason::NotCertified);
         };
         match open.platform.compile(&open.cache, model, model_sha256) {
@@ -1501,9 +1679,233 @@ impl Context {
     }
 }
 
+/// Run the real marker/cache state machine around a discovery boundary. The
+/// generic payload lets filesystem regressions exercise it without native code.
+fn prepare_runtime<P>(
+    cache_base: &Path,
+    observation: &mut Option<Result<Identity, CpuReason>>,
+    discover: impl FnOnce() -> Result<(P, Identity), CpuReason>,
+) -> Result<(P, Cache), CpuReason> {
+    *observation = None;
+    let state = (|| {
+        let boot = boot_id()
+            .map_err(|error| CpuReason::IdentityUnreadable(format!("boot id: {error}")))?;
+        let markers = cache_base.join("markers");
+        private_dir(cache_base)
+            .and_then(|()| private_dir(&markers))
+            .map_err(|error| {
+                CpuReason::CompileFailed(format!("cache {}: {error}", cache_base.display()))
+            })?;
+        let marker = MarkerFile {
+            path: markers.join("discovery"),
+            boot_id: boot.clone(),
+        };
+        let (platform, identity) = compile_guarded(&marker, || {
+            let result = discover();
+            // Record the observation at its boundary, before marker cleanup
+            // or cache preparation can fail. Admission refusal observed no
+            // runtime; a discovery failure did attempt it.
+            if !matches!(result, Err(CpuReason::LoadingNotAdmitted)) {
+                *observation = Some(
+                    result
+                        .as_ref()
+                        .map(|(_, identity)| identity.clone())
+                        .map_err(Clone::clone),
+                );
+            }
+            result
+        })?;
+        let cache = Cache::prepare(cache_base, &identity, &boot).map_err(|error| {
+            CpuReason::CompileFailed(format!("cache {}: {error}", cache_base.display()))
+        })?;
+        Ok((platform, cache, identity))
+    })();
+    state.map(|(platform, cache, _)| (platform, cache))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_prefix_spaces_preserve_loaded_library_inode_and_deletion_checks() {
+        let path = PathBuf::from("/opt/provider runtime/libopenvino.so.2026.2.1");
+        let hashed = [HashedLibrary {
+            path: path.clone(),
+            inode: 42,
+        }];
+        let line = format!("0000-1000 r-xp 00000000 00:23 42 {}\n", path.display());
+        assert_eq!(loaded_as_hashed(&line, &hashed), Ok(()));
+        let changed = line.replace("00:23 42", "00:23 43");
+        assert!(loaded_as_hashed(&changed, &hashed).is_err());
+        let deleted = format!("{} (deleted)\n", line.trim_end());
+        assert!(loaded_as_hashed(&deleted, &hashed).is_err());
+    }
+
+    fn portable_identity() -> Identity {
+        let mut value = identity();
+        value.libraries = format!(
+            "/usr/lib64/libopenvino_c.so.2026.2.1 {}\n/usr/lib64/openvino-2026.2.1/libopenvino_intel_npu_plugin.so {}\n",
+            "a".repeat(64), "b".repeat(64)
+        );
+        value
+    }
+
+    #[test]
+    fn execution_identity_is_layout_portable_without_changing_full_identity() {
+        let original = portable_identity();
+        let mut moved = original.clone();
+        moved.library = "/opt/upstream/runtime/lib/libopenvino_c.so.2621".into();
+        moved.libraries = original
+            .libraries
+            .replace("/usr/lib64", "/opt/upstream/runtime/lib");
+        assert_ne!(original.digest(), moved.digest());
+        assert_eq!(
+            original.execution_digest().unwrap(),
+            moved.execution_digest().unwrap()
+        );
+    }
+
+    #[test]
+    fn execution_identity_keeps_all_numerical_and_library_content_fields() {
+        let original = portable_identity();
+        let before = original.execution_digest().unwrap();
+        let edits: [fn(&mut Identity); 9] = [
+            |i| i.openvino_build.push('x'),
+            |i| i.npu_plugin.push('x'),
+            |i| i.driver_version.push('x'),
+            |i| i.compiler_version.push('x'),
+            |i| i.architecture.push('x'),
+            |i| i.pci_id.push('x'),
+            |i| i.firmware.push('x'),
+            |i| i.configuration.push('x'),
+            |i| i.libraries = i.libraries.replace(&"a".repeat(64), &"c".repeat(64)),
+        ];
+        for edit in edits {
+            let mut different = original.clone();
+            edit(&mut different);
+            assert_ne!(different.execution_digest().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_content_manifests_cannot_be_qualified() {
+        let mut value = portable_identity();
+        for bad in [
+            "".to_owned(),
+            "/lib/library.so no-hash\n".into(),
+            format!(
+                "/first/library.so {}\n/second/library.so {}\n",
+                "a".repeat(64),
+                "a".repeat(64)
+            ),
+            format!("relative/library.so {}\n", "a".repeat(64)),
+        ] {
+            value.libraries = bad;
+            assert!(value.execution_digest().is_err());
+        }
+    }
+
+    fn entry(key: String) -> Certification {
+        Certification {
+            model_sha256: "model",
+            role: Role::Recognizer,
+            identity_digest: Box::leak(key.into_boxed_str()),
+            onnx_runtime: "1.28.1",
+            thresholds: &[],
+            decision_fingerprint: "decision",
+            fingerprint: &[],
+            cpu_reference_digest: "cpu",
+            npu_reference_digest: "npu",
+            evidence: "synthetic",
+        }
+    }
+
+    #[test]
+    fn portable_qualification_matches_equivalent_layout_but_legacy_keys_stay_exact() {
+        let original = portable_identity();
+        let mut moved = original.clone();
+        moved.library = "/usr/local/lib/libopenvino_c.so.2621".into();
+        moved.libraries = original.libraries.replace("/usr/lib64", "/usr/local/lib");
+        let consumer = Consumer {
+            onnx_runtime: "1.28.1",
+            thresholds: &[],
+            decision_fingerprint: "decision",
+        };
+        let portable = [entry(original.execution_digest().unwrap())];
+        assert!(certification_for_identity(
+            &portable,
+            "model",
+            &moved,
+            Some(&moved.libraries),
+            &consumer
+        )
+        .is_some());
+        assert!(
+            certification_for_identity(&portable, "model", &moved, None, &consumer).is_none(),
+            "legacy inventory cannot admit a portable key"
+        );
+        let legacy = [entry(original.digest())];
+        assert!(certification_for_identity(&legacy, "model", &original, None, &consumer).is_some());
+        assert!(certification_for_identity(
+            &legacy,
+            "model",
+            &moved,
+            Some(&moved.libraries),
+            &consumer
+        )
+        .is_none());
+        let mut modified = moved.clone();
+        modified.libraries = moved.libraries.replace(&"b".repeat(64), &"c".repeat(64));
+        assert!(certification_for_identity(
+            &portable,
+            "model",
+            &modified,
+            Some(&modified.libraries),
+            &consumer
+        )
+        .is_none());
+        assert!(certification_for_identity(
+            &portable,
+            "model",
+            &moved,
+            Some(&moved.libraries),
+            &Consumer {
+                onnx_runtime: "1.29.0",
+                ..consumer
+            }
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_header_identical_patch_runtime_resolves_from_a_listed_directory() {
+        let listed = tempfile::tempdir().unwrap();
+        let patch = listed.path().join("libopenvino_c.so.2621");
+        fs::write(&patch, b"").unwrap();
+        assert_eq!(
+            resolve_library(&[listed.path().to_str().unwrap()]),
+            Ok(patch)
+        );
+    }
+
+    #[test]
+    fn the_patch_runtime_is_preferred_and_the_reviewed_legacy_runtime_still_resolves() {
+        let listed = tempfile::tempdir().unwrap();
+        let legacy = listed.path().join(OPENVINO_C_SONAME);
+        let patch = listed.path().join("libopenvino_c.so.2621");
+        fs::write(&legacy, b"").unwrap();
+        fs::write(&patch, b"").unwrap();
+        assert_eq!(
+            resolve_library(&[listed.path().to_str().unwrap()]),
+            Ok(patch.clone())
+        );
+        fs::remove_file(patch).unwrap();
+        assert_eq!(
+            resolve_library(&[listed.path().to_str().unwrap()]),
+            Ok(legacy)
+        );
+    }
 
     fn identity() -> Identity {
         Identity {
@@ -2132,6 +2534,149 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn complete_runtime_manifest_survives_provider_prefix_relocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let build = |prefix: &str| {
+            let root = directory.path().join(prefix);
+            fs::create_dir(&root).unwrap();
+            let names = [
+                "libopenvino_c.so.2026.2.0",
+                "libopenvino.so.2026.2.0",
+                "libze_loader.so.1",
+                "libze_intel_npu.so.1",
+                "libopenvino_intel_npu_plugin.so",
+                "libopenvino_intel_npu_compiler.so",
+                "libopenvino_intel_npu_compiler_loader.so",
+                "libopenvino_ir_frontend.so.2026.2.0",
+                "libopenvino_onnx_frontend.so.2026.2.0",
+                "libtbb.so.12",
+                "libprovider_math.so.1",
+                "irlumed",
+            ];
+            let paths: Vec<_> = names
+                .iter()
+                .map(|name| {
+                    if *name == "libtbb.so.12" || *name == "libprovider_math.so.1" {
+                        root.join("runtime/3rdparty").join(name)
+                    } else {
+                        root.join("runtime/lib").join(name)
+                    }
+                })
+                .collect();
+            for path in &paths {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+            }
+            for path in &paths {
+                fs::write(path, path.file_name().unwrap().as_bytes()).unwrap();
+            }
+            let maps: String = paths.iter().map(|path| map_line(path)).collect();
+            let (manifest, hashed) =
+                execution_libraries(&maps, &root.join("runtime/lib/irlumed")).unwrap();
+            let mut result = identity();
+            result.libraries = manifest;
+            (result, hashed, root, maps)
+        };
+        let (original, _, _, _) = build("openvino");
+        let (relocated, hashed, root, maps) = build("provider");
+        assert_eq!(
+            original.execution_digest().unwrap(),
+            relocated.execution_digest().unwrap()
+        );
+        assert!(relocated.libraries.contains("libtbb.so.12"));
+        assert!(relocated.libraries.contains("libprovider_math.so.1"));
+        assert!(
+            !relocated.libraries.contains("/irlumed "),
+            "a key embedded in the executable cannot also hash that executable"
+        );
+        let executable = root.join("runtime/lib/irlumed");
+        fs::write(&executable, relocated.execution_digest().unwrap()).unwrap();
+        let mut with_entry = relocated.clone();
+        with_entry.libraries = execution_libraries(&maps, &executable).unwrap().0;
+        assert_eq!(with_entry.execution_digest(), relocated.execution_digest());
+        assert!(
+            hashed.iter().any(|library| library.path == executable),
+            "executable still receives mapped-file checks"
+        );
+        let replacement = root.join("replacement");
+        fs::write(&replacement, b"changed dependency").unwrap();
+        fs::rename(replacement, root.join("runtime/3rdparty/libtbb.so.12")).unwrap();
+        let updated = maps
+            .lines()
+            .filter(|line| !line.contains("libtbb.so.12"))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+            + &map_line(&root.join("runtime/3rdparty/libtbb.so.12"));
+        assert!(execution_loaded_as_hashed(&updated, &hashed).is_err());
+        let mut changed = relocated.clone();
+        let (manifest, updated_hashes) =
+            execution_libraries(&updated, &root.join("runtime/lib/irlumed")).unwrap();
+        changed.libraries = manifest;
+        assert_eq!(
+            execution_loaded_as_hashed(&updated, &updated_hashes),
+            Ok(())
+        );
+        assert_ne!(
+            changed.execution_digest().unwrap(),
+            relocated.execution_digest().unwrap()
+        );
+        let deleted = format!(
+            "{updated}{} (deleted)\n",
+            map_line(&root.join("runtime/3rdparty/libtbb.so.12")).trim_end()
+        );
+        assert!(execution_loaded_as_hashed(&deleted, &updated_hashes).is_err());
+        let outside = directory.path().join("external-dependency.so");
+        fs::write(&outside, b"late native dependency").unwrap();
+        assert!(execution_loaded_as_hashed(
+            &format!("{updated}{}", map_line(&outside)),
+            &updated_hashes
+        )
+        .is_err_and(|error| error.contains("not hashed")));
+    }
+
+    #[test]
+    fn legacy_manifest_ignores_unrelated_colocated_mappings() {
+        let directory = tempfile::tempdir().unwrap();
+        let names = [
+            "libopenvino_c.so.2026.2.0",
+            "libopenvino.so.2026.2.0",
+            "libze_loader.so.1",
+            "libze_intel_npu.so.1",
+            "libopenvino_intel_npu_plugin.so",
+            "libopenvino_intel_npu_compiler.so",
+            "libopenvino_intel_npu_compiler_loader.so",
+            "libopenvino_ir_frontend.so.2026.2.0",
+            "libopenvino_onnx_frontend.so.2026.2.0",
+        ];
+        let mut expected = String::new();
+        let mut paths: Vec<_> = names
+            .iter()
+            .map(|name| directory.path().join(name))
+            .collect();
+        paths.sort();
+        for path in &paths {
+            fs::write(path, b"fixture").unwrap();
+            expected.push_str(&format!(
+                "{} {}\n",
+                path.display(),
+                irlume_common::sha256_hex(b"fixture")
+            ));
+        }
+        let mut maps: String = paths.iter().map(|path| map_line(path)).collect();
+        for name in ["libc.so.6", "libonnxruntime.so.1"] {
+            let path = directory.path().join(name);
+            fs::write(&path, b"unrelated").unwrap();
+            maps.push_str(&map_line(&path));
+        }
+        let (manifest, _) = runtime_libraries(&maps).unwrap();
+        assert_eq!(manifest, expected);
+        let mut legacy = identity();
+        legacy.libraries = expected;
+        let mut current = legacy.clone();
+        current.libraries = manifest;
+        assert_eq!(legacy.digest(), current.digest());
+    }
+
     /// A mapping as btrfs shows it: the filesystem's device, which `stat`
     /// does not report, and the file's inode.
     fn map_line(path: &Path) -> String {
@@ -2215,6 +2760,97 @@ mod tests {
     }
 
     #[test]
+    fn cache_failure_before_discovery_is_unreported() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("not-a-directory");
+        fs::write(&base, b"fixture").unwrap();
+        let mut observation = None;
+        let result = prepare_runtime(
+            &base,
+            &mut observation,
+            || -> Result<((), Identity), CpuReason> {
+                panic!("discovery must not run before its marker is ready")
+            },
+        );
+        assert!(result.is_err());
+        assert!(observation.is_none());
+    }
+
+    #[test]
+    fn cache_failure_after_discovery_retains_platform_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = identity();
+        fs::write(
+            directory.path().join(expected.digest()),
+            b"blocks cache directory",
+        )
+        .unwrap();
+        let mut observation = None;
+        let result = prepare_runtime(directory.path(), &mut observation, || {
+            Ok(((), expected.clone()))
+        });
+        assert!(matches!(result, Err(CpuReason::CompileFailed(_))));
+        assert_eq!(observation, Some(Ok(expected.clone())));
+        let mut context = Context {
+            state: Err(result.err().unwrap()),
+            discovery: observation,
+        };
+        assert_eq!(context.runtime_available(), Some(true));
+        assert_eq!(context.identity().unwrap().digest(), expected.digest());
+        assert!(matches!(
+            context.slot(b"model", "unused").device(),
+            Device::Cpu(CpuReason::CompileFailed(_))
+        ));
+    }
+
+    #[test]
+    fn discovery_observations_distinguish_refusal_failure_and_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut observation = None;
+        let failed = CpuReason::RuntimeAbsent("no runtime".into());
+        assert!(
+            prepare_runtime::<()>(directory.path(), &mut observation, || Err(failed.clone()))
+                .is_err()
+        );
+        assert_eq!(observation, Some(Err(failed)));
+        observation = None;
+        assert!(
+            prepare_runtime::<()>(directory.path(), &mut observation, || Err(
+                CpuReason::LoadingNotAdmitted
+            ))
+            .is_err()
+        );
+        assert!(
+            observation.is_none(),
+            "admission refusal is not a runtime observation"
+        );
+        let expected = identity();
+        assert!(prepare_runtime(directory.path(), &mut observation, || Ok((
+            (),
+            expected.clone()
+        )))
+        .is_ok());
+        assert_eq!(observation, Some(Ok(expected)));
+    }
+
+    #[test]
+    fn marker_cleanup_failure_after_discovery_retains_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut observation = None;
+        let expected = identity();
+        let result = prepare_runtime(directory.path(), &mut observation, || {
+            let marker = directory.path().join("markers/discovery");
+            fs::remove_file(&marker).unwrap();
+            fs::create_dir(&marker).unwrap();
+            Ok(((), expected.clone()))
+        });
+        assert!(
+            matches!(result, Err(CpuReason::CompileFailed(ref why)) if why.contains("cannot clear the marker"))
+        );
+        assert_eq!(observation, Some(Ok(expected)));
+    }
+
+    #[test]
     fn the_library_comes_only_from_the_listed_directories() {
         let dir = tempfile::tempdir().unwrap();
         let listed = dir.path().join("lib64");
@@ -2240,6 +2876,27 @@ mod tests {
             probe_library(Path::new(OPENVINO_C_SONAME)),
             Err(CpuReason::RuntimeAbsent(ref why)) if why.contains("absolute")
         ));
+    }
+
+    #[test]
+    fn unreviewed_loading_profile_is_refused_before_any_native_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        // An invalid ELF would reach dlopen in the former path. The admission
+        // refusal must win before the dynamic loader or device queries run.
+        fs::write(directory.path().join(OPENVINO_C_SONAME), b"not executable").unwrap();
+        let paths = [directory.path().to_str().unwrap()];
+        let result = Platform::open_with(&Sources {
+            library_dirs: &paths,
+            accel_class: directory.path(),
+            debugfs_accel: directory.path(),
+            maps: directory.path(),
+            force_compiler: true,
+        });
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("loading profile has not been admitted"));
     }
 
     #[test]

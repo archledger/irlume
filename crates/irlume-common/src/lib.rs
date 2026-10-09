@@ -1563,6 +1563,62 @@ pub struct RecognizerPlacement {
     /// The NPU platform identity digest, when discovery read one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// Whether this engine successfully discovered an accessible NPU
+    /// runtime/platform. `None` means it did not attempt/report discovery.
+    /// Discovery alone does not qualify a model for accelerated decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_available: Option<bool>,
+    /// Whether this engine currently passed the model's NPU qualification
+    /// and placement checks. `None` means no usable runtime was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualified: Option<bool>,
+}
+
+#[cfg(test)]
+mod recognizer_runtime_wire_tests {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct LegacyPlacement {
+        device: String,
+        reason: Option<String>,
+        platform: Option<String>,
+    }
+
+    #[test]
+    fn runtime_discovery_and_qualification_are_optional_for_legacy_peers() {
+        let placement = RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some("runtime available; model awaits qualification".into()),
+            platform: Some("identity".into()),
+            runtime_available: Some(true),
+            qualified: Some(false),
+        };
+        let json = serde_json::to_string(&placement).unwrap();
+        let legacy: LegacyPlacement = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.device, placement.device);
+        assert_eq!(legacy.reason, placement.reason);
+        assert_eq!(legacy.platform, placement.platform);
+        let new: RecognizerPlacement =
+            serde_json::from_str(r#"{"device":"cpu","reason":"legacy","platform":"identity"}"#)
+                .unwrap();
+        assert_eq!(new.runtime_available, None);
+        assert_eq!(new.qualified, None);
+    }
+
+    #[test]
+    fn unreported_runtime_facts_are_omitted_not_invented_as_false() {
+        let placement = RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some("not built".into()),
+            platform: None,
+            runtime_available: None,
+            qualified: None,
+        };
+        let json = serde_json::to_value(placement).unwrap();
+        assert!(json.get("runtime_available").is_none());
+        assert!(json.get("qualified").is_none());
+    }
 }
 
 /// Prospective cumulative face-request budget, independent of password recovery.

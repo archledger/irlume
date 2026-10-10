@@ -248,7 +248,7 @@ mod onnx {
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
     use ort::session::{
-        builder::{AutoDevicePolicy, GraphOptimizationLevel},
+        builder::{AutoDevicePolicy, GraphOptimizationLevel, SessionBuilder},
         Session,
     };
     use ort::value::Tensor;
@@ -552,6 +552,29 @@ mod onnx {
         std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1")
     }
 
+    /// Pin the session to the exact default CPU execution provider: register
+    /// the environment's Microsoft CPU device explicitly. Explicit
+    /// registration is the only suppression of the automatic
+    /// device-selection policy the builder arms (upstream has no API to
+    /// disarm it; the policy otherwise ranks any other CPU-type EP ahead of
+    /// the default, which the NPU parity reference and the CPU-session
+    /// warnings must not silently rely on). Falls back to the CPU
+    /// preference policy only when the runtime exposes no default CPU
+    /// device.
+    fn pin_default_cpu_ep(b: SessionBuilder) -> irlume_common::Result<SessionBuilder> {
+        let Ok(env) = ort::environment::Environment::current() else {
+            return b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err);
+        };
+        let default_cpu = env.devices().find(|device| {
+            device.ep_vendor().is_ok_and(|vendor| vendor == "Microsoft")
+                && matches!(device.hardware_device().ty(), ort::memory::DeviceType::CPU)
+        });
+        match default_cpu {
+            Some(device) => b.with_devices([device], None).map_err(err),
+            None => b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err),
+        }
+    }
+
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
         ensure_ort_resolvable()?;
         #[allow(unused_mut)]
@@ -562,16 +585,6 @@ mod onnx {
         // warning (ADR-0033 section 7). Sessions here run on the CPU, or on
         // the escaped providers below.
         b = b.with_no_environment_execution_providers().map_err(err)?;
-        // The crate initializes every builder with an automatic
-        // NPU-preferring device-selection policy; pin the policy to CPU
-        // selection, so a runtime with built-in accelerators cannot
-        // auto-place these models. Registering the CPU provider would not
-        // do this (it only toggles the CPU memory arena, which must stay
-        // at its default), and the explicit providers of the escaped arm
-        // below override the policy where they register.
-        b = b
-            .with_auto_device(AutoDevicePolicy::PreferCPU)
-            .map_err(err)?;
         // Register a hardware execution provider if compiled in (cf. howrs),
         // but never inside an authentication build by default: these
         // providers place ops outside the per-model certification regime and
@@ -647,6 +660,7 @@ mod onnx {
                      it outside the per-model certification regime \
                      (ADR-0033 section 7)"
                 );
+                b = pin_default_cpu_ep(b)?;
             }
         }
         #[cfg(not(any(feature = "cuda", feature = "openvino", feature = "tensorrt")))]
@@ -670,6 +684,7 @@ mod onnx {
                      CPU (ADR-0033 section 7)"
                 );
             }
+            b = pin_default_cpu_ep(b)?;
         }
         // Each resident model has its own pool. Let idle workers block while
         // another model runs, retaining two threads for each active inference.
@@ -1168,16 +1183,41 @@ mod onnx {
                 !build.contains("ort::ep::CoreML"),
                 "CoreML is never registered in any arm"
             );
-            // The automatic device-selection policy is pinned to CPU
-            // before any arm: registering the CPU provider would not reset
-            // it and would only toggle the memory arena away from its
-            // default.
-            let policy = build
-                .find("with_auto_device(AutoDevicePolicy::PreferCPU)")
-                .expect("the selection policy is pinned to CPU");
+            // The escape-inactive arms pin the exact default CPU
+            // execution provider (the environment's Microsoft CPU device),
+            // which both names the reference CPU EP and suppresses the
+            // automatic device-selection policy; the escaped arm never pins
+            // it, because a CPU provider registered first would claim the
+            // whole graph ahead of the escaped providers.
+            let pins = build.matches("pin_default_cpu_ep(b)?").count();
             assert!(
-                no_env < policy && policy < escape,
-                "the policy pin sits between the environment cutoff and the escape"
+                pins >= 2,
+                "both escape-inactive arms pin the default CPU EP"
+            );
+            let first_pin = build.find("pin_default_cpu_ep(b)?").expect("a pin");
+            assert!(
+                first_pin > escape,
+                "the pin comes after the escaped arm, never inside it"
+            );
+            let helper = source
+                .split("fn pin_default_cpu_ep(")
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(
+                        "
+    fn ",
+                    )
+                    .next()
+                })
+                .expect("the exact-CPU helper");
+            assert!(
+                helper.contains("with_devices([device], None)")
+                    && helper.contains(r#""Microsoft""#),
+                "the helper registers the environment's Microsoft CPU device"
+            );
+            assert!(
+                helper.contains("AutoDevicePolicy::PreferCPU"),
+                "the helper falls back to the CPU preference policy"
             );
             assert!(
                 !build.contains("ort::ep::CPU::default()"),

@@ -20,9 +20,12 @@ All notable changes to irlume are documented here. This project adheres to
   registers ahead of CUDA under the escape and the OpenVINO provider is
   pinned to the GPU device; CoreML is never registered (every
   MLComputeUnits combination admits the CPU) and a build that compiled it
-  is told it stays inactive; and every session pins the automatic
-  device-selection policy to CPU, overriding the crate's NPU-preferring
-  default so a runtime with built-in accelerators cannot auto-place these
+  is told it stays inactive; and every session outside the escape
+  registers the runtime's exact default CPU execution provider, which
+  names the reference CPU EP and suppresses the crate's armed
+  NPU-preferring automatic device selection (the policy would otherwise
+  rank any other CPU-type provider ahead of the default), so a runtime
+  with built-in accelerators cannot auto-place or substitute these
   models. A compiled provider without the escape, and the escape in a
   build without a provider feature, both warn their actual outcome
   (ADR-0033 section 7).

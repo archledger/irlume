@@ -172,16 +172,18 @@ unregistered and the sessions run on the CPU, and a build with no
 provider feature that receives the escape warns that it is ineffective,
 so no experiment mistakes a CPU session for a provider result and no CPU
 session is mislabeled as uncertified. Three ordering and selection rules
-complete the contract: every session pins the automatic device-selection
-policy to CPU before any provider decision (the crate initializes every
-builder with an NPU-preferring policy; registering the CPU provider
-would not reset it and would only disable its memory arena), so a
-runtime with built-in accelerators cannot auto-place these models; under
-the escape TensorRT registers ahead of CUDA so it claims its subgraphs
-first; and CoreML never registers, because every MLComputeUnits
-combination admits the CPU and no strict arm could promise it
-accelerator-only execution, so a build that compiled it is told it stays
-inactive. A future ADR that wants an
+complete the contract: every session that is not on the escaped
+providers registers the environment's exact default CPU execution
+provider (the Microsoft CPU device; explicit registration is the only
+suppression of the automatic device-selection policy the builder arms,
+and that policy would rank any other CPU-type EP ahead of the reference
+CPU EP, which the certification's parity reference names), so a runtime
+with built-in accelerators or additional CPU-type providers cannot
+auto-place or substitute these models; under the escape TensorRT
+registers ahead of CUDA so it claims its subgraphs first; and CoreML
+never registers, because every MLComputeUnits combination admits the CPU
+and no strict arm could promise it accelerator-only execution, so a
+build that compiled it is told it stays inactive. A future ADR that wants an
 execution-provider lane must still solve what the probe measured: the
 silent-fallback default, a missing cuDNN surfacing only at inference
 time after a successful session creation, one teardown-time heap

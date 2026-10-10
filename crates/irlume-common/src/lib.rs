@@ -1549,6 +1549,17 @@ pub fn single_line(text: &str, max_chars: usize) -> String {
     line
 }
 
+/// The reported reason when CPU is the selected recognizer device
+/// (`recognizer_device=cpu`). The vision `npu` feature's `CpuReason` display
+/// and the daemon's placement reporting share this text, so both build
+/// lanes report the same reason.
+pub const RECOGNIZER_CPU_SELECTED_REASON: &str =
+    "CPU is selected for the recognizer (recognizer_device=cpu)";
+/// The reported reason when GPU is the selected recognizer device and no
+/// build admits GPU placement (`recognizer_device=gpu`). Shared as above.
+pub const RECOGNIZER_GPU_NOT_ADMITTED_REASON: &str =
+    "GPU is selected for the recognizer (recognizer_device=gpu); no build admits GPU placement yet";
+
 /// Where the recognizer computes authentication probes (ADR-0022 §13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecognizerPlacement {

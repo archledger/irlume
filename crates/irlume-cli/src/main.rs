@@ -4960,7 +4960,10 @@ fn doctor_run(
                     State::Info,
                     "gpu; no build admits GPU placement yet".to_owned(),
                 ),
-                Some(other) => (State::Info, other.to_owned()),
+                Some(other) => (
+                    State::Unknown,
+                    format!("the daemon reported an unrecognized selection ({other})"),
+                ),
                 None => (
                     State::Unknown,
                     "the daemon did not report a device selection".to_owned(),

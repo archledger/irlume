@@ -376,13 +376,10 @@ impl fmt::Display for CpuReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("NPU use is disabled"),
-            Self::CpuSelected => {
-                f.write_str("CPU is selected for the recognizer (recognizer_device=cpu)")
+            Self::CpuSelected => f.write_str(irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
+            Self::GpuSelectedNotAdmitted => {
+                f.write_str(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON)
             }
-            Self::GpuSelectedNotAdmitted => f.write_str(
-                "GPU is selected for the recognizer (recognizer_device=gpu); no build admits \
-                 GPU placement yet",
-            ),
             Self::LoadingNotAdmitted => {
                 f.write_str("the NPU loading profile has not been admitted; using CPU")
             }

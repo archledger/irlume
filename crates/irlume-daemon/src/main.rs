@@ -472,12 +472,13 @@ mod recognizer_selection {
         Unreadable,
         Duplicate,
     }
-
     /// The `recognizer_device` key of a `settings.conf` file's bytes: absent
     /// when no line names it, the single value when one does, duplicate when
     /// more than one does (an ambiguous selection is refused, like a
     /// duplicated provider), unreadable when the file is not UTF-8. A line
-    /// that names the key without `=` is a malformed value, not absence.
+    /// that attempts this exact key without a well-formed assignment, in the
+    /// bare, colon or space shape, is a malformed value, not absence (the
+    /// `npu_library` rule).
     fn settings_conf_value(bytes: &[u8]) -> Setting<'_> {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return Setting::Unreadable;
@@ -487,19 +488,22 @@ mod recognizer_selection {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // Recognize attempts at this exact key even when the assignment
+            // is malformed. Unrelated keys with the same prefix remain
+            // unrelated.
+            let key_token = line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next();
+            if key_token != Some("recognizer_device") {
+                continue;
+            }
             match line.split_once('=') {
-                Some((key, value)) if key.trim() == "recognizer_device" => {
-                    values.push(value.trim());
+                Some((key, raw)) if key.trim() == "recognizer_device" => {
+                    values.push(raw.trim());
                 }
-                // A line that names the key without `=`, in the bare, colon
-                // or space shape, is a malformed assignment, not absence
-                // (the provider-selection rule for `npu_library`).
-                None if ["recognizer_device", "recognizer_device:"]
-                    .contains(&line.split_whitespace().next().unwrap_or("")) =>
-                {
-                    values.push("");
-                }
-                _ => {}
+                // An attempted assignment that is not well-formed is a
+                // malformed value, not absence.
+                _ => values.push(""),
             }
         }
         match values.as_slice() {
@@ -588,7 +592,9 @@ mod recognizer_selection {
     static CURRENT: std::sync::OnceLock<std::sync::Mutex<Option<Selection>>> =
         std::sync::OnceLock::new();
 
-    fn publish(selection: Selection) {
+    /// Set the governing selection for `Health`; called with the engine it
+    /// governs, by a successful engine build.
+    pub(super) fn publish(selection: Selection) {
         *CURRENT
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
@@ -604,8 +610,10 @@ mod recognizer_selection {
             .map(|selection| selection.as_str().to_owned())
     }
 
-    /// Resolve, journal the malformed-source warning, publish the governing
-    /// selection, and note selections a build cannot honor.
+    /// Resolve and journal the malformed-source warning, and note selections
+    /// a build cannot honor. Publishing the governing selection is the
+    /// successful engine build's job, so a failed post-panic rebuild keeps
+    /// the retained engine and the selection that still governs it.
     pub(super) fn adopt(settings: &super::npu_placement::SettingsSnapshot) -> Plan {
         let plan = Plan::resolve(
             std::env::var_os("IRLUME_RECOGNIZER_DEVICE").as_deref(),
@@ -632,8 +640,20 @@ mod recognizer_selection {
             }
             Selection::Auto | Selection::Cpu => {}
         }
-        publish(plan.selection());
         plan
+    }
+
+    /// In builds without the `npu` feature the engine cannot report
+    /// selection-specific CPU reasons (the context machinery that carries
+    /// them is NPU-only), so the daemon stamps the shared reason text at
+    /// publish time. `auto` and `npu` keep the engine's own reason.
+    #[cfg(not(feature = "npu"))]
+    pub(super) fn selected_cpu_reason(selection: Option<&str>) -> Option<&'static str> {
+        match selection {
+            Some("cpu") => Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
+            Some("gpu") => Some(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON),
+            _ => None,
+        }
     }
 }
 
@@ -917,9 +937,6 @@ fn build_engine_from_config(
     // switch and the provider to the same machine settings (#1053).
     let settings = npu_placement::SettingsSnapshot::read();
     let plan = recognizer_selection::adopt(&settings);
-    // The selection reaches NPU placement only in `npu` builds.
-    #[cfg(not(feature = "npu"))]
-    let _ = (&settings, &plan);
     let engine = load_shipped_recognizer(&config.det, &config.model, recognizer.as_ref())
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
@@ -977,7 +994,11 @@ fn build_engine_from_config(
     // Release them immediately afterward, including when construction fails.
     #[cfg(feature = "npu")]
     drop(recognizer);
-    engine
+    // The governing selection publishes only with the engine it governs: a
+    // failed build (a post-panic rebuild keeps the previous engine) leaves
+    // the previously published selection in place, which is the one still
+    // governing the retained engine (PR #1054 review).
+    engine.inspect(|_| recognizer_selection::publish(plan.selection()))
 }
 
 fn rebuild_engine_from_config(
@@ -5091,10 +5112,27 @@ fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
     copy_engine_camera_selection(&mut bits, engine);
 }
 
+/// In builds without the `npu` feature the engine cannot report
+/// selection-specific CPU reasons (the NPU context machinery that carries
+/// them does not exist there), so an explicit CPU or GPU selection stamps
+/// its shared reason text at publish time. With the `npu` feature the
+/// placement context already carries the exact reason; nothing is stamped.
+#[cfg(not(feature = "npu"))]
+fn stamp_selected_cpu_reason(placement: &mut irlume_common::RecognizerPlacement) {
+    if let Some(reason) = recognizer_selection::selected_cpu_reason(placement.selection.as_deref())
+    {
+        placement.reason = Some(reason.to_owned());
+    }
+}
+
+#[cfg(feature = "npu")]
+fn stamp_selected_cpu_reason(_: &mut irlume_common::RecognizerPlacement) {}
+
 /// Publish where the recognizer runs now, journaling a move off the NPU.
 fn publish_recognizer_placement(engine: &irlume_auth::Engine) {
     let mut placement = engine.recognizer_placement();
     placement.selection = recognizer_selection::current();
+    stamp_selected_cpu_reason(&mut placement);
     let mut bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
     if bits.recognizer.as_ref() == Some(&placement) {
         return;
@@ -5136,6 +5174,7 @@ fn publish_engine_bits(
     // different pair after hotplug and open devices merely to publish status.
     let mut recognizer = engine.recognizer_placement();
     recognizer.selection = recognizer_selection::current();
+    stamp_selected_cpu_reason(&mut recognizer);
     let mut bits = EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
@@ -18833,6 +18872,33 @@ mod tests {
                 .count(),
             1
         );
+        // The governing selection publishes only with the engine it governs,
+        // after every load and (in `npu` builds) the placement attempt.
+        let publish = build
+            .find("recognizer_selection::publish(plan.selection())")
+            .expect("publish the plan's selection");
+        assert!(build
+            .find("load_pad_models(engine")
+            .is_some_and(|at| at < publish));
+        assert!(build
+            .find("npu_placement::place(")
+            .is_some_and(|at| at < publish));
+    }
+
+    #[cfg(not(feature = "npu"))]
+    #[test]
+    fn non_npu_builds_stamp_selection_reasons_at_publish() {
+        assert_eq!(
+            recognizer_selection::selected_cpu_reason(Some("cpu")),
+            Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
+        );
+        assert_eq!(
+            recognizer_selection::selected_cpu_reason(Some("gpu")),
+            Some(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON)
+        );
+        for keep in [Some("auto"), Some("npu"), Some("tpu"), None] {
+            assert_eq!(recognizer_selection::selected_cpu_reason(keep), None);
+        }
     }
 
     #[test]
@@ -18902,7 +18968,9 @@ mod tests {
             "recognizer_device=tensor",
             "recognizer_device",
             "recognizer_device: cpu",
+            "recognizer_device:cpu",
             "recognizer_device cpu",
+            "recognizer_device-x=cpu",
         ] {
             std::fs::write(&settings, raw).unwrap();
             let resolved = plan();
@@ -18931,6 +18999,20 @@ mod tests {
         use recognizer_selection::{Plan, Selection};
         let _g = env_lock();
         let _sb = sandbox("recognizer-device-attempt");
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _restore_switch = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
+        let _restore_device = Restore(
+            "IRLUME_RECOGNIZER_DEVICE",
+            std::env::var_os("IRLUME_RECOGNIZER_DEVICE"),
+        );
         std::env::remove_var("IRLUME_NPU");
         std::env::remove_var("IRLUME_RECOGNIZER_DEVICE");
         let settings = irlume_common::config::config_path("settings.conf");

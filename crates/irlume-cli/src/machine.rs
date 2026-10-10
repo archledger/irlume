@@ -547,8 +547,14 @@ fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> ser
             if let Some(qualified) = placement.qualified {
                 value["qualified"] = json!(qualified);
             }
-            if let Some(selection) = placement.selection {
-                value["selection"] = json!(selection);
+            // Only the contract's own values reach the machine API: a newer
+            // daemon may report a selection this schema does not know, and a
+            // released CLI must not copy it into `status --json`.
+            if matches!(
+                placement.selection.as_deref(),
+                Some("auto" | "cpu" | "npu" | "gpu")
+            ) {
+                value["selection"] = json!(placement.selection);
             }
             value
         }
@@ -588,6 +594,21 @@ mod provider_runtime_reporting_tests {
         }));
         assert!(value.get("runtime_available").is_none());
         assert!(value.get("qualified").is_none());
+        assert!(value.get("selection").is_none());
+    }
+
+    #[test]
+    fn an_unknown_selection_word_stays_out_of_the_machine_api() {
+        // A newer daemon may report a value this contract does not know; the
+        // released CLI must not copy it into `status --json`.
+        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+            device: "cpu".into(),
+            reason: None,
+            platform: None,
+            runtime_available: None,
+            qualified: None,
+            selection: Some("tpu".into()),
+        }));
         assert!(value.get("selection").is_none());
     }
 }

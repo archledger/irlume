@@ -19,11 +19,15 @@ tflite = ["dep:edgefirst-tflite"]
 # Hardware-acceleration execution providers, selected at compile time (cf. howrs).
 # Default build = CPU. The heavy math runs inside ONNX Runtime, already SIMD +
 # multi-threaded; compiling one of these features only makes a provider
-# AVAILABLE: it is registered (strictly, CPU fallback disabled, loudly warned)
-# only behind the exact escape IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1, because the
-# providers run outside the per-model certification regime (ADR-0033 §7).
-# Without the escape the provider stays unregistered and every session warns
-# that it runs on the CPU. Our own glue loops vectorize via target-cpu
+# AVAILABLE: it is registered (strictly, CPU fallback disabled, loudly warned,
+# TensorRT ahead of CUDA, OpenVINO pinned to the GPU device) only behind the
+# exact escape IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1, because the providers run
+# outside the per-model certification regime (ADR-0033 §7). Without the escape
+# the provider stays unregistered, the CPU provider is registered explicitly
+# (overriding the crate's automatic NPU-preferring device selection) and every
+# session warns that it runs on the CPU. CoreML is never registered: every
+# MLComputeUnits combination admits the CPU, so no strict arm could promise it
+# accelerator-only execution. Our own glue loops vectorize via target-cpu
 # (see .cargo/config.toml).
 cuda = ["ort/cuda"]
 openvino = ["ort/openvino"]

@@ -16,10 +16,14 @@ All notable changes to irlume are documented here. This project adheres to
   escape `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (an unconditional warning,
   not the opt-in debug log) and strictly there: a provider that cannot
   load is an error, and CPU fallback for operations the providers cannot
-  cover is disabled, so no session runs on the CPU unannounced; a
-  compiled provider without the escape, and the escape in a build without
-  a provider feature, both warn their actual outcome (ADR-0033 section
-  7).
+  cover is disabled, so no session runs on the CPU unannounced; TensorRT
+  registers ahead of CUDA under the escape and the OpenVINO provider is
+  pinned to the GPU device; CoreML is never registered (every
+  MLComputeUnits combination admits the CPU); and every session outside
+  the escape registers the CPU execution provider explicitly, overriding
+  the crate's automatic NPU-preferring device selection. A compiled
+  provider without the escape, and the escape in a build without a
+  provider feature, both warn their actual outcome (ADR-0033 section 7).
 
 - Ordinary-only requests with a saved split selection and no explicit ordinary
   override report the ordinary camera path's limitation. Dual-sensor

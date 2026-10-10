@@ -543,17 +543,19 @@ mod onnx {
 
     /// The exact test escape that opts an execution-provider experiment in
     /// (ADR-0033 section 7): `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1`, nothing
-    /// else. Like the virtual-camera escape it is deliberate and visible in
-    /// the log, and without it the providers stay unregistered however the
-    /// crate was compiled.
+    /// else. Like the virtual-camera escape it is deliberate and impossible
+    /// to miss in the log: the warning is unconditional, not behind the
+    /// `IRLUME_LOG` debug setting, because this build runs outside the
+    /// per-model certification regime.
     fn ep_escape_enabled() -> bool {
         let enabled =
             std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1");
         if enabled {
-            irlume_common::dlog!(
-                "onnx: execution providers are registered only through the \
-                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; this build is outside \
-                 the per-model certification regime (ADR-0033 section 7)"
+            irlume_common::jout_warn!(
+                "irlume: execution providers are registered only through the \
+                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; this session runs \
+                 outside the per-model certification regime (ADR-0033 \
+                 section 7)"
             );
         }
         enabled
@@ -571,6 +573,10 @@ mod onnx {
         // exact test escape opts an experiment in, and registration is then
         // strict: a provider that cannot load is an error, not CPU placement.
         if ep_escape_enabled() {
+            // Strict means strict: a provider that cannot load is an error,
+            // and a graph the registered providers cannot fully cover
+            // refuses instead of quietly running parts on the CPU EP.
+            b = b.with_disable_cpu_fallback().map_err(err)?;
             #[cfg(feature = "cuda")]
             {
                 b = b
@@ -1030,9 +1036,10 @@ mod onnx {
 
         /// ADR-0033 section 7: whatever execution-provider features this
         /// build was compiled with, the session constructor may register a
-        /// provider only behind the exact test escape and only strictly (a
-        /// provider that cannot load is an error, never silent CPU
-        /// execution).
+        /// provider only behind the exact test escape, loudly (an
+        /// unconditional warning, not the opt-in debug log) and strictly:
+        /// a provider that cannot load is an error, and CPU fallback for
+        /// unsupported ops is disabled, so no unannounced CPU execution.
         #[test]
         fn execution_providers_stay_escape_gated_and_strict() {
             let source = include_str!("lib.rs");
@@ -1044,6 +1051,13 @@ mod onnx {
             let escape = build
                 .find("if ep_escape_enabled() {")
                 .expect("the escape guard wraps every registration");
+            let disable = build
+                .find("with_disable_cpu_fallback()")
+                .expect("CPU fallback is disabled under the escape");
+            assert!(
+                escape < disable,
+                "the no-CPU-fallback switch sits inside the escape"
+            );
             for provider in [
                 "ort::ep::CUDA",
                 "ort::ep::OpenVINO",
@@ -1062,6 +1076,15 @@ mod onnx {
                     );
                 }
             }
+            let escape_fn = source
+                .split("fn ep_escape_enabled() -> bool {")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }").next())
+                .expect("the escape reader");
+            assert!(
+                escape_fn.contains("jout_warn!") && !escape_fn.contains("dlog!"),
+                "the escape warns unconditionally, not behind IRLUME_LOG"
+            );
         }
 
         #[test]

@@ -13,9 +13,11 @@ All notable changes to irlume are documented here. This project adheres to
   authentication-adjacent computation outside the per-model certification
   regime and defaulted to silent CPU execution when the provider library
   could not load. The providers now register only behind the exact
-  escape `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (logged) and strictly
-  there: a provider that cannot load is an error, never unannounced CPU
-  execution (ADR-0033 section 7).
+  escape `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (an unconditional warning,
+  not the opt-in debug log) and strictly there: a provider that cannot
+  load is an error, and CPU fallback for operations the providers cannot
+  cover is disabled, so no session runs on the CPU unannounced
+  (ADR-0033 section 7).
 
 - Ordinary-only requests with a saved split selection and no explicit ordinary
   override report the ordinary camera path's limitation. Dual-sensor

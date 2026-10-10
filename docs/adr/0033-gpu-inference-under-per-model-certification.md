@@ -150,9 +150,12 @@ sessions serve the recognizer, the detector and the PAD cues, so
 registration placed authentication-adjacent computation outside
 `CERTIFIED`, with the silent-CPU default on failure, both measured in
 the archhost probe). Registration exists only behind the exact escape
-`IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (logged, in the spirit of the
-virtual-camera escape) and is strict there: a provider that cannot load
-is an error, never unannounced CPU execution. A future ADR that wants an
+`IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1`, announced by an unconditional
+warning (not the opt-in debug log, in the spirit of the virtual-camera
+escape's visibility), and is strict there: a provider that cannot load
+is an error, and CPU fallback for operations the registered providers
+cannot cover is disabled, so a graph the providers cannot fully execute
+refuses instead of running partly on the CPU unannounced. A future ADR that wants an
 execution-provider lane must still solve what the probe measured: the
 silent-fallback default, a missing cuDNN surfacing only at inference
 time after a successful session creation, one teardown-time heap

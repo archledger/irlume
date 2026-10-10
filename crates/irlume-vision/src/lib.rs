@@ -566,7 +566,12 @@ mod onnx {
             return b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err);
         };
         let default_cpu = env.devices().find(|device| {
-            device.ep_vendor().is_ok_and(|vendor| vendor == "Microsoft")
+            // The exact reference CPU EP: name, vendor and hardware type all
+            // checked, so another CPU-type device (even a Microsoft-vendor
+            // one) can never substitute for the CPU session the
+            // certification names.
+            device.ep().is_ok_and(|ep| ep == "CPUExecutionProvider")
+                && device.ep_vendor().is_ok_and(|vendor| vendor == "Microsoft")
                 && matches!(device.hardware_device().ty(), ort::memory::DeviceType::CPU)
         });
         match default_cpu {
@@ -1229,8 +1234,9 @@ mod onnx {
                 .expect("the exact-CPU helper");
             assert!(
                 helper.contains("with_devices([device], None)")
+                    && helper.contains(r#""CPUExecutionProvider""#)
                     && helper.contains(r#""Microsoft""#),
-                "the helper registers the environment's Microsoft CPU device"
+                "the helper matches the EP name, vendor and type before registering"
             );
             assert!(
                 helper.contains("AutoDevicePolicy::PreferCPU"),

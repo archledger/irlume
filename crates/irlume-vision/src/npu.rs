@@ -1229,13 +1229,52 @@ impl Platform {
         Self::open_library(sources, library.clone(), library)
     }
 
+    /// The admitted test-only entry for the hardware measurement harness
+    /// (`npu_hardware` in `onnx/npu_tests.rs`): [`Self::open_with`] without
+    /// the closed loading admission, so the ignored `npu_hw_*` measurements
+    /// can collect the evidence a certification starts from. Production
+    /// paths never call this; a `#[cfg(test)]` constructor is not a setting
+    /// that turns [`runtime::admit_loading`]'s refusal into an opt-in bypass.
+    #[cfg(test)]
+    fn open_with_admitted(sources: &Sources<'_>) -> Result<Self, CpuReason> {
+        let library = resolve_library(sources.library_dirs)?;
+        Self::open_library_admitted(sources, library.clone(), library)
+    }
+
+    /// [`Self::open_with_admitted`] on the production [`Sources`], so root
+    /// reads the real firmware build from the kernel's debugfs; a normal
+    /// user falls back to [`Self::open_with_debugfs`]'s "unverified" label.
+    /// Test-only, like [`Self::open_with_admitted`].
+    #[cfg(test)]
+    pub(crate) fn open_admitted() -> Result<Self, CpuReason> {
+        Self::open_with_admitted(&Sources {
+            library_dirs: OPENVINO_LIBRARY_DIRS,
+            accel_class: Path::new("/sys/class/accel"),
+            debugfs_accel: Path::new("/sys/kernel/debug/accel"),
+            maps: Path::new("/proc/self/maps"),
+            force_compiler: true,
+        })
+    }
+
     fn open_library(
         sources: &Sources<'_>,
         library: PathBuf,
         selected: PathBuf,
     ) -> Result<Self, CpuReason> {
-        use openvino::{DeviceType, PropertyKey, RwPropertyKey};
         runtime::admit_loading()?;
+        Self::open_library_admitted(sources, library, selected)
+    }
+
+    /// Everything [`Self::open_library`] does after the loading admission.
+    /// Reached without the admission only through the admitted test-only
+    /// constructors ([`Self::open_with_admitted`]); production callers
+    /// always pass [`Self::open_library`], which admits first.
+    fn open_library_admitted(
+        sources: &Sources<'_>,
+        library: PathBuf,
+        selected: PathBuf,
+    ) -> Result<Self, CpuReason> {
+        use openvino::{DeviceType, PropertyKey, RwPropertyKey};
         probe_library(&library)?;
         let (pci_id, bus_address) = accelerator(sources.accel_class)?;
         let firmware = firmware_build(sources.debugfs_accel, &bus_address)?;
@@ -1324,16 +1363,18 @@ impl Platform {
         )
     }
 
-    /// [`Self::open`] with the firmware build read from `debugfs_accel`
-    /// instead of the kernel's debugfs, for the hardware tests a normal user
-    /// runs, and with `force_compiler` false to leave OpenVINO's default
-    /// compiler type for an experiment that measures it.
+    /// [`Self::open_admitted`] with the firmware build read from
+    /// `debugfs_accel` instead of the kernel's debugfs, for the hardware
+    /// tests a normal user runs, and with `force_compiler` false to leave
+    /// OpenVINO's default compiler type for an experiment that measures it.
+    /// Admitted test-only entry: like [`Self::open_admitted`], this reaches
+    /// the loading body without the closed production admission.
     #[cfg(test)]
     pub(crate) fn open_with_debugfs(
         debugfs_accel: &Path,
         force_compiler: bool,
     ) -> Result<Self, CpuReason> {
-        Self::open_with(&Sources {
+        Self::open_with_admitted(&Sources {
             library_dirs: OPENVINO_LIBRARY_DIRS,
             accel_class: Path::new("/sys/class/accel"),
             debugfs_accel,
@@ -3093,6 +3134,34 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("loading profile has not been admitted"));
+    }
+
+    #[test]
+    fn the_hardware_measurements_entry_is_admitted_in_tests_only() {
+        let directory = tempfile::tempdir().unwrap();
+        // The same garbage soname the refusal test uses: the test resolver
+        // accepts it and the library probe then fails cleanly at the
+        // dynamic loader, as an_absent_runtime_is_a_cpu_answer_not_a_panic
+        // pins, so nothing native runs.
+        fs::write(directory.path().join(OPENVINO_C_SONAME), b"not executable").unwrap();
+        let paths = [directory.path().to_str().unwrap()];
+        let Err(reason) = Platform::open_with_admitted(&Sources {
+            library_dirs: &paths,
+            accel_class: directory.path(),
+            debugfs_accel: directory.path(),
+            maps: directory.path(),
+            force_compiler: true,
+        }) else {
+            panic!("a garbage soname cannot open a platform");
+        };
+        assert!(
+            !matches!(reason, CpuReason::LoadingNotAdmitted),
+            "the hardware measurements entry skips the closed admission: {reason:?}"
+        );
+        assert!(
+            matches!(reason, CpuReason::RuntimeAbsent(_)),
+            "the garbage soname fails at the library probe: {reason:?}"
+        );
     }
 
     #[test]

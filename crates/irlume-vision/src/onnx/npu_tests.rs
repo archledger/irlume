@@ -452,7 +452,10 @@ mod npu_reference_tests {
 /// The models on a real NPU, through the same struct paths production
 /// uses, against their ONNX Runtime CPU sessions. Placement bypasses
 /// [`crate::npu::CERTIFIED`] on purpose: this is the evidence a
-/// certification starts from, not a certification. Run on a Lunar Lake
+/// certification starts from, not a certification. Platform construction
+/// likewise uses the admitted test-only entry (`Platform::open_admitted`
+/// / `open_with_debugfs`); production opens stay refused by the closed
+/// loading admission. Run on a Lunar Lake
 /// host with the 2026.2.0 stack and core dumps off:
 /// `ulimit -c 0; cargo test -p irlume-vision --features npu --release --lib -- --ignored npu_hw_ --test-threads 1 --nocapture`
 /// (`IRLUME_NPU_TEST_MODELS` overrides `/usr/share/irlume/models`;
@@ -486,7 +489,7 @@ mod npu_hardware {
     }
 
     fn platform(scratch: &std::path::Path) -> Platform {
-        let mut platform = Platform::open().unwrap_or_else(|_| {
+        let mut platform = Platform::open_admitted().unwrap_or_else(|_| {
             Platform::open_with_debugfs(&fake_debugfs(scratch), true).expect("NPU platform")
         });
         // An experiment outside the certified configuration, e.g. "f32".

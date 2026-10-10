@@ -588,6 +588,10 @@ mod npu_hardware {
         let identity = platform.identity().clone();
         eprintln!("platform opened in {:?}", started.elapsed());
         eprintln!("identity {identity:?}\ndigest {}", identity.digest());
+        eprintln!(
+            "execution digest {} (portable identity_digest)",
+            platform.execution_digest().expect("execution manifest")
+        );
         let cache_dir = scratch.path().join("cache");
         let cache = Cache::prepare(&cache_dir, &identity, &boot_id().unwrap()).unwrap();
         let rss_platform = rss_mib();

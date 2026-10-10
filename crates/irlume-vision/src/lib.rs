@@ -565,6 +565,12 @@ mod onnx {
         ensure_ort_resolvable()?;
         #[allow(unused_mut)]
         let mut b = Session::builder().map_err(err)?;
+        // Never inherit execution providers a custom host registered on the
+        // process `ort::Environment`: they would place this build's sessions
+        // outside the per-model certification regime without any escape or
+        // warning (ADR-0033 section 7). Sessions here run on the CPU, or on
+        // the escaped providers below.
+        b = b.with_no_environment_execution_providers().map_err(err)?;
         // Register a hardware execution provider if compiled in (cf. howrs),
         // but never inside an authentication build by default: these
         // providers place ops outside the per-model certification regime and
@@ -572,6 +578,12 @@ mod onnx {
         // provider library cannot load (measured; ADR-0033 section 7). The
         // exact test escape opts an experiment in, and registration is then
         // strict: a provider that cannot load is an error, not CPU placement.
+        #[cfg(any(
+            feature = "cuda",
+            feature = "openvino",
+            feature = "tensorrt",
+            feature = "coreml"
+        ))]
         if ep_escape_enabled() {
             // Strict means strict: a provider that cannot load is an error,
             // and a graph the registered providers cannot fully cover
@@ -607,6 +619,23 @@ mod onnx {
                         .error_on_failure()])
                     .map_err(err)?;
             }
+        }
+        // A build without any execution-provider feature keeps its normal
+        // CPU sessions: disabling CPU fallback there would refuse every
+        // model commit, so the escape is reported as ineffective instead of
+        // honored into a face-unavailable daemon.
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "openvino",
+            feature = "tensorrt",
+            feature = "coreml"
+        )))]
+        if ep_escape_enabled() {
+            irlume_common::jout_warn!(
+                "irlume: IRLUME_TEST_ALLOW_UNCERTIFIED_EP is set, but this \
+                 build compiles no execution provider; the sessions stay on \
+                 their CPU sessions (ADR-0033 section 7)"
+            );
         }
         // Each resident model has its own pool. Let idle workers block while
         // another model runs, retaining two threads for each active inference.
@@ -1048,15 +1077,35 @@ mod onnx {
                 .nth(1)
                 .and_then(|rest| rest.split("\n    fn ").next())
                 .expect("session build");
+            // Environment providers are closed off before any escape logic.
+            let no_env = build
+                .find("with_no_environment_execution_providers()")
+                .expect("environment providers are never inherited");
+            // The first escape arm is the provider-registering one (the
+            // cfg(any(...)) arm); the not-any arm only warns.
             let escape = build
                 .find("if ep_escape_enabled() {")
                 .expect("the escape guard wraps every registration");
+            assert!(
+                no_env < escape,
+                "the environment-provider cutoff precedes the escape"
+            );
             let disable = build
                 .find("with_disable_cpu_fallback()")
                 .expect("CPU fallback is disabled under the escape");
             assert!(
                 escape < disable,
                 "the no-CPU-fallback switch sits inside the escape"
+            );
+            // The provider arm is compiled only when a provider feature is;
+            // without one, the escape warns instead of disabling CPU fallback.
+            let any_arm = build
+                .find("cfg(any(")
+                .expect("the provider arm is feature-gated");
+            assert!(any_arm < escape, "the provider arm is the gated first arm");
+            assert!(
+                build.contains("cfg(not(any("),
+                "a provider-less build reports the ineffective escape"
             );
             for provider in [
                 "ort::ep::CUDA",

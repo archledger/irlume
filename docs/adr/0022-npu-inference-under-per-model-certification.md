@@ -448,6 +448,10 @@ entry under this ADR; one needs an amendment that defines a LiteRT reference
 GPU devices stay out of scope. Revisit only with evidence that CPU-only users
 face unacceptable latency.
 
+Amended 2026-10-10 by ADR-0033: the #1053 measurements are that evidence, and
+ADR-0033 admits the GPU under this ADR's regime, with the execution-provider
+(CUDA, TensorRT) lane still out of scope.
+
 ## Consequences
 
 - A build without `npu`, or with it and an empty table, makes the decisions it

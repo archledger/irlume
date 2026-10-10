@@ -23,11 +23,11 @@ tflite = ["dep:edgefirst-tflite"]
 # TensorRT ahead of CUDA, OpenVINO pinned to the GPU device) only behind the
 # exact escape IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1, because the providers run
 # outside the per-model certification regime (ADR-0033 §7). Without the escape
-# the provider stays unregistered, the CPU provider is registered explicitly
-# (overriding the crate's automatic NPU-preferring device selection) and every
-# session warns that it runs on the CPU. CoreML is never registered: every
-# MLComputeUnits combination admits the CPU, so no strict arm could promise it
-# accelerator-only execution. Our own glue loops vectorize via target-cpu
+# the provider stays unregistered, the automatic device-selection policy is
+# pinned to CPU (the crate's default prefers an NPU) and every session warns
+# that it runs on the CPU. CoreML is never registered (every MLComputeUnits
+# combination admits the CPU) and a build that compiled it is told it stays
+# inactive. Our own glue loops vectorize via target-cpu
 # (see .cargo/config.toml).
 cuda = ["ort/cuda"]
 openvino = ["ort/openvino"]

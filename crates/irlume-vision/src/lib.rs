@@ -247,7 +247,10 @@ pub type Embedding = [f32; EMBED_DIM];
 mod onnx {
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
-    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::session::{
+        builder::{AutoDevicePolicy, GraphOptimizationLevel},
+        Session,
+    };
     use ort::value::Tensor;
 
     /// Intra-op threads per ONNX session. Keep two threads for model latency;
@@ -559,17 +562,27 @@ mod onnx {
         // warning (ADR-0033 section 7). Sessions here run on the CPU, or on
         // the escaped providers below.
         b = b.with_no_environment_execution_providers().map_err(err)?;
+        // The crate initializes every builder with an automatic
+        // NPU-preferring device-selection policy; pin the policy to CPU
+        // selection, so a runtime with built-in accelerators cannot
+        // auto-place these models. Registering the CPU provider would not
+        // do this (it only toggles the CPU memory arena, which must stay
+        // at its default), and the explicit providers of the escaped arm
+        // below override the policy where they register.
+        b = b
+            .with_auto_device(AutoDevicePolicy::PreferCPU)
+            .map_err(err)?;
         // Register a hardware execution provider if compiled in (cf. howrs),
         // but never inside an authentication build by default: these
         // providers place ops outside the per-model certification regime and
         // the `ort` crate's default is to fall back to CPU silently when the
         // provider library cannot load (measured; ADR-0033 section 7).
         //
-        // Every arm names its executor: without the exact test escape the
-        // sessions register the CPU execution provider explicitly, which
-        // also overrides the crate's automatic device-selection policy
-        // (`MaxEfficiency`, NPU-preferring) so a runtime with built-in
-        // accelerators cannot auto-place these models; with the escape the
+        // Every arm names its executor: the automatic device-selection
+        // policy is pinned to CPU before any arm (the crate initializes
+        // every builder with an NPU-preferring `MaxEfficiency` policy), and
+        // a runtime with built-in accelerators cannot auto-place these
+        // models; with the escape the
         // registered providers are strict (a provider that cannot load is an
         // error, CPU fallback for uncovered ops is disabled, TensorRT
         // registers ahead of CUDA so it claims its subgraphs first, and the
@@ -634,9 +647,6 @@ mod onnx {
                      it outside the per-model certification regime \
                      (ADR-0033 section 7)"
                 );
-                b = b
-                    .with_execution_providers([ort::ep::CPU::default().build()])
-                    .map_err(err)?;
             }
         }
         #[cfg(not(any(feature = "cuda", feature = "openvino", feature = "tensorrt")))]
@@ -647,10 +657,19 @@ mod onnx {
                      this build compiles no execution provider; the sessions \
                      stay on their CPU sessions (ADR-0033 section 7)"
                 );
+            } else {
+                // CoreML is a compiled-but-inert provider here: it is never
+                // registered (its compute units always admit the CPU), and
+                // a build that compiled it must hear that like any other
+                // inactive provider.
+                #[cfg(feature = "coreml")]
+                irlume_common::jout_warn!(
+                    "irlume: the coreml execution provider is compiled into \
+                     this build but is never registered, because its compute \
+                     units always admit the CPU; these sessions run on the \
+                     CPU (ADR-0033 section 7)"
+                );
             }
-            b = b
-                .with_execution_providers([ort::ep::CPU::default().build()])
-                .map_err(err)?;
         }
         // Each resident model has its own pool. Let idle workers block while
         // another model runs, retaining two threads for each active inference.
@@ -1149,12 +1168,24 @@ mod onnx {
                 !build.contains("ort::ep::CoreML"),
                 "CoreML is never registered in any arm"
             );
-            // Outside the escape the CPU execution provider is registered
-            // explicitly, overriding the crate's automatic (NPU-preferring)
-            // device-selection policy.
+            // The automatic device-selection policy is pinned to CPU
+            // before any arm: registering the CPU provider would not reset
+            // it and would only toggle the memory arena away from its
+            // default.
+            let policy = build
+                .find("with_auto_device(AutoDevicePolicy::PreferCPU)")
+                .expect("the selection policy is pinned to CPU");
             assert!(
-                build.matches("ort::ep::CPU::default()").count() >= 2,
-                "both escape-inactive arms pin the CPU provider explicitly"
+                no_env < policy && policy < escape,
+                "the policy pin sits between the environment cutoff and the escape"
+            );
+            assert!(
+                !build.contains("ort::ep::CPU::default()"),
+                "no arm registers the CPU provider; the arena keeps its default"
+            );
+            assert!(
+                build.contains("is never registered"),
+                "an inert coreml build announces its inactive provider"
             );
             // The OpenVINO provider is pinned to an accelerator: its omitted
             // device_type defaults to CPU, which the disabled CPU fallback

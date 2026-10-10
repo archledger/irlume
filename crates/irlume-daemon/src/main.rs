@@ -335,9 +335,12 @@ mod npu_placement {
     /// file. This startup read cannot be supplied by a socket/status peer.
     #[cfg(feature = "npu")]
     pub(super) fn runtime_selection() -> irlume_auth::npu::RuntimeSelection {
-        let file = std::fs::read(irlume_common::config::config_path("settings.conf"));
+        let path = irlume_common::config::config_path("settings.conf");
+        let file = std::fs::read(&path);
         let setting = match &file {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && no_dangling_link_on(&path) =>
+            {
                 irlume_auth::npu::LibrarySetting::Absent
             }
             Err(_) => irlume_auth::npu::LibrarySetting::Unreadable,
@@ -347,6 +350,19 @@ mod npu_placement {
             std::env::var_os("IRLUME_NPU_LIBRARY").as_deref(),
             setting,
         )
+    }
+
+    /// After a NotFound read, only genuine absence permits automatic selection.
+    /// Check every ancestor too: a missing target or unresolved metadata is
+    /// unreadable policy, even when the leaf's name cannot be inspected.
+    #[cfg(feature = "npu")]
+    fn no_dangling_link_on(path: &std::path::Path) -> bool {
+        path.ancestors()
+            .filter(|part| !part.as_os_str().is_empty())
+            .all(|part| match std::fs::symlink_metadata(part) {
+                Ok(_) => std::fs::metadata(part).is_ok(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            })
     }
 }
 
@@ -18472,6 +18488,11 @@ mod tests {
         let _restore = Restore(std::env::var_os("IRLUME_NPU_LIBRARY"));
         std::env::remove_var("IRLUME_NPU_LIBRARY");
         let settings = irlume_common::config::config_path("settings.conf");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "a genuinely absent settings file permits automatic selection"
+        );
         std::fs::write(
             &settings,
             "npu=on\nnpu_library=/opt/source/libopenvino_c.so.2621\n",
@@ -18517,6 +18538,68 @@ mod tests {
             npu_placement::runtime_selection(),
             irlume_auth::npu::RuntimeSelection::Rejected(_)
         ));
+        std::fs::remove_dir(&settings).unwrap();
+
+        // A configured name whose target is missing is unreadable policy,
+        // not permission to select a different provider automatically.
+        let config_dir = settings.parent().unwrap();
+        std::os::unix::fs::symlink(config_dir.join("missing-settings"), &settings).unwrap();
+        let dangling_file = npu_placement::runtime_selection();
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            ),
+            "the administrator override still wins over a dangling settings file"
+        );
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        std::fs::remove_file(&settings).unwrap();
+
+        let missing_directory = config_dir.join("missing-directory");
+        let linked_directory = config_dir.join("linked-directory");
+        std::os::unix::fs::symlink(&missing_directory, &linked_directory).unwrap();
+        // Put the link above an additional missing directory, so checking
+        // only settings.conf or its immediate parent cannot pass this case.
+        std::env::set_var("IRLUME_CONFIG_DIR", linked_directory.join("nested"));
+        let dangling_directory = npu_placement::runtime_selection();
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            ),
+            "the administrator override still wins over a dangling directory component"
+        );
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        std::env::set_var("IRLUME_CONFIG_DIR", missing_directory.join("nested"));
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "genuinely absent directory components permit automatic selection"
+        );
+        std::fs::create_dir(&missing_directory).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", linked_directory.join("nested"));
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "a resolved directory link with absent settings permits automatic selection"
+        );
+        std::env::set_var("IRLUME_CONFIG_DIR", config_dir);
+
+        // Observe both broken paths before asserting, so a failing run reports
+        // both regressions rather than stopping before the ancestor case.
+        assert!(
+            matches!(
+                dangling_file,
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ) && matches!(
+                dangling_directory,
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ),
+            "dangling settings must refuse automatic selection: file={dangling_file:?}, \
+             directory component={dangling_directory:?}"
+        );
     }
 
     /// Isolated state/config/keyring/template-key/recovery dirs plus a method

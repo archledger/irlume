@@ -129,3 +129,33 @@ This corrects the paired startup policy's propagation of a pending return that
 adaptive single-stream warm-up already handles. It does not establish why a device
 reported ERROR, qualify concurrent split capture or enable split authentication
 (#995; ADR-0032).
+
+## Amendment 2026-10-09: held-side faults invalidate their rate evidence explicitly
+
+The held-pair failover change (#1033) ends in-place stream recovery on the
+held concurrent pair path. The recovery epoch was the only invalidation that
+path performed: it revoked the faulted role's amortization entry as a side
+effect of renegotiating the broken stream. The failover now revokes that
+entry explicitly instead. Every capture fault the capture call itself
+returns (the `denoised`/`capture_with_stats` callbacks), other than
+Preempted or DeadlineExpired, calls `invalidate_rate_evidence` on the
+faulted role's session before the pair fails over (both on the
+`assess_full_with_finish` held pair and on the managed collector's pair),
+revoking exactly the cache entry the recovery epoch revoked, keyed by that
+session's own amortization key. The below-floor refusal case named in #1033
+is covered by that explicit call when it surfaces from the capture call. A
+fault the pair folds in after the callback returned successfully (a
+drain-phase continuity, rate or privacy failure) does not reach the explicit
+call; that gap existed before #1033 as well (those paths never recovered
+either) and the fallback's probe re-measures this session, so it stays
+recorded here rather than closed by this change. Both
+held sessions are then discarded; the mandatory sequential fallback's fresh
+one-shot session for the faulted role re-pays the full 30-delta fill, while
+the healthy role's cached entry stays valid and its fallback session may
+still admit on the probe, as before.
+
+One-shot capture paths are unchanged. Their pre-existing invalidation gaps
+remain out of scope here: a fill-time hard fault returned from
+`next_discarded` and a fill-time `observe_success` failure (also
+`next_discarded`) do not invalidate the amortization entry. Neither was
+introduced by this change.

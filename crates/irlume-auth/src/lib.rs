@@ -2747,7 +2747,6 @@ enum RuntimeDegradation {
     ConcurrentCaptureFailure,
     PairArmFailure,
     PairRateEstablishmentFailure,
-    StreamRecovery,
     MissingRuntimeContract,
     CameraGenerationChanged,
     StreamContractMismatch,
@@ -2792,7 +2791,6 @@ impl RuntimeDegradation {
             Self::ConcurrentCaptureFailure => "concurrent_capture_failure",
             Self::PairArmFailure => "pair_arm_failure",
             Self::PairRateEstablishmentFailure => "pair_rate_establishment_failure",
-            Self::StreamRecovery => "stream_recovery",
             Self::MissingRuntimeContract => "missing_runtime_contract",
             Self::CameraGenerationChanged => "camera_generation_changed",
             Self::StreamContractMismatch => "stream_contract_mismatch",
@@ -2897,10 +2895,9 @@ fn concurrent_pair_requires_fallback(
     sequential: bool,
     rgb_failed: bool,
     ir_failed: bool,
-    recovered_side: bool,
     invalid_runtime_contract: bool,
 ) -> bool {
-    !sequential && (rgb_failed || ir_failed || recovered_side || invalid_runtime_contract)
+    !sequential && (rgb_failed || ir_failed || invalid_runtime_contract)
 }
 
 fn capture_pair_sequentially<R, I>(
@@ -2987,25 +2984,46 @@ fn runtime_violation_degradation(
 fn concurrent_pair_degradation(
     violation: Option<irlume_camera::RuntimePairViolation>,
     missing_runtime_contract: bool,
-    recovered_side: bool,
 ) -> RuntimeDegradation {
-    // A recovered frame keeps its recovery marker, so a recovered side's
-    // continuity violation reports as stream recovery.
-    if recovered_side && violation == Some(irlume_camera::RuntimePairViolation::Continuity) {
-        return RuntimeDegradation::StreamRecovery;
-    }
     violation.map_or_else(
         || {
             if missing_runtime_contract {
                 RuntimeDegradation::MissingRuntimeContract
-            } else if recovered_side {
-                RuntimeDegradation::StreamRecovery
             } else {
                 RuntimeDegradation::ConcurrentCaptureFailure
             }
         },
         runtime_violation_degradation,
     )
+}
+
+/// The error a failed held pair returns to its owner: the winning side's
+/// ORIGINAL error (message, typed payload and class preserved, ADR-0030 §5),
+/// matching the managed collector's transport. When both sides failed the
+/// most specific class wins: `PrivacyShutter` > `CameraBusy` >
+/// `CameraUnavailable` > everything else. On equal rank the RGB side wins.
+fn held_pair_side_error(
+    rgb_error: Option<irlume_common::Error>,
+    ir_error: Option<irlume_common::Error>,
+) -> Option<irlume_common::Error> {
+    fn class_rank(error: &irlume_common::Error) -> u8 {
+        match error {
+            irlume_common::Error::PrivacyShutter(_) => 3,
+            irlume_common::Error::CameraBusy(_) => 2,
+            irlume_common::Error::CameraUnavailable(_) => 1,
+            _ => 0,
+        }
+    }
+    match (rgb_error, ir_error) {
+        (Some(rgb), Some(ir)) => {
+            if class_rank(&ir) > class_rank(&rgb) {
+                Some(ir)
+            } else {
+                Some(rgb)
+            }
+        }
+        (rgb_error, ir_error) => rgb_error.or(ir_error),
+    }
 }
 
 fn diagnostic_runtime_violation(
@@ -3016,7 +3034,6 @@ fn diagnostic_runtime_violation(
         RuntimeDegradation::ConcurrentCaptureFailure => Label::ConcurrentCaptureFailure,
         RuntimeDegradation::PairArmFailure => Label::PairArmFailure,
         RuntimeDegradation::PairRateEstablishmentFailure => Label::PairRateEstablishmentFailure,
-        RuntimeDegradation::StreamRecovery => Label::StreamRecovery,
         RuntimeDegradation::MissingRuntimeContract => Label::MissingRuntimeContract,
         RuntimeDegradation::CameraGenerationChanged => Label::CameraGenerationChanged,
         RuntimeDegradation::StreamContractMismatch => Label::StreamContractMismatch,
@@ -3756,79 +3773,165 @@ mod capture_mode_switch_tests {
 
     #[test]
     fn only_a_one_shot_concurrent_hard_failure_trips_runtime_health() {
-        assert!(concurrent_pair_requires_fallback(
-            false, true, false, false, false
-        ));
-        assert!(concurrent_pair_requires_fallback(
-            false, false, true, false, false
-        ));
-        assert!(concurrent_pair_requires_fallback(
-            false, false, false, true, false
-        ));
-        assert!(concurrent_pair_requires_fallback(
-            false, false, false, false, true
-        ));
+        assert!(concurrent_pair_requires_fallback(false, true, false, false));
+        assert!(concurrent_pair_requires_fallback(false, false, true, false));
+        assert!(concurrent_pair_requires_fallback(false, false, false, true));
+        assert!(!concurrent_pair_requires_fallback(true, true, true, true));
         assert!(!concurrent_pair_requires_fallback(
-            true, true, true, true, true
-        ));
-        assert!(!concurrent_pair_requires_fallback(
-            false, false, false, false, false
+            false, false, false, false
         ));
     }
 
     #[test]
-    fn recovered_side_continuity_violation_keeps_the_stream_recovery_label() {
+    fn held_side_faults_label_concurrent_capture_failure() {
         use irlume_camera::RuntimePairViolation as Violation;
-        // A recovered frame keeps its recovery marker, so the pair it joins
-        // fails continuity; the held pair still reports the recovery.
+        // A held-side fault with no pair-contract violation fails over as a
+        // concurrent capture failure; a missing contract says so; a validator
+        // violation keeps its own label. Continuity is no longer relabelled
+        // to stream recovery (#1033 removed in-place recovery).
         assert_eq!(
-            concurrent_pair_degradation(Some(Violation::Continuity), false, true),
-            RuntimeDegradation::StreamRecovery
+            concurrent_pair_degradation(None, false),
+            RuntimeDegradation::ConcurrentCaptureFailure
         );
         assert_eq!(
-            concurrent_pair_degradation(Some(Violation::Continuity), false, false),
+            concurrent_pair_degradation(None, true),
+            RuntimeDegradation::MissingRuntimeContract
+        );
+        assert_eq!(
+            concurrent_pair_degradation(Some(Violation::Continuity), false),
             RuntimeDegradation::ContinuityLoss
         );
         assert_eq!(
-            concurrent_pair_degradation(Some(Violation::ActiveIr), false, true),
+            concurrent_pair_degradation(Some(Violation::ActiveIr), false),
             RuntimeDegradation::ActiveIrMissing
         );
         assert_eq!(
-            concurrent_pair_degradation(None, false, true),
-            RuntimeDegradation::StreamRecovery
+            concurrent_pair_degradation(Some(Violation::CameraGeneration), false),
+            RuntimeDegradation::CameraGenerationChanged
         );
         assert_eq!(
-            concurrent_pair_degradation(None, true, true),
-            RuntimeDegradation::MissingRuntimeContract
+            concurrent_pair_degradation(Some(Violation::StreamContract), false),
+            RuntimeDegradation::StreamContractMismatch
+        );
+        assert_eq!(
+            concurrent_pair_degradation(Some(Violation::DeliveredRate), false),
+            RuntimeDegradation::DeliveredRateShortfall
         );
     }
 
     #[test]
-    fn recovered_side_other_violations_keep_their_own_labels() {
-        use irlume_camera::RuntimePairViolation as Violation;
-        // Only continuity is relabelled on a recovered side; a pair that
-        // also changed generation or contract, or ran below its floor,
-        // reports that violation.
-        for (violation, label) in [
+    fn held_pair_side_error_keeps_each_sides_original_error_and_class() {
+        use irlume_common::{CameraStreamRateEvidence, Error};
+        let evidence = |role: &str| {
+            Box::new(CameraStreamRateEvidence {
+                role: role.into(),
+                requested_num: 1,
+                requested_den: 30,
+                accepted_num: 1,
+                accepted_den: 15,
+                floor_num: 15,
+                floor_den: 1,
+                tolerance_percent: 98,
+                window_count: 30,
+                window_span_us: 2_000_000,
+                delivered_num: 10,
+                delivered_den: 1,
+                meets_floor: false,
+                sequence_gap: 0,
+                cumulative_drops: 0,
+                clock: "monotonic".into(),
+                source: "end_of_frame".into(),
+                latest_timestamp_us: 7,
+                stream_epoch: 1,
+            })
+        };
+        // One side failed: that side's ORIGINAL error object is returned
+        // unchanged (variant, message and typed payload, ADR-0030 §5).
+        match held_pair_side_error(Some(Error::PrivacyShutter("shutter".into())), None) {
+            Some(Error::PrivacyShutter(message)) => assert_eq!(message, "shutter"),
+            other => panic!("the rgb shutter error must win unchanged: {other:?}"),
+        }
+        match held_pair_side_error(None, Some(Error::DeliveredRate(evidence("ir")))) {
+            Some(Error::DeliveredRate(got)) => assert_eq!(*got, *evidence("ir")),
+            other => panic!("the ir rate evidence must win unchanged: {other:?}"),
+        }
+        // Both sides failed: the most specific class wins and ITS side's
+        // original error is returned. Class precedence: PrivacyShutter >
+        // CameraBusy > CameraUnavailable > everything else.
+        for (rgb, ir, rgb_wins) in [
             (
-                Violation::CameraGeneration,
-                RuntimeDegradation::CameraGenerationChanged,
+                Error::PrivacyShutter("rgb shutter".into()),
+                Error::CameraBusy("ir busy".into()),
+                true,
             ),
             (
-                Violation::StreamContract,
-                RuntimeDegradation::StreamContractMismatch,
+                Error::CameraBusy("rgb busy".into()),
+                Error::PrivacyShutter("ir shutter".into()),
+                false,
             ),
             (
-                Violation::DeliveredRate,
-                RuntimeDegradation::DeliveredRateShortfall,
+                Error::CameraBusy("rgb busy".into()),
+                Error::CameraUnavailable("ir unavailable".into()),
+                true,
+            ),
+            (
+                Error::CameraUnavailable("rgb unavailable".into()),
+                Error::CameraBusy("ir busy".into()),
+                false,
+            ),
+            (
+                Error::CameraUnavailable("rgb unavailable".into()),
+                Error::Hardware("ir boom".into()),
+                true,
+            ),
+            (
+                Error::Hardware("rgb boom".into()),
+                Error::CameraUnavailable("ir unavailable".into()),
+                false,
+            ),
+            // Equal rank: the RGB side wins.
+            (
+                Error::Hardware("rgb boom".into()),
+                Error::Hardware("ir boom".into()),
+                true,
+            ),
+            (
+                Error::PrivacyShutter("rgb shutter".into()),
+                Error::PrivacyShutter("ir shutter".into()),
+                true,
             ),
         ] {
-            assert_eq!(
-                concurrent_pair_degradation(Some(violation), false, true),
-                label,
-                "{violation:?}"
-            );
+            let expected = if rgb_wins {
+                format!("{rgb:?}")
+            } else {
+                format!("{ir:?}")
+            };
+            let got = held_pair_side_error(Some(rgb), Some(ir)).expect("one side wins");
+            assert_eq!(format!("{got:?}"), expected);
         }
+        assert!(held_pair_side_error(None, None).is_none());
+    }
+
+    #[test]
+    fn a_held_fault_label_and_first_trip_are_preserved() {
+        let degradation = concurrent_pair_degradation(None, false);
+        assert_eq!(degradation, RuntimeDegradation::ConcurrentCaptureFailure);
+        let sink = RecordingSink::default();
+        emit_capture_fallback(degradation, &sink);
+        assert_eq!(
+            sink.events(),
+            vec![ShareSafeEventKind::CaptureFallback {
+                reason: RuntimeViolationLabel::ConcurrentCaptureFailure,
+            }]
+        );
+        let mut health = RuntimeCaptureHealth::default();
+        assert!(health.trip("dock-a", degradation));
+        assert!(!health.trip("dock-a", RuntimeDegradation::ContinuityLoss));
+        assert_eq!(
+            health.degradation("dock-a"),
+            Some(RuntimeDegradation::ConcurrentCaptureFailure),
+            "the first trip's reason wins"
+        );
     }
 
     /// #586 proactive degradation: a concurrent capture that SUCCEEDED but
@@ -5496,53 +5599,50 @@ impl Engine {
         // just the frames. Every RETRY below deliberately stays on the one-shot
         // path: a retry exists because something went wrong with this capture,
         // and re-opening is what makes a broken stream recoverable.
-        // One denoised capture from a HELD session, recovering the stream in
-        // place on a mid-stream fault. The broken stream owns the device's
-        // buffer queue, so the standalone-reopen retry below answers EBUSY
-        // from our own handle and surfaces as "camera busy, close that app"
-        // with nothing to close (#187 hardware session: Brio QBUF EINVAL at
-        // .266366, retry's S_FMT EBUSY at .269393, no close between).
-        // Recovery renegotiates on the fd the session already holds.
+        // One denoised capture from a HELD session. A mid-stream fault never
+        // recovers in place (#1033): the faulted role's ADR-0021 rate-evidence
+        // entry is invalidated explicitly and the pair fails over at once,
+        // before anything reopens. The device queue belongs to the caller's
+        // stream, so a reopen before the failover's release would answer EBUSY
+        // from our own handle and surface as "camera busy, close that app" with
+        // nothing to close (#187 history: Brio QBUF EINVAL at .266366, retry's
+        // S_FMT EBUSY at .269393, no close between).
         fn held_rgb_capture(
             rgb_s: &mut irlume_camera::RgbSession<'_>,
-        ) -> (irlume_common::Result<irlume_camera::Frame>, bool) {
+        ) -> irlume_common::Result<irlume_camera::Frame> {
             match rgb_s.denoised() {
-                Ok(f) => (Ok(f), false),
+                Ok(f) => Ok(f),
                 Err(
                     e
                     @ (irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired),
-                ) => (Err(e), false),
+                ) => Err(e),
                 Err(e) => {
+                    rgb_s.invalidate_rate_evidence();
                     irlume_common::dlog!(
-                        "assess: held rgb stream broke ({e}); recovering it in place"
+                        "assess: held rgb capture failed ({e}); failing the pair over"
                     );
-                    let recovered = rgb_s.recover().and_then(|()| rgb_s.denoised());
-                    (recovered, true)
+                    Err(e)
                 }
             }
         }
-        // One IR capture from a HELD session, recovering the stream in place
-        // on a mid-stream fault. Mirrors held_rgb_capture; the same EBUSY
-        // reasoning applies: a standalone reopen would collide with the held
-        // session's own fd on a double-open-rejecting camera.
+        // One IR capture from a HELD session. Mirrors held_rgb_capture: a
+        // mid-stream fault invalidates the IR role's rate-evidence entry and
+        // fails the pair over; no reopen ever meets the session's own fd.
         fn held_ir_capture(
             ir_s: &mut irlume_camera::IrSession<'_>,
-        ) -> (
-            irlume_common::Result<(irlume_camera::Frame, irlume_camera::IrCaptureStats)>,
-            bool,
-        ) {
+        ) -> irlume_common::Result<(irlume_camera::Frame, irlume_camera::IrCaptureStats)> {
             match ir_s.capture_with_stats() {
-                Ok(f) => (Ok(f), false),
+                Ok(f) => Ok(f),
                 Err(
                     e
                     @ (irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired),
-                ) => (Err(e), false),
+                ) => Err(e),
                 Err(e) => {
+                    ir_s.invalidate_rate_evidence();
                     irlume_common::dlog!(
-                        "assess: held ir stream broke ({e}); recovering it in place"
+                        "assess: held ir capture failed ({e}); failing the pair over"
                     );
-                    let recovered = ir_s.recover().and_then(|()| ir_s.capture_with_stats());
-                    (recovered, true)
+                    Err(e)
                 }
             }
         }
@@ -5554,124 +5654,92 @@ impl Engine {
         // consumer reconstructing the capture span adds them instead of
         // overlapping two stages that were emitted together at the end.
         let mut rgb_timing_emitted = false;
-        let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms, recovered_side) =
-            if let Some((rgb_s, ir_s)) = held {
-                if sequential {
+        let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms) = if let Some((rgb_s, ir_s)) = held {
+            if sequential {
+                // Held sessions exist only on the concurrent schedule
+                // (`cameras_for_held_pair` drops them when sequential); a held
+                // pair must never hand frames to the sequential assessment
+                // (#1033).
+                return Err(irlume_common::Error::Hardware(
+                    "held pair capture requires the concurrent schedule".into(),
+                )
+                .into());
+            }
+            let (mut rgb_ms, mut ir_ms) = (0, 0);
+            let (rgb, ir) = irlume_camera::capture_pair_with(
+                rgb_s,
+                ir_s,
+                |session| {
                     let t = std::time::Instant::now();
-                    let (rgb, rgb_recovered) = held_rgb_capture(rgb_s);
-                    let rgb_ms = t.elapsed().as_millis();
-                    if rgb.is_ok() {
-                        emit_trace_stage_ms(
-                            diagnostics,
-                            irlume_common::diagnostics::TraceStage::RgbCapture,
-                            rgb_ms,
-                        );
-                        rgb_timing_emitted = true;
-                    }
-                    if rgb.is_err() {
-                        (rgb, rgb_ms, Ok(None), 0, rgb_recovered)
-                    } else {
-                        let t = std::time::Instant::now();
-                        let (ir, ir_recovered) = held_ir_capture(ir_s);
-                        (
-                            rgb,
-                            rgb_ms,
-                            ir.map(Some),
-                            t.elapsed().as_millis(),
-                            rgb_recovered || ir_recovered,
-                        )
-                    }
-                } else {
-                    let (mut rgb_ms, mut ir_ms) = (0, 0);
-                    let (mut rgb_recovered, mut ir_recovered) = (false, false);
-                    let (rgb, ir) = irlume_camera::capture_pair_with(
-                        rgb_s,
-                        ir_s,
-                        |session| {
-                            let t = std::time::Instant::now();
-                            let (capture, recovered) = held_rgb_capture(session);
-                            rgb_ms = t.elapsed().as_millis();
-                            rgb_recovered = recovered;
-                            capture
-                        },
-                        |session| {
-                            let t = std::time::Instant::now();
-                            let capture =
-                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    Self::run_camera_operation(operation, || {
-                                        let (capture, recovered) = held_ir_capture(session);
-                                        ir_recovered = recovered;
-                                        capture
-                                    })
-                                }))
-                                .unwrap_or_else(|_| {
-                                    Err(irlume_common::Error::Hardware(
-                                        "IR capture thread panicked".into(),
-                                    ))
-                                });
-                            ir_ms = t.elapsed().as_millis();
-                            capture
-                        },
-                    );
-                    (
-                        rgb,
-                        rgb_ms,
-                        ir.map(Some),
-                        ir_ms,
-                        rgb_recovered || ir_recovered,
-                    )
-                }
-            } else if sequential {
+                    let capture = held_rgb_capture(session);
+                    rgb_ms = t.elapsed().as_millis();
+                    capture
+                },
+                |session| {
+                    let t = std::time::Instant::now();
+                    let capture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::run_camera_operation(operation, || held_ir_capture(session))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(irlume_common::Error::Hardware(
+                            "IR capture thread panicked".into(),
+                        ))
+                    });
+                    ir_ms = t.elapsed().as_millis();
+                    capture
+                },
+            );
+            (rgb, rgb_ms, ir.map(Some), ir_ms)
+        } else if sequential {
+            let t = std::time::Instant::now();
+            let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
+            let rgb_ms = t.elapsed().as_millis();
+            if rgb.is_ok() {
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    rgb_ms,
+                );
+                rgb_timing_emitted = true;
+            }
+            // Match the old short-circuit: don't fire the IR emitter after an
+            // RGB fault (privacy switch, missing node); the shared retry below
+            // surfaces the RGB error.
+            if rgb.is_err() {
+                (rgb, rgb_ms, Ok(None), 0)
+            } else {
+                let t = std::time::Instant::now();
+                let ir = irlume_camera::capture_ir_sequential_with_stats_and_control(
+                    &self.ir_dev,
+                    &control,
+                );
+                (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
+            }
+        } else {
+            std::thread::scope(|s| {
+                let ir_dev = self.ir_dev.clone();
+                let ir_control = control.clone();
+                let ir_thread = s.spawn(move || {
+                    let t = std::time::Instant::now();
+                    let captured = Self::run_camera_operation(operation, || {
+                        irlume_camera::capture_ir_with_stats_and_control(&ir_dev, &ir_control)
+                    });
+                    (captured, t.elapsed().as_millis())
+                });
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
-                if rgb.is_ok() {
-                    emit_trace_stage_ms(
-                        diagnostics,
-                        irlume_common::diagnostics::TraceStage::RgbCapture,
-                        rgb_ms,
-                    );
-                    rgb_timing_emitted = true;
-                }
-                // Match the old short-circuit: don't fire the IR emitter after an
-                // RGB fault (privacy switch, missing node); the shared retry below
-                // surfaces the RGB error.
-                if rgb.is_err() {
-                    (rgb, rgb_ms, Ok(None), 0, false)
-                } else {
-                    let t = std::time::Instant::now();
-                    let ir = irlume_camera::capture_ir_sequential_with_stats_and_control(
-                        &self.ir_dev,
-                        &control,
-                    );
-                    (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis(), false)
-                }
-            } else {
-                std::thread::scope(|s| {
-                    let ir_dev = self.ir_dev.clone();
-                    let ir_control = control.clone();
-                    let ir_thread = s.spawn(move || {
-                        let t = std::time::Instant::now();
-                        let captured = Self::run_camera_operation(operation, || {
-                            irlume_camera::capture_ir_with_stats_and_control(&ir_dev, &ir_control)
-                        });
-                        (captured, t.elapsed().as_millis())
-                    });
-                    let t = std::time::Instant::now();
-                    let rgb =
-                        irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
-                    let rgb_ms = t.elapsed().as_millis();
-                    let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
-                        (
-                            Err(irlume_common::Error::Hardware(
-                                "IR capture thread panicked".into(),
-                            )),
-                            0,
-                        )
-                    });
-                    (rgb, rgb_ms, ir.map(Some), ir_ms, false)
-                })
-            };
+                let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
+                    (
+                        Err(irlume_common::Error::Hardware(
+                            "IR capture thread panicked".into(),
+                        )),
+                        0,
+                    )
+                });
+                (rgb, rgb_ms, ir.map(Some), ir_ms)
+            })
+        };
         self.check_request_active()?;
         for error in [rgb_res.as_ref().err(), ir_res.as_ref().err()]
             .into_iter()
@@ -5732,68 +5800,58 @@ impl Engine {
             sequential,
             rgb_res.is_err(),
             ir_res.is_err(),
-            recovered_side,
             runtime_violation.is_some() || missing_runtime_contract,
         );
         if held_sessions && pair_requires_fallback {
-            let degradation = concurrent_pair_degradation(
-                runtime_violation,
-                missing_runtime_contract,
-                recovered_side,
-            );
+            let degradation =
+                concurrent_pair_degradation(runtime_violation, missing_runtime_contract);
             emit_capture_fallback(degradation, diagnostics);
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                 trip_runtime_capture_health(context_key, degradation);
             }
-            let message = format!(
-                "held concurrent pair became unusable (rgb: {}; ir: {}; recovered-side: {recovered_side}; runtime: {}); both results must be discarded",
-                rgb_res
-                    .as_ref()
-                    .err()
-                    .map_or("ok".to_owned(), ToString::to_string),
-                ir_res
-                    .as_ref()
-                    .err()
-                    .map_or("ok".to_owned(), ToString::to_string),
-                runtime_violation.map_or_else(
-                    || if missing_runtime_contract { "missing contract".to_owned() } else { "ok".to_owned() },
-                    |error| error.to_string(),
-                ),
+            let rgb_error = rgb_res.err();
+            let ir_error = ir_res.err();
+            let rgb_note = rgb_error
+                .as_ref()
+                .map_or("ok".to_owned(), ToString::to_string);
+            let ir_note = ir_error
+                .as_ref()
+                .map_or("ok".to_owned(), ToString::to_string);
+            let runtime_note = runtime_violation.map_or_else(
+                || {
+                    if missing_runtime_contract {
+                        "missing contract".to_owned()
+                    } else {
+                        "ok".to_owned()
+                    }
+                },
+                |error| error.to_string(),
             );
-            // The pair-failure context wraps the message; the cause is the
-            // underlying refusal's (ADR-0030 §5): a shutter engaged on
-            // either side stays a privacy shutter.
-            // The pair-failure context wraps the message; the class is the
-            // underlying refusal's (ADR-0030 §5), the most specific of the
-            // two sides winning: shutter, then busy, then the budget or a
-            // pre-emption, then the camera itself.
-            let sides = [rgb_res.as_ref().err(), ir_res.as_ref().err()];
-            let pick = |matches: fn(&irlume_common::Error) -> bool| {
-                sides.into_iter().flatten().any(matches)
-            };
-            use irlume_common::Error as E;
-            let classified = if pick(|e| matches!(e, E::PrivacyShutter(_))) {
-                E::PrivacyShutter(message)
-            } else if pick(|e| matches!(e, E::CameraBusy(_))) {
-                E::CameraBusy(message)
-            } else if pick(|e| matches!(e, E::DeadlineExpired)) {
-                E::DeadlineExpired
-            } else if pick(|e| matches!(e, E::Preempted(_))) {
-                E::Preempted(message)
-            } else if pick(|e| matches!(e, E::CameraUnavailable(_))) {
-                E::CameraUnavailable(message)
-            } else {
-                E::Hardware(message)
-            };
-            return Err(CapturePathError::ConcurrentPair(classified));
+            // Both sides stay visible in the log before the losing error is
+            // discarded.
+            irlume_common::dlog!(
+                "assess: held pair failing over (rgb: {rgb_note}; ir: {ir_note}; runtime: {runtime_note})"
+            );
+            if let Some(side_error) = held_pair_side_error(rgb_error, ir_error) {
+                // The pair-failure error is the failing side's original error
+                // (ADR-0030 §5 class preserved); when both sides fail the most
+                // specific class wins and its side's original error is returned.
+                return Err(CapturePathError::ConcurrentPair(side_error));
+            }
+            // Neither side failed: both captures succeeded but the pair's
+            // runtime contract is violated or missing, so both results must
+            // still be discarded and there is no side error to carry.
+            let message = format!(
+                "held concurrent pair became unusable (rgb: {rgb_note}; ir: {ir_note}; runtime: {runtime_note}); both results must be discarded"
+            );
+            return Err(CapturePathError::ConcurrentPair(
+                irlume_common::Error::Hardware(message),
+            ));
         }
         let mut pair_sequential_retried = false;
         if pair_requires_fallback {
-            let degradation = concurrent_pair_degradation(
-                runtime_violation,
-                missing_runtime_contract,
-                recovered_side,
-            );
+            let degradation =
+                concurrent_pair_degradation(runtime_violation, missing_runtime_contract);
             emit_capture_fallback(degradation, diagnostics);
             if let Some(context_key) = capture_mode.runtime_key.as_deref() {
                 trip_runtime_capture_health(context_key, degradation);
@@ -5891,10 +5949,12 @@ impl Engine {
         let mut rgb_hard_retried = pair_sequential_retried;
         let rgb = match rgb_res {
             Ok(f) => f,
-            // Standalone reopen is only safe when THIS call opened one-shot:
-            // with held sessions the device queue belongs to the caller's
-            // stream, the in-place recovery above already had its attempt,
-            // and a reopen here meets our own handle as EBUSY (#187).
+            // Standalone reopen is only safe when THIS call opened one-shot.
+            // With held sessions the device queue belongs to the caller's
+            // stream, and the pair failover drops both sessions and handles
+            // before any reopen, so a reopen here never meets our own handle
+            // (the #187 history: EBUSY from our own fd on a double-open
+            // rejecting camera).
             Err(e) if !held_sessions && !pair_sequential_retried => {
                 irlume_common::dlog!(
                     "assess: rgb capture retry ({} capture failed: {e})",

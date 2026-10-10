@@ -155,6 +155,15 @@ All notable changes to irlume are documented here. This project adheres to
   the boundary's own error, as the raw ADR-0031 §4 evidence already did,
   instead of spending the eight-try budget and reporting the drift as an
   unavailable camera (#1035).
+- A held concurrent pair no longer recovers a broken stream in place before
+  the mandatory sequential fallback. A held-side capture fault fails over at
+  once with that side's original error (message, typed payload and class
+  preserved, ADR-0030 §5; when both sides fault the most specific class
+  wins), the failover reports `concurrent_capture_failure` instead of
+  `stream_recovery`, and the faulted role's ADR-0021 rate-evidence entry is
+  invalidated explicitly on every capture fault the capture call itself
+  returns other than a cancellation or deadline expiry (ADR-0021 amendment
+  2026-10-09; #1033).
 
 - Concurrent pair capture no longer renews ADR-0021 rate-evidence reuse
   from a probe-admitted partial window, and a continuity probe on either

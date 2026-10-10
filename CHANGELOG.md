@@ -150,6 +150,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- NPU startup reads the opt-in and provider from one settings snapshot, so
+  an atomic settings replacement cannot combine decisions from different
+  versions. Non-NPU builds release verified recognizer bytes before auxiliary
+  sessions load on startup and post-panic rebuilds (ADR-0022; #1051).
+
 - A wrapper format drift, an interval drift or a failed format or interval
   read seen at a stream's first dequeue ends warm-up on that dequeue with
   the boundary's own error, as the raw ADR-0031 §4 evidence already did,

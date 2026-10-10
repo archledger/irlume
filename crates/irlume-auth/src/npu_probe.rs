@@ -154,10 +154,19 @@ impl Engine {
         };
         #[cfg(not(feature = "npu"))]
         let (device, reason) = ("cpu", Some("not built with NPU support".to_owned()));
+        #[cfg(feature = "npu")]
+        let runtime_available = self.npu_runtime_available;
+        #[cfg(not(feature = "npu"))]
+        let runtime_available = None;
+        let qualified = runtime_available
+            .filter(|available| *available)
+            .map(|_| device == "npu");
         irlume_common::RecognizerPlacement {
             device: device.into(),
             reason,
             platform: self.npu_platform.clone(),
+            runtime_available,
+            qualified,
         }
     }
 
@@ -168,16 +177,31 @@ impl Engine {
     /// CPU.
     #[cfg(feature = "npu")]
     pub fn open_npu_context(&self, cache_base: &std::path::Path) -> irlume_vision::npu::Context {
+        self.open_npu_context_with_runtime(
+            cache_base,
+            &irlume_vision::npu::RuntimeSelection::Automatic,
+        )
+    }
+
+    /// Open an administrator-selected provider runtime for this CPU consumer.
+    /// Discovery does not bypass the recognizer's qualification or parity.
+    #[cfg(feature = "npu")]
+    pub fn open_npu_context_with_runtime(
+        &self,
+        cache_base: &std::path::Path,
+        selection: &irlume_vision::npu::RuntimeSelection,
+    ) -> irlume_vision::npu::Context {
         let runtime = irlume_vision::onnx_runtime_version().unwrap_or_default();
         let thresholds = self.npu_thresholds();
         let fingerprint = super::decision_fingerprint();
-        irlume_vision::npu::Context::open(
+        irlume_vision::npu::Context::open_with_runtime(
             cache_base,
             &irlume_vision::npu::Consumer {
                 onnx_runtime: &runtime,
                 thresholds: &thresholds,
                 decision_fingerprint: &fingerprint,
             },
+            selection,
         )
     }
 
@@ -203,6 +227,7 @@ impl Engine {
                 "the NPU recognizer must be the loaded recognizer".into(),
             ));
         }
+        self.npu_runtime_available = npu.runtime_available();
         self.npu_platform = npu
             .identity()
             .ok()

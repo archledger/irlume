@@ -541,9 +541,47 @@ fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> ser
             if let Some(platform) = placement.platform {
                 value["platform"] = json!(platform);
             }
+            if let Some(available) = placement.runtime_available {
+                value["runtime_available"] = json!(available);
+            }
+            if let Some(qualified) = placement.qualified {
+                value["qualified"] = json!(qualified);
+            }
             value
         }
         None => json!({ "known": false }),
+    }
+}
+
+#[cfg(test)]
+mod provider_runtime_reporting_tests {
+    use super::*;
+
+    #[test]
+    fn available_provider_runtime_and_unqualified_model_are_distinct_json_facts() {
+        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some("not qualified".into()),
+            platform: Some("opaque".into()),
+            runtime_available: Some(true),
+            qualified: Some(false),
+        }));
+        assert_eq!(value["device"], "cpu");
+        assert_eq!(value["runtime_available"], true);
+        assert_eq!(value["qualified"], false);
+    }
+
+    #[test]
+    fn older_provider_reports_leave_new_status_facts_absent() {
+        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some("legacy".into()),
+            platform: None,
+            runtime_available: None,
+            qualified: None,
+        }));
+        assert!(value.get("runtime_available").is_none());
+        assert!(value.get("qualified").is_none());
     }
 }
 

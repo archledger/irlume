@@ -4943,6 +4943,32 @@ fn doctor_run(
             };
             dout!(report, "[doctor] recognizer: {line}");
             report.check_detail("recognizer-device", State::Info, line);
+            let (runtime_state, runtime_line) = match placement.runtime_available {
+                Some(true) => (
+                    State::Info,
+                    "available to this engine; provider-neutral discovery succeeded",
+                ),
+                Some(false) => (
+                    State::Info,
+                    "unavailable to this engine; see the recognizer reason",
+                ),
+                None => (
+                    State::Unknown,
+                    "runtime discovery was not attempted or reported",
+                ),
+            };
+            dout!(report, "[doctor] NPU runtime: {runtime_line}");
+            report.check_detail("npu-runtime", runtime_state, runtime_line);
+            let (qualification_state, qualification_line) = match placement.qualified {
+                Some(true) => (State::Info, "qualified for this engine's NPU placement"),
+                Some(false) => (
+                    State::Info,
+                    "not qualified for current placement; CPU reference active",
+                ),
+                None => (State::Unknown, "no model qualification was reported"),
+            };
+            dout!(report, "[doctor] NPU qualification: {qualification_line}");
+            report.check_detail("npu-qualification", qualification_state, qualification_line);
             let platform = placement
                 .platform
                 .unwrap_or_else(|| "no NPU platform identity was read".to_owned());
@@ -4956,6 +4982,8 @@ fn doctor_run(
                 "the daemon predates this report",
             );
             report.check("npu-platform", State::Unknown);
+            report.check("npu-runtime", State::Unknown);
+            report.check("npu-qualification", State::Unknown);
         }
         _ => {
             report.check_detail(
@@ -4964,6 +4992,8 @@ fn doctor_run(
                 "the daemon did not answer",
             );
             report.check("npu-platform", State::Unknown);
+            report.check("npu-runtime", State::Unknown);
+            report.check("npu-qualification", State::Unknown);
         }
     }
     // --- companion factors / data-at-rest ----------------------------------

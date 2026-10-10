@@ -549,6 +549,14 @@
             "platform": {
               "description": "The NPU platform identity digest, when one was read.",
               "type": "string"
+            },
+            "runtime_available": {
+              "description": "Whether this engine discovered an accessible NPU runtime/platform, independent of provider branding. Optional; absence means not attempted/reported, not false. This is not model qualification.",
+              "type": "boolean"
+            },
+            "qualified": {
+              "description": "Whether the engine currently passed the model's qualification and NPU placement checks. Optional; absence means unreported or no available runtime. Actual device and reason still describe fallback or retirement.",
+              "type": "boolean"
             }
           }
         }

@@ -229,16 +229,19 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 /// `None` is the fallback when verification could not retain readable bytes.
 /// Post-panic rebuilds repeat verification in [`rebuild_engine_from_config`]
 /// and pass retained bytes here when available. Each build drops that buffer
-/// as soon as the session owns its copy rather than retaining it for the
-/// daemon's lifetime.
+/// once NPU placement has borrowed it as the parity canary's input (auxiliary
+/// sessions load before placement, so their native mappings land in the
+/// placement's certified executable inventory) rather than retaining it for
+/// the daemon's lifetime.
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
     verified: Option<&irlume_common::HashedModel>,
 ) -> irlume_common::Result<irlume_auth::Engine> {
     match verified {
-        // The caller owns the serialized buffer and drops it before it loads
-        // any auxiliary sessions.
+        // The caller owns the serialized buffer and drops it after
+        // construction: the auxiliary sessions load before NPU placement,
+        // which borrows the bytes as its parity canary's input.
         Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, weights),
         None => irlume_auth::Engine::load(det_path, model_path),
     }
@@ -268,7 +271,7 @@ mod npu_placement {
             .map_or(true, |progress| progress.is_some());
         super::note_worker_progress();
         let mut context = if switch_allows() {
-            engine.open_npu_context(&cache_base())
+            engine.open_npu_context_with_runtime(&cache_base(), &runtime_selection())
         } else {
             irlume_auth::npu::Context::disabled()
         };
@@ -319,16 +322,53 @@ mod npu_placement {
 
     /// The `IRLUME_NPU` / `npu` switch (ADR-0022 §12).
     #[cfg(feature = "npu")]
-    fn switch_allows() -> bool {
-        let file = std::fs::read(irlume_common::config::config_path("settings.conf"));
+    pub(super) fn switch_allows() -> bool {
+        let path = irlume_common::config::config_path("settings.conf");
+        let file = std::fs::read(&path);
         let setting = match &file {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && no_dangling_link_on(&path) =>
+            {
                 irlume_auth::npu::Setting::Absent
             }
             Err(_) => irlume_auth::npu::Setting::Unreadable,
             Ok(bytes) => irlume_auth::npu::settings_conf_value(bytes),
         };
         irlume_auth::npu::switch_allows(std::env::var_os("IRLUME_NPU").as_deref(), setting)
+    }
+
+    /// The administrator picks the installed provider by an absolute library
+    /// file. This startup read cannot be supplied by a socket/status peer.
+    #[cfg(feature = "npu")]
+    pub(super) fn runtime_selection() -> irlume_auth::npu::RuntimeSelection {
+        let path = irlume_common::config::config_path("settings.conf");
+        let file = std::fs::read(&path);
+        let setting = match &file {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && no_dangling_link_on(&path) =>
+            {
+                irlume_auth::npu::LibrarySetting::Absent
+            }
+            Err(_) => irlume_auth::npu::LibrarySetting::Unreadable,
+            Ok(bytes) => irlume_auth::npu::library_setting(bytes),
+        };
+        irlume_auth::npu::RuntimeSelection::read(
+            std::env::var_os("IRLUME_NPU_LIBRARY").as_deref(),
+            setting,
+        )
+    }
+
+    /// After a NotFound read, only genuine absence permits automatic selection.
+    /// Check every ancestor too: a missing target or unresolved metadata is
+    /// unreadable policy, even when the leaf's name cannot be inspected.
+    #[cfg(feature = "npu")]
+    fn no_dangling_link_on(path: &std::path::Path) -> bool {
+        path.ancestors()
+            .filter(|part| !part.as_os_str().is_empty())
+            .all(|part| match std::fs::symlink_metadata(part) {
+                Ok(_) => std::fs::metadata(part).is_ok(),
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            })
     }
 }
 
@@ -612,16 +652,6 @@ fn build_engine_from_config(
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
         .map(|engine| engine.with_ir_adapter_required(config.adapter_required))
-        // The NPU is offered only the verified bytes, once the adapter is
-        // configured, because an adapter keeps the recognizer on CPU
-        // (ADR-0022 §2).
-        .map(|engine| match &recognizer {
-            Some(weights) => npu_placement::place(engine, weights),
-            None => engine,
-        });
-    // The verified buffer is released before the auxiliary sessions load.
-    drop(recognizer);
-    engine
         // FaceMesh load failure disables rescue alignment only; recognition
         // and the PAM-conversation intent confirmation do not need the mesh.
         // Outside strict mode the daemon therefore stays available; strict
@@ -647,6 +677,30 @@ fn build_engine_from_config(
         })
         .and_then(|engine| engine.with_blaze_rescue(&config.blaze))
         .map(|engine| load_pad_models(engine, &config.vit_pad, &config.pad_ir))
+        // The NPU is offered only the verified bytes, once the adapter is
+        // configured, because an adapter keeps the recognizer on CPU
+        // (ADR-0022 §2), and only after every auxiliary session above has
+        // been constructed: opening the NPU context captures the certified
+        // executable inventory the pre-inference recheck enforces, so the
+        // lazily dlopen'd TFLite C runtime that with_mesh loads must already
+        // be mapped when the capture hashes it (PR #1047 review comment
+        // 4236061696). A file-backed executable mapping that appears only
+        // after the capture is rejected as unhashed and retires the slot to
+        // CPU once loading admission opens.
+        .map(|(engine, rgb_pad, ir_pad)| {
+            let engine = match &recognizer {
+                Some(weights) => npu_placement::place(engine, weights),
+                None => engine,
+            };
+            (engine, rgb_pad, ir_pad)
+        });
+    // The verified buffer is released as soon as placement has borrowed it
+    // for the parity canary. It is no longer dropped before the auxiliary
+    // sessions load: those sessions must precede the NPU inventory capture,
+    // and placement needs these same verified bytes. It is still never
+    // retained for the daemon's lifetime.
+    drop(recognizer);
+    engine
 }
 
 fn rebuild_engine_from_config(
@@ -983,8 +1037,11 @@ fn main() {
             //
             // `recognizer` is what startup already read, hashed and verified
             // (#346); None requests a fresh manifest check for a post-panic
-            // rebuild. Verified recognizer bytes are released as soon as its
-            // session is built, before constructing auxiliary model sessions.
+            // rebuild. Verified recognizer bytes are released once engine
+            // construction is done with them: the auxiliary model sessions
+            // load before NPU placement (whose certified executable inventory
+            // must already contain their native mappings), and placement's
+            // parity canary borrows the bytes last.
             let engine_config = EngineBuildConfig {
                 det,
                 model,
@@ -4725,6 +4782,31 @@ fn publish_engine_bits_raw(bits: EngineBits) {
     *engine_bits().lock().unwrap_or_else(|e| e.into_inner()) = bits;
 }
 
+/// Native provider errors remain privileged diagnostics. A bounded line can
+/// still contain paths or device identifiers, so non-root Health uses only
+/// categories derived from the published observation, never native text.
+fn recognizer_for_peer(
+    placement: &irlume_common::RecognizerPlacement,
+    uid: u32,
+) -> irlume_common::RecognizerPlacement {
+    let mut projected = placement.clone();
+    if uid != 0 {
+        projected.reason = if placement.device == "npu" {
+            None
+        } else {
+            Some(
+                match placement.runtime_available {
+                    None => "NPU discovery not reported; using CPU",
+                    Some(false) => "NPU runtime unavailable; using CPU",
+                    Some(true) => "NPU recognizer unavailable; using CPU",
+                }
+                .into(),
+            )
+        };
+    }
+    projected
+}
+
 /// Publish the engine's changed selection without discovering or opening any
 /// device. Physical connection state belongs to the passive inventory.
 fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
@@ -6097,7 +6179,10 @@ fn dispatch_status_with_diagnostics(
                 ir_pad: bits.ir_pad,
                 version: env!("CARGO_PKG_VERSION").into(),
                 apparmor: apparmor_confinement(),
-                recognizer: bits.recognizer.clone(),
+                recognizer: bits
+                    .recognizer
+                    .as_ref()
+                    .map(|placement| recognizer_for_peer(placement, peer.uid)),
             }
         }
         // The peer's right to ask about this account was settled by the
@@ -11764,11 +11849,19 @@ mod tests {
     }
 
     #[test]
-    fn the_recognizer_buffer_is_released_before_the_auxiliary_sessions() {
-        // build_engine_from_config owns the verified recognizer buffer: the
-        // loader borrows it, the NPU placement (after the IR adapter is
-        // configured, ADR-0022 §2) borrows it, and it is dropped before any
-        // auxiliary model session starts.
+    fn auxiliary_sessions_load_before_the_npu_inventory_capture() {
+        // build_engine_from_config must construct every auxiliary session
+        // (mesh, blaze rescue, PAD models) BEFORE npu_placement::place opens
+        // the NPU context: that open captures the certified executable
+        // inventory the pre-inference recheck enforces, and the shipped TFLite
+        // mesh makes with_mesh lazily dlopen the TFLite C runtime, so a
+        // mapping that appears only after the capture is rejected as unhashed
+        // and retires the slot to CPU before the first authentication
+        // inference once loading admission opens (PR #1047 review comment
+        // 4236061696). The verified recognizer buffer therefore outlives the
+        // auxiliary construction (the loader and the placement's parity canary
+        // both borrow it) and is dropped immediately after placement rather
+        // than before the auxiliary sessions load.
         let _: fn(
             &str,
             &str,
@@ -11782,8 +11875,11 @@ mod tests {
             .expect("build_engine_from_config");
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(at("with_ir_adapter_required") < at("npu_placement::place"));
+        assert!(at("with_mesh") < at("npu_placement::place"));
+        assert!(at("with_mesh_degraded") < at("npu_placement::place"));
+        assert!(at("with_blaze_rescue") < at("npu_placement::place"));
+        assert!(at("load_pad_models") < at("npu_placement::place"));
         assert!(at("npu_placement::place") < at("drop(recognizer);"));
-        assert!(at("drop(recognizer);") < at("with_mesh"));
     }
 
     #[test]
@@ -16997,6 +17093,8 @@ mod tests {
                 device: "cpu".into(),
                 reason: Some("not certified".into()),
                 platform: Some("ab12".into()),
+                runtime_available: Some(true),
+                qualified: Some(false),
             }),
         });
         let peer = Peer {
@@ -17021,10 +17119,60 @@ mod tests {
                 assert_eq!(recognizer.device, "cpu");
                 assert_eq!(recognizer.reason.as_deref(), Some("not certified"));
                 assert_eq!(recognizer.platform.as_deref(), Some("ab12"));
+                assert_eq!(recognizer.runtime_available, Some(true));
+                assert_eq!(recognizer.qualified, Some(false));
             }
             other => panic!("expected Health, got {other:?}"),
         }
         publish_engine_bits_raw(EngineBits::default());
+    }
+
+    #[test]
+    fn health_projects_provider_errors_for_non_root_and_preserves_root_detail() {
+        let _g = env_lock();
+        let detail = "runtime unavailable: /home/private/provider.so /dev/accel/accel0 serial=fixture-private";
+        publish_engine_bits_raw(EngineBits {
+            recognizer: Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some(detail.into()),
+                platform: Some("ab12".into()),
+                runtime_available: Some(false),
+                qualified: None,
+            }),
+            ..Default::default()
+        });
+        let root = dispatch_status(&Request::Health, &peer(0)).unwrap();
+        let ordinary = dispatch_status(&Request::Health, &peer(NOBODY)).unwrap();
+        publish_engine_bits_raw(EngineBits::default());
+        let Response::Health {
+            recognizer: Some(root),
+            ..
+        } = root
+        else {
+            panic!("root Health");
+        };
+        let Response::Health {
+            recognizer: Some(ordinary),
+            ..
+        } = ordinary
+        else {
+            panic!("ordinary Health");
+        };
+        assert_eq!(root.reason.as_deref(), Some(detail));
+        assert_eq!(ordinary.device, "cpu");
+        assert_eq!(ordinary.runtime_available, Some(false));
+        assert_eq!(ordinary.platform, root.platform);
+        let wire = serde_json::to_string(&ordinary).unwrap();
+        for private in ["/home/", "/dev/", "fixture-private", "provider.so"] {
+            assert!(
+                !wire.contains(private),
+                "private provider detail in Health: {wire}"
+            );
+        }
+        assert_eq!(
+            ordinary.reason.as_deref(),
+            Some("NPU runtime unavailable; using CPU")
+        );
     }
 
     #[test]
@@ -18355,6 +18503,157 @@ mod tests {
             event.kind,
             ShareSafeEventKind::CaptureScheduleSelected { .. }
         )));
+    }
+
+    #[cfg(feature = "npu")]
+    #[test]
+    fn administrator_provider_selection_reads_machine_config_and_environment_only() {
+        let _g = env_lock();
+        let _sb = sandbox("npu-provider-selection");
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _restore_library =
+            Restore("IRLUME_NPU_LIBRARY", std::env::var_os("IRLUME_NPU_LIBRARY"));
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        let _restore_switch = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
+        std::env::remove_var("IRLUME_NPU");
+        let settings = irlume_common::config::config_path("settings.conf");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "a genuinely absent settings file permits automatic selection"
+        );
+        assert!(
+            npu_placement::switch_allows(),
+            "a genuinely absent settings file leaves the NPU switch on"
+        );
+        std::fs::write(
+            &settings,
+            "npu=on\nnpu_library=/opt/source/libopenvino_c.so.2621\n",
+        )
+        .unwrap();
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library("/opt/source/libopenvino_c.so.2621".into())
+        );
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            )
+        );
+        std::env::set_var("IRLUME_NPU_LIBRARY", "");
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        for malformed in [
+            "npu_library",
+            "npu_library: /one",
+            "npu_library /one",
+            "npu_library=/one\nnpu_library",
+        ] {
+            std::fs::write(&settings, malformed).unwrap();
+            assert!(matches!(
+                npu_placement::runtime_selection(),
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ));
+        }
+        std::fs::write(&settings, "npu_library=/one\nnpu_library=/two\n").unwrap();
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
+        std::fs::remove_file(&settings).unwrap();
+        std::fs::create_dir(&settings).unwrap();
+        assert!(matches!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Rejected(_)
+        ));
+        std::fs::remove_dir(&settings).unwrap();
+
+        // A configured name whose target is missing is unreadable policy,
+        // not permission to select a different provider automatically.
+        let config_dir = settings.parent().unwrap();
+        std::os::unix::fs::symlink(config_dir.join("missing-settings"), &settings).unwrap();
+        let dangling_file = npu_placement::runtime_selection();
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            ),
+            "the administrator override still wins over a dangling settings file"
+        );
+        // The kill switch reads the same unreadable file: the library override
+        // must not carry NPU use past a policy that cannot be read.
+        let dangling_file_switch = npu_placement::switch_allows();
+        std::env::set_var("IRLUME_NPU", "on");
+        let dangling_file_switch_on = npu_placement::switch_allows();
+        std::env::remove_var("IRLUME_NPU");
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        std::fs::remove_file(&settings).unwrap();
+
+        let missing_directory = config_dir.join("missing-directory");
+        let linked_directory = config_dir.join("linked-directory");
+        std::os::unix::fs::symlink(&missing_directory, &linked_directory).unwrap();
+        // Put the link above an additional missing directory, so checking
+        // only settings.conf or its immediate parent cannot pass this case.
+        std::env::set_var("IRLUME_CONFIG_DIR", linked_directory.join("nested"));
+        let dangling_directory = npu_placement::runtime_selection();
+        std::env::set_var("IRLUME_NPU_LIBRARY", "/usr/local/lib/libopenvino_c.so.2621");
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Library(
+                "/usr/local/lib/libopenvino_c.so.2621".into()
+            ),
+            "the administrator override still wins over a dangling directory component"
+        );
+        let dangling_directory_switch = npu_placement::switch_allows();
+        std::env::remove_var("IRLUME_NPU_LIBRARY");
+        std::env::set_var("IRLUME_CONFIG_DIR", missing_directory.join("nested"));
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "genuinely absent directory components permit automatic selection"
+        );
+        std::fs::create_dir(&missing_directory).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", linked_directory.join("nested"));
+        assert_eq!(
+            npu_placement::runtime_selection(),
+            irlume_auth::npu::RuntimeSelection::Automatic,
+            "a resolved directory link with absent settings permits automatic selection"
+        );
+        std::env::set_var("IRLUME_CONFIG_DIR", config_dir);
+
+        // Observe both broken paths before asserting, so a failing run reports
+        // both regressions rather than stopping before the ancestor case.
+        assert!(
+            matches!(
+                dangling_file,
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ) && matches!(
+                dangling_directory,
+                irlume_auth::npu::RuntimeSelection::Rejected(_)
+            ),
+            "dangling settings must refuse automatic selection: file={dangling_file:?}, \
+             directory component={dangling_directory:?}"
+        );
+        assert!(
+            !dangling_file_switch && !dangling_file_switch_on && !dangling_directory_switch,
+            "dangling settings must keep the kill switch off: file={dangling_file_switch}, \
+             file with IRLUME_NPU=on={dangling_file_switch_on}, \
+             directory component={dangling_directory_switch}"
+        );
     }
 
     /// Isolated state/config/keyring/template-key/recovery dirs plus a method

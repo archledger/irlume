@@ -104,6 +104,8 @@ pub struct Engine {
     /// The NPU platform identity digest the recognizer was placed for, when
     /// discovery read one (ADR-0022 §13).
     npu_platform: Option<String>,
+    #[cfg(feature = "npu")]
+    npu_runtime_available: Option<bool>,
     /// Whether this request's probes may run on the NPU: set only by an
     /// authentication whose enrollment admits it, and cleared when that
     /// request's scope ends (ADR-0022 §2). Every other path embeds on CPU.
@@ -4120,6 +4122,8 @@ impl Engine {
             embed_space,
             embed_producer: None,
             npu_platform: None,
+            #[cfg(feature = "npu")]
+            npu_runtime_available: None,
             npu_probe: false,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
             mesh: None,
@@ -15208,6 +15212,51 @@ mod engine_tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "each name once");
+    }
+
+    #[cfg(feature = "npu")]
+    #[test]
+    fn npu_probe_placement_preserves_unreported_and_failed_discovery() {
+        let _g = env_guard();
+        let _s = shared();
+        let weights =
+            irlume_common::HashedModel::new(std::fs::read(model_path("glintr100.onnx")).unwrap());
+        let mut engine = Engine::load_with_recognizer_weights(
+            &model_path("face_detection_yunet_2023mar.onnx"),
+            &weights,
+        )
+        .unwrap();
+        struct Sandbox(std::path::PathBuf);
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                teardown_sandbox(&self.0);
+            }
+        }
+        let directory = Sandbox(state_sandbox("npu-observation"));
+        let bad_cache = directory.0.join("not-a-directory");
+        std::fs::write(&bad_cache, b"fixture").unwrap();
+        let mut context = engine.open_npu_context(&bad_cache);
+        engine
+            .place_recognizer_on_npu(&weights, &mut context)
+            .unwrap();
+        let placement = engine.recognizer_placement();
+        assert_eq!(placement.device, "cpu");
+        assert_eq!(placement.runtime_available, None);
+        assert_eq!(placement.platform, None);
+        assert_eq!(placement.qualified, None);
+        let mut context = engine.open_npu_context_with_runtime(
+            &directory.0,
+            &irlume_vision::npu::RuntimeSelection::Rejected("fixture rejected"),
+        );
+        engine
+            .place_recognizer_on_npu(&weights, &mut context)
+            .unwrap();
+        assert_eq!(engine.recognizer_placement().runtime_available, Some(false));
+        let mut context = irlume_vision::npu::Context::disabled();
+        engine
+            .place_recognizer_on_npu(&weights, &mut context)
+            .unwrap();
+        assert_eq!(engine.recognizer_placement().runtime_available, None);
     }
 
     #[test]

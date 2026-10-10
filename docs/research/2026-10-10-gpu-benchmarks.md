@@ -49,11 +49,13 @@
     results were printed. Session teardown is a real daemon path
     (model retirement and rebuilds), so this class must be validated
     before any production use.
-- **Decision relevance:** the ADR-0022 section 15 revisit condition is
-  met: the integrated GPU is 2.5x the weakest fleet CPU on this model
+- **Decision relevance:** motivation for the ADR-0022 section 15
+  reopen, not proof of a failed user-facing latency budget
+  (authentication is capture-bound and no end-to-end budget is recorded
+  here): the integrated GPU is 2.5x the weakest fleet CPU on this model
   through the already-validated provider path, and the dGPU shows an
   order of magnitude more through a path this project has not audited.
-  ADR-0033 scopes the first and defers the second.
+  ADR-0033 scopes the first and leaves the second inert.
 - **Pending:** the UX5406S (Lunar Lake, Arc 140V) rerun of the same
   harness, which feeds the `auto` ranking evidence; the minihost numbers
   are a proxy from the weakest CPU and a 24-EU-class integrated GPU.

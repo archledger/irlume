@@ -4,10 +4,16 @@
 
 Proposed 2026-10-10.
 
-Amends ADR-0022 section 15 ("No GPU"): that section reserved GPU devices
-for a revisit "only with evidence that CPU-only users face unacceptable
-latency". The #1053 Phase 2 measurements are that evidence (the Context
-records them). Everything else in ADR-0022 is unchanged and binding:
+Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
+reopen GPU support during #1053. Section 15 asked for "evidence that
+CPU-only users face unacceptable latency"; the #1053 Phase 2 measurements
+show the accelerator is much faster, not that CPU users today face a
+failed budget: authentication is capture-bound and no user-facing
+latency target is violated. This ADR therefore does not claim the
+section 15 condition is met by measurement alone; it records the
+maintainer exercising the revisit with the measurements as motivation,
+and keeps CPU the default (`auto` stays on CPU until a certification
+passes). Everything else in ADR-0022 is unchanged and binding:
 this ADR adds the GPU as an eligible device under the same regime. It
 depends on the ADR-0022 amendment of 2026-10-09 (provider selection,
 closed native loading) and on the recognizer device selection of #1053
@@ -32,6 +38,10 @@ fleet ([the measurement record](../research/2026-10-10-gpu-benchmarks.md)):
 | minihost, ADL-N CPU, OpenVINO CPU | 178.6 ms |
 | archhost, 16-thread CPU, production ONNX Runtime session | 108.7 ms |
 | archhost, RTX 3060 (dGPU), ONNX Runtime CUDA EP | 7.6 to 7.8 ms |
+
+No end-to-end latency budget is recorded here: the numbers below are
+per-inference recognizer costs on synthetic inputs, the motivation for
+the revisit rather than proof of a user-facing failure.
 
 Three findings shape the decision:
 
@@ -71,22 +81,30 @@ of #1053 (section 12), and reporting (section 13).
 
 GPU placement uses the same root-owned, soname-validated
 `libopenvino_c.so.2621`/`.2620` provider loading the NPU uses, compiled
-for one explicit GPU device. Exactly one GPU is selected; `MULTI`,
-`HETERO` and `AUTO` devices stay out of scope for placement, because
-they spread one model across devices or choose them per run, which no
-identity or certification can name. Multi-GPU systems must disambiguate
-(`GPU.0`, `GPU.1`): an identity that cannot name one device refuses
-placement. The default `PERFORMANCE_HINT` for latency-oriented compile
+for one explicit GPU device. `MULTI`, `HETERO` and `AUTO` devices stay
+out of scope for placement, because they spread one model across devices
+or choose them per run, which no identity or certification can name. A
+system that exposes more than one GPU refuses GPU placement until a
+reviewed rule selects one: `recognizer_device=gpu` is a class-level
+setting with no device index, and inventing an implicit ordering
+(first, fastest, any) would place a model on a device the certification
+never named. Exactly one visible GPU, or no placement; a device-index
+setting is future work with its own evidence. The default `PERFORMANCE_HINT` for latency-oriented compile
 configurations matches the NPU precedent (batch 1, LATENCY).
 
 ### 3. GPU platform identity extends the ADR-0022 identity
 
 The identity adds the GPU plugin version, the GPU device name and PCI
 vendor and device of the selected render node, the OpenCL ICD or Level
-Zero loader the GPU plugin resolves, the GPU driver version, the compile
-configuration, and the SHA-256 of every runtime library the daemon maps
-once the GPU is enumerated, under the same one-open-file inode discipline
-as ADR-0022 section 4. A driver or compute-runtime update is a different
+Zero loader the GPU plugin resolves, the GPU driver version, the build of
+the GPU firmware the kernel loaded where the driver exposes it (on Intel
+integrated graphics the GuC and HuC firmware versions of the render
+node), the compile configuration, and the SHA-256 of every runtime
+library the daemon maps once the GPU is enumerated, under the same
+one-open-file inode discipline as ADR-0022 section 4. Like that section,
+a firmware build that cannot be read makes the identity unreadable and
+placement refuses, and the firmware is a field because a driver version
+does not imply it. A driver or compute-runtime update is a different
 identity; a kernel release is not a field, for the same reason as
 ADR-0022.
 
@@ -103,12 +121,16 @@ reported, exactly as #1054 ships today.
 ### 5. Certification gates are unchanged and binding
 
 A GPU certification must reproduce, on the target GPU identity and the
-CPU reference: the startup parity canary, the decision fingerprint over
-every decision arm, zero impostor accepts that the CPU reference denies,
-zero presentation-attack flips, and the drift bounds per arm, with the
-compile configuration pinned as an identity field. The measured 0.9995
-cosine band is an input to those gates, not a pass of them. Enrollment,
-self-tests and every non-probe path stay on CPU.
+CPU reference, the ADR-0022 section 7 gates in their original direction:
+the startup parity canary, the decision fingerprint over every decision
+arm, and no input the CPU reference denies that the GPU grants, over both
+the impostor corpus and the presentation-attack corpus. The direction is
+the ADR-0022 rule: no new grants. A GPU that denies more attacks or more
+impostors than the CPU reference is not disqualified by that alone. The
+drift bounds per arm, with the compile configuration pinned as an
+identity field, are unchanged. The measured 0.9995 cosine band is an
+input to those gates, not a pass of them. Enrollment, self-tests and
+every non-probe path stay on CPU.
 
 ### 6. `auto` ranks certification, never device class
 
@@ -118,23 +140,44 @@ Ranking among several certified devices is set by measured evidence on
 the decision hardware (the UX5406S rerun of the measurement record is
 pending), not by device class or vendor.
 
-### 7. Execution-provider GPUs stay out of scope
+### 7. Execution-provider GPUs stay inert
 
-The CUDA and TensorRT execution provider features remain compile-time
-off and admit no placement. The archhost probe measured why they need
-their own ADR before any use: provider registration defaults to failing
-silently (CPU execution with no error; the strict opt-in must be
-mandatory and verified), a missing cuDNN surfaces only at inference time
-after a successful session creation, one run corrupted the heap at
-session teardown, and the dependency closure (driver, CUDA runtime,
-cuBLAS, cuDNN; about 2.6 GiB on the probe host) is a trust surface this
-project has not audited. The measurements are recorded so a future ADR
-starts from evidence.
+The CUDA, OpenVINO-EP, TensorRT and CoreML execution-provider features
+of `irlume-vision` are not a placement path, and as of this ADR they are
+inert in every build: a custom build compiled with one of those features
+no longer registers its provider in an ONNX session at all (these
+sessions serve the recognizer, the detector and the PAD cues, so
+registration placed authentication-adjacent computation outside
+`CERTIFIED`, with the silent-CPU default on failure, both measured in
+the archhost probe). Registration exists only behind the exact escape
+`IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (logged, in the spirit of the
+virtual-camera escape) and is strict there: a provider that cannot load
+is an error, never unannounced CPU execution. A future ADR that wants an
+execution-provider lane must still solve what the probe measured: the
+silent-fallback default, a missing cuDNN surfacing only at inference
+time after a successful session creation, one teardown-time heap
+corruption, and the dependency closure (driver, CUDA runtime, cuBLAS,
+cuDNN; about 2.6 GiB on the probe host) that this project has not
+audited.
+
+### 8. A GPU kill switch beside the selection
+
+`recognizer_device` names an intent; it is not an emergency switch, the
+same way the NPU needed its own. The GPU gets `gpu` in
+`settings.conf` and `IRLUME_GPU` on the daemon with ADR-0022 section 12
+semantics substituted: either source disabling wins; an empty, unknown
+or non-UTF-8 value, an unreadable settings file, or a duplicated key
+disables GPU use; a recognized on value leaves admission and
+certification to decide and enables nothing by itself. The switch
+disables GPU placement independently of the NPU switch: the NPU-named
+keys stay NPU-only, and coupling them would leave the GPU running
+precisely when an operator believed every accelerator was off.
 
 ## Consequences
 
-- ADR-0022 section 15 no longer reserves the GPU; its revisit condition
-  is discharged by this record.
+- ADR-0022 section 15 no longer reserves the GPU; the maintainer's
+  revisit of it is recorded here, with CPU the default until a
+  certification passes.
 - The implementation order is fixed by Phasing below; nothing in this
   ADR requires a behavior change in the same PR.
 - `doctor` and `status --json` will eventually report GPU runtime
@@ -152,9 +195,11 @@ starts from evidence.
 2. Benchmarks and probe evidence: done, this record's Context and the
    measurement record.
 3. Implementation: the GPU device target through the validated provider
-   machinery (enumeration, identity, compile, retirement), hardware-gated
-   tests runnable on an Intel GPU host (minihost today), no loading
-   admission change.
+   machinery (enumeration, identity with firmware, compile, retirement,
+   the `gpu` kill switch, the single-GPU rule), hardware-gated tests
+   runnable on an Intel GPU host (minihost today), no loading admission
+   change. The execution-provider inertness of section 7 landed with
+   this ADR, ahead of the rest.
 4. Certification runs on the decision hardware (UX5406S; minihost as the
    proxy), producing ADR-0022 section 7 evidence per identity.
 5. Loading-admission profile for the GPU inventory, reviewed separately
@@ -170,14 +215,18 @@ starts from evidence.
   retirement to CPU on drift or mapped-library mismatch.
 - No-GPU CI lanes keep the CPU answers: an absent GPU is a reason, not a
   build or start failure, in both `npu` and default builds.
-- Identity tests: `GPU.0`/`GPU.1` disambiguation refuses an ambiguous
-  identity; a rebuilt compute-runtime library is a different identity
-  under the inode discipline.
+- Identity tests: a system exposing more than one GPU refuses placement
+  (section 2); a rebuilt compute-runtime library, or a GPU firmware
+  build that cannot be read, is a different or unusable identity under
+  the inode discipline (section 3).
 - A `gpu` selection without an admitted loading profile reports the
   admission refusal as its CPU reason (already true of #1054 for the
   unadmitted build; the admission-aware reason lands with phase 3).
-- Source-shape or unit test: no execution provider is registered without
-  the strict failure mode if the inert features are ever built (phase 3
-  seam; the archhost evidence is the reason).
+- The execution providers stay escape-gated and strict in every feature
+  combination: the source-shape test landed with this ADR
+  (`execution_providers_stay_escape_gated_and_strict`).
+- The `gpu`/`IRLUME_GPU` switch follows the section 12 semantics: either
+  source disabling wins, malformed values disable, and an on value
+  admits nothing (phase 3 tests beside the `npu` switch tests).
 - The certification table stays empty unless every gate of section 5
   passes on the named identity.

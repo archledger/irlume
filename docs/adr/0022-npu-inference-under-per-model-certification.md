@@ -448,9 +448,11 @@ entry under this ADR; one needs an amendment that defines a LiteRT reference
 GPU devices stay out of scope. Revisit only with evidence that CPU-only users
 face unacceptable latency.
 
-Amended 2026-10-10 by ADR-0033: the #1053 measurements are that evidence, and
-ADR-0033 admits the GPU under this ADR's regime, with the execution-provider
-(CUDA, TensorRT) lane still out of scope.
+Amended 2026-10-10 by ADR-0033: the maintainer reopened the GPU question on
+the #1053 measurements (which show the accelerator faster, not a failed
+user-facing latency budget), and ADR-0033 admits the GPU under this ADR's
+regime, keeps CPU the default until a certification passes, and leaves the
+execution-provider (CUDA, TensorRT) lane inert.
 
 ## Consequences
 

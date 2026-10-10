@@ -541,35 +541,66 @@ mod onnx {
         (candidate, verdict)
     }
 
+    /// The exact test escape that opts an execution-provider experiment in
+    /// (ADR-0033 section 7): `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1`, nothing
+    /// else. Like the virtual-camera escape it is deliberate and visible in
+    /// the log, and without it the providers stay unregistered however the
+    /// crate was compiled.
+    fn ep_escape_enabled() -> bool {
+        let enabled =
+            std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1");
+        if enabled {
+            irlume_common::dlog!(
+                "onnx: execution providers are registered only through the \
+                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; this build is outside \
+                 the per-model certification regime (ADR-0033 section 7)"
+            );
+        }
+        enabled
+    }
+
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
         ensure_ort_resolvable()?;
         #[allow(unused_mut)]
         let mut b = Session::builder().map_err(err)?;
-        // Register a hardware execution provider if compiled in (cf. howrs).
-        // These fall back to CPU if the EP can't initialize at runtime.
-        #[cfg(feature = "cuda")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::CUDA::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "openvino")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::OpenVINO::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "tensorrt")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::TensorRT::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "coreml")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::CoreML::default().build()])
-                .map_err(err)?;
+        // Register a hardware execution provider if compiled in (cf. howrs),
+        // but never inside an authentication build by default: these
+        // providers place ops outside the per-model certification regime and
+        // the `ort` crate's default is to fall back to CPU silently when the
+        // provider library cannot load (measured; ADR-0033 section 7). The
+        // exact test escape opts an experiment in, and registration is then
+        // strict: a provider that cannot load is an error, not CPU placement.
+        if ep_escape_enabled() {
+            #[cfg(feature = "cuda")]
+            {
+                b = b
+                    .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+                    .map_err(err)?;
+            }
+            #[cfg(feature = "openvino")]
+            {
+                b = b
+                    .with_execution_providers([ort::ep::OpenVINO::default()
+                        .build()
+                        .error_on_failure()])
+                    .map_err(err)?;
+            }
+            #[cfg(feature = "tensorrt")]
+            {
+                b = b
+                    .with_execution_providers([ort::ep::TensorRT::default()
+                        .build()
+                        .error_on_failure()])
+                    .map_err(err)?;
+            }
+            #[cfg(feature = "coreml")]
+            {
+                b = b
+                    .with_execution_providers([ort::ep::CoreML::default()
+                        .build()
+                        .error_on_failure()])
+                    .map_err(err)?;
+            }
         }
         // Each resident model has its own pool. Let idle workers block while
         // another model runs, retaining two threads for each active inference.
@@ -996,6 +1027,42 @@ mod onnx {
     #[cfg(test)]
     mod adapter_contract_tests {
         use super::*;
+
+        /// ADR-0033 section 7: whatever execution-provider features this
+        /// build was compiled with, the session constructor may register a
+        /// provider only behind the exact test escape and only strictly (a
+        /// provider that cannot load is an error, never silent CPU
+        /// execution).
+        #[test]
+        fn execution_providers_stay_escape_gated_and_strict() {
+            let source = include_str!("lib.rs");
+            let build = source
+                .split("fn build(model: &[u8])")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .expect("session build");
+            let escape = build
+                .find("if ep_escape_enabled() {")
+                .expect("the escape guard wraps every registration");
+            for provider in [
+                "ort::ep::CUDA",
+                "ort::ep::OpenVINO",
+                "ort::ep::TensorRT",
+                "ort::ep::CoreML",
+            ] {
+                for (index, _) in build.match_indices(provider) {
+                    assert!(
+                        escape < index,
+                        "{provider} registers only inside the escape guard"
+                    );
+                    let statement = &build[index..index + 200];
+                    assert!(
+                        statement.contains("error_on_failure()"),
+                        "{provider} registration must be strict, not silently CPU"
+                    );
+                }
+            }
+        }
 
         #[test]
         fn adapter_output_is_normalized_without_changing_direction() {

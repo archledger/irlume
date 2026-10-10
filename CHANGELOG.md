@@ -7,6 +7,29 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Custom builds of `irlume-vision` compiled with the `cuda`, `openvino`,
+  `tensorrt` or `coreml` execution-provider features no longer register
+  those providers in ONNX sessions: the registrations placed
+  authentication-adjacent computation outside the per-model certification
+  regime and defaulted to silent CPU execution when the provider library
+  could not load. The providers now register only behind the exact
+  escape `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (an unconditional warning,
+  not the opt-in debug log) and strictly there: a provider that cannot
+  load is an error, and CPU fallback for operations the providers cannot
+  cover is disabled, so no session runs on the CPU unannounced; TensorRT
+  registers ahead of CUDA under the escape and the OpenVINO provider is
+  pinned to the GPU device; CoreML is never registered (every
+  MLComputeUnits combination admits the CPU) and a build that compiled it
+  is told it stays inactive; and every session outside the escape
+  registers the runtime's exact default CPU execution provider, which
+  names the reference CPU EP and suppresses the crate's armed
+  NPU-preferring automatic device selection (the policy would otherwise
+  rank any other CPU-type provider ahead of the default), so a runtime
+  with built-in accelerators cannot auto-place or substitute these
+  models. A compiled provider without the escape, and the escape in a
+  build without a provider feature, both warn their actual outcome
+  (ADR-0033 section 7).
+
 - Ordinary-only requests with a saved split selection and no explicit ordinary
   override report the ordinary camera path's limitation. Dual-sensor
   authentication with a proven ordinary override uses that reason for a

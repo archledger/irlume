@@ -247,7 +247,10 @@ pub type Embedding = [f32; EMBED_DIM];
 mod onnx {
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
-    use ort::session::{builder::GraphOptimizationLevel, Session};
+    use ort::session::{
+        builder::{AutoDevicePolicy, GraphOptimizationLevel, SessionBuilder},
+        Session,
+    };
     use ort::value::Tensor;
 
     /// Intra-op threads per ONNX session. Keep two threads for model latency;
@@ -541,35 +544,156 @@ mod onnx {
         (candidate, verdict)
     }
 
+    /// The exact test escape that opts an execution-provider experiment in
+    /// (ADR-0033 section 7): `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1`, nothing
+    /// else. A pure read: the caller announces what the value means for its
+    /// build, so no arm can mislabel another arm's sessions.
+    fn ep_escape_set() -> bool {
+        std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1")
+    }
+
+    /// Pin the session to the exact default CPU execution provider: register
+    /// the environment's Microsoft CPU device explicitly. Explicit
+    /// registration is the only suppression of the automatic
+    /// device-selection policy the builder arms (upstream has no API to
+    /// disarm it; the policy otherwise ranks any other CPU-type EP ahead of
+    /// the default, which the NPU parity reference and the CPU-session
+    /// warnings must not silently rely on). Falls back to the CPU
+    /// preference policy only when the runtime exposes no default CPU
+    /// device.
+    fn pin_default_cpu_ep(b: SessionBuilder) -> irlume_common::Result<SessionBuilder> {
+        let Ok(env) = ort::environment::Environment::current() else {
+            return b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err);
+        };
+        let default_cpu = env.devices().find(|device| {
+            device.ep_vendor().is_ok_and(|vendor| vendor == "Microsoft")
+                && matches!(device.hardware_device().ty(), ort::memory::DeviceType::CPU)
+        });
+        match default_cpu {
+            Some(device) => b.with_devices([device], None).map_err(err),
+            None => b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err),
+        }
+    }
+
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
         ensure_ort_resolvable()?;
         #[allow(unused_mut)]
         let mut b = Session::builder().map_err(err)?;
-        // Register a hardware execution provider if compiled in (cf. howrs).
-        // These fall back to CPU if the EP can't initialize at runtime.
-        #[cfg(feature = "cuda")]
+        // Never inherit execution providers a custom host registered on the
+        // process `ort::Environment`: they would place this build's sessions
+        // outside the per-model certification regime without any escape or
+        // warning (ADR-0033 section 7). Sessions here run on the CPU, or on
+        // the escaped providers below.
+        b = b.with_no_environment_execution_providers().map_err(err)?;
+        // Register a hardware execution provider if compiled in (cf. howrs),
+        // but never inside an authentication build by default: these
+        // providers place ops outside the per-model certification regime and
+        // the `ort` crate's default is to fall back to CPU silently when the
+        // provider library cannot load (measured; ADR-0033 section 7).
+        //
+        // Every arm names its executor: the automatic device-selection
+        // policy is pinned to CPU before any arm (the crate initializes
+        // every builder with an NPU-preferring `MaxEfficiency` policy), and
+        // a runtime with built-in accelerators cannot auto-place these
+        // models; with the escape the
+        // registered providers are strict (a provider that cannot load is an
+        // error, CPU fallback for uncovered ops is disabled, TensorRT
+        // registers ahead of CUDA so it claims its subgraphs first, and the
+        // OpenVINO provider is pinned to the GPU device). CoreML never
+        // registers: every MLComputeUnits combination includes the CPU, so
+        // no strict arm could honestly promise it accelerator-only
+        // execution (ADR-0033 section 7).
+        #[cfg(any(feature = "cuda", feature = "openvino", feature = "tensorrt"))]
         {
-            b = b
-                .with_execution_providers([ort::ep::CUDA::default().build()])
-                .map_err(err)?;
+            if ep_escape_set() {
+                // Deliberate and impossible to miss: this build runs outside
+                // the per-model certification regime. Unconditional, not
+                // behind the IRLUME_LOG debug setting.
+                irlume_common::jout_warn!(
+                    "irlume: execution providers are registered through the \
+                     IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; these sessions \
+                     run outside the per-model certification regime \
+                     (ADR-0033 section 7)"
+                );
+                // CoreML stays inert here too, and a build that compiled it
+                // alongside a registered provider must hear that, like every
+                // other inactive provider.
+                #[cfg(feature = "coreml")]
+                irlume_common::jout_warn!(
+                    "irlume: the coreml execution provider is compiled into \
+                     this build but is never registered, because its compute \
+                     units always admit the CPU (ADR-0033 section 7)"
+                );
+                // Strict means strict: a provider that cannot load is an
+                // error, and a graph the registered providers cannot fully
+                // cover refuses instead of quietly running parts on the CPU
+                // EP.
+                b = b.with_disable_cpu_fallback().map_err(err)?;
+                #[cfg(feature = "tensorrt")]
+                {
+                    b = b
+                        .with_execution_providers([ort::ep::TensorRT::default()
+                            .build()
+                            .error_on_failure()])
+                        .map_err(err)?;
+                }
+                #[cfg(feature = "cuda")]
+                {
+                    b = b
+                        .with_execution_providers([ort::ep::CUDA::default()
+                            .build()
+                            .error_on_failure()])
+                        .map_err(err)?;
+                }
+                #[cfg(feature = "openvino")]
+                {
+                    // Pinned to the accelerator: the provider's omitted
+                    // device_type defaults to CPU, which the disabled CPU
+                    // fallback cannot catch, and a hardware experiment must
+                    // not record CPU results through this provider.
+                    b = b
+                        .with_execution_providers([ort::ep::OpenVINO::default()
+                            .with_device_type("GPU")
+                            .build()
+                            .error_on_failure()])
+                        .map_err(err)?;
+                }
+            } else {
+                // A compiled provider without the escape stays unregistered;
+                // an experiment must not mistake these CPU sessions for
+                // provider results (the silent-CPU trap this regime closes).
+                irlume_common::jout_warn!(
+                    "irlume: an execution provider is compiled into this \
+                     build but stays unregistered; these sessions run on the \
+                     CPU. Set IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1 to register \
+                     it outside the per-model certification regime \
+                     (ADR-0033 section 7)"
+                );
+                b = pin_default_cpu_ep(b)?;
+            }
         }
-        #[cfg(feature = "openvino")]
+        #[cfg(not(any(feature = "cuda", feature = "openvino", feature = "tensorrt")))]
         {
-            b = b
-                .with_execution_providers([ort::ep::OpenVINO::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "tensorrt")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::TensorRT::default().build()])
-                .map_err(err)?;
-        }
-        #[cfg(feature = "coreml")]
-        {
-            b = b
-                .with_execution_providers([ort::ep::CoreML::default().build()])
-                .map_err(err)?;
+            if ep_escape_set() {
+                irlume_common::jout_warn!(
+                    "irlume: IRLUME_TEST_ALLOW_UNCERTIFIED_EP is set, but \
+                     this build compiles no execution provider; the sessions \
+                     stay on their CPU sessions (ADR-0033 section 7)"
+                );
+            } else {
+                // CoreML is a compiled-but-inert provider here: it is never
+                // registered (its compute units always admit the CPU), and
+                // a build that compiled it must hear that like any other
+                // inactive provider.
+                #[cfg(feature = "coreml")]
+                irlume_common::jout_warn!(
+                    "irlume: the coreml execution provider is compiled into \
+                     this build but is never registered, because its compute \
+                     units always admit the CPU; these sessions run on the \
+                     CPU (ADR-0033 section 7)"
+                );
+            }
+            b = pin_default_cpu_ep(b)?;
         }
         // Each resident model has its own pool. Let idle workers block while
         // another model runs, retaining two threads for each active inference.
@@ -996,6 +1120,166 @@ mod onnx {
     #[cfg(test)]
     mod adapter_contract_tests {
         use super::*;
+
+        /// ADR-0033 section 7: whatever execution-provider features this
+        /// build was compiled with, the session constructor may register a
+        /// provider only behind the exact test escape, loudly (an
+        /// unconditional warning, not the opt-in debug log) and strictly:
+        /// a provider that cannot load is an error, and CPU fallback for
+        /// unsupported ops is disabled, so no unannounced CPU execution.
+        #[test]
+        fn execution_providers_stay_escape_gated_and_strict() {
+            let source = include_str!("lib.rs");
+            let build = source
+                .split("fn build(model: &[u8])")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .expect("session build");
+            // Environment providers are closed off before any escape logic.
+            let no_env = build
+                .find("with_no_environment_execution_providers()")
+                .expect("environment providers are never inherited");
+            // The first escape arm is the provider-registering one (the
+            // cfg(any(...)) arm); the not-any arm only warns.
+            let escape = build
+                .find("if ep_escape_set() {")
+                .expect("the escape guard wraps every registration");
+            assert!(
+                no_env < escape,
+                "the environment-provider cutoff precedes the escape"
+            );
+            let disable = build
+                .find("with_disable_cpu_fallback()")
+                .expect("CPU fallback is disabled under the escape");
+            assert!(
+                escape < disable,
+                "the no-CPU-fallback switch sits inside the escape"
+            );
+            // The provider arm is compiled only when a provider feature is;
+            // without one, the escape warns instead of disabling CPU fallback.
+            let any_arm = build
+                .find("cfg(any(")
+                .expect("the provider arm is feature-gated");
+            assert!(any_arm < escape, "the provider arm is the gated first arm");
+            assert!(
+                build.contains("cfg(not(any("),
+                "a provider-less build reports the ineffective escape"
+            );
+            for provider in ["ort::ep::CUDA", "ort::ep::OpenVINO", "ort::ep::TensorRT"] {
+                for (index, _) in build.match_indices(provider) {
+                    assert!(
+                        escape < index,
+                        "{provider} registers only inside the escape guard"
+                    );
+                    let statement = &build[index..index + 200];
+                    assert!(
+                        statement.contains("error_on_failure()"),
+                        "{provider} registration must be strict, not silently CPU"
+                    );
+                }
+            }
+            // TensorRT registers ahead of CUDA so it claims its subgraphs
+            // first (the ort provider-order guidance).
+            let trt = build
+                .find("ort::ep::TensorRT::default()")
+                .expect("TensorRT");
+            let cuda = build.find("ort::ep::CUDA::default()").expect("CUDA");
+            assert!(trt < cuda, "TensorRT registers before CUDA");
+            // CoreML never registers: every MLComputeUnits combination
+            // includes the CPU, so no strict arm could promise it
+            // accelerator-only execution.
+            assert!(
+                !build.contains("ort::ep::CoreML"),
+                "CoreML is never registered in any arm"
+            );
+            // The escape-inactive arms pin the exact default CPU
+            // execution provider (the environment's Microsoft CPU device),
+            // which both names the reference CPU EP and suppresses the
+            // automatic device-selection policy; the escaped arm never pins
+            // it, because a CPU provider registered first would claim the
+            // whole graph ahead of the escaped providers.
+            let pins = build.matches("pin_default_cpu_ep(b)?").count();
+            assert!(
+                pins >= 2,
+                "both escape-inactive arms pin the default CPU EP"
+            );
+            // The explicit CPU device and the CPU-fallback disable are
+            // mutually exclusive upstream (a hard error when combined), so
+            // each appears exactly where it belongs.
+            assert_eq!(
+                build.matches("with_disable_cpu_fallback()").count(),
+                1,
+                "the CPU-fallback disable appears once, inside the escape"
+            );
+            let first_pin = build.find("pin_default_cpu_ep(b)?").expect("a pin");
+            assert!(
+                first_pin > escape,
+                "the pin comes after the escaped arm, never inside it"
+            );
+            let helper = source
+                .split("fn pin_default_cpu_ep(")
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(
+                        "
+    fn ",
+                    )
+                    .next()
+                })
+                .expect("the exact-CPU helper");
+            assert!(
+                helper.contains("with_devices([device], None)")
+                    && helper.contains(r#""Microsoft""#),
+                "the helper registers the environment's Microsoft CPU device"
+            );
+            assert!(
+                helper.contains("AutoDevicePolicy::PreferCPU"),
+                "the helper falls back to the CPU preference policy"
+            );
+            assert!(
+                !build.contains("ort::ep::CPU::default()"),
+                "no arm registers the CPU provider; the arena keeps its default"
+            );
+            assert!(
+                build.contains("is never registered"),
+                "an inert coreml build announces its inactive provider"
+            );
+            // The OpenVINO provider is pinned to an accelerator: its omitted
+            // device_type defaults to CPU, which the disabled CPU fallback
+            // cannot catch.
+            let openvino = build
+                .find("ort::ep::OpenVINO::default()")
+                .expect("the OpenVINO provider registration");
+            assert!(
+                build[openvino..openvino + 120].contains("with_device_type(\"GPU\")"),
+                "the escaped OpenVINO provider names the GPU device"
+            );
+            let escape_fn = source
+                .split("fn ep_escape_set() -> bool {")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }").next())
+                .expect("the escape reader");
+            assert!(
+                !escape_fn.contains("jout_warn!") && !escape_fn.contains("dlog!"),
+                "the escape reader is pure; each arm labels its own sessions"
+            );
+            // Every arm announces its own outcome: registration warns it is
+            // uncertified, an inactive compiled provider warns it stayed
+            // unregistered, and a provider-less build warns the escape is
+            // ineffective. No session is mislabeled.
+            assert!(
+                build.contains("outside the per-model certification regime"),
+                "the active escape announces the uncertified sessions"
+            );
+            assert!(
+                build.contains("stays unregistered"),
+                "a compiled provider without the escape announces CPU sessions"
+            );
+            assert!(
+                build.contains("compiles no execution provider"),
+                "the ineffective escape in a provider-less build is reported"
+            );
+        }
 
         #[test]
         fn adapter_output_is_normalized_without_changing_direction() {

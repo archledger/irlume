@@ -4943,6 +4943,31 @@ fn doctor_run(
             };
             dout!(report, "[doctor] recognizer: {line}");
             report.check_detail("recognizer-device", State::Info, line);
+            let (selection_state, selection_line) = match placement.selection.as_deref() {
+                Some("auto") => (
+                    State::Info,
+                    "auto; only a certified device can take the recognizer off CPU".to_owned(),
+                ),
+                Some("cpu") => (
+                    State::Info,
+                    "cpu; every probe stays on the CPU reference".to_owned(),
+                ),
+                Some("npu") => (
+                    State::Info,
+                    "npu; admission and certification still decide".to_owned(),
+                ),
+                Some("gpu") => (
+                    State::Info,
+                    "gpu; no build admits GPU placement yet".to_owned(),
+                ),
+                Some(other) => (State::Info, other.to_owned()),
+                None => (
+                    State::Unknown,
+                    "the daemon did not report a device selection".to_owned(),
+                ),
+            };
+            dout!(report, "[doctor] recognizer selection: {selection_line}");
+            report.check_detail("recognizer-selection", selection_state, selection_line);
             let (runtime_state, runtime_line) = match placement.runtime_available {
                 Some(true) => (
                     State::Info,
@@ -4981,6 +5006,7 @@ fn doctor_run(
                 State::Unknown,
                 "the daemon predates this report",
             );
+            report.check("recognizer-selection", State::Unknown);
             report.check("npu-platform", State::Unknown);
             report.check("npu-runtime", State::Unknown);
             report.check("npu-qualification", State::Unknown);
@@ -4991,6 +5017,7 @@ fn doctor_run(
                 State::Unknown,
                 "the daemon did not answer",
             );
+            report.check("recognizer-selection", State::Unknown);
             report.check("npu-platform", State::Unknown);
             report.check("npu-runtime", State::Unknown);
             report.check("npu-qualification", State::Unknown);

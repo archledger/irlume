@@ -342,6 +342,13 @@ pub enum CpuReason {
     /// NPU use is switched off, or the model was loaded without an NPU
     /// context.
     Disabled,
+    /// The administrator selected CPU for the recognizer
+    /// (`recognizer_device=cpu`); no NPU discovery or compile is attempted.
+    CpuSelected,
+    /// The administrator selected GPU for the recognizer
+    /// (`recognizer_device=gpu`); no build admits GPU placement yet, and no
+    /// NPU discovery or compile is attempted.
+    GpuSelectedNotAdmitted,
     /// No reviewed installation/launch profile admits native loading. This
     /// is independent of model certification and is checked before dlopen.
     LoadingNotAdmitted,
@@ -369,6 +376,13 @@ impl fmt::Display for CpuReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => f.write_str("NPU use is disabled"),
+            Self::CpuSelected => {
+                f.write_str("CPU is selected for the recognizer (recognizer_device=cpu)")
+            }
+            Self::GpuSelectedNotAdmitted => f.write_str(
+                "GPU is selected for the recognizer (recognizer_device=gpu); no build admits \
+                 GPU placement yet",
+            ),
             Self::LoadingNotAdmitted => {
                 f.write_str("the NPU loading profile has not been admitted; using CPU")
             }
@@ -1652,6 +1666,16 @@ impl Context {
     pub fn disabled() -> Self {
         Self {
             state: Err(CpuReason::Disabled),
+            discovery: None,
+        }
+    }
+
+    /// NPU placement is not attempted because the administrator selected a
+    /// different outcome for the recognizer (`recognizer_device`): every
+    /// model gets `reason`. Discovery is not run.
+    pub fn not_selected(reason: CpuReason) -> Self {
+        Self {
+            state: Err(reason),
             discovery: None,
         }
     }

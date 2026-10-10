@@ -1572,6 +1572,11 @@ pub struct RecognizerPlacement {
     /// and placement checks. `None` means no usable runtime was reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qualified: Option<bool>,
+    /// The device selection that governs this placement: `auto`, `cpu`,
+    /// `npu` or `gpu` (`recognizer_device` in `settings.conf`).
+    /// `None` when the daemon does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
 }
 
 #[cfg(test)]
@@ -1593,6 +1598,7 @@ mod recognizer_runtime_wire_tests {
             platform: Some("identity".into()),
             runtime_available: Some(true),
             qualified: Some(false),
+            selection: Some("auto".into()),
         };
         let json = serde_json::to_string(&placement).unwrap();
         let legacy: LegacyPlacement = serde_json::from_str(&json).unwrap();
@@ -1604,6 +1610,7 @@ mod recognizer_runtime_wire_tests {
                 .unwrap();
         assert_eq!(new.runtime_available, None);
         assert_eq!(new.qualified, None);
+        assert_eq!(new.selection, None);
     }
 
     #[test]
@@ -1614,10 +1621,12 @@ mod recognizer_runtime_wire_tests {
             platform: None,
             runtime_available: None,
             qualified: None,
+            selection: None,
         };
         let json = serde_json::to_value(placement).unwrap();
         assert!(json.get("runtime_available").is_none());
         assert!(json.get("qualified").is_none());
+        assert!(json.get("selection").is_none());
     }
 }
 

@@ -167,6 +167,9 @@ impl Engine {
             platform: self.npu_platform.clone(),
             runtime_available,
             qualified,
+            // The daemon stamps the governing device selection after the
+            // engine reports; the engine itself never reads settings.
+            selection: None,
         }
     }
 

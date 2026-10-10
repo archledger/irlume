@@ -795,13 +795,33 @@ renumbered), then auto-detection. There is no node-number default: when no
 pair is found, the RGB-only convenience tier uses the first RGB camera
 discovered.
 
+### Recognizer device selection
+
+`recognizer_device` in `/etc/irlume/settings.conf` names the device the
+recognizer should use for authentication probes: `auto` (the default), `cpu`,
+`npu` or `gpu`. `IRLUME_RECOGNIZER_DEVICE` on the daemon overrides the key.
+The selection is read when the engine starts or rebuilds; restart the daemon
+after changing it, as with the provider selection.
+
+A selection names a target; it never lowers a gate. `auto` ranks certified
+devices and is today's switch-gated behavior, which keeps the recognizer on
+CPU because no accelerator placement is admitted and certified. `cpu` keeps
+every probe on the CPU reference and skips NPU discovery. `npu` attempts NPU
+placement under the existing `npu`/`IRLUME_NPU` kill switch, admission and
+certification (ADR-0022); the kill switch still wins. `gpu` is reported but
+no build admits GPU placement yet. An IR adapter keeps the recognizer on CPU
+whatever the selection. An empty, unknown, duplicated or non-UTF-8 value, or
+an unreadable `settings.conf`, is a journal warning and resolves to `auto`;
+authentication never fails over the device preference. `irlume doctor` shows
+the governing selection as `recognizer-selection`, and `irlume status --json`
+reports it as `recognizer.selection`.
+
 ### Optional NPU provider selection
 
 Native NPU loading is closed: no installation/launch profile is admitted, no
 setting bypasses native-entry refusal, and the `CERTIFIED` table is empty.
 Authentication remains on CPU, including builds with the default-off `npu`
 feature.
-
 The `npu_library` key in `/etc/irlume/settings.conf` selects an absolute OpenVINO
 C API file from an administrator-managed installation. `IRLUME_NPU_LIBRARY` on
 the daemon overrides that key. Without either, selection checks standard system
@@ -826,6 +846,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_ENFORCE_BIOPOLICY` | same switch as `enforce_biopolicy` in `settings.conf`; the env var wins | off |
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
 | `IRLUME_NPU` | NPU kill switch alongside the machine `npu` key; either source disabling wins. Empty, unknown or non-UTF-8 switch values and unreadable settings disable it. On values cannot bypass loading admission or certification | leaves admission and certification to decide; currently CPU |
+| `IRLUME_RECOGNIZER_DEVICE` | overrides machine `recognizer_device`; a present but unrecognized value is a warning and resolves to `auto` | `auto` |
 | `IRLUME_NPU_LIBRARY` | absolute C API file; overrides machine `npu_library`, with root-managed installation checks. Selects a file without admitting native loading | standard system and `/usr/local` library roots |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` (packaged units set `/usr/share/irlume/models/…`) |
 | `IRLUME_VIT_PAD_MODEL` / `IRLUME_PAD_IR_MODEL` | paths to the shipped PAD weights (ViT RGB / FLIR IR) | `/etc/irlume/liveness_vit.onnx`, `/etc/irlume/flir.onnx` (packaged units set `/usr/share/irlume/models/…`) |

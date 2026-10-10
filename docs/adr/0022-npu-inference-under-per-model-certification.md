@@ -202,9 +202,13 @@ combination runs on CPU. Tests recompute the thresholds and both fingerprints
 from the current code, so a change to preprocessing, decoding, the decision
 code, a threshold or the ONNX Runtime output fails them until the entry is
 certified again or removed in the same change. There is no `AUTO`, `HETERO` or
-`MULTI` device, no GPU, and no selection by device availability or speed. An
+`MULTI` device, and no selection by device availability or speed. An
 entry is added only by a reviewed change that cites its certification evidence
 (section 7).
+
+Amended 2026-10-10 by ADR-0033: the "no GPU" clause of this prohibition
+is superseded there; the GPU is eligible under this table's regime, one
+explicit device, while `AUTO`, `HETERO` and `MULTI` remain refused.
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
@@ -447,6 +451,12 @@ entry under this ADR; one needs an amendment that defines a LiteRT reference
 
 GPU devices stay out of scope. Revisit only with evidence that CPU-only users
 face unacceptable latency.
+
+Amended 2026-10-10 by ADR-0033: the maintainer reopened the GPU question on
+the #1053 measurements (which show the accelerator faster, not a failed
+user-facing latency budget), and ADR-0033 admits the GPU under this ADR's
+regime, keeps CPU the default until a certification passes, and leaves the
+execution-provider (CUDA, TensorRT) lane inert.
 
 ## Consequences
 

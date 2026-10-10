@@ -543,22 +543,10 @@ mod onnx {
 
     /// The exact test escape that opts an execution-provider experiment in
     /// (ADR-0033 section 7): `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1`, nothing
-    /// else. Like the virtual-camera escape it is deliberate and impossible
-    /// to miss in the log: the warning is unconditional, not behind the
-    /// `IRLUME_LOG` debug setting, because this build runs outside the
-    /// per-model certification regime.
-    fn ep_escape_enabled() -> bool {
-        let enabled =
-            std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1");
-        if enabled {
-            irlume_common::jout_warn!(
-                "irlume: execution providers are registered only through the \
-                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; this session runs \
-                 outside the per-model certification regime (ADR-0033 \
-                 section 7)"
-            );
-        }
-        enabled
+    /// else. A pure read: the caller announces what the value means for its
+    /// build, so no arm can mislabel another arm's sessions.
+    fn ep_escape_set() -> bool {
+        std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_some_and(|value| value == *"1")
     }
 
     fn build(model: &[u8]) -> irlume_common::Result<Session> {
@@ -584,7 +572,16 @@ mod onnx {
             feature = "tensorrt",
             feature = "coreml"
         ))]
-        if ep_escape_enabled() {
+        if ep_escape_set() {
+            // Deliberate and impossible to miss: this build runs outside the
+            // per-model certification regime. Unconditional, not behind the
+            // IRLUME_LOG debug setting.
+            irlume_common::jout_warn!(
+                "irlume: execution providers are registered through the \
+                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP escape; these sessions run \
+                 outside the per-model certification regime (ADR-0033 \
+                 section 7)"
+            );
             // Strict means strict: a provider that cannot load is an error,
             // and a graph the registered providers cannot fully cover
             // refuses instead of quietly running parts on the CPU EP.
@@ -619,6 +616,16 @@ mod onnx {
                         .error_on_failure()])
                     .map_err(err)?;
             }
+        } else {
+            // A compiled provider without the escape stays unregistered; an
+            // experiment must not mistake these CPU sessions for provider
+            // results (the silent-CPU trap this regime closes).
+            irlume_common::jout_warn!(
+                "irlume: an execution provider is compiled into this build \
+                 but stays unregistered; these sessions run on the CPU. Set \
+                 IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1 to register it outside \
+                 the per-model certification regime (ADR-0033 section 7)"
+            );
         }
         // A build without any execution-provider feature keeps its normal
         // CPU sessions: disabling CPU fallback there would refuse every
@@ -630,7 +637,7 @@ mod onnx {
             feature = "tensorrt",
             feature = "coreml"
         )))]
-        if ep_escape_enabled() {
+        if ep_escape_set() {
             irlume_common::jout_warn!(
                 "irlume: IRLUME_TEST_ALLOW_UNCERTIFIED_EP is set, but this \
                  build compiles no execution provider; the sessions stay on \
@@ -1084,7 +1091,7 @@ mod onnx {
             // The first escape arm is the provider-registering one (the
             // cfg(any(...)) arm); the not-any arm only warns.
             let escape = build
-                .find("if ep_escape_enabled() {")
+                .find("if ep_escape_set() {")
                 .expect("the escape guard wraps every registration");
             assert!(
                 no_env < escape,
@@ -1126,13 +1133,29 @@ mod onnx {
                 }
             }
             let escape_fn = source
-                .split("fn ep_escape_enabled() -> bool {")
+                .split("fn ep_escape_set() -> bool {")
                 .nth(1)
                 .and_then(|rest| rest.split("\n    }").next())
                 .expect("the escape reader");
             assert!(
-                escape_fn.contains("jout_warn!") && !escape_fn.contains("dlog!"),
-                "the escape warns unconditionally, not behind IRLUME_LOG"
+                !escape_fn.contains("jout_warn!") && !escape_fn.contains("dlog!"),
+                "the escape reader is pure; each arm labels its own sessions"
+            );
+            // Every arm announces its own outcome: registration warns it is
+            // uncertified, an inactive compiled provider warns it stayed
+            // unregistered, and a provider-less build warns the escape is
+            // ineffective. No session is mislabeled.
+            assert!(
+                build.contains("outside the per-model certification regime"),
+                "the active escape announces the uncertified sessions"
+            );
+            assert!(
+                build.contains("stays unregistered"),
+                "a compiled provider without the escape announces CPU sessions"
+            );
+            assert!(
+                build.contains("compiles no execution provider"),
+                "the ineffective escape in a provider-less build is reported"
             );
         }
 

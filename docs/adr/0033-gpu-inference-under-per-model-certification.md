@@ -155,7 +155,12 @@ warning (not the opt-in debug log, in the spirit of the virtual-camera
 escape's visibility), and is strict there: a provider that cannot load
 is an error, and CPU fallback for operations the registered providers
 cannot cover is disabled, so a graph the providers cannot fully execute
-refuses instead of running partly on the CPU unannounced. A future ADR that wants an
+refuses instead of running partly on the CPU unannounced. No arm is
+silent: a compiled provider without the escape warns that it stays
+unregistered and the sessions run on the CPU, and a build with no
+provider feature that receives the escape warns that it is ineffective,
+so no experiment mistakes a CPU session for a provider result and no CPU
+session is mislabeled as uncertified. A future ADR that wants an
 execution-provider lane must still solve what the probe measured: the
 silent-fallback default, a missing cuDNN surfacing only at inference
 time after a successful session creation, one teardown-time heap

@@ -1035,6 +1035,152 @@ fn managed_preparation_required_identity_errors_clear_votes_without_capture_fall
 }
 
 #[test]
+fn held_pair_failures_reach_the_pair_owner_with_the_side_error_payload() {
+    let _guard = env_guard();
+    let mut state = shared();
+    let engine = &mut state.engine;
+    engine.vit_scores = vec![0.2; 4];
+    let evidence = irlume_common::CameraStreamRateEvidence {
+        role: "rgb".into(),
+        requested_num: 1,
+        requested_den: 30,
+        accepted_num: 1,
+        accepted_den: 15,
+        floor_num: 15,
+        floor_den: 1,
+        tolerance_percent: 98,
+        window_count: 30,
+        window_span_us: 2_000_000,
+        delivered_num: 10,
+        delivered_den: 1,
+        meets_floor: false,
+        sequence_gap: 1,
+        cumulative_drops: 2,
+        clock: "monotonic".into(),
+        source: "end_of_frame".into(),
+        latest_timestamp_us: 42,
+        stream_epoch: 3,
+    };
+    let mut held_pair_failed = false;
+    let result = engine.finish_pair_authentication(
+        &paired_enrollment(),
+        AuthenticationPurpose::Verify,
+        None,
+        Err(CapturePathError::ConcurrentPair(
+            irlume_common::Error::DeliveredRate(Box::new(evidence.clone())),
+        )),
+        Some(&mut held_pair_failed),
+        &(),
+    );
+    assert!(
+        held_pair_failed,
+        "the pair owner must learn the pair failed"
+    );
+    assert!(
+        engine.vit_scores.is_empty(),
+        "a failed pair clears the votes"
+    );
+    match result {
+        Err(irlume_common::Error::DeliveredRate(got)) => {
+            assert_eq!(*got, evidence, "the typed payload must survive unchanged");
+        }
+        Err(other) => panic!("the side error's class and payload must survive: {other}"),
+        Ok(_) => panic!("a failed pair cannot grant"),
+    }
+}
+
+#[test]
+fn a_held_pair_fault_fails_over_and_the_sequential_fallback_grants_inside_the_15s_window() {
+    use std::{cell::Cell, time::Duration};
+    let _guard = env_guard();
+    let mut state = shared();
+    let engine = &mut state.engine;
+    let previous_ir = engine.ir_available;
+    engine.ir_available = true;
+    engine.vit_scores.clear();
+    // The unattended fixture half of the #1033 acceptance: a held pair that
+    // faults on one side fails over at once with that side's own error, and
+    // the sequential fallback still grants on a face inside the ordinary
+    // 15 s window.
+    let window = AuthenticationWindow::new(15_000);
+    let deadline = window.capture_deadline().unwrap();
+    let clock = Cell::new(window.origin());
+    let mut costliest = Duration::ZERO;
+    let mut mode = unavailable_capture_mode_selection();
+    mode.sequential = false;
+    let (fault, held_pair_failed, _deferred) = engine.authentication_attempt_loop_with(
+        deadline,
+        15_000,
+        &mut costliest,
+        |engine| {
+            let mut held_pair_failed = false;
+            let out = engine.finish_pair_authentication(
+                &paired_enrollment(),
+                AuthenticationPurpose::Verify,
+                Some("login"),
+                Err(CapturePathError::ConcurrentPair(
+                    irlume_common::Error::PrivacyShutter("shutter".into()),
+                )),
+                Some(&mut held_pair_failed),
+                &(),
+            );
+            clock.set(clock.get() + Duration::from_millis(2_000));
+            (out, held_pair_failed, None::<()>)
+        },
+        || clock.get(),
+    );
+    assert!(
+        held_pair_failed,
+        "the pair owner must learn the pair failed"
+    );
+    assert!(
+        matches!(fault, Err(irlume_common::Error::PrivacyShutter(_))),
+        "the failover carries the side's own error"
+    );
+    demote_after_concurrent_capture_failure(&mut mode);
+    assert!(
+        mode.is_sequential(),
+        "the failover demotes this context before the sequential retry"
+    );
+    engine.vit_scores = vec![0.2; 4];
+    let (granted, fallback, _deferred) = engine.authentication_attempt_loop_with(
+        deadline,
+        15_000,
+        &mut costliest,
+        |engine| {
+            let sample = visible_pair_sample(engine, 4, 0.2, true);
+            let prepared = engine
+                .prepare_pair_authentication_with(sample, |_, evidence| {
+                    Ok(materialize_synthetic_pair(evidence))
+                })
+                .map_err(CapturePathError::from);
+            let out = engine.finish_pair_authentication(
+                &paired_enrollment(),
+                AuthenticationPurpose::Verify,
+                Some("login"),
+                prepared,
+                None,
+                &(),
+            );
+            clock.set(clock.get() + Duration::from_millis(2_000));
+            (out, false, None::<()>)
+        },
+        || clock.get(),
+    );
+    assert!(
+        !fallback,
+        "a granted fallback attempt needs no further retry"
+    );
+    assert_eq!(granted.unwrap().kind, OutcomeKind::Granted);
+    assert!(
+        clock.get() < deadline,
+        "the grant must land inside the 15 s window"
+    );
+    engine.ir_available = previous_ir;
+    engine.vit_scores.clear();
+}
+
+#[test]
 fn managed_preparation_admission_and_refusal_follow_stream_owner_release() {
     let _guard = env_guard();
     let mut state = shared();

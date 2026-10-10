@@ -2019,6 +2019,16 @@ impl<S> TrackedStream<S> {
         self
     }
 
+    /// Revoke this stream's ADR-0021 rate-amortization entry. Shared by the
+    /// recovery epoch in [`Self::install_recovered`] and by the explicit
+    /// held-side fault path (#1033) behind the sessions'
+    /// `invalidate_rate_evidence`. Nothing else about the stream changes.
+    fn invalidate_rate_evidence(&mut self) {
+        if let Some(key) = &self.amort_key {
+            rate_amortization::invalidate(key);
+        }
+    }
+
     fn with_control(mut self, control: &CaptureControl) -> Self {
         self.control = control.clone();
         self
@@ -2062,9 +2072,7 @@ impl<S> TrackedStream<S> {
         }
         self.stream = stream.take();
         self.recovery_epoch_pending = true;
-        if let Some(key) = &self.amort_key {
-            rate_amortization::invalidate(key);
-        }
+        self.invalidate_rate_evidence();
         // Drop the pre-recovery rate window immediately. The recovered stream
         // has its own STREAMON transient and its timestamps may move to a new
         // domain (the recovery epoch resets both trackers), so a stale "ready"
@@ -5785,6 +5793,22 @@ impl<'a> RgbSession<'a> {
         Ok(())
     }
 
+    /// Explicit ADR-0021 invalidation for a held-side capture fault (#1033):
+    /// the auth layer no longer recovers held streams in place, so the
+    /// recovery-epoch side effect no longer runs; callers revoke the faulted
+    /// role's cached rate evidence here before the pair fails over.
+    ///
+    /// Revokes only this session's rate-amortization entry (exactly the
+    /// [`Self::recover`] recovery epoch's cache side effect), keyed by the
+    /// session's own amortization key. The rate window, the probe admission
+    /// and the live stream stay untouched: the caller is about to discard
+    /// this session. The fallback's fresh one-shot session for this role then
+    /// pays a full fill instead of admitting on a 5-delta probe (ADR-0021
+    /// items 3-5).
+    pub fn invalidate_rate_evidence(&mut self) {
+        self.stream.invalidate_rate_evidence();
+    }
+
     /// Discard frames until auto-exposure has settled, once per session. A
     /// second capture on the same stream is already settled, and re-running the
     /// warm-up would throw away good frames to no purpose.
@@ -7401,12 +7425,16 @@ impl IrSession<'_> {
         let format =
             frame_provenance::ValidatedFormatIdentity::from_stable_format(&self.cam.negotiated);
         // The state is NOT impossible, which is why this is an error and not
-        // the expect it used to be: a failed `recover` (its reopen can lose a
-        // format race with another application, #427, or hit transient
-        // EBUSY/ENODEV) leaves the slot None for good, and the grace loop
-        // retries the held session. The RGB twin already answers hardware
-        // trouble here for the same reason; on the sequential branch the old
-        // panic unwound out of the daemon worker.
+        // the expect it used to be: only `recover()`'s teardown can leave the
+        // slot None (its reopen can lose a format race with another
+        // application, #427, or hit transient EBUSY/ENODEV, and after a
+        // failed recovery the slot stays None for good). After #1033 the auth
+        // layer no longer recovers held sessions in place, so `recover()` is
+        // test-only with no production caller; this arm remains a defensive
+        // typed error for any future recover() caller and the camera's own
+        // tests. The RGB twin already answers hardware trouble here for the
+        // same reason; on the sequential branch the old panic unwound out of
+        // the daemon worker.
         if self.stream.stream_mut().is_none() {
             return Err(Error::CameraUnavailable(
                 "IR stream missing after a failed recovery".into(),
@@ -7883,6 +7911,22 @@ impl IrSession<'_> {
         self.dec = IrDecoder::new(self.cam.pix, self.cam.quantization);
         self.lit = lit;
         Ok(())
+    }
+
+    /// Explicit ADR-0021 invalidation for a held-side capture fault (#1033):
+    /// the auth layer no longer recovers held streams in place, so the
+    /// recovery-epoch side effect no longer runs; callers revoke the faulted
+    /// role's cached rate evidence here before the pair fails over.
+    ///
+    /// Revokes only this session's rate-amortization entry (exactly the
+    /// [`Self::recover`] recovery epoch's cache side effect), keyed by the
+    /// session's own amortization key. The rate window, the probe admission
+    /// and the live stream stay untouched: the caller is about to discard
+    /// this session. The fallback's fresh one-shot session for this role then
+    /// pays a full fill instead of admitting on a 5-delta probe (ADR-0021
+    /// items 3-5).
+    pub fn invalidate_rate_evidence(&mut self) {
+        self.stream.invalidate_rate_evidence();
     }
 }
 
@@ -14291,6 +14335,107 @@ mod tests {
         }
     }
 
+    /// #1033: the held-side failover path in `irlume-auth` revokes the
+    /// faulted role's cached ADR-0021 rate evidence through the session's
+    /// `invalidate_rate_evidence` by name, because the auth layer no longer
+    /// recovers held streams in place and the recovery-epoch cache side
+    /// effect no longer runs. Both session surfaces must expose it.
+    #[test]
+    fn both_session_surfaces_expose_held_side_rate_invalidation() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        for (impl_signature, surface) in [
+            ("\nimpl<'a> RgbSession<'a> {", "RgbSession"),
+            ("\nimpl IrSession<'_> {", "IrSession"),
+        ] {
+            assert!(
+                source_body(production, impl_signature)
+                    .contains("pub fn invalidate_rate_evidence(&mut self)"),
+                "{surface} must expose invalidate_rate_evidence for the #1033 held-side fault path"
+            );
+        }
+    }
+
+    /// Explicit ADR-0021 invalidation for a held-side capture fault (#1033):
+    /// the auth layer no longer recovers held streams in place, so the
+    /// recovery-epoch side effect no longer runs and the faulted role's
+    /// cached rate evidence is revoked here before the pair fails over. The
+    /// revocation must remove the entry and nothing else, so the fallback's
+    /// fresh one-shot session for that role pays a full fill instead of
+    /// admitting on a 5-delta probe (ADR-0021 items 3-5). Both session
+    /// surfaces expose the entry point; the fixture drives the shared
+    /// stream-level helper.
+    #[test]
+    fn held_side_fault_invalidation_removes_the_cached_rate_evidence() {
+        // Compile-level note that both session surfaces expose the entry
+        // point the #1033 auth call sites use (`&mut self`, no arguments).
+        fn both_surfaces_revoke(rgb: &mut RgbSession<'_>, ir: &mut IrSession<'_>) {
+            rgb.invalidate_rate_evidence();
+            ir.invalidate_rate_evidence();
+        }
+        let _ = both_surfaces_revoke;
+        // Admission depends on the kill switch being clear; hold the env lock
+        // so the kill-switch test cannot flip it mid-assertion.
+        let _guard = crate::testenv::env_lock();
+        for role in [contracts::StreamRole::Rgb, contracts::StreamRole::Ir] {
+            let node = "/dev/video-held-side-invalidate";
+            let key = rate_amortization::Key::new(node, role);
+            rate_amortization::test_support::force_completion(key.clone(), None);
+            let mut first = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            first
+                .fill_rate_evidence()
+                .expect("full fill records completion");
+            assert!(rate_amortization::amortizable(&key), "{role:?}");
+            let mut faulted = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            faulted.fill_rate_evidence().expect("probe admission");
+            assert!(faulted.health_admitted, "{role:?}: the probe admitted");
+            assert!(
+                rate_amortization::amortizable(&key),
+                "{role:?}: the evidence is still cached before the fault"
+            );
+            let window_deltas_before = faulted.rate_window.count();
+
+            faulted.invalidate_rate_evidence();
+
+            assert!(
+                !rate_amortization::amortizable(&key),
+                "{role:?}: a held-side fault revokes the cached rate evidence (ADR-0021, #1033)"
+            );
+            // The narrow call revokes only the cache entry: the session the
+            // caller is about to discard keeps its window, its admission and
+            // its stream.
+            assert!(
+                faulted.health_admitted,
+                "{role:?}: the probe admission is untouched"
+            );
+            assert_eq!(
+                faulted.rate_window.count(),
+                window_deltas_before,
+                "{role:?}: the rate window is untouched"
+            );
+            faulted
+                .next()
+                .expect("delivery after the narrow revocation");
+
+            let mut fallback = rate_fill_fixture(role, 40, 66_667).with_rate_amortization(node);
+            fallback.fill_rate_evidence().expect("fallback fill");
+            let (_, discarded, _) = fallback.accounting();
+            let full_fill =
+                (rate_gate::startup_flush(role) + rate_gate::RATE_WINDOW_CAPACITY + 1) as u64;
+            assert!(
+                discarded >= full_fill,
+                "{role:?}: the fallback re-pays the full fill instead of a probe: {discarded}"
+            );
+            assert!(
+                !fallback.health_admitted,
+                "{role:?}: no probe admission after the revocation"
+            );
+            rate_amortization::test_support::force_completion(key, None);
+        }
+    }
+
     #[test]
     fn paired_startup_leaves_ir_unstarted_until_rgb_has_a_buffer() {
         let mut rgb = rate_fill_fixture(contracts::StreamRole::Rgb, 100, 66_667);
@@ -20610,8 +20755,10 @@ mod tests {
         }
     }
 
-    /// Recover a held session in place, then capture, as `irlume-auth`'s
-    /// held capture does after a mid-stream fault.
+    /// Recover a held session in place, then capture, to measure the
+    /// camera-level recovery contract this test exercises: a recovery epoch
+    /// revokes the probe admission and refills the rate window before the
+    /// recovered capture.
     fn measure_held_recovery<S: HeldCounters, T>(
         session: &mut S,
         recover: impl FnOnce(&mut S) -> irlume_common::Result<()>,
@@ -20637,12 +20784,15 @@ mod tests {
     }
 
     /// ADR-0021 decision item 3 on a real pair: a held pair admitted by the
-    /// continuity probe recovers one side in place, as a held capture does
-    /// after a mid-stream fault. The recovery revokes that side's admission,
-    /// so its next capture discards a full window in the new epoch before
-    /// its burst, and the burst keeps the recovery marker on its first
-    /// contributor. Each role is measured before any assertion, and the
-    /// `HELD-RECOVERY` lines report what the held-pair fallback waits for.
+    /// continuity probe recovers one side in place. Since #1033 the auth
+    /// layer no longer does this on a held-side fault (it fails the pair over
+    /// and revokes the entry explicitly); this test pins the camera-level
+    /// recovery contract for `recover()` itself and any future caller. The
+    /// recovery revokes that side's admission, so its next capture discards a
+    /// full window in the new epoch before its burst, and the burst keeps the
+    /// recovery marker on its first contributor. Each role is measured before
+    /// any assertion, and the `HELD-RECOVERY` lines report what a fallback
+    /// behind an in-place recovery would wait for.
     #[test]
     #[ignore = "needs a real RGB+IR camera pair; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE"]
     fn held_pair_recovery_after_a_probe_admission_refills_its_window() {
@@ -20750,6 +20900,230 @@ mod tests {
             let after =
                 after.unwrap_or_else(|error| panic!("{role:?}: recovered capture: {error}"));
             assert_recovered_capture(&before, &after);
+        }
+    }
+
+    /// #1033 measurement: a held-side fault on a probe-admitted pair, handled
+    /// the way `irlume-auth` handled it BEFORE the fix (recover the stream in
+    /// place, then capture again; the frame is then discarded and the pair
+    /// falls back to one-shot sequential) versus AFTER (revoke the faulted
+    /// role's ADR-0021 rate evidence, return the fault, fail over at once).
+    /// One invocation measures both strategies once per role on identically
+    /// prepared probe-admitted pairs; the hardware harness invokes it three
+    /// times, giving the acceptance's three runs per role per strategy.
+    ///
+    /// The induced fault is the stream-teardown state on one side mid-hold
+    /// (`TrackedStream::take`, the same teardown `recover()` starts from): the
+    /// next capture on that side returns a typed delivery error exactly as a
+    /// mid-stream fault does, without any recovery side effects. Each
+    /// `HELD-FAULT` line reports the held pair duration (the whole
+    /// `capture_pair_with` call) and the time from the observed fault until
+    /// the pair result is available (when the fallback starts). The OLD
+    /// strategy replicates the pre-#1033 `held_*_capture` bodies verbatim
+    /// (recover + recapture through `measure_held_recovery`); the NEW strategy
+    /// replicates the post-#1033 bodies (`invalidate_rate_evidence` + return
+    /// the error). Like production, the recovered frame is discarded either
+    /// way, so the recapture's result is not asserted.
+    #[test]
+    #[ignore = "needs a real RGB+IR camera pair; set IRLUME_TEST_RGB_DEVICE/IRLUME_TEST_IR_DEVICE"]
+    fn held_fault_failover_without_in_place_recovery() {
+        use contracts::StreamRole;
+        let (rgb_path, ir_path) = loopback_pair();
+        let operation = lease::acquire_camera_operation(
+            &[rgb_path.as_str(), ir_path.as_str()],
+            lease::CameraOperationKind::Capture,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("acquire pair operation");
+        let rgb_camera = operation.open_rgb(&rgb_path).expect("open RGB camera");
+        let ir_camera = operation.open_ir(&ir_path).expect("open IR camera");
+        let arm = || {
+            let rgb = rgb_camera.session().expect("arm RGB");
+            let ir = ir_camera
+                .session_for_pair_with_progress(&no_progress())
+                .expect("arm IR");
+            (rgb, ir)
+        };
+        for role in [StreamRole::Rgb, StreamRole::Ir] {
+            // Probe admission is hardware-timing-sensitive by design: a
+            // startup Parked return or a below-floor sample skips the probe
+            // and falls back to a safe full fill (no admission). The
+            // measurement needs an admitted pair, so re-arm until one probe
+            // admits both sides; the fill re-records the completion each
+            // attempt. Failures carry both sides' counters.
+            let arm_probe_admitted_pair = || {
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    {
+                        let (mut rgb, mut ir) = arm();
+                        establish_pair_rate(&mut rgb, &mut ir).expect("full paired fill");
+                    }
+                    let (mut rgb, mut ir) = arm();
+                    establish_pair_rate(&mut rgb, &mut ir).expect("paired probe");
+                    if rgb.stream.health_admitted && ir.stream.health_admitted {
+                        return (rgb, ir);
+                    }
+                    if attempt >= 3 {
+                        let describe =
+                            |label: &str, admitted: bool, accounting: (u64, u64, u64)| {
+                                format!(
+                                    "{label}: admitted={admitted} observed={} discarded={}",
+                                    accounting.0, accounting.1
+                                )
+                            };
+                        panic!(
+                            "{role:?}: no probe-admitted pair after {attempt} attempts \
+                             ({}; {})",
+                            describe("rgb", rgb.stream.health_admitted, rgb.stream.accounting()),
+                            describe("ir", ir.stream.health_admitted, ir.stream.accounting()),
+                        );
+                    }
+                }
+            };
+            let (new_pair_ms, new_fallback_ms) = {
+                // NEW strategy (#1033): fault -> revoke rate evidence -> fail
+                // over at once.
+                let (mut rgb, mut ir) = arm_probe_admitted_pair();
+                match role {
+                    StreamRole::Rgb => drop(rgb.stream.take()),
+                    StreamRole::Ir => drop(ir.stream.take()),
+                }
+                let (mut rgb_fault_at, mut ir_fault_at) = (None, None);
+                let started = std::time::Instant::now();
+                let (rgb_res, ir_res) = capture_pair_with(
+                    &mut rgb,
+                    &mut ir,
+                    |s| {
+                        let frame = s.denoised();
+                        if let Err(error) = &frame {
+                            assert!(
+                                !matches!(
+                                    error,
+                                    irlume_common::Error::Preempted(_)
+                                        | irlume_common::Error::DeadlineExpired
+                                ),
+                                "the induced fault must be a real capture fault"
+                            );
+                            s.invalidate_rate_evidence();
+                            rgb_fault_at = Some(std::time::Instant::now());
+                        }
+                        frame
+                    },
+                    |s| {
+                        let captured = s.capture_with_stats();
+                        if let Err(error) = &captured {
+                            assert!(
+                                !matches!(
+                                    error,
+                                    irlume_common::Error::Preempted(_)
+                                        | irlume_common::Error::DeadlineExpired
+                                ),
+                                "the induced fault must be a real capture fault"
+                            );
+                            s.invalidate_rate_evidence();
+                            ir_fault_at = Some(std::time::Instant::now());
+                        }
+                        captured
+                    },
+                );
+                let pair_ms = started.elapsed().as_millis();
+                let fault_at = match role {
+                    StreamRole::Rgb => rgb_fault_at.expect("the RGB side faulted"),
+                    StreamRole::Ir => ir_fault_at.expect("the IR side faulted"),
+                };
+                let fallback_ms = fault_at.elapsed().as_millis();
+                match role {
+                    StreamRole::Rgb => {
+                        assert!(rgb_res.is_err(), "{role:?}: the fault surfaces");
+                        assert!(ir_res.is_ok(), "{role:?}: the companion captured");
+                    }
+                    StreamRole::Ir => {
+                        assert!(ir_res.is_err(), "{role:?}: the fault surfaces");
+                        assert!(rgb_res.is_ok(), "{role:?}: the companion captured");
+                    }
+                }
+                let faulted_key = rate_amortization::Key::new(
+                    match role {
+                        StreamRole::Rgb => &rgb_path,
+                        StreamRole::Ir => &ir_path,
+                    },
+                    role,
+                );
+                assert!(
+                    !rate_amortization::amortizable(&faulted_key),
+                    "{role:?}: the NEW handling must leave the faulted role's rate evidence revoked"
+                );
+                (pair_ms, fallback_ms)
+            };
+            let (old_recover_ms, old_capture_ms, old_pair_ms, old_fallback_ms) = {
+                // OLD strategy (pre-#1033): fault -> recover in place ->
+                // recapture (pays the ADR-0021 window refill the recovery
+                // epoch revokes) -> the pair still falls back afterwards.
+                let (mut rgb, mut ir) = arm_probe_admitted_pair();
+                match role {
+                    StreamRole::Rgb => drop(rgb.stream.take()),
+                    StreamRole::Ir => drop(ir.stream.take()),
+                }
+                let (mut rgb_fault_at, mut ir_fault_at) = (None, None);
+                let (mut rgb_measured, mut ir_measured) = (None, None);
+                let started = std::time::Instant::now();
+                let (_rgb_res, _ir_res) = capture_pair_with(
+                    &mut rgb,
+                    &mut ir,
+                    |s| match s.denoised() {
+                        Ok(frame) => Ok(frame),
+                        Err(
+                            error @ (irlume_common::Error::Preempted(_)
+                            | irlume_common::Error::DeadlineExpired),
+                        ) => Err(error),
+                        Err(_) => {
+                            rgb_fault_at = Some(std::time::Instant::now());
+                            measure_held_recovery(
+                                s,
+                                |s| s.recover(),
+                                |s| s.denoised(),
+                                &mut rgb_measured,
+                            )
+                        }
+                    },
+                    |s| match s.capture_with_stats() {
+                        Ok(captured) => Ok(captured),
+                        Err(
+                            error @ (irlume_common::Error::Preempted(_)
+                            | irlume_common::Error::DeadlineExpired),
+                        ) => Err(error),
+                        Err(_) => {
+                            ir_fault_at = Some(std::time::Instant::now());
+                            measure_held_recovery(
+                                s,
+                                |s| s.recover(),
+                                |s| s.capture_with_stats(),
+                                &mut ir_measured,
+                            )
+                        }
+                    },
+                );
+                let pair_ms = started.elapsed().as_millis();
+                let (fault_at, measured) = match role {
+                    StreamRole::Rgb => (rgb_fault_at, rgb_measured),
+                    StreamRole::Ir => (ir_fault_at, ir_measured),
+                };
+                let fault_at = fault_at.expect("the faulted side faulted before recovering");
+                let fallback_ms = fault_at.elapsed().as_millis();
+                let measured = measured.expect("the old handling recovered in place");
+                (
+                    measured.recover_ms,
+                    measured.capture_ms,
+                    pair_ms,
+                    fallback_ms,
+                )
+            };
+            eprintln!(
+                "HELD-FAULT role={role:?} new_pair_ms={new_pair_ms} new_fallback_ms={new_fallback_ms} \
+                 old_recover_ms={old_recover_ms} old_capture_ms={old_capture_ms} \
+                 old_pair_ms={old_pair_ms} old_fallback_ms={old_fallback_ms}"
+            );
         }
     }
 

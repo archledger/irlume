@@ -45,7 +45,117 @@ fn held_concurrent_failure_is_returned_to_the_pair_owner() {
     assert!(assess.contains("CapturePathError::ConcurrentPair"));
     assert!(assess.contains("concurrent_pair_requires_fallback"));
     assert!(assess.contains("runtime_contract"));
-    assert!(assess.contains("recovered_side"));
+    // #1033: a held-side capture fault fails the pair over at once. The two
+    // held capture helpers stay, their fault arms invalidate the faulted
+    // role's ADR-0021 rate-evidence entry explicitly, and no stream is ever
+    // recovered in place before the mandatory sequential fallback.
+    assert!(assess.contains("fn held_rgb_capture("));
+    assert!(assess.contains("fn held_ir_capture("));
+}
+
+fn assess_span(source: &str) -> &str {
+    function(
+        source,
+        "    fn assess_full_with_finish<T>(",
+        "\n    pub fn authenticate(",
+    )
+}
+
+fn auth_source() -> String {
+    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+        .expect("read auth source")
+}
+
+#[test]
+fn held_capture_faults_invalidate_rate_evidence_explicitly() {
+    let source = auth_source();
+    let assess = assess_span(&source);
+    assert!(
+        assess.contains("invalidate_rate_evidence"),
+        "a held-side fault must invalidate the faulted role's rate evidence"
+    );
+}
+
+#[test]
+fn held_captures_never_recover_a_stream_in_place() {
+    let source = auth_source();
+    let assess = assess_span(&source);
+    assert!(
+        !assess.contains(".recover()"),
+        "a held capture must never recover its stream in place"
+    );
+    assert!(
+        !assess.contains("recovered_side"),
+        "the recovered-side relabel leaves with in-place recovery"
+    );
+    // The acceptance bar is crate-wide: no `recover(` anywhere under
+    // crates/irlume-auth/src, tests or not.
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read auth src dir") {
+            let path = entry.expect("auth src entry").path();
+            if path.is_dir() {
+                walk(&path, hits);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read auth src file");
+                if text.contains(".recover()") {
+                    hits.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        &mut hits,
+    );
+    assert!(
+        hits.is_empty(),
+        "no recover( call may survive under crates/irlume-auth/src: {hits:?}"
+    );
+}
+
+#[test]
+fn held_pair_refuses_the_sequential_schedule() {
+    let source = auth_source();
+    let assess = assess_span(&source);
+    assert!(
+        assess.contains("held pair capture requires the concurrent schedule"),
+        "a held pair refuses the sequential schedule instead of capturing on it"
+    );
+}
+
+#[test]
+fn held_pair_failure_returns_the_side_original_error() {
+    let source = auth_source();
+    assert!(
+        source.contains("fn held_pair_side_error("),
+        "the pair-failure error is the winning side's original error"
+    );
+    let assess = assess_span(&source);
+    assert!(
+        assess.contains("held_pair_side_error(rgb_error, ir_error)"),
+        "the held pair-failure path must return the winning side's original error"
+    );
+}
+
+#[test]
+fn managed_pair_faults_invalidate_rate_evidence_explicitly() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/managed_pad.rs"))
+            .expect("read managed_pad source");
+    let sample = function(&source, "    fn prepare_managed_concurrent_sample(", "\n}");
+    assert!(
+        sample.contains("invalidate_rate_evidence"),
+        "a managed pair side fault must revoke the faulted role's rate evidence too"
+    );
+    assert!(
+        sample.contains("fault_revokes_rate_evidence"),
+        "the managed revocation must stay gated on the non-cancellation predicate"
+    );
+    assert!(
+        sample.contains("Preempted") && sample.contains("DeadlineExpired"),
+        "cancellations must stay outside the rate-evidence revocation"
+    );
 }
 
 #[test]

@@ -423,18 +423,38 @@ impl Engine {
         let (mut rgb_ms, mut ir_ms) = (0, 0);
         // No recovery within an evidence transaction: either side failing
         // invalidates both, and the existing outer fallback owns any reopen.
+        // A non-cancellation side fault revokes that role's ADR-0021 cached
+        // rate evidence explicitly (#1033), so the fallback's fresh session
+        // for the faulted role cannot admit on a probe contradicted by the
+        // fault. A cancellation is not a fault and revokes nothing.
+        let fault_revokes_rate_evidence = |error: &irlume_common::Error| {
+            !matches!(
+                error,
+                irlume_common::Error::Preempted(_) | irlume_common::Error::DeadlineExpired
+            )
+        };
         let (rgb_result, ir_result) = irlume_camera::capture_pair_with(
             rgb,
             ir,
             |session| {
                 let started = Instant::now();
                 let frame = session.denoised();
+                if let Err(error) = &frame {
+                    if fault_revokes_rate_evidence(error) {
+                        session.invalidate_rate_evidence();
+                    }
+                }
                 rgb_ms = started.elapsed().as_millis();
                 frame
             },
             |session| {
                 let started = Instant::now();
                 let frame = session.capture_with_stats();
+                if let Err(error) = &frame {
+                    if fault_revokes_rate_evidence(error) {
+                        session.invalidate_rate_evidence();
+                    }
+                }
                 ir_ms = started.elapsed().as_millis();
                 frame
             },

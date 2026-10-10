@@ -615,6 +615,15 @@ mod onnx {
                      run outside the per-model certification regime \
                      (ADR-0033 section 7)"
                 );
+                // CoreML stays inert here too, and a build that compiled it
+                // alongside a registered provider must hear that, like every
+                // other inactive provider.
+                #[cfg(feature = "coreml")]
+                irlume_common::jout_warn!(
+                    "irlume: the coreml execution provider is compiled into \
+                     this build but is never registered, because its compute \
+                     units always admit the CPU (ADR-0033 section 7)"
+                );
                 // Strict means strict: a provider that cannot load is an
                 // error, and a graph the registered providers cannot fully
                 // cover refuses instead of quietly running parts on the CPU
@@ -1193,6 +1202,14 @@ mod onnx {
             assert!(
                 pins >= 2,
                 "both escape-inactive arms pin the default CPU EP"
+            );
+            // The explicit CPU device and the CPU-fallback disable are
+            // mutually exclusive upstream (a hard error when combined), so
+            // each appears exactly where it belongs.
+            assert_eq!(
+                build.matches("with_disable_cpu_fallback()").count(),
+                1,
+                "the CPU-fallback disable appears once, inside the escape"
             );
             let first_pin = build.find("pin_default_cpu_ep(b)?").expect("a pin");
             assert!(

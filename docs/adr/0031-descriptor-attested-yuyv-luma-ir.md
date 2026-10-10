@@ -462,9 +462,10 @@ file descriptor (`crates/irlume-camera/src/yuyv_fd.rs`).
   boundary where the negotiated format is already compared (#427): before
   and after the buffer claim, after a stream's first dequeue, and on every
   reopen after recovery. A moved field, another node or a failed read
-  refuses that capture as stream state drift. At the first dequeue the
-  refusal also ends warm-up, which retries other dequeue failures, so a
-  later clean read cannot heal it.
+  refuses that capture as stream state drift. At the first dequeue any
+  refusal from these rechecks, raw evidence or the wrapper format and
+  interval snapshot alike, ends warm-up, which retries other dequeue
+  failures, so a later clean read cannot heal it.
 - **Without evidence.** A camera whose binding fails has no evidence and
   captures exactly as before; only the ceiling, which no YUYV stream has,
   needs it. IR paths outside an `IrCamera` (emitter setup and the raw and

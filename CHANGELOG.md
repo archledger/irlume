@@ -139,6 +139,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A wrapper format drift, an interval drift or a failed format or interval
+  read seen at a stream's first dequeue ends warm-up on that dequeue with
+  the boundary's own error, as the raw ADR-0031 §4 evidence already did,
+  instead of spending the eight-try budget and reporting the drift as an
+  unavailable camera (#1035).
+
 - Concurrent pair capture no longer renews ADR-0021 rate-evidence reuse
   from a probe-admitted partial window, and a continuity probe on either
   fill path never admits below the full five deltas, so a run of

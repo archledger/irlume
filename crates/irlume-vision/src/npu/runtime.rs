@@ -219,6 +219,22 @@ fn validate_file(path: &Path, trust: &Trust) -> Result<PathBuf, CpuReason> {
     Ok(canonical)
 }
 
+/// The first path component, leaf included, whose name cannot be inspected to
+/// a resolved file: one that exists without resolving (a dangling symlink) or
+/// whose metadata cannot be read. A component that genuinely does not exist is
+/// absence, not an error. Mirrors the settings reader's ancestor walk
+/// (`no_dangling_link_on` in the daemon and `irlume-common`).
+fn unresolvable_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|part| !part.as_os_str().is_empty())
+        .find_map(|part| match fs::symlink_metadata(part) {
+            Ok(_) if fs::metadata(part).is_ok() => None,
+            Ok(_) => Some(part.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(part.to_path_buf()),
+        })
+}
+
 fn resolve_selected(
     selection: &RuntimeSelection,
     dirs: &[&str],
@@ -240,7 +256,18 @@ fn resolve_selected(
                     }
                     match fs::symlink_metadata(&path) {
                         Ok(_) => return validate_file(&path, trust).map(|_| path),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // A leaf NotFound reached through an ancestor that
+                            // exists without resolving is not genuine absence.
+                            if let Some(unresolvable) = unresolvable_ancestor(&path) {
+                                return Err(CpuReason::IdentityUnreadable(format!(
+                                    "NPU library lookup {}: ancestor {} cannot be resolved",
+                                    path.display(),
+                                    unresolvable.display()
+                                )));
+                            }
+                            continue;
+                        }
                         Err(error) => {
                             return Err(CpuReason::IdentityUnreadable(format!(
                                 "NPU library lookup {}: {error}",
@@ -406,6 +433,73 @@ mod tests {
             )
             .unwrap(),
             good.join("libopenvino_c.so.2621")
+        );
+    }
+
+    #[test]
+    fn a_dangling_standard_root_is_not_absence_and_refuses_lower_candidates() {
+        let (directory, trust) = fixture();
+        let dangling = directory.path().join("dangling_root");
+        symlink("missing_target", &dangling).unwrap();
+        let healthy = directory.path().join("healthy_root");
+        fs::create_dir(&healthy).unwrap();
+        fs::write(healthy.join("libopenvino_c.so.2621"), b"fixture").unwrap();
+        let error = resolve(
+            &RuntimeSelection::Automatic,
+            &[dangling.to_str().unwrap(), healthy.to_str().unwrap()],
+            &trust,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(dangling.to_str().unwrap()),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_directory_ancestor_is_not_absence_and_refuses() {
+        let (directory, trust) = fixture();
+        let linked = directory.path().join("linked");
+        symlink("missing_target", &linked).unwrap();
+        let nested = linked.join("nested");
+        let healthy = directory.path().join("healthy_root");
+        fs::create_dir(&healthy).unwrap();
+        fs::write(healthy.join("libopenvino_c.so.2621"), b"fixture").unwrap();
+        let error = resolve(
+            &RuntimeSelection::Automatic,
+            &[nested.to_str().unwrap(), healthy.to_str().unwrap()],
+            &trust,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(linked.to_str().unwrap()),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_absence_still_advances_and_empty_root_list_stays_not_found() {
+        let (directory, trust) = fixture();
+        let empty = directory.path().join("healthy_empty");
+        fs::create_dir(&empty).unwrap();
+        let healthy = directory.path().join("healthy_root");
+        fs::create_dir(&healthy).unwrap();
+        fs::write(healthy.join("libopenvino_c.so.2621"), b"fixture").unwrap();
+        assert_eq!(
+            resolve(
+                &RuntimeSelection::Automatic,
+                &[empty.to_str().unwrap(), healthy.to_str().unwrap()],
+                &trust
+            )
+            .unwrap(),
+            healthy.join("libopenvino_c.so.2621")
+        );
+        assert_eq!(
+            resolve(&RuntimeSelection::Automatic, &[], &trust).unwrap_err(),
+            CpuReason::RuntimeAbsent(
+                "no reviewed NPU C API library is installed in the standard system/source locations"
+                    .into()
+            )
         );
     }
 

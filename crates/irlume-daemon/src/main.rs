@@ -229,16 +229,19 @@ fn verify_models(paths: &[&str], keep: Option<&str>) -> Option<irlume_common::Ha
 /// `None` is the fallback when verification could not retain readable bytes.
 /// Post-panic rebuilds repeat verification in [`rebuild_engine_from_config`]
 /// and pass retained bytes here when available. Each build drops that buffer
-/// as soon as the session owns its copy rather than retaining it for the
-/// daemon's lifetime.
+/// once NPU placement has borrowed it as the parity canary's input (auxiliary
+/// sessions load before placement, so their native mappings land in the
+/// placement's certified executable inventory) rather than retaining it for
+/// the daemon's lifetime.
 fn load_shipped_recognizer(
     det_path: &str,
     model_path: &str,
     verified: Option<&irlume_common::HashedModel>,
 ) -> irlume_common::Result<irlume_auth::Engine> {
     match verified {
-        // The caller owns the serialized buffer and drops it before it loads
-        // any auxiliary sessions.
+        // The caller owns the serialized buffer and drops it after
+        // construction: the auxiliary sessions load before NPU placement,
+        // which borrows the bytes as its parity canary's input.
         Some(weights) => irlume_auth::Engine::load_with_recognizer_weights(det_path, weights),
         None => irlume_auth::Engine::load(det_path, model_path),
     }
@@ -649,16 +652,6 @@ fn build_engine_from_config(
         .map(|engine| engine.with_devices(&config.rgb_dev, &config.ir_dev))
         .and_then(|engine| engine.with_ir_adapter(&config.adapter))
         .map(|engine| engine.with_ir_adapter_required(config.adapter_required))
-        // The NPU is offered only the verified bytes, once the adapter is
-        // configured, because an adapter keeps the recognizer on CPU
-        // (ADR-0022 §2).
-        .map(|engine| match &recognizer {
-            Some(weights) => npu_placement::place(engine, weights),
-            None => engine,
-        });
-    // The verified buffer is released before the auxiliary sessions load.
-    drop(recognizer);
-    engine
         // FaceMesh load failure disables rescue alignment only; recognition
         // and the PAM-conversation intent confirmation do not need the mesh.
         // Outside strict mode the daemon therefore stays available; strict
@@ -684,6 +677,30 @@ fn build_engine_from_config(
         })
         .and_then(|engine| engine.with_blaze_rescue(&config.blaze))
         .map(|engine| load_pad_models(engine, &config.vit_pad, &config.pad_ir))
+        // The NPU is offered only the verified bytes, once the adapter is
+        // configured, because an adapter keeps the recognizer on CPU
+        // (ADR-0022 §2), and only after every auxiliary session above has
+        // been constructed: opening the NPU context captures the certified
+        // executable inventory the pre-inference recheck enforces, so the
+        // lazily dlopen'd TFLite C runtime that with_mesh loads must already
+        // be mapped when the capture hashes it (PR #1047 review comment
+        // 4236061696). A file-backed executable mapping that appears only
+        // after the capture is rejected as unhashed and retires the slot to
+        // CPU once loading admission opens.
+        .map(|(engine, rgb_pad, ir_pad)| {
+            let engine = match &recognizer {
+                Some(weights) => npu_placement::place(engine, weights),
+                None => engine,
+            };
+            (engine, rgb_pad, ir_pad)
+        });
+    // The verified buffer is released as soon as placement has borrowed it
+    // for the parity canary. It is no longer dropped before the auxiliary
+    // sessions load: those sessions must precede the NPU inventory capture,
+    // and placement needs these same verified bytes. It is still never
+    // retained for the daemon's lifetime.
+    drop(recognizer);
+    engine
 }
 
 fn rebuild_engine_from_config(
@@ -1020,8 +1037,11 @@ fn main() {
             //
             // `recognizer` is what startup already read, hashed and verified
             // (#346); None requests a fresh manifest check for a post-panic
-            // rebuild. Verified recognizer bytes are released as soon as its
-            // session is built, before constructing auxiliary model sessions.
+            // rebuild. Verified recognizer bytes are released once engine
+            // construction is done with them: the auxiliary model sessions
+            // load before NPU placement (whose certified executable inventory
+            // must already contain their native mappings), and placement's
+            // parity canary borrows the bytes last.
             let engine_config = EngineBuildConfig {
                 det,
                 model,
@@ -11829,11 +11849,19 @@ mod tests {
     }
 
     #[test]
-    fn the_recognizer_buffer_is_released_before_the_auxiliary_sessions() {
-        // build_engine_from_config owns the verified recognizer buffer: the
-        // loader borrows it, the NPU placement (after the IR adapter is
-        // configured, ADR-0022 §2) borrows it, and it is dropped before any
-        // auxiliary model session starts.
+    fn auxiliary_sessions_load_before_the_npu_inventory_capture() {
+        // build_engine_from_config must construct every auxiliary session
+        // (mesh, blaze rescue, PAD models) BEFORE npu_placement::place opens
+        // the NPU context: that open captures the certified executable
+        // inventory the pre-inference recheck enforces, and the shipped TFLite
+        // mesh makes with_mesh lazily dlopen the TFLite C runtime, so a
+        // mapping that appears only after the capture is rejected as unhashed
+        // and retires the slot to CPU before the first authentication
+        // inference once loading admission opens (PR #1047 review comment
+        // 4236061696). The verified recognizer buffer therefore outlives the
+        // auxiliary construction (the loader and the placement's parity canary
+        // both borrow it) and is dropped immediately after placement rather
+        // than before the auxiliary sessions load.
         let _: fn(
             &str,
             &str,
@@ -11847,8 +11875,11 @@ mod tests {
             .expect("build_engine_from_config");
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
         assert!(at("with_ir_adapter_required") < at("npu_placement::place"));
+        assert!(at("with_mesh") < at("npu_placement::place"));
+        assert!(at("with_mesh_degraded") < at("npu_placement::place"));
+        assert!(at("with_blaze_rescue") < at("npu_placement::place"));
+        assert!(at("load_pad_models") < at("npu_placement::place"));
         assert!(at("npu_placement::place") < at("drop(recognizer);"));
-        assert!(at("drop(recognizer);") < at("with_mesh"));
     }
 
     #[test]

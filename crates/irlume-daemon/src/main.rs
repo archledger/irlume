@@ -319,10 +319,13 @@ mod npu_placement {
 
     /// The `IRLUME_NPU` / `npu` switch (ADR-0022 §12).
     #[cfg(feature = "npu")]
-    fn switch_allows() -> bool {
-        let file = std::fs::read(irlume_common::config::config_path("settings.conf"));
+    pub(super) fn switch_allows() -> bool {
+        let path = irlume_common::config::config_path("settings.conf");
+        let file = std::fs::read(&path);
         let setting = match &file {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && no_dangling_link_on(&path) =>
+            {
                 irlume_auth::npu::Setting::Absent
             }
             Err(_) => irlume_auth::npu::Setting::Unreadable,
@@ -18476,22 +18479,29 @@ mod tests {
     fn administrator_provider_selection_reads_machine_config_and_environment_only() {
         let _g = env_lock();
         let _sb = sandbox("npu-provider-selection");
-        struct Restore(Option<std::ffi::OsString>);
+        struct Restore(&'static str, Option<std::ffi::OsString>);
         impl Drop for Restore {
             fn drop(&mut self) {
-                match &self.0 {
-                    Some(value) => std::env::set_var("IRLUME_NPU_LIBRARY", value),
-                    None => std::env::remove_var("IRLUME_NPU_LIBRARY"),
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
                 }
             }
         }
-        let _restore = Restore(std::env::var_os("IRLUME_NPU_LIBRARY"));
+        let _restore_library =
+            Restore("IRLUME_NPU_LIBRARY", std::env::var_os("IRLUME_NPU_LIBRARY"));
         std::env::remove_var("IRLUME_NPU_LIBRARY");
+        let _restore_switch = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
+        std::env::remove_var("IRLUME_NPU");
         let settings = irlume_common::config::config_path("settings.conf");
         assert_eq!(
             npu_placement::runtime_selection(),
             irlume_auth::npu::RuntimeSelection::Automatic,
             "a genuinely absent settings file permits automatic selection"
+        );
+        assert!(
+            npu_placement::switch_allows(),
+            "a genuinely absent settings file leaves the NPU switch on"
         );
         std::fs::write(
             &settings,
@@ -18553,6 +18563,12 @@ mod tests {
             ),
             "the administrator override still wins over a dangling settings file"
         );
+        // The kill switch reads the same unreadable file: the library override
+        // must not carry NPU use past a policy that cannot be read.
+        let dangling_file_switch = npu_placement::switch_allows();
+        std::env::set_var("IRLUME_NPU", "on");
+        let dangling_file_switch_on = npu_placement::switch_allows();
+        std::env::remove_var("IRLUME_NPU");
         std::env::remove_var("IRLUME_NPU_LIBRARY");
         std::fs::remove_file(&settings).unwrap();
 
@@ -18571,6 +18587,7 @@ mod tests {
             ),
             "the administrator override still wins over a dangling directory component"
         );
+        let dangling_directory_switch = npu_placement::switch_allows();
         std::env::remove_var("IRLUME_NPU_LIBRARY");
         std::env::set_var("IRLUME_CONFIG_DIR", missing_directory.join("nested"));
         assert_eq!(
@@ -18599,6 +18616,12 @@ mod tests {
             ),
             "dangling settings must refuse automatic selection: file={dangling_file:?}, \
              directory component={dangling_directory:?}"
+        );
+        assert!(
+            !dangling_file_switch && !dangling_file_switch_on && !dangling_directory_switch,
+            "dangling settings must keep the kill switch off: file={dangling_file_switch}, \
+             file with IRLUME_NPU=on={dangling_file_switch_on}, \
+             directory component={dangling_directory_switch}"
         );
     }
 

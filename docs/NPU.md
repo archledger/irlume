@@ -11,6 +11,30 @@ runtimes follow the same rules. `intel-npu-stack` is an optional reference
 installation; its package name grants no permission. The default-off `npu`
 build feature does not bypass loading admission or model certification.
 
+## Recognizer device selection
+
+`recognizer_device` in `/etc/irlume/settings.conf` (`IRLUME_RECOGNIZER_DEVICE`
+on the daemon overrides it) names the recognizer's intended device: `auto`
+(the default), `cpu`, `npu` or `gpu` (#1053). The selection never lowers a
+gate:
+
+- `auto` ranks certified devices. No accelerator placement is admitted and
+  certified today, so `auto` keeps the recognizer on CPU, exactly the
+  switch-gated behavior.
+- `cpu` keeps every probe on the CPU reference and skips NPU discovery and
+  compile; the placement reason names the selection.
+- `npu` attempts NPU placement under the same admission and certification
+  gates; the separate `npu`/`IRLUME_NPU` kill switch still wins.
+- `gpu` is accepted and reported, but no build admits GPU placement yet; the
+  recognizer stays on CPU with that reason.
+
+An IR adapter keeps the recognizer on CPU whatever the selection (ADR-0022
+§2). An empty, unknown, duplicated or non-UTF-8 value, or an unreadable
+`settings.conf`, is a journal warning and resolves to `auto`; authentication
+never fails over the device preference. The selection joins the same single
+startup settings snapshot as the NPU switch and the provider selection, and
+a restart applies a change.
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then
@@ -116,6 +140,7 @@ installation relocation and model certification still need their own evidence.
 | `npu-runtime` | `recognizer.runtime_available` | `true` when discovery completed with a runtime/platform identity; `false` when discovery returned an error other than loading-admission refusal; omitted when unreported |
 | `npu-qualification` | `recognizer.qualified` | When runtime availability is `true`, whether the recognizer is currently placed on NPU after qualification and placement checks; otherwise omitted |
 | `recognizer-device` | `recognizer.device` | Current engine placement: `cpu` or `npu` |
+| `recognizer-selection` | `recognizer.selection` | The governing device selection (`recognizer_device`): `auto`, `cpu`, `npu` or `gpu` |
 | `npu-platform` | `recognizer.platform` | Exact platform identity digest, when discovery obtained one |
 
 A loading-admission refusal reports no runtime observation. So does a failure

@@ -191,14 +191,18 @@ jobs:
           # Synthetic published state and sandboxed config only; these exact
           # tests need neither model loading nor the token-delivery CLI helper.
           # Require every name so a renamed or ignored regression fails CI.
-          ./scripts/run-tests-guarded.sh --min 4 \
+          ./scripts/run-tests-guarded.sh --min 6 \
             --require tests::npu_settings_snapshot_survives_atomic_replacement \
             --require tests::administrator_provider_selection_reads_machine_config_and_environment_only \
+            --require tests::recognizer_device_selection_reads_machine_config_and_environment_only \
+            --require tests::recognizer_device_selection_skips_or_attempts_npu_placement \
             --require tests::health_reports_the_published_engine_bits \
             --require tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
             -- cargo test --locked -p irlume-daemon --features npu --bin irlumed -- --exact \
             tests::npu_settings_snapshot_survives_atomic_replacement \
             tests::administrator_provider_selection_reads_machine_config_and_environment_only \
+            tests::recognizer_device_selection_reads_machine_config_and_environment_only \
+            tests::recognizer_device_selection_skips_or_attempts_npu_placement \
             tests::health_reports_the_published_engine_bits \
             tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail
 

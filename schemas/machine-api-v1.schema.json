@@ -557,6 +557,11 @@
             "qualified": {
               "description": "Whether the engine currently passed the model's qualification and NPU placement checks. Optional; absence means unreported or no available runtime. Actual device and reason still describe fallback or retirement.",
               "type": "boolean"
+            },
+            "selection": {
+              "description": "The device selection that governs this placement (recognizer_device in settings.conf). Optional; absence means the daemon did not report one.",
+              "type": "string",
+              "enum": ["auto", "cpu", "npu", "gpu"]
             }
           }
         }

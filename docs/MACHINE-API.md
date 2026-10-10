@@ -149,7 +149,7 @@ asked about.
   "camera": { "known": true, "rgb": true, "ir": true },
   "fingerprint": false,
   "fingerprint_known": true,
-  "recognizer": { "known": true, "device": "cpu", "reason": "…" }
+  "recognizer": { "known": true, "device": "cpu", "reason": "…", "selection": "auto" }
 }
 ```
 
@@ -195,6 +195,13 @@ Optional `recognizer.qualified` is reported only when `runtime_available` is
 `true`: it is `true` for current NPU placement after qualification and placement
 checks, and `false` when the recognizer stays on or retires to CPU. Missing
 fields from older peers remain absent; clients must not infer `false`.
+
+Optional `recognizer.selection` is the device selection governing the placement
+(`recognizer_device` in `settings.conf`): `auto`, `cpu`, `npu` or `gpu`. It is
+the administrator's configured target, not a placement claim: `auto` and `npu`
+still leave admission and certification to decide, `cpu` keeps every probe on
+the CPU reference, and `gpu` names a target no build admits yet. It is omitted
+when the daemon does not report one.
 
 These are engine facts, not a per-account guarantee. Matchable scans with
 missing or different CPU-producer tags, including legacy enrollments, require
@@ -282,6 +289,7 @@ reused for a different meaning. The registry as of this contract:
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
 | `recognizer-device` | the daemon's engine placement for authentication probes (ADR-0022): `NPU`, or `CPU:` with a peer-appropriate reason. Enrollment producer checks can still require CPU probes. `info`; `unknown` when the daemon did not answer or predates the report |
+| `recognizer-selection` | the device selection governing that placement (`recognizer_device`): `auto`, `cpu`, `npu` or `gpu`, with what each still leaves to admission and certification. `info`; `unknown` when the daemon did not answer or predates the report |
 | `npu-platform` | the NPU platform identity digest the daemon read for the recognizer, or that none was read. `info`; `unknown` as for `recognizer-device` |
 | `npu-runtime` | the engine's runtime discovery observation. `info` for reported availability or failure; `unknown` for unreported discovery, loading-admission refusal, or an older/non-answering daemon |
 | `npu-qualification` | whether the recognizer is currently placed on NPU after qualification/placement checks. `info` for a reported fact; `unknown` when runtime availability is not `true` or qualification is unreported. Discovery alone never implies NPU authentication |

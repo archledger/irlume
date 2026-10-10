@@ -34,6 +34,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Recognizer device selection: `recognizer_device` in `settings.conf`
+  (`IRLUME_RECOGNIZER_DEVICE` overrides) names the recognizer's intended
+  device, `auto` (the default), `cpu`, `npu` or `gpu`. A selection never
+  lowers a gate: `cpu` skips NPU discovery with the reason reported, `npu`
+  attempts placement under the unchanged kill switch, admission and
+  certification, `gpu` is reported but no build admits placement yet, and
+  `auto` keeps today's switch-gated behavior. A malformed value or unreadable
+  settings is a journal warning resolving to `auto`, the selection joins the
+  one startup settings snapshot, and `doctor` (`recognizer-selection`) and
+  `status --json` (`recognizer.selection`) report it (#1053).
+
 - NPU provider selection and reporting groundwork: an administrator can select
   an absolute C API file with `npu_library` or `IRLUME_NPU_LIBRARY`; automatic
   selection checks standard system and `/usr/local` roots, preferring

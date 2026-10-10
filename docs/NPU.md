@@ -90,7 +90,11 @@ If it cannot be identified in the inventory, inventory construction refuses.
 Every observed shared native library remains keyed. Anonymous executable
 mappings and non-executable data files are outside the execution inventory.
 An executable file mapped later without an inventory entry, or a deleted or
-replaced mapped file, refuses placement. Distinct paths with the same basename
+replaced mapped file, refuses placement. The inventory is checked before and
+after every inference, including parity. A failed check discards the result
+and retires the model to CPU. These snapshots do not detect code loaded and
+unloaded entirely between checks or replace pre-load admission.
+Distinct paths with the same basename
 make the portable key ambiguous and refuse portable qualification, even if
 their bytes match.
 

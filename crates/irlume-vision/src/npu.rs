@@ -816,10 +816,21 @@ fn discard_blobs(blobs: &Path) -> io::Result<()> {
 
 /// An NPU model whose every inference is bracketed by its marker, so a
 /// crash or a watchdog kill mid-inference keeps the model on CPU after the
-/// restart (ADR-0022 §10).
+/// restart (ADR-0022 §10). Validate the retained execution inventory around
+/// every native call, including parity, before any output reaches a decoder.
 struct Marked {
     inner: Box<dyn Infer>,
     marker: MarkerFile,
+    maps: PathBuf,
+    libraries: Vec<HashedLibrary>,
+}
+
+impl Marked {
+    fn verify_libraries(&self) -> Result<(), String> {
+        fs::read_to_string(&self.maps)
+            .map_err(|error| format!("maps: {error}"))
+            .and_then(|maps| execution_loaded_as_hashed(&maps, &self.libraries))
+    }
 }
 
 impl Infer for Marked {
@@ -827,7 +838,14 @@ impl Infer for Marked {
         self.marker
             .arm()
             .map_err(|error| format!("cannot write the marker: {error}"))?;
-        let output = self.inner.infer(input);
+        let output = (|| {
+            self.verify_libraries()?;
+            let output = self.inner.infer(input);
+            // Inference may lazily load native code after compilation. Check
+            // even on an inner error, and never return an unchecked output.
+            self.verify_libraries()?;
+            output
+        })();
         self.marker
             .disarm()
             .map_err(|error| format!("cannot clear the marker: {error}"))?;
@@ -1428,7 +1446,12 @@ impl Platform {
             }
             (Ok(inner), true)
         })?;
-        Ok(Box::new(Marked { inner, marker }))
+        Ok(Box::new(Marked {
+            inner,
+            marker,
+            maps: self.maps.clone(),
+            libraries: self.libraries.clone(),
+        }))
     }
 
     fn compile_unguarded(
@@ -2422,6 +2445,7 @@ mod tests {
         let cache = Cache::prepare(base.path(), &identity(), "boot-a").unwrap();
         let marker = cache.marker_file(&sha);
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (maps, libraries) = inference_inventory_fixture(base.path());
         let mut marked = Marked {
             inner: Box::new(Fake {
                 replies: vec![Ok(vec![1.0]), Err("lost".into())],
@@ -2429,6 +2453,8 @@ mod tests {
                 seen: Some((marker.path.clone(), seen.clone())),
             }),
             marker: cache.marker_file(&sha),
+            maps,
+            libraries,
         };
         assert_eq!(marked.infer(&[0.0]), Ok(vec![1.0]));
         assert_eq!(cache.marker(&sha), Marker::Absent, "cleared after a return");
@@ -2455,6 +2481,7 @@ mod tests {
     #[test]
     fn a_marker_that_cannot_be_written_keeps_the_npu_from_answering() {
         let base = tempfile::tempdir().unwrap();
+        let (maps, libraries) = inference_inventory_fixture(base.path());
         let mut marked = Marked {
             inner: Box::new(Fake {
                 replies: vec![Ok(vec![1.0])],
@@ -2465,8 +2492,177 @@ mod tests {
                 path: base.path().join("missing-dir").join("marker"),
                 boot_id: "boot-a".into(),
             },
+            maps,
+            libraries,
         };
         assert!(marked.infer(&[0.0]).is_err());
+    }
+
+    fn inference_inventory_fixture(base: &Path) -> (PathBuf, Vec<HashedLibrary>) {
+        let library = base.join("libfixture.so");
+        fs::write(&library, b"synthetic library").unwrap();
+        let maps = base.join("maps");
+        fs::write(&maps, map_line(&library)).unwrap();
+        let libraries = vec![HashedLibrary {
+            inode: fs::metadata(&library).unwrap().ino(),
+            path: library,
+        }];
+        (maps, libraries)
+    }
+
+    struct DuringInference {
+        action: Box<dyn FnMut() + Send>,
+        marker: PathBuf,
+        calls: Calls,
+    }
+
+    impl Infer for DuringInference {
+        fn infer(&mut self, _input: &[f32]) -> Result<Vec<f32>, String> {
+            assert!(self.marker.exists(), "native call must remain marked");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.action)();
+            Ok(vec![0.25])
+        }
+    }
+
+    fn inference_inventory_model(
+        base: &Path,
+        action: impl FnMut() + Send + 'static,
+    ) -> (Marked, Calls) {
+        let (maps, libraries) = inference_inventory_fixture(base);
+        let marker = MarkerFile {
+            path: base.join("inference-marker"),
+            boot_id: "fixture-boot".into(),
+        };
+        let calls = Calls::default();
+        let inner = Box::new(DuringInference {
+            action: Box::new(action),
+            marker: marker.path.clone(),
+            calls: calls.clone(),
+        });
+        (
+            Marked {
+                inner,
+                marker,
+                maps,
+                libraries,
+            },
+            calls,
+        )
+    }
+
+    #[test]
+    fn inference_inventory_accepts_valid_calls_and_clears_marker() {
+        let base = tempfile::tempdir().unwrap();
+        let (mut model, calls) = inference_inventory_model(base.path(), || {});
+        for _ in 0..2 {
+            assert_eq!(model.infer(&[0.0]), Ok(vec![0.25]));
+            assert_eq!(model.marker.state(), Marker::Absent);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn inference_inventory_rejects_lazy_mappings_and_retires_slot() {
+        // Both the first call (used by parity) and a later call must discard
+        // an otherwise valid result when native code loads a new dependency.
+        for load_on in [1, 2] {
+            let base = tempfile::tempdir().unwrap();
+            let maps = base.path().join("maps");
+            let extra = base.path().join("liblazy.so");
+            fs::write(&extra, b"synthetic late dependency").unwrap();
+            let mut count = 0;
+            let (model, calls) = inference_inventory_model(base.path(), move || {
+                count += 1;
+                if count == load_on {
+                    let changed = fs::read_to_string(&maps).unwrap() + &map_line(&extra);
+                    fs::write(&maps, changed).unwrap();
+                }
+            });
+            let original = fs::read_to_string(&model.maps).unwrap();
+            let mut slot = Slot::certified(
+                Box::new(model),
+                Box::leak(Box::new(entry("synthetic-key".into()))),
+            );
+            for _ in 1..load_on {
+                assert_eq!(slot.run(&[0.0], first), Some(0.25));
+            }
+            let mut decoded = false;
+            assert_eq!(
+                slot.run(&[0.0], |raw| {
+                    decoded = true;
+                    first(raw)
+                }),
+                None,
+                "unqualified output must request CPU fallback"
+            );
+            assert!(!decoded, "rejected output must not reach the decoder");
+            assert!(matches!(
+                slot.device(),
+                Device::Cpu(CpuReason::Retired(why)) if why.contains("not hashed")
+            ));
+            assert!(slot.certification().is_none());
+            assert!(!base.path().join("inference-marker").exists());
+            fs::write(base.path().join("maps"), original).unwrap();
+            assert_eq!(slot.run(&[0.0], first), None, "retirement is permanent");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), load_on);
+        }
+    }
+
+    #[test]
+    fn inference_inventory_refuses_pre_call_invalidation_without_native_entry() {
+        for fault in ["unhashed", "replaced", "deleted"] {
+            let base = tempfile::tempdir().unwrap();
+            let maps = base.path().join("maps");
+            let restore = base.path().join("original-maps");
+            let (mut model, calls) = inference_inventory_model(base.path(), move || {
+                // A post-call-only check would miss the pre-call violation.
+                fs::write(&maps, fs::read(&restore).unwrap()).unwrap();
+            });
+            let original = fs::read_to_string(&model.maps).unwrap();
+            fs::write(base.path().join("original-maps"), &original).unwrap();
+            let changed = match fault {
+                "unhashed" => {
+                    let extra = base.path().join("libextra.so");
+                    fs::write(&extra, b"synthetic dependency").unwrap();
+                    original + &map_line(&extra)
+                }
+                "replaced" => {
+                    let replacement = base.path().join("replacement");
+                    fs::write(&replacement, b"replacement library").unwrap();
+                    fs::rename(replacement, &model.libraries[0].path).unwrap();
+                    map_line(&model.libraries[0].path)
+                }
+                "deleted" => format!("{} (deleted)\n", original.trim_end()),
+                _ => unreachable!(),
+            };
+            fs::write(&model.maps, changed).unwrap();
+            assert!(model.infer(&[0.0]).is_err(), "{fault}");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(model.marker.state(), Marker::Absent);
+        }
+    }
+
+    #[test]
+    fn inference_inventory_refuses_unreadable_maps_before_native_entry() {
+        let base = tempfile::tempdir().unwrap();
+        let (mut model, calls) = inference_inventory_model(base.path(), || {});
+        fs::remove_file(&model.maps).unwrap();
+        assert!(model.infer(&[0.0]).is_err_and(|why| why.contains("maps:")));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(model.marker.state(), Marker::Absent);
+    }
+
+    #[test]
+    fn inference_inventory_discards_output_when_maps_read_fails_after_call() {
+        let base = tempfile::tempdir().unwrap();
+        let maps = base.path().join("maps");
+        let (mut model, calls) = inference_inventory_model(base.path(), move || {
+            fs::remove_file(&maps).unwrap();
+        });
+        assert!(model.infer(&[0.0]).is_err_and(|why| why.contains("maps:")));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model.marker.state(), Marker::Absent);
     }
 
     #[test]

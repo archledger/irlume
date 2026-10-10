@@ -594,8 +594,14 @@ mod onnx {
             }
             #[cfg(feature = "openvino")]
             {
+                // Pinned to the accelerator: the provider's omitted
+                // device_type defaults to CPU, which the disabled CPU
+                // fallback cannot catch, and a hardware experiment must not
+                // record CPU results through this provider (PR #1055
+                // review).
                 b = b
                     .with_execution_providers([ort::ep::OpenVINO::default()
+                        .with_device_type("GPU")
                         .build()
                         .error_on_failure()])
                     .map_err(err)?;
@@ -1132,6 +1138,16 @@ mod onnx {
                     );
                 }
             }
+            // The OpenVINO provider is pinned to an accelerator: its omitted
+            // device_type defaults to CPU, which the disabled CPU fallback
+            // cannot catch.
+            let openvino = build
+                .find("ort::ep::OpenVINO::default()")
+                .expect("the OpenVINO provider registration");
+            assert!(
+                build[openvino..openvino + 120].contains("with_device_type(\"GPU\")"),
+                "the escaped OpenVINO provider names the GPU device"
+            );
             let escape_fn = source
                 .split("fn ep_escape_set() -> bool {")
                 .nth(1)

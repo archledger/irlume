@@ -19,9 +19,13 @@ depends on the ADR-0022 amendment of 2026-10-09 (provider selection,
 closed native loading) and on the recognizer device selection of #1053
 (`recognizer_device`, merged as #1054).
 
-By itself this ADR admits no loading profile, certifies no model, and
-changes no placement: `CERTIFIED` stays empty and the recognizer stays on
-CPU until the gates below are satisfied on real hardware.
+By itself this ADR admits no loading profile and certifies no model:
+`CERTIFIED` stays empty and certified placement stays on CPU until the
+gates below are satisfied on real hardware. One shipped-behavior change
+rides along (section 7 and the CHANGELOG): custom builds that compiled an
+execution-provider feature previously placed every ONNX session on that
+provider; those sessions now run on the CPU unless the exact test escape
+is set.
 
 ## Context
 
@@ -90,7 +94,14 @@ setting with no device index, and inventing an implicit ordering
 (first, fastest, any) would place a model on a device the certification
 never named. Exactly one visible GPU, or no placement; a device-index
 setting is future work with its own evidence. The default `PERFORMANCE_HINT` for latency-oriented compile
-configurations matches the NPU precedent (batch 1, LATENCY).
+configurations matches the NPU precedent (batch 1, LATENCY). Unlike the
+NPU premise of ADR-0022 section 6, OpenVINO GPUs accept several
+inference precisions, and the precision changes the drift a certification
+judges, so the fixed compile configuration names
+`INFERENCE_PRECISION_HINT` explicitly: the certified configuration is
+`f16` (the GPU default on current drivers), the value is an identity
+field, and a certification run records the precision it used, so an
+implementation claiming conformance compiles with the same one.
 
 ### 3. GPU platform identity extends the ADR-0022 identity
 
@@ -186,8 +197,9 @@ precisely when an operator believed every accelerator was off.
 - ADR-0022 section 15 no longer reserves the GPU; the maintainer's
   revisit of it is recorded here, with CPU the default until a
   certification passes.
-- The implementation order is fixed by Phasing below; nothing in this
-  ADR requires a behavior change in the same PR.
+- The implementation order is fixed by Phasing below; the only behavior
+  change this ADR ships is the execution-provider inertness of section 7
+  (and its CHANGELOG entry).
 - `doctor` and `status --json` will eventually report GPU runtime
   discovery and qualification as they do for the NPU; the selection row
   of #1054 already reports the configured target.

@@ -202,9 +202,13 @@ combination runs on CPU. Tests recompute the thresholds and both fingerprints
 from the current code, so a change to preprocessing, decoding, the decision
 code, a threshold or the ONNX Runtime output fails them until the entry is
 certified again or removed in the same change. There is no `AUTO`, `HETERO` or
-`MULTI` device, no GPU, and no selection by device availability or speed. An
+`MULTI` device, and no selection by device availability or speed. An
 entry is added only by a reviewed change that cites its certification evidence
 (section 7).
+
+Amended 2026-10-10 by ADR-0033: the "no GPU" clause of this prohibition
+is superseded there; the GPU is eligible under this table's regime, one
+explicit device, while `AUTO`, `HETERO` and `MULTI` remain refused.
 
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift

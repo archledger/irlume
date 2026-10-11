@@ -6,6 +6,98 @@
 //! A child of `onnx`, so the tests can place a model on the NPU directly.
 
 use super::*;
+/// Shared with the GPU hardware lanes: the recorded-frame readers and
+/// the CPU-vs-accelerator drift statistics of the NPU evidence
+/// harness.
+pub(super) fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {
+    let kind = match raw.get(..2)? {
+        b"P5" => 'g',
+        b"P6" => 'c',
+        _ => return None,
+    };
+    let mut fields = Vec::new();
+    let mut i = 2;
+    while fields.len() < 3 {
+        while raw.get(i)?.is_ascii_whitespace() {
+            i += 1;
+        }
+        if raw[i] == b'#' {
+            while raw.get(i)? != &b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while raw.get(i)?.is_ascii_digit() {
+            i += 1;
+        }
+        fields.push(
+            std::str::from_utf8(&raw[start..i])
+                .ok()?
+                .parse::<u32>()
+                .ok()?,
+        );
+    }
+    let (w, h) = (fields[0], fields[1]);
+    let data = raw.get(i + 1..)?;
+    let need = (w * h) as usize * if kind == 'g' { 1 } else { 3 };
+    (fields[2] == 255 && data.len() >= need).then(|| (kind, w, h, &data[..need]))
+}
+
+#[derive(Default)]
+pub(super) struct Stats {
+    pub(super) n: usize,
+    pub(super) max_delta: f32,
+    sum_delta: f64,
+    pub(super) flips: usize,
+    /// Flips where the CPU score was at or above the threshold and
+    /// the NPU score below it.
+    pub(super) flips_down: usize,
+    /// Closest CPU score to the threshold, as a distance.
+    nearest: f32,
+}
+
+impl Stats {
+    pub(super) fn add(&mut self, cpu: f32, npu: f32, threshold: f32) {
+        if self.n == 0 {
+            self.nearest = f32::INFINITY;
+        }
+        self.n += 1;
+        let delta = (cpu - npu).abs();
+        self.max_delta = self.max_delta.max(delta);
+        self.sum_delta += f64::from(delta);
+        if (cpu >= threshold) != (npu >= threshold) {
+            self.flips += 1;
+            if cpu >= threshold {
+                self.flips_down += 1;
+            }
+        }
+        self.nearest = self.nearest.min((cpu - threshold).abs());
+    }
+
+    pub(super) fn line(&self, name: &str) -> String {
+        if self.n == 0 {
+            return format!("{name}: no samples");
+        }
+        format!(
+                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, NPU below: {}) nearest CPU score to threshold {:.4}",
+                self.n,
+                self.max_delta,
+                self.sum_delta / self.n as f64,
+                self.flips,
+                self.flips_down,
+                self.nearest
+            )
+    }
+}
+
+pub(super) fn is_attack(dir: &str) -> bool {
+    dir.starts_with("spoof-")
+        || dir.contains("banner")
+        || dir.contains("phone")
+        || dir.contains("screen")
+        || dir.contains("replay")
+}
 
 mod npu_enrollment_tests {
     use super::*;
@@ -1019,96 +1111,6 @@ mod npu_hardware {
                 &irlume_common::sha256_hex(&bits)[..16]
             );
         }
-    }
-
-    fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {
-        let kind = match raw.get(..2)? {
-            b"P5" => 'g',
-            b"P6" => 'c',
-            _ => return None,
-        };
-        let mut fields = Vec::new();
-        let mut i = 2;
-        while fields.len() < 3 {
-            while raw.get(i)?.is_ascii_whitespace() {
-                i += 1;
-            }
-            if raw[i] == b'#' {
-                while raw.get(i)? != &b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            let start = i;
-            while raw.get(i)?.is_ascii_digit() {
-                i += 1;
-            }
-            fields.push(
-                std::str::from_utf8(&raw[start..i])
-                    .ok()?
-                    .parse::<u32>()
-                    .ok()?,
-            );
-        }
-        let (w, h) = (fields[0], fields[1]);
-        let data = raw.get(i + 1..)?;
-        let need = (w * h) as usize * if kind == 'g' { 1 } else { 3 };
-        (fields[2] == 255 && data.len() >= need).then(|| (kind, w, h, &data[..need]))
-    }
-
-    #[derive(Default)]
-    struct Stats {
-        n: usize,
-        max_delta: f32,
-        sum_delta: f64,
-        flips: usize,
-        /// Flips where the CPU score was at or above the threshold and
-        /// the NPU score below it.
-        flips_down: usize,
-        /// Closest CPU score to the threshold, as a distance.
-        nearest: f32,
-    }
-
-    impl Stats {
-        fn add(&mut self, cpu: f32, npu: f32, threshold: f32) {
-            if self.n == 0 {
-                self.nearest = f32::INFINITY;
-            }
-            self.n += 1;
-            let delta = (cpu - npu).abs();
-            self.max_delta = self.max_delta.max(delta);
-            self.sum_delta += f64::from(delta);
-            if (cpu >= threshold) != (npu >= threshold) {
-                self.flips += 1;
-                if cpu >= threshold {
-                    self.flips_down += 1;
-                }
-            }
-            self.nearest = self.nearest.min((cpu - threshold).abs());
-        }
-
-        fn line(&self, name: &str) -> String {
-            if self.n == 0 {
-                return format!("{name}: no samples");
-            }
-            format!(
-                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, NPU below: {}) nearest CPU score to threshold {:.4}",
-                self.n,
-                self.max_delta,
-                self.sum_delta / self.n as f64,
-                self.flips,
-                self.flips_down,
-                self.nearest
-            )
-        }
-    }
-
-    fn is_attack(dir: &str) -> bool {
-        dir.starts_with("spoof-")
-            || dir.contains("banner")
-            || dir.contains("phone")
-            || dir.contains("screen")
-            || dir.contains("replay")
     }
 
     /// Real recorded frames, CPU vs NPU at the wired thresholds: the

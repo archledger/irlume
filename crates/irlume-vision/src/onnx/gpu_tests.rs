@@ -12,6 +12,10 @@ mod gpu_groundwork_tests {
     use crate::gpu::Setting;
     use crate::npu::gpu::{self, Discovery, Firmware, Identity, RenderNode};
     use std::path::{Path, PathBuf};
+    // The recorded-frame reader, the attack-directory rule and the
+    // CPU-vs-accelerator drift statistics, shared with the NPU evidence
+    // harness.
+    use super::super::npu_tests::{is_attack, pnm, Stats};
 
     /// The production entry refuses before dlopen, exactly as the NPU
     /// context does: no profile admits GPU loading yet.
@@ -999,5 +1003,510 @@ mod gpu_groundwork_tests {
             "mapped libraries after compile: {}",
             identity.libraries.lines().count()
         );
+        // The certification bundle's CPU half: the reference digest of the
+        // same fixed inputs the GPU digests above cover.
+        println!(
+            "CPU reference digest {}",
+            cpu.cpu_reference_digest().unwrap()
+        );
+    }
+
+    /// A face found in one image, aligned and embedded on the CPU session
+    /// and on the GPU platform, or skipped when no face is found.
+    struct FaceProbe {
+        cpu: crate::Embedding,
+        gpu: Vec<f32>,
+    }
+
+    /// Embed one image's best face on both devices. Returns None when the
+    /// image has no detectable face.
+    fn probe_both(
+        detector: &mut crate::Detector,
+        cpu: &mut crate::Embedder,
+        gpu: &mut Box<dyn crate::npu::Infer>,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Option<FaceProbe> {
+        let view = crate::align::RgbView {
+            data: rgb,
+            width,
+            height,
+        };
+        let found = detector.detect(&view).ok()?;
+        let face = found
+            .into_iter()
+            .filter(crate::detection_is_finite)
+            .max_by(|a, b| a.score.total_cmp(&b.score))?;
+        let chip = crate::align::align_to_arcface(&view, &face.landmarks).ok()?;
+        let data = crate::align::preprocess_arcface(&chip);
+        let cpu = cpu.embed_preprocessed(&data).ok()?;
+        let gpu = gpu.infer(&data).ok()?;
+        Some(FaceProbe { cpu, gpu })
+    }
+
+    fn decode_image(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+        let raw = std::fs::read(path).ok()?;
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("pgm") | Some("ppm") => {
+                let (kind, w, h, data) = pnm(&raw)?;
+                let rgb = if kind == 'g' {
+                    data.iter().flat_map(|&g| [g, g, g]).collect()
+                } else {
+                    data.to_vec()
+                };
+                Some((rgb, w, h))
+            }
+            Some("jpg") | Some("jpeg") | Some("png") => {
+                let img = image::open(path).ok()?.to_rgb8();
+                let (w, h) = img.dimensions();
+                Some((img.into_raw(), w, h))
+            }
+            _ => None,
+        }
+    }
+
+    /// Real recorded frames, recognizer CPU vs GPU at the wired 0.55
+    /// threshold, mirroring the NPU real-frames lane for the one
+    /// GPU-eligible model: the PAD cues and the detector stay on the CPU
+    /// (ADR-0033 section 5), so this lane tracks match decisions only.
+    /// Measurement, not a certification: the drift and flips are reported
+    /// against the section 7 directions and CERTIFIED stays empty.
+    #[test]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, the recognizer weights and recorded evaluation frames"]
+    fn gpu_hw_real_frames_track_cpu() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = recognizer_bytes();
+        let mut cpu = cpu_reference();
+        let mut platform =
+            gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
+                .expect("the GPU platform opens");
+        let cache = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let (mut recognizer, assignment) = platform.compile(&cache, &bytes).unwrap();
+        assert!(assignment == "GPU" || assignment.starts_with("GPU."));
+        let detector_bytes =
+            std::fs::read(model_path("face_detection_yunet_2023mar.onnx")).unwrap();
+        let mut detector = crate::Detector::load_from_memory(&detector_bytes).unwrap();
+
+        let root = PathBuf::from(
+            std::env::var("IRLUME_NPU_EVAL_DIR")
+                .unwrap_or_else(|_| format!("{}/irlume-suncal", std::env::var("HOME").unwrap())),
+        );
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&root).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "flir-candidate") {
+                    dirs.extend(
+                        std::fs::read_dir(&path)
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir()),
+                    );
+                } else {
+                    dirs.push(path);
+                }
+            }
+        }
+        dirs.sort();
+
+        let (mut genuine_ir, mut attacks_ir) = (Stats::default(), Stats::default());
+        let (mut genuine_rgb, mut attacks_rgb) = (Stats::default(), Stats::default());
+        let mut cosine_min = f32::INFINITY;
+        let mut reference: Option<Vec<f32>> = None;
+        let mut reference_rgb: Option<Vec<f32>> = None;
+        let (mut frames, mut faces) = (0usize, 0usize);
+        for dir in &dirs {
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            let attack = is_attack(&name);
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .collect();
+            files.sort();
+            for file in files {
+                let Some((rgb, width, height)) = decode_image(&file) else {
+                    continue;
+                };
+                frames += 1;
+                let ir = file
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("pgm"));
+                let Some(probe) = probe_both(
+                    &mut detector,
+                    &mut cpu,
+                    &mut recognizer,
+                    &rgb,
+                    width,
+                    height,
+                ) else {
+                    continue;
+                };
+                faces += 1;
+                let cosine: f32 = probe.cpu.iter().zip(&probe.gpu).map(|(x, y)| x * y).sum();
+                cosine_min = cosine_min.min(cosine);
+                let reference = if ir {
+                    &mut reference
+                } else {
+                    &mut reference_rgb
+                };
+                if reference.is_none() && attack {
+                    continue; // no genuine reference of this modality yet
+                }
+                let template = reference.get_or_insert(probe.cpu.to_vec()).clone();
+                let score = |embedding: &[f32]| -> f32 {
+                    embedding.iter().zip(&template).map(|(x, y)| x * y).sum()
+                };
+                let (cpu_score, gpu_score) = (score(&probe.cpu), score(&probe.gpu));
+                let stats: &mut Stats = match (attack, ir) {
+                    (true, true) => &mut attacks_ir,
+                    (true, false) => &mut attacks_rgb,
+                    (false, true) => &mut genuine_ir,
+                    (false, false) => &mut genuine_rgb,
+                };
+                stats.add(cpu_score, gpu_score, 0.55);
+            }
+        }
+        assert!(platform.still_loaded_as_hashed().is_ok());
+        println!(
+            "frames {frames}, with a face {faces}, directories {}",
+            dirs.len()
+        );
+        println!(
+            "{}",
+            genuine_ir.line("recognizer genuine IR vs first frame at 0.55")
+        );
+        println!(
+            "{}",
+            attacks_ir.line("recognizer IR attacks vs first genuine IR frame at 0.55")
+        );
+        println!(
+            "{}",
+            genuine_rgb.line("recognizer genuine RGB vs first frame at 0.55")
+        );
+        println!(
+            "{}",
+            attacks_rgb.line("recognizer RGB attacks vs first genuine RGB frame at 0.55")
+        );
+        println!("recognizer CPU vs GPU embedding cosine, lowest {cosine_min:.6}");
+        let new_grants: usize = [&attacks_ir, &attacks_rgb]
+            .iter()
+            .map(|s| s.flips - s.flips_down)
+            .sum();
+        let genuine_flips = genuine_ir.flips + genuine_rgb.flips;
+        println!(
+            "recognizer: genuine flips {genuine_flips}, new grants on presentation attacks {new_grants}; measurement only, CERTIFIED stays empty"
+        );
+    }
+
+    /// The recognizer model file of `name` from the same roots as
+    /// [`recognizer_bytes`].
+    fn model_path(name: &str) -> PathBuf {
+        [
+            std::env::var("IRLUME_NPU_TEST_MODELS")
+                .map(|dir| PathBuf::from(dir).join(name))
+                .ok(),
+            Some(PathBuf::from("/usr/share/irlume/models").join(name)),
+            Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../models")
+                    .join(name),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{name} is not in the model roots"))
+    }
+
+    /// Every jpg/jpeg/png under `root`, recursively, sorted. A local
+    /// walker keeps the evidence harness free of new dependencies.
+    fn collect_images(root: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| {
+                        matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png")
+                    })
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// One identity's first two images from a grouped corpus.
+    fn lfw_person_key(path: &Path) -> Option<String> {
+        let stem = path.file_stem()?.to_str()?;
+        Some(match stem.rsplit_once('_') {
+            Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
+                head.to_owned()
+            }
+            _ => stem.to_owned(),
+        })
+    }
+
+    /// Recognition-corpus drift: genuine pairs from the LFW grouping and
+    /// impostor pairs across identities (LFW cross-person and the
+    /// impostor-only FairFace tree), scored CPU-template vs CPU-probe and
+    /// CPU-template vs GPU-probe at the 0.55 threshold. This is the
+    /// zero-effort-impostor half of the ADR-0022 section 7 evidence the
+    /// NPU certification judged, measured on the GPU identity; reported,
+    /// not certified. Corpora roots: `IRLUME_GPU_CORPORA_LFW` and
+    /// `IRLUME_GPU_CORPORA_FAIRFACE` (default `~/datasets/lfw` and
+    /// `~/datasets/fairface`), bounded by `IRLUME_GPU_CORPORA_PERSONS`
+    /// (default 400) and `IRLUME_GPU_CORPORA_IMPOSTORS` (default 3000).
+    #[test]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, the recognizer weights and the recognition corpora"]
+    fn gpu_hw_recognition_corpora_drift() {
+        let home = std::env::var("HOME").unwrap();
+        let lfw_root = PathBuf::from(
+            std::env::var("IRLUME_GPU_CORPORA_LFW")
+                .unwrap_or_else(|_| format!("{home}/datasets/lfw")),
+        );
+        let fairface_root = PathBuf::from(
+            std::env::var("IRLUME_GPU_CORPORA_FAIRFACE")
+                .unwrap_or_else(|_| format!("{home}/datasets/fairface")),
+        );
+        let max_persons: usize = std::env::var("IRLUME_GPU_CORPORA_PERSONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400);
+        let max_impostors: usize = std::env::var("IRLUME_GPU_CORPORA_IMPOSTORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = recognizer_bytes();
+        let mut cpu = cpu_reference();
+        let mut platform =
+            gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
+                .expect("the GPU platform opens");
+        let cache = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let (mut recognizer, assignment) = platform.compile(&cache, &bytes).unwrap();
+        assert!(assignment == "GPU" || assignment.starts_with("GPU."));
+        let detector_bytes =
+            std::fs::read(model_path("face_detection_yunet_2023mar.onnx")).unwrap();
+        let mut detector = crate::Detector::load_from_memory(&detector_bytes).unwrap();
+
+        // Group the LFW tree by person (deterministic order).
+        let all = collect_images(&lfw_root);
+        let mut by_person: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
+        for path in all {
+            if let Some(key) = lfw_person_key(&path) {
+                by_person.entry(key).or_default().push(path);
+            }
+        }
+        let people: Vec<(&String, &Vec<PathBuf>)> = by_person
+            .iter()
+            .filter(|(_, files)| files.len() >= 2)
+            .take(max_persons)
+            .collect();
+        println!(
+            "lfw: {} images, {} people with two or more, using {}",
+            by_person.values().map(Vec::len).sum::<usize>(),
+            by_person.iter().filter(|(_, f)| f.len() >= 2).count(),
+            people.len()
+        );
+
+        let mut no_face = 0usize;
+        let mut embed = |detector: &mut crate::Detector,
+                         cpu: &mut crate::Embedder,
+                         gpu: &mut Box<dyn crate::npu::Infer>,
+                         path: &Path|
+         -> Option<FaceProbe> {
+            let result = decode_image(path).and_then(|(rgb, width, height)| {
+                probe_both(detector, cpu, gpu, &rgb, width, height)
+            });
+            if result.is_none() {
+                no_face += 1;
+            }
+            result
+        };
+
+        // Genuine pairs: first image as the CPU template, second as probe.
+        let mut genuine = Stats::default();
+        for (_, files) in &people {
+            let (Some(template), Some(probe)) = (
+                embed(&mut detector, &mut cpu, &mut recognizer, &files[0]),
+                embed(&mut detector, &mut cpu, &mut recognizer, &files[1]),
+            ) else {
+                continue;
+            };
+            let cpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.cpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            let gpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.gpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            genuine.add(cpu_score, gpu_score, 0.55);
+        }
+
+        // Impostor pairs, LFW: person i's first image as the template,
+        // person i+1's first as the probe.
+        let mut impostor_lfw = Stats::default();
+        for pair in people.windows(2) {
+            if impostor_lfw.n >= max_impostors / 2 {
+                break;
+            }
+            let (Some(template), Some(probe)) = (
+                embed(&mut detector, &mut cpu, &mut recognizer, &pair[0].1[0]),
+                embed(&mut detector, &mut cpu, &mut recognizer, &pair[1].1[0]),
+            ) else {
+                continue;
+            };
+            let cpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.cpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            let gpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.gpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            impostor_lfw.add(cpu_score, gpu_score, 0.55);
+        }
+
+        // Impostor pairs, FairFace (impostor-only tree): consecutive files.
+        let mut impostor_fairface = Stats::default();
+        let fairface_files = collect_images(&fairface_root);
+        for pair in fairface_files.windows(2) {
+            if impostor_fairface.n + impostor_lfw.n >= max_impostors {
+                break;
+            }
+            let (Some(template), Some(probe)) = (
+                embed(&mut detector, &mut cpu, &mut recognizer, &pair[0]),
+                embed(&mut detector, &mut cpu, &mut recognizer, &pair[1]),
+            ) else {
+                continue;
+            };
+            let cpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.cpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            let gpu_score: f32 = template
+                .cpu
+                .iter()
+                .zip(&probe.gpu)
+                .map(|(x, y)| x * y)
+                .sum();
+            impostor_fairface.add(cpu_score, gpu_score, 0.55);
+        }
+        assert!(platform.still_loaded_as_hashed().is_ok());
+        println!("skipped images without a detectable face: {no_face}");
+        println!("{}", genuine.line("genuine LFW pairs at 0.55"));
+        println!(
+            "{}",
+            impostor_lfw.line("impostor LFW cross-person pairs at 0.55")
+        );
+        println!(
+            "{}",
+            impostor_fairface.line("impostor FairFace pairs at 0.55")
+        );
+        let new_grants: usize = [&impostor_lfw, &impostor_fairface]
+            .iter()
+            .map(|s| s.flips - s.flips_down)
+            .sum();
+        println!(
+            "impostor flips {} (new grants {new_grants}); measurement only, CERTIFIED stays empty",
+            impostor_lfw.flips + impostor_fairface.flips
+        );
+    }
+
+    /// The suspend/resume recheck a GPU certification requires: after a
+    /// real system suspend (an attended, owner-approved session; never
+    /// triggered here), the compiled model's bits and the mapped-library
+    /// inventory must be unchanged. Run with
+    /// `IRLUME_GPU_TEST_RESUMED=1` set after the resume; without it the
+    /// lane reports that no suspend was recorded and asserts nothing.
+    #[test]
+    #[ignore = "hardware: needs a real, attended system suspend before the run"]
+    fn gpu_hw_suspend_resume_recheck() {
+        let resumed = std::env::var("IRLUME_GPU_TEST_RESUMED").is_ok_and(|v| v == "1");
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = recognizer_bytes();
+        // The CPU session fixes the native-library baseline (see
+        // cpu_reference); the recheck itself watches the GPU bits.
+        let _cpu = cpu_reference();
+        let mut platform =
+            gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
+                .expect("the GPU platform opens");
+        let cache = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let (mut recognizer, _) = platform.compile(&cache, &bytes).unwrap();
+        let raw = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        let before: Vec<String> = (0..3)
+            .map(|k| {
+                let answer = recognizer
+                    .infer(&super::super::npu_reference::chip(k))
+                    .unwrap();
+                irlume_common::sha256_hex(&raw(&answer))
+            })
+            .collect();
+        if !resumed {
+            println!(
+                "no suspend recorded (IRLUME_GPU_TEST_RESUMED unset): digest baseline is \
+                 {before:?}; rerun this lane with IRLUME_GPU_TEST_RESUMED=1 after a real, \
+                 attended suspend"
+            );
+            return;
+        }
+        // The flag says a real suspend happened since the platform opened;
+        // the boot-time clock the NPU recheck uses proves it did.
+        assert!(
+            crate::npu::suspended(crate::npu::Bound::AtLeast).is_some(),
+            "IRLUME_GPU_TEST_RESUMED=1 but no suspend is recorded this boot"
+        );
+        for (k, baseline) in before.iter().enumerate() {
+            let answer = recognizer
+                .infer(&super::super::npu_reference::chip(k))
+                .unwrap();
+            assert_eq!(
+                &irlume_common::sha256_hex(&raw(&answer)),
+                baseline,
+                "input {k} changed across the suspend"
+            );
+        }
+        assert!(platform.still_loaded_as_hashed().is_ok());
+        println!("post-resume bits and mapped inventory unchanged");
     }
 }

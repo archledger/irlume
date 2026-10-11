@@ -1475,14 +1475,14 @@ mod gpu_groundwork_tests {
         let mut lfw_pairs_used = [0usize; 2];
         for line in text.lines().skip(1) {
             let fields: Vec<&str> = line.split(',').collect();
-            if fields.len() < 9 {
+            if fields.len() < 8 {
                 continue;
             }
             let is_same = fields[3] == "1";
             if lfw_pairs_used[usize::from(is_same)] >= max_pairs {
                 continue;
             }
-            let (a, b) = (train.join(fields[7]), train.join(fields[8]));
+            let (a, b) = (train.join(fields[6]), train.join(fields[7]));
             if !a.is_file() || !b.is_file() {
                 continue;
             }

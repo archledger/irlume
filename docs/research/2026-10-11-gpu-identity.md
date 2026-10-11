@@ -129,7 +129,9 @@ The evidence lanes merged after the identity slice, run on the decision
 hardware (UX5406S Arc 140V, identity digest 28b38b63, fixed
 configuration batch=1/LATENCY/f16, OpenVINO RPM 2026.2.1, OpenCL ICD
 stack), recognizer only; the PAD cues and the detector stay on the CPU
-where ADR-0033 section 5 keeps them. Measurement, not a certification:
+where ADR-0033 section 5 keeps them. RGB probes run the TTA pipeline
+production authenticates RGB with; IR stays plain; corpora templates
+are the CPU enrollment embedding. Measurement, not a certification:
 `CERTIFIED` stays empty and no loading profile is admitted.
 
 Real recorded frames (the suncal corpus, 2397 frames, 1851 with a
@@ -140,8 +142,8 @@ detected face, 67 directories), CPU-template vs GPU-probe at the wired
 |---|---|---|---|
 | genuine IR | 1347 | 0.000381 | 0 |
 | IR presentation attacks | 123 | 0.000285 | 0 |
-| genuine RGB | 282 | 0.000271 | 0 |
-| RGB presentation attacks | 99 | 0.000338 | 0 |
+| genuine RGB (TTA) | 282 | 0.000274 | 0 |
+| RGB presentation attacks (TTA) | 99 | 0.000193 | 0 |
 
 Embedding cosine floor 0.999996; zero new grants on presentation
 attacks; the nearest genuine CPU score sat 0.0001 from the threshold
@@ -152,20 +154,24 @@ cross-person and the FairFace impostor-only tree):
 
 | Arm | n | max abs drift | flips |
 |---|---|---|---|
-| genuine LFW pairs | 400 | 0.000289 | 0 |
-| impostor LFW pairs | 399 | 0.000342 | 0 |
-| impostor FairFace pairs | 2601 | 0.000457 | 0 |
+| genuine LFW pairs (TTA) | 400 | 0.000303 | 0 |
+| impostor LFW pairs (TTA) | 399 | 0.000207 | 0 |
+| impostor FairFace pairs (TTA) | 2601 | 0.000354 | 0 |
 
 Zero impostor flips, zero new grants over 3000 impostor pairs; 542
 corpus images had no detectable face and were skipped. The GPU output
 is production-normalized in the lanes (the model's raw output is not
-the embedding; the first run's cosine floor of 10.8 exposed the missing
+the embedding; a first run's cosine floor of 10.8 exposed the missing
 normalization before any number was recorded as evidence).
 
-The suspend/resume recheck lane records its digest baseline
-(e36d2af9, ed919455, 1488b03d over the three fixed reference inputs)
-and asserts the bits and the mapped inventory after a real, attended
-suspend (`IRLUME_GPU_TEST_RESUMED=1`). That attended session remains
-pending; no suspend was triggered by this work. The drift band
-(0.00028 to 0.00046) sits at the NPU certification's measured drift
-level on the same corpora class.
+Suspend/resume: the recheck lane runs as one process spanning the
+suspend and proves a resume by growth of the CLOCK_BOOTTIME-minus-
+MONOTONIC reading. During the final run the laptop suspended on its
+own idle policy inside the wait window: the three reference inputs
+reproduced their digests exactly (e36d2af9, ed919455, 1488b03d, the
+same values across every process this campaign) and the mapped-library
+inventory still verified after the resume. No suspend was triggered by
+the lane itself; a deliberate attended suspend remains available to
+re-confirm, but the requirement's evidence now exists from a real
+suspend. The drift band (0.00019 to 0.00038) sits at the NPU
+certification's measured drift level on the same corpora class.

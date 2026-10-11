@@ -97,12 +97,20 @@ impl FirmwareObservation {
     }
 }
 
+/// Collect a debugfs directory. Volatile entries (DRM `client-*`
+/// directories appear and vanish while a desktop uses the GPU) must not
+/// turn a live system's firmware walk unreadable: an entry that disappears
+/// mid-walk is skipped, every other error refuses.
 fn directory_entries(path: &Path) -> Result<Vec<PathBuf>, FirmwareError> {
     let entries = std::fs::read_dir(path).map_err(|_| FirmwareError::Unreadable)?;
-    let mut paths = entries
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| FirmwareError::Unreadable)?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(FirmwareError::Unreadable),
+        }
+    }
     paths.sort();
     Ok(paths)
 }
@@ -164,7 +172,16 @@ fn observe_firmware(debugfs: &Path) -> Result<FirmwareObservation, FirmwareError
         if !(pci_slot(name) || !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())) {
             continue;
         }
-        let canonical = card.canonicalize().map_err(|_| FirmwareError::Unreadable)?;
+        let Ok(canonical) = card.canonicalize() else {
+            // A volatile client or vanished alias mid-walk.
+            if card
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            return Err(FirmwareError::Unreadable);
+        };
         let slots = nodes.entry(canonical).or_default();
         if let Some(name) = card.file_name().and_then(|name| name.to_str()) {
             if pci_slot(name) {

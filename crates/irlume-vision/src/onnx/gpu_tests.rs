@@ -763,6 +763,22 @@ mod gpu_groundwork_tests {
         )
     }
 
+    /// The recognizer's CPU reference session. BOTH hardware lanes build
+    /// it before opening the GPU platform: the daemon's CPU sessions
+    /// exist before an accelerator platform opens (the fixed
+    /// initialization order the NPU identity already relies on), so the
+    /// GPU inventory includes the CPU runtime in every execution order
+    /// and one host yields one digest whether a lane runs alone or after
+    /// its sibling.
+    fn cpu_reference() -> crate::Embedder {
+        let dir = std::env::var("IRLUME_NPU_TEST_MODELS")
+            .unwrap_or_else(|_| "/usr/share/irlume/models".into());
+        let path = Path::new(&dir).join("glintr100.onnx");
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        crate::Embedder::load_from_memory(&bytes).expect("the CPU session builds")
+    }
+
     /// Ignored: needs the real provider stack and an Intel GPU. Run as root
     /// so debugfs joins the identity: a Found result MUST carry the loaded
     /// firmware of the bound render node. The complete identity binds the
@@ -772,6 +788,9 @@ mod gpu_groundwork_tests {
     #[test]
     #[ignore = "hardware: needs the validated OpenVINO provider and an Intel GPU"]
     fn gpu_hw_identity_binds_plugin_render_node_and_libraries() {
+        // Same native-library baseline as the compile lane: the CPU
+        // session first, then the platform (see cpu_reference).
+        let _cpu = cpu_reference();
         match gpu::discover_admitted(&hw_selection()) {
             Discovery::Found(identity) => {
                 assert!(!identity.full_name.is_empty());
@@ -873,9 +892,9 @@ mod gpu_groundwork_tests {
         let bytes =
             std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         // The CPU reference session exists before the platform identity is
-        // taken: anything the process maps afterwards must refuse (the
-        // discipline the NPU platform runs under too).
-        let mut cpu = crate::Embedder::load_from_memory(&bytes).expect("the CPU session builds");
+        // taken (see cpu_reference): anything the process maps afterwards
+        // must refuse, the discipline the NPU platform runs under too.
+        let mut cpu = cpu_reference();
         let mut platform =
             gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
                 .expect("the GPU platform opens with the fixed configuration");

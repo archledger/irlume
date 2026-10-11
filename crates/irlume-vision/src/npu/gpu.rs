@@ -413,6 +413,11 @@ pub(crate) fn plugin_pci(info: &str) -> Option<String> {
     let bus = component("bus:")?;
     let device = component("device:")?;
     let function = component("function:")?;
+    // A report with trailing or repeated components is not the plugin's
+    // format; it refuses instead of being reduced to a canonical address.
+    if tokens.next().is_some() {
+        return None;
+    }
     canonical_pci(&domain, &bus, &device, &function)
 }
 
@@ -939,37 +944,17 @@ pub(crate) fn discover_admitted_with(
     selection: &RuntimeSelection,
     sources: &Sources<'_>,
 ) -> Discovery {
-    let library = match runtime::resolve_library(
-        selection,
-        super::OPENVINO_LIBRARY_DIRS,
-        &runtime::Trust::default(),
-    ) {
-        Ok(library) => library,
-        Err(error) => return Discovery::Unavailable(format!("provider: {error}")),
-    };
-    if let Err(error) = openvino_sys::library::load_from(&library.canonical) {
-        return Discovery::Unavailable(format!("load: {error}"));
+    // Discovery reports the same identity the compile platform keys on:
+    // it opens the warmed platform, whose inventory covers everything a
+    // compile maps, so one host yields one digest whichever entry the
+    // harness used. A separate enumeration-time manifest would silently
+    // under-name the stack on hosts whose compiles map more libraries.
+    match GpuPlatform::open_admitted(selection, sources) {
+        Ok(platform) => Discovery::Found(Box::new(platform.identity().clone())),
+        Err(OpenError::Absent) => Discovery::Absent,
+        Err(OpenError::Multiple(devices)) => Discovery::MultipleGpus(devices),
+        Err(OpenError::Failed(why)) => Discovery::Unavailable(why),
     }
-    let Ok(core) = openvino::Core::new() else {
-        return Discovery::Unavailable("core".into());
-    };
-    let gpu = openvino::DeviceType::Other("GPU".into());
-    // The GPU plugin answers AVAILABLE_DEVICES with its device indices
-    // ("0", "1", ...); "GPU" is an alias for GPU.0 and the order beyond it
-    // is driver-dependent, so the count alone decides (ADR-0033 section 2).
-    let indices = match core.get_property(&gpu, &openvino::PropertyKey::AvailableDevices) {
-        Ok(indices) => indices,
-        Err(error) => return Discovery::Unavailable(format!("enumerate: {error}")),
-    };
-    discover_enumerated_gpu(&indices, |device| {
-        // The identity snapshots its own manifest at the end of its
-        // property and version reads, so nothing those calls map escapes
-        // the discovery inventory.
-        match identity(&core, &library, sources, device) {
-            Ok((identity, _)) => Discovery::Found(Box::new(identity)),
-            Err(error) => Discovery::Unavailable(error),
-        }
-    })
 }
 
 /// The actual enumeration-to-discovery path, injectable before any device
@@ -1057,6 +1042,37 @@ const INFERENCE_PRECISION: &str = "f16";
 #[cfg(test)]
 const PERFORMANCE_HINT: &str = "LATENCY";
 
+/// Why opening the GPU platform refused: typed so discovery reports the
+/// enumeration answers instead of parsing error prose.
+#[cfg(test)]
+pub(crate) enum OpenError {
+    /// No GPU is exposed.
+    Absent,
+    /// More than one GPU is exposed; placement refuses until a reviewed
+    /// rule selects one (ADR-0033 section 2).
+    Multiple(Vec<String>),
+    /// Anything else, with the reason.
+    Failed(String),
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => f.write_str("no GPU is exposed"),
+            Self::Multiple(devices) => write!(f, "more than one GPU: {devices:?}"),
+            Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 #[cfg(test)]
 impl GpuPlatform {
     /// Open the platform through the validated provider and apply
@@ -1065,16 +1081,17 @@ impl GpuPlatform {
     pub(crate) fn open_admitted(
         selection: &RuntimeSelection,
         sources: &Sources<'_>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, OpenError> {
+        let failed = |why: String| OpenError::Failed(why);
         let library = runtime::resolve_library(
             selection,
             super::OPENVINO_LIBRARY_DIRS,
             &runtime::Trust::default(),
         )
-        .map_err(|error| format!("provider: {error}"))?;
+        .map_err(|error| failed(format!("provider: {error}")))?;
         openvino_sys::library::load_from(&library.canonical)
-            .map_err(|error| format!("load: {error}"))?;
-        let mut core = openvino::Core::new().map_err(|error| format!("core: {error}"))?;
+            .map_err(|error| failed(format!("load: {error}")))?;
+        let mut core = openvino::Core::new().map_err(|error| failed(format!("core: {error}")))?;
         // The single-GPU rule gates the platform too: a system exposing
         // more than one GPU refuses placement (ADR-0033 section 2), and
         // every property, compile and warm-up below names the one
@@ -1082,17 +1099,17 @@ impl GpuPlatform {
         let gpu = openvino::DeviceType::Other("GPU".into());
         let indices = core
             .get_property(&gpu, &openvino::PropertyKey::AvailableDevices)
-            .map_err(|error| format!("enumerate: {error}"))?;
+            .map_err(|error| failed(format!("enumerate: {error}")))?;
         let enumerated = crate::gpu::parse_device_indices(&indices);
         let device_name = match enumerated.as_slice() {
-            [] => return Err("no GPU is exposed".into()),
+            [] => return Err(OpenError::Absent),
             [one] => one.clone(),
-            _ => return Err(format!("more than one GPU: {enumerated:?}")),
+            _ => return Err(OpenError::Multiple(enumerated)),
         };
         let device = openvino::DeviceType::Other(device_name.clone().into());
-        let mut set = |key: openvino::RwPropertyKey, value: &str| -> Result<(), String> {
+        let mut set = |key: openvino::RwPropertyKey, value: &str| -> Result<(), OpenError> {
             core.set_property(&device, &key, value)
-                .map_err(|error| format!("{value}: {error}"))
+                .map_err(|error| failed(format!("{value}: {error}")))
         };
         set(
             openvino::RwPropertyKey::HintPerformanceMode,
@@ -1114,22 +1131,26 @@ impl GpuPlatform {
         ] {
             let read = core
                 .get_property(&device, &key)
-                .map_err(|error| format!("{} read back: {error}", key.as_ref()))?;
+                .map_err(|error| failed(format!("{} read back: {error}", key.as_ref())))?;
             if read != expected {
-                return Err(format!("{} reads {read:?}, not {expected}", key.as_ref()));
+                return Err(failed(format!(
+                    "{} reads {read:?}, not {expected}",
+                    key.as_ref()
+                )));
             }
         }
         // Warm the compile path up with the embedded model before the
         // identity's inventory is taken: compiling loads driver libraries
         // the enumeration alone does not (udev on the measured hosts), and
         // the identity must name everything its own execution runs.
-        let warm_scratch = tempfile::tempdir().map_err(|error| format!("warm-up dir: {error}"))?;
+        let warm_scratch =
+            tempfile::tempdir().map_err(|error| failed(format!("warm-up dir: {error}")))?;
         {
             use openvino::{DeviceType, RwPropertyKey};
             // The fixture's input is already a static float[1].
             let warm = core
                 .read_model_from_buffer(WARM_UP_ONNX, None)
-                .map_err(|error| format!("warm-up read: {error}"))?;
+                .map_err(|error| failed(format!("warm-up read: {error}")))?;
             let device = DeviceType::Other(device_name.clone().into());
             core.set_property(
                 &device,
@@ -1137,24 +1158,25 @@ impl GpuPlatform {
                 warm_scratch
                     .path()
                     .to_str()
-                    .ok_or("the warm-up cache path is not UTF-8")?,
+                    .ok_or_else(|| failed("the warm-up cache path is not UTF-8".into()))?,
             )
-            .map_err(|error| format!("warm-up CACHE_DIR: {error}"))?;
+            .map_err(|error| failed(format!("warm-up CACHE_DIR: {error}")))?;
             let compiled = core
                 .compile_model(&warm, device)
-                .map_err(|error| format!("warm-up compile: {error}"))?;
+                .map_err(|error| failed(format!("warm-up compile: {error}")))?;
             let assigned = compiled
                 .get_property(&openvino::PropertyKey::Other("EXECUTION_DEVICES".into()))
-                .map_err(|error| format!("warm-up EXECUTION_DEVICES: {error}"))?;
+                .map_err(|error| failed(format!("warm-up EXECUTION_DEVICES: {error}")))?;
             if assigned.trim() != "GPU" && assigned.trim() != device_name {
-                return Err(format!("the warm-up compiled on {assigned:?}"));
+                return Err(failed(format!("the warm-up compiled on {assigned:?}")));
             }
         }
         // The identity is assembled here, after the warm-up, and it
         // snapshots its own manifest at the end of its reads, so its
         // inventory covers the full compile-path stack; the hashed set it
         // returns is the platform's verification inventory.
-        let (identity, libraries) = identity(&core, &library, sources, &device_name)?;
+        let (identity, libraries) =
+            identity(&core, &library, sources, &device_name).map_err(failed)?;
         Ok(Self {
             core,
             identity,

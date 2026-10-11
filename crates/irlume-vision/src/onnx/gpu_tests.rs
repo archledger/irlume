@@ -177,6 +177,9 @@ mod gpu_groundwork_tests {
             "{domain: 0 bus: 0 device: 0x2 function: 8}",
             "{domain: 0 bus: 0 device: zz function: 0}",
             "{domain: 0 bus: 0x device: 0x2 function: 0}",
+            "{domain: 0 bus: 0 device: 0x2 function: 0 function: 1}",
+            "{domain: 0 bus: 0 device: 0x2 function: 0 extra}",
+            "{domain: 0 bus: 0 device: 0x2 function: 0 2}",
         ] {
             assert_eq!(gpu::plugin_pci(malformed), None, "{malformed:?}");
         }

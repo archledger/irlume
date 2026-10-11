@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! GPU tests (ADR-0033): the closed-admission refusal in every build, the
+//! GPU tests (ADR-0033): the closed-admission refusal, the
 //! complete-identity parsers and binding rules, and the ignored hardware
 //! measurements `gpu_hw_*` that collect the evidence a certification
 //! starts from. The hardware tests need no camera, no daemon and no
@@ -157,6 +157,16 @@ mod gpu_groundwork_tests {
             gpu::plugin_pci("{domain: 1 bus: 0xa device: 0x1f function: 7}"),
             Some("0001:0a:1f.7".into())
         );
+        // The plugin prints domain, bus and function as decimal: bus 10 is
+        // 0x0a, not 0x10.
+        assert_eq!(
+            gpu::plugin_pci("{domain: 0 bus: 10 device: 0x2 function: 0}"),
+            Some("0000:0a:02.0".into())
+        );
+        assert_eq!(
+            gpu::plugin_pci("{domain: 16 bus: 0 device: 0x2 function: 0}"),
+            Some("0010:00:02.0".into())
+        );
         for malformed in [
             "",
             "{}",
@@ -166,6 +176,7 @@ mod gpu_groundwork_tests {
             "{domain: 0x10000 bus: 0 device: 0x2 function: 0}",
             "{domain: 0 bus: 0 device: 0x2 function: 8}",
             "{domain: 0 bus: 0 device: zz function: 0}",
+            "{domain: 0 bus: 0x device: 0x2 function: 0}",
         ] {
             assert_eq!(gpu::plugin_pci(malformed), None, "{malformed:?}");
         }
@@ -242,6 +253,9 @@ mod gpu_groundwork_tests {
         let (family, _) = gpu::loader_stack(&line("/usr/lib/libze_loader.so.1")).unwrap();
         assert_eq!(family, "level-zero");
         assert!(gpu::loader_stack("").is_err());
+        // A non-executable mapping of the loader is not the plugin's stack.
+        let dormant = "7f0000000000-7f0000001000 r--p 00000000 00:23 1 /usr/lib/libOpenCL.so.1.0.0";
+        assert!(gpu::loader_stack(dormant).is_err());
         let both = format!(
             "{}\n{}",
             line("/usr/lib/libOpenCL.so.1.0.0"),
@@ -254,9 +268,20 @@ mod gpu_groundwork_tests {
     /// A fixture stack: the C API, the core, the GPU plugin, an OpenCL
     /// loader and the two frontends beside the core, as the memory map
     /// lines of an enumerated process would name them.
-    fn fixture_stack(dir: &Path) -> (String, Vec<(PathBuf, u64)>) {
+    fn fixture_stack(dir: &Path) -> (String, Vec<(PathBuf, u64)>, PathBuf) {
         let mut mapped = Vec::new();
         let mut maps = String::new();
+        let mut line = |path: &Path| {
+            let inode = {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(path).unwrap().ino()
+            };
+            maps.push_str(&format!(
+                "7f0000000000-7f0000001000 r-xp 00000000 00:23 {inode} {}\n",
+                path.display()
+            ));
+            inode
+        };
         for name in [
             "libopenvino_c.so.2621",
             "libopenvino.so.2621",
@@ -266,14 +291,7 @@ mod gpu_groundwork_tests {
         ] {
             let path = dir.join(name);
             std::fs::write(&path, format!("bytes of {name}")).unwrap();
-            let inode = {
-                use std::os::unix::fs::MetadataExt;
-                std::fs::metadata(&path).unwrap().ino()
-            };
-            maps.push_str(&format!(
-                "7f0000000000-7f0000001000 r-xp 00000000 00:23 {inode} {}\n",
-                path.display()
-            ));
+            let inode = line(&path);
             mapped.push((path, inode));
         }
         for name in [
@@ -282,7 +300,12 @@ mod gpu_groundwork_tests {
         ] {
             std::fs::write(dir.join(name), format!("bytes of {name}")).unwrap();
         }
-        (maps, mapped)
+        // The process executable: mapped and executable, but excluded from
+        // the manifest like the NPU execution inventory excludes it.
+        let executable = dir.join("test-binary");
+        std::fs::write(&executable, b"the test binary").unwrap();
+        line(&executable);
+        (maps, mapped, executable)
     }
 
     /// The GPU library inventory hashes every mapped executable library
@@ -291,13 +314,25 @@ mod gpu_groundwork_tests {
     #[test]
     fn gpu_library_inventory_hashes_and_verifies_the_gpu_stack() {
         let dir = tempfile::tempdir().unwrap();
-        let (maps, mapped) = fixture_stack(dir.path());
-        let (manifest, hashed) = gpu::gpu_libraries(&maps).unwrap();
+        let (maps, mapped, executable) = fixture_stack(dir.path());
+        let (manifest, hashed) = gpu::gpu_libraries(&maps, &executable).unwrap();
         for (path, _) in &mapped {
             let line = format!("{} ", path.display());
             assert!(manifest.contains(&line), "{line} missing from {manifest}");
         }
-        assert!(hashed.len() >= mapped.len() + 2, "frontends join the set");
+        assert!(hashed.len() >= mapped.len() + 3, "frontends join the set");
+        assert!(
+            !manifest.contains("test-binary"),
+            "the executable stays out of the manifest: {manifest}"
+        );
+        assert!(
+            hashed.iter().any(|library| library.path == executable),
+            "the executable stays in the verified inventory"
+        );
+        // An executable that is not mapped refuses.
+        let absent = dir.path().join("other-binary");
+        let error = gpu::gpu_libraries(&maps, &absent).unwrap_err();
+        assert!(error.contains("absent"), "{error}");
         // Every required member must be mapped; a stack without the plugin
         // or a loader refuses.
         for drop in ["libopenvino_intel_gpu_plugin.so", "libOpenCL.so.1"] {
@@ -306,7 +341,7 @@ mod gpu_groundwork_tests {
                 .filter(|line| !line.contains(drop))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let error = gpu::gpu_libraries(&pruned).unwrap_err();
+            let error = gpu::gpu_libraries(&pruned, &executable).unwrap_err();
             assert!(
                 error.contains("GPU plugin") || error.contains("loader"),
                 "{drop}: {error}"
@@ -315,14 +350,15 @@ mod gpu_groundwork_tests {
         // This test process has not enumerated a GPU, so its real map
         // refuses too: no member is present.
         let real = std::fs::read_to_string("/proc/self/maps").unwrap();
-        assert!(gpu::gpu_libraries(&real).is_err());
+        let own = std::fs::read_link("/proc/self/exe").unwrap();
+        assert!(gpu::gpu_libraries(&real, &own).is_err());
         // A mapped library replaced under the identity is a different
         // file: the inode kept no longer matches the map's.
         let plugin = dir.path().join("libopenvino_intel_gpu_plugin.so");
         let replaced = dir.path().join("replacement");
         std::fs::write(&replaced, "other bytes").unwrap();
         std::fs::rename(&replaced, &plugin).unwrap();
-        let error = gpu::gpu_libraries(&maps).unwrap_err();
+        let error = gpu::gpu_libraries(&maps, &executable).unwrap_err();
         assert!(error.contains("not the file that was hashed"), "{error}");
     }
 

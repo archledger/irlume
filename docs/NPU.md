@@ -65,8 +65,9 @@ or `libze_loader`, from `/proc/self/maps`) and the fixed compile
 configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`
 are identity fields. Every native library the enumeration mapped is
 hashed through one open file whose inode is kept, under ADR-0022's
-inode discipline: the whole file-backed executable inventory plus the
-IR and ONNX frontends beside the core, because ICD enumeration maps
+inode discipline: the whole file-backed executable inventory (minus the
+process executable, as the NPU execution inventory excludes it) plus
+the IR and ONNX frontends beside the core, because ICD enumeration maps
 foreign ICD libraries (a Mesa Rusticl ICD ran in the measured
 processes). `GPU_DRIVER_VERSION` is never read: reading it through the
 C API kills the process on the measured 2026.2.1 builds, so driver

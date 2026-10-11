@@ -362,12 +362,23 @@ pub(crate) fn canonical_pci(
     device: &str,
     function: &str,
 ) -> Option<String> {
+    // The plugin prints domain, bus and function as decimal and the
+    // device with a `0x` prefix (`{domain: %u bus: %u device: 0x%x
+    // function: %u}`), so an unprefixed component is decimal and only a
+    // `0x` prefix selects hexadecimal; each component must fit its width.
     let number = |text: &str, text_width: usize, max: u32| {
-        let digits = text.strip_prefix("0x").unwrap_or(text);
-        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return None;
-        }
-        u32::from_str_radix(digits, 16).ok().and_then(|value| {
+        let (digits, radix) = if let Some(digits) = text.strip_prefix("0x") {
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            (digits, 16)
+        } else {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            (text, 10)
+        };
+        u32::from_str_radix(digits, radix).ok().and_then(|value| {
             (value < (1 << (4 * text_width)) as u32 && value <= max)
                 .then(|| format!("{value:0text_width$X}"))
         })
@@ -520,6 +531,11 @@ pub(crate) fn loader_stack(maps: &str) -> Result<(&'static str, String), String>
         let Some(mapping) = super::maps::mapping(line) else {
             continue;
         };
+        // Only an executable mapping proves the loader ran here; a
+        // non-executable remap of the same file is not the plugin's stack.
+        if !mapping.executable {
+            continue;
+        }
         let name = Path::new(mapping.path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -571,7 +587,10 @@ pub(crate) fn loader_stack(maps: &str) -> Result<(&'static str, String), String>
 /// When a required member is missing, a library cannot be opened or read,
 /// or a mapped library is not the file that was hashed.
 #[cfg(test)]
-pub(crate) fn gpu_libraries(maps: &str) -> Result<(String, Vec<super::HashedLibrary>), String> {
+pub(crate) fn gpu_libraries(
+    maps: &str,
+    executable: &Path,
+) -> Result<(String, Vec<super::HashedLibrary>), String> {
     let loader = loader_stack(maps)?;
     let mut paths: Vec<PathBuf> = maps
         .lines()
@@ -630,6 +649,21 @@ pub(crate) fn gpu_libraries(maps: &str) -> Result<(String, Vec<super::HashedLibr
             inode: metadata.ino(),
         });
     }
+    // The process executable stays in the verified inventory (its mapping
+    // and inode are checked) but out of the manifest, exactly as the NPU
+    // execution inventory excludes it: a digest compiled into the binary
+    // must not change with every rebuild of that binary.
+    if !hashed.iter().any(|library| library.path == executable) {
+        return Err("the process executable is absent from the mapped inventory".into());
+    }
+    let lines = lines
+        .lines()
+        .filter(|line| {
+            line.rsplit_once(' ')
+                .is_some_and(|(path, _)| Path::new(path) != executable)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
     let (loader_family, _) = loader;
     super::verify_mappings(maps, &hashed, super::InventoryScope::Execution).map_err(|why| {
         format!("the {loader_family} stack changed under the GPU identity: {why}")
@@ -801,8 +835,15 @@ fn identity(
     core: &openvino::Core,
     library: &runtime::ResolvedLibrary,
     sources: &Sources<'_>,
+    // The one enumerated device (`GPU.N`), never a hard-coded index, and
+    // the mapped-library manifest of the moment the caller fixed the
+    // inventory: after enumeration for discovery, after the compile
+    // warm-up for the platform, so the digest names everything its own
+    // execution runs.
+    enumerated: &str,
+    manifest: &str,
 ) -> Result<Identity, String> {
-    let device = openvino::DeviceType::Other("GPU.0".into());
+    let device = openvino::DeviceType::Other(enumerated.to_owned().into());
     let property = |key: &str| {
         core.get_property(
             &device,
@@ -829,6 +870,10 @@ fn identity(
         .ok_or_else(|| "no vendor in DEVICE_ARCHITECTURE".to_owned())?;
     let render = render_node(sources.sysfs_drm, &device_pci, &vendor, &device_id)
         .map_err(|why| format!("render node: {why}"))?;
+    // A firmware build that cannot be read makes the identity unusable
+    // (ADR-0033 section 3): the discovery answer is the refusal, never a
+    // Found identity carrying an Unreadable or Malformed observation. A
+    // non-root reader gets exactly that reason.
     let firmware = match observe_firmware(sources.debugfs) {
         Ok(observation) => {
             if !observation.pci_slots.contains(&render.pci) {
@@ -840,15 +885,19 @@ fn identity(
             }
             observation.into_firmware()
         }
-        Err(FirmwareError::Unreadable) => Firmware::Unreadable,
-        Err(FirmwareError::Malformed(why)) => Firmware::Malformed(why),
+        Err(FirmwareError::Unreadable) => {
+            return Err("firmware: debugfs is unreadable (run as root)".into());
+        }
+        Err(FirmwareError::Malformed(why)) => {
+            return Err(format!("firmware: malformed report: {why}"));
+        }
     };
     let maps = std::fs::read_to_string(sources.maps).map_err(|error| format!("maps: {error}"))?;
     let loader = loader_stack(&maps)
         .map_err(|why| format!("loader: {why}"))?
         .0
         .to_owned();
-    let (libraries, _) = gpu_libraries(&maps)?;
+    let libraries = manifest.to_owned();
     Ok(Identity {
         selected_library: library.selected.to_string_lossy().into_owned(),
         canonical_library: library.canonical.to_string_lossy().into_owned(),
@@ -907,8 +956,20 @@ pub(crate) fn discover_admitted_with(
         Ok(indices) => indices,
         Err(error) => return Discovery::Unavailable(format!("enumerate: {error}")),
     };
-    discover_enumerated_gpu(&indices, |_device| {
-        match identity(&core, &library, sources) {
+    discover_enumerated_gpu(&indices, |device| {
+        // The discovery manifest is the enumeration-time inventory the
+        // ADR names; the platform's compile-time inventory is broader.
+        let manifest = std::fs::read_to_string(sources.maps)
+            .and_then(|maps| {
+                std::fs::read_link("/proc/self/exe").map(|executable| (maps, executable))
+            })
+            .map_err(|error| format!("inventory: {error}"))
+            .and_then(|(maps, executable)| gpu_libraries(&maps, &executable));
+        let manifest = match manifest {
+            Ok((manifest, _)) => manifest,
+            Err(error) => return Discovery::Unavailable(error),
+        };
+        match identity(&core, &library, sources, device, &manifest) {
             Ok(identity) => Discovery::Found(Box::new(identity)),
             Err(error) => Discovery::Unavailable(error),
         }
@@ -962,10 +1023,11 @@ pub(crate) fn firmware_with_pci(debugfs: &Path, sysfs_pci: &Path) -> (Firmware, 
 }
 
 /// An opened GPU platform for the hardware evidence harness: the validated
-/// provider, the complete [`Identity`], and the fixed compile
-/// configuration applied and read back (ADR-0033 section 2). Test-only,
-/// like the admitted discovery it builds on; production loading admission
-/// stays closed.
+/// provider, the complete [`Identity`] assembled after a compile warm-up
+/// so its manifest covers the whole compile-path stack, and the fixed
+/// compile configuration applied and read back (ADR-0033 section 2).
+/// Test-only, like the admitted discovery it builds on; production
+/// loading admission stays closed.
 #[cfg(test)]
 pub(crate) struct GpuPlatform {
     core: openvino::Core,
@@ -1017,8 +1079,21 @@ impl GpuPlatform {
         openvino_sys::library::load_from(&library.canonical)
             .map_err(|error| format!("load: {error}"))?;
         let mut core = openvino::Core::new().map_err(|error| format!("core: {error}"))?;
-        let identity = identity(&core, &library, sources)?;
-        let device = openvino::DeviceType::Other("GPU.0".into());
+        // The single-GPU rule gates the platform too: a system exposing
+        // more than one GPU refuses placement (ADR-0033 section 2), and
+        // every property, compile and warm-up below names the one
+        // enumerated device, never a hard-coded index.
+        let gpu = openvino::DeviceType::Other("GPU".into());
+        let indices = core
+            .get_property(&gpu, &openvino::PropertyKey::AvailableDevices)
+            .map_err(|error| format!("enumerate: {error}"))?;
+        let enumerated = crate::gpu::parse_device_indices(&indices);
+        let device_name = match enumerated.as_slice() {
+            [] => return Err("no GPU is exposed".into()),
+            [one] => one.clone(),
+            _ => return Err(format!("more than one GPU: {enumerated:?}")),
+        };
+        let device = openvino::DeviceType::Other(device_name.clone().into());
         let mut set = |key: openvino::RwPropertyKey, value: &str| -> Result<(), String> {
             core.set_property(&device, &key, value)
                 .map_err(|error| format!("{value}: {error}"))
@@ -1049,9 +1124,9 @@ impl GpuPlatform {
             }
         }
         // Warm the compile path up with the embedded model before the
-        // inventory is taken: compiling loads driver libraries the
-        // enumeration alone does not (udev on the measured hosts), and the
-        // identity must name everything a later compile runs.
+        // identity's inventory is taken: compiling loads driver libraries
+        // the enumeration alone does not (udev on the measured hosts), and
+        // the identity must name everything its own execution runs.
         let warm_scratch = tempfile::tempdir().map_err(|error| format!("warm-up dir: {error}"))?;
         {
             use openvino::{DeviceType, RwPropertyKey};
@@ -1059,7 +1134,7 @@ impl GpuPlatform {
             let warm = core
                 .read_model_from_buffer(WARM_UP_ONNX, None)
                 .map_err(|error| format!("warm-up read: {error}"))?;
-            let device = DeviceType::Other("GPU.0".into());
+            let device = DeviceType::Other(device_name.clone().into());
             core.set_property(
                 &device,
                 &RwPropertyKey::CacheDir,
@@ -1075,19 +1150,25 @@ impl GpuPlatform {
             let assigned = compiled
                 .get_property(&openvino::PropertyKey::Other("EXECUTION_DEVICES".into()))
                 .map_err(|error| format!("warm-up EXECUTION_DEVICES: {error}"))?;
-            if assigned.trim() != "GPU" && assigned.trim() != "GPU.0" {
+            if assigned.trim() != "GPU" && assigned.trim() != device_name {
                 return Err(format!("the warm-up compiled on {assigned:?}"));
             }
         }
+        // The identity is assembled here, after the warm-up, so its
+        // manifest covers the full compile-path stack; the executable the
+        // NPU inventory excludes is excluded here too.
+        let executable =
+            std::fs::read_link("/proc/self/exe").map_err(|error| format!("exe: {error}"))?;
         let maps =
             std::fs::read_to_string(sources.maps).map_err(|error| format!("maps: {error}"))?;
-        let (_, libraries) = gpu_libraries(&maps)?;
+        let (manifest, libraries) = gpu_libraries(&maps, &executable)?;
+        let identity = identity(&core, &library, sources, &device_name, &manifest)?;
         Ok(Self {
             core,
             identity,
             libraries,
             maps: sources.maps.to_path_buf(),
-            device: "GPU.0".to_owned(),
+            device: device_name,
         })
     }
 

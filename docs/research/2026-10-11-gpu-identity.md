@@ -97,10 +97,11 @@ Fedora RPM 2026.2.1, GPU plugin build `2026.2.1-000--`.
   the manifest inventories every file-backed executable mapping
   rather than a guessed name closure.
 - Manifest scope, as implemented: every file-backed executable
-  mapping from `/proc/self/maps` after enumeration, plus the IR and
-  ONNX frontends beside the core (which compiling loads), each
-  hashed through one open file whose inode is kept, re-verified
-  against the maps after compile.
+  mapping from `/proc/self/maps` (minus the process executable, as the
+  NPU execution inventory excludes it), plus the IR and ONNX frontends
+  beside the core (which compiling loads), each hashed through one
+  open file whose inode is kept, re-verified against the maps after
+  compile.
 
 ## Property surface
 

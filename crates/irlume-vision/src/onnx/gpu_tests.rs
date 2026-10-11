@@ -797,7 +797,60 @@ mod gpu_groundwork_tests {
                      or the repository models/ tree (scripts/fetch-models.sh)"
                 )
             });
-        std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        // The evidence must name the exact model it measured: the SHA-256
+        // is printed and, when the model root ships the pinned SHA256SUMS,
+        // checked against it, so a stale or modified model file cannot
+        // pose as the pinned recognizer.
+        let digest = irlume_common::sha256_hex(&bytes);
+        let sums = path.parent().unwrap().join("SHA256SUMS");
+        if sums.is_file() {
+            let pinned = std::fs::read_to_string(&sums)
+                .unwrap_or_else(|error| panic!("{}: {error}", sums.display()));
+            let expected = pinned
+                .lines()
+                .find_map(|line| {
+                    line.split_whitespace().next().filter(|_| {
+                        line.rsplit(['/', ' '])
+                            .next()
+                            .is_some_and(|n| n == "glintr100.onnx")
+                    })
+                })
+                .unwrap_or_else(|| panic!("{} names no glintr100.onnx", sums.display()));
+            assert_eq!(
+                digest,
+                expected,
+                "{} is not the pinned glintr100.onnx",
+                path.display()
+            );
+        } else {
+            // The installed tree need not ship the sums; the repository's
+            // tracked pin still names the one model this evidence may use.
+            let repo_sums = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/SHA256SUMS");
+            if repo_sums.is_file() {
+                let pinned = std::fs::read_to_string(&repo_sums)
+                    .unwrap_or_else(|error| panic!("{}: {error}", repo_sums.display()));
+                let expected = pinned.lines().find_map(|line| {
+                    let hash = line.split_whitespace().next()?;
+                    line.rsplit(['/', ' '])
+                        .next()
+                        .filter(|name| *name == "glintr100.onnx")
+                        .map(|_| hash.to_owned())
+                });
+                if let Some(expected) = expected {
+                    assert_eq!(
+                        digest,
+                        expected,
+                        "{} is not the pinned glintr100.onnx",
+                        path.display()
+                    );
+                }
+            }
+            println!("unpinned model root: {} sha256 {digest}", path.display());
+        }
+        println!("recognizer {} sha256 {digest}", path.display());
+        bytes
     }
 
     /// The recognizer's CPU reference session. BOTH hardware lanes build
@@ -1013,6 +1066,7 @@ mod gpu_groundwork_tests {
 
     /// A face found in one image, aligned and embedded on the CPU session
     /// and on the GPU platform, or skipped when no face is found.
+    #[derive(Clone)]
     struct FaceProbe {
         cpu: crate::Embedding,
         gpu: Vec<f32>,
@@ -1154,9 +1208,13 @@ mod gpu_groundwork_tests {
         let (mut genuine_ir, mut attacks_ir) = (Stats::default(), Stats::default());
         let (mut genuine_rgb, mut attacks_rgb) = (Stats::default(), Stats::default());
         let mut cosine_min = f32::INFINITY;
-        let mut reference: Option<Vec<f32>> = None;
-        let mut reference_rgb: Option<Vec<f32>> = None;
-        let (mut frames, mut faces) = (0usize, 0usize);
+        // Every decoded frame in one deterministic list, so a first pass
+        // can establish each modality's genuine reference BEFORE any
+        // attack is scored: an attack directory that sorts before the
+        // first genuine directory still counts against the reference,
+        // instead of being dropped.
+        let mut corpus: Vec<(PathBuf, bool, bool)> = Vec::new(); // (file, attack, ir)
+        let mut frames = 0usize;
         for dir in &dirs {
             let name = dir.file_name().unwrap().to_string_lossy().into_owned();
             let attack = is_attack(&name);
@@ -1167,48 +1225,69 @@ mod gpu_groundwork_tests {
                 .collect();
             files.sort();
             for file in files {
-                let Some((rgb, width, height, grayscale)) = decode_image(&file) else {
-                    continue;
-                };
-                frames += 1;
-                let ir = grayscale;
-                // RGB authenticates through the TTA pipeline; IR stays
-                // plain, exactly where production uses each.
-                let Some(probe) = probe_both(
-                    &mut detector,
-                    &mut cpu,
-                    &mut recognizer,
-                    &rgb,
-                    width,
-                    height,
-                    !ir,
-                ) else {
-                    continue;
-                };
-                faces += 1;
-                let cosine: f32 = probe.cpu.iter().zip(&probe.gpu).map(|(x, y)| x * y).sum();
-                cosine_min = cosine_min.min(cosine);
-                let reference = if ir {
+                if let Some((.., grayscale)) = decode_image(&file) {
+                    frames += 1;
+                    corpus.push((file, attack, grayscale));
+                }
+            }
+        }
+        let mut reference: Option<Vec<f32>> = None;
+        let mut reference_rgb: Option<Vec<f32>> = None;
+        // Pass 1: the first genuine frame with a detectable face of each
+        // modality becomes that modality's CPU template.
+        let mut faces = 0usize;
+        let mut probes: Vec<(FaceProbe, bool, bool)> = Vec::new();
+        for (file, attack, ir) in &corpus {
+            let (rgb, width, height, _) = decode_image(file).unwrap();
+            let Some(probe) = probe_both(
+                &mut detector,
+                &mut cpu,
+                &mut recognizer,
+                &rgb,
+                width,
+                height,
+                !ir,
+            ) else {
+                continue;
+            };
+            faces += 1;
+            probes.push((probe, *attack, *ir));
+        }
+        for probe in &mut probes {
+            if !probe.1 {
+                let slot = if probe.2 {
                     &mut reference
                 } else {
                     &mut reference_rgb
                 };
-                if reference.is_none() && attack {
-                    continue; // no genuine reference of this modality yet
+                if slot.is_none() {
+                    *slot = Some(probe.0.cpu.to_vec());
                 }
-                let template = reference.get_or_insert(probe.cpu.to_vec()).clone();
-                let score = |embedding: &[f32]| -> f32 {
-                    embedding.iter().zip(&template).map(|(x, y)| x * y).sum()
-                };
-                let (cpu_score, gpu_score) = (score(&probe.cpu), score(&probe.gpu));
-                let stats: &mut Stats = match (attack, ir) {
-                    (true, true) => &mut attacks_ir,
-                    (true, false) => &mut attacks_rgb,
-                    (false, true) => &mut genuine_ir,
-                    (false, false) => &mut genuine_rgb,
-                };
-                stats.add(cpu_score, gpu_score, 0.55);
             }
+        }
+        // Pass 2: score everything against its modality's template.
+        for (probe, attack, ir) in &probes {
+            let cosine: f32 = probe.cpu.iter().zip(&probe.gpu).map(|(x, y)| x * y).sum();
+            cosine_min = cosine_min.min(cosine);
+            let template = if *ir {
+                reference.as_ref()
+            } else {
+                reference_rgb.as_ref()
+            };
+            let Some(template) = template else {
+                continue; // no genuine reference of this modality at all
+            };
+            let score = |embedding: &[f32]| -> f32 {
+                embedding.iter().zip(template).map(|(x, y)| x * y).sum()
+            };
+            let (cpu_score, gpu_score) = (score(&probe.cpu), score(&probe.gpu));
+            let stats: &mut Stats = match (attack, ir) {
+                (true, true) => &mut attacks_ir,
+                (true, false) => &mut attacks_rgb,
+                (false, true) => &mut genuine_ir,
+                (false, false) => &mut genuine_rgb,
+            };
+            stats.add(cpu_score, gpu_score, 0.55);
         }
         assert!(platform.still_loaded_as_hashed().is_ok());
         // A vacuous run is not evidence: every arm must have samples.
@@ -1226,19 +1305,25 @@ mod gpu_groundwork_tests {
         );
         println!(
             "{}",
-            genuine_ir.line("recognizer genuine IR vs first frame at 0.55")
+            genuine_ir.line_as("recognizer genuine IR vs first frame at 0.55", "GPU")
         );
         println!(
             "{}",
-            attacks_ir.line("recognizer IR attacks vs first genuine IR frame at 0.55")
+            attacks_ir.line_as(
+                "recognizer IR attacks vs first genuine IR frame at 0.55",
+                "GPU"
+            )
         );
         println!(
             "{}",
-            genuine_rgb.line("recognizer genuine RGB vs first frame at 0.55")
+            genuine_rgb.line_as("recognizer genuine RGB vs first frame at 0.55", "GPU")
         );
         println!(
             "{}",
-            attacks_rgb.line("recognizer RGB attacks vs first genuine RGB frame at 0.55")
+            attacks_rgb.line_as(
+                "recognizer RGB attacks vs first genuine RGB frame at 0.55",
+                "GPU"
+            )
         );
         println!("recognizer CPU vs GPU embedding cosine, lowest {cosine_min:.6}");
         let new_grants: usize = [&attacks_ir, &attacks_rgb]
@@ -1299,27 +1384,19 @@ mod gpu_groundwork_tests {
         out
     }
 
-    /// One identity's first two images from a grouped corpus.
-    fn lfw_person_key(path: &Path) -> Option<String> {
-        let stem = path.file_stem()?.to_str()?;
-        Some(match stem.rsplit_once('_') {
-            Some((head, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
-                head.to_owned()
-            }
-            _ => stem.to_owned(),
-        })
-    }
-
-    /// Recognition-corpus drift: genuine pairs from the LFW grouping and
-    /// impostor pairs across identities (LFW cross-person and the
-    /// impostor-only FairFace tree), scored CPU-template vs CPU-probe and
-    /// CPU-template vs GPU-probe at the 0.55 threshold. This is the
-    /// zero-effort-impostor half of the ADR-0022 section 7 evidence the
-    /// NPU certification judged, measured on the GPU identity; reported,
-    /// not certified. Corpora roots: `IRLUME_GPU_CORPORA_LFW` and
-    /// `IRLUME_GPU_CORPORA_FAIRFACE` (default `~/datasets/lfw` and
-    /// `~/datasets/fairface`), bounded by `IRLUME_GPU_CORPORA_PERSONS`
-    /// (default 400) and `IRLUME_GPU_CORPORA_IMPOSTORS` (default 3000).
+    /// Recognition-corpus drift on the canonical LFW verification pairs
+    /// and the impostor-only FairFace tree, scored CPU-template vs
+    /// CPU-probe and CPU-template vs GPU-probe at the 0.55 threshold.
+    /// This is the zero-effort-impostor half of the ADR-0022 section 7
+    /// evidence the NPU certification judged, measured on the GPU
+    /// identity; reported, not certified. The LFW pairs come from the
+    /// corpus's own `pairs.csv` (the official verification protocol, with
+    /// its is_same labels and resolved paths), never an invented pairing.
+    /// Roots: `IRLUME_GPU_CORPORA_LFW` and `IRLUME_GPU_CORPORA_FAIRFACE`
+    /// (default `~/datasets/lfw` and `~/datasets/fairface`), bounded by
+    /// `IRLUME_GPU_CORPORA_PAIRS` (default 400 genuine pairs and 400
+    /// impostor pairs) and `IRLUME_GPU_CORPORA_IMPOSTORS` (default 2600
+    /// FairFace pairs). RGB probes run the TTA pipeline.
     #[test]
     #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, the recognizer weights and the recognition corpora"]
     fn gpu_hw_recognition_corpora_drift() {
@@ -1332,14 +1409,24 @@ mod gpu_groundwork_tests {
             std::env::var("IRLUME_GPU_CORPORA_FAIRFACE")
                 .unwrap_or_else(|_| format!("{home}/datasets/fairface")),
         );
-        let max_persons: usize = std::env::var("IRLUME_GPU_CORPORA_PERSONS")
+        let max_pairs: usize = std::env::var("IRLUME_GPU_CORPORA_PAIRS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(400);
         let max_impostors: usize = std::env::var("IRLUME_GPU_CORPORA_IMPOSTORS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3000);
+            .unwrap_or(2600);
+        assert!(
+            lfw_root.is_dir(),
+            "the LFW root {} is missing (IRLUME_GPU_CORPORA_LFW)",
+            lfw_root.display()
+        );
+        assert!(
+            fairface_root.is_dir(),
+            "the FairFace root {} is missing (IRLUME_GPU_CORPORA_FAIRFACE)",
+            fairface_root.display()
+        );
 
         let scratch = tempfile::tempdir().unwrap();
         let bytes = recognizer_bytes();
@@ -1355,81 +1442,57 @@ mod gpu_groundwork_tests {
             std::fs::read(model_path("face_detection_yunet_2023mar.onnx")).unwrap();
         let mut detector = crate::Detector::load_from_memory(&detector_bytes).unwrap();
 
-        // Group the LFW tree by person (deterministic order).
-        let all = collect_images(&lfw_root);
-        let mut by_person: std::collections::BTreeMap<String, Vec<PathBuf>> = Default::default();
-        for path in all {
-            if let Some(key) = lfw_person_key(&path) {
-                by_person.entry(key).or_default().push(path);
-            }
-        }
-        let people: Vec<(&String, &Vec<PathBuf>)> = by_person
-            .iter()
-            .filter(|(_, files)| files.len() >= 2)
-            .take(max_persons)
-            .collect();
-        println!(
-            "lfw: {} images, {} people with two or more, using {}",
-            by_person.values().map(Vec::len).sum::<usize>(),
-            by_person.iter().filter(|(_, f)| f.len() >= 2).count(),
-            people.len()
-        );
-
+        // Embed each image at most once, whatever pairs reference it.
+        let mut embedded: std::collections::HashMap<PathBuf, Option<FaceProbe>> =
+            Default::default();
         let mut no_face = 0usize;
-        // The corpora are RGB: the probes run the TTA pipeline production
-        // authenticates RGB with; the template stays the CPU embedding of
-        // the enrollment view.
         let mut embed = |detector: &mut crate::Detector,
                          cpu: &mut crate::Embedder,
                          gpu: &mut Box<dyn crate::npu::Infer>,
                          path: &Path|
          -> Option<FaceProbe> {
+            if let Some(cached) = embedded.get(path) {
+                return cached.clone();
+            }
             let result = decode_image(path).and_then(|(rgb, width, height, _grayscale)| {
                 probe_both(detector, cpu, gpu, &rgb, width, height, true)
             });
             if result.is_none() {
                 no_face += 1;
             }
+            embedded.insert(path.to_path_buf(), result.clone());
             result
         };
 
-        // Genuine pairs: first image as the CPU template, second as probe.
-        let mut genuine = Stats::default();
-        for (_, files) in &people {
-            let (Some(template), Some(probe)) = (
-                embed(&mut detector, &mut cpu, &mut recognizer, &files[0]),
-                embed(&mut detector, &mut cpu, &mut recognizer, &files[1]),
-            ) else {
+        // The canonical pairs: pair_id,fold_id,fold_position,is_same,
+        // image_a,image_b,image_a_path,image_b_path, paths relative to
+        // the corpus's train/ tree.
+        let pairs_csv = lfw_root.join("pairs.csv");
+        let text = std::fs::read_to_string(&pairs_csv)
+            .unwrap_or_else(|error| panic!("{}: {error}", pairs_csv.display()));
+        let train = lfw_root.join("train");
+        let (mut genuine, mut impostor_lfw) = (Stats::default(), Stats::default());
+        let mut lfw_pairs_used = [0usize; 2];
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields.len() < 9 {
                 continue;
-            };
-            let cpu_score: f32 = template
-                .cpu
-                .iter()
-                .zip(&probe.cpu)
-                .map(|(x, y)| x * y)
-                .sum();
-            let gpu_score: f32 = template
-                .cpu
-                .iter()
-                .zip(&probe.gpu)
-                .map(|(x, y)| x * y)
-                .sum();
-            genuine.add(cpu_score, gpu_score, 0.55);
-        }
-
-        // Impostor pairs, LFW: person i's first image as the template,
-        // person i+1's first as the probe.
-        let mut impostor_lfw = Stats::default();
-        for pair in people.windows(2) {
-            if impostor_lfw.n >= max_impostors / 2 {
-                break;
+            }
+            let is_same = fields[3] == "1";
+            if lfw_pairs_used[usize::from(is_same)] >= max_pairs {
+                continue;
+            }
+            let (a, b) = (train.join(fields[7]), train.join(fields[8]));
+            if !a.is_file() || !b.is_file() {
+                continue;
             }
             let (Some(template), Some(probe)) = (
-                embed(&mut detector, &mut cpu, &mut recognizer, &pair[0].1[0]),
-                embed(&mut detector, &mut cpu, &mut recognizer, &pair[1].1[0]),
+                embed(&mut detector, &mut cpu, &mut recognizer, &a),
+                embed(&mut detector, &mut cpu, &mut recognizer, &b),
             ) else {
                 continue;
             };
+            lfw_pairs_used[usize::from(is_same)] += 1;
             let cpu_score: f32 = template
                 .cpu
                 .iter()
@@ -1442,14 +1505,22 @@ mod gpu_groundwork_tests {
                 .zip(&probe.gpu)
                 .map(|(x, y)| x * y)
                 .sum();
-            impostor_lfw.add(cpu_score, gpu_score, 0.55);
+            if is_same {
+                genuine.add(cpu_score, gpu_score, 0.55);
+            } else {
+                impostor_lfw.add(cpu_score, gpu_score, 0.55);
+            }
         }
+        println!(
+            "lfw pairs.csv: {} genuine, {} impostor pairs used",
+            lfw_pairs_used[1], lfw_pairs_used[0]
+        );
 
         // Impostor pairs, FairFace (impostor-only tree): consecutive files.
         let mut impostor_fairface = Stats::default();
         let fairface_files = collect_images(&fairface_root);
         for pair in fairface_files.windows(2) {
-            if impostor_fairface.n + impostor_lfw.n >= max_impostors {
+            if impostor_fairface.n >= max_impostors {
                 break;
             }
             let (Some(template), Some(probe)) = (
@@ -1475,19 +1546,20 @@ mod gpu_groundwork_tests {
         assert!(platform.still_loaded_as_hashed().is_ok());
         // A vacuous run is not evidence: both directions need samples.
         assert!(genuine.n > 0, "no genuine pairs were measured");
+        assert!(impostor_lfw.n > 0, "no LFW impostor pairs were measured");
         assert!(
-            impostor_lfw.n + impostor_fairface.n > 0,
-            "no impostor pairs were measured"
+            impostor_fairface.n > 0,
+            "no FairFace impostor pairs were measured"
         );
         println!("skipped images without a detectable face: {no_face}");
-        println!("{}", genuine.line("genuine LFW pairs at 0.55"));
+        println!("{}", genuine.line_as("genuine LFW pairs at 0.55", "GPU"));
         println!(
             "{}",
-            impostor_lfw.line("impostor LFW cross-person pairs at 0.55")
+            impostor_lfw.line_as("impostor LFW pairs at 0.55", "GPU")
         );
         println!(
             "{}",
-            impostor_fairface.line("impostor FairFace pairs at 0.55")
+            impostor_fairface.line_as("impostor FairFace pairs at 0.55", "GPU")
         );
         let new_grants: usize = [&impostor_lfw, &impostor_fairface]
             .iter()
@@ -1556,7 +1628,9 @@ mod gpu_groundwork_tests {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let now = crate::npu::suspended(crate::npu::Bound::AtLeast)
                 .expect("the suspend clock is readable");
-            if now > clock_baseline {
+            // The same granularity production uses: growth below it is
+            // read jitter, not a suspend.
+            if now > clock_baseline + crate::npu::RESUME_GRANULARITY {
                 resumed = true;
                 break;
             }

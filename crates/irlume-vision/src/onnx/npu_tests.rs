@@ -76,11 +76,17 @@ impl Stats {
     }
 
     pub(super) fn line(&self, name: &str) -> String {
+        self.line_as(name, "NPU")
+    }
+
+    /// [`Self::line`] naming the accelerator the CPU outputs are compared
+    /// against, so GPU evidence is not labeled NPU.
+    pub(super) fn line_as(&self, name: &str, device: &str) -> String {
         if self.n == 0 {
             return format!("{name}: no samples");
         }
         format!(
-                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, NPU below: {}) nearest CPU score to threshold {:.4}",
+                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, {device} below: {}) nearest CPU score to threshold {:.4}",
                 self.n,
                 self.max_delta,
                 self.sum_delta / self.n as f64,

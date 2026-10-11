@@ -5,6 +5,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Complete GPU platform identity under closed admission: the test-only
+  GPU discovery now binds the plugin's `DEVICE_PCI_INFO` report to
+  exactly one DRM render node (sysfs address and `vendor`/`device`
+  attributes must match), reads the GuC/HuC firmware of that same node,
+  records the GPU plugin build, the loader family the plugin resolved
+  (`libOpenCL` or `libze_loader`, from the mapped libraries), the fixed
+  compile configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`
+  and the SHA-256 of every mapped native library under the ADR-0022
+  one-open-file inode discipline. `GPU_DRIVER_VERSION` is never read:
+  the property read kills the process on the measured 2026.2.1 builds,
+  so driver identity comes from the hashed manifest. Ignored
+  `gpu_hw_*` hardware tests collect the identity and compile the
+  recognizer on `GPU.0` under the fixed configuration with a CPU parity
+  canary and post-compile library re-verification. Loading admission
+  stays closed and `CERTIFIED` stays empty (ADR-0033 section 3, #1053).
+
 ### Changed
 
 - Custom builds of `irlume-vision` compiled with the `cuda`, `openvino`,

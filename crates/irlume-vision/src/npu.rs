@@ -1017,9 +1017,9 @@ fn firmware_build(debugfs_accel: &Path, bus_address: &str) -> Result<String, Cpu
 /// on the measured host). An update renames a new file into place, created
 /// while the old inode is still allocated, so it always has a new inode.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct HashedLibrary {
-    path: PathBuf,
-    inode: u64,
+pub(crate) struct HashedLibrary {
+    pub(crate) path: PathBuf,
+    pub(crate) inode: u64,
 }
 
 fn is_runtime_library(path: &str) -> bool {

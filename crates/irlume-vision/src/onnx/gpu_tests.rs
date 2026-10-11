@@ -1018,8 +1018,30 @@ mod gpu_groundwork_tests {
         gpu: Vec<f32>,
     }
 
-    /// Embed one image's best face on both devices. Returns None when the
-    /// image has no detectable face.
+    /// One L2-normalized embedding from the GPU's raw output, exactly as
+    /// production normalizes the session output.
+    fn gpu_norm_infer(gpu: &mut Box<dyn crate::npu::Infer>, data: &[f32]) -> Vec<f32> {
+        let mut raw = gpu.infer(data).expect("the GPU recognizer answers");
+        let norm: f32 = raw.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!(norm.is_finite() && norm > 0.0, "the GPU output has no norm");
+        raw.iter_mut().for_each(|value| *value /= norm);
+        raw
+    }
+
+    /// The mean of two normalized embeddings, renormalized, mirroring
+    /// production `tta_mean`.
+    fn tta_mean(a: &[f32], b: &[f32]) -> Vec<f32> {
+        let mut out: Vec<f32> = a.iter().zip(b).map(|(x, y)| x + y).collect();
+        let norm: f32 = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+        out.iter_mut().for_each(|value| *value /= norm);
+        out
+    }
+
+    /// Embed one image's best face on both devices, plain or through the
+    /// TTA pipeline production authenticates RGB with. Returns None only
+    /// when no face is detectable or alignable; a device that fails to
+    /// answer PANICS, so a measurement can never silently lose samples to
+    /// an inference error.
     fn probe_both(
         detector: &mut crate::Detector,
         cpu: &mut crate::Embedder,
@@ -1027,6 +1049,7 @@ mod gpu_groundwork_tests {
         rgb: &[u8],
         width: u32,
         height: u32,
+        tta: bool,
     ) -> Option<FaceProbe> {
         let view = crate::align::RgbView {
             data: rgb,
@@ -1039,21 +1062,21 @@ mod gpu_groundwork_tests {
             .filter(crate::detection_is_finite)
             .max_by(|a, b| a.score.total_cmp(&b.score))?;
         let chip = crate::align::align_to_arcface(&view, &face.landmarks).ok()?;
-        let data = crate::align::preprocess_arcface(&chip);
-        let cpu = cpu.embed_preprocessed(&data).ok()?;
-        // The model's raw output is not the embedding: production
-        // L2-normalizes it, and every cosine and score below assumes unit
-        // vectors, so the GPU output is normalized the same way here.
-        let mut gpu = gpu.infer(&data).ok()?;
-        let norm: f32 = gpu.iter().map(|value| value * value).sum::<f32>().sqrt();
-        if !norm.is_finite() || norm <= 0.0 {
-            return None;
-        }
-        gpu.iter_mut().for_each(|value| *value /= norm);
+        let plain = crate::align::preprocess_arcface(&chip);
+        let (cpu, gpu) = if tta {
+            let cpu = cpu.embed_tta(&chip).expect("the CPU TTA embedding");
+            let a = gpu_norm_infer(gpu, &plain);
+            let flipped = crate::align::preprocess_arcface(&crate::align::flip_h(&chip));
+            let b = gpu_norm_infer(gpu, &flipped);
+            (cpu, tta_mean(&a, &b))
+        } else {
+            let cpu = cpu.embed_preprocessed(&plain).expect("the CPU embedding");
+            (cpu, gpu_norm_infer(gpu, &plain))
+        };
         Some(FaceProbe { cpu, gpu })
     }
 
-    fn decode_image(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    fn decode_image(path: &Path) -> Option<(Vec<u8>, u32, u32, bool)> {
         let raw = std::fs::read(path).ok()?;
         match path
             .extension()
@@ -1061,19 +1084,22 @@ mod gpu_groundwork_tests {
             .map(str::to_ascii_lowercase)
             .as_deref()
         {
+            // The PNM kind, not the extension, decides the modality, like
+            // the NPU lane: a grayscale P5 under any name is IR.
             Some("pgm") | Some("ppm") => {
                 let (kind, w, h, data) = pnm(&raw)?;
-                let rgb = if kind == 'g' {
+                let grayscale = kind == 'g';
+                let rgb = if grayscale {
                     data.iter().flat_map(|&g| [g, g, g]).collect()
                 } else {
                     data.to_vec()
                 };
-                Some((rgb, w, h))
+                Some((rgb, w, h, grayscale))
             }
             Some("jpg") | Some("jpeg") | Some("png") => {
                 let img = image::open(path).ok()?.to_rgb8();
                 let (w, h) = img.dimensions();
-                Some((img.into_raw(), w, h))
+                Some((img.into_raw(), w, h, false))
             }
             _ => None,
         }
@@ -1141,14 +1167,13 @@ mod gpu_groundwork_tests {
                 .collect();
             files.sort();
             for file in files {
-                let Some((rgb, width, height)) = decode_image(&file) else {
+                let Some((rgb, width, height, grayscale)) = decode_image(&file) else {
                     continue;
                 };
                 frames += 1;
-                let ir = file
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("pgm"));
+                let ir = grayscale;
+                // RGB authenticates through the TTA pipeline; IR stays
+                // plain, exactly where production uses each.
                 let Some(probe) = probe_both(
                     &mut detector,
                     &mut cpu,
@@ -1156,6 +1181,7 @@ mod gpu_groundwork_tests {
                     &rgb,
                     width,
                     height,
+                    !ir,
                 ) else {
                     continue;
                 };
@@ -1185,6 +1211,15 @@ mod gpu_groundwork_tests {
             }
         }
         assert!(platform.still_loaded_as_hashed().is_ok());
+        // A vacuous run is not evidence: every arm must have samples.
+        for (name, stats) in [
+            ("genuine IR", &genuine_ir),
+            ("IR attacks", &attacks_ir),
+            ("genuine RGB", &genuine_rgb),
+            ("RGB attacks", &attacks_rgb),
+        ] {
+            assert!(stats.n > 0, "the {name} arm measured no samples");
+        }
         println!(
             "frames {frames}, with a face {faces}, directories {}",
             dirs.len()
@@ -1341,13 +1376,16 @@ mod gpu_groundwork_tests {
         );
 
         let mut no_face = 0usize;
+        // The corpora are RGB: the probes run the TTA pipeline production
+        // authenticates RGB with; the template stays the CPU embedding of
+        // the enrollment view.
         let mut embed = |detector: &mut crate::Detector,
                          cpu: &mut crate::Embedder,
                          gpu: &mut Box<dyn crate::npu::Infer>,
                          path: &Path|
          -> Option<FaceProbe> {
-            let result = decode_image(path).and_then(|(rgb, width, height)| {
-                probe_both(detector, cpu, gpu, &rgb, width, height)
+            let result = decode_image(path).and_then(|(rgb, width, height, _grayscale)| {
+                probe_both(detector, cpu, gpu, &rgb, width, height, true)
             });
             if result.is_none() {
                 no_face += 1;
@@ -1435,6 +1473,12 @@ mod gpu_groundwork_tests {
             impostor_fairface.add(cpu_score, gpu_score, 0.55);
         }
         assert!(platform.still_loaded_as_hashed().is_ok());
+        // A vacuous run is not evidence: both directions need samples.
+        assert!(genuine.n > 0, "no genuine pairs were measured");
+        assert!(
+            impostor_lfw.n + impostor_fairface.n > 0,
+            "no impostor pairs were measured"
+        );
         println!("skipped images without a detectable face: {no_face}");
         println!("{}", genuine.line("genuine LFW pairs at 0.55"));
         println!(
@@ -1455,16 +1499,24 @@ mod gpu_groundwork_tests {
         );
     }
 
-    /// The suspend/resume recheck a GPU certification requires: after a
-    /// real system suspend (an attended, owner-approved session; never
-    /// triggered here), the compiled model's bits and the mapped-library
-    /// inventory must be unchanged. Run with
-    /// `IRLUME_GPU_TEST_RESUMED=1` set after the resume; without it the
-    /// lane reports that no suspend was recorded and asserts nothing.
+    /// The suspend/resume recheck a GPU certification requires, run as
+    /// ONE process that spans the suspend: it opens the platform, records
+    /// the digest baseline and the suspended-time baseline, then waits
+    /// (`IRLUME_GPU_TEST_SUSPEND_WAIT_SECS`, default 600) for a real
+    /// system suspend. A resume is proven only by growth of the
+    /// CLOCK_BOOTTIME-minus-MONOTONIC reading beyond read granularity,
+    /// the same proof production uses; when the clock grows, the
+    /// reference inputs must reproduce their bits and the mapped-library
+    /// inventory must still verify. No suspend within the window prints
+    /// the baseline and asserts nothing; the lane never suspends the
+    /// system itself, so the wait is the attended owner's action.
     #[test]
-    #[ignore = "hardware: needs a real, attended system suspend before the run"]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU and the recognizer weights; the recheck arm waits for a real attended suspend"]
     fn gpu_hw_suspend_resume_recheck() {
-        let resumed = std::env::var("IRLUME_GPU_TEST_RESUMED").is_ok_and(|v| v == "1");
+        let wait_seconds: u64 = std::env::var("IRLUME_GPU_TEST_SUSPEND_WAIT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
         let scratch = tempfile::tempdir().unwrap();
         let bytes = recognizer_bytes();
         // The CPU session fixes the native-library baseline (see
@@ -1482,36 +1534,45 @@ mod gpu_groundwork_tests {
                 .flat_map(|value| value.to_le_bytes())
                 .collect()
         };
-        let before: Vec<String> = (0..3)
+        let baseline: Vec<String> = (0..3)
             .map(|k| {
                 let answer = recognizer
                     .infer(&super::super::npu_reference::chip(k))
-                    .unwrap();
+                    .expect("the GPU answers before the suspend");
                 irlume_common::sha256_hex(&raw(&answer))
             })
             .collect();
+        // The understating baseline and the overstating later reading can
+        // only overstate a suspend, never hide one (npu::suspended).
+        let clock_baseline = crate::npu::suspended(crate::npu::Bound::AtMost)
+            .expect("the suspend clock is readable");
+        println!(
+            "digest baseline {baseline:?}; suspend now (attended) - waiting up to \
+             {wait_seconds}s for the clock to grow"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_seconds);
+        let mut resumed = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let now = crate::npu::suspended(crate::npu::Bound::AtLeast)
+                .expect("the suspend clock is readable");
+            if now > clock_baseline {
+                resumed = true;
+                break;
+            }
+        }
         if !resumed {
-            println!(
-                "no suspend recorded (IRLUME_GPU_TEST_RESUMED unset): digest baseline is \
-                 {before:?}; rerun this lane with IRLUME_GPU_TEST_RESUMED=1 after a real, \
-                 attended suspend"
-            );
+            println!("no suspend within {wait_seconds}s: no recheck claimed, nothing asserted");
             return;
         }
-        // The flag says a real suspend happened since the platform opened;
-        // the boot-time clock the NPU recheck uses proves it did.
-        assert!(
-            crate::npu::suspended(crate::npu::Bound::AtLeast).is_some(),
-            "IRLUME_GPU_TEST_RESUMED=1 but no suspend is recorded this boot"
-        );
-        for (k, baseline) in before.iter().enumerate() {
+        for (k, expected) in baseline.iter().enumerate() {
             let answer = recognizer
                 .infer(&super::super::npu_reference::chip(k))
-                .unwrap();
+                .expect("the GPU answers after the resume");
             assert_eq!(
                 &irlume_common::sha256_hex(&raw(&answer)),
-                baseline,
-                "input {k} changed across the suspend"
+                expected,
+                "input {k} changed across a real suspend"
             );
         }
         assert!(platform.still_loaded_as_hashed().is_ok());

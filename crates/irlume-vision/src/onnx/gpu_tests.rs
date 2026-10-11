@@ -1041,7 +1041,15 @@ mod gpu_groundwork_tests {
         let chip = crate::align::align_to_arcface(&view, &face.landmarks).ok()?;
         let data = crate::align::preprocess_arcface(&chip);
         let cpu = cpu.embed_preprocessed(&data).ok()?;
-        let gpu = gpu.infer(&data).ok()?;
+        // The model's raw output is not the embedding: production
+        // L2-normalizes it, and every cosine and score below assumes unit
+        // vectors, so the GPU output is normalized the same way here.
+        let mut gpu = gpu.infer(&data).ok()?;
+        let norm: f32 = gpu.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return None;
+        }
+        gpu.iter_mut().for_each(|value| *value /= norm);
         Some(FaceProbe { cpu, gpu })
     }
 

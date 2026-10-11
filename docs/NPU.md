@@ -44,6 +44,10 @@ from the other source. Both default and accelerator builds report the
 GPU-disabled reason from the governing startup snapshot. The NPU-named
 keys never leak into it.
 
+Root and ordinary status callers receive these fixed public selection and
+switch reasons. Native provider error text remains privileged; ordinary
+callers receive its categorical projection.
+
 GPU groundwork ships behind the same closed loading admission as the NPU
 (ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
 exposing more than one GPU refuses placement until a reviewed rule selects
@@ -180,8 +184,9 @@ matchable scans have missing or different CPU-producer tags uses CPU probes,
 including legacy enrollments. Enrollment and self-tests use CPU. An IR adapter
 also keeps the recognizer on CPU.
 
-Non-root Health replies use fixed CPU-fallback categories: discovery not
-reported, runtime unavailable, or recognizer unavailable. Native error details
+Apart from the fixed public selection/switch reasons above, non-root Health
+replies use fixed CPU-fallback categories: discovery not reported, runtime
+unavailable, or recognizer unavailable. Native error details
 are available only to root peers; the privileged journal also retains bounded
 detailed reasons. Consumers should use the fields, not parse reason text. See
 [Machine API](MACHINE-API.md) for the reporting contract.

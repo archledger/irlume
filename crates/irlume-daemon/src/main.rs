@@ -5140,7 +5140,8 @@ fn publish_engine_bits_raw(bits: EngineBits) {
 
 /// Native provider errors remain privileged diagnostics. A bounded line can
 /// still contain paths or device identifiers, so non-root Health uses only
-/// categories derived from the published observation, never native text.
+/// categories derived from the published observation or exact public policy
+/// reasons, never native text.
 fn recognizer_for_peer(
     placement: &irlume_common::RecognizerPlacement,
     uid: u32,
@@ -5149,6 +5150,15 @@ fn recognizer_for_peer(
     if uid != 0 {
         projected.reason = if placement.device == "npu" {
             None
+        } else if matches!(
+            placement.reason.as_deref(),
+            Some(
+                irlume_common::RECOGNIZER_CPU_SELECTED_REASON
+                    | irlume_common::RECOGNIZER_GPU_DISABLED_REASON
+                    | irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON
+            )
+        ) {
+            placement.reason.clone()
         } else {
             Some(
                 match placement.runtime_available {
@@ -17574,6 +17584,66 @@ mod tests {
         // The device selection is a fixed word, safe for every peer.
         assert_eq!(root.selection.as_deref(), Some("npu"));
         assert_eq!(ordinary.selection.as_deref(), Some("npu"));
+
+        let projected_health = |uid| {
+            let Response::Health {
+                recognizer: Some(placement),
+                ..
+            } = dispatch_status(&Request::Health, &peer(uid)).unwrap()
+            else {
+                panic!("published recognizer in Health")
+            };
+            placement
+        };
+        for (selection, reason) in [
+            ("cpu", irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
+            ("gpu", irlume_common::RECOGNIZER_GPU_DISABLED_REASON),
+            ("gpu", irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON),
+        ] {
+            publish_engine_bits_raw(EngineBits {
+                recognizer: Some(irlume_common::RecognizerPlacement {
+                    device: "cpu".into(),
+                    reason: Some(reason.into()),
+                    platform: None,
+                    runtime_available: None,
+                    qualified: None,
+                    selection: Some(selection.into()),
+                }),
+                ..Default::default()
+            });
+            assert_eq!(projected_health(0).reason.as_deref(), Some(reason));
+            let ordinary = projected_health(NOBODY);
+            assert_eq!(ordinary.reason.as_deref(), Some(reason));
+            assert_eq!(ordinary.selection.as_deref(), Some(selection));
+            assert_eq!(ordinary.runtime_available, None);
+        }
+        // Only exact public reasons survive. Native details remain masked
+        // even when they contain an otherwise safe GPU reason as a prefix.
+        for detail in [
+            detail.to_owned(),
+            format!(
+                "{} /home/private/provider.so",
+                irlume_common::RECOGNIZER_GPU_DISABLED_REASON
+            ),
+        ] {
+            publish_engine_bits_raw(EngineBits {
+                recognizer: Some(irlume_common::RecognizerPlacement {
+                    device: "cpu".into(),
+                    reason: Some(detail.clone()),
+                    platform: None,
+                    runtime_available: None,
+                    qualified: None,
+                    selection: Some("gpu".into()),
+                }),
+                ..Default::default()
+            });
+            assert_eq!(projected_health(0).reason.as_deref(), Some(detail.as_str()));
+            assert_eq!(
+                projected_health(NOBODY).reason.as_deref(),
+                Some("NPU discovery not reported; using CPU")
+            );
+        }
+        publish_engine_bits_raw(EngineBits::default());
     }
 
     #[test]

@@ -68,7 +68,9 @@ All notable changes to irlume are documented here. This project adheres to
   GuC/HuC firmware across the actual GTs/tiles. Unreadable or conflicting
   firmware refuses; the observation cannot key certification. Default and
   accelerator builds retain the GPU-switch CPU reason from the successful
-  build's settings snapshot. The `gpu_hw_*` ignored tests collect preliminary
+  build's settings snapshot. Ordinary status preserves the fixed public
+  selection/switch reasons while native provider details remain masked.
+  The `gpu_hw_*` ignored tests collect preliminary
   discovery evidence on real Intel GPUs; no loading profile is admitted and
   `CERTIFIED` stays empty (#1053).
 

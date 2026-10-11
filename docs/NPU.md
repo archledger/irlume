@@ -90,9 +90,10 @@ ulimit -c 0; cargo test -p irlume-vision --features npu --release \
 ```
 
 `IRLUME_NPU_LIBRARY` selects a non-standard C API file, with
-`LD_LIBRARY_PATH` pointing the test process at that runtime root, and
-`IRLUME_NPU_TEST_MODELS` names the model directory. No certification
-table entry or loading profile exists.
+`LD_LIBRARY_PATH` pointing the test process at that runtime root. Both
+lanes need the recognizer weights, from `IRLUME_NPU_TEST_MODELS`, an
+installed `/usr/share/irlume/models` tree or the repository `models/`
+tree. No certification table entry or loading profile exists.
 
 ## Select a C API file
 

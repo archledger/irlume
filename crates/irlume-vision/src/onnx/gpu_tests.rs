@@ -271,6 +271,13 @@ mod gpu_groundwork_tests {
     /// A fixture stack: the C API, the core, the GPU plugin, an OpenCL
     /// loader and the two frontends beside the core, as the memory map
     /// lines of an enumerated process would name them.
+    /// Write a maps string to a file the inventory can read and re-read.
+    fn maps_file(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
     fn fixture_stack(dir: &Path) -> (String, Vec<(PathBuf, u64)>, PathBuf) {
         let mut mapped = Vec::new();
         let mut maps = String::new();
@@ -318,7 +325,9 @@ mod gpu_groundwork_tests {
     fn gpu_library_inventory_hashes_and_verifies_the_gpu_stack() {
         let dir = tempfile::tempdir().unwrap();
         let (maps, mapped, executable) = fixture_stack(dir.path());
-        let (manifest, hashed) = gpu::gpu_libraries(&maps, &executable).unwrap();
+        let maps = maps_file(dir.path(), "maps", &maps);
+        let (manifest, hashed, loader) = gpu::gpu_libraries(&maps, &executable).unwrap();
+        assert_eq!(loader, "opencl");
         for (path, _) in &mapped {
             let line = format!("{} ", path.display());
             assert!(manifest.contains(&line), "{line} missing from {manifest}");
@@ -338,12 +347,14 @@ mod gpu_groundwork_tests {
         assert!(error.contains("absent"), "{error}");
         // Every required member must be mapped; a stack without the plugin
         // or a loader refuses.
+        let maps_text = std::fs::read_to_string(&maps).unwrap();
         for drop in ["libopenvino_intel_gpu_plugin.so", "libOpenCL.so.1"] {
-            let pruned: String = maps
+            let pruned: String = maps_text
                 .lines()
                 .filter(|line| !line.contains(drop))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let pruned = maps_file(dir.path(), "pruned", &pruned);
             let error = gpu::gpu_libraries(&pruned, &executable).unwrap_err();
             assert!(
                 error.contains("GPU plugin") || error.contains("loader"),
@@ -352,9 +363,8 @@ mod gpu_groundwork_tests {
         }
         // This test process has not enumerated a GPU, so its real map
         // refuses too: no member is present.
-        let real = std::fs::read_to_string("/proc/self/maps").unwrap();
         let own = std::fs::read_link("/proc/self/exe").unwrap();
-        assert!(gpu::gpu_libraries(&real, &own).is_err());
+        assert!(gpu::gpu_libraries(Path::new("/proc/self/maps"), &own).is_err());
         // A mapped library replaced under the identity is a different
         // file: the inode kept no longer matches the map's.
         let plugin = dir.path().join("libopenvino_intel_gpu_plugin.so");
@@ -763,19 +773,39 @@ mod gpu_groundwork_tests {
         )
     }
 
+    /// The recognizer's weights, from the test override, an installed
+    /// tree or the fetched repository tree, in that order.
+    fn recognizer_bytes() -> Vec<u8> {
+        let candidates = [
+            std::env::var("IRLUME_NPU_TEST_MODELS")
+                .map(|dir| PathBuf::from(dir).join("glintr100.onnx"))
+                .ok(),
+            Some(PathBuf::from("/usr/share/irlume/models/glintr100.onnx")),
+            Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/glintr100.onnx")),
+        ];
+        let path = candidates
+            .into_iter()
+            .flatten()
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "glintr100.onnx is not in IRLUME_NPU_TEST_MODELS, /usr/share/irlume/models \
+                     or the repository models/ tree (scripts/fetch-models.sh)"
+                )
+            });
+        std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    }
+
     /// The recognizer's CPU reference session. BOTH hardware lanes build
     /// it before opening the GPU platform: the daemon's CPU sessions
     /// exist before an accelerator platform opens (the fixed
     /// initialization order the NPU identity already relies on), so the
     /// GPU inventory includes the CPU runtime in every execution order
     /// and one host yields one digest whether a lane runs alone or after
-    /// its sibling.
+    /// its sibling. The weights are a prerequisite of both lanes; the
+    /// repository tree satisfies it after scripts/fetch-models.sh.
     fn cpu_reference() -> crate::Embedder {
-        let dir = std::env::var("IRLUME_NPU_TEST_MODELS")
-            .unwrap_or_else(|_| "/usr/share/irlume/models".into());
-        let path = Path::new(&dir).join("glintr100.onnx");
-        let bytes =
-            std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let bytes = recognizer_bytes();
         crate::Embedder::load_from_memory(&bytes).expect("the CPU session builds")
     }
 
@@ -786,7 +816,7 @@ mod gpu_groundwork_tests {
     /// the same address, one loader family and the hashed library manifest
     /// (ADR-0033 section 3).
     #[test]
-    #[ignore = "hardware: needs the validated OpenVINO provider and an Intel GPU"]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU and the recognizer weights"]
     fn gpu_hw_identity_binds_plugin_render_node_and_libraries() {
         // Same native-library baseline as the compile lane: the CPU
         // session first, then the platform (see cpu_reference).
@@ -882,15 +912,11 @@ mod gpu_groundwork_tests {
     /// retirement trigger). Observation evidence for ADR-0033 section 5,
     /// not a certification: CERTIFIED stays empty.
     #[test]
-    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU and the models"]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU and the recognizer weights"]
     fn gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration() {
         use super::super::npu_reference;
         let scratch = tempfile::tempdir().unwrap();
-        let dir = std::env::var("IRLUME_NPU_TEST_MODELS")
-            .unwrap_or_else(|_| "/usr/share/irlume/models".into());
-        let path = Path::new(&dir).join("glintr100.onnx");
-        let bytes =
-            std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let bytes = recognizer_bytes();
         // The CPU reference session exists before the platform identity is
         // taken (see cpu_reference): anything the process maps afterwards
         // must refuse, the discipline the NPU platform runs under too.

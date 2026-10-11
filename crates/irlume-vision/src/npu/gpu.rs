@@ -593,10 +593,12 @@ pub(crate) fn loader_stack(maps: &str) -> Result<(&'static str, String), String>
 /// or a mapped library is not the file that was hashed.
 #[cfg(test)]
 pub(crate) fn gpu_libraries(
-    maps: &str,
+    maps_file: &Path,
     executable: &Path,
-) -> Result<(String, Vec<super::HashedLibrary>), String> {
-    let loader = loader_stack(maps)?;
+) -> Result<(String, Vec<super::HashedLibrary>, &'static str), String> {
+    // First snapshot: the paths to hash and the loader family.
+    let maps = std::fs::read_to_string(maps_file).map_err(|error| format!("maps: {error}"))?;
+    let loader = loader_stack(&maps)?;
     let mut paths: Vec<PathBuf> = maps
         .lines()
         .filter_map(super::maps::mapping)
@@ -670,10 +672,16 @@ pub(crate) fn gpu_libraries(
         .map(|line| format!("{line}\n"))
         .collect::<String>();
     let (loader_family, _) = loader;
-    super::verify_mappings(maps, &hashed, super::InventoryScope::Execution).map_err(|why| {
+    // Hashing a large stack takes time a runtime's background thread can
+    // use to map more code, so the inventory is verified against a FRESH
+    // snapshot taken after the hashing: anything mapped by then must be
+    // one of the hashed files, or the identity refuses.
+    let fresh =
+        std::fs::read_to_string(maps_file).map_err(|error| format!("maps (re-read): {error}"))?;
+    super::verify_mappings(&fresh, &hashed, super::InventoryScope::Execution).map_err(|why| {
         format!("the {loader_family} stack changed under the GPU identity: {why}")
     })?;
-    Ok((lines, hashed))
+    Ok((lines, hashed, loader_family))
 }
 
 /// The complete GPU platform identity (ADR-0033 section 3): the plugin's
@@ -897,14 +905,10 @@ fn identity(
             return Err(format!("firmware: malformed report: {why}"));
         }
     };
-    let maps = std::fs::read_to_string(sources.maps).map_err(|error| format!("maps: {error}"))?;
-    let loader = loader_stack(&maps)
-        .map_err(|why| format!("loader: {why}"))?
-        .0
-        .to_owned();
     let executable =
         std::fs::read_link("/proc/self/exe").map_err(|error| format!("exe: {error}"))?;
-    let (libraries, hashed) = gpu_libraries(&maps, &executable)?;
+    let (libraries, hashed, loader) = gpu_libraries(sources.maps, &executable)?;
+    let loader = loader.to_owned();
     Ok((
         Identity {
             selected_library: library.selected.to_string_lossy().into_owned(),

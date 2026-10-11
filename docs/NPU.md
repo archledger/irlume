@@ -51,18 +51,49 @@ callers receive its categorical projection.
 GPU groundwork ships behind the same closed loading admission as the NPU
 (ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
 exposing more than one GPU refuses placement until a reviewed rule selects
-one device. Its incomplete identity observation records the runtime build,
-plugin-reported name and capabilities, provider endpoint and loaded GuC/HuC
-firmware. Firmware reads walk every tile and GT, reject unreadable or
-conflicting reports, and allow xe's documented GuC-only GTs only alongside
-a complete agreeing pair. PCI data belongs to that unique firmware node;
-the plugin-to-render-node binding is not yet established.
+one device. The identity observation is the complete ADR-0033 section 3
+set: runtime and GPU plugin builds (`Core::versions("GPU")`),
+plugin-reported name, capabilities, architecture, execution units,
+memory, and the provider endpoint, plus the loaded GuC/HuC firmware.
+Firmware reads walk every tile and GT, reject unreadable or conflicting
+reports, and allow xe's documented GuC-only GTs only alongside a complete
+agreeing pair. The plugin's `DEVICE_PCI_INFO` is parsed and must bind
+exactly one render node whose sysfs address and `vendor`/`device`
+attributes (`/sys/class/drm/renderD*/device`) match it; the firmware
+belongs to that node. The loader family the plugin resolved (`libOpenCL`
+or `libze_loader`, from `/proc/self/maps`) and the fixed compile
+configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`
+are identity fields. Every native library the enumeration mapped is
+hashed through one open file whose inode is kept, under ADR-0022's
+inode discipline: the whole file-backed executable inventory (minus the
+process executable, as the NPU execution inventory excludes it) plus
+the IR and ONNX frontends beside the core, because ICD enumeration maps
+foreign ICD libraries (a Mesa Rusticl ICD ran in the measured
+processes). `GPU_DRIVER_VERSION` is never read: reading it through the
+C API kills the process on the measured 2026.2.1 builds, so driver
+identity comes from the hashed mapped-library manifest.
 
-This observation cannot key certification. Plugin/driver and loader-stack
-identity, verified render-node binding, compile configuration and mapped
-library hashes under ADR-0022's inode discipline remain required. The
-ignored `gpu_hw_*` tests collect preliminary discovery evidence only.
-No certification table entry or loading profile exists.
+This observation cannot key certification; the loading-admission and
+certification gates decide. The ignored `gpu_hw_*` tests collect the
+evidence. `gpu_hw_identity_binds_plugin_render_node_and_libraries` runs
+as root (debugfs joins the identity) and checks the binding, firmware,
+loader family and manifest on a real GPU;
+`gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration`
+compiles the recognizer on `GPU.0` under the fixed configuration,
+requires `EXECUTION_DEVICES` to name the GPU, checks a parity canary
+against the CPU reference and re-verifies the mapped libraries after
+the compile (the retirement trigger). Run them like the `npu_hw_*` lane:
+
+```sh
+ulimit -c 0; cargo test -p irlume-vision --features npu --release \
+  --lib -- --ignored gpu_hw_ --test-threads 1 --nocapture
+```
+
+`IRLUME_NPU_LIBRARY` selects a non-standard C API file, with
+`LD_LIBRARY_PATH` pointing the test process at that runtime root. Both
+lanes need the recognizer weights, from `IRLUME_NPU_TEST_MODELS`, an
+installed `/usr/share/irlume/models` tree or the repository `models/`
+tree. No certification table entry or loading profile exists.
 
 ## Select a C API file
 

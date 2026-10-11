@@ -35,6 +35,22 @@ never fails over the device preference. The selection joins the same single
 startup settings snapshot as the NPU switch and the provider selection, and
 a restart applies a change.
 
+The GPU has its own kill switch beside the selection (ADR-0033 section 8):
+`gpu` in `/etc/irlume/settings.conf`, with `IRLUME_GPU` on the daemon
+overriding it. It follows the `npu` switch semantics: an absent file leaves
+admission and certification to decide, any off value, malformed input or an
+unreadable settings file disables GPU use, and either source disabling
+wins. The NPU-named keys never leak into it.
+
+GPU groundwork ships behind the same closed loading admission as the NPU
+(ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
+exposing more than one GPU refuses placement until a reviewed rule selects
+one device, and the GPU identity binds the device's full name and
+capabilities, the selected provider endpoint and the loaded GuC/HuC
+firmware builds, which an unreadable firmware makes refuse. The
+`gpu_hw_*` hardware measurements are the ignored tests that collect this
+evidence; no certification table entry exists.
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then

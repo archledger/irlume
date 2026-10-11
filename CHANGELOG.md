@@ -57,6 +57,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- GPU groundwork under closed admission (ADR-0033 sections 2 to 4 and 8):
+  a `gpu` kill switch beside the device selection (`gpu` in
+  `settings.conf`, `IRLUME_GPU` overriding, NPU-switch semantics,
+  independent of the `npu`-named keys), GPU discovery that refuses before
+  `dlopen` exactly like the NPU context, the single-GPU rule (a system
+  exposing more than one GPU refuses placement until a reviewed rule
+  selects one device), and a GPU identity that binds the device full name,
+  capabilities, the selected provider endpoint and the loaded GuC/HuC
+  firmware builds (unreadable firmware refuses). The `gpu_hw_*` ignored
+  tests collect the discovery evidence on real Intel GPUs; no loading
+  profile is admitted and `CERTIFIED` stays empty.
+
 - Recognizer device selection: `recognizer_device` in `settings.conf`
   (`IRLUME_RECOGNIZER_DEVICE` overrides) names the recognizer's intended
   device, `auto` (the default), `cpu`, `npu` or `gpu`. A selection never

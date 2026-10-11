@@ -26,6 +26,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod gpu;
 mod identity;
 mod maps;
 mod runtime;

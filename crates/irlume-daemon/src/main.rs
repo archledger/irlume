@@ -282,7 +282,18 @@ mod npu_placement {
                  (npu/IRLUME_NPU) is off; the recognizer stays on CPU"
             );
         }
-        let mut context = match placement_attempt(plan, settings.switch_allows()) {
+        let gpu_allows = settings.gpu_switch_allows();
+        if matches!(
+            plan.selection(),
+            super::recognizer_selection::Selection::Gpu
+        ) && !gpu_allows
+        {
+            irlume_common::jout_warn!(
+                "irlumed: recognizer_device=gpu is selected, but the GPU switch \
+                 (gpu/IRLUME_GPU) is off; the recognizer stays on CPU"
+            );
+        }
+        let mut context = match placement_attempt(plan, settings.switch_allows(), gpu_allows) {
             PlacementAttempt::Skip(reason) => irlume_auth::npu::Context::not_selected(reason),
             PlacementAttempt::Try => {
                 engine.open_npu_context_with_runtime(&cache_base(), &settings.runtime_selection())
@@ -311,10 +322,17 @@ mod npu_placement {
     pub(super) fn placement_attempt(
         plan: &super::recognizer_selection::Plan,
         switch_allows: bool,
+        gpu_allows: bool,
     ) -> PlacementAttempt {
         use super::recognizer_selection::Selection;
         match plan.selection() {
             Selection::Cpu => PlacementAttempt::Skip(irlume_auth::npu::CpuReason::CpuSelected),
+            // The GPU kill switch wins over the selection; otherwise the
+            // closed loading admission keeps the recognizer on CPU
+            // (ADR-0033 sections 4 and 8).
+            Selection::Gpu if !gpu_allows => {
+                PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
+            }
             Selection::Gpu => {
                 PlacementAttempt::Skip(irlume_auth::npu::CpuReason::GpuSelectedNotAdmitted)
             }
@@ -390,6 +408,18 @@ mod npu_placement {
                 Self::Bytes(bytes) => irlume_auth::npu::settings_conf_value(bytes),
             };
             irlume_auth::npu::switch_allows(std::env::var_os("IRLUME_NPU").as_deref(), setting)
+        }
+
+        /// The `IRLUME_GPU` / `gpu` kill switch (ADR-0033 section 8), with
+        /// the same semantics as the NPU switch; either source disabling
+        /// wins and malformed input disables.
+        pub(super) fn gpu_switch_allows(&self) -> bool {
+            let setting = match self {
+                Self::Absent => irlume_auth::npu::gpu::Setting::Absent,
+                Self::Unreadable => irlume_auth::npu::gpu::Setting::Unreadable,
+                Self::Bytes(bytes) => irlume_auth::npu::gpu::settings_conf_value(bytes),
+            };
+            irlume_auth::npu::gpu::switch_allows(std::env::var_os("IRLUME_GPU").as_deref(), setting)
         }
 
         /// The administrator picks an absolute installed provider file.
@@ -18885,6 +18915,59 @@ mod tests {
             .is_some_and(|at| at < publish));
     }
 
+    #[cfg(feature = "npu")]
+    #[test]
+    fn recognizer_gpu_switch_reads_machine_config_and_environment_only() {
+        let _g = env_lock();
+        let _sb = sandbox("recognizer-gpu-switch");
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _restore_gpu = Restore("IRLUME_GPU", std::env::var_os("IRLUME_GPU"));
+        let _restore_npu = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
+        std::env::remove_var("IRLUME_GPU");
+        std::env::remove_var("IRLUME_NPU");
+        let settings = irlume_common::config::config_path("settings.conf");
+        let switch = || npu_placement::SettingsSnapshot::read().gpu_switch_allows();
+
+        // An absent file leaves the GPU switch permissive.
+        assert!(switch());
+        // Any off line wins over any on line, and malformed input disables.
+        for (text, expected) in [
+            ("gpu=on\n", true),
+            ("gpu=off\n", false),
+            ("gpu=on\ngpu=off\n", false),
+            ("gpu=maybe\n", false),
+            ("gpu=\n", false),
+            ("npu=off\n", true),
+        ] {
+            std::fs::write(&settings, text).unwrap();
+            assert_eq!(switch(), expected, "{text:?}");
+        }
+        std::fs::remove_file(&settings).unwrap();
+        std::fs::create_dir(&settings).unwrap();
+        assert!(!switch(), "an unreadable settings file disables");
+        std::fs::remove_dir(&settings).unwrap();
+        // Either source disabling wins, independently of the NPU switch.
+        std::fs::write(&settings, "gpu=on\nnpu=off\n").unwrap();
+        std::env::set_var("IRLUME_NPU", "off");
+        assert!(
+            switch(),
+            "the NPU-named keys never leak into the GPU switch"
+        );
+        std::env::remove_var("IRLUME_NPU");
+        std::env::set_var("IRLUME_GPU", "0");
+        assert!(!switch());
+        std::env::set_var("IRLUME_GPU", "garbage");
+        assert!(!switch());
+    }
+
     #[cfg(not(feature = "npu"))]
     #[test]
     fn non_npu_builds_stamp_selection_reasons_at_publish() {
@@ -19009,16 +19092,18 @@ mod tests {
             }
         }
         let _restore_switch = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
+        let _restore_gpu = Restore("IRLUME_GPU", std::env::var_os("IRLUME_GPU"));
         let _restore_device = Restore(
             "IRLUME_RECOGNIZER_DEVICE",
             std::env::var_os("IRLUME_RECOGNIZER_DEVICE"),
         );
         std::env::remove_var("IRLUME_NPU");
+        std::env::remove_var("IRLUME_GPU");
         std::env::remove_var("IRLUME_RECOGNIZER_DEVICE");
         let settings = irlume_common::config::config_path("settings.conf");
 
-        let attempt = |selection: Selection, npu: &str| {
-            std::fs::write(&settings, format!("npu={npu}\n")).unwrap();
+        let attempt = |selection: Selection, npu: &str, gpu: &str| {
+            std::fs::write(&settings, format!("npu={npu}\ngpu={gpu}\n")).unwrap();
             let snapshot = npu_placement::SettingsSnapshot::read();
             let plan = Plan::resolve(
                 Some(std::ffi::OsStr::new(match selection {
@@ -19029,33 +19114,43 @@ mod tests {
                 })),
                 &snapshot,
             );
-            npu_placement::placement_attempt(&plan, snapshot.switch_allows())
+            npu_placement::placement_attempt(
+                &plan,
+                snapshot.switch_allows(),
+                snapshot.gpu_switch_allows(),
+            )
         };
 
         use npu_placement::PlacementAttempt;
         assert!(matches!(
-            attempt(Selection::Cpu, "on"),
+            attempt(Selection::Cpu, "on", "on"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::CpuSelected)
         ));
         assert!(matches!(
-            attempt(Selection::Gpu, "on"),
+            attempt(Selection::Gpu, "on", "on"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::GpuSelectedNotAdmitted)
+        ));
+        // The GPU kill switch wins over a selected GPU; the off state of
+        // the NPU-named keys never leaks into it (ADR-0033 section 8).
+        assert!(matches!(
+            attempt(Selection::Gpu, "on", "off"),
+            PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
         ));
         // The kill switch wins over a selected or automatic NPU attempt.
         assert!(matches!(
-            attempt(Selection::Npu, "off"),
+            attempt(Selection::Npu, "off", "on"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
         ));
         assert!(matches!(
-            attempt(Selection::Auto, "off"),
+            attempt(Selection::Auto, "off", "on"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
         ));
         assert!(matches!(
-            attempt(Selection::Npu, "on"),
+            attempt(Selection::Npu, "on", "on"),
             PlacementAttempt::Try
         ));
         assert!(matches!(
-            attempt(Selection::Auto, "on"),
+            attempt(Selection::Auto, "on", "on"),
             PlacementAttempt::Try
         ));
     }

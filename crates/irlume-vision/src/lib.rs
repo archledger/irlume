@@ -2809,6 +2809,10 @@ mod onnx {
     #[path = "npu_tests.rs"]
     mod npu_tests;
 
+    #[cfg(all(test, feature = "npu"))]
+    #[path = "gpu_tests.rs"]
+    mod gpu_tests;
+
     /// Fixed synthetic inputs of the CPU reference fingerprint and digests
     /// (ADR-0022 §3), shared with the hardware tests. The digest inputs are
     /// in every build: enrollment records the CPU reference that produced a

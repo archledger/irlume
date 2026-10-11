@@ -847,6 +847,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_FORBID_EXTERNAL_CAMERAS` | same switch as `forbid_external_cameras` in `settings.conf`; the env var wins | off |
 | `IRLUME_NPU` | NPU kill switch alongside the machine `npu` key; either source disabling wins. Empty, unknown or non-UTF-8 switch values and unreadable settings disable it. On values cannot bypass loading admission or certification | leaves admission and certification to decide; currently CPU |
 | `IRLUME_RECOGNIZER_DEVICE` | overrides machine `recognizer_device`; a present but unrecognized value is a warning and resolves to `auto` | `auto` |
+| `IRLUME_GPU` | GPU kill switch alongside the machine `gpu` key; either source disabling wins, malformed values disable | leaves admission and certification to decide |
 | `IRLUME_NPU_LIBRARY` | absolute C API file; overrides machine `npu_library`, with root-managed installation checks. Selects a file without admitting native loading | standard system and `/usr/local` library roots |
 | `IRLUME_DET_MODEL` / `IRLUME_MODEL` / `IRLUME_MESH_MODEL` / `IRLUME_BLAZE_MODEL` | paths to the detector / recognizer / FaceMesh / BlazeFace weights | `/etc/irlume/*.onnx` (packaged units set `/usr/share/irlume/models/…`) |
 | `IRLUME_VIT_PAD_MODEL` / `IRLUME_PAD_IR_MODEL` | paths to the shipped PAD weights (ViT RGB / FLIR IR) | `/etc/irlume/liveness_vit.onnx`, `/etc/irlume/flir.onnx` (packaged units set `/usr/share/irlume/models/…`) |

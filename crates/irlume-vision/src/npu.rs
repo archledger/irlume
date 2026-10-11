@@ -26,6 +26,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod gpu;
 mod identity;
 mod maps;
 mod runtime;
@@ -349,6 +350,8 @@ pub enum CpuReason {
     /// (`recognizer_device=gpu`); no build admits GPU placement yet, and no
     /// NPU discovery or compile is attempted.
     GpuSelectedNotAdmitted,
+    /// The GPU kill switch disabled use (ADR-0033 section 8).
+    GpuDisabled,
     /// No reviewed installation/launch profile admits native loading. This
     /// is independent of model certification and is checked before dlopen.
     LoadingNotAdmitted,
@@ -380,6 +383,7 @@ impl fmt::Display for CpuReason {
             Self::GpuSelectedNotAdmitted => {
                 f.write_str(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON)
             }
+            Self::GpuDisabled => f.write_str(irlume_common::RECOGNIZER_GPU_DISABLED_REASON),
             Self::LoadingNotAdmitted => {
                 f.write_str("the NPU loading profile has not been admitted; using CPU")
             }

@@ -21,6 +21,7 @@ pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;
 pub mod detect;
+pub mod gpu;
 pub mod light;
 pub mod moire;
 #[cfg(feature = "npu")]
@@ -2808,6 +2809,10 @@ mod onnx {
     #[cfg(all(test, feature = "npu"))]
     #[path = "npu_tests.rs"]
     mod npu_tests;
+
+    #[cfg(all(test, feature = "npu"))]
+    #[path = "gpu_tests.rs"]
+    mod gpu_tests;
 
     /// Fixed synthetic inputs of the CPU reference fingerprint and digests
     /// (ADR-0022 §3), shared with the hardware tests. The digest inputs are

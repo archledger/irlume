@@ -1555,6 +1555,8 @@ pub fn single_line(text: &str, max_chars: usize) -> String {
 /// lanes report the same reason.
 pub const RECOGNIZER_CPU_SELECTED_REASON: &str =
     "CPU is selected for the recognizer (recognizer_device=cpu)";
+/// The shared CPU reason when the GPU kill switch disables use in any build.
+pub const RECOGNIZER_GPU_DISABLED_REASON: &str = "GPU use is disabled by the gpu/IRLUME_GPU switch";
 /// The reported reason when GPU is the selected recognizer device and no
 /// build admits GPU placement (`recognizer_device=gpu`). Shared as above.
 pub const RECOGNIZER_GPU_NOT_ADMITTED_REASON: &str =

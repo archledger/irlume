@@ -32,8 +32,37 @@ An IR adapter keeps the recognizer on CPU whatever the selection (ADR-0022
 §2). An empty, unknown, duplicated or non-UTF-8 value, or an unreadable
 `settings.conf`, is a journal warning and resolves to `auto`; authentication
 never fails over the device preference. The selection joins the same single
-startup settings snapshot as the NPU switch and the provider selection, and
-a restart applies a change.
+startup settings snapshot as both accelerator switches and the provider
+selection, and a restart applies a change.
+
+The GPU has its own kill switch beside the selection (ADR-0033 section 8):
+`gpu` in `/etc/irlume/settings.conf` and `IRLUME_GPU` on the daemon.
+An absent source leaves admission and certification to decide. An off,
+empty, malformed, non-UTF-8, duplicate or unreadable source disables GPU
+use; either disabling source wins, including against an enabling value
+from the other source. Both default and accelerator builds report the
+GPU-disabled reason from the governing startup snapshot. The NPU-named
+keys never leak into it.
+
+Root and ordinary status callers receive these fixed public selection and
+switch reasons. Native provider error text remains privileged; ordinary
+callers receive its categorical projection.
+
+GPU groundwork ships behind the same closed loading admission as the NPU
+(ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
+exposing more than one GPU refuses placement until a reviewed rule selects
+one device. Its incomplete identity observation records the runtime build,
+plugin-reported name and capabilities, provider endpoint and loaded GuC/HuC
+firmware. Firmware reads walk every tile and GT, reject unreadable or
+conflicting reports, and allow xe's documented GuC-only GTs only alongside
+a complete agreeing pair. PCI data belongs to that unique firmware node;
+the plugin-to-render-node binding is not yet established.
+
+This observation cannot key certification. Plugin/driver and loader-stack
+identity, verified render-node binding, compile configuration and mapped
+library hashes under ADR-0022's inode discipline remain required. The
+ignored `gpu_hw_*` tests collect preliminary discovery evidence only.
+No certification table entry or loading profile exists.
 
 ## Select a C API file
 
@@ -155,8 +184,9 @@ matchable scans have missing or different CPU-producer tags uses CPU probes,
 including legacy enrollments. Enrollment and self-tests use CPU. An IR adapter
 also keeps the recognizer on CPU.
 
-Non-root Health replies use fixed CPU-fallback categories: discovery not
-reported, runtime unavailable, or recognizer unavailable. Native error details
+Apart from the fixed public selection/switch reasons above, non-root Health
+replies use fixed CPU-fallback categories: discovery not reported, runtime
+unavailable, or recognizer unavailable. Native error details
 are available only to root peers; the privileged journal also retains bounded
 detailed reasons. Consumers should use the fields, not parse reason text. See
 [Machine API](MACHINE-API.md) for the reporting contract.

@@ -290,6 +290,8 @@ mod identity_arms;
 mod npu_probe;
 pub use authentication_window::AuthenticationWindow;
 pub use identity_arms::decision_fingerprint;
+/// The GPU kill switch available in every build (ADR-0033 section 8).
+pub use irlume_vision::gpu;
 /// The NPU runtime the daemon opens for the recognizer (ADR-0022).
 #[cfg(feature = "npu")]
 pub use irlume_vision::npu;

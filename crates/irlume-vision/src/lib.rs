@@ -21,6 +21,7 @@ pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;
 pub mod detect;
+pub mod gpu;
 pub mod light;
 pub mod moire;
 #[cfg(feature = "npu")]

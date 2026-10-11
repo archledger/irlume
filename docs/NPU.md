@@ -32,24 +32,33 @@ An IR adapter keeps the recognizer on CPU whatever the selection (ADR-0022
 §2). An empty, unknown, duplicated or non-UTF-8 value, or an unreadable
 `settings.conf`, is a journal warning and resolves to `auto`; authentication
 never fails over the device preference. The selection joins the same single
-startup settings snapshot as the NPU switch and the provider selection, and
-a restart applies a change.
+startup settings snapshot as both accelerator switches and the provider
+selection, and a restart applies a change.
 
 The GPU has its own kill switch beside the selection (ADR-0033 section 8):
-`gpu` in `/etc/irlume/settings.conf`, with `IRLUME_GPU` on the daemon
-overriding it. It follows the `npu` switch semantics: an absent file leaves
-admission and certification to decide, any off value, malformed input or an
-unreadable settings file disables GPU use, and either source disabling
-wins. The NPU-named keys never leak into it.
+`gpu` in `/etc/irlume/settings.conf` and `IRLUME_GPU` on the daemon.
+An absent source leaves admission and certification to decide. An off,
+empty, malformed, non-UTF-8, duplicate or unreadable source disables GPU
+use; either disabling source wins, including against an enabling value
+from the other source. Both default and accelerator builds report the
+GPU-disabled reason from the governing startup snapshot. The NPU-named
+keys never leak into it.
 
 GPU groundwork ships behind the same closed loading admission as the NPU
 (ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
 exposing more than one GPU refuses placement until a reviewed rule selects
-one device, and the GPU identity binds the device's full name and
-capabilities, the selected provider endpoint and the loaded GuC/HuC
-firmware builds, which an unreadable firmware makes refuse. The
-`gpu_hw_*` hardware measurements are the ignored tests that collect this
-evidence; no certification table entry exists.
+one device. Its incomplete identity observation records the runtime build,
+plugin-reported name and capabilities, provider endpoint and loaded GuC/HuC
+firmware. Firmware reads walk every tile and GT, reject unreadable or
+conflicting reports, and allow xe's documented GuC-only GTs only alongside
+a complete agreeing pair. PCI data belongs to that unique firmware node;
+the plugin-to-render-node binding is not yet established.
+
+This observation cannot key certification. Plugin/driver and loader-stack
+identity, verified render-node binding, compile configuration and mapped
+library hashes under ADR-0022's inode discipline remain required. The
+ignored `gpu_hw_*` tests collect preliminary discovery evidence only.
+No certification table entry or loading profile exists.
 
 ## Select a C API file
 

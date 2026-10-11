@@ -107,12 +107,13 @@ implementation claiming conformance compiles with the same one.
 
 The identity adds the GPU plugin version, the GPU device name and PCI
 vendor and device of the selected render node, the OpenCL ICD or Level
-Zero loader the GPU plugin resolves, the GPU driver version, the build of
-the GPU firmware the kernel loaded where the driver exposes it (on Intel
-integrated graphics the GuC and HuC firmware versions of the render
-node), the compile configuration, and the SHA-256 of every runtime
-library the daemon maps once the GPU is enumerated, under the same
-one-open-file inode discipline as ADR-0022 section 4. Like that section,
+Zero loader the GPU plugin resolves, the GPU driver version (amended
+2026-10-11, below), the build of the GPU firmware the kernel loaded
+where the driver exposes it (on Intel integrated graphics the GuC and
+HuC firmware versions of the render node), the compile configuration,
+and the SHA-256 of every runtime library the daemon maps once the GPU is
+enumerated, under the same one-open-file inode discipline as ADR-0022
+section 4. Like that section,
 a firmware build that cannot be read makes the identity unreadable and
 placement refuses, and the firmware is a field because a driver version
 does not imply it. A driver or compute-runtime update is a different
@@ -203,6 +204,22 @@ certification to decide and enables nothing by itself. The switch
 disables GPU placement independently of the NPU switch: the NPU-named
 keys stay NPU-only, and coupling them would leave the GPU running
 precisely when an operator believed every accelerator was off.
+
+
+## Amendment 2026-10-11: the driver version is the hashed driver stack
+
+Section 3 named "the GPU driver version" as an identity field. Measuring
+the shipped 2026.2.1 builds ([the identity
+record](../research/2026-10-11-gpu-identity.md)) found that reading the
+plugin's `GPU_DRIVER_VERSION` through the OpenVINO C API kills the
+calling process on both measured builds (the root-owned archive and the
+Fedora RPM), deterministically, before any error can be returned. No
+safe read of that property exists at this runtime version, so the
+identity does not read it: the driver version is carried by the
+mapped-library manifest's content hashes instead, which section 3
+already makes a different identity on any driver or compute-runtime
+rebuild. A future runtime that answers the property safely may add it
+back as an explicit field; until then the manifest is the binding form.
 
 ## Consequences
 

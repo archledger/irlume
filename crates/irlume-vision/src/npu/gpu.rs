@@ -835,14 +835,14 @@ fn identity(
     core: &openvino::Core,
     library: &runtime::ResolvedLibrary,
     sources: &Sources<'_>,
-    // The one enumerated device (`GPU.N`), never a hard-coded index, and
-    // the mapped-library manifest of the moment the caller fixed the
-    // inventory: after enumeration for discovery, after the compile
-    // warm-up for the platform, so the digest names everything its own
-    // execution runs.
+    // The one enumerated device (`GPU.N`), never a hard-coded index. The
+    // mapped-library manifest is snapshotted here, at the end, after every
+    // property and version call above: if any of them maps another
+    // executable library, it joins the manifest instead of escaping it.
+    // The caller fixes the moment (after enumeration for discovery, after
+    // the compile warm-up for the platform) by when it calls this.
     enumerated: &str,
-    manifest: &str,
-) -> Result<Identity, String> {
+) -> Result<(Identity, Vec<super::HashedLibrary>), String> {
     let device = openvino::DeviceType::Other(enumerated.to_owned().into());
     let property = |key: &str| {
         core.get_property(
@@ -897,26 +897,31 @@ fn identity(
         .map_err(|why| format!("loader: {why}"))?
         .0
         .to_owned();
-    let libraries = manifest.to_owned();
-    Ok(Identity {
-        selected_library: library.selected.to_string_lossy().into_owned(),
-        canonical_library: library.canonical.to_string_lossy().into_owned(),
-        runtime_version: openvino::version().parts().collect::<Vec<_>>().join("."),
-        runtime_build: openvino::version().build_number,
-        gpu_plugin,
-        full_name,
-        capabilities,
-        architecture,
-        execution_units,
-        total_memory,
-        device_id,
-        device_pci,
-        render_node: render,
-        firmware,
-        loader,
-        configuration: COMPILE_CONFIGURATION.to_owned(),
-        libraries,
-    })
+    let executable =
+        std::fs::read_link("/proc/self/exe").map_err(|error| format!("exe: {error}"))?;
+    let (libraries, hashed) = gpu_libraries(&maps, &executable)?;
+    Ok((
+        Identity {
+            selected_library: library.selected.to_string_lossy().into_owned(),
+            canonical_library: library.canonical.to_string_lossy().into_owned(),
+            runtime_version: openvino::version().parts().collect::<Vec<_>>().join("."),
+            runtime_build: openvino::version().build_number,
+            gpu_plugin,
+            full_name,
+            capabilities,
+            architecture,
+            execution_units,
+            total_memory,
+            device_id,
+            device_pci,
+            render_node: render,
+            firmware,
+            loader,
+            configuration: COMPILE_CONFIGURATION.to_owned(),
+            libraries,
+        },
+        hashed,
+    ))
 }
 
 /// The admitted test-only entry for the hardware evidence harness
@@ -957,20 +962,11 @@ pub(crate) fn discover_admitted_with(
         Err(error) => return Discovery::Unavailable(format!("enumerate: {error}")),
     };
     discover_enumerated_gpu(&indices, |device| {
-        // The discovery manifest is the enumeration-time inventory the
-        // ADR names; the platform's compile-time inventory is broader.
-        let manifest = std::fs::read_to_string(sources.maps)
-            .and_then(|maps| {
-                std::fs::read_link("/proc/self/exe").map(|executable| (maps, executable))
-            })
-            .map_err(|error| format!("inventory: {error}"))
-            .and_then(|(maps, executable)| gpu_libraries(&maps, &executable));
-        let manifest = match manifest {
-            Ok((manifest, _)) => manifest,
-            Err(error) => return Discovery::Unavailable(error),
-        };
-        match identity(&core, &library, sources, device, &manifest) {
-            Ok(identity) => Discovery::Found(Box::new(identity)),
+        // The identity snapshots its own manifest at the end of its
+        // property and version reads, so nothing those calls map escapes
+        // the discovery inventory.
+        match identity(&core, &library, sources, device) {
+            Ok((identity, _)) => Discovery::Found(Box::new(identity)),
             Err(error) => Discovery::Unavailable(error),
         }
     })
@@ -1154,15 +1150,11 @@ impl GpuPlatform {
                 return Err(format!("the warm-up compiled on {assigned:?}"));
             }
         }
-        // The identity is assembled here, after the warm-up, so its
-        // manifest covers the full compile-path stack; the executable the
-        // NPU inventory excludes is excluded here too.
-        let executable =
-            std::fs::read_link("/proc/self/exe").map_err(|error| format!("exe: {error}"))?;
-        let maps =
-            std::fs::read_to_string(sources.maps).map_err(|error| format!("maps: {error}"))?;
-        let (manifest, libraries) = gpu_libraries(&maps, &executable)?;
-        let identity = identity(&core, &library, sources, &device_name, &manifest)?;
+        // The identity is assembled here, after the warm-up, and it
+        // snapshots its own manifest at the end of its reads, so its
+        // inventory covers the full compile-path stack; the hashed set it
+        // returns is the platform's verification inventory.
+        let (identity, libraries) = identity(&core, &library, sources, &device_name)?;
         Ok(Self {
             core,
             identity,

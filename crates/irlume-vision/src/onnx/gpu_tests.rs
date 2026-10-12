@@ -1117,7 +1117,10 @@ mod gpu_groundwork_tests {
             width,
             height,
         };
-        let found = detector.detect(&view).ok()?;
+        // A detector runtime error fails the lane: an evidence run must
+        // not lose frames to an inference failure it mistook for an
+        // undetectable face.
+        let found = detector.detect(&view).expect("the detector answers");
         let face = found
             .into_iter()
             .filter(crate::detection_is_finite)

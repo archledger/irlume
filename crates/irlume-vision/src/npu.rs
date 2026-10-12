@@ -556,7 +556,7 @@ impl Default for Slot {
 }
 
 /// Growth of [`suspended`] below this is read jitter, not a suspend.
-const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
+pub(crate) const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
 
 /// Which side of the true value a [`suspended`] reading may fall on.
 #[derive(Clone, Copy, Debug)]

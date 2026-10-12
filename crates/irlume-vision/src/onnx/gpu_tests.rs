@@ -777,80 +777,66 @@ mod gpu_groundwork_tests {
         )
     }
 
-    /// The recognizer's weights, from the test override, an installed
-    /// tree or the fetched repository tree, in that order.
-    fn recognizer_bytes() -> Vec<u8> {
+    /// One model's bytes, pin-checked like the recognizer (see
+    /// [`recognizer_bytes`]).
+    fn model_bytes(name: &str) -> Vec<u8> {
         let candidates = [
             std::env::var("IRLUME_NPU_TEST_MODELS")
-                .map(|dir| PathBuf::from(dir).join("glintr100.onnx"))
+                .map(|dir| PathBuf::from(dir).join(name))
                 .ok(),
-            Some(PathBuf::from("/usr/share/irlume/models/glintr100.onnx")),
-            Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/glintr100.onnx")),
+            Some(PathBuf::from("/usr/share/irlume/models").join(name)),
+            Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../models")
+                    .join(name),
+            ),
         ];
         let path = candidates
             .into_iter()
             .flatten()
             .find(|path| path.is_file())
-            .unwrap_or_else(|| {
-                panic!(
-                    "glintr100.onnx is not in IRLUME_NPU_TEST_MODELS, /usr/share/irlume/models \
-                     or the repository models/ tree (scripts/fetch-models.sh)"
-                )
-            });
+            .unwrap_or_else(|| panic!("{name} is not in the model roots"));
         let bytes =
             std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        // The evidence must name the exact model it measured: the SHA-256
-        // is printed and, when the model root ships the pinned SHA256SUMS,
-        // checked against it, so a stale or modified model file cannot
-        // pose as the pinned recognizer.
         let digest = irlume_common::sha256_hex(&bytes);
-        let sums = path.parent().unwrap().join("SHA256SUMS");
-        if sums.is_file() {
-            let pinned = std::fs::read_to_string(&sums)
-                .unwrap_or_else(|error| panic!("{}: {error}", sums.display()));
-            let expected = pinned
-                .lines()
-                .find_map(|line| {
-                    line.split_whitespace().next().filter(|_| {
-                        line.rsplit(['/', ' '])
-                            .next()
-                            .is_some_and(|n| n == "glintr100.onnx")
-                    })
-                })
-                .unwrap_or_else(|| panic!("{} names no glintr100.onnx", sums.display()));
-            assert_eq!(
-                digest,
-                expected,
-                "{} is not the pinned glintr100.onnx",
-                path.display()
-            );
-        } else {
-            // The installed tree need not ship the sums; the repository's
-            // tracked pin still names the one model this evidence may use.
-            let repo_sums = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/SHA256SUMS");
-            if repo_sums.is_file() {
-                let pinned = std::fs::read_to_string(&repo_sums)
-                    .unwrap_or_else(|error| panic!("{}: {error}", repo_sums.display()));
-                let expected = pinned.lines().find_map(|line| {
-                    let hash = line.split_whitespace().next()?;
-                    line.rsplit(['/', ' '])
-                        .next()
-                        .filter(|name| *name == "glintr100.onnx")
-                        .map(|_| hash.to_owned())
-                });
-                if let Some(expected) = expected {
-                    assert_eq!(
-                        digest,
-                        expected,
-                        "{} is not the pinned glintr100.onnx",
-                        path.display()
-                    );
-                }
+        let check = |sums: &str, sums_path: &std::path::Path| {
+            sums.lines().find_map(|line| {
+                let hash = line.split_whitespace().next()?;
+                line.rsplit(['/', ' '])
+                    .next()
+                    .filter(|file| *file == name)
+                    .map(|_| (hash.to_owned(), sums_path.display().to_string()))
+            })
+        };
+        let root_sums = path.parent().unwrap().join("SHA256SUMS");
+        let repo_sums = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/SHA256SUMS");
+        let pinned = std::fs::read_to_string(&root_sums)
+            .ok()
+            .and_then(|text| check(&text, &root_sums))
+            .or_else(|| {
+                std::fs::read_to_string(&repo_sums)
+                    .ok()
+                    .and_then(|text| check(&text, &repo_sums))
+            });
+        match pinned {
+            Some((expected, where_from)) => {
+                assert_eq!(
+                    digest,
+                    expected,
+                    "{name} from {} is not the pinned model ({where_from})",
+                    path.display()
+                );
             }
-            println!("unpinned model root: {} sha256 {digest}", path.display());
+            None => println!("unpinned model root for {name}: {}", path.display()),
         }
-        println!("recognizer {} sha256 {digest}", path.display());
+        println!("model {name} {} sha256 {digest}", path.display());
         bytes
+    }
+
+    /// The recognizer's weights, from the test override, an installed
+    /// tree or the fetched repository tree, in that order.
+    fn recognizer_bytes() -> Vec<u8> {
+        model_bytes("glintr100.onnx")
     }
 
     /// The recognizer's CPU reference session. BOTH hardware lanes build
@@ -1103,10 +1089,83 @@ mod gpu_groundwork_tests {
     /// when no face is detectable or alignable; a device that fails to
     /// answer PANICS, so a measurement can never silently lose samples to
     /// an inference error.
+    /// The production detection cascade the evidence walks: the YuNet
+    /// detector plus the BlazeFace/FaceMesh rescue irlume-auth arms
+    /// behind it, every model pin-checked at load.
+    struct DetectionCascade {
+        detector: crate::Detector,
+        blaze: crate::BlazeRescue,
+        mesh: crate::FaceMesh,
+    }
+
+    impl DetectionCascade {
+        fn load() -> Self {
+            let detector_bytes = model_bytes("face_detection_yunet_2023mar.onnx");
+            Self {
+                detector: crate::Detector::load_from_memory(&detector_bytes).unwrap(),
+                blaze: crate::BlazeRescue::load_from_memory(&model_bytes(
+                    "blaze_face_short_range.onnx",
+                ))
+                .unwrap(),
+                mesh: crate::FaceMesh::load_from_memory(&model_bytes("face_landmark.onnx"))
+                    .unwrap(),
+            }
+        }
+    }
+
+    /// The recognizer's two devices for one probe.
+    struct Devices<'a> {
+        cpu: &'a mut crate::Embedder,
+        gpu: &'a mut Box<dyn crate::npu::Infer>,
+    }
+
+    /// One decoded corpus image.
+    struct Decoded {
+        rgb: Vec<u8>,
+        width: u32,
+        height: u32,
+        grayscale: bool,
+    }
+
+    /// The production detection cascade's rescue arm, mirroring
+    /// irlume-auth's rescue_detect: after a YuNet miss, BlazeFace
+    /// proposes a coarse box and FaceMesh refines it into the five
+    /// alignment landmarks.
+    fn rescue_detect(
+        blaze: &mut crate::BlazeRescue,
+        mesh: &mut crate::FaceMesh,
+        view: &crate::align::RgbView<'_>,
+    ) -> Option<crate::Detection> {
+        let (bbox, score) = blaze.detect_top(view).ok().flatten()?;
+        let lm = mesh.landmarks(view, &bbox, 0.25).ok()?;
+        if lm.len() < crate::MESH_N {
+            return None;
+        }
+        const LEFT_EYE_RING: [usize; 6] = [33, 160, 158, 133, 153, 144];
+        const RIGHT_EYE_RING: [usize; 6] = [362, 385, 387, 263, 373, 380];
+        let center = |idx: &[usize; 6]| {
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            for &i in idx {
+                x += lm[i].0;
+                y += lm[i].1;
+            }
+            (x / 6.0, y / 6.0)
+        };
+        let e1 = center(&LEFT_EYE_RING);
+        let e2 = center(&RIGHT_EYE_RING);
+        let (le, re) = if e1.0 <= e2.0 { (e1, e2) } else { (e2, e1) };
+        let (m1, m2) = (lm[61], lm[291]);
+        let (ml, mr) = if m1.0 <= m2.0 { (m1, m2) } else { (m2, m1) };
+        Some(crate::Detection {
+            bbox,
+            score,
+            landmarks: [le, re, lm[1], ml, mr],
+        })
+    }
+
     fn probe_both(
-        detector: &mut crate::Detector,
-        cpu: &mut crate::Embedder,
-        gpu: &mut Box<dyn crate::npu::Infer>,
+        cascade: &mut DetectionCascade,
+        devices: &mut Devices<'_>,
         rgb: &[u8],
         width: u32,
         height: u32,
@@ -1120,52 +1179,81 @@ mod gpu_groundwork_tests {
         // A detector runtime error fails the lane: an evidence run must
         // not lose frames to an inference failure it mistook for an
         // undetectable face.
-        let found = detector.detect(&view).expect("the detector answers");
+        let found = cascade
+            .detector
+            .detect(&view)
+            .expect("the detector answers");
         let face = found
             .into_iter()
             .filter(crate::detection_is_finite)
-            .max_by(|a, b| a.score.total_cmp(&b.score))?;
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            // The production cascade rescues a YuNet miss through
+            // BlazeFace + FaceMesh before it gives up (irlume-auth's
+            // rescue_detect); the evidence walks the same path.
+            .or_else(|| rescue_detect(&mut cascade.blaze, &mut cascade.mesh, &view))?;
         let chip = crate::align::align_to_arcface(&view, &face.landmarks).ok()?;
         let plain = crate::align::preprocess_arcface(&chip);
         let (cpu, gpu) = if tta {
-            let cpu = cpu.embed_tta(&chip).expect("the CPU TTA embedding");
-            let a = gpu_norm_infer(gpu, &plain);
+            let cpu = devices.cpu.embed_tta(&chip).expect("the CPU TTA embedding");
+            let a = gpu_norm_infer(devices.gpu, &plain);
             let flipped = crate::align::preprocess_arcface(&crate::align::flip_h(&chip));
-            let b = gpu_norm_infer(gpu, &flipped);
+            let b = gpu_norm_infer(devices.gpu, &flipped);
             (cpu, tta_mean(&a, &b))
         } else {
-            let cpu = cpu.embed_preprocessed(&plain).expect("the CPU embedding");
-            (cpu, gpu_norm_infer(gpu, &plain))
+            let cpu = devices
+                .cpu
+                .embed_preprocessed(&plain)
+                .expect("the CPU embedding");
+            (cpu, gpu_norm_infer(devices.gpu, &plain))
         };
         Some(FaceProbe { cpu, gpu })
     }
 
-    fn decode_image(path: &Path) -> Option<(Vec<u8>, u32, u32, bool)> {
-        let raw = std::fs::read(path).ok()?;
-        match path
+    /// Ok(None) marks a non-image file the corpus walker may carry;
+    /// a file with an image extension that cannot be read or decoded
+    /// REFUSES the run instead of silently shrinking the corpus.
+    fn decode_image(path: &Path) -> Result<Option<Decoded>, String> {
+        let ext = path
             .extension()
             .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
+            .map(str::to_ascii_lowercase);
+        let Some(ext) = ext.as_deref() else {
+            return Ok(None);
+        };
+        let raw = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        match ext {
             // The PNM kind, not the extension, decides the modality, like
             // the NPU lane: a grayscale P5 under any name is IR.
-            Some("pgm") | Some("ppm") => {
-                let (kind, w, h, data) = pnm(&raw)?;
+            "pgm" | "ppm" => {
+                let Some((kind, w, h, data)) = pnm(&raw) else {
+                    return Err(format!("{}: malformed PNM", path.display()));
+                };
                 let grayscale = kind == 'g';
                 let rgb = if grayscale {
                     data.iter().flat_map(|&g| [g, g, g]).collect()
                 } else {
                     data.to_vec()
                 };
-                Some((rgb, w, h, grayscale))
+                Ok(Some(Decoded {
+                    rgb,
+                    width: w,
+                    height: h,
+                    grayscale,
+                }))
             }
-            Some("jpg") | Some("jpeg") | Some("png") => {
-                let img = image::open(path).ok()?.to_rgb8();
+            "jpg" | "jpeg" | "png" => {
+                let img = image::open(path)
+                    .map_err(|error| format!("{}: {error}", path.display()))?
+                    .to_rgb8();
                 let (w, h) = img.dimensions();
-                Some((img.into_raw(), w, h, false))
+                Ok(Some(Decoded {
+                    rgb: img.into_raw(),
+                    width: w,
+                    height: h,
+                    grayscale: false,
+                }))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -1188,9 +1276,7 @@ mod gpu_groundwork_tests {
         std::fs::create_dir_all(&cache).unwrap();
         let (mut recognizer, assignment) = platform.compile(&cache, &bytes).unwrap();
         assert!(assignment == "GPU" || assignment.starts_with("GPU."));
-        let detector_bytes =
-            std::fs::read(model_path("face_detection_yunet_2023mar.onnx")).unwrap();
-        let mut detector = crate::Detector::load_from_memory(&detector_bytes).unwrap();
+        let mut cascade = DetectionCascade::load();
 
         let root = PathBuf::from(
             std::env::var("IRLUME_NPU_EVAL_DIR")
@@ -1214,6 +1300,17 @@ mod gpu_groundwork_tests {
             }
         }
         dirs.sort();
+        // Recorded sessions nest attack takes in subdirectories (for
+        // example mn3-session/phone-replay-car); every image under each
+        // session belongs to it, so the corpus is collected recursively
+        // and the session's name keeps deciding attack or genuine.
+        let mut sessions: Vec<(PathBuf, bool)> = Vec::new();
+        for dir in &dirs {
+            let attack = is_attack(&dir.file_name().unwrap().to_string_lossy());
+            collect_images(dir)
+                .into_iter()
+                .for_each(|file| sessions.push((file, attack)));
+        }
 
         let (mut genuine_ir, mut attacks_ir) = (Stats::default(), Stats::default());
         let (mut genuine_rgb, mut attacks_rgb) = (Stats::default(), Stats::default());
@@ -1225,20 +1322,10 @@ mod gpu_groundwork_tests {
         // instead of being dropped.
         let mut corpus: Vec<(PathBuf, bool, bool)> = Vec::new(); // (file, attack, ir)
         let mut frames = 0usize;
-        for dir in &dirs {
-            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
-            let attack = is_attack(&name);
-            let mut files: Vec<_> = std::fs::read_dir(dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .collect();
-            files.sort();
-            for file in files {
-                if let Some((.., grayscale)) = decode_image(&file) {
-                    frames += 1;
-                    corpus.push((file, attack, grayscale));
-                }
+        for (file, attack) in &sessions {
+            if let Some(image) = decode_image(file).unwrap_or_else(|error| panic!("{error}")) {
+                frames += 1;
+                corpus.push((file.clone(), *attack, image.grayscale));
             }
         }
         let mut reference: Option<Vec<f32>> = None;
@@ -1248,14 +1335,19 @@ mod gpu_groundwork_tests {
         let mut faces = 0usize;
         let mut probes: Vec<(FaceProbe, bool, bool)> = Vec::new();
         for (file, attack, ir) in &corpus {
-            let (rgb, width, height, _) = decode_image(file).unwrap();
+            let image = decode_image(file)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .expect("the corpus was decoded once");
+            let mut devices = Devices {
+                cpu: &mut cpu,
+                gpu: &mut recognizer,
+            };
             let Some(probe) = probe_both(
-                &mut detector,
-                &mut cpu,
-                &mut recognizer,
-                &rgb,
-                width,
-                height,
+                &mut cascade,
+                &mut devices,
+                &image.rgb,
+                image.width,
+                image.height,
                 !ir,
             ) else {
                 continue;
@@ -1344,26 +1436,12 @@ mod gpu_groundwork_tests {
         println!(
             "recognizer: genuine flips {genuine_flips}, new grants on presentation attacks {new_grants}; measurement only, CERTIFIED stays empty"
         );
-    }
-
-    /// The recognizer model file of `name` from the same roots as
-    /// [`recognizer_bytes`].
-    fn model_path(name: &str) -> PathBuf {
-        [
-            std::env::var("IRLUME_NPU_TEST_MODELS")
-                .map(|dir| PathBuf::from(dir).join(name))
-                .ok(),
-            Some(PathBuf::from("/usr/share/irlume/models").join(name)),
-            Some(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../models")
-                    .join(name),
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("{name} is not in the model roots"))
+        // The no-new-grants direction is the security gate itself
+        // (ADR-0033 section 5): the test result must carry it, not the log.
+        assert_eq!(
+            new_grants, 0,
+            "the GPU granted a presentation attack the CPU denied"
+        );
     }
 
     /// Every jpg/jpeg/png under `root`, recursively, sorted. A local
@@ -1448,15 +1526,13 @@ mod gpu_groundwork_tests {
         std::fs::create_dir_all(&cache).unwrap();
         let (mut recognizer, assignment) = platform.compile(&cache, &bytes).unwrap();
         assert!(assignment == "GPU" || assignment.starts_with("GPU."));
-        let detector_bytes =
-            std::fs::read(model_path("face_detection_yunet_2023mar.onnx")).unwrap();
-        let mut detector = crate::Detector::load_from_memory(&detector_bytes).unwrap();
+        let mut cascade = DetectionCascade::load();
 
         // Embed each image at most once, whatever pairs reference it.
         let mut embedded: std::collections::HashMap<PathBuf, Option<FaceProbe>> =
             Default::default();
         let mut no_face = 0usize;
-        let mut embed = |detector: &mut crate::Detector,
+        let mut embed = |cascade: &mut DetectionCascade,
                          cpu: &mut crate::Embedder,
                          gpu: &mut Box<dyn crate::npu::Infer>,
                          path: &Path|
@@ -1464,9 +1540,21 @@ mod gpu_groundwork_tests {
             if let Some(cached) = embedded.get(path) {
                 return cached.clone();
             }
-            let result = decode_image(path).and_then(|(rgb, width, height, _grayscale)| {
-                probe_both(detector, cpu, gpu, &rgb, width, height, true)
-            });
+            let result = match decode_image(path) {
+                Ok(Some(image)) => {
+                    let mut devices = Devices { cpu, gpu };
+                    probe_both(
+                        cascade,
+                        &mut devices,
+                        &image.rgb,
+                        image.width,
+                        image.height,
+                        true,
+                    )
+                }
+                Ok(None) => None,
+                Err(error) => panic!("{error}"),
+            };
             if result.is_none() {
                 no_face += 1;
             }
@@ -1497,8 +1585,8 @@ mod gpu_groundwork_tests {
                 continue;
             }
             let (Some(template), Some(probe)) = (
-                embed(&mut detector, &mut cpu, &mut recognizer, &a),
-                embed(&mut detector, &mut cpu, &mut recognizer, &b),
+                embed(&mut cascade, &mut cpu, &mut recognizer, &a),
+                embed(&mut cascade, &mut cpu, &mut recognizer, &b),
             ) else {
                 continue;
             };
@@ -1526,32 +1614,63 @@ mod gpu_groundwork_tests {
             lfw_pairs_used[1], lfw_pairs_used[0]
         );
 
-        // Impostor pairs, FairFace (impostor-only tree): consecutive files.
+        // Impostor pairs, FairFace (impostor-only tree), balanced across
+        // its demographic group directories: mixed-population pairs would
+        // understate the within-group risk (docs/FAIRNESS.md), and a
+        // globally sorted walk would exhaust the alphabetically earliest
+        // group before reaching the rest.
         let mut impostor_fairface = Stats::default();
-        let fairface_files = collect_images(&fairface_root);
-        for pair in fairface_files.windows(2) {
-            if impostor_fairface.n >= max_impostors {
-                break;
+        let mut groups: Vec<(String, Vec<PathBuf>)> = Vec::new();
+        for entry in std::fs::read_dir(&fairface_root)
+            .unwrap_or_else(|error| panic!("{}: {error}", fairface_root.display()))
+            .filter_map(Result::ok)
+        {
+            if entry.path().is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                groups.push((name, collect_images(&entry.path())));
             }
-            let (Some(template), Some(probe)) = (
-                embed(&mut detector, &mut cpu, &mut recognizer, &pair[0]),
-                embed(&mut detector, &mut cpu, &mut recognizer, &pair[1]),
-            ) else {
-                continue;
-            };
-            let cpu_score: f32 = template
-                .cpu
+        }
+        groups.sort();
+        assert!(
+            !groups.is_empty(),
+            "the FairFace root has no group directories"
+        );
+        println!(
+            "fairface groups: {}",
+            groups
                 .iter()
-                .zip(&probe.cpu)
-                .map(|(x, y)| x * y)
-                .sum();
-            let gpu_score: f32 = template
-                .cpu
-                .iter()
-                .zip(&probe.gpu)
-                .map(|(x, y)| x * y)
-                .sum();
-            impostor_fairface.add(cpu_score, gpu_score, 0.55);
+                .map(|(name, files)| format!("{name} {}", files.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let per_group = (max_impostors / groups.len()).max(1);
+        for (_, files) in &groups {
+            let mut measured = 0usize;
+            for pair in files.windows(2) {
+                if measured >= per_group {
+                    break;
+                }
+                let (Some(template), Some(probe)) = (
+                    embed(&mut cascade, &mut cpu, &mut recognizer, &pair[0]),
+                    embed(&mut cascade, &mut cpu, &mut recognizer, &pair[1]),
+                ) else {
+                    continue;
+                };
+                measured += 1;
+                let cpu_score: f32 = template
+                    .cpu
+                    .iter()
+                    .zip(&probe.cpu)
+                    .map(|(x, y)| x * y)
+                    .sum();
+                let gpu_score: f32 = template
+                    .cpu
+                    .iter()
+                    .zip(&probe.gpu)
+                    .map(|(x, y)| x * y)
+                    .sum();
+                impostor_fairface.add(cpu_score, gpu_score, 0.55);
+            }
         }
         assert!(platform.still_loaded_as_hashed().is_ok());
         // A vacuous run is not evidence: both directions need samples.
@@ -1579,6 +1698,9 @@ mod gpu_groundwork_tests {
             "impostor flips {} (new grants {new_grants}); measurement only, CERTIFIED stays empty",
             impostor_lfw.flips + impostor_fairface.flips
         );
+        // The no-new-grants direction is the security gate itself
+        // (ADR-0033 section 5): the test result must carry it, not the log.
+        assert_eq!(new_grants, 0, "the GPU granted an impostor the CPU denied");
     }
 
     /// The suspend/resume recheck a GPU certification requires, run as

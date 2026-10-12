@@ -12,6 +12,7 @@
 mod gpu_evidence;
 
 mod gpu_groundwork_tests {
+    use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;
     use crate::npu::gpu::{self, Discovery, Firmware, Identity, RenderNode};
     use std::path::{Path, PathBuf};
@@ -1466,12 +1467,64 @@ mod gpu_groundwork_tests {
         }
     }
 
+    /// Separate arms stay separate. The borrowed scores are private evaluation
+    /// inputs; only aggregate counts and partial budget outcomes leave this call.
+    fn measured_arm_line(
+        arm: &str,
+        population: Population,
+        scores: &[(f32, f32)],
+    ) -> Result<String, InvalidEvidence> {
+        let report = super::gpu_evidence::measure(population, 0.55, scores)?;
+        Ok(format!("arm={arm:?} {}", report.line()))
+    }
+
+    #[test]
+    fn gpu_budget_reporter_keeps_the_recorded_rgb_denominator() {
+        let threshold = 0.55_f32;
+        let mut rgb = vec![(0.9, 0.9); 339];
+        rgb[0] = (threshold, f32::from_bits(threshold.to_bits() - 1));
+        let rgb_line =
+            measured_arm_line("recorded genuine RGB", Population::Genuine, &rgb).unwrap();
+        assert!(rgb_line.starts_with("arm=\"recorded genuine RGB\" MEASURED_BUDGET "));
+        assert!(rgb_line.contains("verdict_budget=FAIL"));
+        assert!(rgb_line.contains("samples=339"));
+        assert!(rgb_line.contains("error_rate_delta=1/339"));
+        assert!(rgb_line.contains("certification=NOT_EVALUATED"));
+
+        // A second, larger passing arm must not dilute the failing arm.
+        let ir = vec![(0.9, 0.9); 1474];
+        let ir_line = measured_arm_line("recorded genuine IR", Population::Genuine, &ir).unwrap();
+        assert!(ir_line.contains("outcome=PASS"));
+        assert!(rgb_line.contains("outcome=FAIL"));
+    }
+
+    #[test]
+    fn gpu_budget_reporter_refuses_invalid_scores_instead_of_filtering_them() {
+        assert!(matches!(
+            measured_arm_line(
+                "impostor group",
+                Population::Impostor,
+                &[(0.0, 0.0), (f32::NAN, 0.0)]
+            ),
+            Err(InvalidEvidence::Comparison { ordinal: 1 })
+        ));
+    }
+
+    #[test]
+    fn gpu_budget_reporter_empty_arm_is_inconclusive_and_labels_are_escaped() {
+        let line = measured_arm_line("arm\nlabel", Population::Attack, &[]).unwrap();
+        assert!(line.starts_with("arm=\"arm\\nlabel\" MEASURED_BUDGET "));
+        assert!(line.contains("outcome=INCONCLUSIVE"));
+        assert!(line.contains("error_rate_delta=undefined"));
+        assert!(!line.contains('\n'));
+    }
+
     /// Real recorded frames, recognizer CPU vs GPU at the wired 0.55
     /// threshold, mirroring the NPU real-frames lane for the one
     /// GPU-eligible model: the PAD cues and the detector stay on the CPU
     /// (ADR-0033 section 5), so this lane tracks match decisions only.
-    /// Measurement, not a certification: the drift and flips are reported
-    /// against the section 7 directions and CERTIFIED stays empty.
+    /// Measurement, not a certification: each arm's counts and explicit
+    /// measured-budget outcome are reported. CERTIFIED stays empty.
     #[test]
     #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, the recognizer weights and recorded evaluation frames"]
     fn gpu_hw_real_frames_track_cpu() {
@@ -1531,6 +1584,8 @@ mod gpu_groundwork_tests {
 
         let (mut genuine_ir, mut attacks_ir) = (Stats::default(), Stats::default());
         let (mut genuine_rgb, mut attacks_rgb) = (Stats::default(), Stats::default());
+        let (mut genuine_ir_scores, mut attacks_ir_scores) = (Vec::new(), Vec::new());
+        let (mut genuine_rgb_scores, mut attacks_rgb_scores) = (Vec::new(), Vec::new());
         let mut cosine_min = f32::INFINITY;
         // Every decoded frame in one deterministic list, so a first pass
         // can establish each modality's genuine reference BEFORE any
@@ -1600,13 +1655,14 @@ mod gpu_groundwork_tests {
                 embedding.iter().zip(template).map(|(x, y)| x * y).sum()
             };
             let (cpu_score, gpu_score) = (score(&probe.cpu), score(&probe.gpu));
-            let stats: &mut Stats = match (attack, ir) {
-                (true, true) => &mut attacks_ir,
-                (true, false) => &mut attacks_rgb,
-                (false, true) => &mut genuine_ir,
-                (false, false) => &mut genuine_rgb,
+            let (stats, scores) = match (attack, ir) {
+                (true, true) => (&mut attacks_ir, &mut attacks_ir_scores),
+                (true, false) => (&mut attacks_rgb, &mut attacks_rgb_scores),
+                (false, true) => (&mut genuine_ir, &mut genuine_ir_scores),
+                (false, false) => (&mut genuine_rgb, &mut genuine_rgb_scores),
             };
             stats.add(cpu_score, gpu_score, 0.55);
+            scores.push((cpu_score, gpu_score));
         }
         assert!(platform.still_loaded_as_hashed().is_ok());
         // A vacuous run is not evidence: every arm must have samples.
@@ -1646,6 +1702,30 @@ mod gpu_groundwork_tests {
             )
         );
         println!("recognizer CPU vs GPU embedding cosine, lowest {cosine_min:.6}");
+        for (arm, population, scores) in [
+            (
+                "recorded genuine IR",
+                Population::Genuine,
+                &genuine_ir_scores,
+            ),
+            (
+                "recorded IR attacks",
+                Population::Attack,
+                &attacks_ir_scores,
+            ),
+            (
+                "recorded genuine RGB",
+                Population::Genuine,
+                &genuine_rgb_scores,
+            ),
+            (
+                "recorded RGB attacks",
+                Population::Attack,
+                &attacks_rgb_scores,
+            ),
+        ] {
+            println!("{}", measured_arm_line(arm, population, scores).unwrap());
+        }
         let new_grants: usize = [&attacks_ir, &attacks_rgb]
             .iter()
             .map(|s| s.flips - s.flips_down)
@@ -2040,6 +2120,7 @@ mod gpu_groundwork_tests {
         // image_a,image_b,image_a_path,image_b_path, paths relative to
         // the corpus's train/ tree.
         let (mut genuine, mut impostor_lfw) = (Stats::default(), Stats::default());
+        let (mut genuine_scores, mut impostor_lfw_scores) = (Vec::new(), Vec::new());
         let mut lfw_pairs_used = [0usize; 2];
         for (is_same, a, b) in lfw_pairs(&lfw_root) {
             if lfw_pairs_used[usize::from(is_same)] >= max_pairs {
@@ -2066,8 +2147,10 @@ mod gpu_groundwork_tests {
                 .sum();
             if is_same {
                 genuine.add(cpu_score, gpu_score, 0.55);
+                genuine_scores.push((cpu_score, gpu_score));
             } else {
                 impostor_lfw.add(cpu_score, gpu_score, 0.55);
+                impostor_lfw_scores.push((cpu_score, gpu_score));
             }
         }
         println!(
@@ -2099,6 +2182,7 @@ mod gpu_groundwork_tests {
         for (name, files) in &groups {
             let mut measured = 0usize;
             let mut group_stats = Stats::default();
+            let mut group_scores = Vec::new();
             let mut skipped_pairs = 0usize;
             for pair in files.windows(2) {
                 if measured >= per_group {
@@ -2126,11 +2210,23 @@ mod gpu_groundwork_tests {
                     .sum();
                 impostor_fairface.add(cpu_score, gpu_score, 0.55);
                 group_stats.add(cpu_score, gpu_score, 0.55);
+                group_scores.push((cpu_score, gpu_score));
             }
             println!(
                 "FairFace group {name}: discovered {} images, skipped {skipped_pairs} pairs; {}",
                 files.len(),
                 group_stats.line_as("measured at 0.55", "GPU")
+            );
+            // The aggregate FairFace counters below cannot waive a failed
+            // demographic group's drift or no-new-grant budget.
+            println!(
+                "{}",
+                measured_arm_line(
+                    &format!("FairFace impostor {name}"),
+                    Population::Impostor,
+                    &group_scores,
+                )
+                .unwrap()
             );
             measured_groups.push((name.clone(), group_stats));
         }
@@ -2146,6 +2242,14 @@ mod gpu_groundwork_tests {
         println!("skipped images without a usable aligned face: {no_face}");
         cascade.report();
         println!("{}", genuine.line_as("genuine LFW pairs at 0.55", "GPU"));
+        println!(
+            "{}",
+            measured_arm_line("genuine LFW", Population::Genuine, &genuine_scores).unwrap()
+        );
+        println!(
+            "{}",
+            measured_arm_line("impostor LFW", Population::Impostor, &impostor_lfw_scores).unwrap()
+        );
         println!(
             "{}",
             impostor_lfw.line_as("impostor LFW pairs at 0.55", "GPU")

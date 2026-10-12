@@ -260,7 +260,7 @@ zero alignment refusals. No input or inference error was skipped.
 
 ### Suspend and certification limits
 
-No actual attended suspend is qualified by this record. Earlier
+The `r6-20261012` run qualified no actual attended suspend. Earlier
 positive claims based on the production recheck trigger are withdrawn:
 that trigger intentionally permits extra rechecks after scheduling
 delays and is not proof of suspend. Production remains unchanged.
@@ -273,6 +273,83 @@ The final combined run waited 10 seconds and explicitly reported
 inconclusive evidence with no post-resume checks exercised.
 
 IR recognition corpora, fusion/calibration/template-count decisions,
-repeatability, crash campaigns and actual suspend remain separate
+repeatability and crash campaigns remain separate
 ADR-0022 section 7 obligations. `CERTIFIED` stays empty, production
 loading admission stays closed, and CPU authentication stays authoritative.
+
+## Qualification continuation, 2026-10-12
+
+These additional observations use the same test source, binary, model
+pins, Arc 140V stack and identity as `r6-20261012` above. They do not
+establish full certification or change production loading admission.
+
+### Attended system suspend
+
+Receipt `attended-suspend-20261012` selects only
+`onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_suspend_resume_recheck`,
+with a 1200-second wait, a 1500-second process cap, zero core limits
+and CPU affinity `0-3`. The operator manually suspends the machine
+after the baseline is ready, then wakes and unlocks it; the test does
+not initiate a power transition.
+
+The same process proves bounded clock growth and verifies all three
+fixed synthetic output fingerprints and the mapped-library inventory
+after resume. Result: 1 passed, 0 failed, 164.08 seconds. Its identity
+remains `f85917697c1fc39ddc9f0e15bb2ca9a84d66aaa69bdc7fef56ce41e52af272ed`,
+37 mapped libraries and the default native TFLite mesh. The kernel
+journal independently records `s2idle` entry at 19:51:28 UTC and resume
+and suspend exit at 19:52:13 UTC. This closes one actual system-suspend
+baseline, not the runtime-suspend or 1000-inference requirements.
+
+### Independent process observations
+
+Twenty fresh processes each pass the exact existing compile/parity/
+retirement test. All four fixed synthetic GPU output fingerprints and
+the CPU-reference fingerprint repeat across processes, with the same
+identity and configuration. Each process uses a fresh temporary
+application model-cache directory. Runtime cache bypass and cache-hit
+provenance were not queried, so these are repeatability observations,
+not the required 20 cache-bypassed cold compiles or 20 warm loads.
+
+### Observed rejection-budget gap
+
+The recorded genuine RGB arm above has one additional rejection among
+339 comparisons: `100 / 339 = 0.294985` percentage points. That exceeds
+ADR-0022 section 7's inclusive 0.2-point genuine rejection-increase
+budget for this measured arm. Pooling genuine IR or LFW comparisons
+into its denominator would conceal, not resolve, this gap.
+
+The earlier receipt does not record the baseline CPU/GPU rejection
+counts or CPU threshold-shift rates. Its first-reference-template,
+face-usable subset is not a production-shaped authentication or a
+population FRR estimate. Those missing counts, drift-shift rates, IR
+corpora and production fusion/calibration/template-count decisions
+remain qualification work. No certification table entry is justified.
+
+### Per-arm measurement-budget reports
+
+The test-only collectors now emit `MEASURED_BUDGET` for each recorded
+modality/population, each LFW population and each FairFace demographic
+group. Reports include CPU/GPU accept and reject counts, both verdict-
+flip directions and error-rate deltas as exact count fractions. Each
+arm's measured maximum absolute score drift also shifts its CPU threshold
+in both directions, with the resulting counts and budget outcomes.
+
+The genuine net rejection-increase limit is inclusive `1/500`; any new
+impostor or attack grant fails regardless of aggregate improvement.
+Threshold-shift movement is absolute: genuine error rates may move by
+at most `1/500`, negative error rates by at most 10% of their baseline
+or `1/100000` when zero. Integer comparisons decide those boundaries;
+rounded rates or displayed shifted thresholds never decide acceptance.
+Nonfinite inputs refuse the report; empty inputs are inconclusive.
+
+These are per-arm, fixed `score >= 0.55` budgets, not a global drift
+bound over all corpora or production-shaped authentication decisions.
+Reports explicitly mark `certification=NOT_EVALUATED`. A collector can
+complete successfully while reporting a measured-budget `FAIL`; its
+existing non-vacuity, mapped-inventory and zero-new-negative-grant
+assertions remain enforced. Neither a passing collector nor a passing
+partial budget supplies missing certification coverage. Comparisons
+remain in memory, and output is aggregate-only; anonymous differing-
+verdict margins are private in-memory audit metadata, not persisted
+frames, embeddings, scores or identifying paths.

@@ -10,9 +10,13 @@ All notable changes to irlume are documented here. This project adheres to
 - Measurement-only GPU certification-evidence lanes for the recognizer
   on the decision hardware (ADR-0033 phase 4): recorded-frame corpus CPU
   vs GPU at the wired threshold with presentation attacks, recognition
-  corpora genuine and impostor drift with a zero-new-grants report, and
-  a suspend/resume recheck lane that runs after a real attended
-  suspend. `CERTIFIED` stays empty and loading admission stays closed
+  corpora genuine and impostor drift with zero-new-grants assertions,
+  and a suspend/resume recheck lane gated by bounded proof of an
+  attended suspend. Evidence uses committed model pins, the default
+  native-mesh cascade, PNM and nested attack takes, strict input
+  validation and per-demographic measured coverage. A wait without
+  suspend proof is inconclusive. `CERTIFIED` stays empty and loading
+  admission stays closed
   (ADR-0033 section 5, #1053).
 
 - Complete GPU platform identity under closed admission: the test-only

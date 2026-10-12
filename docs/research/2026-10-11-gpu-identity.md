@@ -123,62 +123,156 @@ empty, and CPU authentication stays authoritative. The record feeds
 the identity implementation and its `gpu_hw_*` hardware tests; it
 places nothing.
 
-## Phase 4 certification-evidence measurements (same day)
+## Phase 4 measurement correction, 2026-10-12
 
-The evidence lanes merged after the identity slice, run on the decision
-hardware (UX5406S Arc 140V, identity digest 28b38b63, fixed
-configuration batch=1/LATENCY/f16, OpenVINO RPM 2026.2.1, OpenCL ICD
-stack), recognizer only; the PAD cues and the detector stay on the CPU
-where ADR-0033 section 5 keeps them. RGB probes run the TTA pipeline
-production authenticates RGB with; IR stays plain; corpora templates
-are the CPU enrollment embedding. Measurement, not a certification:
-`CERTIFIED` stays empty and no loading profile is admitted.
+These are measurement-only lanes in PR #1058, following the merged
+identity slice (#1057). Earlier phase-4 tables are superseded: their
+collectors omitted PNM frames or nested attack labels, their rescue
+used the ONNX mesh alternative, and their populations cannot stand
+as evidence for the corrected default-native-mesh path.
 
-Real recorded frames (the suncal corpus, 2397 frames, 1851 with a
-detected face, 67 directories), CPU-template vs GPU-probe at the wired
-0.55 threshold:
+Test source: `crates/irlume-vision/src/onnx/gpu_tests.rs` SHA-256
+`bc177053c5d7dc444eef9f67a2484f4d552bcadd9d5e9e56de19648111c3a7a8`,
+Rust 1.88.0 release build with `npu`. Hardware: UX5406S Arc 140V,
+Fedora 44, installed OpenVINO 2026.2.1, ONNX Runtime 1.28.1 and
+native TFLite CPU mesh. Configuration remains
+`batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`.
+Kernel `7.2.9-201.fc44.x86_64`, compute-runtime RPM
+`26.35.39758.11-3.fc44`, OpenVINO RPM `2026.2.1-1.intelnpu.fc44`.
 
-| Arm | n | max abs drift | flips |
+Receipt identifier: `r6-20261012`. The synthetic CPU-reference digest
+reported by the compile lane is
+`cbee96a116304c8a6e1d7890258254f1f4db41896b3fa58ceb9a2b224fad4a7a`.
+This is a runtime fingerprint from fixed synthetic inputs, not a
+biometric template. The local private receipt retains the exact
+invocation; the share-safe record below contains only aggregate results.
+Executed binary SHA-256:
+`d06c873d6ee6a96991b238ac5f779daeb26c7e7779d40fb9a9d11a2d4764f693`.
+The combined run finished 5 tests passed, 0 failed in 3557.99 seconds.
+This includes the suspend lane's inconclusive no-suspend path, not a
+qualified post-resume result.
+
+The release test binary was built with
+`cargo +1.88.0 test --release --locked -p irlume-vision --features npu --lib -- gpu_groundwork_tests --test-threads=1`.
+It was then run as root with zero core limits and CPU affinity `0-3`:
+
+```sh
+env ORT_DYLIB_PATH=/usr/share/irlume/onnxruntime/lib/libonnxruntime.so \
+    IRLUME_TFLITE_LIB=/usr/share/irlume/tflite/libtensorflowlite_c.so \
+    IRLUME_NPU_TEST_MODELS=/usr/share/irlume/models \
+    IRLUME_NPU_EVAL_DIR="$SUNCAL_ROOT" \
+    IRLUME_GPU_CORPORA_LFW="$LFW_ROOT" \
+    IRLUME_GPU_CORPORA_FAIRFACE="$FAIRFACE_ROOT" \
+    IRLUME_GPU_TEST_SUSPEND_WAIT_SECS=10 \
+    "$VISION_TEST_BINARY" --ignored \
+    gpu_hw_identity_binds_plugin_render_node_and_libraries \
+    gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration \
+    gpu_hw_real_frames_track_cpu gpu_hw_recognition_corpora_drift \
+    gpu_hw_suspend_resume_recheck --test-threads=1 --nocapture
+```
+
+The root variables stand for the existing suncal session tree, LFW
+`train` plus its canonical eight-field `pairs.csv`, and FairFace's
+seven demographic group directories. Pair caps use the unchanged
+defaults: 400 genuine and 400 impostor LFW comparisons and a 2600
+FairFace cap shared within groups. These are bounded evidence subsets,
+not whole-dataset evaluations.
+
+Every lane loads the same CPU recognizer, YuNet, BlazeFace and default
+`face_landmarks_detector.tflite` before GPU inventory capture. Each
+receipt names its actual identity. The recorded-frame receipt reports
+digest `f85917697c1fc39ddc9f0e15bb2ca9a84d66aaa69bdc7fef56ce41e52af272ed`
+with 37 mapped libraries, including the CPU runtimes. All five combined
+lane receipts agree exactly. Three additional fresh processes, run in
+suspend-baseline/discovery/compile order, each passed its single selected
+test and reported the same digest, configuration, library count and
+native-mesh baseline. The standalone compile also reproduced all four
+synthetic GPU input digests and the CPU-reference fingerprint. The
+standalone suspend wait was zero; it qualifies no post-resume behavior.
+
+Every artifact is checked against the embedded committed
+`models/SHA256SUMS`; a model root chooses a location, not accepted
+hashes. The recognizer hash is
+`a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60`.
+RGB probes use production TTA; IR probes remain plain. CPU and GPU
+embeddings use production normalization. Templates remain CPU
+embeddings. Detection and alignment use CPU models; PAD, fusion,
+calibration and template-count authentication decisions are not
+measured by these pairwise lanes.
+
+### Recorded genuine frames and presentation attacks
+
+The corrected recursive suncal walk includes PGM/PPM and nested
+attack takes: 2627 decoded frames, 2160 usable aligned faces, 67
+top-level session directories. Classification uses directory
+components, not image names. The first usable genuine frame of each
+modality supplies its CPU template before any attack is scored.
+
+| Arm at 0.55 | n | max abs drift | flips |
 |---|---|---|---|
-| genuine IR | 1347 | 0.000381 | 0 |
-| IR presentation attacks | 123 | 0.000285 | 0 |
-| genuine RGB (TTA) | 282 | 0.000274 | 0 |
-| RGB presentation attacks (TTA) | 99 | 0.000193 | 0 |
+| genuine IR | 1474 | 0.000730 | 0 |
+| IR presentation attacks | 138 | 0.000285 | 0 |
+| genuine RGB (TTA) | 339 | 0.000274 | 1 rejection |
+| RGB presentation attacks (TTA) | 209 | 0.000196 | 0 |
 
-Embedding cosine floor 0.999996; zero new grants on presentation
-attacks; the nearest genuine CPU score sat 0.0001 from the threshold
-and did not flip.
+The lane passed its mapped-inventory, non-vacuity and zero-new-attack-
+grant assertions. Its reported lowest CPU/GPU embedding cosine was
+0.999994; the recorded-frame lane does not assert a cosine bound.
+One genuine RGB comparison accepted by CPU was rejected by GPU; this
+is not identical decision parity and must not be read as certification.
+The CPU cascade attempted 568 rescues, recovered 101 faces, and
+reported zero geometric mesh refusals and zero alignment refusals.
+Unexpected inference failures and input read/decode/traversal errors
+refuse the measurement rather than disappearing as no-face samples.
 
-Recognition corpora (the LFW corpus's own pairs.csv verification
-protocol, 400 genuine and 400 impostor pairs; the FairFace
-impostor-only tree, 2600 pairs):
+### Recognition corpora
 
-| Arm | n | max abs drift | flips |
+The corrected canonical LFW and within-group FairFace lane passed.
+Headers, pair rows, labels and referenced files validated, and all
+seven demographic groups contributed measured comparisons.
+
+| Arm at 0.55, RGB TTA | n | max abs drift | flips |
 |---|---|---|---|
-| genuine LFW pairs (TTA) | 400 | 0.000236 | 0 |
-| impostor LFW pairs (TTA) | 400 | 0.000229 | 0 |
-| impostor FairFace pairs (TTA) | 2600 | 0.000354 | 0 |
+| genuine LFW | 400 | 0.000236 | 0 |
+| impostor LFW | 400 | 0.000229 | 0 |
+| impostor FairFace | 2597 | 0.000313 | 0 |
 
-Zero impostor flips, zero new grants over 3000 impostor pairs; 271
-corpus images had no detectable face and were skipped (each image
-embeds once, however many pairs reference it). The recognizer file is
-pinned for the evidence: sha256
-a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60,
-equal to the repository models/SHA256SUMS pin. The GPU output
-is production-normalized in the lanes (the model's raw output is not
-the embedding; a first run's cosine floor of 10.8 exposed the missing
-normalization before any number was recorded as evidence).
+Zero new impostor grants over 2997 impostor comparisons. FairFace's
+2600 cap is divided by seven groups using integer quotas: 371 per
+group, hence 2597 measured pairs, not 2600. Skipped candidate pairs
+are replaced within each group until its measured quota is reached.
 
-Suspend/resume: the recheck lane runs as one process spanning the
-suspend and proves a resume by growth of the CLOCK_BOOTTIME-minus-
-MONOTONIC reading beyond production's 1ms read granularity. An earlier
-run of the pre-granularity lane reported a positive recheck, but its
-growth check accepted sub-granularity jitter, so that result is
-withdrawn as evidence. With the corrected gate the lane waited 1800
-seconds on the decision hardware without a suspend and claimed
-nothing, exactly as designed; the baseline digests (e36d2af9,
-ed919455, 1488b03d, identical across every process this campaign)
-stand ready for the attended real-suspend session, which remains the
-pending obligation. No suspend is ever triggered by the lane itself.
-The drift band (0.00019 to 0.00038) sits at the NPU
-certification's measured drift level on the same corpora class.
+| FairFace group | discovered images | measured pairs | skipped candidate pairs |
+|---|---|---|---|
+| Black | 1556 | 371 | 18 |
+| East Asian | 1550 | 371 | 12 |
+| Indian | 1516 | 371 | 18 |
+| Latino Hispanic | 1623 | 371 | 12 |
+| Middle Eastern | 1209 | 371 | 10 |
+| Southeast Asian | 1415 | 371 | 16 |
+| White | 2085 | 371 | 36 |
+
+Every group's receipt reported zero flips. The cache reported 61
+distinct images without a usable aligned face; skipped-pair counts
+are not distinct-image counts. The CPU cascade attempted 202 rescues,
+recovered 141 faces, and reported zero geometric mesh refusals and
+zero alignment refusals. No input or inference error was skipped.
+
+### Suspend and certification limits
+
+No actual attended suspend is qualified by this record. Earlier
+positive claims based on the production recheck trigger are withdrawn:
+that trigger intentionally permits extra rechecks after scheduling
+delays and is not proof of suspend. Production remains unchanged.
+The measurement lane instead requires a later lower bound of
+CLOCK_BOOTTIME-minus-MONOTONIC to exceed its baseline upper bound by
+more than 1 ms. Delayed clock reads cannot manufacture that proof;
+small suspends can remain inconclusive. A wait without proof does not
+exercise or qualify post-resume checks. The lane never suspends the host.
+The final combined run waited 10 seconds and explicitly reported
+inconclusive evidence with no post-resume checks exercised.
+
+IR recognition corpora, fusion/calibration/template-count decisions,
+repeatability, crash campaigns and actual suspend remain separate
+ADR-0022 section 7 obligations. `CERTIFIED` stays empty, production
+loading admission stays closed, and CPU authentication stays authoritative.

@@ -149,17 +149,22 @@ Embedding cosine floor 0.999996; zero new grants on presentation
 attacks; the nearest genuine CPU score sat 0.0001 from the threshold
 and did not flip.
 
-Recognition corpora (LFW grouped, 400 people; impostor pairs LFW
-cross-person and the FairFace impostor-only tree):
+Recognition corpora (the LFW corpus's own pairs.csv verification
+protocol, 400 genuine and 400 impostor pairs; the FairFace
+impostor-only tree, 2600 pairs):
 
 | Arm | n | max abs drift | flips |
 |---|---|---|---|
-| genuine LFW pairs (TTA) | 400 | 0.000303 | 0 |
-| impostor LFW pairs (TTA) | 399 | 0.000207 | 0 |
-| impostor FairFace pairs (TTA) | 2601 | 0.000354 | 0 |
+| genuine LFW pairs (TTA) | 400 | 0.000236 | 0 |
+| impostor LFW pairs (TTA) | 400 | 0.000229 | 0 |
+| impostor FairFace pairs (TTA) | 2600 | 0.000354 | 0 |
 
-Zero impostor flips, zero new grants over 3000 impostor pairs; 542
-corpus images had no detectable face and were skipped. The GPU output
+Zero impostor flips, zero new grants over 3000 impostor pairs; 271
+corpus images had no detectable face and were skipped (each image
+embeds once, however many pairs reference it). The recognizer file is
+pinned for the evidence: sha256
+a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60,
+equal to the repository models/SHA256SUMS pin. The GPU output
 is production-normalized in the lanes (the model's raw output is not
 the embedding; a first run's cosine floor of 10.8 exposed the missing
 normalization before any number was recorded as evidence).

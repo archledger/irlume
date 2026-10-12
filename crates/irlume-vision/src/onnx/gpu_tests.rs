@@ -1076,6 +1076,13 @@ mod gpu_groundwork_tests {
     /// production normalizes the session output.
     fn gpu_norm_infer(gpu: &mut Box<dyn crate::npu::Infer>, data: &[f32]) -> Vec<f32> {
         let mut raw = gpu.infer(data).expect("the GPU recognizer answers");
+        // A malformed output (wrong length) is not a drift measurement
+        // waiting to happen: every cosine and score assumes EMBED_DIM.
+        assert_eq!(
+            raw.len(),
+            crate::EMBED_DIM,
+            "the GPU output is not the recognizer's embedding"
+        );
         let norm: f32 = raw.iter().map(|value| value * value).sum::<f32>().sqrt();
         assert!(norm.is_finite() && norm > 0.0, "the GPU output has no norm");
         raw.iter_mut().for_each(|value| *value /= norm);

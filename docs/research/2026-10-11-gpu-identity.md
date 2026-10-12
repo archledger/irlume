@@ -171,12 +171,14 @@ normalization before any number was recorded as evidence).
 
 Suspend/resume: the recheck lane runs as one process spanning the
 suspend and proves a resume by growth of the CLOCK_BOOTTIME-minus-
-MONOTONIC reading. During the final run the laptop suspended on its
-own idle policy inside the wait window: the three reference inputs
-reproduced their digests exactly (e36d2af9, ed919455, 1488b03d, the
-same values across every process this campaign) and the mapped-library
-inventory still verified after the resume. No suspend was triggered by
-the lane itself; a deliberate attended suspend remains available to
-re-confirm, but the requirement's evidence now exists from a real
-suspend. The drift band (0.00019 to 0.00038) sits at the NPU
+MONOTONIC reading beyond production's 1ms read granularity. An earlier
+run of the pre-granularity lane reported a positive recheck, but its
+growth check accepted sub-granularity jitter, so that result is
+withdrawn as evidence. With the corrected gate the lane waited 1800
+seconds on the decision hardware without a suspend and claimed
+nothing, exactly as designed; the baseline digests (e36d2af9,
+ed919455, 1488b03d, identical across every process this campaign)
+stand ready for the attended real-suspend session, which remains the
+pending obligation. No suspend is ever triggered by the lane itself.
+The drift band (0.00019 to 0.00038) sits at the NPU
 certification's measured drift level on the same corpora class.

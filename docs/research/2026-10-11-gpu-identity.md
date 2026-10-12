@@ -260,7 +260,7 @@ zero alignment refusals. No input or inference error was skipped.
 
 ### Suspend and certification limits
 
-No actual attended suspend is qualified by this record. Earlier
+The `r6-20261012` run qualified no actual attended suspend. Earlier
 positive claims based on the production recheck trigger are withdrawn:
 that trigger intentionally permits extra rechecks after scheduling
 delays and is not proof of suspend. Production remains unchanged.
@@ -273,6 +273,136 @@ The final combined run waited 10 seconds and explicitly reported
 inconclusive evidence with no post-resume checks exercised.
 
 IR recognition corpora, fusion/calibration/template-count decisions,
-repeatability, crash campaigns and actual suspend remain separate
+repeatability and crash campaigns remain separate
 ADR-0022 section 7 obligations. `CERTIFIED` stays empty, production
 loading admission stays closed, and CPU authentication stays authoritative.
+
+## Qualification continuation, 2026-10-12
+
+These additional observations use the same test source, binary, model
+pins, Arc 140V stack and identity as `r6-20261012` above. They do not
+establish full certification or change production loading admission.
+
+### Attended system suspend
+
+Receipt `attended-suspend-20261012` selects only
+`onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_suspend_resume_recheck`,
+with a 1200-second wait, a 1500-second process cap, zero core limits
+and CPU affinity `0-3`. The operator manually suspends the machine
+after the baseline is ready, then wakes and unlocks it; the test does
+not initiate a power transition.
+
+The same process proves bounded clock growth and verifies all three
+fixed synthetic output fingerprints and the mapped-library inventory
+after resume. Result: 1 passed, 0 failed, 164.08 seconds. Its identity
+remains `f85917697c1fc39ddc9f0e15bb2ca9a84d66aaa69bdc7fef56ce41e52af272ed`,
+37 mapped libraries and the default native TFLite mesh. The kernel
+journal independently records `s2idle` entry at 19:51:28 UTC and resume
+and suspend exit at 19:52:13 UTC. This closes one actual system-suspend
+baseline, not the runtime-suspend or 1000-inference requirements.
+
+### Independent process observations
+
+Twenty fresh processes each pass the exact existing compile/parity/
+retirement test. All four fixed synthetic GPU output fingerprints and
+the CPU-reference fingerprint repeat across processes, with the same
+identity and configuration. Each process uses a fresh temporary
+application model-cache directory. Runtime cache bypass and cache-hit
+provenance were not queried, so these are repeatability observations,
+not the required 20 cache-bypassed cold compiles or 20 warm loads.
+
+### Observed rejection-budget gap
+
+The recorded genuine RGB arm above has one additional rejection among
+339 comparisons: `100 / 339 = 0.294985` percentage points. That exceeds
+ADR-0022 section 7's inclusive 0.2-point genuine rejection-increase
+budget for this measured arm. Pooling genuine IR or LFW comparisons
+into its denominator would conceal, not resolve, this gap.
+
+The earlier receipt does not record the baseline CPU/GPU rejection
+counts or CPU threshold-shift rates. Its first-reference-template,
+face-usable subset is not a production-shaped authentication or a
+population FRR estimate. Those missing counts, drift-shift rates, IR
+corpora and production fusion/calibration/template-count decisions
+remain qualification work. No certification table entry is justified.
+
+### Per-arm measurement-budget reports
+
+The test-only collectors now emit `MEASURED_BUDGET` for each recorded
+modality/population, each LFW population and each FairFace demographic
+group. Reports include CPU/GPU accept and reject counts, both verdict-
+flip directions and error-rate deltas as exact count fractions. Each
+arm's measured maximum absolute score drift also shifts its CPU threshold
+in both directions, with the resulting counts and budget outcomes.
+
+The genuine net rejection-increase limit is inclusive `1/500`; any new
+impostor or attack grant fails regardless of aggregate improvement.
+Threshold-shift movement is absolute: genuine error rates may move by
+at most `1/500`, negative error rates by at most 10% of their baseline
+or `1/100000` when zero. Integer comparisons decide those boundaries;
+rounded rates or displayed shifted thresholds never decide acceptance.
+Nonfinite inputs refuse the report; empty inputs are inconclusive.
+
+These are per-arm, fixed `score >= 0.55` budgets, not a global drift
+bound over all corpora or production-shaped authentication decisions.
+Reports explicitly mark `certification=NOT_EVALUATED`. A collector can
+complete successfully while reporting a measured-budget `FAIL`; its
+existing non-vacuity, mapped-inventory and zero-new-negative-grant
+assertions remain enforced. Neither a passing collector nor a passing
+partial budget supplies missing certification coverage. Comparisons
+remain in memory, and output is aggregate-only; anonymous differing-
+verdict margins are private in-memory audit metadata, not persisted
+frames, embeddings, scores or identifying paths.
+
+### Measured-budget receipt, 2026-10-12
+
+Receipt `budget-report-20261012` runs the two existing data collectors on
+source commit `ec62ed176e3b0418c44a41c421000bd70120e0b7`. GPU test-source
+SHA-256 is `dda91f20d5c917c2f506f1799dd69ab9a1bbc2836e0e7df638bde82d05a4a791`;
+the private helper is
+`04c0acd97fb9180dfff7eb28c985d19a387ece7893df5ccecc91e03d324910d5`.
+Binary SHA-256 is
+`cacd6ad509644d1c1758577b109ae9e9160958d28414c034cdbe66e81717b40f`.
+Both collectors pass their existing assertions, 2 passed and 0 failed
+in 1882.85 seconds, and report the same `f8591769...` identity, 37 mapped
+libraries, model pins and default native mesh as the earlier receipt.
+
+The 13 separate partial budget reports contain two failures. In the table,
+shift counts are changes in the population's CPU error count at its lower
+and upper thresholds, not GPU verdict flips. Error counts are rejections
+for genuine comparisons and recognizer accepts for negative comparisons.
+
+| Arm | n | CPU / GPU errors | GPU error delta | Lower / upper CPU shift delta | Partial budget |
+|---|---|---|---|---|---|
+| recorded genuine IR | 1474 | 482 / 482 | 0 | -5 / +2 | FAIL, lower shift |
+| recorded IR attacks | 138 | 0 / 0 | 0 | 0 / 0 | PASS |
+| recorded genuine RGB | 339 | 312 / 313 | +1 | 0 / +1 | FAIL, verdict and upper shift |
+| recorded RGB attacks | 209 | 13 / 13 | 0 | 0 / 0 | PASS |
+| genuine LFW | 400 | 108 / 108 | 0 | 0 / 0 | PASS |
+| impostor LFW | 400 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Black | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace East Asian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Indian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Latino Hispanic | 371 | 1 / 1 | 0 | 0 / 0 | PASS |
+| FairFace Middle Eastern | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Southeast Asian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace White | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+
+Recorded genuine IR has no actual verdict flip, but its lower threshold
+shift changes 5/1474 errors, `0.339213` percentage points. Section 7.5's
+absolute movement budget therefore fails even though that direction
+improves the measured rejection rate. The upper shift moves 2/1474,
+within budget. Recorded genuine RGB repeats its 1/339 additional
+rejection and upper-shift failure, `0.294985` points. Neither failure
+can be waived by pooling a passing arm or by the collectors' successful
+exits. There are no new recognizer grants on attacks or impostors;
+unchanged baseline recognizer accepts are not claims of full-system
+authentication grants, and PAD decisions are not measured here.
+
+These face-usable, pairwise subsets and first-reference recorded templates
+do not estimate deployed authentication FRR/FAR. Their explicit CPU/GPU
+baseline counts replace the earlier count gap, but do not fill the IR
+corpora, calibration, fusion, template-count or global-drift requirements.
+No certification or loading admission follows. On the same code, all 23
+isolated local gates pass, including 4758 guarded workspace tests and
+240 vision NPU-feature tests; synthetic reporting regressions total 18.

@@ -353,3 +353,56 @@ partial budget supplies missing certification coverage. Comparisons
 remain in memory, and output is aggregate-only; anonymous differing-
 verdict margins are private in-memory audit metadata, not persisted
 frames, embeddings, scores or identifying paths.
+
+### Measured-budget receipt, 2026-10-12
+
+Receipt `budget-report-20261012` runs the two existing data collectors on
+source commit `ec62ed176e3b0418c44a41c421000bd70120e0b7`. GPU test-source
+SHA-256 is `dda91f20d5c917c2f506f1799dd69ab9a1bbc2836e0e7df638bde82d05a4a791`;
+the private helper is
+`04c0acd97fb9180dfff7eb28c985d19a387ece7893df5ccecc91e03d324910d5`.
+Binary SHA-256 is
+`cacd6ad509644d1c1758577b109ae9e9160958d28414c034cdbe66e81717b40f`.
+Both collectors pass their existing assertions, 2 passed and 0 failed
+in 1882.85 seconds, and report the same `f8591769...` identity, 37 mapped
+libraries, model pins and default native mesh as the earlier receipt.
+
+The 13 separate partial budget reports contain two failures. In the table,
+shift counts are changes in the population's CPU error count at its lower
+and upper thresholds, not GPU verdict flips. Error counts are rejections
+for genuine comparisons and recognizer accepts for negative comparisons.
+
+| Arm | n | CPU / GPU errors | GPU error delta | Lower / upper CPU shift delta | Partial budget |
+|---|---|---|---|---|---|
+| recorded genuine IR | 1474 | 482 / 482 | 0 | -5 / +2 | FAIL, lower shift |
+| recorded IR attacks | 138 | 0 / 0 | 0 | 0 / 0 | PASS |
+| recorded genuine RGB | 339 | 312 / 313 | +1 | 0 / +1 | FAIL, verdict and upper shift |
+| recorded RGB attacks | 209 | 13 / 13 | 0 | 0 / 0 | PASS |
+| genuine LFW | 400 | 108 / 108 | 0 | 0 / 0 | PASS |
+| impostor LFW | 400 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Black | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace East Asian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Indian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Latino Hispanic | 371 | 1 / 1 | 0 | 0 / 0 | PASS |
+| FairFace Middle Eastern | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace Southeast Asian | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+| FairFace White | 371 | 0 / 0 | 0 | 0 / 0 | PASS |
+
+Recorded genuine IR has no actual verdict flip, but its lower threshold
+shift changes 5/1474 errors, `0.339213` percentage points. Section 7.5's
+absolute movement budget therefore fails even though that direction
+improves the measured rejection rate. The upper shift moves 2/1474,
+within budget. Recorded genuine RGB repeats its 1/339 additional
+rejection and upper-shift failure, `0.294985` points. Neither failure
+can be waived by pooling a passing arm or by the collectors' successful
+exits. There are no new recognizer grants on attacks or impostors;
+unchanged baseline recognizer accepts are not claims of full-system
+authentication grants, and PAD decisions are not measured here.
+
+These face-usable, pairwise subsets and first-reference recorded templates
+do not estimate deployed authentication FRR/FAR. Their explicit CPU/GPU
+baseline counts replace the earlier count gap, but do not fill the IR
+corpora, calibration, fusion, template-count or global-drift requirements.
+No certification or loading admission follows. On the same code, all 23
+isolated local gates pass, including 4758 guarded workspace tests and
+240 vision NPU-feature tests; synthetic reporting regressions total 18.

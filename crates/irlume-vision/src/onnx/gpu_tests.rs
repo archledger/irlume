@@ -946,6 +946,7 @@ mod gpu_groundwork_tests {
         for name in [
             "gpu_hw_identity_binds_plugin_render_node_and_libraries",
             "gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration",
+            "gpu_hw_model_cache_provenance_control",
             "gpu_hw_real_frames_track_cpu",
             "gpu_hw_recognition_corpora_drift",
             "gpu_hw_suspend_resume_recheck",
@@ -1156,6 +1157,160 @@ mod gpu_groundwork_tests {
         println!(
             "CPU reference digest {}",
             cpu.cpu_reference_digest().unwrap()
+        );
+    }
+
+    fn cache_control_request<'a>(
+        mode: &str,
+        directory: Option<&'a Path>,
+    ) -> Result<(gpu::CacheMode<'a>, gpu::CacheProvenance), String> {
+        match (mode, directory) {
+            ("bypass", None) => Ok((gpu::CacheMode::Disabled, gpu::CacheProvenance::Bypass)),
+            ("miss" | "hit", Some(path)) => {
+                let text = path.to_str().ok_or("the cache directory is not UTF-8")?;
+                if text.contains('\0') || !path.is_absolute() || !path.is_dir() {
+                    return Err("the control needs an existing absolute cache directory".into());
+                }
+                if mode == "miss" {
+                    let first = std::fs::read_dir(path)
+                        .map_err(|error| format!("cache directory: {error}"))?
+                        .next()
+                        .transpose()
+                        .map_err(|error| format!("cache entry: {error}"))?;
+                    if first.is_some() {
+                        return Err("the first-miss cache directory is not empty".into());
+                    }
+                }
+                let expected = if mode == "miss" {
+                    gpu::CacheProvenance::Miss
+                } else {
+                    gpu::CacheProvenance::Hit
+                };
+                Ok((gpu::CacheMode::Directory(path), expected))
+            }
+            _ => Err("use explicit bypass without a directory, or miss/hit with one".into()),
+        }
+    }
+
+    #[test]
+    fn gpu_cache_control_requires_explicit_mode_and_directory_intent() {
+        let owned = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            cache_control_request("bypass", None).unwrap(),
+            (gpu::CacheMode::Disabled, gpu::CacheProvenance::Bypass)
+        ));
+        for (mode, expected) in [
+            ("miss", gpu::CacheProvenance::Miss),
+            ("hit", gpu::CacheProvenance::Hit),
+        ] {
+            let (cache, provenance) = cache_control_request(mode, Some(owned.path())).unwrap();
+            assert!(matches!(cache, gpu::CacheMode::Directory(path) if path == owned.path()));
+            assert_eq!(provenance, expected);
+            assert!(cache_control_request(mode, None).is_err());
+        }
+        assert!(cache_control_request("bypass", Some(owned.path())).is_err());
+        for invalid in ["", "BYPASS", "Miss", " hit", "hit ", "warm", "miss hit"] {
+            assert!(cache_control_request(invalid, Some(owned.path())).is_err());
+        }
+    }
+
+    #[test]
+    fn gpu_cache_control_first_miss_requires_empty_directory_without_clearing_it() {
+        let owned = tempfile::tempdir().unwrap();
+        let file = owned.path().join("synthetic.cache");
+        std::fs::write(&file, b"synthetic cache control").unwrap();
+        assert!(cache_control_request("miss", Some(owned.path())).is_err());
+        // Existing files do not establish a hit; its runtime flag still must.
+        assert!(cache_control_request("hit", Some(owned.path())).is_ok());
+        assert_eq!(std::fs::read(file).unwrap(), b"synthetic cache control");
+    }
+
+    #[test]
+    fn gpu_cache_control_refuses_invalid_paths_before_opening_the_platform() {
+        use std::os::unix::ffi::OsStringExt;
+        let owned = tempfile::tempdir().unwrap();
+        let file = owned.path().join("not-directory");
+        std::fs::write(&file, b"synthetic").unwrap();
+        let non_utf8 = owned.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+        std::fs::create_dir(&non_utf8).unwrap();
+        for mode in ["miss", "hit"] {
+            for path in [
+                Path::new(""),
+                Path::new("relative"),
+                Path::new("/nul\0"),
+                file.as_path(),
+                owned.path().join("missing").as_path(),
+                non_utf8.as_path(),
+            ] {
+                assert!(cache_control_request(mode, Some(path)).is_err());
+            }
+        }
+    }
+
+    /// One explicit recognizer cache operation, after the separate platform
+    /// identity warm-up. Invoke in separate processes for miss, hit and bypass;
+    /// retain the caller-owned miss directory for the hit. No power transition.
+    #[test]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, recognizer weights and explicit cache-control settings"]
+    fn gpu_hw_model_cache_provenance_control() {
+        use super::super::npu_reference;
+        let mode = std::env::var("IRLUME_GPU_CACHE_CONTROL_MODE")
+            .expect("explicit IRLUME_GPU_CACHE_CONTROL_MODE=bypass, miss or hit");
+        let directory = std::env::var_os("IRLUME_GPU_CACHE_CONTROL_DIR").map(PathBuf::from);
+        let (cache, expected) = cache_control_request(&mode, directory.as_deref()).unwrap();
+        let bytes = recognizer_bytes();
+        let (mut cpu, _cascade) = hw_cpu_cascade();
+        let mut platform =
+            gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
+                .expect("the GPU platform opens for cache provenance");
+        report_hw_identity("cache control", platform.identity());
+        let (mut model, assignment, observation) = platform
+            .compile_with_cache_observation(cache, expected, &bytes)
+            .expect("strict recognizer cache provenance and configuration");
+        let raw = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        let mut first = Vec::new();
+        for k in 0..4 {
+            let chip = npu_reference::chip(k);
+            let reference = cpu.embed_preprocessed(&chip).unwrap();
+            let answer = model.infer(&chip).unwrap();
+            assert_eq!(answer.len(), crate::EMBED_DIM);
+            let repeat = model.infer(&chip).unwrap();
+            assert_eq!(raw(&answer), raw(&repeat), "cache-control input {k}");
+            let norm = answer.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!(norm.is_finite() && norm > 0.0);
+            let cosine: f32 = answer
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a * b / norm)
+                .sum();
+            assert!(cosine > 0.999, "cache-control input {k}: {cosine}");
+            println!(
+                "cache input {k}: digest {}",
+                irlume_common::sha256_hex(&raw(&answer))
+            );
+            first.push(answer);
+        }
+        assert_ne!(raw(&first[0]), raw(&first[1]));
+        for (k, earlier) in first.iter().enumerate() {
+            let revisit = model.infer(&npu_reference::chip(k)).unwrap();
+            assert_eq!(raw(earlier), raw(&revisit), "interleaved cache input {k}");
+        }
+        assert!(platform.still_loaded_as_hashed().is_ok());
+        println!(
+            "CPU reference digest {}",
+            cpu.cpu_reference_digest().unwrap()
+        );
+        assert!(platform.still_loaded_as_hashed().is_ok());
+        println!(
+            "CACHE_CONTROL expected={expected:?} loaded_from_cache={} core_cache_empty={} compiled_cache_empty={} cache_paths_match=true assignment={assignment:?} configuration_readbacks_matched=true recognizer_compiles=1 gpu_reference_inferences=12 counted_endurance_inferences=0 platform_identity_warmup=SEPARATE certification=NOT_EVALUATED",
+            if observation.loaded_from_cache { "YES" } else { "NO" },
+            observation.core_cache_dir.is_empty(),
+            observation.compiled_cache_dir.is_empty(),
         );
     }
 

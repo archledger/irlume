@@ -8,6 +8,9 @@
 //! settings: they resolve the validated provider, enumerate the GPU, bind
 //! it to its render node and compile under the fixed configuration.
 
+#[path = "gpu_evidence.rs"]
+mod gpu_evidence;
+
 mod gpu_groundwork_tests {
     use crate::gpu::Setting;
     use crate::npu::gpu::{self, Discovery, Firmware, Identity, RenderNode};

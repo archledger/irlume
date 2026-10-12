@@ -11,6 +11,9 @@
 #[path = "gpu_evidence.rs"]
 mod gpu_evidence;
 
+#[path = "gpu_reliability_counter_tests.rs"]
+mod gpu_reliability_counter_tests;
+
 mod gpu_groundwork_tests {
     use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;

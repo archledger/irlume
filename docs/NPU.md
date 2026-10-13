@@ -136,6 +136,63 @@ does not supply the retained-model endurance or suspend protocols.
 The historical campaign remains bound to its recorded source and binary
 in [the cache receipt](research/2026-10-12-gpu-cache-provenance.md).
 
+### Retained-process reliability control
+
+The separate ignored control
+`onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control`
+keeps one recognizer request and four immutable synthetic references through
+400 pre-event, 300 runtime-event and 300 system-event calls. The first calls
+after each event count; setup, platform warm-up and CPU canaries do not. Every
+counted result must reproduce all finite output bits. An error or failed
+CPU/inventory/device-binding boundary stops the run without replacement calls.
+
+From the same root/provider/model/CPU/TFLite environment used for the cache
+controls, set `IRLUME_GPU_RELIABILITY_REFERENCE` to a regular JSON file with
+exactly these five fields (maximum 8192 bytes):
+
+| Field | Required value |
+|---|---|
+| `identity` | Prior matching GPU identity digest, 64 lowercase hex characters |
+| `cpu_reference` | Prior matching CPU reference digest, 64 lowercase hex characters |
+| `gpu_bits` | Array of four prior raw GPU output digests for `chip(0..3)`, in order |
+| `runtime_wait_secs` | Integer 0 through 600 |
+| `system_wait_secs` | Integer 0 through 600 |
+
+Use digests from the same previously verified synthetic receipt; the control
+refuses a changed identity or baseline. It compiles with verified model-cache
+bypass, fixed batch1/LATENCY/f16 and explicit GPU.0 assignment. Do not derive a
+replacement reference from a failed run.
+
+Zero system wait supports unattended operational evidence only. A nonzero
+system wait additionally requires `IRLUME_GPU_RELIABILITY_ATTENDED=1`, set only
+after the operator is ready for this particular retained process. At the
+`RELIABILITY_READY` line after 700 counted calls, the operator initiates system
+suspend/resume. The control never invokes suspend or changes runtime-PM policy.
+
+```sh
+ulimit -c 0
+: "${IRLUME_GPU_RELIABILITY_REFERENCE:?set the prior-reference JSON path}"
+control=onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control
+cargo test -p irlume-vision --features npu --release --lib -- \
+  --ignored --exact "$control" --test-threads 1 --nocapture
+```
+
+The runtime witness reads the bound PCI device's power metadata and counters,
+requiring active/suspended/suspended/active endpoints and positive suspended
+growth, with conservative clock bounds excluding material system sleep across
+the whole leg and its first four post-wait calls. System evidence requires a
+fresh clock-offset increase strictly greater than 1 ms. Neither idle delay nor
+historical counter totals suffice. Missing events yield explicitly inconclusive
+coverage even if all 1000 operational calls succeed; unavailable observations
+can refuse the run without attributing a GPU failure.
+
+Archive actual phase counts, witnesses, identity, source and binary hashes.
+`RELIABILITY_COVERAGE_READY=true` is conditional evidence after owned resources
+are dropped, with `NORMAL_PROCESS_EXIT=PENDING`. Accept it only together with
+the exact process's normal exit and one passed selected test, no timeout/crash.
+Cargo exit zero alone is insufficient. This control supplies neither full
+certification nor production admission; CPU remains authoritative.
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then

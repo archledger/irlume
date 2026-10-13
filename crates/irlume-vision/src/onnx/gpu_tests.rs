@@ -26,6 +26,9 @@ mod gpu_reliability_protocol_tests;
 #[path = "gpu_reliability_reader_tests.rs"]
 mod gpu_reliability_reader_tests;
 
+#[path = "gpu_reliability_hardware_tests.rs"]
+mod gpu_reliability_hardware_tests;
+
 mod gpu_groundwork_tests {
     use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;
@@ -789,7 +792,7 @@ mod gpu_groundwork_tests {
 
     /// The shared hardware-lane setup: the validated provider selection and
     /// the real kernel sources.
-    fn hw_selection() -> crate::npu::RuntimeSelection {
+    pub(super) fn hw_selection() -> crate::npu::RuntimeSelection {
         crate::npu::RuntimeSelection::read(
             std::env::var_os("IRLUME_NPU_LIBRARY").as_deref(),
             crate::npu::LibrarySetting::Absent,
@@ -928,7 +931,7 @@ mod gpu_groundwork_tests {
 
     /// The recognizer's weights, from the test override, an installed
     /// tree or the fetched repository tree, in that order.
-    fn recognizer_bytes() -> Vec<u8> {
+    pub(super) fn recognizer_bytes() -> Vec<u8> {
         model_bytes("glintr100.onnx")
     }
 
@@ -941,13 +944,13 @@ mod gpu_groundwork_tests {
     /// Every hardware lane loads the same CPU models before GPU inventory
     /// capture, including the native TFLite library. Receipts still print
     /// their actual identity instead of assuming test order is harmless.
-    fn hw_cpu_cascade() -> (crate::Embedder, DetectionCascade) {
+    pub(super) fn hw_cpu_cascade() -> (crate::Embedder, DetectionCascade) {
         let cpu = cpu_reference();
         let cascade = DetectionCascade::load();
         (cpu, cascade)
     }
 
-    fn report_hw_identity(lane: &str, identity: &Identity) {
+    pub(super) fn report_hw_identity(lane: &str, identity: &Identity) {
         assert_eq!(identity.configuration, gpu::COMPILE_CONFIGURATION);
         println!(
             "{lane} identity digest {} (configuration {}), {} mapped libraries; CPU mesh {EVIDENCE_MESH_MODEL}",
@@ -958,19 +961,29 @@ mod gpu_groundwork_tests {
     #[test]
     fn gpu_evidence_hardware_lanes_share_pre_inventory_setup() {
         let source = include_str!("gpu_tests.rs");
-        for name in [
+        for (source, name) in [
             "gpu_hw_identity_binds_plugin_render_node_and_libraries",
             "gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration",
             "gpu_cache_hw_model_cache_provenance_control",
             "gpu_hw_real_frames_track_cpu",
             "gpu_hw_recognition_corpora_drift",
             "gpu_hw_suspend_resume_recheck",
-        ] {
+        ]
+        .into_iter()
+        .map(|name| (source, name))
+        .chain([(
+            include_str!("gpu_reliability_hardware_tests.rs"),
+            "gpu_retained_hw_reliability_control",
+        )]) {
             let body = source
                 .split(&format!("fn {name}()"))
                 .nth(1)
                 .unwrap()
-                .split("\n    }")
+                .split(if name == "gpu_retained_hw_reliability_control" {
+                    "\n}"
+                } else {
+                    "\n    }"
+                })
                 .next()
                 .unwrap();
             let setup = body.find("hw_cpu_cascade()").expect(name);
@@ -1425,7 +1438,7 @@ mod gpu_groundwork_tests {
     /// behind it, every model pin-checked at load.
     const EVIDENCE_MESH_MODEL: &str = "face_landmarks_detector.tflite";
 
-    struct DetectionCascade {
+    pub(super) struct DetectionCascade {
         detector: crate::Detector,
         blaze: crate::BlazeRescue,
         mesh: crate::FaceMesh,

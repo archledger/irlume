@@ -169,6 +169,21 @@ impl Reader {
     }
 
     /// # Errors
+    /// Refuses missing, malformed or changed device/driver/boot bindings. This
+    /// boundary check does not require runtime-PM counters to be available.
+    pub(super) fn verify_binding(&self) -> Result<(), String> {
+        for _ in 0..2 {
+            if binding(&self.device_link, &self.boot_file, &mut |p| {
+                std::fs::read_to_string(p)
+            })? != self.binding
+            {
+                return Err("device binding changed at boundary".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// # Errors
     /// Refuses unreadable/malformed counters, binding changes or reversed time.
     /// Mixed or transitional status/control remains visible to the pure witness.
     pub(super) fn sample(&self) -> Result<Observation, String> {
@@ -320,6 +335,18 @@ mod tests {
         std::fs::remove_file(fixture.device.join("driver")).unwrap();
         symlink(replacement, fixture.device.join("driver")).unwrap();
         assert!(Reader::new(&fixture.drm, &fixture.boot, &fixture.node).is_err());
+    }
+
+    #[test]
+    fn boundary_binding_check_does_not_need_counters_but_rejects_rebinding() {
+        for field in 0..5 {
+            let fixture = Fixture::new();
+            let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+            std::fs::remove_file(fixture.device.join("power/runtime_active_time")).unwrap();
+            assert!(reader.verify_binding().is_ok());
+            change_binding(&fixture, field);
+            assert!(reader.verify_binding().is_err());
+        }
     }
 
     #[test]

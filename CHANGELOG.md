@@ -258,6 +258,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume camera census` no longer calls a camera an administrator
+  deauthorized (`authorized` 0) a kernel or firmware problem: the row names
+  the deauthorized interfaces, or the device when it was deauthorized whole
+  (it was missing from the census before), and how to re-enable them. A
+  device that also has an authorized interface with no driver keeps the
+  fault warning for it (#1063).
+
 - NPU startup reads the opt-in and provider from one settings snapshot, so
   an atomic settings replacement cannot combine decisions from different
   versions. Non-NPU builds release verified recognizer bytes before auxiliary

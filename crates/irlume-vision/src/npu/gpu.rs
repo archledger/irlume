@@ -1046,6 +1046,124 @@ const INFERENCE_PRECISION: &str = "f16";
 #[cfg(test)]
 const PERFORMANCE_HINT: &str = "LATENCY";
 
+/// Private evidence-harness proposal, not an upstream API or placement setting.
+#[cfg(test)]
+pub(crate) enum CacheMode<'a> {
+    Disabled,
+    /// Caller-owned existing directory, retained for the whole compile.
+    Directory(&'a Path),
+}
+
+/// The automatic OpenVINO model-cache outcome a strict compile must observe.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheProvenance {
+    Bypass,
+    Miss,
+    Hit,
+}
+
+/// Recognizer readbacks only; no claim about driver caches or global coldness.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CacheObservation {
+    pub core_cache_dir: String,
+    pub compiled_cache_dir: String,
+    pub loaded_from_cache: bool,
+}
+
+#[cfg(test)]
+type CacheCompileResult = (Box<dyn super::Infer>, String, Option<CacheObservation>);
+
+#[cfg(test)]
+fn cache_path(mode: CacheMode<'_>, expected: CacheProvenance) -> Result<&Path, String> {
+    match (mode, expected) {
+        (CacheMode::Disabled, CacheProvenance::Bypass) => Ok(Path::new("")),
+        (CacheMode::Directory(path), CacheProvenance::Miss | CacheProvenance::Hit) => {
+            let text = path
+                .to_str()
+                .ok_or_else(|| "the cache path is not UTF-8".to_owned())?;
+            if text.contains('\0') || !path.is_absolute() || !path.is_dir() {
+                return Err(
+                    "the cache path must be an existing absolute directory without NUL".into(),
+                );
+            }
+            Ok(path)
+        }
+        _ => Err("the cache mode does not match the expected provenance".into()),
+    }
+}
+
+// Both compile entries use this gate. None never runs an observer, so legacy
+// compilation acquires no provenance getters or their refusal paths.
+#[cfg(test)]
+fn cache_observation_gate<T>(
+    expected: Option<CacheProvenance>,
+    observe: impl FnOnce(CacheProvenance) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    expected.map(observe).transpose()
+}
+
+#[cfg(test)]
+fn require_cache_property(key: &str, read: &str, expected: &str) -> Result<(), String> {
+    if read != expected {
+        return Err(format!("{key} reads {read:?}, not {expected:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn parse_loaded_from_cache(read: &str) -> Result<bool, String> {
+    match read {
+        "YES" => Ok(true),
+        "NO" => Ok(false),
+        _ => Err(format!(
+            "LOADED_FROM_CACHE is not exactly YES or NO: {read:?}"
+        )),
+    }
+}
+
+#[cfg(test)]
+fn read_cache_observation(
+    requested: &str,
+    expected: CacheProvenance,
+    core_cache_dir: String,
+    mut get: impl FnMut(&'static str) -> Result<String, String>,
+) -> Result<CacheObservation, String> {
+    if requested.is_empty() != (expected == CacheProvenance::Bypass) {
+        return Err("the cache directory does not match the expected provenance".into());
+    }
+    require_cache_property("Core CACHE_DIR", &core_cache_dir, requested)?;
+    let mut read = |key| get(key).map_err(|error| format!("{key} readback: {error}"));
+    let compiled_cache_dir = read("CACHE_DIR")?;
+    require_cache_property("compiled CACHE_DIR", &compiled_cache_dir, requested)?;
+    // GPU 2026.2.1 implements this getter but omits it from SUPPORTED_PROPERTIES.
+    let loaded_from_cache = parse_loaded_from_cache(&read("LOADED_FROM_CACHE")?)?;
+    if loaded_from_cache != (expected == CacheProvenance::Hit) {
+        return Err(format!("LOADED_FROM_CACHE does not establish {expected:?}"));
+    }
+    for (key, value) in [
+        ("PERFORMANCE_HINT", PERFORMANCE_HINT),
+        ("INFERENCE_PRECISION_HINT", INFERENCE_PRECISION),
+    ] {
+        require_cache_property(key, &read(key)?, value)?;
+    }
+    Ok(CacheObservation {
+        core_cache_dir,
+        compiled_cache_dir,
+        loaded_from_cache,
+    })
+}
+
+#[cfg(test)]
+fn validate_gpu_assignment(device: &str, assignment: &str) -> Result<String, String> {
+    let assigned = assignment.trim();
+    if assigned != device && assigned != "GPU" {
+        return Err(format!("OpenVINO assigned {assigned:?}, not {device}"));
+    }
+    Ok(assigned.to_owned())
+}
+
 /// Why opening the GPU platform refused: typed so discovery reports the
 /// enumeration answers instead of parsing error prose.
 #[cfg(test)]
@@ -1216,6 +1334,34 @@ impl GpuPlatform {
         cache_dir: &Path,
         model: &[u8],
     ) -> Result<(Box<dyn super::Infer>, String), String> {
+        self.compile_inner(cache_dir, model, None)
+            .map(|(model, assignment, _)| (model, assignment))
+    }
+
+    /// Strict recognizer model-cache evidence after the separate identity
+    /// warm-up. Disabled resets CACHE_DIR to empty; it does not flush drivers.
+    ///
+    /// # Errors
+    /// Refuses invalid mode/path, any compile/identity error, failed readback,
+    /// or cache/configuration readbacks that do not establish `expected`.
+    pub(crate) fn compile_with_cache_observation(
+        &mut self,
+        cache: CacheMode<'_>,
+        expected: CacheProvenance,
+        model: &[u8],
+    ) -> Result<(Box<dyn super::Infer>, String, CacheObservation), String> {
+        let path = cache_path(cache, expected)?;
+        let (model, assignment, observation) = self.compile_inner(path, model, Some(expected))?;
+        let observation = observation.ok_or_else(|| "cache observation missing".to_owned())?;
+        Ok((model, assignment, observation))
+    }
+
+    fn compile_inner(
+        &mut self,
+        cache_dir: &Path,
+        model: &[u8],
+        expected: Option<CacheProvenance>,
+    ) -> Result<CacheCompileResult, String> {
         use openvino::{DeviceType, PartialShape, PropertyKey, RwPropertyKey};
         let failed = |what: &str, error: &dyn std::fmt::Display| format!("{what}: {error}");
         let mut read = self
@@ -1255,22 +1401,34 @@ impl GpuPlatform {
         self.core
             .set_property(&device, &RwPropertyKey::CacheDir, blobs)
             .map_err(|error| failed("CACHE_DIR", &error))?;
+        let core_cache_dir = cache_observation_gate(expected, |_| {
+            let read = self
+                .core
+                .get_property(&device, &PropertyKey::from(RwPropertyKey::CacheDir))
+                .map_err(|error| failed("Core CACHE_DIR", &error))?;
+            require_cache_property("Core CACHE_DIR", &read, blobs)?;
+            Ok(read)
+        })?;
         let mut compiled = self
             .core
             .compile_model(&read, device)
             .map_err(|error| failed("compile", &error))?;
-        let assignment = compiled
-            .get_property(&PropertyKey::Other("EXECUTION_DEVICES".into()))
-            .map_err(|error| failed("EXECUTION_DEVICES", &error))?
-            .trim()
-            .to_owned();
-        let assigned = assignment.as_str();
-        if assigned != self.device && assigned != "GPU" {
-            return Err(format!(
-                "OpenVINO assigned {assigned:?}, not {}",
-                self.device
-            ));
-        }
+        let assignment = validate_gpu_assignment(
+            &self.device,
+            &compiled
+                .get_property(&PropertyKey::Other("EXECUTION_DEVICES".into()))
+                .map_err(|error| failed("EXECUTION_DEVICES", &error))?,
+        )?;
+        let observation = cache_observation_gate(expected, |expected| {
+            let core_dir =
+                core_cache_dir.ok_or_else(|| "Core cache observation missing".to_owned())?;
+            read_cache_observation(blobs, expected, core_dir, |key| {
+                compiled
+                    .get_property(&PropertyKey::Other(key.into()))
+                    .map(|value| value.into_owned())
+                    .map_err(|error| error.to_string())
+            })
+        })?;
         let request = compiled
             .create_infer_request()
             .map_err(|error| failed("infer request", &error))?;
@@ -1280,7 +1438,7 @@ impl GpuPlatform {
             request,
             input_shape,
         };
-        Ok((Box::new(model), assignment))
+        Ok((Box::new(model), assignment, observation))
     }
 }
 
@@ -1339,3 +1497,7 @@ impl super::Infer for GpuModel {
             .to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_cache_tests.rs"]
+mod gpu_cache_tests;

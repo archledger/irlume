@@ -152,6 +152,21 @@ logged. It weakens nothing in production: the daemon's environment comes from
 its root-owned systemd unit, so setting it requires the same root the pin does
 not defend against, and a unit test pins the escape to exact-path matches.
 
+**Split camera pairs (ADR-0032).** A split pair takes RGB and IR from two
+USB devices that an administrator authorized together; it stays disabled
+unless the machine owner opts in (`split_camera_pairs=experimental`, read at
+daemon start). Its pin records each side's identity and exact USB location,
+and both sides are revalidated before every capture, but replacement hardware
+that presents every recorded fact on the same port cannot be told apart
+(ADR-0032 section 2). Split evidence comes from two captures taken one after
+the other, so a split grant needs an IR identity match and never rests on the
+RGB match. Following the Windows Hello sensor-group rule (an RGB-only and an
+IR-only camera combine only inside one chassis), both sides must also report
+`removable: fixed` unless the owner sets `allow_external_split_cameras=1`;
+replacing a built-in side means opening the machine, while an external side
+can be swapped in seconds. Because `removable` is sometimes `unknown` for
+built-in cameras, such a machine refuses split pairs until its owner decides.
+
 ## The Windows camera contract (#169)
 
 These Hello modules are designed and certified against Windows, so the Windows

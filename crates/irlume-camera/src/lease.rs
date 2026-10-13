@@ -275,13 +275,37 @@ pub struct SplitLeaseRequest {
     pub ir: crate::SplitSideExpectation,
 }
 
+/// The machine owner's experimental split opt-in for this process, set at
+/// most once (ADR-0032, amendment 2026-10-13).
+static EXPERIMENTAL_SPLIT_TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Latch `irlumed`'s startup reading of `split_camera_pairs=experimental`.
+///
+/// The first call decides for the life of the process and later calls change
+/// nothing; the return value is the latched answer. Only the daemon's startup
+/// calls this, before it serves a request, so every predicate read within one
+/// request sees the same answer. Clients never call it and stay closed.
+pub fn latch_experimental_split_trust(enabled: bool) -> bool {
+    *EXPERIMENTAL_SPLIT_TRUST.get_or_init(|| enabled)
+}
+
+/// Whether this process latched the experimental split opt-in. False until
+/// [`latch_experimental_split_trust`] ran with `true`.
+#[must_use]
+pub fn experimental_split_trust() -> bool {
+    EXPERIMENTAL_SPLIT_TRUST.get().copied().unwrap_or(false)
+}
+
 /// Whether the split acquisition and capture gates admit one trust kind.
 ///
 /// Production: false for Authentication, Enrollment and Capture, so both
-/// gates keep refusing every split trust operation. Diagnostics, Setup and
-/// Preview are not trust kinds; the gates admit them on their own and this
-/// returns false for them too. The reviewed activation change edits only
-/// this body. No environment or configuration input is read.
+/// gates keep refusing every split trust operation, unless the daemon latched
+/// the machine owner's experimental opt-in at startup
+/// ([`latch_experimental_split_trust`]); the latch admits Enrollment and
+/// Authentication only, never Capture. Diagnostics, Setup and Preview are not
+/// trust kinds; the gates admit them on their own and this returns false for
+/// them too. The supported activation change edits only this body. Nothing
+/// is read here: the latch is the daemon's one startup reading.
 ///
 /// A `test-support` build also asks the non-granting fixture installed on
 /// the calling thread, whose admission can name only Enrollment or
@@ -290,7 +314,7 @@ pub struct SplitLeaseRequest {
 pub fn split_trust_admitted(kind: CameraOperationKind) -> bool {
     match kind {
         CameraOperationKind::Enrollment | CameraOperationKind::Authentication => {
-            fixture_admits_split_trust(kind)
+            experimental_split_trust() || fixture_admits_split_trust(kind)
         }
         CameraOperationKind::Capture
         | CameraOperationKind::Preview

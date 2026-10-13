@@ -26,69 +26,69 @@ fn split_trust_is_closed_for_every_kind_without_test_support() {
     }
 }
 
+use std::path::{Path, PathBuf};
+
+fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.expect("readable source entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if path.is_dir() {
+            if name != "target" && !name.starts_with('.') {
+                collect(&path, files);
+            }
+        } else if name.ends_with(".rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn test_file(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.ends_with("_tests.rs") || name == "tests.rs" || relative.contains("/tests/")
+}
+
+/// Lines outside top-level `#[cfg(test)]` or `#[cfg(all(test, ...))]`
+/// module blocks; rustfmt closes such a module with a lone `}`.
+fn production_lines(text: &str) -> Vec<(usize, &str)> {
+    let mut lines = Vec::new();
+    let mut gated = false;
+    let mut in_test_module = false;
+    for (index, line) in text.lines().enumerate() {
+        let code = line.trim_end();
+        if in_test_module {
+            in_test_module = code != "}";
+            continue;
+        }
+        let opens_module = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+            .iter()
+            .any(|prefix| code.starts_with(prefix))
+            && code.ends_with('{');
+        if gated && opens_module {
+            gated = false;
+            in_test_module = true;
+            continue;
+        }
+        if code == "#[cfg(test)]" || code.starts_with("#[cfg(all(test,") {
+            gated = true;
+        } else if !code.starts_with("#[") {
+            gated = false;
+        }
+        lines.push((index + 1, line));
+    }
+    lines
+}
+
 /// Production code never names the fixture override: only test files, inline
 /// top-level `#[cfg(test)]` modules and the defining fixture module may.
 #[test]
 fn admit_split_trust_is_named_only_by_test_code() {
-    use std::path::{Path, PathBuf};
-
-    fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries {
-            let path = entry.expect("readable source entry").path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_owned();
-            if path.is_dir() {
-                if name != "target" && !name.starts_with('.') {
-                    collect(&path, files);
-                }
-            } else if name.ends_with(".rs") {
-                files.push(path);
-            }
-        }
-    }
-
-    fn test_file(relative: &str) -> bool {
-        let name = relative.rsplit('/').next().unwrap_or(relative);
-        name.ends_with("_tests.rs") || name == "tests.rs" || relative.contains("/tests/")
-    }
-
-    /// Lines outside top-level `#[cfg(test)]` or `#[cfg(all(test, ...))]`
-    /// module blocks; rustfmt closes such a module with a lone `}`.
-    fn production_lines(text: &str) -> Vec<(usize, &str)> {
-        let mut lines = Vec::new();
-        let mut gated = false;
-        let mut in_test_module = false;
-        for (index, line) in text.lines().enumerate() {
-            let code = line.trim_end();
-            if in_test_module {
-                in_test_module = code != "}";
-                continue;
-            }
-            let opens_module = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
-                .iter()
-                .any(|prefix| code.starts_with(prefix))
-                && code.ends_with('{');
-            if gated && opens_module {
-                gated = false;
-                in_test_module = true;
-                continue;
-            }
-            if code == "#[cfg(test)]" || code.starts_with("#[cfg(all(test,") {
-                gated = true;
-            } else if !code.starts_with("#[") {
-                gated = false;
-            }
-            lines.push((index + 1, line));
-        }
-        lines
-    }
-
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     assert!(
         root.join("Cargo.toml").is_file() && root.join("crates").is_dir(),
@@ -138,6 +138,129 @@ fn admit_split_trust_is_named_only_by_test_code() {
         violations.is_empty(),
         "production code names the split trust fixture override: {violations:?}"
     );
+}
+
+/// Only the daemon's startup latches the experimental opt-in: every other
+/// production file, the CLI, TUI and PAM module included, never names it.
+#[test]
+fn the_experimental_latch_is_called_only_by_the_daemon() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    collect(&root.join("crates"), &mut files);
+    collect(&root.join("fuzz"), &mut files);
+    let needle = "latch_experimental_split_trust";
+    let mut defined = false;
+    let mut daemon_calls = 0;
+    let mut violations = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        if !text.contains(needle) {
+            continue;
+        }
+        let relative = path.strip_prefix(&root).map_or_else(
+            |_| path.display().to_string(),
+            |relative| relative.display().to_string(),
+        );
+        let lines: Vec<_> = production_lines(&text)
+            .into_iter()
+            .filter(|(_, line)| line.contains(needle) && !line.trim_start().starts_with("//"))
+            .collect();
+        match relative.as_str() {
+            "crates/irlume-camera/src/lease.rs" => {
+                defined = text.contains("pub fn latch_experimental_split_trust(enabled: bool)");
+            }
+            "crates/irlume-daemon/src/main.rs" => daemon_calls += lines.len(),
+            // The daemon reaches camera items through irlume-auth re-exports.
+            "crates/irlume-auth/src/lib.rs" => violations.extend(
+                lines
+                    .into_iter()
+                    .filter(|(_, line)| !line.starts_with("pub use irlume_camera::lease::{"))
+                    .map(|(number, _)| format!("{relative}:{number}")),
+            ),
+            _ if test_file(&relative) => {}
+            _ => violations.extend(
+                lines
+                    .into_iter()
+                    .map(|(number, _)| format!("{relative}:{number}")),
+            ),
+        }
+    }
+    assert!(defined, "the latch moved out of lease.rs; update this scan");
+    assert_eq!(
+        daemon_calls, 1,
+        "irlumed latches the opt-in exactly once, at startup"
+    );
+    assert!(
+        violations.is_empty(),
+        "only the daemon may latch the experimental split opt-in: {violations:?}"
+    );
+}
+
+/// Runs one ignored child test in a fresh test process, where nothing has
+/// latched yet, and requires that exactly that test ran and passed.
+fn run_latch_child(name: &str) {
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--ignored", "--exact", name, "--test-threads=1"])
+        .output()
+        .expect("spawn the latch child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "latch child {name} failed or did not run: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn the_experimental_latch_admits_enrollment_and_authentication_only() {
+    run_latch_child("lease::split_trust_tests::latch_child_opened");
+}
+
+#[test]
+fn a_closed_latch_cannot_be_reopened() {
+    run_latch_child("lease::split_trust_tests::latch_child_closed");
+}
+
+#[test]
+#[ignore = "fresh-process child of the_experimental_latch_admits_enrollment_and_authentication_only"]
+fn latch_child_opened() {
+    use super::CameraOperationKind::{
+        Authentication, Capture, Diagnostics, Enrollment, Preview, Setup,
+    };
+    use super::{experimental_split_trust, latch_experimental_split_trust, split_trust_admitted};
+    assert!(!experimental_split_trust(), "a fresh process starts closed");
+    assert!(!split_trust_admitted(Enrollment));
+    assert!(latch_experimental_split_trust(true));
+    assert!(experimental_split_trust());
+    assert!(split_trust_admitted(Enrollment));
+    assert!(split_trust_admitted(Authentication));
+    for kind in [Capture, Preview, Diagnostics, Setup] {
+        assert!(
+            !split_trust_admitted(kind),
+            "{kind:?} is never latched open"
+        );
+    }
+    assert!(
+        latch_experimental_split_trust(false),
+        "a second call changes nothing"
+    );
+    assert!(split_trust_admitted(Authentication));
+}
+
+#[test]
+#[ignore = "fresh-process child of a_closed_latch_cannot_be_reopened"]
+fn latch_child_closed() {
+    use super::CameraOperationKind::{Authentication, Enrollment};
+    use super::{experimental_split_trust, latch_experimental_split_trust, split_trust_admitted};
+    assert!(!latch_experimental_split_trust(false));
+    assert!(
+        !latch_experimental_split_trust(true),
+        "a later call cannot open a closed latch"
+    );
+    assert!(!experimental_split_trust());
+    assert!(!split_trust_admitted(Enrollment));
+    assert!(!split_trust_admitted(Authentication));
 }
 
 #[cfg(feature = "test-support")]

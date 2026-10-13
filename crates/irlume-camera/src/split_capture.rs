@@ -169,6 +169,197 @@ fn capture_split_pair_observed_with(
         .map_err(|error| Error::Hardware(error.to_string()))?
 }
 
+/// Bounds for one all-or-nothing split batch (ADR-0032, amendment
+/// 2026-10-13, section 8).
+#[derive(Clone, Copy, Debug)]
+pub struct SplitBatchRequest {
+    /// Number of fresh pairs, from one through five.
+    pub pairs: usize,
+    /// Original operation deadline; capture never extends it.
+    pub deadline: Instant,
+}
+
+/// A group of complete split pairs captured under one original split
+/// operation: one RGB session, released before one IR session starts.
+///
+/// Privately constructed like [`SplitPairCapture`]; it yields its pairs only
+/// as receipts revalidated against the same operation.
+pub struct SplitBatchCapture {
+    pairs: Vec<SplitPairCapture>,
+}
+
+impl SplitBatchCapture {
+    /// How many pairs the batch holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    /// Whether the batch holds no pair; a returned batch never does.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Consume the batch into its per-pair receipts, each revalidated against
+    /// the original operation.
+    ///
+    /// # Errors
+    /// Returns the errors of [`SplitPairCapture::revalidate`] for any pair.
+    pub fn into_pair_captures(
+        self,
+        operation: &CameraOperationSession,
+    ) -> Result<Vec<SplitPairCapture>> {
+        for pair in &self.pairs {
+            pair.revalidate(operation)?;
+        }
+        Ok(self.pairs)
+    }
+}
+
+/// Capture `request.pairs` complete split pairs under one original split
+/// operation: one RGB session yields that many denoised samples and is
+/// released, then one IR session yields that many bursts with statistics.
+///
+/// Stream setup is paid once per role instead of once per pair, so a group
+/// fits the windows a one-shot attempt per PAD vote cannot (ADR-0032,
+/// amendment 2026-10-13, section 8). Every pair passes the split frame
+/// contract. Failure returns no partial batch and never retries either side.
+///
+/// # Errors
+/// Refuses an invalid count, ordinary or unsupported operations, stale or
+/// wrong-role endpoints, cancellation or deadline, capture failure, unordered
+/// samples or invalid complete-pair provenance.
+pub fn capture_split_batch_observed(
+    rgb_dev: &str,
+    ir_dev: &str,
+    operation: &CameraOperationSession,
+    control: &CaptureControl,
+    request: SplitBatchRequest,
+    observe: &dyn Fn(crate::SequentialBatchPhase, Duration),
+) -> Result<SplitBatchCapture> {
+    use crate::sequential_batch::{collect_phase, IR_PHASES, RGB_PHASES};
+    capture_split_batch_with(
+        rgb_dev,
+        ir_dev,
+        operation,
+        control,
+        request,
+        |checkpoint| {
+            let checkpoint = || checkpoint();
+            let camera = crate::RgbCamera::open(rgb_dev)?;
+            collect_phase(
+                request.pairs,
+                (
+                    || camera.session_with_control(control),
+                    |session| session.denoised(),
+                ),
+                &checkpoint,
+                RGB_PHASES,
+                observe,
+            )
+        },
+        |checkpoint| {
+            let checkpoint = || checkpoint();
+            let camera = crate::IrCamera::open(ir_dev)?;
+            collect_phase(
+                request.pairs,
+                (
+                    || {
+                        camera.session_with_control_and_startup(
+                            control,
+                            crate::IrSessionStartup::Adaptive,
+                        )
+                    },
+                    |session| session.capture_with_stats(),
+                ),
+                &checkpoint,
+                IR_PHASES,
+                observe,
+            )
+        },
+    )
+}
+
+/// [`capture_split_batch_observed`] with the two role captures injected; each
+/// receives the batch checkpoint (cancellation and deadline).
+pub(crate) fn capture_split_batch_with(
+    rgb_dev: &str,
+    ir_dev: &str,
+    operation: &CameraOperationSession,
+    control: &CaptureControl,
+    request: SplitBatchRequest,
+    capture_rgb: impl FnOnce(&dyn Fn() -> Result<()>) -> Result<Vec<Frame>>,
+    capture_ir: impl FnOnce(&dyn Fn() -> Result<()>) -> Result<Vec<(Frame, IrCaptureStats)>>,
+) -> Result<SplitBatchCapture> {
+    if !(1..=5).contains(&request.pairs) {
+        return Err(Error::Hardware(
+            "split batch requires one through five pairs".into(),
+        ));
+    }
+    control.check()?;
+    let (rgb_binding, _) = split_bindings(rgb_dev, ir_dev, operation)?;
+    let checkpoint = || -> Result<()> {
+        control.check()?;
+        if Instant::now() >= request.deadline {
+            Err(Error::Hardware("split batch deadline expired".into()))
+        } else {
+            Ok(())
+        }
+    };
+    operation
+        .run(|| {
+            checkpoint()?;
+            let rgb = capture_rgb(&checkpoint)?;
+            checkpoint()?;
+            // The RGB owner has released its stream and device. Check BOTH
+            // sides before opening IR; a departure never becomes a new lookup.
+            split_bindings(rgb_dev, ir_dev, operation)?;
+            for frame in &rgb {
+                validate_frame(frame, &rgb_binding, Spectrum::Rgb)?;
+            }
+            let ir = capture_ir(&checkpoint)?;
+            checkpoint()?;
+            if rgb.len() != request.pairs || ir.len() != request.pairs {
+                return Err(Error::Hardware("split batch is incomplete".into()));
+            }
+            if rgb
+                .last()
+                .zip(ir.first())
+                .is_some_and(|(r, (i, _))| r.captured.end > i.captured.start)
+            {
+                return Err(Error::Hardware(
+                    "split batch phases are not RGB then IR".into(),
+                ));
+            }
+            let mut pairs = Vec::with_capacity(request.pairs);
+            let mut previous: Option<(crate::CaptureWindow, crate::CaptureWindow)> = None;
+            for (rgb, (ir, stats)) in rgb.into_iter().zip(ir) {
+                checkpoint()?;
+                if previous
+                    .is_some_and(|(r, i)| r.end >= rgb.captured.start || i.end >= ir.captured.start)
+                {
+                    return Err(Error::Hardware(
+                        "split batch samples are not ordered and disjoint".into(),
+                    ));
+                }
+                validate_split_pair_in_operation(rgb_dev, ir_dev, operation, &rgb, &ir)?;
+                previous = Some((rgb.captured, ir.captured));
+                pairs.push(SplitPairCapture {
+                    operation: operation.lease().clone(),
+                    rgb_dev: rgb_dev.into(),
+                    ir_dev: ir_dev.into(),
+                    rgb,
+                    ir,
+                    stats,
+                });
+            }
+            checkpoint()?;
+            Ok(SplitBatchCapture { pairs })
+        })
+        .map_err(|error| Error::Hardware(error.to_string()))?
+}
+
 /// Validate both frames against the same retained split capability.
 ///
 /// This checks runtime bindings, geometry, spectrum, immutable capture windows,

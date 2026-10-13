@@ -1119,6 +1119,7 @@ fn main() {
         return;
     }
     users::initialize();
+    latch_split_camera_pairs();
     // Next, before models load. The watchdog deadline starts ticking the moment
     // systemd execs us, and loading the ONNX sessions takes tens of seconds on a
     // cold cache; starting the pings after that made the daemon miss its own
@@ -2124,6 +2125,47 @@ fn forbid_external_cameras() -> bool {
     };
     irlume_auth::set_forbid_external_cameras(on);
     on
+}
+
+/// The journal line for the startup reading of `split_camera_pairs`, with
+/// `true` for a warning. `None` for a closed default or an explicit `off`.
+fn split_camera_pairs_notice(
+    observed: irlume_common::config::SplitCameraPairsObservation,
+) -> Option<(bool, &'static str)> {
+    use irlume_common::config::SplitCameraPairsObservation as Observed;
+    match observed {
+        Observed::Default | Observed::Off => None,
+        Observed::Experimental => Some((
+            false,
+            "irlumed: EXPERIMENTAL split camera pairs enabled by \
+             split_camera_pairs=experimental: authorized split pairs may enroll and \
+             authenticate (ADR-0032); built-in cameras only unless \
+             allow_external_split_cameras=1; not qualified",
+        )),
+        Observed::Invalid => Some((
+            true,
+            "irlumed: WARNING: split_camera_pairs in settings.conf is neither \
+             'experimental' nor 'off'; split camera pairs stay disabled",
+        )),
+        Observed::Unreadable => Some((
+            true,
+            "irlumed: WARNING: settings.conf cannot be read; split camera pairs stay \
+             disabled",
+        )),
+    }
+}
+
+/// Latch the machine owner's experimental split camera pair opt-in once,
+/// before the socket is bound or any request is served (ADR-0032, amendment
+/// 2026-10-13). A changed `split_camera_pairs` applies at the next start.
+fn latch_split_camera_pairs() {
+    let observed = irlume_common::config::observe_split_camera_pairs();
+    irlume_auth::latch_experimental_split_trust(observed.enabled());
+    match split_camera_pairs_notice(observed) {
+        Some((true, line)) => jout_warn!("{line}"),
+        Some((false, line)) => jout_notice!("{line}"),
+        None => {}
+    }
 }
 
 /// Peer identity from SO_PEERCRED.
@@ -6571,6 +6613,7 @@ fn dispatch_status_with_diagnostics(
                     .recognizer
                     .as_ref()
                     .map(|placement| recognizer_for_peer(placement, peer.uid)),
+                split_trust: Some(irlume_auth::experimental_split_trust()),
             }
         }
         // The peer's right to ask about this account was settled by the
@@ -8810,6 +8853,11 @@ fn dispatch_scoped_session_inner(
         };
         let mut camera_request = match engine.prepare_split_enrollment_camera(&expected, &authorization) {
             Ok(request) => request,
+            // The owner can act on the external-camera rules, so they keep
+            // their own reason; every other failure keeps the generic one.
+            Err(error) if irlume_auth::is_split_external_refusal(&error) => {
+                return Response::Error(error.to_string())
+            }
             Err(_) => return Response::Error("split enrollment choice changed or is unavailable; list and confirm the pair again".into()),
         };
         match camera_request.prepared_enrollment_binding() {
@@ -17480,6 +17528,25 @@ mod tests {
         }
     }
 
+    /// The startup reading of `split_camera_pairs` is silent when closed by
+    /// default or by `off`, a notice when opted in and a warning otherwise
+    /// (ADR-0032, amendment 2026-10-13).
+    #[test]
+    fn split_camera_pairs_startup_lines_name_the_setting() {
+        use irlume_common::config::SplitCameraPairsObservation as Observed;
+        assert_eq!(split_camera_pairs_notice(Observed::Default), None);
+        assert_eq!(split_camera_pairs_notice(Observed::Off), None);
+        let (warning, line) = split_camera_pairs_notice(Observed::Experimental).unwrap();
+        assert!(!warning);
+        assert!(line.contains("EXPERIMENTAL") && line.contains("split_camera_pairs=experimental"));
+        assert!(line.contains("allow_external_split_cameras=1"), "{line}");
+        for observed in [Observed::Invalid, Observed::Unreadable] {
+            let (warning, line) = split_camera_pairs_notice(observed).unwrap();
+            assert!(warning, "{observed:?}");
+            assert!(line.contains("stay disabled"), "{line}");
+        }
+    }
+
     #[test]
     fn health_reports_the_published_engine_bits() {
         // Health dispatch tests share this process-wide cache. Keep the
@@ -17516,9 +17583,13 @@ mod tests {
                 rgb_pad,
                 ir_pad,
                 recognizer,
+                split_trust,
                 ..
             } => {
                 assert!(mesh && adapter);
+                // No test process latches the experimental split opt-in, and
+                // a new daemon always reports it.
+                assert_eq!(split_trust, Some(false));
                 assert_eq!(rgb_pad, Some(irlume_common::PadModelStatus::Loaded));
                 assert_eq!(ir_pad, Some(irlume_common::PadModelStatus::Disabled));
                 let recognizer = recognizer.expect("the placement is reported");

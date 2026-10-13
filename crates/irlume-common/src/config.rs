@@ -97,6 +97,102 @@ pub fn observe_face_sensor_policy() -> FaceSensorPolicyObservation {
     selected.map_or(DefaultDual, Explicit)
 }
 
+/// The settings.conf key of the experimental split camera pair opt-in
+/// (ADR-0032, amendment 2026-10-13).
+pub const SPLIT_CAMERA_PAIRS_KEY: &str = "split_camera_pairs";
+
+/// The settings.conf key that lets a split pair use external cameras.
+pub const ALLOW_EXTERNAL_SPLIT_CAMERAS_KEY: &str = "allow_external_split_cameras";
+
+/// One reading of the machine owner's split camera pair opt-in. Only
+/// `Experimental` opens split enrollment and authentication; every other
+/// reading keeps them closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitCameraPairsObservation {
+    /// No `split_camera_pairs` line: closed, the default.
+    Default,
+    /// `split_camera_pairs=off`: closed, as the owner last chose.
+    Off,
+    /// `split_camera_pairs=experimental`: the owner's opt-in.
+    Experimental,
+    /// A malformed, empty, repeated or unknown setting: closed.
+    Invalid,
+    /// settings.conf exists but cannot be read: closed.
+    Unreadable,
+}
+
+impl SplitCameraPairsObservation {
+    /// Whether this reading opts in.
+    #[must_use]
+    pub fn enabled(self) -> bool {
+        self == Self::Experimental
+    }
+}
+
+/// The value of `key` in one settings.conf snapshot under the strict grammar
+/// security keys use: `Ok(None)` when no line names the key,
+/// `Ok(Some(value))` for exactly one well-formed `key=value` line, and
+/// `Err(())` for a malformed or repeated attempt to set it, so a typo cannot
+/// silently read as the default.
+fn strict_setting<'a>(text: &'a str, key: &str) -> Result<Option<&'a str>, ()> {
+    let mut found = None;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let names_key = line.strip_prefix(key).is_some_and(|tail| {
+            tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || c == '=' || c == ':')
+        });
+        if !names_key {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(());
+        };
+        if name.trim() != key || found.is_some() {
+            return Err(());
+        }
+        found = Some(value.trim());
+    }
+    Ok(found)
+}
+
+/// Read the split camera pair opt-in once, without probing cameras. irlumed
+/// latches this reading at startup; a change applies at its next start.
+pub fn observe_split_camera_pairs() -> SplitCameraPairsObservation {
+    use SplitCameraPairsObservation::{Default, Experimental, Invalid, Off, Unreadable};
+    let text = match std::fs::read_to_string(config_path("settings.conf")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Default,
+        Err(_) => return Unreadable,
+    };
+    match strict_setting(&text, SPLIT_CAMERA_PAIRS_KEY) {
+        Ok(None) => Default,
+        Ok(Some("experimental")) => Experimental,
+        Ok(Some("off")) => Off,
+        Ok(Some(_)) | Err(()) => Invalid,
+    }
+}
+
+/// Whether a split pair may use cameras the kernel does not report as
+/// `removable: fixed` (ADR-0032, amendment 2026-10-13, section 3).
+///
+/// Only one well-formed `allow_external_split_cameras` line with an on
+/// spelling ([`truthy`]) allows it. Absence, any other value, a malformed or
+/// repeated line and an unreadable settings.conf keep the built-in rule.
+/// Read live, like `forbid_external_cameras`, which still refuses every
+/// external camera when it is on.
+#[must_use]
+pub fn allow_external_split_cameras() -> bool {
+    std::fs::read_to_string(config_path("settings.conf")).is_ok_and(|text| {
+        strict_setting(&text, ALLOW_EXTERNAL_SPLIT_CAMERAS_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(truthy)
+    })
+}
+
 fn config_root() -> PathBuf {
     std::env::var_os("IRLUME_CONFIG_DIR")
         .map(PathBuf::from)
@@ -1458,6 +1554,107 @@ mod tests {
 
         std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox config root holding exactly `settings` (or no settings.conf
+    /// for `None`), for the split camera pair readers.
+    fn with_split_settings(name: &str, settings: Option<&str>, check: impl FnOnce()) {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(dir.join("settings.conf"), text).unwrap();
+        }
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        check();
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the exact `experimental` value opens split pairs; every other
+    /// reading, malformed or unreadable ones included, stays closed.
+    #[test]
+    fn split_camera_pairs_opens_only_on_the_exact_experimental_value() {
+        use SplitCameraPairsObservation::{Default, Experimental, Invalid, Off};
+        for (settings, expected) in [
+            (None, Default),
+            (Some(""), Default),
+            (Some("# split_camera_pairs=experimental\n"), Default),
+            (Some("split_camera_pairs_note=experimental\n"), Default),
+            (Some("split_camera_pairs=experimental\n"), Experimental),
+            (
+                Some("  split_camera_pairs = experimental  \n"),
+                Experimental,
+            ),
+            (Some("split_camera_pairs=off\n"), Off),
+            (Some("split_camera_pairs=\n"), Invalid),
+            (Some("split_camera_pairs=on\n"), Invalid),
+            (Some("split_camera_pairs=Experimental\n"), Invalid),
+            (Some("split_camera_pairs experimental\n"), Invalid),
+            (Some("split_camera_pairs: experimental\n"), Invalid),
+            (
+                Some("split_camera_pairs=experimental\nsplit_camera_pairs=experimental\n"),
+                Invalid,
+            ),
+            (
+                Some("split_camera_pairs=off\nsplit_camera_pairs=experimental\n"),
+                Invalid,
+            ),
+        ] {
+            with_split_settings("split-pairs", settings, || {
+                let observed = observe_split_camera_pairs();
+                assert_eq!(observed, expected, "{settings:?}");
+                assert_eq!(observed.enabled(), expected == Experimental, "{settings:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn unreadable_settings_keep_split_camera_pairs_closed() {
+        let _g = testenv::lock();
+        let dir =
+            std::env::temp_dir().join(format!("irlume-cfg-split-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory where the file should be cannot be read as text.
+        std::fs::create_dir_all(dir.join("settings.conf")).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        assert_eq!(
+            observe_split_camera_pairs(),
+            SplitCameraPairsObservation::Unreadable
+        );
+        assert!(!observe_split_camera_pairs().enabled());
+        assert!(!allow_external_split_cameras());
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// External split cameras need one well-formed on spelling; anything else
+    /// keeps the built-in rule, and `forbid_external_cameras` is separate.
+    #[test]
+    fn external_split_cameras_need_one_well_formed_on_spelling() {
+        for (settings, expected) in [
+            (None, false),
+            (Some("forbid_external_cameras=0\n"), false),
+            (Some("allow_external_split_cameras=1\n"), true),
+            (Some("allow_external_split_cameras = yes\n"), true),
+            (
+                Some("allow_external_split_cameras=on\nforbid_external_cameras=1\n"),
+                true,
+            ),
+            (Some("allow_external_split_cameras=0\n"), false),
+            (Some("allow_external_split_cameras=maybe\n"), false),
+            (Some("allow_external_split_cameras=\n"), false),
+            (Some("allow_external_split_cameras 1\n"), false),
+            (
+                Some("allow_external_split_cameras=1\nallow_external_split_cameras=1\n"),
+                false,
+            ),
+        ] {
+            with_split_settings("split-external", settings, || {
+                assert_eq!(allow_external_split_cameras(), expected, "{settings:?}");
+            });
+        }
     }
 
     #[test]

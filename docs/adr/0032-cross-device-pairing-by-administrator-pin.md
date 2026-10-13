@@ -22,6 +22,9 @@ ADR-0031 section 4's YUYV exposure refusal remains in force.
 This ADR defines the contract for later implementation PRs. Its acceptance
 tests and activation gate must be satisfied before split-pair enrollment or
 authentication becomes available.
+Since the 2026-10-13 amendment a machine owner can opt in to experimental
+split enrollment and authentication; supported activation still needs the
+full acceptance matrix (#1030).
 
 ## Context
 
@@ -1336,3 +1339,188 @@ proven ordinary override. Each rejected case retains its deny kind/cause and
 avoids lease/open attempts; the ordinary-override rows also retain primary bytes
 and clear request state. These are software checks. The physical acceptance and
 separate reviewed activation requirements remain unchanged.
+
+## Amendment 2026-10-13: experimental owner opt-in activation
+
+This amends the 2026-10-06 retained-runtime amendment, which says there is no
+environment or configuration switch and that turning the predicate on is a
+separate reviewed change. It also amends the 2026-10-08 refusal-context
+amendment's closed-admission replies on a host that opts in. Grant arms, PAD,
+the retry ceiling, consent, routing order, sequential capture and storage are
+unchanged.
+
+**Why.** The software runtime is complete behind the predicate (2026-10-06 and
+2026-10-08 amendments). The remaining #1030 gate is attended acceptance on two
+separate single-role cameras with native GREY IR, and no such pair exists in the
+maintainer fleet: the BRIO and NexiGo are each a complete RGB+IR camera, so the
+resolver refuses either split (case 8, 2026-10-07). The ThinkPad T480 split
+modules stay refused by ADR-0031 section 4 (YUYV-only IR, #887). The project
+already ships one experimental machine-owner opt-in with the same shape: the
+IR-only sensor policy (ADR-0028, `face_sensor_policy=ir-only-experimental`).
+Split pairs follow that precedent, so owners of qualifying hardware can use
+and report on them before the supported activation lands.
+
+### 1. The setting
+
+`split_camera_pairs=experimental` in `/etc/irlume/settings.conf` is the only
+opt-in. `sudo irlume split experimental on --yes` writes it under the
+settings lock; `sudo irlume split experimental off` writes
+`split_camera_pairs=off`; `irlume split experimental` (or `status`) shows the
+saved and the running state. Without `--yes` the command prints the warning
+and changes nothing, and neither command overwrites a malformed setting. Only the exact
+value `experimental` opens. An absent key, `off`, any other value, a
+malformed or duplicated line or an unreadable `settings.conf` keeps the
+predicate closed; all but the absent key and `off` log a startup warning. The
+setting fails toward its protection.
+No environment variable opens it.
+
+### 2. One latch per daemon process
+
+`irlumed` reads the setting once at startup, before it serves a request, and
+latches the answer in `irlume_camera::lease`. While latched,
+`split_trust_admitted` returns true for Enrollment and Authentication. Capture,
+Preview, Diagnostics and Setup keep their existing answers, so Capture stays
+closed. The latch is set at most once and never cleared; a later call changes
+nothing. Changing the setting takes effect at the next daemon start, as
+`recognizer_device` does. Clients never latch: the CLI, TUI and PAM module
+make no latch call (a source-scan test pins the daemon's one call), and a
+process that never latches keeps the closed predicate. The `test-support` fixture path is unchanged.
+
+The predicate is read several times within one request (preparation, both
+leases, `split_grant_refusal`). A per-read configuration lookup could change
+between those reads; a process-lifetime latch keeps every read in one request
+equal, which is what the earlier no-configuration rule protected.
+
+### 3. Built-in split sides by default
+
+Windows Hello combines an RGB-only and an IR-only camera into one sensor group
+only when both "must be added to the same physical chassis"; for external
+cameras, "both Type 1 and Type 2 Camera modules must be built into the same
+physical device" (Microsoft, USB Video Class camera implementation guide,
+"Sensor Group Generation"). Irlume adopts that rule as the default for split
+pairs. Every split trust path that applies the external-camera policy
+(enrollment choice, account routing and the routed split install) refuses a
+pair unless both sides report `removable: fixed`; `removable` and `unknown` are
+external. This holds whatever `forbid_external_cameras` says, whose default
+stays off for ordinary cameras. A complete external RGB+IR camera such as the
+BRIO or NexiGo is one physical device, the case Windows also allows, and is
+unaffected.
+
+An administrator who deliberately builds a split from external cameras, such as
+a test rig, sets `allow_external_split_cameras=1`. Only an on spelling enables
+it; absence, any other value or an unreadable file keeps the built-in rule, and
+`forbid_external_cameras=1` still refuses every external camera.
+
+A split pair's IR evidence comes from a separate USB device, and §2 already
+records that replacement hardware presenting every recorded fact is
+indistinguishable. A built-in side cannot be swapped without opening the
+chassis; an external one can be unplugged and replaced in seconds, the
+CVE-2021-34466 class THREAT_MODEL.md "Camera trust: device pinning" describes.
+
+### 4. The privileged-prompt precheck
+
+`Response::Health` gains `split_trust: Option<bool>`, additive and omitted by
+older daemons. It reports the latch. The PAM module's
+`privileged_face_is_rgb_only` treats a `convenience` tier as known-impossible
+only when the daemon does not report split trust. On a split-only host no
+ordinary pair exists, so the standing selection is RGB-only and Health says
+`convenience`; without this field, sudo, su, doas and polkit returned
+`PAM_IGNORE` before any request reached the daemon, while the daemon's own
+advisory (`may_select_account_camera`) defers the standing tier when a split
+can route. With split trust reported, PAM keeps the existing confirmation path
+and the daemon's chosen-tier admission decides. An older daemon (field absent)
+and an older PAM module (field ignored) keep today's suppression, which ends in
+the password. The cost falls only on opted-in hosts without a usable split
+pair: they ask for the privileged confirmation, then the daemon refuses and the
+password follows.
+
+### 5. Visibility
+
+A latched daemon logs one startup notice naming the setting; an invalid value
+logs a warning. `irlume split experimental`, `irlume doctor` and the CLI help
+say when split pairs are experimental. The CHANGELOG, docs/COMMANDS.md "Split
+camera authorizations", docs/SETUP.md, docs/SECURITY_AT_REST.md and
+docs/THREAT_MODEL.md "Camera trust: device pinning" describe the opt-in, the
+built-in rule and the §2 replacement limitation.
+
+### 6. What stays the same
+
+Split evidence keeps the sequential posture and grants only through the
+IR-identity-verified arms. YUYV IR still has no clipping ceiling (ADR-0031 §4),
+so the T480 class stays refused (#887). Concurrent split capture and IR-only
+authentication on a split pair stay refused. `irlume split add`, `select` and
+`remove` stay root-only and OS-approved as before, and enrollment still needs
+an explicit split choice. The rows that pin the closed default keep passing
+unchanged, because no test process latches; new rows exercise the latch in a
+child process so the closed default is never observed after it.
+
+### 7. Experimental, then supported
+
+The experimental opt-in ships after: the latch, built-in rule and precheck rows
+above; the existing software whole-call rows; and one attended positive run on
+two separate cameras that each present one capture role, recorded in the PR
+(enroll, reset, add-group, PAM grant automatic and pinned, unplug and
+revocation refusals, journal lines, no images saved). A complete RGB+IR camera
+can present one role when the kernel deauthorizes its other UVC function
+(`/sys/bus/usb/devices/<interface>/authorized`); the resolver claims only
+present capture nodes (`SplitCandidate::is_ordinary_pair`). Such a rig is
+external and needs `allow_external_split_cameras=1`. Its composition and
+census output belong in the PR record.
+
+The first attended run (archhost, 2026-10-13; BRIO with its IR streaming
+interface deauthorized as the RGB side, NexiGo with its RGB function
+deauthorized as the IR side) enrolled ten scans and, with a diagnostic
+45-second window, granted pinned, automatic and after a replug through the
+IR-identity arms. With the default 15-second window it never granted: every
+attempt ended `collecting RGB PAD evidence`, which section 8 addresses. Every
+refusal (unplugged side, renumbered node, `forbid_external_cameras`, the
+built-in rule, revocation) arrived in under 75 ms, before any open.
+
+Supported activation, with split pairs available without the setting, stays the
+separate reviewed change tracked in #1030.
+
+### 8. Grouped split evidence
+
+This amends the 2026-10-06 retained-runtime amendment, which keeps split
+authentication off the grouped collector. Each split attempt reopened both
+streams and contributed one RGB PAD score: the rig measured about 3.3 s for
+the RGB one-shot (1.4 s warm-up, 1.7 s rate fill) and 3.2 s to arm the IR
+side, so the five-score median of ADR-0013 needed about 35 s, beyond every
+default window. The convenience tier met the same limit on 2026-09-17 and
+answered it with one armed session per group (`capture_rgb_denoised_batch`).
+
+A split authentication whose service and window admit the grouped collector
+for an ordinary sequential pair (`grouped_auth::eligible_configuration`'s
+scope, both PAD models, a window of at least `GRACE_WINDOW_MS`) now collects
+one group under its one split Authentication operation: one RGB session
+yields five denoised samples and is released, then one IR session yields five
+bursts with their statistics and is released. RGB still ends before IR
+starts. Every RGB and IR pair passes the existing split frame contract
+(`validate_split_pair_in_operation`: binding, geometry, spectrum, delivery,
+continuity, active-IR provenance, RGB before IR) and becomes its own
+privately constructed split receipt. The batch returns all five or nothing.
+
+The grouped evaluator then runs unchanged: each sample passes the liveness
+and PAD gates in order, a break in usable evidence resets the vote, identity
+runs only on the final admissible sample, and an interrupted group never
+reuses earlier votes. The vote count, thresholds and median are ADR-0013's.
+Split evidence keeps the sequential posture, so only the IR-identity arms
+can grant, and `split_grant_refusal` still runs before any grant arm. No
+stored qualification, held pair or concurrent schedule is involved, and the
+sequential posture holds at any skew. Each pair still meets the existing
+8-second sequential pairing budget (`SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW`):
+RGB older than that is discarded as stale and can only deny. Because the
+batch takes every RGB sample before any IR sample, each pair's gap is about
+the IR session start; the rig measured 4.1 to 5.2 s. A camera whose IR
+start pushes a pair past 8 s refuses that group and the password follows,
+rather than letting older RGB evidence into the liveness decision. Services or windows
+outside that scope keep the one-shot split attempt, which cannot fill the vote
+in a short window and so falls back to the password. A privileged prompt's
+short default window widens to `GRACE_WINDOW_MS` when the owner's privileged
+opt-in applies and either the standing pair's stored qualification selects a
+bounded collection, as before, or split Authentication is admitted and the
+authorization store holds a record (`split_collection_possible`, a metadata
+read that reserves time only).
+ It needs the full acceptance matrix
+(cases 1 to 15) with attended evidence on hardware whose split sides are built
+in, and this ADR's move out of Proposed.

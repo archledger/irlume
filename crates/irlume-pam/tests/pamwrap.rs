@@ -1230,19 +1230,37 @@ fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
     use irlume_common::config::{
         FaceSensorPolicy as Policy, FaceSensorPolicyObservation as Observed,
     };
-    for (tier, policy, offered) in [
-        ("secure", Some(Observed::DefaultDual), true),
+    // `split_trust` is the daemon's latched experimental split opt-in
+    // (ADR-0032, amendment 2026-10-13): on a split-only host the standing
+    // tier is convenience, yet account routing can still pick the split pair,
+    // so only an absent or false report keeps the RGB-only suppression.
+    for (tier, policy, split_trust, offered) in [
+        ("secure", Some(Observed::DefaultDual), None, true),
         (
             "convenience",
             Some(Observed::Explicit(Policy::IrOnlyExperimental)),
+            None,
             true,
         ),
-        ("convenience", Some(Observed::Explicit(Policy::Dual)), false),
-        ("convenience", Some(Observed::Invalid), false),
-        ("convenience", Some(Observed::Unreadable), false),
-        ("convenience", None, false),
-        ("older-no-health", None, true),
-        ("future-tier", None, true),
+        (
+            "convenience",
+            Some(Observed::Explicit(Policy::Dual)),
+            None,
+            false,
+        ),
+        ("convenience", Some(Observed::Invalid), None, false),
+        ("convenience", Some(Observed::Unreadable), None, false),
+        ("convenience", None, None, false),
+        ("convenience", Some(Observed::DefaultDual), Some(true), true),
+        ("convenience", None, Some(true), true),
+        (
+            "convenience",
+            Some(Observed::DefaultDual),
+            Some(false),
+            false,
+        ),
+        ("older-no-health", None, None, true),
+        ("future-tier", None, None, true),
     ] {
         let Some(h) = Harness::try_new("privileged-tier-compat") else {
             return;
@@ -1260,6 +1278,7 @@ fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
                 version: String::new(),
                 apparmor: None,
                 recognizer: None,
+                split_trust,
             },
             Request::FaceSensorStatus { user: None } => match policy {
                 Some(policy) => Response::FaceSensorStatus {
@@ -1281,7 +1300,10 @@ fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
             h.write_service("sudo", &[h.auth_line("required", "")]);
             let before = log.lock().unwrap().len();
             let (ok, out) = h.run("sudo", &["authenticate"], "yes\n", None);
-            assert_eq!(ok, offered, "{tier}, {policy:?}, consent={consent}: {out}");
+            assert_eq!(
+                ok, offered,
+                "{tier}, {policy:?}, {split_trust:?}, consent={consent}: {out}"
+            );
             assert_eq!(
                 out.contains(FACE_INTENT_INFO),
                 offered && consent == "1",
@@ -1290,7 +1312,9 @@ fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
             let requests = log.lock().unwrap();
             let requests = &requests[before..];
             assert!(matches!(requests[0], Request::Health));
-            let face_index = if tier == "convenience" {
+            // Reported split trust settles the tier question without the
+            // sensor-policy query.
+            let face_index = if tier == "convenience" && split_trust != Some(true) {
                 assert!(matches!(
                     requests[1],
                     Request::FaceSensorStatus { user: None }

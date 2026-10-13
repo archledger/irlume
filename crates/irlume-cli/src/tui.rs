@@ -1284,6 +1284,9 @@ impl LightState {
                 // Where the recognizer runs is doctor's and status's to
                 // report (ADR-0022 §13).
                 recognizer: _,
+                // The experimental split opt-in is status's and doctor's to
+                // report (ADR-0032, amendment 2026-10-13).
+                split_trust: _,
             }) => Some(HealthInfo {
                 tier,
                 rgb_dev,

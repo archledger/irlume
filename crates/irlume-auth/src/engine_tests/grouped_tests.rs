@@ -740,6 +740,67 @@ fn grouped_eligibility_keeps_service_and_purpose_scope_despite_long_override() {
     }
 }
 
+/// A split group serves exactly the services and purposes an ordinary
+/// measured sequential group serves (ADR-0032, amendment 2026-10-13,
+/// section 8), privileged opt-in included.
+#[test]
+fn split_grouped_scope_matches_the_ordinary_grouped_scope() {
+    let mode = measured_sequential_configuration();
+    for service in [
+        Some("login"),
+        Some("swaylock"),
+        Some("gdm-password"),
+        None,
+        Some("unknown-local-service"),
+        Some("sudo"),
+        Some("polkit-1"),
+        Some("sshd"),
+    ] {
+        for purpose in [
+            AuthenticationPurpose::Verify,
+            AuthenticationPurpose::AppConsent,
+            AuthenticationPurpose::CredentialRelease,
+        ] {
+            for opt_in in [false, true] {
+                let window = crate::GRACE_WINDOW_MS;
+                assert_eq!(
+                    crate::grouped_auth::split_eligible_configuration(
+                        true, true, true, window, purpose, service, opt_in,
+                    ),
+                    crate::grouped_auth::eligible_configuration(
+                        &mode, true, true, true, window, purpose, service, opt_in,
+                    ),
+                    "service={service:?}, purpose={purpose:?}, opt_in={opt_in}"
+                );
+            }
+        }
+    }
+}
+
+/// A split group needs IR, both PAD models and a window of at least
+/// `GRACE_WINDOW_MS`; there is no qualification to require.
+#[test]
+fn split_grouped_eligibility_requires_ir_both_pad_models_and_the_window() {
+    let eligible = |ir, rgb_pad, ir_pad, window| {
+        crate::grouped_auth::split_eligible_configuration(
+            ir,
+            rgb_pad,
+            ir_pad,
+            window,
+            AuthenticationPurpose::Verify,
+            Some("login"),
+            false,
+        )
+    };
+    let window = crate::GRACE_WINDOW_MS;
+    assert!(eligible(true, true, true, window));
+    assert!(eligible(true, true, true, window + 1));
+    assert!(!eligible(true, true, true, window - 1));
+    assert!(!eligible(false, true, true, window));
+    assert!(!eligible(true, false, true, window));
+    assert!(!eligible(true, true, false, window));
+}
+
 #[test]
 fn grouped_cold_login_release_uses_complete_collection_only_for_known_local_services() {
     let mode = measured_sequential_configuration();

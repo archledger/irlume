@@ -128,6 +128,12 @@ fn confirm_face_intent(pamh: &Pam, service: ServiceKind) -> IntentConfirmation {
 /// Older daemons may not implement status: an unknown tier keeps the existing
 /// consent path and its daemon-side authorization. Once RGB-only is known,
 /// only an explicit IR-only policy can keep the choice available.
+///
+/// A daemon that reports the experimental split opt-in (`split_trust`) is not
+/// known RGB-only: a split-only host's standing tier is convenience, yet its
+/// account routing can choose the split pair (ADR-0032, amendment 2026-10-13).
+/// The daemon's chosen-tier admission then decides. An older daemon omits the
+/// field and keeps this suppression.
 fn privileged_face_is_rgb_only() -> bool {
     use irlume_common::client::request_until;
     use irlume_common::config::FaceSensorPolicy;
@@ -135,7 +141,8 @@ fn privileged_face_is_rgb_only() -> bool {
     let deadline = Instant::now() + Duration::from_millis(1500);
     if !matches!(
         request_until(&Request::Health, deadline),
-        Ok(Response::Health { tier, .. }) if tier == "convenience"
+        Ok(Response::Health { tier, split_trust, .. })
+            if tier == "convenience" && split_trust != Some(true)
     ) {
         return false;
     }

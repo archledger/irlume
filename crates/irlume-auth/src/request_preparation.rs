@@ -15,6 +15,19 @@ enum PreparedPair {
     Split(Box<PreparedSplit>),
 }
 
+/// Whether a privileged request may route a split that collects one grouped
+/// batch (ADR-0032, amendment 2026-10-13, section 8): split Authentication is
+/// admitted and the authorization store holds a record. Metadata only: no
+/// camera opens and no account is read. Like the stored-qualification hint it
+/// reserves window time, never capture or grant authority.
+pub(crate) fn split_collection_possible() -> bool {
+    SplitTrustEntry::Authentication.admitted()
+        && matches!(
+            irlume_common::split_publish::read_camera_selection().split(),
+            SplitReadState::Valid { records, .. } if !records.is_empty()
+        )
+}
+
 /// The split trust entry a retained split selection was prepared for.
 ///
 /// A split selection is usable for trust work only while the running Engine
@@ -747,18 +760,46 @@ fn split_guard_matches(
         && same_side(&guard.ir, &expected.ir)
 }
 
+/// The external-camera rule for a split pair (ADR-0032, amendment
+/// 2026-10-13, section 3). Like a Windows Hello sensor group, a split pair is
+/// built in: both sides must report `removable: fixed` unless the owner set
+/// `allow_external_split_cameras`. `forbid_external_cameras` still refuses
+/// every external side, with its own reason.
 fn split_external_policy(pair: &irlume_camera::SplitPair) -> irlume_common::Result<()> {
+    let external = !pair.rgb.fixed || !pair.ir.fixed;
+    if !external {
+        return Ok(());
+    }
     let forbid = irlume_common::PreferencesState::observe()
         .forbid_external_cameras
         .unwrap_or(true)
         || std::env::var("IRLUME_CAMERA_REQUIRE_FIXED").is_ok_and(|value| value == "1");
-    if forbid && (!pair.rgb.fixed || !pair.ir.fixed) {
-        return Err(Error::Policy(
-            "split camera choice has an external side and is forbidden".into(),
-        ));
+    if forbid {
+        return Err(Error::Policy(SPLIT_EXTERNAL_FORBIDDEN.into()));
+    }
+    if !irlume_common::config::allow_external_split_cameras() {
+        return Err(Error::Policy(SPLIT_BUILT_IN_REFUSAL.into()));
     }
     Ok(())
 }
+
+/// The refusal for a split pair with an external side under
+/// `forbid_external_cameras`.
+const SPLIT_EXTERNAL_FORBIDDEN: &str = "split camera choice has an external side and is forbidden";
+
+/// Whether `error` is one of the split external-camera refusals, which the
+/// owner can act on and which a reply may therefore name as they are.
+#[must_use]
+pub fn is_split_external_refusal(error: &Error) -> bool {
+    matches!(error, Error::Policy(reason)
+        if reason == SPLIT_BUILT_IN_REFUSAL || reason == SPLIT_EXTERNAL_FORBIDDEN)
+}
+
+/// The refusal for a split pair with an external side while the owner has not
+/// allowed external split cameras.
+pub(crate) const SPLIT_BUILT_IN_REFUSAL: &str =
+    "split camera pairs use built-in cameras; this choice has an external side \
+     (allow_external_split_cameras=1 allows it)";
 
 fn split_activation_refusal() -> Error {
     Error::Policy(irlume_camera::lease::CameraLeaseError::SplitActivationDisabled.to_string())
@@ -867,6 +908,11 @@ impl Drop for CameraRequestScope<'_> {
             self.engine.camera_selection = None;
             self.engine.primary_attempt = None;
             self.engine.secondary_attempt = None;
+            // The PAD vote ring and capture-setup timer are request-local; a
+            // finished request must not leave them for the next one, which a
+            // split diagnostic refuses as pending state.
+            self.engine.vit_scores.clear();
+            self.engine.capture_setup_started = None;
             if !keep {
                 self.engine.rgb_dev = rgb;
                 self.engine.ir_dev = ir;

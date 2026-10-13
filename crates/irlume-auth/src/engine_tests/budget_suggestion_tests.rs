@@ -63,6 +63,48 @@ impl Drop for ReadyEngine<'_> {
     }
 }
 
+/// A split-only host's standing pair has no IR, yet an admitted split route
+/// collects a group, so its privileged prompt reserves the grouped window;
+/// without that route the short window stays and no hint is read (ADR-0032,
+/// amendment 2026-10-13, section 8; archhost split rig).
+#[test]
+fn a_split_only_host_reserves_the_grouped_window_only_with_a_split_route() {
+    let _guard = env_guard();
+    let _env = Environment::new();
+    std::env::set_var("IRLUME_PRIVILEGED_GROUPED_PAD", "1");
+    let mut s = shared();
+    let ready = ReadyEngine::new(&mut s.engine);
+    ready.engine.ir_available = false;
+    let window = ready.engine.authentication_window_from_with_hints(
+        Instant::now(),
+        Some("sudo"),
+        AuthenticationPurpose::Verify,
+        Dual,
+        || true,
+        || true,
+    );
+    assert_eq!(window.milliseconds, GRACE_WINDOW_MS);
+    let window = ready.engine.authentication_window_from_with_hints(
+        Instant::now(),
+        Some("sudo"),
+        AuthenticationPurpose::Verify,
+        Dual,
+        || false,
+        || panic!("no IR and no split route evaluated the hint"),
+    );
+    assert_eq!(window.milliseconds, SUDO_GRACE_WINDOW_MS);
+    ready.engine.ir_available = true;
+    let window = ready.engine.authentication_window_from_with_hints(
+        Instant::now(),
+        Some("sudo"),
+        AuthenticationPurpose::Verify,
+        Dual,
+        || panic!("standing IR read the split route"),
+        || true,
+    );
+    assert_eq!(window.milliseconds, GRACE_WINDOW_MS);
+}
+
 #[test]
 fn budget_hint_is_not_evaluated_for_excluded_requests() {
     let _guard = env_guard();

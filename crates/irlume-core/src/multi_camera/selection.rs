@@ -321,8 +321,50 @@ pub fn select_for_account<K: Clone>(
 pub fn select_bound_for_account<K: Clone>(
     connected: &[BoundCandidatePair<K>],
     account: &AccountCameras,
-    mut eligible: impl FnMut(CandidateScope) -> bool,
+    eligible: impl FnMut(CandidateScope) -> bool,
     forbid_external: bool,
+) -> SelectionOutcome<K> {
+    select_bound_for_account_with(
+        connected,
+        account,
+        eligible,
+        ExternalCameraPolicy {
+            forbid_external,
+            split_built_in_only: forbid_external,
+        },
+    )
+}
+
+/// Which candidates the external-camera policy excludes from ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalCameraPolicy {
+    /// `forbid_external_cameras`: every class needs two fixed sides.
+    pub forbid_external: bool,
+    /// The split built-in rule (ADR-0032, amendment 2026-10-13, section 3):
+    /// a split candidate needs two fixed sides even when ordinary external
+    /// cameras are allowed.
+    pub split_built_in_only: bool,
+}
+
+impl ExternalCameraPolicy {
+    /// Whether this policy excludes `pair` for an external or unknown side.
+    fn excludes<K>(self, pair: &BoundCandidatePair<K>) -> bool {
+        let forbidden = self.forbid_external
+            || (self.split_built_in_only && matches!(pair.pair, CompletePairKey::Split(_)));
+        forbidden && !(pair.rgb_fixed && pair.ir_fixed)
+    }
+}
+
+/// [`select_bound_for_account`] with a per-class external-camera policy:
+/// the split built-in rule can exclude an external split candidate while
+/// external ordinary cameras stay allowed. Its skip reason is the same
+/// [`SkipReason::ExternalForbidden`].
+#[must_use]
+pub fn select_bound_for_account_with<K: Clone>(
+    connected: &[BoundCandidatePair<K>],
+    account: &AccountCameras,
+    mut eligible: impl FnMut(CandidateScope) -> bool,
+    external: ExternalCameraPolicy,
 ) -> SelectionOutcome<K> {
     let primary = account.primary.as_ref().and_then(GroupPair::complete_key);
     if primary.is_none() && matches!(account.primary.as_ref(), Some(GroupPair::Split(_))) {
@@ -371,7 +413,7 @@ pub fn select_bound_for_account<K: Clone>(
         let secondary = matches!(scope, CandidateScope::Secondary { .. });
         let allowed: Vec<&BoundCandidatePair<K>> = carrying
             .into_iter()
-            .filter(|pair| !forbid_external || (pair.rgb_fixed && pair.ir_fixed))
+            .filter(|pair| !external.excludes(pair))
             .collect();
         let reason = if secondary && groups.iter().filter(|(_, other)| other == key).count() > 1 {
             Some(SkipReason::AmbiguousGroups)

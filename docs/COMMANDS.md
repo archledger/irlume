@@ -96,6 +96,34 @@ Conventions that apply everywhere:
 These commands manage the authorization store described by ADR-0032; they
 do not enable split-pair enrollment or authentication.
 
+### Experimental opt-in
+
+Split enrollment and authentication are disabled unless the machine owner opts
+in (ADR-0032, amendment 2026-10-13):
+
+```sh
+irlume split experimental                  # saved and running state
+sudo irlume split experimental on --yes    # save split_camera_pairs=experimental
+sudo irlume split experimental off         # save split_camera_pairs=off
+sudo systemctl restart irlumed             # irlumed reads the setting at startup
+```
+
+Without `--yes`, `on` prints the warning and changes nothing. A malformed or
+unreadable `split_camera_pairs` setting keeps split pairs disabled and is not
+overwritten. While opted in, the activation message below no longer applies:
+an authorized, selected split pair can enroll (`irlume enroll
+--split-camera-choice`) and authenticate through the account route. Split
+evidence stays sequential and grants only on an IR identity match, and YUYV-only
+IR cameras stay refused (ADR-0031 section 4).
+
+Like a Windows Hello sensor group, a split pair uses built-in cameras: both
+sides must report `removable: fixed`, or the choice refuses with `split camera
+pairs use built-in cameras; this choice has an external side
+(allow_external_split_cameras=1 allows it)`. Set
+`allow_external_split_cameras=1` in `/etc/irlume/settings.conf` only for a
+deliberate external rig; `forbid_external_cameras=1` still refuses every
+external camera.
+
 ### Two different refusals
 
 Ordinary-only requests and split-capable authentication have different refusal
@@ -144,8 +172,8 @@ policy: split enrollment and authentication are not enabled
 That is the activation message. It covers `enroll --split-camera-choice`,
 `enroll --add-camera --split-camera-choice`, automatic or saved-pin authentication
 against split input, and the declared split entries. These contexts can use a
-split pair when the appropriate trust kind is admitted; production admission
-remains closed. Retained-pin gates and withdrawn admission also keep this
+split pair when the appropriate trust kind is admitted; admission stays closed
+unless the machine owner opted in (see "Experimental opt-in" above). Retained-pin gates and withdrawn admission also keep this
 activation message. `irlume split` commands are unaffected by either refusal;
 they report the authorization store.
 
@@ -170,6 +198,9 @@ policy: split enrollment and authentication are not enabled
 | `irlume split remove 'PAIRKEY'` | yes | remove an authorization without requiring its cameras to remain connected |
 | `irlume split select 'PAIRKEY' --guard JSON` | yes | select an authorized pair after checking its displayed incarnations and facts |
 | `irlume split select --clear --guard JSON` | yes | clear the selection using the displayed guard |
+| `irlume split experimental [status]` | for the saved value | show the saved `split_camera_pairs` setting and what the running daemon latched |
+| `irlume split experimental on --yes` | yes | opt in to experimental split enrollment and authentication; applies after `systemctl restart irlumed` |
+| `irlume split experimental off` | yes | save `split_camera_pairs=off`; applies after a daemon restart |
 
 Root listings include each saved record's canonical `key` for `select` and
 `remove`; non-root listings omit it. Split listings use a bounded 1 MiB socket

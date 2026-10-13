@@ -51,6 +51,26 @@ pub(super) fn eligible_configuration(
     service: Option<&str>,
     privileged_opt_in: bool,
 ) -> bool {
+    grouped_scope(purpose, service, privileged_opt_in)
+        && mode.is_sequential()
+        && mode.source == STORED_CAPTURE_MODE_SOURCE
+        && !mode.operation_demoted.get()
+        && mode.qualification_state
+            == irlume_common::diagnostics::QualificationState::MeasuredSequential
+        && has_ir
+        && has_rgb_pad
+        && has_ir_pad
+        && window >= GRACE_WINDOW_MS
+}
+
+/// The services and purposes a grouped collection may serve, whatever the
+/// camera class: local login and lock surfaces, privileged ones only with the
+/// owner's opt-in, and Verify's unknown-service default.
+fn grouped_scope(
+    purpose: AuthenticationPurpose,
+    service: Option<&str>,
+    privileged_opt_in: bool,
+) -> bool {
     let local_session = matches!(
         service.and_then(irlume_common::pam_service::classify),
         Some(
@@ -75,7 +95,7 @@ pub(super) fn eligible_configuration(
         );
     // Preserve Verify's unknown-service default. Credential release must name
     // a recognized local login/lock service; budgets cannot widen this scope.
-    let in_scope = match purpose {
+    match purpose {
         AuthenticationPurpose::Verify => {
             local_session
                 || privileged
@@ -85,13 +105,24 @@ pub(super) fn eligible_configuration(
         }
         AuthenticationPurpose::CredentialRelease => local_session,
         AuthenticationPurpose::AppConsent => privileged,
-    };
-    in_scope
-        && mode.is_sequential()
-        && mode.source == STORED_CAPTURE_MODE_SOURCE
-        && !mode.operation_demoted.get()
-        && mode.qualification_state
-            == irlume_common::diagnostics::QualificationState::MeasuredSequential
+    }
+}
+
+/// Whether a split authentication collects one grouped batch (ADR-0032,
+/// amendment 2026-10-13, section 8): the grouped scope of an ordinary
+/// sequential pair, both PAD models and IR, and a window of at least
+/// [`GRACE_WINDOW_MS`]. A split pair has no stored qualification or runtime
+/// contract to require; its sequential posture holds at any skew.
+pub(super) fn split_eligible_configuration(
+    has_ir: bool,
+    has_rgb_pad: bool,
+    has_ir_pad: bool,
+    window: u64,
+    purpose: AuthenticationPurpose,
+    service: Option<&str>,
+    privileged_opt_in: bool,
+) -> bool {
+    grouped_scope(purpose, service, privileged_opt_in)
         && has_ir
         && has_rgb_pad
         && has_ir_pad
@@ -193,6 +224,9 @@ impl Engine {
     /// Pre-identity gates use detected face presence, never missing embeddings
     /// from an unfinished assessment. Final admission repeats its existing gates.
     fn grouped_evidence_refusal(&self, a: &Assessment) -> Option<Outcome> {
+        if let Some(refusal) = self.split_evidence_refusal(a) {
+            return Some(refusal);
+        }
         let rgb = a.signals.rgb_face.is_some();
         let ir = a.signals.ir_face.is_some();
         // Actual required execution failures are terminal even when scene or
@@ -489,6 +523,133 @@ impl Engine {
                 Instant::now,
             )
         })?;
+        match prepared {
+            PreparedGroup::Refused(outcome) => Ok(outcome),
+            PreparedGroup::Ready(a) => {
+                if Instant::now() >= deadline {
+                    self.vit_scores.clear();
+                    return Ok(expired());
+                }
+                let outcome =
+                    self.authenticate_qualified_assessment(enr, purpose, service, *a, diagnostics);
+                self.vit_scores.clear();
+                if Instant::now() >= deadline {
+                    return Ok(expired());
+                }
+                outcome
+            }
+        }
+    }
+
+    /// One grouped split attempt (ADR-0032, amendment 2026-10-13, section 8):
+    /// the whole five-sample PAD vote from ONE split batch under the original
+    /// split Authentication operation, each pair assessed as split evidence in
+    /// order, identity only on the final admissible sample. The grant boundary,
+    /// `split_grant_refusal` included, is the ordinary one.
+    pub(super) fn authenticate_split_grouped_once(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        deadline: Instant,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        self.begin_grouped_attempt();
+        if Instant::now() >= deadline {
+            return Ok(expired());
+        }
+        #[cfg(feature = "test-support")]
+        if crate::test_support::fixture_installed() {
+            let prepared = in_grouped_evaluation(diagnostics, || {
+                self.evaluate_grouped_samples_ex(
+                    vec![(); VIT_PAD_VOTE_N],
+                    deadline,
+                    |engine, ()| {
+                        let assessment =
+                            engine.fixture_assessment(operation)?.ok_or_else(|| {
+                                irlume_common::Error::Hardware(
+                                    "split assessment fixture supplied no assessment".into(),
+                                )
+                            })?;
+                        Ok(DeferredAssessment {
+                            assessment,
+                            identity: (),
+                        })
+                    },
+                    |_, evidence| Ok(evidence.assessment),
+                    Instant::now,
+                    GroupModality::Pair,
+                )
+            })?;
+            return self.finish_grouped(enr, purpose, service, prepared, deadline, diagnostics);
+        }
+        let control = self.capture_control();
+        self.emit_capture_setup(diagnostics);
+        let started = Instant::now();
+        let batch = irlume_camera::capture_split_batch_observed(
+            &self.rgb_dev,
+            &self.ir_dev,
+            operation,
+            &control,
+            irlume_camera::SplitBatchRequest {
+                pairs: VIT_PAD_VOTE_N,
+                deadline,
+            },
+            &|phase, elapsed| emit_batch_phase(diagnostics, phase, elapsed),
+        );
+        if batch.is_ok() {
+            self.arm_finalization();
+        }
+        let samples = batch?.into_pair_captures(operation)?;
+        irlume_common::dlog!(
+            "[assessment-stage] split-grouped-capture: pairs={} elapsed={}ms",
+            samples.len(),
+            started.elapsed().as_millis()
+        );
+        let prepared = in_grouped_evaluation(diagnostics, || {
+            self.evaluate_grouped_samples_with(
+                samples,
+                deadline,
+                |engine, captured| {
+                    captured.revalidate(operation)?;
+                    let detected =
+                        engine.detect_rgb_assessment(captured.rgb(), None, diagnostics)?;
+                    engine
+                        .assess_captured_pair(
+                            PairCapture::Split(captured),
+                            detected,
+                            PairAssessmentContext {
+                                operation,
+                                sequential: true,
+                                pair_sequential_retried: false,
+                                rgb_hard_retried: false,
+                                held_sessions: false,
+                                ir_ms: None,
+                                diagnostics,
+                            },
+                        )
+                        .map_err(CapturePathError::into_inner)
+                },
+                |engine, evidence| engine.materialize_pair_identity(evidence, diagnostics),
+                Instant::now,
+            )
+        })?;
+        self.finish_grouped(enr, purpose, service, prepared, deadline, diagnostics)
+    }
+
+    /// The shared end of a grouped attempt: a refused group answers as it is;
+    /// a ready one reaches the ordinary grant boundary inside the deadline,
+    /// and the vote ring never outlives the attempt.
+    fn finish_grouped(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        prepared: PreparedGroup,
+        deadline: Instant,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
         match prepared {
             PreparedGroup::Refused(outcome) => Ok(outcome),
             PreparedGroup::Ready(a) => {

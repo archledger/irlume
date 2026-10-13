@@ -38,8 +38,9 @@ login or locks a person out. It is critical-tier
   ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) "Privilege separation").
   Before privileged intent, camera-free `Health` and, for convenience tier,
   `FaceSensorStatus { user: None }` share a 1.5-second deadline. Known RGB-only
-  without explicit IR-only policy returns IGNORE before prompting or consuming
-  input; unknown health keeps the existing consent and daemon authorization.
+  (a `convenience` tier without reported `split_trust`) without explicit
+  IR-only policy returns IGNORE before prompting or consuming input; unknown
+  health keeps the existing consent and daemon authorization.
   Three other bounded paths send more than one request, and all stay: `wait` retries
   `try_verify` or `try_unseal` until a match or until an attempt ends after
   `WAIT_BUDGET` (20 s); with `facefirst` or `ondemand` an `UnsealUnavailable`

@@ -606,3 +606,180 @@ fn split_rgb_restore_admission_survives_peer_loss_without_reopening_capture() {
         "lost own incarnation cannot restore"
     );
 }
+
+/// `count` RGB frames then `count` IR frames, each role ordered and disjoint,
+/// every IR frame after the last RGB frame (ADR-0032, amendment 2026-10-13,
+/// section 8).
+fn batch_frames(
+    operation: &CameraOperationSession,
+    count: usize,
+) -> (Vec<Frame>, Vec<(Frame, IrCaptureStats)>) {
+    let start = Instant::now();
+    let binding = |path, role| operation.lease().frame_binding(path, role).unwrap();
+    let rgb = (0..count)
+        .map(|i| {
+            bound_uniform_frame(
+                binding(RGB, contracts::StreamRole::Rgb),
+                start + Duration::from_millis(10 * i as u64),
+            )
+        })
+        .collect();
+    let ir = (0..count)
+        .map(|i| {
+            (
+                bound_uniform_frame(
+                    binding(IR, contracts::StreamRole::Ir),
+                    start + Duration::from_millis(1000 + 10 * i as u64),
+                ),
+                uniform_ir_stats(),
+            )
+        })
+        .collect();
+    (rgb, ir)
+}
+
+fn batch_request(pairs: usize) -> crate::split_capture::SplitBatchRequest {
+    crate::split_capture::SplitBatchRequest {
+        pairs,
+        deadline: Instant::now() + Duration::from_secs(30),
+    }
+}
+
+#[test]
+fn split_batch_returns_ordered_pairs_with_the_rgb_session_before_ir() {
+    let (guard, expected) = fixture();
+    let operation = acquire(&expected);
+    let (rgb, ir) = batch_frames(&operation, 5);
+    let control = CaptureControl::with_progress(no_progress());
+    let phase = Cell::new(0);
+    let batch = crate::split_capture::capture_split_batch_with(
+        RGB,
+        IR,
+        &operation,
+        &control,
+        batch_request(5),
+        |checkpoint| {
+            checkpoint().unwrap();
+            phase.set(1);
+            Ok(rgb)
+        },
+        |checkpoint| {
+            checkpoint().unwrap();
+            assert_eq!(phase.get(), 1, "the IR session starts after the RGB one");
+            phase.set(2);
+            Ok(ir)
+        },
+    )
+    .unwrap();
+    assert_eq!(batch.len(), 5);
+    let pairs = batch.into_pair_captures(&operation).unwrap();
+    assert_eq!(pairs.len(), 5);
+    for window in pairs.windows(2) {
+        assert!(window[0].rgb().captured.end < window[1].rgb().captured.start);
+        assert!(window[0].ir().captured.end < window[1].ir().captured.start);
+    }
+    for pair in &pairs {
+        pair.revalidate(&operation).unwrap();
+    }
+    drop(pairs);
+    drop(operation);
+    assert_eq!(guard.lease_counts_observer()(), (0, 0));
+}
+
+#[test]
+fn split_batch_refuses_partial_misordered_or_overlapping_samples() {
+    let (_guard, expected) = fixture();
+    let operation = acquire(&expected);
+    let control = CaptureControl::with_progress(no_progress());
+    let run = |rgb: Vec<Frame>, ir: Vec<(Frame, IrCaptureStats)>| {
+        crate::split_capture::capture_split_batch_with(
+            RGB,
+            IR,
+            &operation,
+            &control,
+            batch_request(5),
+            |_| Ok(rgb),
+            |_| Ok(ir),
+        )
+        .map(|batch| batch.len())
+    };
+    // One RGB sample short: no partial batch.
+    let (mut rgb, ir) = batch_frames(&operation, 5);
+    rgb.pop();
+    assert!(run(rgb, ir).is_err());
+    // An RGB sample inside the IR phase.
+    let (mut rgb, ir) = batch_frames(&operation, 5);
+    let late = ir[0].0.captured.start + Duration::from_millis(1);
+    rgb[4] = bound_uniform_frame(
+        operation
+            .lease()
+            .frame_binding(RGB, contracts::StreamRole::Rgb)
+            .unwrap(),
+        late,
+    );
+    assert!(run(rgb, ir).is_err());
+    // IR samples out of order.
+    let (rgb, mut ir) = batch_frames(&operation, 5);
+    ir.swap(1, 2);
+    assert!(run(rgb, ir).is_err());
+    // IR without active illumination provenance.
+    let (rgb, mut ir) = batch_frames(&operation, 5);
+    ir[3].0 = bound_uniform_frame_with(
+        operation
+            .lease()
+            .frame_binding(IR, contracts::StreamRole::Ir)
+            .unwrap(),
+        ir[3].0.captured.start,
+        contracts::IlluminationProvenance::Unknown,
+        true,
+        false,
+    );
+    assert!(run(rgb, ir).is_err());
+    let (rgb, ir) = batch_frames(&operation, 5);
+    assert_eq!(run(rgb, ir).unwrap(), 5, "the same frames in order pass");
+}
+
+#[test]
+fn split_batch_refuses_counts_outside_one_through_five_and_expired_deadlines() {
+    let (_guard, expected) = fixture();
+    let operation = acquire(&expected);
+    let control = CaptureControl::with_progress(no_progress());
+    for pairs in [0, 6] {
+        let opened = Cell::new(false);
+        let result = crate::split_capture::capture_split_batch_with(
+            RGB,
+            IR,
+            &operation,
+            &control,
+            batch_request(pairs),
+            |_| {
+                opened.set(true);
+                Ok(Vec::new())
+            },
+            |_| Ok(Vec::new()),
+        );
+        assert!(result.is_err(), "{pairs} pairs");
+        assert!(!opened.get(), "{pairs} pairs: refused before any capture");
+    }
+    let opened = Cell::new(false);
+    let result = crate::split_capture::capture_split_batch_with(
+        RGB,
+        IR,
+        &operation,
+        &control,
+        crate::split_capture::SplitBatchRequest {
+            pairs: 5,
+            deadline: Instant::now(),
+        },
+        |_| {
+            opened.set(true);
+            Ok(Vec::new())
+        },
+        |_| Ok(Vec::new()),
+    );
+    assert!(result.is_err());
+    assert!(
+        !opened.get(),
+        "an expired deadline refuses before any capture"
+    );
+}

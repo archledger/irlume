@@ -2692,6 +2692,7 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
             recognizer: None,
+            split_trust: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -3596,6 +3597,7 @@ session    optional                     pam_irlume.so reseal\n";
             version: String::new(),
             apparmor: None,
             recognizer: None,
+            split_trust: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -3790,6 +3792,7 @@ impl LightdmBed {
                 version: String::new(),
                 apparmor: None,
                 recognizer: None,
+                split_trust: None,
             },
             _ => Response::Error("unexpected request".into()),
         });
@@ -4476,6 +4479,7 @@ fn status_takes_the_camera_pair_from_the_daemon_not_a_local_probe() {
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
             recognizer: None,
+            split_trust: None,
         },
         _ => Response::Error("unexpected request".into()),
     });
@@ -5430,6 +5434,7 @@ fn setup_walks_every_step_noninteractively() {
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
             recognizer: None,
+            split_trust: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
             profiles: Vec::new(),

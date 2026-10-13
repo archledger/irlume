@@ -323,6 +323,166 @@ fn whole_entry_authentication_grants_after_real_pad_retries() {
     assert!(restored);
 }
 
+/// The stage timings a whole entry reported, in order.
+#[derive(Default)]
+struct Stages(std::sync::Mutex<Vec<irlume_common::diagnostics::TraceStage>>);
+
+impl irlume_common::diagnostics::DiagnosticSink for Stages {
+    fn emit_trace(&self, kind: irlume_common::diagnostics::TraceEventKind) {
+        if let irlume_common::diagnostics::TraceEventKind::StageTiming { stage, .. } = kind {
+            self.0.lock().unwrap().push(stage);
+        }
+    }
+}
+
+impl Stages {
+    fn grouped(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|stage| **stage == irlume_common::diagnostics::TraceStage::GroupedEvaluation)
+            .count()
+    }
+}
+
+/// Write a split-bound primary whose one scan matches [`sample`].
+fn write_split_enrollment(shared: &mut Shared, fixture: &Fixture) {
+    let (guard, publication) = fixture.choice();
+    let binding = {
+        let request = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        request.prepared_enrollment_binding().unwrap()
+    };
+    let mut enrollment = Enrollment::new(USER);
+    let mut scan = scan512(1, true, None);
+    scan.rgb = sample().embedding.unwrap().to_vec();
+    scan.ir = Some(scan.rgb.clone());
+    scan.embed_space = Some(shared.engine.embed_space().into());
+    scan.ir_space = Some(shared.engine.ir_space().into());
+    enrollment.camera_binding = Some(binding);
+    enrollment.profiles.push(FaceProfile {
+        name: "Synthetic Profile".into(),
+        scans: vec![scan],
+        ir_calib: None,
+        ir_calibs: Default::default(),
+    });
+    std::fs::write(fixture.primary(), serde_json::to_vec(&enrollment).unwrap()).unwrap();
+}
+
+/// One whole authentication entry for [`USER`] on `service` in `window`.
+fn authenticate_entry(
+    shared: &mut Shared,
+    service: &str,
+    window: u64,
+    sink: &Stages,
+) -> irlume_common::Result<crate::Outcome> {
+    shared
+        .engine
+        .authenticate_for_in_window_with_policy_preparing_delivering(
+            USER,
+            Some(service),
+            AuthenticationPurpose::Verify,
+            AuthenticationWindow::new(window),
+            irlume_common::config::FaceSensorPolicy::Dual,
+            sink,
+            &mut |_, _| Ok(()),
+            &mut |_, _| {},
+        )
+}
+
+/// ADR-0032, amendment 2026-10-13, section 8: an eligible split
+/// authentication fills the five-score vote inside ONE grouped attempt and
+/// grants through the IR-identity arm on the final sample.
+#[test]
+fn grouped_split_authentication_fills_the_vote_in_one_group() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new();
+    write_split_enrollment(&mut shared, &fixture);
+    let _admission = fixture
+        .camera
+        .admit_split_trust(&[CameraOperationKind::Authentication]);
+    let script = AssessmentGuard::install(
+        fixture.expected(),
+        CameraOperationKind::Authentication,
+        |_| Ok(sample()),
+    )
+    .unwrap();
+    let sink = Stages::default();
+    let result = authenticate_entry(&mut shared, "login", crate::GRACE_WINDOW_MS, &sink);
+    drop(shared);
+    assert!(
+        matches!(result, Ok(ref outcome) if outcome.granted && outcome.reason.contains("ir-fallback")),
+        "{result:?}"
+    );
+    assert_eq!(script.calls(), 5);
+    assert_eq!(sink.grouped(), 1, "one grouped evaluation, no one-shot rounds");
+}
+
+/// A window below the grouped minimum keeps the one-shot split attempt.
+#[test]
+fn a_short_window_keeps_the_one_shot_split_attempt() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new();
+    write_split_enrollment(&mut shared, &fixture);
+    let _admission = fixture
+        .camera
+        .admit_split_trust(&[CameraOperationKind::Authentication]);
+    let script = AssessmentGuard::install(
+        fixture.expected(),
+        CameraOperationKind::Authentication,
+        |_| Ok(sample()),
+    )
+    .unwrap();
+    let sink = Stages::default();
+    let result = authenticate_entry(&mut shared, "login", crate::GRACE_WINDOW_MS - 1, &sink);
+    drop(shared);
+    assert!(matches!(result, Ok(ref outcome) if outcome.granted), "{result:?}");
+    assert_eq!(script.calls(), 5);
+    assert_eq!(sink.grouped(), 0, "the one-shot route never groups");
+}
+
+/// A group whose evidence breaks resets the vote and refuses; the next group
+/// starts empty, so the grant needs five fresh samples and no earlier vote is
+/// reused.
+#[test]
+fn an_interrupted_split_group_never_reuses_its_votes() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new();
+    write_split_enrollment(&mut shared, &fixture);
+    let _admission = fixture
+        .camera
+        .admit_split_trust(&[CameraOperationKind::Authentication]);
+    let script = AssessmentGuard::install(
+        fixture.expected(),
+        CameraOperationKind::Authentication,
+        |context| {
+            let mut next = sample();
+            if context.index == 3 {
+                next.verdict = Verdict::Uncertain;
+                next.reason = "synthetic framing break".into();
+            }
+            Ok(next)
+        },
+    )
+    .unwrap();
+    let sink = Stages::default();
+    let result = authenticate_entry(&mut shared, "login", crate::GRACE_WINDOW_MS, &sink);
+    drop(shared);
+    assert!(matches!(result, Ok(ref outcome) if outcome.granted), "{result:?}");
+    assert_eq!(
+        script.calls(),
+        10,
+        "the first group ends unqualified; the second needs five fresh samples"
+    );
+    assert_eq!(sink.grouped(), 2);
+}
+
 #[test]
 fn support_factory_starts_empty_and_nonfinite_pad_is_failed() {
     let sample = assessment(PadInput::Score(f32::NAN), PadInput::Score(f32::INFINITY));

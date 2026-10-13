@@ -690,6 +690,10 @@ pub fn status(args: &[String]) -> ExitCode {
     let user = user_arg(args);
     println!("irlume status for '{user}'");
     println!("  face sensors  : {}", crate::sensor_policy::status_line());
+    println!(
+        "  split pairs   : {}",
+        crate::split::experimental_status_line()
+    );
 
     // Daemon + method.
     let reach = daemon_reach();

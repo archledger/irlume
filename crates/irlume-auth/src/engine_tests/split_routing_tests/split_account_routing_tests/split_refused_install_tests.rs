@@ -83,6 +83,12 @@ fn a_refused_split_install_ends_account_routing(refusal: PureRefusal) {
     rig.authorize(false);
     let counts = rig.recorder.lease_counts_observer();
     let _admitted = rig.recorder.admit_split_trust(&[Authentication]);
+    if matches!(refusal, PureRefusal::ExternalSide) {
+        // This row exercises the install gate, so the owner allowed external
+        // split cameras past the ranking's built-in rule.
+        irlume_common::config::write_kv("settings.conf", "allow_external_split_cameras", "1")
+            .unwrap();
+    }
     let standing = Standing::new(&mut shared.engine);
     {
         let mut request = standing

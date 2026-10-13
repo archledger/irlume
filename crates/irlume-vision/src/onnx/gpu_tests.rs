@@ -23,6 +23,9 @@ mod gpu_reliability_witness_tests;
 #[path = "gpu_reliability_protocol_tests.rs"]
 mod gpu_reliability_protocol_tests;
 
+#[path = "gpu_reliability_reader_tests.rs"]
+mod gpu_reliability_reader_tests;
+
 mod gpu_groundwork_tests {
     use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;

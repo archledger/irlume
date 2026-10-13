@@ -258,6 +258,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- When one-shot face attempts end their window with the RGB PAD vote still
+  incomplete, the prompt now says "authentication timed out; use your
+  password", as grouped expiry already did, instead of advice read from the
+  last capture: a dim face had produced "it is too dark to see your face;
+  add light" although the IR path matched in that light (#1063).
+
 - `irlume camera census` no longer calls a camera an administrator
   deauthorized (`authorized` 0) a kernel or firmware problem: the row names
   the deauthorized interfaces, or the device when it was deauthorized whole

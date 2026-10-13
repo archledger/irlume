@@ -7499,6 +7499,43 @@ impl Engine {
                     return (Err(error), held_pair_failed, None);
                 }
             };
+            // A retry candidate's next round must also fit: its teardown has
+            // not run yet (it is deferred) and must complete before the next
+            // capture can start, so the two costs ADD: the pending release, at
+            // the costliest release this request has measured (or the floor
+            // before one has been), plus the costliest capture, the next
+            // attempt's estimate. Capture and release are kept apart so neither
+            // is counted twice across rounds. A round that settles here keeps
+            // its deferral, so the final refusal is still delivered before the
+            // teardown; a round that retries pays the teardown now, inside its
+            // own measured whole-round cost, as before.
+            let retry_estimate = || {
+                let pending_release = if deferred.is_some() {
+                    self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                pending_release + costliest_capture
+            };
+            // #1063: an RGB PAD vote still incomplete when the window closes,
+            // or when no further attempt fits in it, ran out of time. It is
+            // classified as the deadline, as grouped expiry is, not as advice
+            // read from this capture's framing facts: a dim face the IR path
+            // can match is not why the vote was short. Read before the line so
+            // the line can say so; the decisions below read the clock again
+            // after it, as they always have, and time only moves forward, so
+            // an attempt classified here as settling also settles there. A zero
+            // window is the one-shot mode, whose deadline is its start, so it
+            // keeps the framing label.
+            let settles_at_line = window != 0
+                && out.kind == OutcomeKind::RgbPadPending
+                && (now() >= deadline
+                    || deadline.saturating_duration_since(now()) < retry_estimate());
+            let situation_kind = if settles_at_line {
+                OutcomeKind::DeadlineExpired
+            } else {
+                out.kind
+            };
             // One situation line per FAILED attempt (#616 step 2), including
             // attempts the grace window retries: the "why did it fail" a
             // person reads in `irlume logs`, from the facts this attempt
@@ -7506,13 +7543,15 @@ impl Engine {
             if !out.granted {
                 irlume_common::dlog!(
                     "{}",
-                    attempt_situation_line(out.kind, out.score, &self.last_attempt_facts)
+                    attempt_situation_line(situation_kind, out.score, &self.last_attempt_facts)
                 );
                 // #616 step 3: the wire reads what the journal just said.
-                // Same guard, same facts: the prompt situation can never
-                // disagree with the journaled one.
-                self.last_attempt_situation =
-                    Some(auth_attempt_situation(out.kind, &self.last_attempt_facts));
+                // Same guard, same kind, same facts: the prompt situation can
+                // never disagree with the journaled one.
+                self.last_attempt_situation = Some(auth_attempt_situation(
+                    situation_kind,
+                    &self.last_attempt_facts,
+                ));
             } else {
                 // A granted final attempt clears the label, so a later
                 // reader can never prompt off a stale failure.
@@ -7535,22 +7574,7 @@ impl Engine {
                 }
                 return (Ok(out), false, deferred);
             }
-            // A retry candidate. Its teardown has not run yet (it is deferred)
-            // and must complete before the next capture can start, so the two
-            // costs ADD: the pending release, at the costliest release this
-            // request has measured (or the floor before one has been), plus
-            // the costliest capture, the next attempt's estimate. Capture and
-            // release are kept apart so neither is counted twice across
-            // rounds. A round that settles here keeps its deferral, so the
-            // final refusal is still delivered before the teardown; a round
-            // that retries pays the teardown now, inside its own measured
-            // whole-round cost, as before.
-            let pending_release = if deferred.is_some() {
-                self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
-            } else {
-                std::time::Duration::ZERO
-            };
-            let estimate = pending_release + costliest_capture;
+            let estimate = retry_estimate();
             let retry_wont_fit = deadline.saturating_duration_since(now()) < estimate;
             if retry_wont_fit {
                 irlume_common::dlog!(
@@ -14173,6 +14197,27 @@ mod engine_tests {
         score: f32,
         seed_cost_ms: u64,
     ) -> (Outcome, usize, std::time::Duration) {
+        scripted_pad_retry_shaped(
+            e,
+            window_ms,
+            setup_ms,
+            costs_ms,
+            score,
+            seed_cost_ms,
+            |_| {},
+        )
+    }
+
+    /// [`scripted_pad_retry`] with each attempt's assessment reshaped first.
+    fn scripted_pad_retry_shaped(
+        e: &mut Engine,
+        window_ms: u64,
+        setup_ms: u64,
+        costs_ms: &[u64],
+        score: f32,
+        seed_cost_ms: u64,
+        shape: impl Fn(&mut Assessment),
+    ) -> (Outcome, usize, std::time::Duration) {
         use std::cell::Cell;
         use std::time::{Duration, Instant};
         let start = Instant::now();
@@ -14190,7 +14235,10 @@ mod engine_tests {
                 calls.set(index + 1);
                 clock.set(clock.get() + Duration::from_millis(*cost));
                 let deny = engine.vit_pad_votes_deny(score);
-                let (enr, assessment) = pad_matching_fixture(score, deny);
+                let (enr, mut assessment) = pad_matching_fixture(score, deny);
+                shape(&mut assessment);
+                // As the capture paths do before deciding.
+                engine.last_attempt_facts = AttemptFacts::from_assessment(&assessment);
                 (
                     engine.authenticate_assessment(
                         &enr,
@@ -14600,6 +14648,121 @@ mod engine_tests {
         assert!(out.reason.contains("collecting RGB PAD evidence"));
         assert_eq!(out.score, 0.0);
         assert_eq!(cost, std::time::Duration::from_millis(7_800));
+    }
+
+    /// #1063: the archhost split rig's one-shot route ended its window with
+    /// the RGB PAD vote incomplete and a dim RGB face, and the prompt said
+    /// "too dark" although the IR path matched in that light. A window that
+    /// closes on an incomplete vote is a timeout, whichever settle point
+    /// ends it; framing facts still name a vote-short attempt the window
+    /// could retry, and a decided denial keeps its own label.
+    /// A centred RGB face below the `too dark` bar, as on the archhost rig.
+    fn dim_face(a: &mut Assessment) {
+        a.signals.rgb_face = Some(irlume_liveness::FaceBox {
+            cx: 0.5,
+            cy: 0.5,
+            score: 0.9,
+        });
+        a.signals.face_frac = 0.30;
+        a.signals.rgb_face_brightness = 30.0;
+    }
+
+    #[test]
+    fn an_incomplete_pad_vote_at_the_window_end_settles_as_timed_out() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let dim = dim_face;
+        for (costs, setup, calls_expected, case) in [
+            (&[7_800][..], 100, 1, "no further attempt fits"),
+            (&[7_500, 7_500][..], 0, 2, "the window expired"),
+        ] {
+            let (out, calls, _) =
+                scripted_pad_retry_shaped(&mut s.engine, 15_000, setup, costs, 0.20, 0, dim);
+            assert_eq!(calls, calls_expected, "{case}");
+            assert!(!out.granted, "{case}");
+            assert_eq!(out.kind, OutcomeKind::RgbPadPending, "{case}");
+            assert!(out.reason.contains("collecting RGB PAD evidence"), "{case}");
+            assert_eq!(
+                s.engine.last_attempt_situation_label(),
+                Some("timed out"),
+                "{case}"
+            );
+        }
+        // The same dim face on a decided denial keeps the framing label.
+        let (out, calls, _) =
+            scripted_pad_retry_shaped(&mut s.engine, 15_000, 0, &[1_000; 5], 0.99, 0, dim);
+        assert_eq!((calls, out.kind), (5, OutcomeKind::Spoof));
+        assert_eq!(s.engine.last_attempt_situation_label(), Some("too dark"));
+        // A zero window is the one-shot mode (`IRLUME_GRACE_MS=0`): its
+        // deadline is its start, not a window that closed, so it keeps the
+        // framing label as before.
+        let (out, calls, _) =
+            scripted_pad_retry_shaped(&mut s.engine, 0, 0, &[1_000], 0.20, 0, dim);
+        assert_eq!((calls, out.kind), (1, OutcomeKind::RgbPadPending));
+        assert_eq!(s.engine.last_attempt_situation_label(), Some("too dark"));
+    }
+
+    /// #1063 review: the loop's own decisions read the clock after the
+    /// situation line, as before this change, so a line write that runs past
+    /// the deadline settles the attempt with the label the line carried; it
+    /// can never be overwritten afterwards. The clock jumps past the deadline
+    /// at the first read after the capture-cost read and the two the label
+    /// takes.
+    #[test]
+    fn a_slow_situation_line_settles_with_the_label_it_wrote() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let _guard = env_guard();
+        let mut s = shared();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(15_000);
+        let clock = Cell::new(start);
+        let reads_after_capture: Cell<Option<u32>> = Cell::new(None);
+        let mut costliest = Duration::from_millis(1_000);
+        s.engine.vit_scores.clear();
+        let (result, fallback, _deferred) = s.engine.authentication_attempt_loop_with(
+            deadline,
+            15_000,
+            &mut costliest,
+            |engine| {
+                assert!(reads_after_capture.get().is_none(), "one attempt only");
+                clock.set(clock.get() + Duration::from_millis(1_000));
+                reads_after_capture.set(Some(0));
+                let (enr, mut assessment) = pad_matching_fixture(0.20, false);
+                dim_face(&mut assessment);
+                engine.last_attempt_facts = AttemptFacts::from_assessment(&assessment);
+                (
+                    engine.authenticate_assessment(
+                        &enr,
+                        AuthenticationPurpose::Verify,
+                        Some("login"),
+                        assessment,
+                        &(),
+                    ),
+                    false,
+                    None::<()>,
+                )
+            },
+            || {
+                if let Some(reads) = reads_after_capture.get() {
+                    reads_after_capture.set(Some(reads + 1));
+                    if reads + 1 == 4 {
+                        clock.set(deadline + Duration::from_millis(1));
+                    }
+                }
+                clock.get()
+            },
+        );
+        s.engine.vit_scores.clear();
+        assert!(!fallback);
+        let out = result.unwrap();
+        assert_eq!(out.kind, OutcomeKind::RgbPadPending);
+        assert!(reads_after_capture.get().is_some_and(|reads| reads >= 4));
+        assert_eq!(
+            s.engine.last_attempt_situation_label(),
+            Some("too dark"),
+            "the label the line carried, not a later timeout"
+        );
     }
 
     #[test]

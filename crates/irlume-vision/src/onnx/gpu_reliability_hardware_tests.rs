@@ -13,10 +13,10 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
-struct Config {
-    identity: String,
-    cpu_reference: String,
-    gpu_bits: [String; 4],
+pub(super) struct Config {
+    pub(super) identity: String,
+    pub(super) cpu_reference: String,
+    pub(super) gpu_bits: [String; 4],
     runtime_wait: Duration,
     system_wait: Duration,
 }
@@ -75,7 +75,11 @@ impl Config {
     }
 }
 
-fn read_reference(path: &Path, attended: Option<&str>) -> Result<Config, String> {
+/// Read a bounded, explicit reference for an opt-in diagnostic.
+///
+/// # Errors
+/// Refuses non-regular, unreadable, oversized or invalid reference input.
+pub(super) fn read_reference(path: &Path, attended: Option<&str>) -> Result<Config, String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     // Validate the opened descriptor without waiting for a FIFO peer first.

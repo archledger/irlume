@@ -193,6 +193,35 @@ the exact process's normal exit and one passed selected test, no timeout/crash.
 Cargo exit zero alone is insufficient. This control supplies neither full
 certification nor production admission; CPU remains authoritative.
 
+### Runtime-PM lifetime diagnosis
+
+For an unexplained missing runtime event, the separate ignored selector
+`onnx::gpu_tests::gpu_pm_diagnostic_tests::gpu_pm_hw_lifetime_diagnostic`
+compares CPU-only baseline, warmed GPU platform/Core, retained recognizer request,
+request dropped, and platform dropped. Library-global state can survive Core
+destruction; observe a separate `baseline` process after the `lifetime` process
+has exited as well. This intentionally changes object lifetimes and counts **zero
+qualification/endurance calls**. It never initiates system sleep, changes power
+policy, blanks the display or stops other clients.
+
+Use the same root/runtime/model environment and current prior-reference JSON as
+the retained control, with its system wait set to0. Supply all four additional
+settings explicitly:
+
+- `IRLUME_GPU_PM_MODE=baseline` or `lifetime`;
+- `IRLUME_GPU_PM_RENDER_NODE=renderD128` (the selected device's actual node);
+- `IRLUME_GPU_PM_IDLE_SECONDS=60` (integer1 through120, identical across phases);
+- `IRLUME_GPU_PM_OUTPUT_DIR` naming an existing empty absolute directory owned
+  by the test's effective user and inaccessible to group/other users.
+
+Run with `--ignored --exact` and `--test-threads 1 --nocapture`. Each phase saves
+every valid metadata sample, clock bounds, counters and owned device handles in
+private JSON. Console output stays quiet inside each window to avoid per-sample
+rendering activity. Missing/changed metadata, non-AUTO control, counter decreases,
+unexcluded system sleep or changed reference/inventory refuses the comparison.
+Keep the external desktop conditions comparable; a difference or lack of one is
+diagnostic evidence, not automatic attribution to the provider or certification.
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then

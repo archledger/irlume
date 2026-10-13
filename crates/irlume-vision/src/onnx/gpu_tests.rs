@@ -29,6 +29,9 @@ mod gpu_reliability_reader_tests;
 #[path = "gpu_reliability_hardware_tests.rs"]
 mod gpu_reliability_hardware_tests;
 
+#[path = "gpu_pm_diagnostic_tests.rs"]
+mod gpu_pm_diagnostic_tests;
+
 mod gpu_groundwork_tests {
     use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;
@@ -971,19 +974,30 @@ mod gpu_groundwork_tests {
         ]
         .into_iter()
         .map(|name| (source, name))
-        .chain([(
-            include_str!("gpu_reliability_hardware_tests.rs"),
-            "gpu_retained_hw_reliability_control",
-        )]) {
+        .chain([
+            (
+                include_str!("gpu_reliability_hardware_tests.rs"),
+                "gpu_retained_hw_reliability_control",
+            ),
+            (
+                include_str!("gpu_pm_diagnostic_tests.rs"),
+                "gpu_pm_hw_lifetime_diagnostic",
+            ),
+        ]) {
             let body = source
                 .split(&format!("fn {name}()"))
                 .nth(1)
                 .unwrap()
-                .split(if name == "gpu_retained_hw_reliability_control" {
-                    "\n}"
-                } else {
-                    "\n    }"
-                })
+                .split(
+                    if matches!(
+                        name,
+                        "gpu_retained_hw_reliability_control" | "gpu_pm_hw_lifetime_diagnostic"
+                    ) {
+                        "\n}"
+                    } else {
+                        "\n    }"
+                    },
+                )
                 .next()
                 .unwrap();
             let setup = body.find("hw_cpu_cascade()").expect(name);

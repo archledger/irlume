@@ -38,6 +38,15 @@ fn lifetime_mode(value: &str) -> Result<bool, &'static str> {
     }
 }
 
+fn usable_status(status: [Option<&str>; 2]) -> bool {
+    status.into_iter().all(|value| {
+        matches!(
+            value,
+            Some("active" | "suspended" | "suspending" | "resuming")
+        )
+    })
+}
+
 fn device_handles() -> Result<Vec<String>, String> {
     let mut handles = Vec::new();
     for fd in std::fs::read_dir("/proc/self/fd").map_err(|e| e.to_string())? {
@@ -72,10 +81,17 @@ fn observe_stage(
     loop {
         match reader.sample() {
             Ok(sample) => {
-                let auto = sample.view().control == [Some("auto"); 2];
+                let view = sample.view();
+                let auto = view.control == [Some("auto"); 2];
+                let status_error = (!usable_status(view.status))
+                    .then(|| format!("unusable runtime status endpoints: {:?}", view.status));
                 observations.push(sample);
                 if !auto {
                     error = Some("control changed away from AUTO".to_owned());
+                    break;
+                }
+                if let Some(why) = status_error {
+                    error = Some(why);
                     break;
                 }
             }
@@ -283,6 +299,81 @@ fn gpu_pm_hw_lifetime_diagnostic() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn status_validation_checks_both_endpoints_and_keeps_mixed_transitions() {
+        let valid = ["active", "suspended", "suspending", "resuming"];
+        for first in valid {
+            for second in valid {
+                assert!(usable_status([Some(first), Some(second)]));
+            }
+            for bad in [
+                None,
+                Some(""),
+                Some("unknown"),
+                Some("error"),
+                Some("unsupported"),
+                Some("ACTIVE"),
+            ] {
+                assert!(!usable_status([Some(first), bad]));
+                assert!(!usable_status([bad, Some(first)]));
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_status_refuses_the_phase_and_preserves_the_offending_sample() {
+        use std::os::unix::fs::symlink;
+        for status in ["", "unknown", "error", "unsupported", "ACTIVE"] {
+            let root = tempfile::tempdir().unwrap();
+            let drm = root.path().join("drm");
+            let device = root.path().join("devices/0000:00:02.0");
+            let driver = root.path().join("drivers/xe");
+            let output = root.path().join("output");
+            let boot = root.path().join("boot_id");
+            for dir in [
+                drm.join("renderD128"),
+                device.join("power"),
+                driver.clone(),
+                output.clone(),
+            ] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            symlink(&device, drm.join("renderD128/device")).unwrap();
+            symlink(&driver, device.join("driver")).unwrap();
+            for (name, value) in [
+                ("vendor", "0x8086"),
+                ("device", "0x64a0"),
+                ("power/control", "auto"),
+                ("power/runtime_status", status),
+                ("power/runtime_active_time", "100"),
+                ("power/runtime_suspended_time", "200"),
+            ] {
+                std::fs::write(device.join(name), value).unwrap();
+            }
+            std::fs::write(&boot, "11111111-2222-3333-4444-555555555555").unwrap();
+            let node = gpu::RenderNode {
+                name: "renderD128".into(),
+                pci: "0000:00:02.0".into(),
+                vendor: "0x8086".into(),
+                device: "0x64a0".into(),
+            };
+            let mut reader = Reader::new(&drm, &boot, &node).unwrap();
+            let error = observe_stage(&mut reader, &output, "bad_status", Duration::ZERO)
+                .expect_err("unusable status must refuse the comparison");
+            assert!(error.contains("unusable runtime status"), "{error}");
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(output.join("bad_status.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["sample_count"], 1);
+            assert_eq!(
+                saved["samples"][0]["status"],
+                serde_json::json!([status, status])
+            );
+            assert_eq!(saved["error"], error);
+            assert_eq!(saved["qualification"], false);
+        }
+    }
 
     #[test]
     fn diagnostic_requires_explicit_bounded_duration_and_safe_render_name() {

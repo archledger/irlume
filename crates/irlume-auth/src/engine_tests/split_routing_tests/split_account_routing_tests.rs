@@ -981,6 +981,17 @@ fn an_external_split_side_refuses_ranking_install_and_the_grant_boundary() {
             denied.reason
         );
         std::env::remove_var("IRLUME_FORBID_EXTERNAL_CAMERAS");
+        // The split built-in rule (ADR-0032, amendment 2026-10-13) skips the
+        // external pair at ranking until the owner allows external split
+        // cameras; the gates below then still refuse on their own.
+        let denied = expect_denied(route(&request, rig.primary(split_binding()), false).0);
+        assert!(
+            denied.reason.contains("ExternalForbidden"),
+            "{}",
+            denied.reason
+        );
+        irlume_common::config::write_kv("settings.conf", "allow_external_split_cameras", "1")
+            .unwrap();
         // The legacy fixed-camera gate refuses at the install.
         let (split, _) = expect_split(route(&request, rig.primary(split_binding()), false).0);
         std::env::set_var("IRLUME_CAMERA_REQUIRE_FIXED", "1");

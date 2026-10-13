@@ -797,6 +797,73 @@ fn external_policy_requires_both_fixed_sides_in_both_classes() {
     }
 }
 
+/// The split built-in rule (ADR-0032, amendment 2026-10-13, section 3)
+/// excludes an external split candidate while external ordinary cameras stay
+/// allowed, and a lower ordinary secondary is still chosen below it.
+#[test]
+fn split_built_in_rule_excludes_only_external_split_candidates() {
+    let built_in_only = ExternalCameraPolicy {
+        forbid_external: false,
+        split_built_in_only: true,
+    };
+    let split_key = CompletePairKey::Split(split());
+    let external_ordinary = ordinary("1111:2222:dock", "1111:2222:dock");
+    for (rgb_fixed, ir_fixed) in [(false, true), (true, false), (false, false), (true, true)] {
+        let connected = [cam("split", split_key.clone(), rgb_fixed, ir_fixed)];
+        let outcome = select_bound_for_account_with(
+            &connected,
+            &account(Some(split_key.clone()), &[]),
+            |_| true,
+            built_in_only,
+        );
+        if rgb_fixed && ir_fixed {
+            assert_eq!(outcome, selected("split", CandidateScope::Primary, vec![]));
+        } else {
+            assert_eq!(
+                outcome,
+                refused(
+                    RefusalCause::Skipped(SkipReason::ExternalForbidden),
+                    vec![skip(CandidateScope::Primary, SkipReason::ExternalForbidden)],
+                )
+            );
+        }
+    }
+    // An external ordinary camera is unaffected by the split rule.
+    let connected = [cam("dock", external_ordinary.clone(), false, false)];
+    assert_eq!(
+        select_bound_for_account_with(
+            &connected,
+            &account(Some(external_ordinary.clone()), &[]),
+            |_| true,
+            built_in_only,
+        ),
+        selected("dock", CandidateScope::Primary, vec![])
+    );
+    // An excluded external split primary falls to the ordinary secondary.
+    let connected = [
+        cam("split", split_key.clone(), true, false),
+        cam("dock", external_ordinary.clone(), false, false),
+    ];
+    assert_eq!(
+        select_bound_for_account_with(
+            &connected,
+            &account(Some(split_key.clone()), &[external_ordinary.clone()]),
+            |_| true,
+            built_in_only,
+        ),
+        selected(
+            "dock",
+            secondary(0),
+            vec![skip(CandidateScope::Primary, SkipReason::ExternalForbidden)]
+        )
+    );
+    // The wrapper keeps its single-flag meaning: off allows every class.
+    assert_eq!(
+        select(&connected[..1], &account(Some(split_key), &[])),
+        selected("split", CandidateScope::Primary, vec![])
+    );
+}
+
 #[test]
 fn either_side_external_twin_is_filtered_before_indistinguishability() {
     let split = CompletePairKey::Split(split());

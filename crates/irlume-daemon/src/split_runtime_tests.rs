@@ -92,10 +92,15 @@ mod split_runtime_gates {
     /// Two fixed single-endpoint USB devices on one controller, an RGB side
     /// and a native GREY IR side. Every open is refused and recorded.
     fn fixture() -> Guard {
+        fixture_with_ir_fixed(true)
+    }
+
+    /// [`fixture`] with the IR side built in (`true`) or external.
+    fn fixture_with_ir_fixed(ir_fixed: bool) -> Guard {
         let camera = |topology: &str, identity: &str, port: u8, path: &str, format| Camera {
             topology: topology.into(),
             identity: identity.into(),
-            fixed: true,
+            fixed: path == RGB || ir_fixed,
             controller: "0000:00:14.0".into(),
             domain: irlume_common::split_key::SplitDomain::Usb2,
             ports: vec![port],
@@ -321,6 +326,42 @@ mod split_runtime_gates {
             assert!(no_secondary_publication(&user), "{variant}/{reset}");
             assert!(!sb.dir.join("capture-qualifications").exists());
             assert_eq!((engine.rgb_device(), engine.ir_device()), (NO_RGB, NO_IR));
+        }
+    }
+
+    /// The owner can act on the external-camera rules, so an admitted split
+    /// enrollment with an external side names the built-in rule (ADR-0032,
+    /// amendment 2026-10-13, section 3) rather than the generic "changed or
+    /// unavailable" reason, and refuses before any lease. Found on the
+    /// archhost split rig.
+    #[test]
+    fn split_runtime_external_side_names_the_built_in_rule_before_any_lease() {
+        let _guard = env_lock();
+        let mut engine = engine();
+        let sb = sandbox("split-runtime-external");
+        let _environment = Environment::clear();
+        engine.set_devices(NO_RGB, NO_IR);
+        let user = users::name_for_uid(0).unwrap();
+        let account = sb.dir.join(format!("{user}.json"));
+        for (variant, reset) in VARIANTS {
+            let recorder = fixture_with_ir_fixed(false);
+            let _admitted = recorder.admit_split_trust(&[CameraOperationKind::Enrollment]);
+            authorize();
+            write_enrollment(&sb.dir, &primary(&user, variant, reset));
+            let before = std::fs::read(&account).unwrap();
+            let response = dispatch(choice(&user, variant, reset), &peer(0), &mut engine);
+            assert!(
+                matches!(response, Response::Error(ref reason)
+                    if reason.contains("split camera pairs use built-in cameras")
+                        && reason.contains("allow_external_split_cameras=1")),
+                "{variant}/{reset}: {response:?}"
+            );
+            assert!(
+                recorder.calls().is_empty(),
+                "{variant}/{reset}: refused before any lease: {:?}",
+                recorder.calls()
+            );
+            assert_eq!(std::fs::read(&account).unwrap(), before, "{variant}/{reset}");
         }
     }
 

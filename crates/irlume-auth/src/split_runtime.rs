@@ -269,6 +269,19 @@ impl Engine {
 
 /// The split route's explicit schedule: sequential, with no runtime key, no
 /// stored qualification and no environment override.
+/// An installed assessment fixture supplies both PAD scores, the part the
+/// loaded PAD models play in production.
+#[cfg(feature = "test-support")]
+fn fixture_supplies_pad() -> bool {
+    crate::test_support::fixture_installed()
+}
+
+/// No fixture exists outside `test-support` builds.
+#[cfg(not(feature = "test-support"))]
+fn fixture_supplies_pad() -> bool {
+    false
+}
+
 fn split_capture_mode_selection() -> crate::CaptureModeSelection {
     crate::CaptureModeSelection {
         sequential: true,
@@ -352,10 +365,12 @@ impl Engine {
     /// The dual split authentication arm (plan W2a-2): every attempt of the
     /// grace window runs under the routed split's one Authentication
     /// operation, already leased over both original sides. Each attempt
-    /// captures RGB then IR as complete sequential one-shots in the split
-    /// capture branch, with the split schedule and no held pair, capture-mode
-    /// probe, stored qualification, grouped collector or managed pair. The
-    /// grant boundary then applies [`Self::split_grant_refusal`].
+    /// captures RGB then IR in the split capture branch, with the split
+    /// schedule and no held pair, capture-mode probe, stored qualification or
+    /// managed pair: one split batch per attempt where the grouped scope and
+    /// window admit it (ADR-0032, amendment 2026-10-13, section 8), else
+    /// complete sequential one-shots. The grant boundary then applies
+    /// [`Self::split_grant_refusal`].
     pub(crate) fn authenticate_split_routed(
         &mut self,
         enrollment: &Enrollment,
@@ -376,6 +391,48 @@ impl Engine {
         let mode = split_capture_mode_selection();
         crate::emit_capture_context(&mode, true, diagnostics);
         let mut costliest_attempt = std::time::Duration::ZERO;
+        // ADR-0032, amendment 2026-10-13, section 8: where an ordinary
+        // sequential pair would collect a group, a split collects one split
+        // batch per attempt, so the five-score PAD vote fits the window.
+        let grouped = crate::grouped_auth::split_eligible_configuration(
+            self.ir_available,
+            self.has_vit_pad() || fixture_supplies_pad(),
+            self.has_pad_ir() || fixture_supplies_pad(),
+            window.milliseconds,
+            purpose,
+            service,
+            irlume_common::config::privileged_grouped_pad_evidence_enabled(),
+        );
+        irlume_common::dlog!(
+            "split-grouped route: {} (window={} service={:?})",
+            if grouped { "TAKEN" } else { "skipped" },
+            window.milliseconds,
+            service,
+        );
+        if grouped {
+            return self
+                .authentication_attempt_loop_with(
+                    window.deadline,
+                    window.milliseconds,
+                    &mut costliest_attempt,
+                    |engine| {
+                        (
+                            engine.authenticate_split_grouped_once(
+                                enrollment,
+                                purpose,
+                                service,
+                                operation,
+                                window.deadline,
+                                diagnostics,
+                            ),
+                            false,
+                            None::<()>,
+                        )
+                    },
+                    std::time::Instant::now,
+                )
+                .0;
+        }
         self.authentication_attempt_loop(
             enrollment,
             purpose,
@@ -389,6 +446,18 @@ impl Engine {
             &mut costliest_attempt,
         )
         .0
+    }
+
+    /// An installed split's evidence guard, per grouped sample (ADR-0032,
+    /// amendment 2026-10-13, section 8): a sample without split provenance
+    /// refuses the group at once, with the grant boundary's own cause and
+    /// reason, before another sample or any identity work. None otherwise.
+    pub(crate) fn split_evidence_refusal(&self, assessment: &Assessment) -> Option<Outcome> {
+        if self.installed_split_key().is_none() || assessment.split_pair {
+            return None;
+        }
+        let (cause, reason) = SPLIT_GRANT_EVIDENCE;
+        Some(Outcome::deny_because(OutcomeKind::OtherDeny, cause, reason))
     }
 
     /// The grant boundary of an installed split (plan C6, D10; ADR-0032

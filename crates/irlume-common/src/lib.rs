@@ -2053,6 +2053,11 @@ pub enum Response {
         /// daemon predates this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recognizer: Option<RecognizerPlacement>,
+        /// Whether the daemon latched the machine owner's experimental split
+        /// camera pair opt-in at startup (ADR-0032, amendment 2026-10-13).
+        /// `None` means the daemon predates this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split_trust: Option<bool>,
     },
     /// A framing-guide sample (`PositionSample`).
     Position(PositionReport),

@@ -44,19 +44,19 @@ pub enum SequentialBatchPhase {
 
 /// The phase labels of one role's session in a batch.
 #[derive(Clone, Copy)]
-struct PhaseLabels {
+pub(crate) struct PhaseLabels {
     start: SequentialBatchPhase,
     sample: SequentialBatchPhase,
     release: SequentialBatchPhase,
 }
 
-const RGB_PHASES: PhaseLabels = PhaseLabels {
+pub(crate) const RGB_PHASES: PhaseLabels = PhaseLabels {
     start: SequentialBatchPhase::RgbStart,
     sample: SequentialBatchPhase::RgbSample,
     release: SequentialBatchPhase::RgbRelease,
 };
 
-const IR_PHASES: PhaseLabels = PhaseLabels {
+pub(crate) const IR_PHASES: PhaseLabels = PhaseLabels {
     start: SequentialBatchPhase::IrStart,
     sample: SequentialBatchPhase::IrSample,
     release: SequentialBatchPhase::IrRelease,
@@ -358,7 +358,7 @@ pub(super) fn capture_batch_controlled_with<R, I>(
     Ok(pairs)
 }
 
-fn collect_phase<S, T>(
+pub(crate) fn collect_phase<S, T>(
     count: usize,
     (open, capture): (impl FnOnce() -> Result<S>, impl FnMut(&mut S) -> Result<T>),
     checkpoint: &impl Fn() -> Result<()>,

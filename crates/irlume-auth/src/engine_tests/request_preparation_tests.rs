@@ -285,6 +285,22 @@ fn guarded_split_preparation_applies_external_policy_to_either_side() {
         let (guard, publication) = split_choice(&fixture);
         std::env::set_var("IRLUME_FORBID_EXTERNAL_CAMERAS", "0");
         std::env::remove_var("IRLUME_CAMERA_REQUIRE_FIXED");
+        // The split built-in rule (ADR-0032, amendment 2026-10-13): an
+        // external side refuses until the owner allows external split cameras.
+        let Err(refused) = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+        else {
+            panic!("an external split side needs the owner's allowance");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("split camera pairs use built-in cameras"),
+            "{refused}"
+        );
+        irlume_common::config::write_kv("settings.conf", "allow_external_split_cameras", "1")
+            .unwrap();
         drop(
             shared
                 .engine
@@ -304,6 +320,72 @@ fn guarded_split_preparation_applies_external_policy_to_either_side() {
             .is_err());
         assert!(recorder.calls().is_empty());
     }
+}
+
+/// The privileged window hint for a split host (ADR-0032, amendment
+/// 2026-10-13, section 8) needs both admitted split Authentication and a
+/// published authorization record; neither alone reserves the longer window.
+#[test]
+fn split_collection_is_possible_only_with_admission_and_an_authorization() {
+    let _env = env_guard();
+    let empty = Fixture::new(false);
+    assert!(!crate::request_preparation::split_collection_possible());
+    {
+        let _admitted = empty
+            .recorder
+            .admit_split_trust(&[irlume_camera::lease::CameraOperationKind::Authentication]);
+        assert!(
+            !crate::request_preparation::split_collection_possible(),
+            "admission without an authorization record"
+        );
+    }
+    drop(empty);
+    let fixture = Fixture::new(true);
+    fixture.select_split();
+    assert!(
+        !crate::request_preparation::split_collection_possible(),
+        "an authorization record without admission"
+    );
+    let _admitted = fixture
+        .recorder
+        .admit_split_trust(&[irlume_camera::lease::CameraOperationKind::Authentication]);
+    assert!(crate::request_preparation::split_collection_possible());
+}
+
+/// The PAD vote ring and the capture-setup timer are request-local: the outer
+/// request scope clears them on every exit, so a later split diagnostic or
+/// liveness self-test never reads a finished request's votes as pending state.
+/// Found on the archhost split rig (2026-10-13): after a split enrollment the
+/// self-test refused with "split diagnostics cannot enter a pending Engine
+/// request".
+#[test]
+fn the_outer_request_scope_clears_request_local_pad_votes() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let fixture = Fixture::new(true);
+    let (guard, publication) = split_choice(&fixture);
+    {
+        let mut scope = shared
+            .engine
+            .prepare_split_enrollment_camera(&guard, &publication)
+            .unwrap();
+        scope.vit_scores.push(0.4);
+        scope.capture_setup_started = Some(std::time::Instant::now());
+    }
+    assert!(
+        shared.engine.vit_scores.is_empty(),
+        "split enrollment scope"
+    );
+    assert!(shared.engine.capture_setup_started.is_none());
+    drop(fixture);
+    let _ordinary = Fixture::new(false);
+    {
+        let mut scope = shared.engine.prepare_camera_request().unwrap();
+        scope.vit_scores.push(0.4);
+        scope.capture_setup_started = Some(std::time::Instant::now());
+    }
+    assert!(shared.engine.vit_scores.is_empty(), "generic scope");
+    assert!(shared.engine.capture_setup_started.is_none());
 }
 
 #[test]

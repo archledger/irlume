@@ -4753,6 +4753,11 @@ fn doctor_run(
         dout!(report, "  {}", irlume_camera::census::render_line(&entry));
     }
     dout!(report, "[doctor] {}", sensor_policy::PAIRED_SUPPORT_NOTE);
+    dout!(
+        report,
+        "[doctor] experimental split pairs: {}",
+        split::experimental_status_line()
+    );
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
     {

@@ -24,7 +24,10 @@ Live-tested on real hardware (Fedora TPM box + Arch TPM box); results below.
 > secondary reader rejects the whole split-containing store. Encryption,
 > primary-snapshot activation and the account template-key lifecycle stay the
 > same. These storage and matching foundations do not enable split enrollment
-> or authentication; ADR-0032's request-path and acceptance gates remain open.
+> or authentication: those stay disabled unless the machine owner opts in to
+> the experimental split pairs (`split_camera_pairs=experimental`, ADR-0032
+> amendment 2026-10-13), and supported activation still awaits the acceptance
+> matrix in #1030.
 
 ## What is stored and what is NOT
 

@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Experimental split camera pairs as a machine-owner opt-in:
+  `sudo irlume split experimental on --yes` saves
+  `split_camera_pairs=experimental`, and after `systemctl restart irlumed`
+  an authorized, selected split pair (an RGB camera and an IR camera on two
+  USB devices) can enroll and authenticate. irlumed reads the setting once at
+  startup; any other value, a malformed line or an unreadable settings.conf
+  keeps split pairs disabled with a startup warning. Split evidence stays
+  sequential and grants only on an IR identity match, and YUYV-only IR
+  cameras stay refused (#887). Where a greeter, lock screen or opted-in
+  privileged prompt would collect a grouped PAD vote, a split attempt
+  collects all five samples from one RGB session and one IR session under
+  its one split operation, so the vote fits the 15-second window that one
+  sample per attempt could not. `irlume split experimental`, `irlume status`
+  and `irlume doctor` show the saved and the running state. On a host whose
+  cameras form only a split pair, sudo, su, doas and polkit offer face once
+  the daemon reports the opt-in in `Health`; the PAM module no longer takes
+  that host's RGB-only standing tier as final. Supported activation still
+  needs the acceptance matrix in #1030 (ADR-0032 amendment 2026-10-13).
+  Thanks to @maurerr for the report in #1061.
+
 - Measurement-only GPU certification-evidence lanes for the recognizer
   on the decision hardware (ADR-0033 phase 4): recorded-frame corpus CPU
   vs GPU at the wired threshold with presentation attacks, recognition
@@ -36,6 +56,13 @@ All notable changes to irlume are documented here. This project adheres to
   stays closed and `CERTIFIED` stays empty (ADR-0033 section 3, #1053).
 
 ### Changed
+
+- Split camera pairs use built-in cameras: both sides must report
+  `removable: fixed`, as a Windows Hello sensor group requires, or the
+  choice refuses before any camera opens. `allow_external_split_cameras=1`
+  in settings.conf allows a deliberate external rig, and
+  `forbid_external_cameras=1` still refuses every external camera
+  (ADR-0032 amendment 2026-10-13 section 3, #1030).
 
 - Custom builds of `irlume-vision` compiled with the `cuda`, `openvino`,
   `tensorrt` or `coreml` execution-provider features no longer register

@@ -182,6 +182,13 @@ fn refusal(reason: &str) -> Error {
     Error::Hardware(reason.into())
 }
 
+/// Whether this thread has an assessment fixture installed. An unreadable
+/// slot counts as installed, so its refusal surfaces through
+/// [`assess_installed`] instead of reaching a physical capture.
+pub(crate) fn fixture_installed() -> bool {
+    !matches!(installed(), Ok(None))
+}
+
 fn installed() -> Result<Option<Rc<Fixture>>> {
     INSTALLED
         .try_with(|slot| {

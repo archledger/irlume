@@ -191,7 +191,10 @@ fn classify(
             });
         }
     }
-    let selection = multi_camera::selection::select_bound_for_account(
+    let forbid_external = irlume_common::PreferencesState::observe()
+        .forbid_external_cameras
+        .unwrap_or(true);
+    let selection = multi_camera::selection::select_bound_for_account_with(
         &candidates,
         &account,
         |scope| match scope {
@@ -205,9 +208,13 @@ fn classify(
                 })
                 .is_some_and(|view| eligible(&view.matching_enrollment(user))),
         },
-        irlume_common::PreferencesState::observe()
-            .forbid_external_cameras
-            .unwrap_or(true),
+        // ADR-0032, amendment 2026-10-13, section 3: a split pair is built in
+        // unless the owner allowed external split cameras.
+        multi_camera::selection::ExternalCameraPolicy {
+            forbid_external,
+            split_built_in_only: forbid_external
+                || !irlume_common::config::allow_external_split_cameras(),
+        },
     );
     let selected = match selection {
         // A pinned split has no legacy or standing fallback.

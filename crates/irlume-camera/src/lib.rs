@@ -213,7 +213,8 @@ pub use sequential_batch::{
     SequentialBatchPhase, SequentialBatchRequest,
 };
 pub use split_capture::{
-    capture_split_pair_observed, capture_split_pair_with_control, SplitPairCapture,
+    capture_split_batch_observed, capture_split_pair_observed, capture_split_pair_with_control,
+    SplitBatchCapture, SplitBatchRequest, SplitPairCapture,
 };
 // Public for exactly one item, `pending_summary`, doctor's read-only view of
 // the store (#429); every record type stays crate-private so no other code

@@ -34,6 +34,10 @@ pub use irlume_camera::capture_qualification::{
     SequentialReason,
 };
 pub use irlume_camera::lease;
+/// The machine owner's experimental split opt-in (ADR-0032, amendment
+/// 2026-10-13), re-exported so the daemon can latch it once at startup and
+/// report it in `Health` without depending on the camera crate directly.
+pub use irlume_camera::lease::{experimental_split_trust, latch_experimental_split_trust};
 /// The evidence-grade measurement types (ADR-0023), re-exported for the
 /// daemon's artifact writer (the contention report is already re-exported
 /// through the capture-qualification group above).
@@ -79,6 +83,9 @@ pub use irlume_camera::{
 };
 /// Resolve explicitly configured devices without camera discovery or image opens.
 pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
+/// Whether a split preparation failed on an external-camera rule the owner
+/// can act on (ADR-0032, amendment 2026-10-13, section 3).
+pub use request_preparation::is_split_external_refusal;
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
@@ -6661,6 +6668,7 @@ impl Engine {
                 &self.ir_dev,
             )
             .is_some()
+                || request_preparation::split_collection_possible()
         })
     }
 
@@ -6670,6 +6678,30 @@ impl Engine {
         service: Option<&str>,
         purpose: AuthenticationPurpose,
         policy: irlume_common::config::FaceSensorPolicy,
+        hint: impl FnOnce() -> bool,
+    ) -> AuthenticationWindow {
+        self.authentication_window_from_with_hints(
+            started,
+            service,
+            purpose,
+            policy,
+            request_preparation::split_collection_possible,
+            hint,
+        )
+    }
+
+    /// [`Self::authentication_window_from_with_hint`] with the split route
+    /// injectable: `split_route` answers whether a split-only host, whose
+    /// standing pair has no IR, may still route a split group (ADR-0032,
+    /// amendment 2026-10-13, section 8). It is read only after every cheap
+    /// exclusion, and only without standing IR.
+    fn authentication_window_from_with_hints(
+        &self,
+        started: std::time::Instant,
+        service: Option<&str>,
+        purpose: AuthenticationPurpose,
+        policy: irlume_common::config::FaceSensorPolicy,
+        split_route: impl FnOnce() -> bool,
         hint: impl FnOnce() -> bool,
     ) -> AuthenticationWindow {
         // Snapshot the explicit override once and count all routing reads in
@@ -6685,11 +6717,12 @@ impl Engine {
                 service,
                 purpose,
                 policy,
-                self.ir_available && self.has_vit_pad() && self.has_pad_ir(),
+                self.has_vit_pad() && self.has_pad_ir(),
                 true,
                 true,
             )
-            && irlume_common::config::privileged_grouped_pad_evidence_enabled();
+            && irlume_common::config::privileged_grouped_pad_evidence_enabled()
+            && (self.ir_available || split_route());
         AuthenticationWindow::from_started(
             started,
             privileged_budget_for_route(base, override_ms.is_some(), candidate, hint)

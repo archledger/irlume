@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright the irlume contributors.
 
-//! ADR-0031 §4 prerequisite facts for YUYV luma: the reported range of a raw
-//! single-planar format, one frame's footroom and chroma, the session latch
-//! over them and the fixed limited-to-full luma expansion. Pure. It yields no
-//! ceiling and no attestation, and `clipping_white_level` stays `None` for
-//! YUYV.
+//! ADR-0031 §4 for YUYV luma: the reported range of a raw single-planar
+//! format, one frame's footroom and chroma, the session latch over them, and
+//! the clipping ceiling of one burst that all of them and the burst's own
+//! emitter alternation qualify. Pure. `clipping_white_level` stays `None` for
+//! YUYV: the format alone never names a ceiling, only a judged burst does.
 //!
 //! Discriminants always come from the generated `v4l::v4l_sys` constants. No
 //! raw value is converted to an enum: unknown and unsupported values stay
 //! unresolved and refuse. Nothing here opens a device or logs: `yuyv_fd`
 //! reads the format from the fd, and `IrSession` offers the latch every frame
-//! the stream delivers to its bursts. The latch only refuses and nothing
-//! reads it yet; the expansion has no caller until the ceiling.
+//! the stream delivers to its bursts and asks it for each burst's ceiling.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "ADR-0031 §4 pure prerequisite; inspect_yuyv_frame, exposure_prerequisite, the frame facts' accessors, the latch's verdict and the limited-to-full expansion have no production caller before the ceiling"
+        reason = "ADR-0031 §4 pure prerequisite; inspect_yuyv_frame, exposure_prerequisite and the frame facts' accessors have no production caller: the latch reads frames through frame_refusal"
     )
 )]
 
 use crate::frame_provenance::{DequeuedBufferError, PayloadLayout};
+use crate::ir_emitter::{D1MetadataEvidence, D1OpticalEvidence};
 use crate::ValidatedDequeueError;
 use v4l::v4l_sys;
 
@@ -592,23 +592,88 @@ fn frame_refusal(raw: &RawYuyvFormat, payload: &[u8]) -> ContentRefusal {
     shown
 }
 
-/// Limited-range raw luma expanded to full range: 0 for `y <= 16`, 255 for
-/// `y >= 235`, and `round((y - 16) * 255 / 219)` between, which never lands
-/// on a half because 219 is odd, so `E(234) = 254`. A fixed map, never
-/// scaled by a frame's own values (ADR-0031 §4, Amendment 2026-10-07).
-///
-/// The content checks run on raw bytes before it, since raw 14, 15 and 16
-/// all expand to 0. Nothing calls it until the ceiling: decoding YUYV
-/// through it now would move IR face detection, the gate frame and the
-/// enrollment preflight's lit test.
-pub(crate) const fn expand_limited_luma(y: u8) -> u8 {
-    if y <= 16 {
-        0
-    } else if y >= 235 {
-        u8::MAX
-    } else {
-        // At most 218 * 510 + 219 = 111,399, whose quotient is 254.
-        (((y - 16) as u32 * 510 + 219) / 438) as u8
+/// The clipping ceiling of a qualified YUYV burst, on the raw luma the IR
+/// decode keeps. Limited range rails at 235, the ceiling limited-range GREY
+/// already answers (`clipping_white_level`); the decode is not expanded to
+/// full range (ADR-0031 §4, Amendment 2026-10-13).
+pub(crate) const YUYV_LIMITED_WHITE_LEVEL: u8 = 235;
+
+/// Why one burst of a session with fd-bound format evidence has no clipping
+/// ceiling. Each refusal leaves the burst's ceiling unknown, so credential
+/// release refuses it as exposure unmeasurable.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CeilingRefusal {
+    /// The frozen format does not resolve to eligible limited range.
+    Range(MetadataRefusal),
+    /// A frame offered so far in this session violated the content bounds.
+    Content(ContentRefusal),
+    /// The latch did not judge exactly the burst's frames.
+    Unjudged { judged: u64, frames: usize },
+    /// The camera's illumination records break the alternation's parity.
+    IlluminationContradicts,
+    /// The burst's raw luma means do not prove frame-locked emitter
+    /// alternation.
+    NoAlternation,
+}
+
+impl std::fmt::Display for CeilingRefusal {
+    /// The reason by name, for the debug journal; never a pixel value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Range(refusal) => write!(f, "format range refused: {refusal:?}"),
+            Self::Content(refusal) => write!(f, "content latch set: {refusal}"),
+            Self::Unjudged { judged, frames } => {
+                write!(
+                    f,
+                    "the latch judged {judged} of the burst's {frames} frames"
+                )
+            }
+            Self::IlluminationContradicts => {
+                f.write_str("illumination records contradict the emitter alternation")
+            }
+            Self::NoAlternation => f.write_str("no emitter alternation proven on this burst"),
+        }
+    }
+}
+
+impl YuyvContentLatch {
+    /// ADR-0031 §4's ceiling for one burst, decided after the burst
+    /// (Amendment 2026-10-13). `judged_before` is [`Self::inspected`] read
+    /// just before the burst's first dequeue; `frames` holds each burst
+    /// frame's raw V4L2 sequence and raw luma mean in dequeue order, and
+    /// `illumination` the same frames' camera records (`Some(true)` lit).
+    ///
+    /// It answers [`YUYV_LIMITED_WHITE_LEVEL`] only when the frozen format
+    /// resolves to eligible limited range, no frame offered so far in the
+    /// session violated the content bounds, the latch judged exactly these
+    /// frames, the camera's records do not break the alternation's parity,
+    /// and the raw means prove D1 alternation with the setup proof's rules
+    /// unchanged. Nothing carries over between bursts: a proven burst never
+    /// qualifies the next one.
+    pub(crate) fn burst_ceiling(
+        &self,
+        judged_before: u64,
+        frames: &[(u32, f32)],
+        illumination: &[(u32, Option<bool>)],
+    ) -> Result<u8, CeilingRefusal> {
+        limited_range_eligibility(&self.raw).map_err(CeilingRefusal::Range)?;
+        if let Some(refusal) = self.refusal() {
+            return Err(CeilingRefusal::Content(refusal));
+        }
+        let judged = self.inspected.saturating_sub(judged_before);
+        if usize::try_from(judged).ok() != Some(frames.len()) {
+            return Err(CeilingRefusal::Unjudged {
+                judged,
+                frames: frames.len(),
+            });
+        }
+        if D1MetadataEvidence::from_sequence_flags(illumination).contradicts_d1() {
+            return Err(CeilingRefusal::IlluminationContradicts);
+        }
+        if !D1OpticalEvidence::from_sequence_means(frames).proves_d1() {
+            return Err(CeilingRefusal::NoAlternation);
+        }
+        Ok(YUYV_LIMITED_WHITE_LEVEL)
     }
 }
 
@@ -1713,73 +1778,353 @@ mod tests {
         );
     }
 
-    #[test]
-    fn x01_expansion_matches_exact_rounding_on_every_input() {
-        for y in 0..=u8::MAX {
-            // `(Y - 16) * 255 / 219` never lands on a half: 510 * (Y - 16) is
-            // even and 219 is odd, so the f64 rounding mode cannot matter.
-            if (16..=235).contains(&y) {
-                assert_ne!(510 * (u32::from(y) - 16) % 438, 219, "Y {y}");
-            }
-            let exact = ((f64::from(y) - 16.0) * 255.0 / 219.0)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            assert_eq!(expand_limited_luma(y), exact, "Y {y}");
+    /// Offer `count` clean frames to `latch`, alternating raw luma 60 and
+    /// 20, and return its count from before them, the capture's
+    /// `judged_before`.
+    fn judge_clean(latch: &mut YuyvContentLatch, count: usize) -> u64 {
+        let before = latch.inspected();
+        for i in 0..count {
+            let luma = if i % 2 == 0 { 60 } else { 20 };
+            assert_eq!(latch.observe(&flat_bytes(2, 1, luma, 128)), None);
         }
+        before
+    }
+
+    /// `count` frames from raw sequence `first`, each frame's raw luma mean
+    /// `bright` on even sequences and `dark` on odd ones.
+    fn sequenced(
+        sequences: impl IntoIterator<Item = u32>,
+        bright: f32,
+        dark: f32,
+    ) -> Vec<(u32, f32)> {
+        sequences
+            .into_iter()
+            .map(|sequence| (sequence, if sequence % 2 == 0 { bright } else { dark }))
+            .collect()
+    }
+
+    fn burst(first: u32, count: u32, bright: f32, dark: f32) -> Vec<(u32, f32)> {
+        sequenced((0..count).map(|i| first.wrapping_add(i)), bright, dark)
+    }
+
+    /// The camera said nothing about these frames' illumination.
+    fn unsaid(frames: &[(u32, f32)]) -> Vec<(u32, Option<bool>)> {
+        frames
+            .iter()
+            .map(|&(sequence, _)| (sequence, None))
+            .collect()
+    }
+
+    /// A ten-frame burst on a fresh latch that judged exactly its frames.
+    fn ceiling_of(frames: &[(u32, f32)]) -> Result<u8, CeilingRefusal> {
+        let mut latch = fresh(2, 1);
+        let before = judge_clean(&mut latch, frames.len());
+        latch.burst_ceiling(before, frames, &unsaid(frames))
     }
 
     #[test]
-    fn x02_expansion_endpoints_and_footroom() {
-        for (y, expanded) in [
-            (0, 0),
-            (14, 0),
-            (15, 0),
-            (16, 0),
-            (17, 1),
-            (40, 28),
-            (50, 40),
-            (234, 254),
-            (235, 255),
-            (255, 255),
+    fn b01_a_qualified_burst_rails_at_the_limited_grey_ceiling() {
+        assert_eq!(ceiling_of(&burst(100, 10, 60.0, 20.0)), Ok(235));
+        assert_eq!(
+            Some(YUYV_LIMITED_WHITE_LEVEL),
+            crate::clipping_white_level(crate::IrPixel::Grey8, Quantization::LimitedRange),
+            "limited YUYV and limited GREY name one ceiling on the raw decode"
+        );
+        for quantization in [
+            Quantization::Default,
+            Quantization::FullRange,
+            Quantization::LimitedRange,
         ] {
-            assert_eq!(expand_limited_luma(y), expanded, "Y {y}");
-        }
-        for y in 0..=u8::MAX {
-            assert_eq!(expand_limited_luma(y) == 255, y >= 235, "Y {y}");
-            assert_eq!(expand_limited_luma(y) == 0, y <= 16, "Y {y}");
-        }
-        for y in 111..=116 {
-            assert_eq!(expand_limited_luma(y), y, "Y {y} is a fixed point");
-        }
-    }
-
-    #[test]
-    fn x03_expansion_is_monotone() {
-        for y in 0..u8::MAX {
-            let (low, high) = (expand_limited_luma(y), expand_limited_luma(y + 1));
-            assert!(low <= high, "Y {y}");
-            assert!(high - low <= 2, "Y {y}");
-        }
-    }
-
-    #[test]
-    fn x04_expansion_does_not_round_low_like_298_over_256() {
-        for (y, expanded) in [
-            (86, 82),
-            (147, 153),
-            (153, 160),
-            (159, 167),
-            (214, 231),
-            (220, 238),
-            (226, 245),
-            (232, 252),
-        ] {
-            assert_eq!(expand_limited_luma(y), expanded, "Y {y}");
             assert_eq!(
-                ((u32::from(y) - 16) * 298 + 128) >> 8,
-                u32::from(expanded) - 1,
-                "298/256 reads Y {y} one low"
+                crate::clipping_white_level(crate::IrPixel::YuyvLuma, quantization),
+                None,
+                "the format alone never names a YUYV ceiling"
             );
+        }
+    }
+
+    /// §4's T480 frames, judged and measured the way a capture does: lit
+    /// frames of flat chroma 128 at the lowest face-distance lit mean §4
+    /// records (39), dark frames of raw luma 16 to 20 and chroma 137. The
+    /// lift is 21 over the setup proof's 20, so this burst qualifies by one
+    /// point; a lit mean of 37 does not.
+    #[test]
+    fn b02_t480_shaped_frames_qualify_by_one_point() {
+        let (width, height) = (340_u32, 340_u32);
+        let (w, h) = (width as usize, height as usize);
+        for (lit_luma, expected) in [(39_u8, Ok(235)), (37, Err(CeilingRefusal::NoAlternation))] {
+            let mut latch = fresh(width, height);
+            let before = latch.inspected();
+            let mut frames = Vec::new();
+            for sequence in 200_u32..210 {
+                let payload = if sequence % 2 == 0 {
+                    flat_bytes(w, h, lit_luma, 128)
+                } else {
+                    dark_bytes(w, h, &[])
+                };
+                assert_eq!(latch.observe(&payload), None, "frame {sequence}");
+                let luma = crate::decode_ir(&payload, crate::IrPixel::YuyvLuma, width, height);
+                let mean = luma.iter().map(|&y| f64::from(y)).sum::<f64>() / luma.len() as f64;
+                frames.push((sequence, mean as f32));
+            }
+            assert_eq!(
+                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                expected,
+                "lit {lit_luma}"
+            );
+        }
+    }
+
+    #[test]
+    fn b03_the_frozen_range_must_be_eligible_limited() {
+        for (change, refusal) in [
+            (
+                (|raw: &mut RawYuyvFormat| raw.quantization = FULL) as fn(&mut RawYuyvFormat),
+                MetadataRefusal::FullRange,
+            ),
+            (|raw| raw.ycbcr_enc = XV601, MetadataRefusal::ExtendedGamut),
+            (|raw| raw.ycbcr_enc = XV709, MetadataRefusal::ExtendedGamut),
+            (
+                |raw| {
+                    raw.quantization = LIM;
+                    raw.colorspace = JPEG;
+                },
+                MetadataRefusal::JpegColorspace,
+            ),
+        ] {
+            let mut raw = with(|raw| {
+                raw.width = 2;
+                raw.height = 1;
+                raw.bytesperline = 4;
+            });
+            change(&mut raw);
+            let mut latch = YuyvContentLatch::new(raw);
+            let frames = burst(100, 10, 60.0, 20.0);
+            let before = judge_clean(&mut latch, frames.len());
+            assert_eq!(
+                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                Err(CeilingRefusal::Range(refusal))
+            );
+        }
+        let mut unresolved = YuyvContentLatch::new(with(|raw| {
+            raw.width = 2;
+            raw.height = 1;
+            raw.bytesperline = 4;
+            raw.ext_pix_format_supported = false;
+        }));
+        let frames = burst(100, 10, 60.0, 20.0);
+        let before = judge_clean(&mut unresolved, frames.len());
+        assert!(matches!(
+            unresolved.burst_ceiling(before, &frames, &unsaid(&frames)),
+            Err(CeilingRefusal::Range(MetadataRefusal::Unresolved(_)))
+        ));
+    }
+
+    #[test]
+    fn b04_a_content_violation_refuses_every_later_burst_of_the_session() {
+        let mut latch = fresh(2, 1);
+        let frames = burst(100, 10, 60.0, 20.0);
+        let before = judge_clean(&mut latch, frames.len());
+        assert_eq!(
+            latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+            Ok(235)
+        );
+
+        // One frame of the next burst splits its chroma, then nine clean.
+        let before = latch.inspected();
+        assert_eq!(latch.observe(&[60, 128, 60, 140]), Some(CHROMA));
+        judge_clean(&mut latch, 9);
+        let next = burst(110, 10, 60.0, 20.0);
+        assert_eq!(
+            latch.burst_ceiling(before, &next, &unsaid(&next)),
+            Err(CeilingRefusal::Content(CHROMA))
+        );
+        // A clean, alternating third burst does not clear it.
+        let before = judge_clean(&mut latch, 10);
+        let third = burst(120, 10, 60.0, 20.0);
+        assert_eq!(
+            latch.burst_ceiling(before, &third, &unsaid(&third)),
+            Err(CeilingRefusal::Content(CHROMA))
+        );
+    }
+
+    #[test]
+    fn b05_the_latch_must_have_judged_exactly_the_burst() {
+        let frames = burst(100, 10, 60.0, 20.0);
+        for offered in [0, 9, 11] {
+            let mut latch = fresh(2, 1);
+            let before = judge_clean(&mut latch, offered);
+            assert_eq!(
+                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                Err(CeilingRefusal::Unjudged {
+                    judged: offered as u64,
+                    frames: 10
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn b06_the_burst_must_prove_alternation_at_the_unchanged_threshold() {
+        let flat: Vec<(u32, f32)> = (100..110).map(|sequence| (sequence, 60.0)).collect();
+        let ramp: Vec<(u32, f32)> = (100..110)
+            .map(|sequence| (sequence, 20.0 + 5.0 * (sequence - 100) as f32))
+            .collect();
+        for (frames, expected, case) in [
+            (burst(100, 10, 60.0, 40.0), Ok(235), "a lift of exactly 20"),
+            (
+                burst(100, 10, 59.9, 40.0),
+                Err(CeilingRefusal::NoAlternation),
+                "a lift of 19.9",
+            ),
+            (
+                burst(101, 10, 20.0, 60.0),
+                Ok(235),
+                "the bright phase on odd sequences",
+            ),
+            (flat, Err(CeilingRefusal::NoAlternation), "a steady emitter"),
+            (
+                ramp,
+                Err(CeilingRefusal::NoAlternation),
+                "an auto-exposure ramp",
+            ),
+            (
+                burst(100, 5, 60.0, 20.0),
+                Err(CeilingRefusal::NoAlternation),
+                "fewer than three frames per phase",
+            ),
+        ] {
+            assert_eq!(ceiling_of(&frames), expected, "{case}");
+        }
+        let mut unreadable = burst(100, 10, 60.0, 20.0);
+        unreadable[3].1 = f32::NAN;
+        assert_eq!(
+            ceiling_of(&unreadable),
+            Err(CeilingRefusal::NoAlternation),
+            "a NaN mean"
+        );
+    }
+
+    #[test]
+    fn b07_raw_sequences_follow_the_setup_proofs_rules() {
+        let one_drop = sequenced((100..105).chain(106..111), 60.0, 20.0);
+        let two_drops = sequenced((100..104).chain(105..108).chain(109..112), 60.0, 20.0);
+        let wrap = burst(u32::MAX - 4, 10, 60.0, 20.0);
+        let mut repeated = burst(100, 10, 60.0, 20.0);
+        repeated[5] = repeated[4];
+        let mut reversed = burst(100, 10, 60.0, 20.0);
+        reversed.reverse();
+        for (frames, expected, case) in [
+            (one_drop, Ok(235), "one missing frame"),
+            (
+                two_drops,
+                Err(CeilingRefusal::NoAlternation),
+                "two missing frames",
+            ),
+            (wrap, Ok(235), "a u32 sequence wrap"),
+            (
+                repeated,
+                Err(CeilingRefusal::NoAlternation),
+                "a repeated sequence",
+            ),
+            (
+                reversed,
+                Err(CeilingRefusal::NoAlternation),
+                "a reversed burst",
+            ),
+        ] {
+            assert_eq!(ceiling_of(&frames), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn b08_illumination_records_can_veto_but_never_stand_in() {
+        let frames = burst(100, 10, 60.0, 20.0);
+        let agreeing: Vec<(u32, Option<bool>)> = frames
+            .iter()
+            .map(|&(sequence, _)| (sequence, Some(sequence % 2 == 0)))
+            .collect();
+        let mut broken = agreeing.clone();
+        broken[3].1 = Some(true);
+        let mut partial = unsaid(&frames);
+        partial[2].1 = Some(true);
+        partial[3].1 = Some(false);
+        for (records, expected, case) in [
+            (
+                agreeing.clone(),
+                Ok(235),
+                "records agreeing with the optics",
+            ),
+            (partial, Ok(235), "two records"),
+            (
+                broken,
+                Err(CeilingRefusal::IlluminationContradicts),
+                "a parity break",
+            ),
+        ] {
+            let mut latch = fresh(2, 1);
+            let before = judge_clean(&mut latch, frames.len());
+            assert_eq!(
+                latch.burst_ceiling(before, &frames, &records),
+                expected,
+                "{case}"
+            );
+        }
+        // Records that alternate never replace the optical proof.
+        let steady: Vec<(u32, f32)> = (100..110).map(|sequence| (sequence, 60.0)).collect();
+        let mut latch = fresh(2, 1);
+        let before = judge_clean(&mut latch, steady.len());
+        assert_eq!(
+            latch.burst_ceiling(before, &steady, &agreeing),
+            Err(CeilingRefusal::NoAlternation)
+        );
+    }
+
+    #[test]
+    fn b09_a_proven_burst_never_qualifies_the_next() {
+        let mut latch = fresh(2, 1);
+        let proven = burst(100, 10, 60.0, 20.0);
+        let before = judge_clean(&mut latch, proven.len());
+        assert_eq!(
+            latch.burst_ceiling(before, &proven, &unsaid(&proven)),
+            Ok(235)
+        );
+        let steady: Vec<(u32, f32)> = (110..120).map(|sequence| (sequence, 60.0)).collect();
+        let before = judge_clean(&mut latch, steady.len());
+        assert_eq!(
+            latch.burst_ceiling(before, &steady, &unsaid(&steady)),
+            Err(CeilingRefusal::NoAlternation)
+        );
+    }
+
+    #[test]
+    fn b10_the_journal_names_reasons_without_measurements() {
+        for (refusal, line) in [
+            (
+                CeilingRefusal::Range(MetadataRefusal::FullRange),
+                "format range refused: FullRange",
+            ),
+            (
+                CeilingRefusal::Content(FOOTROOM_AND_CHROMA),
+                "content latch set: footroom, chroma span",
+            ),
+            (
+                CeilingRefusal::Unjudged {
+                    judged: 9,
+                    frames: 10,
+                },
+                "the latch judged 9 of the burst's 10 frames",
+            ),
+            (
+                CeilingRefusal::IlluminationContradicts,
+                "illumination records contradict the emitter alternation",
+            ),
+            (
+                CeilingRefusal::NoAlternation,
+                "no emitter alternation proven on this burst",
+            ),
+        ] {
+            assert_eq!(refusal.to_string(), line);
         }
     }
 }

@@ -542,10 +542,17 @@ pub struct IrCaptureStats {
     /// override, a saved pin, or the `/dev/video2` fallback. In both cases
     /// this `None` is what makes `exposure_refusal` refuse. The descriptor is
     /// a firmware claim about a function, not a guarantee about the frames
-    /// being judged, so it does not lift that refusal: do not add a ceiling
-    /// here until the gates of ADR-0031 §4 hold on the opened device and the
-    /// frames themselves, which is what guarantees the selected node is an
-    /// emitter-lit IR source (#385).
+    /// being judged, so it does not lift that refusal.
+    ///
+    /// Only a judged burst does (ADR-0031 §4, Amendment 2026-10-13). An
+    /// attested YUYV camera with fd-bound format evidence gets 235, on the
+    /// raw decode as for limited GREY, for one burst at a time: when its
+    /// frozen format resolves to eligible limited range, no frame its session
+    /// offered the content latch violated the bounds, the latch judged
+    /// exactly that burst's frames, and the burst's own raw luma means prove
+    /// frame-locked emitter alternation that the camera's illumination
+    /// records, if any, do not contradict. Otherwise this stays `None`
+    /// (#385, #887).
     pub white_level: Option<u8>,
     /// Whole-frame clipping in the selected metadata-lit frame. This is
     /// diagnostic evidence only, not a grant gate. `None` means the capture
@@ -6569,7 +6576,8 @@ fn grey16_shift(buf: &[u8]) -> u32 {
 
 /// The decoded value that means "at or above the sensor's ceiling" for a
 /// negotiated IR format, or `None` when the decode cannot carry that claim.
-/// See [`IrCaptureStats::white_level`] for why only the 8-bit greys qualify.
+/// See [`IrCaptureStats::white_level`] for why only the 8-bit greys qualify
+/// by format, and how a judged YUYV burst can still name one.
 ///
 /// GREY is a luma-only Y' format, so its ceiling depends on the quantization
 /// the driver reports: full range puts white at 255, limited range at 235. A
@@ -7324,8 +7332,10 @@ pub struct IrSession<'a> {
     /// ADR-0031 §4's footroom and chroma latch, built once from the camera's
     /// fd evidence and `None` without it. Every frame the stream delivers to
     /// a burst is offered to it before decode. Recovery recreates `dec` but
-    /// keeps the latch, and privacy teardown keeps both. It only refuses, and
-    /// nothing reads it until the ceiling.
+    /// keeps the latch, and privacy teardown keeps both. It only refuses:
+    /// each burst asks it for that burst's clipping ceiling (Amendment
+    /// 2026-10-13), and a latched violation leaves every later burst of the
+    /// session without one.
     content: Option<yuyv_exposure::YuyvContentLatch>,
     lit: bool,
     /// The camera's own per-frame illumination reporting, when it has any.
@@ -7419,7 +7429,10 @@ impl IrSession<'_> {
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
-        let white_level = self.dec.white_level();
+        // The format's own ceiling. YUYV luma names none, so its bursts never
+        // end early on a plateau below and its ceiling is decided after the
+        // burst, from the burst's frames.
+        let format_white_level = self.dec.white_level();
         let binding = lease
             .frame_binding(device, contracts::StreamRole::Ir)
             .map_err(|error| Error::Hardware(error.to_string()))?;
@@ -7452,6 +7465,9 @@ impl IrSession<'_> {
         let stream = &mut self.stream;
         let dec = &mut self.dec;
         let content = &mut self.content;
+        // The latch's count before this burst, so the burst's ceiling can
+        // check that the latch judged exactly the frames it is asked about.
+        let judged_before = content.as_ref().map(|latch| latch.inspected());
         // The emitter may STROBE (pulse), so grab a burst and keep the brightest
         // frame, the lit strobe phase (linhello lesson). Keep every frame so the
         // optional ambient subtraction below can pair the lit frame with an
@@ -7467,6 +7483,9 @@ impl IrSession<'_> {
         // metadata queues for every frame of a 24-frame run; dequeue order is
         // NOT used, because the two queues are drained independently.
         let mut stamps: Vec<i64> = Vec::with_capacity(IR_BURST);
+        // Each frame's raw V4L2 sequence, the parity the YUYV ceiling's
+        // emitter proof is read against; never the vector index.
+        let mut sequences: Vec<u32> = Vec::with_capacity(IR_BURST);
         let mut meta = self.meta.as_mut();
         // A session is reused across captures, so last burst's records are both
         // useless and unbounded growth if kept.
@@ -7492,6 +7511,7 @@ impl IrSession<'_> {
                 .require_endpoint(device)
                 .map_err(|error| Error::Hardware(error.to_string()))?;
             stamps.push(bmeta.timestamp_micros());
+            sequences.push(sequence.raw());
             let frame_taken = std::time::Instant::now();
             taken.push(frame_taken);
             dequeue_evidence.push((bmeta, sequence, timestamp, frame_taken, rate_evidence));
@@ -7506,7 +7526,7 @@ impl IrSession<'_> {
             }
             if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {
                 irlume_common::dlog!(
-                    "[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}",
+                    "[ir] {}: YUYV content latch set for this session, so its bursts get no clipping ceiling: {newly}",
                     camera_text(device)
                 );
             }
@@ -7521,7 +7541,7 @@ impl IrSession<'_> {
             // record can lag one drain, which at worst delays the exit by
             // one frame (the tail's authoritative drain still makes the
             // final selection).
-            if let Some(w) = white_level {
+            if let Some(w) = format_white_level {
                 let flags_now: Vec<Option<ir_metadata::Illumination>> = match meta.as_mut() {
                     Some(log) => stamps.iter().map(|&t| log.illumination_at(t)).collect(),
                     None => vec![None; stamps.len()],
@@ -7548,6 +7568,47 @@ impl IrSession<'_> {
             None => vec![None; means.len()],
         };
         let from_camera = flags.iter().filter(|f| f.is_some()).count();
+        // The clipping ceiling the rest of this capture uses (ADR-0031 §4,
+        // Amendment 2026-10-13). GREY's comes from its format. YUYV luma names
+        // none by format, so a camera with fd-bound evidence asks its session
+        // latch about this burst's own frames, now that all of them are in.
+        let white_level = match (format_white_level, content.as_ref(), judged_before) {
+            (Some(level), _, _) => Some(level),
+            (None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {
+                let judged: Vec<(u32, f32)> = sequences
+                    .iter()
+                    .zip(&means)
+                    .map(|(&sequence, &mean)| (sequence, mean as f32))
+                    .collect();
+                let illumination: Vec<(u32, Option<bool>)> = sequences
+                    .iter()
+                    .zip(&flags)
+                    .map(|(&sequence, flag)| {
+                        (
+                            sequence,
+                            flag.map(|f| matches!(f, ir_metadata::Illumination::Lit)),
+                        )
+                    })
+                    .collect();
+                match latch.burst_ceiling(judged_before, &judged, &illumination) {
+                    Ok(level) => {
+                        irlume_common::dlog!(
+                            "[ir] {}: YUYV clipping ceiling {level} for this burst",
+                            camera_text(device)
+                        );
+                        Some(level)
+                    }
+                    Err(refusal) => {
+                        irlume_common::dlog!(
+                            "[ir] {}: no YUYV clipping ceiling for this burst: {refusal}",
+                            camera_text(device)
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         // Per-frame comparison of the two answers, for measuring how often the
         // old threshold disagreed with the camera. A disagreement is the whole
         // reason this path exists, and it can only be observed against a scene
@@ -13059,11 +13120,14 @@ mod tests {
                 "            content: self",
                 "    content: Option<yuyv_exposure::YuyvContentLatch>,",
                 "        let content = &mut self.content;",
+                "        let judged_before = content.as_ref().map(|latch| latch.inspected());",
                 "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
-                "                    \"[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}\",",
+                "                    \"[ir] {}: YUYV content latch set for this session, so its bursts get no clipping ceiling: {newly}\",",
+                "        let white_level = match (format_white_level, content.as_ref(), judged_before) {",
             ],
-            "the literal builds the latch, the field holds it, and only the burst's borrow \
-             and its observe touch it; a line that reassigns, takes or clears it fails here"
+            "the literal builds the latch, the field holds it, and only the burst's borrow, \
+             its observe and two shared reads (the count before the burst and the burst's \
+             ceiling) touch it; a line that reassigns, takes or clears it fails here"
         );
         assert!(
             !source_code_lines(include_str!("paired_processing.rs")).any(names_content),
@@ -13123,7 +13187,7 @@ mod tests {
             "stream.next()",
             "latch.observe(buf)",
             "dec.decode(buf, w, h)",
-            "if let Some(w) = white_level",
+            "if let Some(w) = format_white_level",
         ] {
             let at = capture[from..]
                 .find(step)
@@ -13161,6 +13225,67 @@ mod tests {
                 !source_code_lines(&burst[dequeued..decoded]).any(|line| line.contains(skip)),
                 "{skip} between the dequeue and the decode could pass a frame by the latch"
             );
+        }
+    }
+
+    /// ADR-0031 §4 (Amendment 2026-10-13): a YUYV burst's clipping ceiling
+    /// is decided after the burst, from the burst's own frames. Before the
+    /// burst only the format's ceiling exists, and it alone drives the
+    /// plateau exit, so a YUYV burst, which has none, always runs to the cap.
+    /// Every frame's raw sequence is kept for the emitter proof. The ceiling
+    /// the selection, the paired saturation evidence and the stats read is
+    /// bound once, after the illumination records and before the first of
+    /// them.
+    #[test]
+    fn the_yuyv_ceiling_is_decided_after_the_burst_from_its_frames() {
+        let lib = include_str!("lib.rs");
+        let session = &lib[lib
+            .find("\nimpl IrSession<'_> {")
+            .expect("impl IrSession moved; update this test")..];
+        let start = session
+            .find("fn capture_with_stats_inner(")
+            .expect("capture_with_stats_inner moved; update this test");
+        let end = session[start..]
+            .find("\n    }\n")
+            .expect("a method that ends at column 4");
+        let capture = &session[start..start + end];
+        let (before, rest) = capture
+            .split_once("\n        for _ in 0..IR_BURST {\n")
+            .expect("the burst loop moved; update this test");
+        let (burst, after) = rest
+            .split_once("\n        }\n")
+            .expect("the burst loop ends at column 8");
+        assert!(before.contains("let format_white_level = self.dec.white_level();"));
+        assert!(
+            before.contains("let judged_before = content.as_ref().map(|latch| latch.inspected());")
+        );
+        assert!(burst.contains("\n            sequences.push(sequence.raw());\n"));
+        assert!(burst.contains("if let Some(w) = format_white_level {"));
+        for (part, name) in [(before, "before"), (burst, "inside")] {
+            assert!(
+                !source_code_lines(part).any(|line| line
+                    .replace("format_white_level", "")
+                    .replace("self.dec.white_level()", "")
+                    .contains("white_level")),
+                "no burst ceiling exists {name} the burst"
+            );
+        }
+        assert_eq!(capture.matches("let white_level").count(), 1, "one binding");
+        assert_eq!(capture.matches("burst_ceiling(").count(), 1, "one question");
+        let mut from = 0;
+        for step in [
+            "let flags: Vec<Option<ir_metadata::Illumination>>",
+            "let white_level = match (format_white_level, content.as_ref(), judged_before) {",
+            "(None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {",
+            "latch.burst_ceiling(judged_before, &judged, &illumination)",
+            "let clipped_fracs",
+            "paired_saturation_evidence(",
+            "white_level,",
+        ] {
+            let at = after[from..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step} is missing or out of order"));
+            from += at + step.len();
         }
     }
 
@@ -19198,9 +19323,9 @@ mod tests {
         assert_eq!(decode_ir(&buf, IrPixel::Grey16, 2, 1), vec![255, 0]);
     }
 
-    /// The limited-to-full expansion stays unwired (ADR-0031 §4, Amendment
-    /// 2026-10-07): a YUYV session decodes the raw luma bytes under every
-    /// reported quantization and still claims no ceiling.
+    /// A YUYV session decodes the raw luma bytes, unexpanded, under every
+    /// reported quantization, and its decoder claims no ceiling: only a
+    /// judged burst names one (ADR-0031 §4, Amendment 2026-10-13).
     #[test]
     fn a_yuyv_session_still_decodes_raw_luma() {
         let payload: Vec<u8> = (0..=u8::MAX).flat_map(|luma| [luma, 128]).collect();
@@ -22157,13 +22282,23 @@ mod tests {
         camera.format_evidence = Some(frozen);
         let mut session = camera.session().expect("the driver keeps its tuple");
         assert_eq!(latched(&session), (0, None), "warm-up and the rate fill");
-        session
+        let (_, stats) = session
             .capture_with_stats()
             .expect("a capture through every boundary");
         let (first, refused) = latched(&session);
         assert!((1..=IR_BURST as u64).contains(&first), "{first} judged");
-        if !yuyv {
+        if yuyv {
+            if refused.is_some() {
+                assert_eq!(
+                    stats.white_level, None,
+                    "a latched violation leaves no ceiling"
+                );
+            }
+        } else {
             assert_eq!(refused, Some(unreadable));
+            // Amendment 2026-10-13: only a YUYV decode asks the latch, so a
+            // GREY format keeps its own ceiling whatever the latch holds.
+            assert_eq!(stats.white_level, session.dec.white_level());
         }
         session.recover().expect("recovery reopens and rechecks");
         assert_eq!(latched(&session), (first, refused), "recovery keeps it");

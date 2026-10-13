@@ -6,7 +6,8 @@ Accepted 2026-09-27 for §1, §2, §3 and §5, which land with the change that
 fixes the classification half of #887. §4, a sensor ceiling for YUYV luma,
 is recorded here and pending: §4 records what the reporter measured on the
 ThinkPad T480, and the ceiling is not implemented, so every YUYV IR frame
-stays refused as exposure unmeasurable. Depends on ADR-0029 §1 and §9
+stays refused as exposure unmeasurable. Amendment 2026-10-13 implements §4
+per burst; it is not yet qualified on the T480. Depends on ADR-0029 §1 and §9
 (camera-free classification; selection never opens a device it will not
 use). Changes nothing in ADR-0023 §3 (profiles still cannot classify),
 ADR-0024's pair authorization, ADR-0019 or the exposure refusal of #358 and
@@ -190,7 +191,7 @@ rule:
 Pairing across USB devices needs its own ADR, amending ADR-0029 §1,
 ADR-0024 and ADR-0007.
 
-### 4. A sensor ceiling for attested YUYV luma (pending, not implemented)
+### 4. A sensor ceiling for attested YUYV luma (per burst since Amendment 2026-10-13)
 
 `clipping_white_level` keeps answering `None` for YUYV luma, attested or
 not, so every credential-releasing attempt on a YUYV IR stream is refused as
@@ -219,7 +220,9 @@ under either quantization, and adds no ceiling. Amendment 2026-10-07
 binds the first two conditions to the open file descriptor, again without
 a ceiling. A second amendment of that date latches the footroom and
 chroma conditions for the session and fixes the expansion, still without
-a ceiling.
+a ceiling. Amendment 2026-10-13 implements the ceiling for each burst that
+meets these conditions, and replaces the last one: the decode stays raw and
+the ceiling is 235.
 
 Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
 
@@ -242,8 +245,9 @@ Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
   its first four frames before they fell to about 55. A statistic taken from
   one window depends on where in the ramp it lands.
 
-The ceiling stays unbuilt, and #385's item 2 with it, until a change
-implements these conditions against the measurement.
+The ceiling stayed unbuilt, and #385's item 2 with it, until a change
+implemented these conditions against the measurement (Amendment
+2026-10-13).
 
 ### 5. The IR frame size for attested YUYV
 
@@ -565,3 +569,78 @@ node: warm-up and the rate fill leave it empty, each burst frame latches
 recovered stream's burst. No real-kernel lane streams attested YUYV, so
 the T480 still needs attended qualification. The burst's emitter
 alternation and the ceiling remain.
+
+## Amendment 2026-10-13: the ceiling, judged per burst
+
+#887. This amendment implements §4. A burst of an IR session whose camera
+holds fd-bound format evidence (Amendment 2026-10-07) gets a clipping ceiling
+of 235 on the raw luma decode, for that burst alone, when all of these hold
+once the burst has ended (`YuyvContentLatch::burst_ceiling` in
+`crates/irlume-camera/src/yuyv_exposure.rs`):
+
+- the frozen format resolves to eligible limited range (Amendment
+  2026-10-06);
+- the session's content latch holds no refusal: no frame offered in the
+  session so far, this burst's included, broke the footroom, chroma,
+  payload-length or readability rule;
+- the latch judged exactly the burst's frames: its count rose by the number
+  of frames the burst decoded;
+- the camera's illumination records for those frames, where it has any, do
+  not break D1 parity (`D1MetadataEvidence::contradicts_d1`: at least four
+  classified records and a parity conflict);
+- the burst's raw luma means, keyed by raw V4L2 sequence and never by index,
+  prove D1 alternation by the setup proof's rules, unchanged
+  (`D1OpticalEvidence::proves_d1`): at least three frames in each phase, a
+  phase-median difference of at least 20, at least three supported bright and
+  three supported dark frames, at least three consistent adjacent pairs and
+  none conflicting, at most one missing sequence, and no repeated or backward
+  step.
+
+Anything else leaves the burst's ceiling `None`, so credential release
+refuses it as exposure unmeasurable, as before. `clipping_white_level` still
+answers `None` for YUYV luma: the format alone never names a ceiling.
+
+- **No expansion.** This replaces §4's last condition and the fixed
+  expansion of the second 2026-10-07 amendment, which is removed unused. The
+  decode stays raw, as for limited-range GREY, whose ceiling
+  `clipping_white_level` already answers at 235; #385's item 2 asked the same
+  of YUYV. Clipping measures the same pixels either way: the expansion
+  reached 255 exactly when raw luma was 235 or more. Expanding would move
+  only the other readers of the frame, as that amendment recorded: §4's
+  face-distance lit means of 39 to 57 would read 27 to 48, mostly below the
+  enrollment preflight's lit bar of 40 (`IR_LIT_MEAN`), and IR face detection
+  and the gate frame would see a scale the T480's measurements were not
+  taken on.
+- **When.** The ceiling is decided after the burst, once the illumination
+  records are drained, and before the gate-frame selection, the paired
+  saturation evidence, the ambient subtraction and the capture's statistics
+  read it. Before the burst only the format's ceiling exists; YUYV has none,
+  so the plateau exit never ends a YUYV burst early, and the proof sees every
+  frame up to the 10-frame cap.
+- **Scope.** Per burst. A proven burst never qualifies the next, and a
+  latched violation leaves every later burst of the session without a
+  ceiling. Held sessions, the sequential batch, one-shot captures and a
+  recovered stream all reach the same capture method. GREY, the Y16 family,
+  NV12, unattested YUYV and an attested camera whose binding refused keep
+  their format's answer.
+- **Journal.** With `IRLUME_LOG=debug`, each judged burst logs its ceiling
+  or the reason it has none, by name; an unjudged burst also logs the two
+  frame counts. No pixel value is logged.
+- **Evidence.** Synthetic tests check each condition, the threshold boundary
+  (a lift of 20.0 qualifies, 19.9 does not), the sequence rules, the
+  illumination veto, the per-burst scope and the journal text, and a
+  source-shape test pins where the ceiling is bound. A burst shaped like §4's
+  T480 frames, lit frames of flat chroma 128 at the lowest face-distance lit
+  mean (39) and dark frames of raw luma 16 to 20 and chroma 137, qualifies by
+  one point; at a lit mean of 37 it does not. Replayed over the three
+  ten-frame bursts recorded on 2026-09-07 from the ASUS FHD webcam's IR camera
+  (GREY, so this ceiling does not apply to it), the unchanged optical rules
+  prove alternation on both bursts whose emitter write succeeded (phase
+  differences 38.7 and 30.6, no conflicting pair) and refuse the one whose
+  write failed (2.0).
+
+Not established: how the T480's own bursts fare at face distance in
+ordinary lighting, whether their lift clears 20 after warm-up, and how often
+a burst refuses. That needs attended qualification on the T480, which may
+move the preliminary bounds. Mandatory PAD and every threshold are
+unchanged.

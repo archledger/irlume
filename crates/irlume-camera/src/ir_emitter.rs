@@ -239,7 +239,10 @@ impl D1OpticalEvidence {
         OpticalD1Verdict::Inconclusive
     }
 
-    const fn proves_d1(self) -> bool {
+    /// Whether the burst proves frame-locked D1 alternation. Also the YUYV
+    /// clipping ceiling's emitter condition (ADR-0031 §4, Amendment
+    /// 2026-10-13), on raw luma means of the burst being judged.
+    pub(crate) const fn proves_d1(self) -> bool {
         matches!(self.verdict(), OpticalD1Verdict::Proven)
     }
 
@@ -342,7 +345,9 @@ impl D1MetadataEvidence {
             && self.parity_conflicts == 0
     }
 
-    const fn contradicts_d1(self) -> bool {
+    /// Whether classified records break D1 parity. Also vetoes the YUYV
+    /// clipping ceiling's optical proof (ADR-0031 §4, Amendment 2026-10-13).
+    pub(crate) const fn contradicts_d1(self) -> bool {
         self.invalid_sequence_steps == 0 && self.classified() >= 4 && self.parity_conflicts > 0
     }
 }

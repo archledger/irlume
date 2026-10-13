@@ -208,7 +208,9 @@ than assuming every desktop has the same prompt or cancellation behavior.
   (#358). The ThinkPad T480 IR camera (USB 5986:1141, #887) is the first
   such camera reported: it offers only YUYV, irlume classifies it as IR from
   its USB descriptor
-  ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)), and its frames
-  are refused this way until their exposure ceiling is measured. Every other
-  module in the record offers grey.
+  ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)), and a burst of
+  its frames earns a ceiling only when the format read from the open camera,
+  the session's frames and the burst's own emitter alternation all qualify
+  (§4, amendment 2026-10-13); other bursts refuse this way. That is not yet
+  qualified on a T480. Every other module in the record offers grey.
 - musl-based distros (Alpine): untested; the release binaries assume glibc.

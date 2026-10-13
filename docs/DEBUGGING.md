@@ -354,10 +354,15 @@ as the Chicony 04f2:b613 module some T480s carry, is outside the rule and
 stays RGB.
 
 Classification changes the listing and the IR frame size (the smallest
-advertised size of at least 340x340), not what authentication accepts. YUYV
-IR frames have no measured exposure ceiling yet, so face authentication on
-such a camera refuses as "IR exposure unmeasurable", and an IR camera on a
-different USB device from the RGB camera does not pair
+advertised size of at least 340x340), not what authentication accepts. A
+YUYV IR burst has an exposure ceiling only when the format read from the
+open camera, the session's frames and the burst's own emitter alternation
+qualify (ADR-0031 §4, amendment 2026-10-13); otherwise face authentication
+refuses it as "IR exposure unmeasurable". With `IRLUME_LOG=debug` irlumed
+logs, for each burst, `YUYV clipping ceiling 235 for this burst` or `no YUYV
+clipping ceiling for this burst:` and the reason, and a latched frame
+violation once per session. An IR camera on a different USB device from the
+RGB camera pairs only as an experimental split pair
 ([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` lists,
 without writing, the extension units of the IR node irlumed has selected.
 When the RGB and IR cameras are two USB devices, no IR node is selected

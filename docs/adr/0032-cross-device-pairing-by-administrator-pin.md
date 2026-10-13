@@ -1506,8 +1506,14 @@ runs only on the final admissible sample, and an interrupted group never
 reuses earlier votes. The vote count, thresholds and median are ADR-0013's.
 Split evidence keeps the sequential posture, so only the IR-identity arms
 can grant, and `split_grant_refusal` still runs before any grant arm. No
-stored qualification, held pair, concurrent schedule or pair-gap contract
-is involved; the split posture already holds at any skew. Services or windows
+stored qualification, held pair or concurrent schedule is involved, and the
+sequential posture holds at any skew. Each pair still meets the existing
+8-second sequential pairing budget (`SEQUENTIAL_MAX_CROSS_SPECTRUM_SKEW`):
+RGB older than that is discarded as stale and can only deny. Because the
+batch takes every RGB sample before any IR sample, each pair's gap is about
+the IR session start; the rig measured 4.1 to 5.2 s. A camera whose IR
+start pushes a pair past 8 s refuses that group and the password follows,
+rather than letting older RGB evidence into the liveness decision. Services or windows
 outside that scope keep the one-shot split attempt, which cannot fill the vote
 in a short window and so falls back to the password. A privileged prompt's
 short default window widens to `GRACE_WINDOW_MS` when the owner's privileged

@@ -14,6 +14,9 @@ mod gpu_evidence;
 #[path = "gpu_reliability_counter_tests.rs"]
 mod gpu_reliability_counter_tests;
 
+#[path = "gpu_reliability_clock_tests.rs"]
+mod gpu_reliability_clock_tests;
+
 mod gpu_groundwork_tests {
     use super::gpu_evidence::{InvalidEvidence, Population};
     use crate::gpu::Setting;
@@ -2489,7 +2492,7 @@ mod gpu_groundwork_tests {
 
     /// Only guaranteed growth beyond clock granularity proves a suspend.
     /// Delayed reads can hide growth here, but cannot invent proof of it.
-    fn suspend_is_proven(
+    pub(super) fn suspend_is_proven(
         baseline_upper: std::time::Duration,
         later_lower: std::time::Duration,
     ) -> bool {

@@ -946,7 +946,7 @@ mod gpu_groundwork_tests {
         for name in [
             "gpu_hw_identity_binds_plugin_render_node_and_libraries",
             "gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration",
-            "gpu_hw_model_cache_provenance_control",
+            "gpu_cache_hw_model_cache_provenance_control",
             "gpu_hw_real_frames_track_cpu",
             "gpu_hw_recognition_corpora_drift",
             "gpu_hw_suspend_resume_recheck",
@@ -1247,12 +1247,64 @@ mod gpu_groundwork_tests {
         }
     }
 
+    #[test]
+    fn gpu_cache_control_is_separate_from_the_documented_hardware_sweep() {
+        let docs = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/NPU.md"));
+        assert!(docs.contains("--lib -- --ignored gpu_hw_ --test-threads 1 --nocapture"));
+        let executable = std::env::current_exe().unwrap();
+        let list = |arguments: &[&str]| {
+            let output = std::process::Command::new(&executable)
+                .args(arguments)
+                .env_remove("IRLUME_GPU_CACHE_CONTROL_MODE")
+                .env_remove("IRLUME_GPU_CACHE_CONTROL_DIR")
+                .output()
+                .expect("the libtest listing child starts");
+            assert!(
+                output.status.success(),
+                "libtest listing failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut names: Vec<String> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_suffix(": test"))
+                .map(str::to_owned)
+                .collect();
+            names.sort();
+            names
+        };
+        let mut ordinary = [
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_identity_binds_plugin_render_node_and_libraries",
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration",
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_real_frames_track_cpu",
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_recognition_corpora_drift",
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_hw_suspend_resume_recheck",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        ordinary.sort();
+        // Listing never invokes a hardware test or loads its models/platform.
+        assert_eq!(
+            list(&["--list", "--ignored", "gpu_hw_"]),
+            ordinary,
+            "the documented sweep must retain only its five ordinary hardware controls"
+        );
+        let control =
+            "onnx::gpu_tests::gpu_groundwork_tests::gpu_cache_hw_model_cache_provenance_control";
+        assert_eq!(
+            list(&["--list", "--ignored", "--exact", control]),
+            vec![control.to_owned()],
+            "the explicit cache control must remain selectable as one ignored test"
+        );
+        assert!(docs.contains(control));
+    }
+
     /// One explicit recognizer cache operation, after the separate platform
     /// identity warm-up. Invoke in separate processes for miss, hit and bypass;
     /// retain the caller-owned miss directory for the hit. No power transition.
     #[test]
     #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU, recognizer weights and explicit cache-control settings"]
-    fn gpu_hw_model_cache_provenance_control() {
+    fn gpu_cache_hw_model_cache_provenance_control() {
         use super::super::npu_reference;
         let mode = std::env::var("IRLUME_GPU_CACHE_CONTROL_MODE")
             .expect("explicit IRLUME_GPU_CACHE_CONTROL_MODE=bypass, miss or hit");

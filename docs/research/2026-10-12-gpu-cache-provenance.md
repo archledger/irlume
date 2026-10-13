@@ -96,6 +96,14 @@ or raw setup/failure diagnostics.
 
 ## Reproduction and evidence limits
 
+The current opt-in selector is
+`onnx::gpu_tests::gpu_groundwork_tests::gpu_cache_hw_model_cache_provenance_control`.
+It is outside the generic `gpu_hw_` sweep and must be invoked separately.
+The historical `d9d091fc` receipt above retains the original selected name,
+source hashes, binary and measured results; the rename is not a new hardware
+campaign. Only its selector name changes; its hardware function body is
+unchanged.
+
 The ignored control requires `IRLUME_GPU_CACHE_CONTROL_MODE` to be exactly
 `bypass`, `miss` or `hit`. Miss and hit also require an existing absolute
 UTF-8 directory in `IRLUME_GPU_CACHE_CONTROL_DIR`; bypass refuses a supplied
@@ -103,8 +111,11 @@ directory. Supply the pinned models and CPU/TFLite runtime as documented
 in [the identity research note](2026-10-11-gpu-identity.md), build the NPU
 feature test binary and invoke the exact control with
 `--ignored --exact --test-threads=1 --nocapture`. Retain the miss directory
-unchanged for subsequent hit processes. Do not run hardware controls as
-ordinary unit tests or overlap another accelerator measurement.
+unchanged for subsequent hit processes. Use the fully qualified current
+selector with `--exact`, as in
+[the separate cache-control recipe](../NPU.md#explicit-cache-controls).
+Do not run hardware controls as ordinary unit tests or overlap another
+accelerator measurement.
 
 Empty directories plus `NO` establish automatic OpenVINO recognizer
 model-cache bypass on this wrapper path, not flushed driver, compiler or

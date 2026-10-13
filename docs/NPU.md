@@ -95,6 +95,47 @@ lanes need the recognizer weights, from `IRLUME_NPU_TEST_MODELS`, an
 installed `/usr/share/irlume/models` tree or the repository `models/`
 tree. No certification table entry or loading profile exists.
 
+### Explicit cache controls
+
+Run all three cache-control processes from a root shell so GPU identity can
+read debugfs. Set the selected provider/model and CPU/TFLite runtime variables
+explicitly in that shell, as described in
+[the identity research note](research/2026-10-11-gpu-identity.md); privilege
+elevation may otherwise discard them. The recipe creates a private root-owned
+directory for the miss and subsequent hit.
+
+The opt-in cache control is outside the generic `gpu_hw_` sweep. Select it
+separately with an explicit mode. Miss and hit require an existing absolute
+UTF-8, caller-owned directory; the first miss refuses a nonempty directory
+without clearing it. Retain that directory unchanged for the subsequent
+automatic import. Bypass requires the directory variable to be unset.
+Use the same provider, models and GPU configuration for all three processes.
+
+```sh
+ulimit -c 0
+control=onnx::gpu_tests::gpu_groundwork_tests::gpu_cache_hw_model_cache_provenance_control
+cache_dir="$(mktemp -d /tmp/irlume-gpu-cache.XXXXXX)"
+IRLUME_GPU_CACHE_CONTROL_MODE=miss IRLUME_GPU_CACHE_CONTROL_DIR="$cache_dir" \
+  cargo test -p irlume-vision --features npu --release --lib -- \
+  --ignored --exact "$control" --test-threads 1 --nocapture
+IRLUME_GPU_CACHE_CONTROL_MODE=hit IRLUME_GPU_CACHE_CONTROL_DIR="$cache_dir" \
+  cargo test -p irlume-vision --features npu --release --lib -- \
+  --ignored --exact "$control" --test-threads 1 --nocapture
+env -u IRLUME_GPU_CACHE_CONTROL_DIR IRLUME_GPU_CACHE_CONTROL_MODE=bypass \
+  cargo test -p irlume-vision --features npu --release --lib -- \
+  --ignored --exact "$control" --test-threads 1 --nocapture
+```
+
+Require exact Core and compiled cache-directory readbacks, `NO` for miss
+and bypass, and `YES` for the automatic import. These are separate-process
+model-cache observations, not globally cold driver/compiler/OS state, a
+performance result or full certification. Each control makes twelve
+recognizer reference calls and counts zero endurance inferences; platform
+identity warm-up is separate. The recipe makes no power transition and
+does not supply the retained-model endurance or suspend protocols.
+The historical campaign remains bound to its recorded source and binary
+in [the cache receipt](research/2026-10-12-gpu-cache-provenance.md).
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then

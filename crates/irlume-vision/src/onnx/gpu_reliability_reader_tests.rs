@@ -64,6 +64,7 @@ pub(super) struct Reader {
     boot_file: PathBuf,
     binding: Binding,
     origin: Instant,
+    previous_counters: Option<(u64, u64)>,
 }
 
 fn text(path: &Path, read: &mut impl FnMut(&Path) -> io::Result<String>) -> Result<String, String> {
@@ -161,6 +162,7 @@ impl Reader {
             boot_file: boot_file.to_owned(),
             binding: expected,
             origin: Instant::now(),
+            previous_counters: None,
         })
     }
 
@@ -184,17 +186,15 @@ impl Reader {
     }
 
     /// # Errors
-    /// Refuses unreadable/malformed counters, binding changes or reversed time.
+    /// Refuses unreadable/malformed/decreasing counters, binding changes or reversed time.
     /// Mixed or transitional status/control remains visible to the pure witness.
-    pub(super) fn sample(&self) -> Result<Observation, String> {
-        self.capture_with(
-            || self.origin.elapsed(),
-            |path| std::fs::read_to_string(path),
-        )
+    pub(super) fn sample(&mut self) -> Result<Observation, String> {
+        let origin = self.origin;
+        self.capture_with(|| origin.elapsed(), |path| std::fs::read_to_string(path))
     }
 
     fn capture_with(
-        &self,
+        &mut self,
         mut now: impl FnMut() -> Duration,
         mut read: impl FnMut(&Path) -> io::Result<String>,
     ) -> Result<Observation, String> {
@@ -221,6 +221,16 @@ impl Reader {
         if end < start {
             return Err("reversed observation bracket".into());
         }
+        // Every observation participates, including polls not selected for the
+        // witness and both final endpoints. A caller cannot skip this check by
+        // choosing a different capture site or reporting missing event coverage.
+        if self
+            .previous_counters
+            .is_some_and(|(active, suspended)| active_ms < active || suspended_ms < suspended)
+        {
+            return Err("runtime counters decreased".into());
+        }
+        self.previous_counters = Some((active_ms, suspended_ms));
         Ok(Observation {
             bindings: [before, after],
             control: [control_before, control_after],
@@ -307,7 +317,7 @@ mod tests {
     #[test]
     fn reader_uses_the_identitys_canonical_pci_power_directory() {
         let fixture = Fixture::new();
-        let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+        let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
         let observation = reader.sample().unwrap();
         let sample = observation.view();
         assert_eq!(sample.active_ms, Some(100));
@@ -350,10 +360,99 @@ mod tests {
     }
 
     #[test]
+    fn final_runtime_counter_decreases_stop_the_driver_before_more_inference() {
+        use super::super::gpu_reliability_hardware_tests::{drive, Observations};
+        use super::super::gpu_reliability_protocol_tests::{Boundary, Protocol, Reference};
+
+        struct Echo(u64);
+        impl crate::npu::Infer for Echo {
+            fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
+                self.0 += 1;
+                Ok(input.to_vec())
+            }
+        }
+        struct CounterObservations {
+            reader: Reader,
+            power: PathBuf,
+            bad_stage: usize,
+            bad_counter: usize,
+        }
+        impl CounterObservations {
+            fn capture(&mut self, stage: usize) -> Result<(), String> {
+                let mut counters = [100 + 10 * stage, 200 + 10 * stage];
+                if stage == self.bad_stage {
+                    counters[self.bad_counter] -= 11;
+                }
+                for (name, value) in ["runtime_active_time", "runtime_suspended_time"]
+                    .into_iter()
+                    .zip(counters)
+                {
+                    std::fs::write(self.power.join(name), value.to_string()).unwrap();
+                }
+                self.reader.sample().map(|_| ())
+            }
+        }
+        impl Observations for CounterObservations {
+            fn boundary(&mut self, _: Boundary) -> Result<(), String> {
+                Ok(())
+            }
+            fn runtime_start(&mut self) -> Result<(), String> {
+                for stage in 0..3 {
+                    self.capture(stage)?;
+                }
+                Ok(())
+            }
+            fn runtime_end(&mut self) -> Result<bool, String> {
+                self.capture(3)?;
+                Ok(false)
+            }
+            fn system(&mut self) -> Result<bool, String> {
+                Ok(false)
+            }
+        }
+        for (bad_stage, expected_calls) in [(2, 400), (3, 404)] {
+            for bad_counter in 0..2 {
+                let fixture = Fixture::new();
+                let mut observations = CounterObservations {
+                    reader: Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap(),
+                    power: fixture.device.join("power"),
+                    bad_stage,
+                    bad_counter,
+                };
+                let references = [1.0_f32, 2.0, 3.0, 4.0].map(|v| Reference {
+                    input: vec![v],
+                    bits: vec![v.to_bits()],
+                });
+                let mut model = Echo(0);
+                let mut protocol = Protocol::new(&mut model, &references, 1).unwrap();
+                let result = drive(&mut protocol, &mut observations);
+                assert!(
+                    result.is_err(),
+                    "stage={bad_stage} counter={bad_counter}: {:?}",
+                    protocol.report()
+                );
+                assert_eq!(
+                    protocol.report().total().gpu_wrapper_attempted,
+                    expected_calls
+                );
+                assert_eq!(
+                    protocol.report().total().gpu_fully_bit_checked_ok,
+                    expected_calls
+                );
+                assert!(!protocol.report().accepted(true));
+                assert_eq!(
+                    model.0, expected_calls,
+                    "no call after detecting the decrease"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn capture_reads_real_endpoints_inside_one_outer_bracket() {
         use std::cell::RefCell;
         let fixture = Fixture::new();
-        let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+        let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
         let trace = RefCell::new(Vec::new());
         let mut times = [Duration::from_secs(2), Duration::from_secs(3)].into_iter();
         let observation = reader
@@ -440,7 +539,7 @@ mod tests {
         for field in 0..5 {
             for during in [false, true] {
                 let fixture = Fixture::new();
-                let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+                let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
                 if !during {
                     change_binding(&fixture, field);
                 }
@@ -473,7 +572,7 @@ mod tests {
     fn missing_read_at_any_endpoint_is_not_a_fabricated_observation() {
         for missing in 0..12 {
             let fixture = Fixture::new();
-            let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+            let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
             let mut calls = 0;
             let result = reader.capture_with(
                 || Duration::ZERO,
@@ -505,7 +604,7 @@ mod tests {
                 "18446744073709551616",
             ] {
                 let fixture = Fixture::new();
-                let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+                let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
                 std::fs::write(fixture.device.join("power").join(name), value).unwrap();
                 assert!(reader.sample().is_err(), "{name} {value}");
             }
@@ -515,7 +614,7 @@ mod tests {
     #[test]
     fn unchanged_bad_posture_is_preserved_for_witness_refusal() {
         let fixture = Fixture::new();
-        let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+        let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
         for status in [
             "suspending",
             "resuming",
@@ -590,7 +689,7 @@ mod tests {
     #[test]
     fn reversed_capture_clock_is_rejected() {
         let fixture = Fixture::new();
-        let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+        let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
         let mut times = [Duration::from_secs(2), Duration::from_secs(1)].into_iter();
         assert_eq!(
             reader
@@ -606,7 +705,7 @@ mod tests {
             validate_runtime_witness, CounterGrowth,
         };
         let fixture = Fixture::new();
-        let reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
+        let mut reader = Reader::new(&fixture.drm, &fixture.boot, &fixture.node).unwrap();
         let observations: [Observation; 4] = std::array::from_fn(|i| {
             for (name, value) in [
                 (

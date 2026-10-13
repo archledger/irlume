@@ -8,7 +8,7 @@
 use super::gpu_reliability_clock_tests::{proves_system_sleep, SleepOffsetBounds};
 use super::gpu_reliability_protocol_tests::{Boundary, Protocol, Reference, Report, Step};
 use super::gpu_reliability_reader_tests::{sleep_bounds, Observation, Reader};
-use super::gpu_reliability_witness_tests::validate_runtime_witness;
+use super::gpu_reliability_witness_tests::{validate_runtime_witness, CounterGrowth, WitnessError};
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
@@ -77,7 +77,14 @@ impl Config {
 
 fn read_reference(path: &Path, attended: Option<&str>) -> Result<Config, String> {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Validate the opened descriptor without waiting for a FIFO peer first.
+    // Nonblocking mode does not alter ordinary regular-file reads on Linux.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| e.to_string())?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err("reference is not a regular file".into());
     }
@@ -91,14 +98,18 @@ fn read_reference(path: &Path, attended: Option<&str>) -> Result<Config, String>
     Config::parse(&text, attended)
 }
 
-trait Observations {
+pub(super) trait Observations {
     fn boundary(&mut self, boundary: Boundary) -> Result<(), String>;
     fn runtime_start(&mut self) -> Result<(), String>;
     fn runtime_end(&mut self) -> Result<bool, String>;
     fn system(&mut self) -> Result<bool, String>;
 }
 
-fn drive(
+/// Drive one retained protocol, stopping on the first observation or call error.
+///
+/// # Errors
+/// Propagates failed observations/boundaries and protocol refusals without retry.
+pub(super) fn drive(
     protocol: &mut Protocol<'_>,
     observations: &mut impl Observations,
 ) -> Result<Report, String> {
@@ -135,6 +146,20 @@ struct HardwareObservations<'a> {
     cpu_checks: u64,
 }
 
+fn runtime_verdict(result: Result<CounterGrowth, WitnessError>) -> Result<bool, String> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(error @ (WitnessError::Counter | WitnessError::Binding | WitnessError::ReadOrder)) => {
+            Err(format!("invalid runtime observation: {error:?}"))
+        }
+        Err(
+            WitnessError::Posture
+            | WitnessError::NoSuspendedGrowth
+            | WitnessError::SystemSleepNotExcluded,
+        ) => Ok(false),
+    }
+}
+
 impl Observations for HardwareObservations<'_> {
     fn boundary(&mut self, boundary: Boundary) -> Result<(), String> {
         self.cpu_checks += 1;
@@ -156,16 +181,11 @@ impl Observations for HardwareObservations<'_> {
             println!("RELIABILITY_RUNTIME no active/AUTO start: INCONCLUSIVE");
             return Ok(());
         }
-        let mut previous = (before.active_ms, before.suspended_ms);
         let deadline = Instant::now() + self.config.runtime_wait;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             let observation = self.reader.sample()?;
             let sample = observation.view();
-            if sample.active_ms < previous.0 || sample.suspended_ms < previous.1 {
-                return Err("runtime counters decreased during wait".into());
-            }
-            previous = (sample.active_ms, sample.suspended_ms);
             if sample.control != [Some("auto"); 2] {
                 println!("RELIABILITY_RUNTIME control changed: INCONCLUSIVE");
                 break;
@@ -199,7 +219,7 @@ impl Observations for HardwareObservations<'_> {
             end,
         );
         println!("RELIABILITY_RUNTIME witness={result:?}; occurrence only, not continuous residency or D3cold");
-        Ok(result.is_ok())
+        runtime_verdict(result)
     }
 
     fn system(&mut self) -> Result<bool, String> {
@@ -532,6 +552,94 @@ mod tests {
             std::fs::write(&path, invalid).unwrap();
             assert!(read_reference(&path, None).is_err());
         }
+    }
+
+    #[test]
+    fn invalid_runtime_counters_are_errors_not_missing_coverage() {
+        for error in [
+            WitnessError::Counter,
+            WitnessError::Binding,
+            WitnessError::ReadOrder,
+        ] {
+            assert!(runtime_verdict(Err(error)).is_err());
+        }
+        for error in [
+            WitnessError::Posture,
+            WitnessError::NoSuspendedGrowth,
+            WitnessError::SystemSleepNotExcluded,
+        ] {
+            assert_eq!(runtime_verdict(Err(error)), Ok(false));
+        }
+        assert_eq!(
+            runtime_verdict(Ok(CounterGrowth {
+                lower_ms: 1,
+                upper_ms: 3
+            })),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn fifo_reference_open_does_not_wait_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+        const CHILD: &str = "IRLUME_TEST_RETAINED_FIFO_CHILD";
+        const TEST: &str = "onnx::gpu_tests::gpu_reliability_hardware_tests::tests::fifo_reference_open_does_not_wait_for_a_writer";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let error = read_reference(Path::new(&path), None)
+                .err()
+                .expect("FIFO refused");
+            assert_eq!(error, "reference is not a regular file");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("reference.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a live NUL-terminated path in this test's private
+        // directory; mkfifo reads it and creates only that fixture node.
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, &path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timed_out = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break false,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    break true;
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fixture wait failed: {error}");
+                }
+            }
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "reference open blocked on a FIFO without a writer"
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "{stdout}"
+        );
     }
 
     #[test]

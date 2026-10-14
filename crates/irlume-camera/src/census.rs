@@ -448,15 +448,32 @@ fn machine_entries() -> Vec<CensusEntry> {
     if let Some(usb_id) = crate::vendor_mipi_bridge_present() {
         out.push(vendor_bridge_entry(&usb_id));
     }
-    for (usb_id, name) in unbound_camera_class() {
-        out.push(unbound_camera_entry(&usb_id, &name));
+    for camera in unbound_camera_class() {
+        out.push(unbound_camera_entry(&camera));
     }
     out
 }
 
-/// USB camera-class devices with no driver bound, as `(vid:pid, sysfs name)`.
+/// One USB device with a camera-class device or interface that no driver
+/// is bound to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnboundCamera {
+    /// `vid:pid`.
+    pub usb_id: String,
+    /// The device's sysfs name, such as `2-1`.
+    pub name: String,
+    /// The unbound camera-class device or interfaces whose `authorized`
+    /// attribute reads 0, by sysfs name, in walk order. The kernel lets no
+    /// driver probe or claim a deauthorized interface (sysfs-bus-usb ABI),
+    /// so these are a deliberate setting, not a fault.
+    pub deauthorized: Vec<String>,
+    /// The other unbound camera-class interfaces, by sysfs name.
+    pub unbound: Vec<String>,
+}
+
+/// USB camera-class devices with no driver bound.
 #[must_use]
-pub fn unbound_camera_class() -> Vec<(String, String)> {
+pub fn unbound_camera_class() -> Vec<UnboundCamera> {
     unbound_camera_class_in(&crate::hostfs::usb_devices_root())
 }
 
@@ -467,8 +484,10 @@ pub fn unbound_camera_class() -> Vec<(String, String)> {
 /// side of "my camera does not show up": the hardware enumerated, the class
 /// code says camera (`0x0e`, USB video class at either level), and nothing
 /// claimed it. That is a driver or firmware problem, never an irlume one,
-/// and the census says so instead of letting it read as absent hardware.
-fn unbound_camera_class_in(devices_root: &Path) -> Vec<(String, String)> {
+/// and the census says so instead of letting it read as absent hardware,
+/// unless the device or interface reads `authorized` 0: then an
+/// administrator, USBGuard or a udev rule deauthorized it on purpose.
+fn unbound_camera_class_in(devices_root: &Path) -> Vec<UnboundCamera> {
     const CAMERA_CLASS: &str = "0e";
     let Ok(devices) = std::fs::read_dir(devices_root) else {
         return Vec::new();
@@ -500,13 +519,40 @@ fn unbound_camera_class_in(devices_root: &Path) -> Vec<(String, String)> {
         let id = |vendor: &str, product: &str| {
             (!vendor.is_empty() && !product.is_empty()).then(|| format!("{vendor}:{product}"))
         };
+        let deauthorized = |dir: &Path| {
+            std::fs::read_to_string(dir.join("authorized")).is_ok_and(|value| value.trim() == "0")
+        };
+        let device_class = read("bDeviceClass");
+        // A device deauthorized as a whole is unconfigured: the USB core
+        // removes its interfaces but leaves the generic driver bound and its
+        // configuration descriptors readable (Linux v7.2 hub.c
+        // `usb_deauthorize_device`, sysfs.c `descriptors_read`), so those
+        // descriptors say whether it is a camera.
+        if deauthorized(&dir) {
+            let camera = device_class == CAMERA_CLASS
+                || std::fs::read(dir.join("descriptors"))
+                    .is_ok_and(|raw| declares_camera_interface(&raw));
+            if let Some(usb_id) = id(&vendor, &product).filter(|_| camera) {
+                out.push(UnboundCamera {
+                    usb_id,
+                    name: name.clone(),
+                    deauthorized: vec![name.clone()],
+                    unbound: Vec::new(),
+                });
+            }
+            continue;
+        }
         // The device-level class first: some cameras set it and carry no
         // class per interface.
-        let device_class = read("bDeviceClass");
         let device_bound = dir.join("driver").exists();
         if device_class == CAMERA_CLASS && !device_bound {
             if let Some(usb_id) = id(&vendor, &product) {
-                out.push((usb_id, name.clone()));
+                out.push(UnboundCamera {
+                    usb_id,
+                    name: name.clone(),
+                    deauthorized: Vec::new(),
+                    unbound: vec![name.clone()],
+                });
                 continue;
             }
         }
@@ -514,6 +560,7 @@ fn unbound_camera_class_in(devices_root: &Path) -> Vec<(String, String)> {
         // interface. A bound sibling interface (the UVC video control one)
         // means the camera is claimed and working.
         let prefix = format!("{name}:");
+        let (mut deauthorized_ifaces, mut unbound_ifaces) = (Vec::new(), Vec::new());
         for iface in names.iter().filter(|n| n.starts_with(&prefix)) {
             let iface_dir = devices_root.join(iface);
             let Ok(class) = std::fs::read_to_string(iface_dir.join("bInterfaceClass")) else {
@@ -521,14 +568,46 @@ fn unbound_camera_class_in(devices_root: &Path) -> Vec<(String, String)> {
             };
             if class.trim().eq_ignore_ascii_case(CAMERA_CLASS) && !iface_dir.join("driver").exists()
             {
-                if let Some(usb_id) = id(&vendor, &product) {
-                    out.push((usb_id, name.clone()));
+                if deauthorized(&iface_dir) {
+                    deauthorized_ifaces.push(iface.clone());
+                } else {
+                    unbound_ifaces.push(iface.clone());
                 }
-                break;
             }
+        }
+        if deauthorized_ifaces.is_empty() && unbound_ifaces.is_empty() {
+            continue;
+        }
+        if let Some(usb_id) = id(&vendor, &product) {
+            out.push(UnboundCamera {
+                usb_id,
+                name: name.clone(),
+                deauthorized: deauthorized_ifaces,
+                unbound: unbound_ifaces,
+            });
         }
     }
     out
+}
+
+/// Whether a `descriptors` file (the device descriptor, then every raw
+/// configuration) declares an interface of camera class `0x0e`. A
+/// malformed length ends the walk.
+fn declares_camera_interface(raw: &[u8]) -> bool {
+    const DEVICE_DESCRIPTOR_LEN: usize = 18;
+    const INTERFACE: u8 = 4;
+    let mut at = DEVICE_DESCRIPTOR_LEN;
+    while let Some(&len) = raw.get(at) {
+        let len = usize::from(len);
+        let Some(descriptor) = raw.get(at..at + len).filter(|_| len >= 2) else {
+            return false;
+        };
+        if descriptor[1] == INTERFACE && len >= 9 && descriptor[5] == 0x0e {
+            return true;
+        }
+        at += len;
+    }
+    false
 }
 
 fn mipi_ipu_entry(generation: &'static str) -> CensusEntry {
@@ -562,22 +641,56 @@ fn vendor_bridge_entry(usb_id: &str) -> CensusEntry {
     }
 }
 
-fn unbound_camera_entry(usb_id: &str, name: &str) -> CensusEntry {
+fn unbound_camera_entry(camera: &UnboundCamera) -> CensusEntry {
+    let UnboundCamera {
+        usb_id,
+        name,
+        deauthorized,
+        unbound,
+    } = camera;
+    let mut evidence = vec![
+        format!("USB {usb_id} carries camera class 0x0e with nothing bound"),
+        format!("sysfs {name}"),
+    ];
+    // A deauthorized interface explains its own missing driver. A UVC
+    // streaming interface is claimed through its control interface, so a
+    // deauthorized control interface can leave an authorized streaming one
+    // unbound too, but without walking the function associations that is
+    // not known, so a device with both keeps the fault warning for the rest.
+    if !deauthorized.is_empty() {
+        evidence.push(format!("authorized=0: {}", deauthorized.join(", ")));
+    }
+    if !deauthorized.is_empty() && !unbound.is_empty() {
+        evidence.push(format!("also unbound: {}", unbound.join(", ")));
+    }
+    let verdict = CensusVerdict::Broken(match (deauthorized.is_empty(), unbound.is_empty()) {
+        (true, _) => {
+            "USB camera-class hardware enumerated with no driver bound: a kernel or firmware \
+             problem, not irlume. Check `dmesg | grep -iE \"uvc|usb\"` and that the uvcvideo \
+             module is loaded"
+        }
+        (false, true) => {
+            "USB camera-class hardware deauthorized in sysfs (authorized=0), so no driver may \
+             claim it: a deliberate setting by an administrator, USBGuard or a udev rule, not a \
+             kernel or firmware fault. To use it, write 1 to each authorized attribute the \
+             evidence names, then replug the camera or rebind uvcvideo"
+        }
+        (false, false) => {
+            "USB camera-class hardware partly deauthorized in sysfs (authorized=0): write 1 to \
+             each authorized attribute the evidence names, then replug the camera or rebind \
+             uvcvideo. The interfaces listed as also unbound are authorized; if they stay \
+             unbound after that, it is a kernel or firmware problem, not irlume. Check `dmesg | \
+             grep -iE \"uvc|usb\"` and that the uvcvideo module is loaded"
+        }
+    });
     CensusEntry {
         node: None,
         class: CensusClass::UsbCameraWithoutDriver {
-            usb_id: usb_id.to_string(),
+            usb_id: usb_id.clone(),
         },
-        verdict: CensusVerdict::Broken(
-            "USB camera-class hardware enumerated with no driver bound: a kernel or firmware \
-             problem, not irlume. Check `dmesg | grep -iE \"uvc|usb\"` and that the uvcvideo \
-             module is loaded",
-        ),
+        verdict,
         privacy_engaged: None,
-        evidence: vec![
-            format!("USB {usb_id} carries camera class 0x0e with nothing bound"),
-            format!("sysfs {name}"),
-        ],
+        evidence,
     }
 }
 
@@ -1078,14 +1191,156 @@ mod tests {
 
         let found = unbound_camera_class_in(&root);
         let _ = std::fs::remove_dir_all(&root);
+        let unbound = |usb_id: &str, name: &str, ifaces: &[&str]| UnboundCamera {
+            usb_id: usb_id.into(),
+            name: name.into(),
+            deauthorized: Vec::new(),
+            unbound: ifaces.iter().map(|iface| (*iface).to_string()).collect(),
+        };
         assert_eq!(
             found,
             vec![
-                ("05a3:9331".to_string(), "2-1".to_string()),
-                ("06cb:0701".to_string(), "4-1".to_string()),
+                unbound("05a3:9331", "2-1", &["2-1"]),
+                unbound("06cb:0701", "4-1", &["4-1:1.0"]),
             ],
             "exactly the unbound camera-class devices, with identity, in walk order"
         );
+    }
+
+    /// #1063: interfaces an administrator deauthorized (`authorized` 0)
+    /// have no driver by design. The archhost split rig's two shapes: the
+    /// BRIO with its IR streaming interface deauthorized while uvcvideo
+    /// holds the rest, and the NexiGo with its RGB function's control and
+    /// streaming interfaces deauthorized. A device with both a deauthorized
+    /// and an otherwise unbound interface names both.
+    #[test]
+    fn deauthorized_camera_interfaces_are_named_as_deliberate() {
+        let root =
+            std::env::temp_dir().join(format!("irlume-census-deauth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let device = |name: &str, vendor: &str, product: &str| {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join("bDeviceClass"), "ef").unwrap();
+            std::fs::write(root.join(name).join("idVendor"), vendor).unwrap();
+            std::fs::write(root.join(name).join("idProduct"), product).unwrap();
+        };
+        let iface = |name: &str, bound: bool, authorized: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("bInterfaceClass"), "0e").unwrap();
+            std::fs::write(dir.join("authorized"), format!("{authorized}\n")).unwrap();
+            if bound {
+                std::fs::create_dir(dir.join("driver")).unwrap();
+            }
+        };
+        device("1-1", "046d", "085e");
+        iface("1-1:1.0", true, "1");
+        iface("1-1:1.1", true, "1");
+        iface("1-1:1.2", false, "0");
+        device("1-2", "3443", "c803");
+        iface("1-2:1.0", false, "0");
+        iface("1-2:1.1", false, "0");
+        iface("1-2:1.2", true, "1");
+        iface("1-2:1.3", true, "1");
+        device("1-3", "04f2", "b74f");
+        iface("1-3:1.0", false, "0");
+        iface("1-3:1.2", false, "1");
+        // Deauthorized as a whole: no interfaces, the generic driver still
+        // bound, the descriptors still readable. A camera is listed by its
+        // descriptors; a deauthorized keyboard is not.
+        let whole = |name: &str, product: &str, interface_class: u8| {
+            device(name, "05a3", product);
+            std::fs::write(root.join(name).join("authorized"), "0\n").unwrap();
+            std::fs::create_dir(root.join(name).join("driver")).unwrap();
+            let mut raw = vec![18, 1];
+            raw.resize(18, 0);
+            raw.extend([9, 2, 26, 0, 1, 1, 0, 0x80, 50]);
+            raw.extend([8, 0x0b, 0, 2, interface_class, 3, 0, 0]);
+            raw.extend([9, 4, 0, 0, 1, interface_class, 1, 0, 0]);
+            std::fs::write(root.join(name).join("descriptors"), raw).unwrap();
+        };
+        whole("1-4", "9331", 0x0e);
+        whole("1-5", "0001", 0x03);
+
+        let found = unbound_camera_class_in(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            vec![
+                UnboundCamera {
+                    usb_id: "046d:085e".into(),
+                    name: "1-1".into(),
+                    deauthorized: names(&["1-1:1.2"]),
+                    unbound: Vec::new(),
+                },
+                UnboundCamera {
+                    usb_id: "3443:c803".into(),
+                    name: "1-2".into(),
+                    deauthorized: names(&["1-2:1.0", "1-2:1.1"]),
+                    unbound: Vec::new(),
+                },
+                UnboundCamera {
+                    usb_id: "04f2:b74f".into(),
+                    name: "1-3".into(),
+                    deauthorized: names(&["1-3:1.0"]),
+                    unbound: names(&["1-3:1.2"]),
+                },
+                UnboundCamera {
+                    usb_id: "05a3:9331".into(),
+                    name: "1-4".into(),
+                    deauthorized: names(&["1-4"]),
+                    unbound: Vec::new(),
+                },
+            ]
+        );
+
+        let entry = unbound_camera_entry(&found[1]);
+        let CensusVerdict::Broken(note) = entry.verdict else {
+            panic!(
+                "a deauthorized camera still cannot be used: {:?}",
+                entry.verdict
+            );
+        };
+        assert!(note.contains("deauthorized") && note.contains("not a kernel or firmware fault"));
+        assert!(entry
+            .evidence
+            .contains(&"authorized=0: 1-2:1.0, 1-2:1.1".to_string()));
+        let mixed = unbound_camera_entry(&found[2]);
+        let evidence = mixed.evidence.join(" | ");
+        assert!(
+            evidence.contains("authorized=0: 1-3:1.0 | also unbound: 1-3:1.2"),
+            "{evidence}"
+        );
+        let CensusVerdict::Broken(note) = mixed.verdict else {
+            panic!("{:?}", mixed.verdict);
+        };
+        assert!(
+            note.contains("partly deauthorized") && note.contains("kernel or firmware problem"),
+            "a mixed device keeps the fault warning for its authorized interfaces: {note}"
+        );
+    }
+
+    #[test]
+    fn descriptors_declare_a_camera_interface_only_when_well_formed() {
+        let mut raw = vec![18, 1];
+        raw.resize(18, 0);
+        raw.extend([9, 2, 18, 0, 1, 1, 0, 0x80, 50]);
+        let camera = [raw.clone(), vec![9, 4, 0, 0, 1, 0x0e, 1, 0, 0]].concat();
+        assert!(declares_camera_interface(&camera));
+        let keyboard = [raw.clone(), vec![9, 4, 0, 0, 1, 0x03, 1, 0, 0]].concat();
+        assert!(!declares_camera_interface(&keyboard));
+        // Class 0x0e outside an interface descriptor does not count.
+        let association = [raw.clone(), vec![8, 0x0b, 0, 2, 0x0e, 3, 0, 0]].concat();
+        assert!(!declares_camera_interface(&association));
+        for broken in [
+            [raw.clone(), vec![0, 4, 0, 0, 1, 0x0e, 1, 0, 0]].concat(),
+            [raw.clone(), vec![9, 4, 0, 0, 1, 0x0e]].concat(),
+            raw[..10].to_vec(),
+            Vec::new(),
+        ] {
+            assert!(!declares_camera_interface(&broken), "{broken:?}");
+        }
     }
 
     #[test]
@@ -1109,14 +1364,22 @@ mod tests {
         assert!(matches!(bridge.verdict, CensusVerdict::Unsupported(_)));
         assert!(bridge.evidence.join(" | ").contains("06cb:0701"));
 
-        let unbound = unbound_camera_entry("05a3:9331", "2-1");
+        let unbound = unbound_camera_entry(&UnboundCamera {
+            usb_id: "05a3:9331".into(),
+            name: "2-1".into(),
+            deauthorized: Vec::new(),
+            unbound: vec!["2-1".into()],
+        });
         assert_eq!(
             unbound.class,
             CensusClass::UsbCameraWithoutDriver {
                 usb_id: "05a3:9331".into()
             }
         );
-        assert!(matches!(unbound.verdict, CensusVerdict::Broken(_)));
+        assert!(matches!(
+            unbound.verdict,
+            CensusVerdict::Broken(note) if note.contains("a kernel or firmware problem")
+        ));
         let evidence = unbound.evidence.join(" | ");
         assert!(
             evidence.contains("05a3:9331") && evidence.contains("2-1"),

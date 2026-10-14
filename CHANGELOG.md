@@ -11,9 +11,11 @@ All notable changes to irlume are documented here. This project adheres to
   can now release credentials: a burst gets a clipping ceiling of 235 on raw
   luma when the format read from the open camera is limited range, no frame
   of the session broke the footroom or flat-chroma bounds, and the burst's
-  own frames show the emitter alternating. Any other burst still refuses as
-  IR exposure unmeasurable. Not yet qualified on a T480 (ADR-0031 §4,
-  amendment 2026-10-13; #887).
+  own frames show the emitter alternating. Such a camera reports no
+  per-frame illumination, so on a split pair under the experimental opt-in
+  that burst's alternation also marks its lit frames for pairing. Any other burst still refuses as IR exposure
+  unmeasurable. Not yet qualified on a T480 (ADR-0031 §4, amendments
+  2026-10-13 and 2026-10-14; #887).
 
 - Experimental split camera pairs as a machine-owner opt-in:
   `sudo irlume split experimental on --yes` saves

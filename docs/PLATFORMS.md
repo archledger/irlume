@@ -200,17 +200,19 @@ than assuming every desktop has the same prompt or cancellation behavior.
   the module was added and has not been re-run since, so it is unverified (see
   [NIXOS.md](NIXOS.md)); a face login on a physical NixOS machine has not been
   reported.
-- Other IR cameras: an 8-bit grey format (`GREY`, `Y8`, `Y800`) is necessary,
-  but does not prove emitter, capture or authentication support. A node
-  that offers **only** `Y16`/`Y10`/`Y12`/`NV12`/`YUYV` is refused rather than
-  untested: those formats name no sensor ceiling, so the IR exposure check
-  cannot run, and irlume refuses instead of judging a frame it never read
-  (#358). The ThinkPad T480 IR camera (USB 5986:1141, #887) is the first
-  such camera reported: it offers only YUYV, irlume classifies it as IR from
-  its USB descriptor
-  ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)), and a burst of
-  its frames earns a ceiling only when the format read from the open camera,
-  the session's frames and the burst's own emitter alternation all qualify
-  (§4, amendment 2026-10-13); other bursts refuse this way. That is not yet
-  qualified on a T480. Every other module in the record offers grey.
+- Other IR cameras: an 8-bit grey format (`GREY`, `Y8`, `Y800`) is the
+  ordinary requirement, and it does not prove emitter, capture or
+  authentication support. A node that offers **only**
+  `Y16`/`Y10`/`Y12`/`NV12` is refused rather than untested: those formats
+  name no sensor ceiling, so the IR exposure check cannot run, and irlume
+  refuses instead of judging a frame it never read (#358). A YUYV-only node
+  is refused the same way unless its USB descriptor attests an IR function
+  and each burst passes ADR-0031 §4's judgment
+  ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)): the format
+  read from the open camera, the session's frames, the stream's active
+  emitter and the burst's own alternation must all qualify (amendments
+  2026-10-13 and 2026-10-14); other bursts refuse. The ThinkPad T480 IR
+  camera (USB 5986:1141, #887) is the first such camera reported. That is
+  not yet qualified on a T480. Every other module in the record offers
+  grey.
 - musl-based distros (Alpine): untested; the release binaries assume glibc.

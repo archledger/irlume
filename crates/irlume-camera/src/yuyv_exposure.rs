@@ -598,6 +598,24 @@ fn frame_refusal(raw: &RawYuyvFormat, payload: &[u8]) -> ContentRefusal {
 /// full range (ADR-0031 §4, Amendment 2026-10-13).
 pub(crate) const YUYV_LIMITED_WHITE_LEVEL: u8 = 235;
 
+/// A burst that met every condition of [`YuyvContentLatch::burst_ceiling`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QualifiedBurst {
+    /// [`YUYV_LIMITED_WHITE_LEVEL`].
+    pub(crate) white_level: u8,
+    bright_on_even: bool,
+}
+
+impl QualifiedBurst {
+    /// Whether the frame with raw V4L2 sequence `sequence` is in the burst's
+    /// bright, emitter-lit phase. Parity survives a u32 wrap because 2^32 is
+    /// even. When the camera supplies no illumination records, this is the
+    /// burst's active-IR evidence (ADR-0031 §4, Amendment 2026-10-14).
+    pub(crate) const fn lit(self, sequence: u32) -> bool {
+        (sequence % 2 == 0) == self.bright_on_even
+    }
+}
+
 /// Why one burst of a session with fd-bound format evidence has no clipping
 /// ceiling. Each refusal leaves the burst's ceiling unknown, so credential
 /// release refuses it as exposure unmeasurable.
@@ -609,6 +627,9 @@ pub(crate) enum CeilingRefusal {
     Content(ContentRefusal),
     /// The latch did not judge exactly the burst's frames.
     Unjudged { judged: u64, frames: usize },
+    /// The stream's emitter is not active, so an alternation in its frames
+    /// is not the emitter's.
+    EmitterInactive,
     /// The camera's illumination records break the alternation's parity.
     IlluminationContradicts,
     /// The burst's raw luma means do not prove frame-locked emitter
@@ -628,6 +649,7 @@ impl std::fmt::Display for CeilingRefusal {
                     "the latch judged {judged} of the burst's {frames} frames"
                 )
             }
+            Self::EmitterInactive => f.write_str("the emitter is not active for this stream"),
             Self::IlluminationContradicts => {
                 f.write_str("illumination records contradict the emitter alternation")
             }
@@ -646,16 +668,19 @@ impl YuyvContentLatch {
     /// It answers [`YUYV_LIMITED_WHITE_LEVEL`] only when the frozen format
     /// resolves to eligible limited range, no frame offered so far in the
     /// session violated the content bounds, the latch judged exactly these
-    /// frames, the camera's records do not break the alternation's parity,
-    /// and the raw means prove D1 alternation with the setup proof's rules
-    /// unchanged. Nothing carries over between bursts: a proven burst never
-    /// qualifies the next one.
+    /// frames, the stream's emitter is active (`emitter_active`, the session's
+    /// emitter guard), the camera's records do not break the alternation's
+    /// parity, the raw means prove D1 alternation with the setup proof's rules
+    /// unchanged, and every record the camera did supply names the optically
+    /// bright frames lit (Amendment 2026-10-14). Nothing carries over between
+    /// bursts: a proven burst never qualifies the next one.
     pub(crate) fn burst_ceiling(
         &self,
         judged_before: u64,
+        emitter_active: bool,
         frames: &[(u32, f32)],
         illumination: &[(u32, Option<bool>)],
-    ) -> Result<u8, CeilingRefusal> {
+    ) -> Result<QualifiedBurst, CeilingRefusal> {
         limited_range_eligibility(&self.raw).map_err(CeilingRefusal::Range)?;
         if let Some(refusal) = self.refusal() {
             return Err(CeilingRefusal::Content(refusal));
@@ -667,13 +692,45 @@ impl YuyvContentLatch {
                 frames: frames.len(),
             });
         }
+        if !emitter_active {
+            return Err(CeilingRefusal::EmitterInactive);
+        }
         if D1MetadataEvidence::from_sequence_flags(illumination).contradicts_d1() {
             return Err(CeilingRefusal::IlluminationContradicts);
         }
-        if !D1OpticalEvidence::from_sequence_means(frames).proves_d1() {
+        let optical = D1OpticalEvidence::from_sequence_means(frames);
+        if !optical.proves_d1() {
             return Err(CeilingRefusal::NoAlternation);
         }
-        Ok(YUYV_LIMITED_WHITE_LEVEL)
+        let burst = QualifiedBurst {
+            white_level: YUYV_LIMITED_WHITE_LEVEL,
+            bright_on_even: optical.bright_on_even(),
+        };
+        // Records that alternate but name the optically dark frames lit are
+        // not this burst's emitter either.
+        if illumination
+            .iter()
+            .any(|&(sequence, lit)| lit.is_some_and(|lit| lit != burst.lit(sequence)))
+        {
+            return Err(CeilingRefusal::IlluminationContradicts);
+        }
+        Ok(burst)
+    }
+}
+
+/// Fixtures other modules' tests build a latch from.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::RawYuyvFormat;
+
+    /// A limited-range, BT.601, extended-field-valid 2x1 YUYV format, the
+    /// tests' base tuple at the smallest tight geometry.
+    pub(crate) fn limited_2x1() -> RawYuyvFormat {
+        let mut raw = super::tests::base_format();
+        raw.width = 2;
+        raw.height = 1;
+        raw.bytesperline = 4;
+        raw
     }
 }
 
@@ -723,6 +780,11 @@ mod tests {
 
     /// Single-planar capture YUYV 2x1, valid extended fields, sRGB, explicit
     /// BT.601 and explicit limited range.
+    /// The tests' base tuple, shared with [`super::tests_support`].
+    pub(super) fn base_format() -> RawYuyvFormat {
+        base()
+    }
+
     fn base() -> RawYuyvFormat {
         RawYuyvFormat {
             buffer_type: CAPTURE,
@@ -1819,7 +1881,12 @@ mod tests {
     fn ceiling_of(frames: &[(u32, f32)]) -> Result<u8, CeilingRefusal> {
         let mut latch = fresh(2, 1);
         let before = judge_clean(&mut latch, frames.len());
-        latch.burst_ceiling(before, frames, &unsaid(frames))
+        level(latch.burst_ceiling(before, true, frames, &unsaid(frames)))
+    }
+
+    /// The ceiling a qualified burst names, for the tests that compare it.
+    fn level(result: Result<QualifiedBurst, CeilingRefusal>) -> Result<u8, CeilingRefusal> {
+        result.map(|burst| burst.white_level)
     }
 
     #[test]
@@ -1868,7 +1935,7 @@ mod tests {
                 frames.push((sequence, mean as f32));
             }
             assert_eq!(
-                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                level(latch.burst_ceiling(before, true, &frames, &unsaid(&frames))),
                 expected,
                 "lit {lit_luma}"
             );
@@ -1902,7 +1969,7 @@ mod tests {
             let frames = burst(100, 10, 60.0, 20.0);
             let before = judge_clean(&mut latch, frames.len());
             assert_eq!(
-                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                level(latch.burst_ceiling(before, true, &frames, &unsaid(&frames))),
                 Err(CeilingRefusal::Range(refusal))
             );
         }
@@ -1915,7 +1982,7 @@ mod tests {
         let frames = burst(100, 10, 60.0, 20.0);
         let before = judge_clean(&mut unresolved, frames.len());
         assert!(matches!(
-            unresolved.burst_ceiling(before, &frames, &unsaid(&frames)),
+            level(unresolved.burst_ceiling(before, true, &frames, &unsaid(&frames))),
             Err(CeilingRefusal::Range(MetadataRefusal::Unresolved(_)))
         ));
     }
@@ -1926,7 +1993,7 @@ mod tests {
         let frames = burst(100, 10, 60.0, 20.0);
         let before = judge_clean(&mut latch, frames.len());
         assert_eq!(
-            latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+            level(latch.burst_ceiling(before, true, &frames, &unsaid(&frames))),
             Ok(235)
         );
 
@@ -1936,14 +2003,14 @@ mod tests {
         judge_clean(&mut latch, 9);
         let next = burst(110, 10, 60.0, 20.0);
         assert_eq!(
-            latch.burst_ceiling(before, &next, &unsaid(&next)),
+            level(latch.burst_ceiling(before, true, &next, &unsaid(&next))),
             Err(CeilingRefusal::Content(CHROMA))
         );
         // A clean, alternating third burst does not clear it.
         let before = judge_clean(&mut latch, 10);
         let third = burst(120, 10, 60.0, 20.0);
         assert_eq!(
-            latch.burst_ceiling(before, &third, &unsaid(&third)),
+            level(latch.burst_ceiling(before, true, &third, &unsaid(&third))),
             Err(CeilingRefusal::Content(CHROMA))
         );
     }
@@ -1955,7 +2022,7 @@ mod tests {
             let mut latch = fresh(2, 1);
             let before = judge_clean(&mut latch, offered);
             assert_eq!(
-                latch.burst_ceiling(before, &frames, &unsaid(&frames)),
+                level(latch.burst_ceiling(before, true, &frames, &unsaid(&frames))),
                 Err(CeilingRefusal::Unjudged {
                     judged: offered as u64,
                     frames: 10
@@ -2065,7 +2132,7 @@ mod tests {
             let mut latch = fresh(2, 1);
             let before = judge_clean(&mut latch, frames.len());
             assert_eq!(
-                latch.burst_ceiling(before, &frames, &records),
+                level(latch.burst_ceiling(before, true, &frames, &records)),
                 expected,
                 "{case}"
             );
@@ -2075,7 +2142,7 @@ mod tests {
         let mut latch = fresh(2, 1);
         let before = judge_clean(&mut latch, steady.len());
         assert_eq!(
-            latch.burst_ceiling(before, &steady, &agreeing),
+            level(latch.burst_ceiling(before, true, &steady, &agreeing)),
             Err(CeilingRefusal::NoAlternation)
         );
     }
@@ -2086,15 +2153,104 @@ mod tests {
         let proven = burst(100, 10, 60.0, 20.0);
         let before = judge_clean(&mut latch, proven.len());
         assert_eq!(
-            latch.burst_ceiling(before, &proven, &unsaid(&proven)),
+            level(latch.burst_ceiling(before, true, &proven, &unsaid(&proven))),
             Ok(235)
         );
         let steady: Vec<(u32, f32)> = (110..120).map(|sequence| (sequence, 60.0)).collect();
         let before = judge_clean(&mut latch, steady.len());
         assert_eq!(
-            latch.burst_ceiling(before, &steady, &unsaid(&steady)),
+            level(latch.burst_ceiling(before, true, &steady, &unsaid(&steady))),
             Err(CeilingRefusal::NoAlternation)
         );
+    }
+
+    /// Amendment 2026-10-14: a qualified burst names its bright phase by raw
+    /// sequence parity, the frames that stand in for missing illumination
+    /// records; either parity can be the bright one, and a u32 wrap keeps it.
+    #[test]
+    fn b11_a_qualified_burst_names_its_lit_frames_by_sequence() {
+        // `burst` gives even sequences the first mean and odd ones the second.
+        for (first, even_mean, odd_mean, lit_even) in [
+            (100_u32, 60.0, 20.0, true),
+            (101, 60.0, 20.0, true),
+            (100, 20.0, 60.0, false),
+            (u32::MAX - 4, 60.0, 20.0, true),
+        ] {
+            let frames = burst(first, 10, even_mean, odd_mean);
+            let mut latch = fresh(2, 1);
+            let before = judge_clean(&mut latch, frames.len());
+            let qualified = latch
+                .burst_ceiling(before, true, &frames, &unsaid(&frames))
+                .expect("an alternating burst qualifies");
+            assert_eq!(qualified.white_level, 235);
+            for &(sequence, mean) in &frames {
+                assert_eq!(
+                    qualified.lit(sequence),
+                    (sequence % 2 == 0) == lit_even,
+                    "sequence {sequence}"
+                );
+                assert_eq!(
+                    qualified.lit(sequence),
+                    mean == 60.0,
+                    "the bright frames are lit"
+                );
+            }
+        }
+    }
+
+    /// #1064 review: an alternation the session's emitter did not make is not
+    /// the emitter's, whatever its shape.
+    #[test]
+    fn b12_an_inactive_emitter_qualifies_no_burst() {
+        let frames = burst(100, 10, 60.0, 20.0);
+        let mut latch = fresh(2, 1);
+        let before = judge_clean(&mut latch, frames.len());
+        assert_eq!(
+            latch.burst_ceiling(before, false, &frames, &unsaid(&frames)),
+            Err(CeilingRefusal::EmitterInactive)
+        );
+    }
+
+    /// #1064 review: records that alternate but are inverted relative to the
+    /// optical phase refuse the burst, so they can never mark a dark frame
+    /// lit; agreeing records, all or some, still qualify.
+    #[test]
+    fn b13_records_inverted_against_the_optics_refuse() {
+        let frames = burst(100, 10, 60.0, 20.0);
+        let agreeing: Vec<(u32, Option<bool>)> = frames
+            .iter()
+            .map(|&(sequence, _)| (sequence, Some(sequence % 2 == 0)))
+            .collect();
+        let inverted: Vec<(u32, Option<bool>)> = agreeing
+            .iter()
+            .map(|&(sequence, lit)| (sequence, lit.map(|lit| !lit)))
+            .collect();
+        let mut one_inverted = unsaid(&frames);
+        one_inverted[4].1 = Some(false);
+        let mut one_agreeing = unsaid(&frames);
+        one_agreeing[4].1 = Some(true);
+        for (records, expected, case) in [
+            (agreeing, Ok(235), "agreeing records"),
+            (one_agreeing, Ok(235), "one agreeing record"),
+            (
+                inverted,
+                Err(CeilingRefusal::IlluminationContradicts),
+                "inverted records",
+            ),
+            (
+                one_inverted,
+                Err(CeilingRefusal::IlluminationContradicts),
+                "one inverted record",
+            ),
+        ] {
+            let mut latch = fresh(2, 1);
+            let before = judge_clean(&mut latch, frames.len());
+            assert_eq!(
+                level(latch.burst_ceiling(before, true, &frames, &records)),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]
@@ -2122,6 +2278,10 @@ mod tests {
             (
                 CeilingRefusal::NoAlternation,
                 "no emitter alternation proven on this burst",
+            ),
+            (
+                CeilingRefusal::EmitterInactive,
+                "the emitter is not active for this stream",
             ),
         ] {
             assert_eq!(refusal.to_string(), line);

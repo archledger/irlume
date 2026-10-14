@@ -4159,11 +4159,16 @@ fn require_ir_privacy_released(
     privacy_refusal_error(device, stage, privacy_state(dev))
 }
 
+/// `prove_device_default` asks the emitter guard to verify, read only, that
+/// the camera's Face Authentication control holds its own default D1 value
+/// when no control is configured; only an attested YUYV IR session asks
+/// (ADR-0031 §4, Amendment 2026-10-14).
 fn enable_ir_emitter_privacy_bounded(
     device: &str,
     dev: &Device,
     card: &str,
     permit: lease::CameraLease,
+    prove_device_default: bool,
     stage: &'static str,
 ) -> irlume_common::Result<ir_emitter::StreamMode> {
     privacy_refusal_error(device, stage, privacy_state(dev))?;
@@ -4187,6 +4192,7 @@ fn enable_ir_emitter_privacy_bounded(
         card,
         device,
         permit,
+        prove_device_default,
         &mut before_forward_write,
     )
     .map_err(|why| {
@@ -7266,6 +7272,7 @@ impl IrCamera {
                 &self.dev,
                 &self.card,
                 self.lease.clone(),
+                self.format_evidence.is_some(),
                 "before Face Authentication D1",
             )?
             .with_timing(capture_timing::Recorder::from_control(control))
@@ -7347,8 +7354,9 @@ pub struct IrSession<'a> {
     /// drops afterward on normal, error and unwind paths. An unconfirmed stop
     /// retains its complete backend for the process lifetime without restoring.
     ///
-    /// Never read. It is held for its `Drop`, which is the whole point, and the
-    /// dead-code lint cannot see that.
+    /// Held for its `Drop`, which is the whole point. Read only by the restore
+    /// paths and, for an attested YUYV session, by the burst judgment's
+    /// emitter check (ADR-0031 §4, Amendment 2026-10-14).
     _mode: ir_emitter::StreamMode,
     /// Reset last, after coupled cleanup or transfer into process retention.
     _session_slot: SessionSlot<'a>,
@@ -7429,6 +7437,12 @@ impl IrSession<'_> {
         let (w, h) = (self.cam.width, self.cam.height);
         let card = &self.cam.card;
         let lit = self.lit;
+        // The emitter condition of an attested YUYV burst (ADR-0031 §4,
+        // Amendment 2026-10-14), read from the camera right before the burst
+        // and again after it: the configured control still holds what the
+        // guard applied, or the camera's own Face Authentication control still
+        // reads its verified device-default D1 value.
+        let emitter_before = self.cam.format_evidence.is_some() && self._mode.still_active();
         // The format's own ceiling. YUYV luma names none, so its bursts never
         // end early on a plateau below and its ceiling is decided after the
         // burst, from the burst's frames.
@@ -7572,8 +7586,10 @@ impl IrSession<'_> {
         // Amendment 2026-10-13). GREY's comes from its format. YUYV luma names
         // none by format, so a camera with fd-bound evidence asks its session
         // latch about this burst's own frames, now that all of them are in.
-        let white_level = match (format_white_level, content.as_ref(), judged_before) {
-            (Some(level), _, _) => Some(level),
+        // An alternation the emitter did not make, before, during or after the
+        // burst, is not the emitter's (Amendment 2026-10-14).
+        let emitter_active = emitter_before && self._mode.still_active();
+        let qualified = match (format_white_level, content.as_ref(), judged_before) {
             (None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {
                 let judged: Vec<(u32, f32)> = sequences
                     .iter()
@@ -7590,13 +7606,14 @@ impl IrSession<'_> {
                         )
                     })
                     .collect();
-                match latch.burst_ceiling(judged_before, &judged, &illumination) {
-                    Ok(level) => {
+                match latch.burst_ceiling(judged_before, emitter_active, &judged, &illumination) {
+                    Ok(burst) => {
                         irlume_common::dlog!(
-                            "[ir] {}: YUYV clipping ceiling {level} for this burst",
-                            camera_text(device)
+                            "[ir] {}: YUYV clipping ceiling {} for this burst",
+                            camera_text(device),
+                            burst.white_level
                         );
-                        Some(level)
+                        Some(burst)
                     }
                     Err(refusal) => {
                         irlume_common::dlog!(
@@ -7609,6 +7626,32 @@ impl IrSession<'_> {
             }
             _ => None,
         };
+        let white_level = format_white_level.or(qualified.map(|burst| burst.white_level));
+        // Amendment 2026-10-14: with no illumination record for any frame of
+        // a qualified burst, its proven bright phase is the frames' active-IR
+        // evidence, as a Windows Device MFT may supply the frame-illumination
+        // attribute the camera does not. Provenance only: the selection and
+        // the camera-reported statistics below keep reading `flags`.
+        // Only on a split pair under the owner's experimental opt-in: the reads
+        // around the burst cannot see the control changed and changed back
+        // within it by another program with access to the camera, which
+        // uvcvideo does not prevent and per-frame records would show.
+        let optical_admitted = optical_provenance_admitted(&lease);
+        let provenance_flags =
+            provenance_illumination(&flags, &sequences, qualified.filter(|_| optical_admitted));
+        if qualified.is_some() && from_camera == 0 {
+            if optical_admitted {
+                irlume_common::dlog!(
+                    "[ir] {}: no illumination records; this burst's proven alternation marks its bright frames active IR",
+                    camera_text(device)
+                );
+            } else {
+                irlume_common::dlog!(
+                    "[ir] {}: no illumination records; a burst's alternation marks frames active IR only on a split pair under the experimental opt-in",
+                    camera_text(device)
+                );
+            }
+        }
         // Per-frame comparison of the two answers, for measuring how often the
         // old threshold disagreed with the camera. A disagreement is the whole
         // reason this path exists, and it can only be observed against a scene
@@ -7838,7 +7881,7 @@ impl IrSession<'_> {
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
         let contributors = dequeue_evidence
             .into_iter()
-            .zip(flags.iter().copied())
+            .zip(provenance_flags.iter().copied())
             .map(
                 |((facts, sequence, timestamp, frame_taken, rate_evidence), illumination)| {
                     let illumination = illumination_provenance(illumination);
@@ -7944,6 +7987,7 @@ impl IrSession<'_> {
             &self.cam.dev,
             &self.cam.card,
             self.cam.lease.clone(),
+            self.cam.format_evidence.is_some(),
             "before recovered Face Authentication D1",
         )?
         .with_producer(producer);
@@ -8257,6 +8301,7 @@ pub mod ir_probe {
             &dev,
             &card,
             permit.clone(),
+            false,
             "before Face Authentication D1",
         )?
         .with_producer(stream.producer());
@@ -8417,6 +8462,7 @@ pub mod startup_probe {
             &cam.dev,
             &cam.card,
             cam.lease.clone(),
+            false,
             "before Face Authentication D1",
         )?
         .with_producer(stream.producer());
@@ -8472,6 +8518,44 @@ fn ir_frame_disposition(mean: f64) -> IrFrameDisposition {
         IrFrameDisposition::SkipBlown
     } else {
         IrFrameDisposition::Deliver
+    }
+}
+
+/// Whether a qualified burst's alternation may stand in for missing
+/// illumination records (ADR-0031 §4, Amendment 2026-10-14): only on a
+/// split pair while the machine owner's experimental split opt-in is latched
+/// (ADR-0032, amendment 2026-10-13). Reads of the emitter control around a
+/// burst cannot exclude a change made and undone within it by another
+/// program with access to the camera, so this evidence stays inside that
+/// opt-in.
+fn optical_provenance_admitted(lease: &lease::CameraLease) -> bool {
+    lease.is_split_pair() && lease::experimental_split_trust()
+}
+
+/// The per-frame illumination a burst's contributors carry as provenance:
+/// the camera's own records, or, when it supplied none for any frame of a
+/// burst that met ADR-0031 §4 (Amendment 2026-10-14), lit for the frames in
+/// the burst's proven bright phase and dark for the rest. A camera with any
+/// record keeps its records, so the two sources never mix.
+fn provenance_illumination(
+    flags: &[Option<ir_metadata::Illumination>],
+    sequences: &[u32],
+    qualified: Option<yuyv_exposure::QualifiedBurst>,
+) -> Vec<Option<ir_metadata::Illumination>> {
+    match qualified {
+        Some(burst) if flags.iter().all(Option::is_none) && flags.len() == sequences.len() => {
+            sequences
+                .iter()
+                .map(|&sequence| {
+                    Some(if burst.lit(sequence) {
+                        ir_metadata::Illumination::Lit
+                    } else {
+                        ir_metadata::Illumination::Dark
+                    })
+                })
+                .collect()
+        }
+        _ => flags.to_vec(),
     }
 }
 
@@ -8570,6 +8654,7 @@ pub fn capture_ir_streaming<B>(
         &dev,
         &card,
         permit.clone(),
+        false,
         "before Face Authentication D1",
     )?
     .with_producer(producer);
@@ -8721,6 +8806,7 @@ pub fn capture_ir_sequence(
         &dev,
         &card,
         permit.clone(),
+        false,
         "before Face Authentication D1",
     )?
     .with_producer(producer);
@@ -13123,7 +13209,7 @@ mod tests {
                 "        let judged_before = content.as_ref().map(|latch| latch.inspected());",
                 "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
                 "                    \"[ir] {}: YUYV content latch set for this session, so its bursts get no clipping ceiling: {newly}\",",
-                "        let white_level = match (format_white_level, content.as_ref(), judged_before) {",
+                "        let qualified = match (format_white_level, content.as_ref(), judged_before) {",
             ],
             "the literal builds the latch, the field holds it, and only the burst's borrow, \
              its observe and two shared reads (the count before the burst and the burst's \
@@ -13275,9 +13361,11 @@ mod tests {
         let mut from = 0;
         for step in [
             "let flags: Vec<Option<ir_metadata::Illumination>>",
-            "let white_level = match (format_white_level, content.as_ref(), judged_before) {",
+            "let qualified = match (format_white_level, content.as_ref(), judged_before) {",
             "(None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {",
-            "latch.burst_ceiling(judged_before, &judged, &illumination)",
+            "latch.burst_ceiling(judged_before, emitter_active, &judged, &illumination)",
+            "let white_level = format_white_level.or(qualified.map(|burst| burst.white_level));",
+            "provenance_illumination(&flags, &sequences, qualified.filter(|_| optical_admitted));",
             "let clipped_fracs",
             "paired_saturation_evidence(",
             "white_level,",
@@ -13287,6 +13375,75 @@ mod tests {
                 .unwrap_or_else(|| panic!("{step} is missing or out of order"));
             from += at + step.len();
         }
+        // Amendment 2026-10-14: frame provenance reads the derived flags, only
+        // under the split opt-in; the camera's own `flags` keep driving the
+        // selection and the statistics.
+        assert!(capture.contains("let optical_admitted = optical_provenance_admitted(&lease);"));
+        assert!(capture.contains("qualified.filter(|_| optical_admitted)"));
+        assert!(lib.contains(
+            "fn optical_provenance_admitted(lease: &lease::CameraLease) -> bool {\n    lease.is_split_pair() && lease::experimental_split_trust()\n}"
+        ));
+        assert_eq!(
+            after
+                .matches(".zip(provenance_flags.iter().copied())")
+                .count(),
+            1,
+            "the contributors carry the derived illumination"
+        );
+        assert!(!after.contains(".zip(flags.iter().copied())"));
+    }
+
+    /// ADR-0031 §4, Amendment 2026-10-14: a qualified burst whose camera
+    /// supplied no illumination record marks its bright phase lit and the
+    /// rest dark, by raw sequence; a camera with any record keeps its
+    /// records; an unqualified burst gets nothing derived.
+    #[test]
+    fn a_qualified_burst_without_records_supplies_its_illumination() {
+        use ir_metadata::Illumination::{Dark, Lit};
+        let frames: Vec<(u32, f32)> = (100_u32..110)
+            .map(|sequence| (sequence, if sequence % 2 == 0 { 60.0 } else { 20.0 }))
+            .collect();
+        let sequences: Vec<u32> = frames.iter().map(|&(sequence, _)| sequence).collect();
+        let raw = yuyv_exposure::tests_support::limited_2x1();
+        let mut latch = yuyv_exposure::YuyvContentLatch::new(raw);
+        let before = latch.inspected();
+        for _ in &frames {
+            assert_eq!(latch.observe(&[60, 128, 60, 128]), None);
+        }
+        let unsaid: Vec<(u32, Option<bool>)> = sequences.iter().map(|&s| (s, None)).collect();
+        let qualified = latch
+            .burst_ceiling(before, true, &frames, &unsaid)
+            .expect("an alternating clean burst qualifies");
+        let none = vec![None; sequences.len()];
+        assert_eq!(
+            provenance_illumination(&none, &sequences, Some(qualified)),
+            sequences
+                .iter()
+                .map(|s| Some(if s % 2 == 0 { Lit } else { Dark }))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(provenance_illumination(&none, &sequences, None), none);
+        let mut partial = none.clone();
+        partial[3] = Some(Lit);
+        assert_eq!(
+            provenance_illumination(&partial, &sequences, Some(qualified)),
+            partial,
+            "a camera with any record keeps its own"
+        );
+        assert_eq!(
+            provenance_illumination(&none, &sequences[..9], Some(qualified)),
+            none,
+            "mismatched lengths derive nothing"
+        );
+        let derived = provenance_illumination(&none, &sequences, Some(qualified));
+        assert_eq!(
+            illumination_provenance(derived[0]),
+            contracts::IlluminationProvenance::ActiveIr
+        );
+        assert_eq!(
+            illumination_provenance(derived[1]),
+            contracts::IlluminationProvenance::Ambient
+        );
     }
 
     #[test]

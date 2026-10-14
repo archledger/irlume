@@ -361,7 +361,16 @@ qualify (ADR-0031 §4, amendment 2026-10-13); otherwise face authentication
 refuses it as "IR exposure unmeasurable". With `IRLUME_LOG=debug` irlumed
 logs, for each burst, `YUYV clipping ceiling 235 for this burst` or `no YUYV
 clipping ceiling for this burst:` and the reason, and a latched frame
-violation once per session. An IR camera on a different USB device from the
+violation once per session. A qualified burst from a camera with no
+illumination records also logs `no illumination records; this burst's proven
+alternation marks its bright frames active IR` (amendment 2026-10-14), or,
+outside a split pair under the experimental opt-in, `a burst's alternation
+marks frames active IR only on a split pair under the experimental opt-in`. When
+no emitter control is configured, such a session logs `face authentication
+holds its device-default D1 value (read only)` at open if the camera's own
+control reports its alternating mode, which counts as an active emitter for
+the burst judgment; without that line or a configured control, bursts log
+`the emitter is not active for this stream`. An IR camera on a different USB device from the
 RGB camera pairs only as an experimental split pair
 ([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` lists,
 without writing, the extension units of the IR node irlumed has selected.

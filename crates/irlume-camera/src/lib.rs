@@ -7589,7 +7589,20 @@ impl IrSession<'_> {
         // An alternation the emitter did not make, before, during or after the
         // burst, is not the emitter's (Amendment 2026-10-14).
         let emitter_active = emitter_before && self._mode.still_active();
+        // Only a split pair under the owner's experimental opt-in judges a
+        // YUYV burst at all: the sequential and IR-only routes do not require
+        // active-IR provenance, so a ceiling there would bypass the opt-in
+        // that confines this evidence (Amendment 2026-10-14). Elsewhere every
+        // YUYV burst stays without a ceiling, as before.
+        let optical_admitted = optical_provenance_admitted(&lease);
         let qualified = match (format_white_level, content.as_ref(), judged_before) {
+            (None, Some(_), Some(_)) if dec.pix == IrPixel::YuyvLuma && !optical_admitted => {
+                irlume_common::dlog!(
+                    "[ir] {}: no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on a split pair under the experimental opt-in",
+                    camera_text(device)
+                );
+                None
+            }
             (None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {
                 let judged: Vec<(u32, f32)> = sequences
                     .iter()
@@ -7632,25 +7645,16 @@ impl IrSession<'_> {
         // evidence, as a Windows Device MFT may supply the frame-illumination
         // attribute the camera does not. Provenance only: the selection and
         // the camera-reported statistics below keep reading `flags`.
-        // Only on a split pair under the owner's experimental opt-in: the reads
-        // around the burst cannot see the control changed and changed back
+        // A burst is qualified only where `optical_admitted` held above: the
+        // reads around a burst cannot see the control changed and changed back
         // within it by another program with access to the camera, which
         // uvcvideo does not prevent and per-frame records would show.
-        let optical_admitted = optical_provenance_admitted(&lease);
-        let provenance_flags =
-            provenance_illumination(&flags, &sequences, qualified.filter(|_| optical_admitted));
+        let provenance_flags = provenance_illumination(&flags, &sequences, qualified);
         if qualified.is_some() && from_camera == 0 {
-            if optical_admitted {
-                irlume_common::dlog!(
-                    "[ir] {}: no illumination records; this burst's proven alternation marks its bright frames active IR",
-                    camera_text(device)
-                );
-            } else {
-                irlume_common::dlog!(
-                    "[ir] {}: no illumination records; a burst's alternation marks frames active IR only on a split pair under the experimental opt-in",
-                    camera_text(device)
-                );
-            }
+            irlume_common::dlog!(
+                "[ir] {}: no illumination records; this burst's proven alternation marks its bright frames active IR",
+                camera_text(device)
+            );
         }
         // Per-frame comparison of the two answers, for measuring how often the
         // old threshold disagreed with the camera. A disagreement is the whole
@@ -13365,7 +13369,7 @@ mod tests {
             "(None, Some(latch), Some(judged_before)) if dec.pix == IrPixel::YuyvLuma => {",
             "latch.burst_ceiling(judged_before, emitter_active, &judged, &illumination)",
             "let white_level = format_white_level.or(qualified.map(|burst| burst.white_level));",
-            "provenance_illumination(&flags, &sequences, qualified.filter(|_| optical_admitted));",
+            "let provenance_flags = provenance_illumination(&flags, &sequences, qualified);",
             "let clipped_fracs",
             "paired_saturation_evidence(",
             "white_level,",
@@ -13379,7 +13383,9 @@ mod tests {
         // under the split opt-in; the camera's own `flags` keep driving the
         // selection and the statistics.
         assert!(capture.contains("let optical_admitted = optical_provenance_admitted(&lease);"));
-        assert!(capture.contains("qualified.filter(|_| optical_admitted)"));
+        assert!(capture.contains(
+            "(None, Some(_), Some(_)) if dec.pix == IrPixel::YuyvLuma && !optical_admitted => {"
+        ));
         assert!(lib.contains(
             "fn optical_provenance_admitted(lease: &lease::CameraLease) -> bool {\n    lease.is_split_pair() && lease::experimental_split_trust()\n}"
         ));

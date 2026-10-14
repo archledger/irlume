@@ -69,19 +69,23 @@ summary lives on the [README](../README.md); this is the detail.
   are judged per burst.** NV12 carries no sensor ceiling irlume can measure,
   so every face attempt on it falls back to the password as "IR exposure
   unmeasurable". A YUYV-only IR camera whose USB descriptor declares it (the
-  T480's 5986:1141) is classified as IR. Its format names no ceiling either:
-  a burst gets one, 235 on the raw luma, only when the format read from the
-  open camera is limited range, no frame of the session has broken the
-  footroom or flat-chroma bounds, the stream's emitter is active (configured
-  by `irlume ir-setup`, or the camera's own face-authentication control
-  reads its default alternating mode), and the burst itself shows the
-  emitter alternating (ADR-0031 §4, amendment 2026-10-13). Such a camera reports no
-  per-frame illumination of its own, so on a split pair under the
-  experimental opt-in that burst's alternation also marks its lit frames
-  (amendment 2026-10-14); other programs with access to the camera can
-  disturb that inference. Any other burst refuses the same
-  way. This has not yet been qualified on a T480. An IR camera that
-  offers MJPG, alone or beside YUYV, is not supported.
+  T480's 5986:1141) is classified as IR, and its format names no ceiling
+  either. Only as the IR side of a split pair under the experimental opt-in
+  does a burst get one, 235 on the raw luma, and only when the format read
+  from the open camera is limited range, no frame of the session has broken
+  the footroom or flat-chroma bounds, the stream's emitter is active, and
+  the burst itself shows the emitter alternating (ADR-0031 §4, amendments
+  2026-10-13 and 2026-10-14). Such a camera reports no per-frame
+  illumination, so that burst's alternation also marks its lit frames, and
+  other programs with access to the camera can disturb that inference. Every
+  other YUYV burst refuses the same way as NV12. The emitter counts as active
+  when `irlume ir-setup` saved its control or the camera's own
+  face-authentication control reads its default alternating mode; neither
+  works on a T480, whose control defaults to general-purpose mode and whose
+  change `ir-setup` cannot measure, so a T480 owner sets
+  `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0` for irlumed (docs/SETUP.md). This
+  has not yet been qualified on a T480. An IR camera that offers MJPG, alone
+  or beside YUYV, is not supported.
 - **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.
   Demographic tuning ([FAIRNESS.md](FAIRNESS.md)) is ongoing.
 - **Root on the live machine is the trust boundary.** The daemon holds decrypted

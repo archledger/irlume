@@ -363,9 +363,10 @@ logs, for each burst, `YUYV clipping ceiling 235 for this burst` or `no YUYV
 clipping ceiling for this burst:` and the reason, and a latched frame
 violation once per session. A qualified burst from a camera with no
 illumination records also logs `no illumination records; this burst's proven
-alternation marks its bright frames active IR` (amendment 2026-10-14), or,
-outside a split pair under the experimental opt-in, `a burst's alternation
-marks frames active IR only on a split pair under the experimental opt-in`. When
+alternation marks its bright frames active IR` (amendment 2026-10-14).
+Outside a split pair under the experimental opt-in, every YUYV burst logs
+`no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on
+a split pair under the experimental opt-in`. When
 no emitter control is configured, such a session logs `face authentication
 holds its device-default D1 value (read only)` at open if the camera's own
 control reports its alternating mode, which counts as an active emitter for

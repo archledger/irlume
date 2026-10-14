@@ -1452,7 +1452,10 @@ built-in rule and the §2 replacement limitation.
 
 Split evidence keeps the sequential posture and grants only through the
 IR-identity-verified arms. YUYV IR still has no clipping ceiling (ADR-0031 §4),
-so the T480 class stays refused (#887). Concurrent split capture and IR-only
+so the T480 class stays refused (#887). Amended 2026-10-14: on a split pair
+under this opt-in, an attested YUYV IR burst that passes ADR-0031 §4's
+judgment now gets a ceiling and supplies its own active-IR evidence; see the
+amendment of that date below. Concurrent split capture and IR-only
 authentication on a split pair stay refused. `irlume split add`, `select` and
 `remove` stay root-only and OS-approved as before, and enrollment still needs
 an explicit split choice. The rows that pin the closed default keep passing

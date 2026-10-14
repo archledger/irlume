@@ -206,8 +206,9 @@ than assuming every desktop has the same prompt or cancellation behavior.
   `Y16`/`Y10`/`Y12`/`NV12` is refused rather than untested: those formats
   name no sensor ceiling, so the IR exposure check cannot run, and irlume
   refuses instead of judging a frame it never read (#358). A YUYV-only node
-  is refused the same way unless its USB descriptor attests an IR function
-  and each burst passes ADR-0031 §4's judgment
+  is refused the same way unless its USB descriptor attests an IR function,
+  it is the IR side of a split pair under the experimental opt-in, and each
+  burst passes ADR-0031 §4's judgment
   ([ADR-0031](adr/0031-descriptor-attested-yuyv-luma-ir.md)): the format
   read from the open camera, the session's frames, the stream's active
   emitter and the burst's own alternation must all qualify (amendments

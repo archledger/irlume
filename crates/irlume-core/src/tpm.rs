@@ -39,7 +39,7 @@ use tss_esapi::constants::tss::{
     TPM2_HR_HMAC_SESSION, TPM2_HR_NV_INDEX, TPM2_HR_PERSISTENT, TPM2_HR_POLICY_SESSION,
     TPM2_HR_TRANSIENT,
 };
-use tss_esapi::constants::{CapabilityType, SessionType};
+use tss_esapi::constants::{CapabilityType, PropertyTag, SessionType};
 use tss_esapi::handles::{
     KeyHandle, NvIndexHandle, NvIndexTpmHandle, ObjectHandle, PersistentTpmHandle, SessionHandle,
     TpmHandle,
@@ -342,6 +342,125 @@ fn note_marker_unavailable_once(path: &std::path::Path) {
     });
 }
 
+pub use irlume_common::tpm_readiness::{
+    roca_fingerprint, FirmwareAdvisory, PcrBankReadiness, StorageKeyCheck, TpmIdentity,
+};
+
+/// The ASCII text of TPM property words: printable characters only, runs of
+/// padding spaces read as one.
+fn property_text(words: &[u32]) -> String {
+    words
+        .iter()
+        .flat_map(|w| w.to_be_bytes())
+        .filter(|b| b.is_ascii_graphic() || *b == b' ')
+        .map(char::from)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Read this TPM's manufacturer, vendor string and firmware version.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn tpm_identity() -> Result<TpmIdentity> {
+    let mut ctx = open_context()?;
+    let mut property = |tag| ctx.get_tpm_property(tag).map_err(tpm_err);
+    identity_from(
+        property(PropertyTag::Manufacturer)?,
+        [
+            property(PropertyTag::VendorString1)?,
+            property(PropertyTag::VendorString2)?,
+            property(PropertyTag::VendorString3)?,
+            property(PropertyTag::VendorString4)?,
+        ],
+        property(PropertyTag::FirmwareVersion1)?,
+    )
+}
+
+/// A [`TpmIdentity`] from the properties `GetCapability` returned. The
+/// manufacturer and firmware version are required; a TPM that leaves one out
+/// (failure mode, a nonconforming part) is not identified. The vendor string
+/// words are optional.
+fn identity_from(
+    manufacturer: Option<u32>,
+    vendor: [Option<u32>; 4],
+    version: Option<u32>,
+) -> Result<TpmIdentity> {
+    let required = |value: Option<u32>, what: &str| {
+        value.ok_or_else(|| Error::Tpm(format!("the TPM did not report its {what}")))
+    };
+    let manufacturer = property_text(&[required(manufacturer, "manufacturer")?]);
+    let version = required(version, "firmware version")?;
+    Ok(TpmIdentity {
+        manufacturer,
+        vendor: property_text(&vendor.map(Option::unwrap_or_default)),
+        firmware: ((version >> 16) as u16, version as u16),
+    })
+}
+
+/// The readiness of `values`, the SHA-256 reading of the policy PCRs.
+fn classify_pcr_bank(values: &[PcrValue]) -> PcrBankReadiness {
+    let missing: Vec<u32> = values
+        .iter()
+        .filter(|v| v.value.len() != 32)
+        .map(|v| v.pcr)
+        .collect();
+    if !missing.is_empty() {
+        return PcrBankReadiness::Missing(missing);
+    }
+    let unextended: Vec<u32> = values
+        .iter()
+        .filter(|v| {
+            crate::envelope::binds_firmware_state(&[v.pcr]) && v.value.iter().all(|&b| b == 0)
+        })
+        .map(|v| v.pcr)
+        .collect();
+    if unextended.is_empty() {
+        PcrBankReadiness::Ready(values.iter().map(|v| v.pcr).collect())
+    } else {
+        PcrBankReadiness::Unextended(unextended)
+    }
+}
+
+/// Check irlume's persistent storage key for the ROCA fingerprint. Reads the
+/// public area of the key at irlume's handle and creates or changes nothing. A
+/// handle that is empty, or holds another stack's key, is
+/// [`StorageKeyCheck::Absent`]: irlume then derives a transient key each time,
+/// from the same template, so the firmware version decides.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn storage_key_check() -> Result<StorageKeyCheck> {
+    let mut ctx = open_context()?;
+    let handle = persistent_srk_raw();
+    let wanted = TpmHandle::Persistent(PersistentTpmHandle::new(handle).map_err(tpm_err)?);
+    if !tpm_handle_exists(&mut ctx, TPM2_HR_PERSISTENT, wanted)? {
+        return Ok(StorageKeyCheck::Absent);
+    }
+    let object = ctx.tr_from_tpm_public(wanted).map_err(tpm_err)?;
+    let (public, _, _) = ctx
+        .read_public(KeyHandle::from(ESYS_TR::from(object)))
+        .map_err(tpm_err)?;
+    if !is_irlume_srk(&public)? {
+        return Ok(StorageKeyCheck::Absent);
+    }
+    Ok(match &public {
+        Public::Rsa { unique, .. } if roca_fingerprint(unique.value()) => {
+            StorageKeyCheck::RocaFingerprint { handle }
+        }
+        _ => StorageKeyCheck::Clean,
+    })
+}
+
+/// Read the policy PCRs ([`policy_pcrs`]) from the SHA-256 bank and say
+/// whether a literal seal over them can bind the boot state.
+#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+pub fn pcr_bank_readiness() -> Result<PcrBankReadiness> {
+    let mut ctx = open_context()?;
+    Ok(classify_pcr_bank(&read_pcr_values(
+        &mut ctx,
+        &policy_pcrs(),
+    )?))
+}
+
 /// The PCRs to bind to: `IRLUME_PCRS` (comma-separated) or `DEFAULT_PCRS`.
 pub fn policy_pcrs() -> Vec<u32> {
     std::env::var("IRLUME_PCRS")
@@ -625,12 +744,17 @@ fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
     Ok(primary.key_handle)
 }
 
-fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
-    let raw = std::env::var("IRLUME_SRK_HANDLE")
+/// irlume's persistent SRK handle: `IRLUME_SRK_HANDLE` (hex) or
+/// [`PERSISTENT_SRK_HANDLE`].
+fn persistent_srk_raw() -> u32 {
+    std::env::var("IRLUME_SRK_HANDLE")
         .ok()
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-        .unwrap_or(PERSISTENT_SRK_HANDLE);
-    PersistentTpmHandle::new(raw).map_err(tpm_err)
+        .unwrap_or(PERSISTENT_SRK_HANDLE)
+}
+
+fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
+    PersistentTpmHandle::new(persistent_srk_raw()).map_err(tpm_err)
 }
 
 /// Outcome of an uninstall-time attempt to evict the persisted SRK.
@@ -2778,6 +2902,78 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let sealed = Public::unmarshall(&env.public).expect("sealed public");
         assert_eq!(sealed.auth_policy().value(), live.value());
         assert_eq!(&*unseal(&env).expect("unseal"), secret);
+    }
+
+    #[test]
+    fn a_tpm_without_its_required_properties_is_not_identified() {
+        let stm = Some(u32::from_be_bytes(*b"STM "));
+        let id = identity_from(stm, [None; 4], Some(0x0001_0301)).expect("identified");
+        assert_eq!((id.manufacturer.as_str(), id.vendor.as_str()), ("STM", ""));
+        assert_eq!(id.firmware, (1, 769));
+        let missing = identity_from(None, [None; 4], Some(1)).unwrap_err();
+        assert!(missing.to_string().contains("manufacturer"), "{missing}");
+        let missing = identity_from(stm, [None; 4], None).unwrap_err();
+        assert!(
+            missing.to_string().contains("firmware version"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn property_words_read_as_trimmed_ascii() {
+        assert_eq!(property_text(&[u32::from_be_bytes(*b"STM ")]), "STM");
+        assert_eq!(property_text(&[u32::from_be_bytes(*b"AMD\0")]), "AMD");
+        assert_eq!(
+            property_text(&[
+                u32::from_be_bytes(*b"SLB9"),
+                u32::from_be_bytes(*b"670\0"),
+                0,
+                0
+            ]),
+            "SLB9670"
+        );
+        assert_eq!(property_text(&[0x0102_0304]), "");
+        // swtpm's vendor string pads its words with spaces.
+        assert_eq!(
+            property_text(&[u32::from_be_bytes(*b"SW  "), u32::from_be_bytes(*b" TPM")]),
+            "SW TPM"
+        );
+    }
+
+    #[test]
+    fn the_pcr_bank_is_ready_only_with_extended_sha256_values() {
+        let value = |pcr, byte: u8, len| PcrValue {
+            pcr,
+            value: vec![byte; len],
+        };
+        assert_eq!(
+            classify_pcr_bank(&[value(7, 0x11, 32)]),
+            PcrBankReadiness::Ready(vec![7])
+        );
+        assert_eq!(
+            classify_pcr_bank(&[value(0, 0x11, 32), value(7, 0, 0)]),
+            PcrBankReadiness::Missing(vec![7]),
+            "no SHA-256 value: the bank is not active"
+        );
+        assert_eq!(
+            classify_pcr_bank(&[value(7, 0, 32), value(11, 0, 32)]),
+            PcrBankReadiness::Unextended(vec![7]),
+            "a zero firmware PCR was never measured; a zero OS PCR may be unused"
+        );
+        assert_eq!(
+            classify_pcr_bank(&[value(11, 0, 32)]),
+            PcrBankReadiness::Ready(vec![11])
+        );
+    }
+
+    /// The storage-key check reads the key a seal persisted, and swtpm's key
+    /// carries no ROCA fingerprint.
+    #[test]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn the_storage_key_check_reads_the_persisted_key() {
+        seal_with_pcrs(b"irlume-storage-key-check-secret!", &[7]).expect("seal");
+        assert_eq!(storage_key_check().expect("check"), StorageKeyCheck::Clean);
     }
 
     /// Real seal→unseal round-trip on the host TPM. Ignored by default: needs

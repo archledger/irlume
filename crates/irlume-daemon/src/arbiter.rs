@@ -174,6 +174,7 @@ pub fn classify(req: &Request) -> Class {
         // users instead of racing them from a connection thread.
         FaceSensorStatus { user: Some(_) }
         | SealPassword { .. }
+        | TpmReadiness
         | KeyringInfo { .. }
         | ForgetPassword { .. }
         | ReleaseTokenForDisarm { .. }

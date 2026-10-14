@@ -152,6 +152,14 @@ fn the_final_failed_attempts_situation_is_exposed_for_the_prompt() {
         .find("} else {")
         .expect("the guard closes with an else for the grant clear");
     assert!(store < guard_close, "the store sits inside the guard");
+    // #1063: the line and the store classify the same effective kind, so a
+    // vote cut short by the window reads `timed out` in both.
+    let guarded = &flat[guard..guard + guard_close];
+    assert!(
+        guarded.contains("attempt_situation_line(situation_kind,")
+            && guarded.contains("Some(auth_attempt_situation( situation_kind,"),
+        "the journal line and the wire label read one kind"
+    );
     assert!(
         flat.contains("self.last_attempt_situation = None;"),
         "a granted final attempt must clear the stored situation"

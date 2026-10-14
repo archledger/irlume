@@ -193,7 +193,10 @@ indefinitely postpone password fallback.
 
 When grouped authentication expires before complete evidence is accepted, its
 final situation is `timed out`. PAM says "authentication timed out; use your
-password". The detailed refusal reason remains in the daemon reply and journal;
+password". The same holds when one-shot attempts end their window with the
+RGB PAD vote still incomplete (`collecting RGB PAD evidence`), whether the
+window expired or no further attempt fits in it; its `attempt:` line reads
+`timed out` with the measurements. The detailed refusal reason remains in the daemon reply and journal;
 the debug `attempt:` line retains the available framing measurements alongside
 the timeout label. Those measurements describe the captured evidence, but do
 not replace the deadline as the reason for this refusal. Other denials retain

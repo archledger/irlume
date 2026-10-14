@@ -271,6 +271,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A literal PCR seal now computes the policy it commits to from the PCR
+  values it reads, by TCG Part 3 §23.7, instead of asking the TPM in a trial
+  session. The STMicroelectronics TPM in a ThinkPad T480 left the PCR values
+  out of that trial policy, so every seal there failed its unseal check with
+  `TPM2_RC_POLICY_FAIL` (0x99d) and enrollment could not finish. The policy
+  is unchanged on every TPM that already worked, so existing envelopes keep
+  unsealing. The PCR values are read as one snapshot, and a PCR with no
+  SHA-256 value now refuses the seal rather than being left out of it
+  (#1067). Thanks to @maurerr for the report and
+  diagnosis.
+
 - When one-shot face attempts end their window with the RGB PAD vote still
   incomplete, the prompt now says "authentication timed out; use your
   password", as grouped expiry already did, instead of advice read from the

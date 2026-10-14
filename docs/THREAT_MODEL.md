@@ -334,8 +334,9 @@ PCR, 0 to 7 (Tier 2; after a firmware or Secure Boot update the admin re-runs
 pcrlock policy over OS-measured PCRs only binds less than PCR 7 and is passed
 over. The pcrlock policy is round-trip verified at seal time, so
 a policy that cannot unseal on the current boot is never trusted; the literal
-PCR-7 fallback binds to PCR values just read from the live TPM, so it unseals
-on the current boot by construction. Never store a recoverable face image;
+PCR-7 fallback binds to PCR values just read from the live TPM, its policy
+computed from them in software rather than in a TPM trial session (#1067), so
+it unseals on the current boot by construction. Never store a recoverable face image;
 decrypted template plaintext and keys are zeroized.
 
 Earlier releases preferred a signed `PolicyAuthorize` over systemd's PCR-11

@@ -427,21 +427,91 @@ fn srk_template() -> Result<Public> {
         .map_err(tpm_err)
 }
 
-/// Read the SHA-256 values for `pcrs` and return them in the same order, stashed
-/// in the envelope so an unseal failure can point at the PCR that shifted.
+/// How many times [`read_pcr_values`] starts over when a PCR moved between the
+/// `PCR_Read`s of one snapshot.
+const PCR_SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Read the SHA-256 values for `pcrs` as one snapshot and return them in the
+/// same order, stashed in the envelope so an unseal failure can point at the
+/// PCR that shifted. A literal seal's policy commits to them together, so a
+/// mixture of values the TPM never held at once would never unseal.
+///
+/// One `PCR_Read` answers up to eight PCRs atomically, which covers every
+/// selection irlume seals to by default. A TPM that answers part of the
+/// selection is asked for the rest, and the answers count as one snapshot only
+/// while its PCR update counter stays the same; otherwise the read starts
+/// over. A PCR the TPM returns no value for (an unallocated bank) gets an
+/// empty value, which [`literal_auth_policy`] refuses.
 fn read_pcr_values(ctx: &mut Context, pcrs: &[u32]) -> Result<Vec<PcrValue>> {
-    let mut out = Vec::with_capacity(pcrs.len());
-    for &p in pcrs {
-        let sel = pcr_selection(&[p])?;
-        let (_c, _s, digests) = ctx.pcr_read(sel).map_err(tpm_err)?;
-        let value = digests
-            .value()
-            .first()
-            .map(|d| d.value().to_vec())
-            .unwrap_or_default();
-        out.push(PcrValue { pcr: p, value });
+    if pcrs.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(out)
+    let wanted = pcr_selection(pcrs)?;
+    for _ in 0..PCR_SNAPSHOT_ATTEMPTS {
+        if let Some(read) = read_pcr_snapshot(ctx, wanted.clone())? {
+            return Ok(pcrs
+                .iter()
+                .map(|&pcr| PcrValue {
+                    pcr,
+                    value: read
+                        .iter()
+                        .find(|v| v.pcr == pcr)
+                        .map(|v| v.value.clone())
+                        .unwrap_or_default(),
+                })
+                .collect());
+        }
+    }
+    Err(Error::Tpm(format!(
+        "PCRs {pcrs:?} kept changing while they were read; try again"
+    )))
+}
+
+/// One snapshot of `remaining`, or `None` when the PCR update counter moved
+/// between two of its `PCR_Read`s.
+fn read_pcr_snapshot(
+    ctx: &mut Context,
+    mut remaining: PcrSelectionList,
+) -> Result<Option<Vec<PcrValue>>> {
+    let mut read = Vec::new();
+    let mut counter = None;
+    while !remaining.is_empty() {
+        let (update_counter, answered, digests) =
+            ctx.pcr_read(remaining.clone()).map_err(tpm_err)?;
+        if counter.is_some_and(|c| c != update_counter) {
+            return Ok(None);
+        }
+        counter = Some(update_counter);
+        let slots: Vec<u32> = answered
+            .get_selections()
+            .iter()
+            .filter(|s| s.hashing_algorithm() == HashingAlgorithm::Sha256)
+            .flat_map(|s| s.selected())
+            .map(|slot| u32::from(slot).trailing_zeros())
+            .collect();
+        if slots.is_empty() {
+            // Nothing more comes back for the rest of the selection.
+            break;
+        }
+        if slots.len() != digests.value().len() {
+            return Err(Error::Tpm(format!(
+                "PCR_Read answered {} PCRs with {} digests",
+                slots.len(),
+                digests.value().len()
+            )));
+        }
+        read.extend(
+            slots
+                .into_iter()
+                .zip(digests.value())
+                .map(|(pcr, digest)| PcrValue {
+                    pcr,
+                    value: digest.value().to_vec(),
+                }),
+        );
+        remaining.subtract(&answered).map_err(tpm_err)?;
+    }
+    Ok(Some(read))
 }
 
 /// Run `body` with an auth session of `kind`; flush the session on the way out
@@ -488,18 +558,40 @@ fn with_session<T>(
     result
 }
 
-/// Compute the PolicyPCR digest for a given PCR selection using a trial session.
-/// The digest is what the sealed object commits to.
-fn compute_policy_digest(ctx: &mut Context, pcrs: Option<&PcrSelectionList>) -> Result<Digest> {
-    with_session(ctx, None, SessionType::Trial, |ctx, session| {
-        if let Some(sel) = pcrs {
-            let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-            ctx.policy_pcr(policy, Digest::default(), sel.clone())
-                .map_err(tpm_err)?;
-        }
-        let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-        ctx.policy_get_digest(policy).map_err(tpm_err)
-    })
+/// The `authPolicy` a literal `PolicyPCR` seal commits to, computed from
+/// `values`, the PCR values just read from this TPM.
+///
+/// Not a trial session: TCG Part 3 §23.7 lets a trial `PolicyPCR` with an
+/// empty `pcrDigest` use the current PCRs (preferred) or refuse, and the
+/// STMicroelectronics TPM in a ThinkPad T480 does neither: it hashes the empty
+/// digest in, giving a policy no unseal session can satisfy (#1067). systemd
+/// computes this value the same way, and the pcrlock tier already did (#248).
+/// The composite is over the values in ascending PCR order, each PCR once, as
+/// the TPM computes it. A PCR without a SHA-256 value refuses the seal, since
+/// the TPM would drop it from the policy and the seal would not bind it.
+fn literal_auth_policy(values: &[PcrValue]) -> Result<Digest> {
+    let mut ordered = values
+        .iter()
+        .map(|v| {
+            <[u8; 32]>::try_from(v.value.as_slice())
+                .map(|value| (v.pcr, value))
+                .map_err(|_| {
+                    Error::Tpm(format!(
+                        "PCR {} has no SHA-256 value on this TPM; refusing to seal to it",
+                        v.pcr
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let zero = Digest::try_from(vec![0u8; 32]).map_err(tpm_err)?;
+    if ordered.is_empty() {
+        return Ok(zero);
+    }
+    ordered.sort_unstable_by_key(|&(pcr, _)| pcr);
+    ordered.dedup_by_key(|&mut (pcr, _)| pcr);
+    let pcrs: Vec<u32> = ordered.iter().map(|&(pcr, _)| pcr).collect();
+    let values: Vec<[u8; 32]> = ordered.iter().map(|&(_, value)| value).collect();
+    policy_pcr_digest(&zero, &pcrs, &pcr_composite_digest(&values)?)
 }
 
 fn sealed_template(policy_digest: Digest) -> Result<Public> {
@@ -916,16 +1008,12 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
 pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     let pcrs = pcrs.to_vec();
     let mut ctx = open_context()?;
-    let pcr_values = read_pcr_values(&mut ctx, &pcrs)?;
 
     with_srk(&mut ctx, |ctx, srk| {
-        let selection = if pcrs.is_empty() {
-            None
-        } else {
-            Some(pcr_selection(&pcrs)?)
-        };
-        let policy_digest = compute_policy_digest(ctx, selection.as_ref())?;
-        let tmpl = sealed_template(policy_digest)?;
+        // Read right before the object is created: the policy commits to these
+        // values, and the copy stashed for diagnosis is the same reading.
+        let pcr_values = read_pcr_values(ctx, &pcrs)?;
+        let tmpl = sealed_template(literal_auth_policy(&pcr_values)?)?;
 
         let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
         let created = ctx
@@ -943,7 +1031,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
             pcrs: pcrs.clone(),
             public: created.out_public.marshall().map_err(tpm_err)?,
             private: created.out_private.to_vec(),
-            pcr_values: pcr_values.clone(),
+            pcr_values,
             password_wrap: None,
             uid: None,
         })
@@ -2533,6 +2621,165 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(parse_pcrs("").is_empty());
     }
 
+    fn pcr(pcr: u32, byte: u8) -> PcrValue {
+        PcrValue {
+            pcr,
+            value: vec![byte; 32],
+        }
+    }
+
+    fn hex(d: &Digest) -> String {
+        d.value().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Known answers computed independently from TCG Part 3 §23.7: the
+    /// composite over the values in ascending PCR order, whatever order the
+    /// list was given in.
+    #[test]
+    fn the_literal_policy_is_the_spec_policy_over_the_values_read() {
+        assert_eq!(
+            hex(&literal_auth_policy(&[pcr(7, 0x77)]).unwrap()),
+            "584f1612373c93cb25fccd2c7dea58d5ebc61e4fec094958112f88a38c56f88c"
+        );
+        let two = "3ca24232249f78be2770f133f56cc0af778c790d532b223b28fb67a6fdffda27";
+        assert_eq!(
+            hex(&literal_auth_policy(&[pcr(0, 0x10), pcr(7, 0x77)]).unwrap()),
+            two
+        );
+        assert_eq!(
+            hex(&literal_auth_policy(&[pcr(7, 0x77), pcr(0, 0x10), pcr(7, 0x77)]).unwrap()),
+            two,
+            "order and a repeated PCR must not change the policy"
+        );
+        assert_eq!(
+            literal_auth_policy(&[]).unwrap().value(),
+            [0u8; 32],
+            "no PCRs is a fresh session's digest"
+        );
+    }
+
+    /// #1067: the T480's STMicroelectronics TPM stamped the policy of an empty
+    /// `pcrDigest` (this value, over PCR 7) on its sealed objects. The literal
+    /// policy must depend on the PCR value instead.
+    #[test]
+    fn the_literal_policy_is_never_the_empty_digest_policy() {
+        let empty_digest_policy =
+            "e987c3a4bc9a3d0af9c7bca78ccc78d06a7f3a7327f2074446f1d87833ea99d3";
+        let empty = policy_pcr_digest(
+            &Digest::try_from(vec![0u8; 32]).unwrap(),
+            &[7],
+            &Digest::default(),
+        )
+        .unwrap();
+        assert_eq!(hex(&empty), empty_digest_policy);
+        for byte in [0x00, 0x77, 0xff] {
+            assert_ne!(
+                hex(&literal_auth_policy(&[pcr(7, byte)]).unwrap()),
+                empty_digest_policy
+            );
+        }
+    }
+
+    #[test]
+    fn a_pcr_without_a_sha256_value_refuses_the_seal() {
+        let err = literal_auth_policy(&[
+            pcr(0, 0x10),
+            PcrValue {
+                pcr: 7,
+                value: Vec::new(),
+            },
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("PCR 7 has no SHA-256 value"),
+            "{err}"
+        );
+    }
+
+    /// The literal seal's policy against what an unseal presents: a live
+    /// policy session over the same PCRs on this TPM (#1067).
+    #[test]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm and on the real chip \
+                (IRLUME_TCTI), and scripts/with-swtpm.sh runs it anywhere"]
+    fn a_literal_seal_commits_to_the_policy_a_live_session_presents() {
+        let pcrs = [7, 0];
+        let secret = b"irlume-literal-policy-live-match";
+        let env = seal_with_pcrs(secret, &pcrs).expect("seal");
+        let sealed = Public::unmarshall(&env.public).expect("sealed public");
+        let mut ctx = open_context().expect("TPM context");
+        let live = with_srk(&mut ctx, |ctx, srk| {
+            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
+                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+                ctx.policy_pcr(policy, Digest::default(), pcr_selection(&pcrs)?)
+                    .map_err(tpm_err)?;
+                ctx.policy_get_digest(policy).map_err(tpm_err)
+            })
+        })
+        .expect("live policy digest");
+        drop(ctx);
+        assert_eq!(
+            sealed.auth_policy().value(),
+            live.value(),
+            "the sealed authPolicy must equal the live session's digest"
+        );
+        assert_eq!(&*unseal(&env).expect("unseal"), secret);
+    }
+
+    /// More PCRs than one `PCR_Read` answers (eight): the snapshot must still
+    /// return every value, in the order asked, and a seal over them must
+    /// commit to the policy a live session presents. swtpm only: on a real
+    /// machine several of these PCRs move while the system runs.
+    #[test]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn a_pcr_snapshot_larger_than_one_read_is_complete() {
+        let mut pcrs: Vec<u32> = (0..=16).rev().collect();
+        pcrs.push(23);
+        let mut ctx = open_context().expect("TPM context");
+        let (_, first, _) = ctx
+            .pcr_read(pcr_selection(&pcrs).unwrap())
+            .expect("one PCR_Read");
+        let first: usize = first
+            .get_selections()
+            .iter()
+            .map(|s| s.selected().len())
+            .sum();
+        assert!(
+            first < pcrs.len(),
+            "one PCR_Read answered all {first}: this test needs a partial answer"
+        );
+        let snapshot = read_pcr_values(&mut ctx, &pcrs).expect("snapshot");
+        assert_eq!(
+            snapshot.iter().map(|v| v.pcr).collect::<Vec<_>>(),
+            pcrs,
+            "values come back in the order asked"
+        );
+        for v in &snapshot {
+            let single = read_pcr_values(&mut ctx, &[v.pcr]).expect("single read");
+            assert_eq!(v.value.len(), 32, "PCR {} has a SHA-256 value", v.pcr);
+            assert_eq!(
+                v.value, single[0].value,
+                "PCR {} matches its own read",
+                v.pcr
+            );
+        }
+        let live = with_srk(&mut ctx, |ctx, srk| {
+            with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
+                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+                ctx.policy_pcr(policy, Digest::default(), pcr_selection(&pcrs)?)
+                    .map_err(tpm_err)?;
+                ctx.policy_get_digest(policy).map_err(tpm_err)
+            })
+        })
+        .expect("live policy digest");
+        drop(ctx);
+        let secret = b"irlume-eighteen-pcr-snapshot-sea";
+        let env = seal_with_pcrs(secret, &pcrs).expect("seal");
+        let sealed = Public::unmarshall(&env.public).expect("sealed public");
+        assert_eq!(sealed.auth_policy().value(), live.value());
+        assert_eq!(&*unseal(&env).expect("unseal"), secret);
+    }
+
     /// Real seal→unseal round-trip on the host TPM. Ignored by default: needs
     /// /dev/tpmrm0 and write access (run as root or a tss-group member).
     #[test]
@@ -3431,13 +3678,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             use tss_esapi::structures::MaxNvBuffer;
             let mut ctx = open_context().unwrap();
             let values = read_pcr_values(&mut ctx, pcrs).unwrap();
-            let digest = with_session(&mut ctx, None, SessionType::Trial, |ctx, session| {
-                let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-                ctx.policy_pcr(policy, Digest::default(), pcr_selection(pcrs)?)
-                    .map_err(tpm_err)?;
-                ctx.policy_get_digest(policy).map_err(tpm_err)
-            })
-            .unwrap();
+            let digest = literal_auth_policy(&values).unwrap();
             let nv = nv_index_handle(&mut ctx, self.nv_index).unwrap();
             let mut content = vec![0x00, 0x0b];
             content.extend_from_slice(digest.value());

@@ -354,10 +354,25 @@ as the Chicony 04f2:b613 module some T480s carry, is outside the rule and
 stays RGB.
 
 Classification changes the listing and the IR frame size (the smallest
-advertised size of at least 340x340), not what authentication accepts. YUYV
-IR frames have no measured exposure ceiling yet, so face authentication on
-such a camera refuses as "IR exposure unmeasurable", and an IR camera on a
-different USB device from the RGB camera does not pair
+advertised size of at least 340x340), not what authentication accepts. A
+YUYV IR burst has an exposure ceiling only when the format read from the
+open camera, the session's frames and the burst's own emitter alternation
+qualify (ADR-0031 §4, amendment 2026-10-13); otherwise face authentication
+refuses it as "IR exposure unmeasurable". With `IRLUME_LOG=debug` irlumed
+logs, for each burst, `YUYV clipping ceiling 235 for this burst` or `no YUYV
+clipping ceiling for this burst:` and the reason, and a latched frame
+violation once per session. A qualified burst from a camera with no
+illumination records also logs `no illumination records; this burst's proven
+alternation marks its bright frames active IR` (amendment 2026-10-14).
+Outside a split pair under the experimental opt-in, every YUYV burst logs
+`no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on
+a split pair under the experimental opt-in`. When
+no emitter control is configured, such a session logs `face authentication
+holds its device-default D1 value (read only)` at open if the camera's own
+control reports its alternating mode, which counts as an active emitter for
+the burst judgment; without that line or a configured control, bursts log
+`the emitter is not active for this stream`. An IR camera on a different USB device from the
+RGB camera pairs only as an experimental split pair
 ([LIMITATIONS.md](LIMITATIONS.md)). `sudo irlume ir-setup --dry-run` lists,
 without writing, the extension units of the IR node irlumed has selected.
 When the RGB and IR cameras are two USB devices, no IR node is selected

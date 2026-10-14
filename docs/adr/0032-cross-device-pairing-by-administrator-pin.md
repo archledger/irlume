@@ -17,7 +17,11 @@ always requires IR-identity-verified grant arms, regardless of measured skew.
 Depends on ADR-0007 (identity and capture qualification), ADR-0024 (complete
 role-labelled credential bindings), ADR-0029 (selection), ADR-0030 (display
 and redaction), and ADR-0031 (descriptor-based YUYV IR classification).
-ADR-0031 section 4's YUYV exposure refusal remains in force.
+ADR-0031 section 4's YUYV exposure refusal remains in force. Amended
+2026-10-14: ADR-0031 section 4 now gives an attested YUYV burst that passes
+its judgment a ceiling, and, on a split pair under the experimental opt-in,
+the burst's alternation stands in for missing illumination records; every
+other YUYV burst is still refused (see the amendment of that date below).
 
 This ADR defines the contract for later implementation PRs. Its acceptance
 tests and activation gate must be satisfied before split-pair enrollment or
@@ -1354,7 +1358,8 @@ unchanged.
 separate single-role cameras with native GREY IR, and no such pair exists in the
 maintainer fleet: the BRIO and NexiGo are each a complete RGB+IR camera, so the
 resolver refuses either split (case 8, 2026-10-07). The ThinkPad T480 split
-modules stay refused by ADR-0031 section 4 (YUYV-only IR, #887). The project
+modules stay refused by ADR-0031 section 4 (YUYV-only IR, #887); amended
+2026-10-14, see the amendment of that date below. The project
 already ships one experimental machine-owner opt-in with the same shape: the
 IR-only sensor policy (ADR-0028, `face_sensor_policy=ir-only-experimental`).
 Split pairs follow that precedent, so owners of qualifying hardware can use
@@ -1447,7 +1452,10 @@ built-in rule and the §2 replacement limitation.
 
 Split evidence keeps the sequential posture and grants only through the
 IR-identity-verified arms. YUYV IR still has no clipping ceiling (ADR-0031 §4),
-so the T480 class stays refused (#887). Concurrent split capture and IR-only
+so the T480 class stays refused (#887). Amended 2026-10-14: on a split pair
+under this opt-in, an attested YUYV IR burst that passes ADR-0031 §4's
+judgment now gets a ceiling and supplies its own active-IR evidence; see the
+amendment of that date below. Concurrent split capture and IR-only
 authentication on a split pair stay refused. `irlume split add`, `select` and
 `remove` stay root-only and OS-approved as before, and enrollment still needs
 an explicit split choice. The rows that pin the closed default keep passing
@@ -1524,3 +1532,15 @@ read that reserves time only).
  It needs the full acceptance matrix
 (cases 1 to 15) with attended evidence on hardware whose split sides are built
 in, and this ADR's move out of Proposed.
+
+## Amendment 2026-10-14: active-IR evidence for attested YUYV sides
+
+#887. The split frame contract's active-IR check is unchanged, and so is
+every other check. For a descriptor-attested YUYV IR side whose camera
+supplies no illumination records, the evidence it checks may now come from
+the IR burst's own proven alternation, as ADR-0031 §4 (Amendment
+2026-10-14) defines, and only while the experimental split opt-in of the
+2026-10-13 amendment is latched. Every other IR side still needs the
+camera's records. The opt-in's warning says so: such a camera's lit frames
+are inferred from each burst, which other programs with access to the
+camera can disturb.

@@ -82,9 +82,12 @@ The machine --json/--contract interface is not supported by split commands.";
 /// The opt-in warning, printed before any change and after enabling.
 pub(crate) const EXPERIMENTAL_WARNING: &str = "EXPERIMENTAL: split camera pairs (an RGB \
 camera and an IR camera on two USB devices) are not qualified for authentication \
-assurance. Their evidence is sequential and grants only on an IR identity match; YUYV-only \
-IR cameras stay refused. Split pairs use built-in cameras unless \
-allow_external_split_cameras=1. The password always remains available.";
+assurance. Their evidence is sequential and grants only on an IR identity match. An \
+attested YUYV-only IR camera without per-frame illumination records, such as the \
+ThinkPad T480's, is judged per burst, and its lit frames are inferred from each burst's \
+own alternation, which other programs with access to the camera can disturb. Split pairs \
+use built-in cameras unless allow_external_split_cameras=1. The password always remains \
+available.";
 
 /// The restart line: irlumed reads `split_camera_pairs` once, at startup.
 pub(crate) const EXPERIMENTAL_RESTART: &str =

@@ -113,8 +113,10 @@ unreadable `split_camera_pairs` setting keeps split pairs disabled and is not
 overwritten. While opted in, the activation message below no longer applies:
 an authorized, selected split pair can enroll (`irlume enroll
 --split-camera-choice`) and authenticate through the account route. Split
-evidence stays sequential and grants only on an IR identity match, and YUYV-only
-IR cameras stay refused (ADR-0031 section 4).
+evidence stays sequential and grants only on an IR identity match. A YUYV-only
+IR side, such as the T480's, releases credentials only on a burst that earns
+its clipping ceiling (ADR-0031 section 4, amendment 2026-10-13); other bursts
+refuse as IR exposure unmeasurable.
 
 Like a Windows Hello sensor group, a split pair uses built-in cameras: both
 sides must report `removable: fixed`, or the choice refuses with `split camera

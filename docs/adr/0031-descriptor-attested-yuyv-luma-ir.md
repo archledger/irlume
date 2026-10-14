@@ -4,9 +4,16 @@
 
 Accepted 2026-09-27 for §1, §2, §3 and §5, which land with the change that
 fixes the classification half of #887. §4, a sensor ceiling for YUYV luma,
-is recorded here and pending: §4 records what the reporter measured on the
-ThinkPad T480, and the ceiling is not implemented, so every YUYV IR frame
-stays refused as exposure unmeasurable. Depends on ADR-0029 §1 and §9
+was recorded then as pending, with what the reporter measured on the
+ThinkPad T480. Amended 2026-10-13 and 2026-10-14: §4 is implemented per
+burst, on a split pair under the machine owner's experimental opt-in
+(ADR-0032) only. There, an attested YUYV IR burst gets a clipping ceiling
+of 235 on the raw decode when it passes the judgment of Amendment
+2026-10-13, and such a burst from a camera with no illumination records
+also supplies its frames' active-IR evidence (Amendment 2026-10-14). Every
+other YUYV IR burst is still refused as exposure unmeasurable. The reporter's T480 enrolled on
+the implementation (PR #1064); confirmed grants on it and qualification on
+more units remain open. Depends on ADR-0029 §1 and §9
 (camera-free classification; selection never opens a device it will not
 use). Changes nothing in ADR-0023 §3 (profiles still cannot classify),
 ADR-0024's pair authorization, ADR-0019 or the exposure refusal of #358 and
@@ -136,7 +143,10 @@ The VideoControl header's own total and the source references of every
 terminal and unit are checked too (Amendment 2026-09-27 below, #913). This
 is not a complete USB/UVC validator, and
 even a fully consistent descriptor is a device-supplied modality claim.
-YUYV credential release remains refused while §4 is pending.
+YUYV credential release remains refused while §4 is pending. (Amended
+2026-10-13 and 2026-10-14: §4 is implemented; on a split pair under the
+experimental opt-in, a burst that passes its judgment can release
+credentials, and every other YUYV burst is still refused.)
 
 The configuration header's `wTotalLength` is not used: a device writes both
 that number and the chain, so the walk judges the descriptors the file
@@ -162,7 +172,10 @@ classes (`uvc_ir`, `uvc_rgb`) and the doctor's section header do not change,
 because `scripts/ir-node-from-doctor.sh` and the machine API depend on them.
 While §4 is pending, a YUYV IR sensor that completes a pair is reported as
 supported with limits rather than at the secure tier, since every
-credential-releasing attempt on it refuses.
+credential-releasing attempt on it refuses. (Amended 2026-10-13 and
+2026-10-14: the census still reports it so; credential release is possible
+only for a burst that passes §4's judgment on a split pair under the
+experimental opt-in.)
 
 ### 2. `VIDIOC_ENUM_FMT` stays the format authority
 
@@ -190,7 +203,12 @@ rule:
 Pairing across USB devices needs its own ADR, amending ADR-0029 §1,
 ADR-0024 and ADR-0007.
 
-### 4. A sensor ceiling for attested YUYV luma (pending, not implemented)
+### 4. A sensor ceiling for attested YUYV luma (per burst since Amendment 2026-10-13)
+
+Amended 2026-10-13 and 2026-10-14: the paragraph below describes §4 as it
+was accepted. `clipping_white_level` still answers `None` for YUYV luma, but
+a judged burst now names a ceiling and can supply active-IR evidence; see
+those amendments for the conditions as implemented.
 
 `clipping_white_level` keeps answering `None` for YUYV luma, attested or
 not, so every credential-releasing attempt on a YUYV IR stream is refused as
@@ -219,7 +237,9 @@ under either quantization, and adds no ceiling. Amendment 2026-10-07
 binds the first two conditions to the open file descriptor, again without
 a ceiling. A second amendment of that date latches the footroom and
 chroma conditions for the session and fixes the expansion, still without
-a ceiling.
+a ceiling. Amendment 2026-10-13 implements the ceiling for each burst that
+meets these conditions, and replaces the last one: the decode stays raw and
+the ceiling is 235.
 
 Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
 
@@ -242,8 +262,9 @@ Measured on the T480 (5986:1141) by @maurerr, the reporter of #887:
   its first four frames before they fell to about 55. A statistic taken from
   one window depends on where in the ramp it lands.
 
-The ceiling stays unbuilt, and #385's item 2 with it, until a change
-implements these conditions against the measurement.
+The ceiling stayed unbuilt, and #385's item 2 with it, until a change
+implemented these conditions against the measurement (Amendment
+2026-10-13).
 
 ### 5. The IR frame size for attested YUYV
 
@@ -261,6 +282,13 @@ qualification contract records the size that was actually requested rather
 than the 640x400 constant.
 
 ## Consequences
+
+Amended 2026-10-13 and 2026-10-14: the bullets below are the consequences
+as accepted, before §4 was implemented. YUYV luma now has a ceiling for
+each burst that passes §4's judgment, and such a burst from a camera without
+illumination records supplies its own active-IR evidence; the T480 enrolls
+as a split pair (ADR-0032), and only bursts that fail the judgment refuse as
+exposure unmeasurable.
 
 - On the T480, `/dev/video0` is listed as an unpaired UVC IR sensor with
   its descriptor evidence, `/dev/video2` stays the RGB camera, and RGB-only
@@ -565,3 +593,209 @@ node: warm-up and the rate fill leave it empty, each burst frame latches
 recovered stream's burst. No real-kernel lane streams attested YUYV, so
 the T480 still needs attended qualification. The burst's emitter
 alternation and the ceiling remain.
+
+## Amendment 2026-10-13: the ceiling, judged per burst
+
+#887. This amendment implements §4. A burst of an IR session whose camera
+holds fd-bound format evidence (Amendment 2026-10-07) gets a clipping ceiling
+of 235 on the raw luma decode, for that burst alone, when all of these hold
+once the burst has ended (`YuyvContentLatch::burst_ceiling` in
+`crates/irlume-camera/src/yuyv_exposure.rs`):
+
+- the frozen format resolves to eligible limited range (Amendment
+  2026-10-06);
+- the session's content latch holds no refusal: no frame offered in the
+  session so far, this burst's included, broke the footroom, chroma,
+  payload-length or readability rule;
+- the latch judged exactly the burst's frames: its count rose by the number
+  of frames the burst decoded;
+- the camera's illumination records for those frames, where it has any, do
+  not break D1 parity (`D1MetadataEvidence::contradicts_d1`: at least four
+  classified records and a parity conflict);
+- the burst's raw luma means, keyed by raw V4L2 sequence and never by index,
+  prove D1 alternation by the setup proof's rules, unchanged
+  (`D1OpticalEvidence::proves_d1`): at least three frames in each phase, a
+  phase-median difference of at least 20, at least three supported bright and
+  three supported dark frames, at least three consistent adjacent pairs and
+  none conflicting, at most one missing sequence, and no repeated or backward
+  step.
+
+Anything else leaves the burst's ceiling `None`, so credential release
+refuses it as exposure unmeasurable, as before. `clipping_white_level` still
+answers `None` for YUYV luma: the format alone never names a ceiling.
+
+- **No expansion.** This replaces §4's last condition and the fixed
+  expansion of the second 2026-10-07 amendment, which is removed unused. The
+  decode stays raw, as for limited-range GREY, whose ceiling
+  `clipping_white_level` already answers at 235; #385's item 2 asked the same
+  of YUYV. Clipping measures the same pixels either way: the expansion
+  reached 255 exactly when raw luma was 235 or more. Expanding would move
+  only the other readers of the frame, as that amendment recorded: §4's
+  face-distance lit means of 39 to 57 would read 27 to 48, mostly below the
+  enrollment preflight's lit bar of 40 (`IR_LIT_MEAN`), and IR face detection
+  and the gate frame would see a scale the T480's measurements were not
+  taken on.
+- **When.** The ceiling is decided after the burst, once the illumination
+  records are drained, and before the gate-frame selection, the paired
+  saturation evidence, the ambient subtraction and the capture's statistics
+  read it. Before the burst only the format's ceiling exists; YUYV has none,
+  so the plateau exit never ends a YUYV burst early, and the proof sees every
+  frame up to the 10-frame cap.
+- **Scope.** Per burst. A proven burst never qualifies the next, and a
+  latched violation leaves every later burst of the session without a
+  ceiling. Held sessions, the sequential batch, one-shot captures and a
+  recovered stream all reach the same capture method. GREY, the Y16 family,
+  NV12, unattested YUYV and an attested camera whose binding refused keep
+  their format's answer.
+- **Journal.** With `IRLUME_LOG=debug`, each judged burst logs its ceiling
+  or the reason it has none, by name; an unjudged burst also logs the two
+  frame counts. No pixel value is logged.
+- **Evidence.** Synthetic tests check each condition, the threshold boundary
+  (a lift of 20.0 qualifies, 19.9 does not), the sequence rules, the
+  illumination veto, the per-burst scope and the journal text, and a
+  source-shape test pins where the ceiling is bound. A burst shaped like §4's
+  T480 frames, lit frames of flat chroma 128 at the lowest face-distance lit
+  mean (39) and dark frames of raw luma 16 to 20 and chroma 137, qualifies by
+  one point; at a lit mean of 37 it does not. Replayed over the three
+  ten-frame bursts recorded on 2026-09-07 from the ASUS FHD webcam's IR camera
+  (GREY, so this ceiling does not apply to it), the unchanged optical rules
+  prove alternation on both bursts whose emitter write succeeded (phase
+  differences 38.7 and 30.6, no conflicting pair) and refuse the one whose
+  write failed (2.0).
+
+Not established: how the T480's own bursts fare at face distance in
+ordinary lighting, whether their lift clears 20 after warm-up, and how often
+a burst refuses. That needs attended qualification on the T480, which may
+move the preliminary bounds. Mandatory PAD and every threshold are
+unchanged. (Amended 2026-10-14: the reporter's T480 enrolled ten scans on
+this implementation before the emitter condition of Amendment 2026-10-14,
+so its bursts did clear the lift of 20 there; what remains open is
+repeatability under the current conditions, how often a burst refuses, and
+confirmed grants.)
+
+## Amendment 2026-10-14: active-IR evidence from a judged burst
+
+#887. Production pairing, ordinary and split, accepts an IR frame only with
+active-IR illumination provenance (`IlluminationProvenance::ActiveIr`), and
+until now only the camera's own per-frame illumination record supplied it.
+The T480's IR camera has none, so after Amendment 2026-10-13 its bursts got
+a ceiling and its frames were still refused: on the reporter's T480, split
+enrollment stopped at the first frame with "split IR frame lacks active
+illumination provenance" right after a burst logged its 235 ceiling.
+
+This amendment adds one source of that evidence, two conditions to the
+burst's qualification, and one limit on where a YUYV burst is judged at
+all:
+
+- **Only on a split pair under the experimental opt-in.** The judgment of
+  Amendment 2026-10-13, ceiling included, runs only for an IR session whose
+  lease is a split pair while the owner's experimental split opt-in is
+  latched (`optical_provenance_admitted`; ADR-0032, amendment 2026-10-13).
+  The ordinary sequential route and the IR-only route do not require
+  active-IR provenance, so a ceiling there would bypass the confinement the
+  limitation below needs. Elsewhere every YUYV burst stays without a ceiling
+  and refuses as exposure unmeasurable, as before §4 was implemented.
+
+- **The stream's emitter is active.** Either the session's emitter guard
+  reports the configured control active for this stream, whether irlume
+  wrote it or found it already set (`StreamMode::lit`), or the camera's own
+  Face Authentication control reads back its device-default D1 value
+  (`VerifiedDefaultMode`). That second source is the read-only proof
+  `read_capture_default` already made under `IRLUME_LOG_EMITTER_WRITES`: on
+  the open device, the control is advertised and synchronous, its current
+  value equals the D1 value derived from its own GET_DEF and GET_MAX and is
+  the default, and a second GET_CUR reads the same; nothing is written. Its
+  D1 entry must also name the one streaming interface the node's descriptor
+  attests, on the attested Microsoft unit. Either source is read again from
+  the camera right before each burst and right after it
+  (`StreamMode::still_active`: the configured control still holds what the
+  guard applied, or the Face Authentication control still reads the
+  verified value, twice), so a control changed by a device reset or another
+  program between bursts qualifies no later burst. Microsoft's UVC 1.5 extensions (section 2.2.2.6)
+  make GET_CUR the camera's statement of each IR streaming interface's mode,
+  D1 being alternating frame illumination. Only an attested YUYV IR session
+  asks for this proof, at open and at recovery, and nothing but its burst
+  qualification reads it; it never runs after a configured or known control,
+  an explicit `IRLUME_IR_EMITTER=off`, a foreign owner or an unchecked
+  recovery. A burst from a stream with neither refuses (`the emitter is not
+  active for this stream`), so an alternation from any other light source
+  qualifies nothing. The T480's Face Authentication control defaults to D0
+  (GET_DEF and GET_CUR 01 01 01, with D0 and D1 advertised, 01 01 03), so the
+  read-only default proof declines it, and `irlume ir-setup` cannot save it
+  ("before 41, after 53, needs +20"). Its D1 mode is selected for now by the
+  documented override, `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0` (unit 8,
+  selector 6, D1 on streaming interface 1, the value discovery derives from
+  those reported values), which is checked against the open camera's
+  descriptor and applied under the same stream guard as a configured
+  control, restoring the original when the stream ends. The built-in table
+  (`known_control`) gains the T480 only once that write, its read-back, the
+  optical result with D1 selected and the restore are recorded on the
+  hardware (#887). The read-only default proof serves an attested YUYV
+  camera whose control already defaults to D1.
+- **Records agree with the optics.** Besides not breaking D1 parity, every
+  illumination record the camera does supply must name the optically
+  bright frames lit. Records that alternate in the opposite phase refuse
+  the burst.
+
+When a burst met every condition of Amendment 2026-10-13 and these
+(`QualifiedBurst`) and the camera supplied no illumination record for any
+of its frames, each frame's provenance comes
+from the burst's proven alternation: active IR for the frames whose raw V4L2
+sequence parity is the bright phase, ambient for the others
+(`provenance_illumination` in `crates/irlume-camera/src/lib.rs`). Nothing
+else changes:
+
+- A camera with any record for the burst keeps its records; the two sources
+  never mix, and records that break the alternation's parity already deny
+  the ceiling.
+- Only provenance reads the derived marks. The gate-frame selection, the
+  paired saturation evidence and the camera-reported statistics
+  (`camera_classified_frames`, `camera_lit_frames`, `ambient_observed`) keep
+  reading the camera's records, so they still say the camera classified
+  nothing.
+- The selected frame carries its own phase. If the selection lands on a
+  dark-phase frame, it is ambient and the pair is still refused.
+- GREY, the Y16 family, NV12, unattested YUYV and an attested camera whose
+  binding refused derive nothing, as no burst of theirs qualifies.
+
+Evidence for the decision:
+
+- **Windows does the same.** In its alternating-illumination mode Windows
+  Hello reads `MF_CAPTURE_METADATA_FRAME_ILLUMINATION` on every IR frame, and
+  the UVC 1.5 extensions let the camera provide it "through a Device MFT or
+  by including a MetadataId_FrameIllumination attribute in the metadata
+  payload" (Microsoft, "Microsoft extensions to USB Video Class 1.5
+  specification", section 2). A host-side component, not only camera
+  firmware, may supply the frame's illumination state.
+- **The T480 cannot supply records on Linux.** Linux v7.2 enables Microsoft
+  per-frame metadata only when the camera's Microsoft extension unit
+  implements the Metadata control, selector 9
+  (`drivers/media/usb/uvc/uvc_metadata.c`, `uvc_meta_detect_msxu`;
+  `include/linux/usb/uvc.h`). The T480 IR camera's unit advertises
+  `bmControls` `0x22`, selectors 2 and 6 only (docs/DEBUGGING.md).
+- **The proof is no looser than records here.** Over the three ten-frame
+  bursts recorded from the ASUS FHD webcam's IR camera on 2026-09-07, the
+  optical bright phase matched the camera's lit and dark records on all 30
+  frames. In the burst whose emitter write failed, the camera still
+  reported alternating lit frames while the lift was 2.0, and the optical
+  proof refuses it.
+
+**Limitation, and why the opt-in.** The reads around a burst cannot see an
+emitter-control change made and undone within it by another program with
+access to the camera. Linux v7.2 uvcvideo applies no V4L2 priority to
+extension-unit queries (`uvc_v4l2.c`, `uvc_ioctl_default` passes
+`UVCIOC_CTRL_QUERY` straight to `uvc_xu_ctrl_query`), and a camera without
+illumination records has no per-frame account that would show it. So the
+whole judgment is confined to the experimental split opt-in, whose warning
+names it; a stronger, per-frame evidence source is tracked in #1069.
+
+The content bounds stay as they are. An earlier ThinkPad IR camera
+(Chicony 04f2:b5cf, J. Henstridge, "ThinkPad Infrared Camera", 2017)
+advertised YUYV while streaming packed 10-bit grey, which no flat-chroma
+frame can carry; the chroma bound of Amendment 2026-10-06 is what refuses
+such a stream. The reporter's T480 run set no content latch.
+
+Synthetic tests check the derivation for both parities, the record and
+length guards, an inactive emitter, records inverted against the optics,
+and that frame provenance reads the derived marks while the selection does
+not. Attended qualification on the T480 remains open.

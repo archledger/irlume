@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Attested YUYV-only IR cameras, such as the ThinkPad T480's (5986:1141),
+  can now release credentials as the IR side of a split pair under the
+  experimental opt-in: a burst gets a clipping ceiling of 235 on raw luma
+  when the format read from the open camera is limited range, no frame
+  of the session broke the footroom or flat-chroma bounds, and the burst's
+  own frames show the emitter alternating. Such a camera reports no
+  per-frame illumination, so that burst's alternation also marks its lit
+  frames for pairing. On a T480 its face-authentication mode must be
+  selected first, for now with `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0`.
+  Any other burst still refuses as IR exposure unmeasurable. Not yet qualified on a T480 (ADR-0031 §4, amendments
+  2026-10-13 and 2026-10-14; #887).
+
 - Experimental split camera pairs as a machine-owner opt-in:
   `sudo irlume split experimental on --yes` saves
   `split_camera_pairs=experimental`, and after `systemctl restart irlumed`
@@ -14,8 +26,9 @@ All notable changes to irlume are documented here. This project adheres to
   USB devices) can enroll and authenticate. irlumed reads the setting once at
   startup; any other value, a malformed line or an unreadable settings.conf
   keeps split pairs disabled with a startup warning. Split evidence stays
-  sequential and grants only on an IR identity match, and YUYV-only IR
-  cameras stay refused (#887). Where a greeter, lock screen or opted-in
+  sequential and grants only on an IR identity match, and a YUYV-only IR
+  side releases credentials only on a burst that earns its ceiling (#887).
+  Where a greeter, lock screen or opted-in
   privileged prompt would collect a grouped PAD vote, a split attempt
   collects all five samples from one RGB session and one IR session under
   its one split operation, so the vote fits the 15-second window that one

@@ -115,6 +115,8 @@ const MAX_D1_MISSING_SEQUENCE_FRAMES: u32 = 1;
 pub(crate) struct D1OpticalEvidence {
     even_frames: usize,
     odd_frames: usize,
+    /// Whether even raw sequences hold the brighter median phase.
+    bright_even: bool,
     phase_delta: f32,
     bright_phase_support: usize,
     dark_phase_support: usize,
@@ -207,6 +209,7 @@ impl D1OpticalEvidence {
         Self {
             even_frames: even.len(),
             odd_frames: odd.len(),
+            bright_even,
             phase_delta: (even_median - odd_median).abs(),
             bright_phase_support,
             dark_phase_support,
@@ -239,8 +242,17 @@ impl D1OpticalEvidence {
         OpticalD1Verdict::Inconclusive
     }
 
-    const fn proves_d1(self) -> bool {
+    /// Whether the burst proves frame-locked D1 alternation. Also the YUYV
+    /// clipping ceiling's emitter condition (ADR-0031 §4, Amendment
+    /// 2026-10-13), on raw luma means of the burst being judged.
+    pub(crate) const fn proves_d1(self) -> bool {
         matches!(self.verdict(), OpticalD1Verdict::Proven)
+    }
+
+    /// Whether even raw sequences are the bright, emitter-lit phase. Only
+    /// meaningful when [`Self::proves_d1`] holds.
+    pub(crate) const fn bright_on_even(self) -> bool {
+        self.bright_even
     }
 
     const fn valid_for_causality(self) -> bool {
@@ -342,7 +354,9 @@ impl D1MetadataEvidence {
             && self.parity_conflicts == 0
     }
 
-    const fn contradicts_d1(self) -> bool {
+    /// Whether classified records break D1 parity. Also vetoes the YUYV
+    /// clipping ceiling's optical proof (ADR-0031 §4, Amendment 2026-10-13).
+    pub(crate) const fn contradicts_d1(self) -> bool {
         self.invalid_sequence_steps == 0 && self.classified() >= 4 && self.parity_conflicts > 0
     }
 }
@@ -1645,7 +1659,7 @@ fn apply_capture_action_guarded(
 /// prevent it (#189). Holding the `Arc` makes the descriptor outlive the guard
 /// by construction.
 pub fn enable(handle: std::sync::Arc<v4l::device::Handle>, card: &str, device: &str) -> StreamMode {
-    enable_guarded(handle, card, device, &mut || Ok(()))
+    enable_guarded(handle, card, device, false, &mut || Ok(()))
         .unwrap_or_else(|_| unreachable!("the unguarded path cannot refuse"))
 }
 
@@ -1748,6 +1762,7 @@ fn enable_guarded(
     handle: std::sync::Arc<v4l::device::Handle>,
     card: &str,
     device: &str,
+    prove_device_default: bool,
     before_forward_write: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<StreamMode, String> {
     let _ = card;
@@ -1866,14 +1881,28 @@ fn enable_guarded(
     // its coordinates; every read of the control itself happens inside the
     // apply path, on the same pass that decides whether to write.
     let Some((unit, selector)) = action.coordinates() else {
-        // Diagnostic observation only. A configured/known write, explicit off,
-        // foreign owner or unchecked recovery can never fall back to this proof.
-        // Keep normal authentication's behavior unchanged when tracing is off.
-        if can_prove_default && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
+        // A configured/known write, explicit off, foreign owner or unchecked
+        // recovery can never fall back to this proof. Outside tracing it runs
+        // only for an attested YUYV IR session that asks (ADR-0031 §4,
+        // Amendment 2026-10-14), so every other camera behaves as before.
+        let tracing = std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some();
+        if can_prove_default && (tracing || prove_device_default) {
             if let Ok(lock) = crate::stream_record::acquire(&id) {
                 if let Ok(Some(control)) = read_capture_default(fd, &id) {
-                    eprintln!("irlume: capture emitter device default verified");
-                    return Ok(StreamMode::new(Box::new(UvcMode {
+                    if tracing {
+                        eprintln!("irlume: capture emitter device default verified");
+                    }
+                    // The D1 entry must name the stream being opened: the one
+                    // streaming interface the node's descriptor attests, on
+                    // the attested Microsoft unit.
+                    let bound = id.ir_function_evidence().is_ok_and(|evidence| {
+                        evidence.msxu_unit == control.unit
+                            && payload_selects_d1_for(
+                                &control.payload,
+                                evidence.streaming_interface,
+                            )
+                    });
+                    let mode = UvcMode {
                         handle: Some(EmitterHandle {
                             handle,
                             lease: None,
@@ -1886,7 +1915,18 @@ fn enable_guarded(
                         active: false, // observational proof, not an enable operation
                         record: None,
                         _lock: Some(lock),
-                    })));
+                    };
+                    if prove_device_default && bound {
+                        irlume_common::dlog!(
+                            "[ir_emitter] {}: face authentication holds its device-default D1 value (read only)",
+                            crate::camera_text(device)
+                        );
+                        return Ok(StreamMode::new(Box::new(VerifiedDefaultMode {
+                            mode,
+                            payload: control.payload,
+                        })));
+                    }
+                    return Ok(StreamMode::new(Box::new(mode)));
                 }
             }
         }
@@ -1981,10 +2021,18 @@ pub(crate) fn enable_with_lease_guarded(
     card: &str,
     device: &str,
     lease: crate::lease::CameraLease,
+    prove_device_default: bool,
     before_forward_write: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<StreamMode, String> {
-    let mut mode =
-        lease.run_active(|| enable_guarded(handle, card, device, before_forward_write))?;
+    let mut mode = lease.run_active(|| {
+        enable_guarded(
+            handle,
+            card,
+            device,
+            prove_device_default,
+            before_forward_write,
+        )
+    })?;
     mode.attach_lease(lease);
     Ok(mode)
 }
@@ -2331,11 +2379,80 @@ trait EmitterBackend {
     /// a backend that does not go through the V4L2 capture node (an LED-class
     /// emitter is a sysfs path with no lease).
     fn attach_lease(&mut self, lease: crate::lease::CameraLease);
+    /// Whether the camera's emitter control still holds the value this
+    /// guard established, read from the camera now: the payload an active
+    /// guard applied or found held, or the device-default D1 value a
+    /// verified default read. The judgment of an attested YUYV burst asks
+    /// before and after each burst (ADR-0031 §4, Amendment 2026-10-14).
+    fn still_active(&self) -> bool {
+        false
+    }
+}
+
+/// A read-only guard over a Face Authentication control that held its own
+/// device-default D1 value for the open node's attested streaming interface
+/// when the stream opened (`read_capture_default`). It writes and restores
+/// nothing, holds the stream lock like the diagnostic proof it extends, and
+/// is not `lit`: irlume enabled nothing (ADR-0031 §4, Amendment 2026-10-14).
+struct VerifiedDefaultMode {
+    mode: UvcMode,
+    /// The device-default D1 value verified at open.
+    payload: Vec<u8>,
+}
+
+impl EmitterBackend for VerifiedDefaultMode {
+    fn lit(&self) -> bool {
+        EmitterBackend::lit(&self.mode)
+    }
+    fn owns_restore(&self) -> bool {
+        EmitterBackend::owns_restore(&self.mode)
+    }
+    fn restore(&mut self) -> std::result::Result<(), RestoreError> {
+        EmitterBackend::restore(&mut self.mode)
+    }
+    fn attach_lease(&mut self, lease: crate::lease::CameraLease) {
+        EmitterBackend::attach_lease(&mut self.mode, lease);
+    }
+    fn still_active(&self) -> bool {
+        let read = || {
+            get_cur(
+                self.mode.fd(),
+                self.mode.unit,
+                self.mode.selector,
+                self.payload.len(),
+            )
+        };
+        read().is_ok_and(|current| current == self.payload)
+            && read().is_ok_and(|current| current == self.payload)
+    }
+}
+
+/// The bmControlFlags bit of a Face Authentication entry that selects D1,
+/// alternating frame illumination (UVC 1.5 extensions, section 2.2.2.6).
+const FACE_AUTH_D1: u8 = 1 << 1;
+
+/// Whether a Face Authentication payload selects D1, and only D1, for
+/// `interface`: one count byte, then eight-byte entries of an interface
+/// number and seven bytes of control flags.
+fn payload_selects_d1_for(payload: &[u8], interface: u8) -> bool {
+    let entries = usize::from(payload.first().copied().unwrap_or(0));
+    (0..entries).any(|i| {
+        let at = 1 + i * 8;
+        payload.get(at..at + 8).is_some_and(|entry| {
+            entry[0] == interface && entry[1] == FACE_AUTH_D1 && entry[2..].iter().all(|&b| b == 0)
+        })
+    })
 }
 
 impl EmitterBackend for UvcMode {
     fn lit(&self) -> bool {
         UvcMode::lit(self)
+    }
+    fn still_active(&self) -> bool {
+        self.active
+            && !self.applied.is_empty()
+            && get_cur(self.fd(), self.unit, self.selector, self.applied.len())
+                .is_ok_and(|current| current == self.applied)
     }
     fn owns_restore(&self) -> bool {
         UvcMode::owns_restore(self)
@@ -2469,6 +2586,12 @@ impl StreamMode {
     /// Whether the emitter control is active for this stream, whoever set it.
     pub fn lit(&self) -> bool {
         self.backend.lit()
+    }
+
+    /// See [`EmitterBackend::still_active`]. Only the judgment of an attested
+    /// YUYV IR burst asks.
+    pub(crate) fn still_active(&self) -> bool {
+        self.backend.still_active()
     }
 
     /// Whether this guard owns an outstanding change that still has to be put
@@ -6836,6 +6959,110 @@ mod tests {
         assert!(log
             .iter()
             .all(|r| matches!(r, fake_camera::Request::Get { .. })));
+    }
+
+    /// ADR-0031 §4, Amendment 2026-10-14: a verified device default is not
+    /// lit, owns and restores nothing, and stays active only while the camera
+    /// still reads back the verified D1 value; every other backend reports
+    /// nothing.
+    #[test]
+    fn a_verified_device_default_holds_only_while_the_control_reads_it_back() {
+        let _lock = crate::testenv::env_lock();
+        let held = vec![1, 2, 2, 0, 0, 0, 0, 0, 0];
+        let verified = |payload: Vec<u8>| {
+            StreamMode::new(Box::new(VerifiedDefaultMode {
+                mode: UvcMode {
+                    handle: None,
+                    unit: 8,
+                    selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+                    restore: Vec::new(),
+                    applied: Vec::new(),
+                    armed: false,
+                    active: false,
+                    record: None,
+                    _lock: None,
+                },
+                payload,
+            }))
+        };
+        let _fake = fake_camera::install(fake_camera::Camera {
+            current: held.clone(),
+            len: 9,
+            info: 3,
+            ..Default::default()
+        });
+        let mut mode = verified(held.clone());
+        assert!(mode.still_active());
+        assert!(!mode.lit());
+        assert!(!mode.owns_restore());
+        assert!(mode.restore().is_ok());
+        fake_camera::set_current(vec![1, 2, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            !mode.still_active(),
+            "a control moved to D0 is no longer verified"
+        );
+        assert!(!StreamMode::inert().still_active());
+    }
+
+    /// The D1 entry must name the attested streaming interface, select D1
+    /// alone and carry no reserved bits.
+    #[test]
+    fn the_d1_entry_must_name_the_attested_streaming_interface() {
+        let payload = [2, 1, 2, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0];
+        assert!(payload_selects_d1_for(&payload, 1));
+        assert!(!payload_selects_d1_for(&payload, 3), "interface 3 is in D0");
+        assert!(
+            !payload_selects_d1_for(&payload, 2),
+            "interface 2 is not listed"
+        );
+        assert!(
+            !payload_selects_d1_for(&[1, 1, 3, 0, 0, 0, 0, 0, 0], 1),
+            "D0 and D1 together"
+        );
+        assert!(
+            !payload_selects_d1_for(&[1, 1, 4, 0, 0, 0, 0, 0, 0], 1),
+            "D2 is not D1"
+        );
+        assert!(
+            !payload_selects_d1_for(&[1, 1, 2, 0, 0, 0, 0, 0, 1], 1),
+            "reserved bits set"
+        );
+        assert!(
+            !payload_selects_d1_for(&[2, 1, 0, 0, 0, 0, 0, 0, 0], 1),
+            "a truncated list"
+        );
+        assert!(!payload_selects_d1_for(&[], 1));
+    }
+
+    /// The proof runs in normal operation only when the session asks for it,
+    /// and still never after a configured or known control, an explicit off,
+    /// a foreign owner or an unchecked recovery; only an attested YUYV IR
+    /// session asks, at open and at recovery, and only its burst
+    /// qualification reads the answer.
+    #[test]
+    fn only_attested_yuyv_sessions_ask_for_the_device_default_proof() {
+        let emitter = include_str!("ir_emitter.rs");
+        assert!(emitter.contains("if can_prove_default && (tracing || prove_device_default) {"));
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib.find("\nmod tests {").expect("tests module")];
+        assert_eq!(
+            production.matches("format_evidence.is_some(),\n").count(),
+            2,
+            "the session open and its recovery ask"
+        );
+        assert_eq!(
+            production
+                .matches("enable_ir_emitter_privacy_bounded(")
+                .count(),
+            7,
+            "the helper and its six callers"
+        );
+        assert!(production.contains(
+            "let emitter_before = self.cam.format_evidence.is_some() && self._mode.still_active();"
+        ));
+        assert!(production
+            .contains("let emitter_active = emitter_before && self._mode.still_active();"));
+        assert!(emitter.contains("if prove_device_default && bound {"));
     }
 
     #[test]

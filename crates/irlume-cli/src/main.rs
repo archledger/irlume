@@ -4057,10 +4057,34 @@ fn tpm_firmware_check(
         format!("{}{vendor}, firmware {major}.{minor}", id.manufacturer)
     };
     // A weak storage key is reported even when the TPM's identity was not read.
-    if let Ok(StorageKeyCheck::RocaFingerprint { handle }) = storage_key {
+    if let Ok(StorageKeyCheck::RocaFingerprint { handle, derived }) = storage_key {
         let what = identity
             .as_ref()
             .map_or_else(|_| String::new(), |id| format!("{}: ", describe(id)));
+        if *derived != Some(true) {
+            // irlume seals under it, but did not (or could not show it did)
+            // derive it: no eviction command for a key another tool may use.
+            let why = if derived.is_some() {
+                "it is not the key irlume's template derives there: another tool may \
+                 have placed it"
+            } else {
+                "irlume could not derive its own key to compare, so another tool may \
+                 have placed it"
+            };
+            return (
+                State::Warn,
+                format!(
+                    "{what}the storage key at irlume's persistent handle {handle:#010x} \
+                     carries the ROCA fingerprint (CVE-2017-15361), and irlume seals under \
+                     it, but {why}. Update the TPM firmware with the machine vendor's \
+                     tool, and find what else uses that key before removing it \
+                     (`tpm2_readpublic -c {handle:#010x}`, on the TPM irlumed uses: pass \
+                     its IRLUME_TCTI with `-T` if it sets one). Do not clear the whole TPM \
+                     for this: that also drops every other key sealed in it, such as a \
+                     disk's"
+                ),
+            );
+        }
         return (
             State::Warn,
             format!(
@@ -6029,7 +6053,12 @@ mod tests {
             "{detail}"
         );
         // A key generated before a firmware update stays weak after it.
-        let weak = |handle| Ok(StorageKeyCheck::RocaFingerprint { handle });
+        let weak = |handle| {
+            Ok(StorageKeyCheck::RocaFingerprint {
+                handle,
+                derived: Some(true),
+            })
+        };
         let (state, detail) = tpm_firmware_check(&id("IFX", (7, 85)), &weak(0x8101_0002));
         assert_eq!(state, State::Warn);
         assert!(
@@ -6055,6 +6084,35 @@ mod tests {
                 && detail.contains("`sudo tpm2_evictcontrol -C o -c 0x81000005`")
                 && !detail.contains("0x81010002"),
             "{detail}"
+        );
+        // A key with irlume's template that irlume did not derive gets no
+        // eviction command: another tool may rely on it.
+        for derived in [Some(false), None] {
+            let planted = Ok(StorageKeyCheck::RocaFingerprint {
+                handle: 0x8101_0002,
+                derived,
+            });
+            let (state, detail) = tpm_firmware_check(&id("IFX", (7, 85)), &planted);
+            assert_eq!(state, State::Warn, "{detail}");
+            assert!(
+                detail.contains("ROCA fingerprint")
+                    && detail.contains("another tool may have placed it")
+                    && detail.contains("`tpm2_readpublic -c 0x81010002`")
+                    && detail.contains("IRLUME_TCTI with `-T`")
+                    && detail.contains("Do not clear the whole TPM")
+                    && !detail.contains("tpm2_evictcontrol"),
+                "{derived:?}: {detail}"
+            );
+        }
+        // A daemon from before the field answers without it.
+        let old: StorageKeyCheck =
+            serde_json::from_str(r#"{"RocaFingerprint":{"handle":2164326402}}"#).unwrap();
+        assert_eq!(
+            old,
+            StorageKeyCheck::RocaFingerprint {
+                handle: 0x8101_0002,
+                derived: None
+            }
         );
         let (state, detail) = tpm_firmware_check(&id("IFX", (7, 85)), &Ok(StorageKeyCheck::Absent));
         assert_eq!(state, State::Info, "{detail}");

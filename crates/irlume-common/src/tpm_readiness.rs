@@ -86,7 +86,16 @@ pub enum StorageKeyCheck {
     /// vulnerable Infineon library, whatever the firmware is now, and stays
     /// weak until it is regenerated. `handle` is the persistent handle it was
     /// read at: irlumed's `IRLUME_SRK_HANDLE`, `0x81010002` by default.
-    RocaFingerprint { handle: u32 },
+    /// `derived` says whether it is the key irlume's template derives there:
+    /// irlume seals under a key with its template either way, but one it did
+    /// not derive may have been placed by another tool. `None` when the
+    /// comparison could not be made (deriving failed, or a daemon from before
+    /// the field answered), which the eviction advice treats like `false`.
+    RocaFingerprint {
+        handle: u32,
+        #[serde(default)]
+        derived: Option<bool>,
+    },
 }
 
 /// The primes of the ROCA fingerprint test (Nemec et al., CCS 2017; the

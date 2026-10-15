@@ -442,12 +442,46 @@ pub fn storage_key_check() -> Result<StorageKeyCheck> {
     if !is_irlume_srk(&public)? {
         return Ok(StorageKeyCheck::Absent);
     }
-    Ok(match &public {
-        Public::Rsa { unique, .. } if roca_fingerprint(unique.value()) => {
-            StorageKeyCheck::RocaFingerprint { handle }
-        }
-        _ => StorageKeyCheck::Clean,
+    let roca = matches!(&public, Public::Rsa { unique, .. } if roca_fingerprint(unique.value()));
+    roca_verdict(roca, handle, || {
+        derives_from_srk_template(&mut ctx, &public)
     })
+}
+
+/// The storage-key verdict. Only a key with the ROCA fingerprint, which doctor
+/// then advises evicting, is compared with the key irlume's template derives,
+/// since deriving it takes seconds on slow TPMs. A comparison that fails (an
+/// owner-hierarchy password, say) leaves the fingerprint reported, with
+/// `derived` unknown.
+fn roca_verdict(
+    roca: bool,
+    handle: u32,
+    derived: impl FnOnce() -> Result<bool>,
+) -> Result<StorageKeyCheck> {
+    if !roca {
+        return Ok(StorageKeyCheck::Clean);
+    }
+    Ok(StorageKeyCheck::RocaFingerprint {
+        handle,
+        derived: derived().ok(),
+    })
+}
+
+/// Whether `persisted` is the key irlume's [`srk_template`] derives under the
+/// owner hierarchy: the same template and seed always give the same modulus,
+/// so a key with irlume's template and another modulus was placed by someone
+/// else. Derives a transient primary to compare and flushes it.
+fn derives_from_srk_template(ctx: &mut Context, persisted: &Public) -> Result<bool> {
+    let transient = create_srk(ctx)?;
+    let derived = ctx.read_public(transient);
+    let _ = ctx.flush_context(transient.into());
+    // A read failure is a transport error, not evidence about identity (the
+    // #757 review caught every-error-is-foreign).
+    let (derived, _, _) = derived.map_err(tpm_err)?;
+    Ok(matches!(
+        (rsa_modulus(persisted), rsa_modulus(&derived)),
+        (Some(persisted), Some(derived)) if persisted == derived
+    ))
 }
 
 /// Read the policy PCRs ([`policy_pcrs`]) from the SHA-256 bank and say
@@ -814,23 +848,7 @@ pub fn evict_persistent_srk() -> Result<SrkEviction> {
     // #757 review caught every-error-is-foreign): propagate it, so the
     // uninstall reports a failed check instead of a preserved foreign key.
     let (persisted_public, _, _) = ctx.read_public(key_handle).map_err(tpm_err)?;
-    let transient = create_srk(&mut ctx)?;
-    let (transient_public, _, _) = match ctx.read_public(transient) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ctx.flush_context(transient.into());
-            return Err(tpm_err(e));
-        }
-    };
-    let _ = ctx.flush_context(transient.into());
-    let ours = match (
-        rsa_modulus(&persisted_public),
-        rsa_modulus(&transient_public),
-    ) {
-        (Some(persisted), Some(derived)) => persisted == derived,
-        _ => false,
-    };
-    if !ours {
+    if !derives_from_srk_template(&mut ctx, &persisted_public)? {
         // A persistent object is never flushed (the load path's rule); the
         // ESYS reference goes away with the context.
         return Ok(SrkEviction::Foreign);
@@ -2976,6 +2994,33 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(storage_key_check().expect("check"), StorageKeyCheck::Clean);
     }
 
+    /// Only a key with the ROCA fingerprint is compared with the key irlume's
+    /// template derives, and the comparison decides `derived`.
+    #[test]
+    fn only_a_roca_key_is_compared_with_the_derived_one() {
+        assert_eq!(
+            roca_verdict(false, 0x8101_0002, || panic!("a clean key is not derived")).unwrap(),
+            StorageKeyCheck::Clean
+        );
+        for derived in [true, false] {
+            assert_eq!(
+                roca_verdict(true, 0x8100_0005, || Ok(derived)).unwrap(),
+                StorageKeyCheck::RocaFingerprint {
+                    handle: 0x8100_0005,
+                    derived: Some(derived)
+                }
+            );
+        }
+        assert_eq!(
+            roca_verdict(true, 0x8101_0002, || Err(Error::Tpm("owner auth".into()))).unwrap(),
+            StorageKeyCheck::RocaFingerprint {
+                handle: 0x8101_0002,
+                derived: None
+            },
+            "a failed comparison keeps the fingerprint"
+        );
+    }
+
     /// Real seal→unseal round-trip on the host TPM. Ignored by default: needs
     /// /dev/tpmrm0 and write access (run as root or a tss-group member).
     #[test]
@@ -3387,6 +3432,35 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             )
         })
         .expect("manual foreign cleanup");
+    }
+
+    /// The check the ROCA advice relies on: irlume's own persisted SRK is the
+    /// key its template derives; a key with irlume's template planted at the
+    /// handle is not, though irlume would seal under it.
+    #[test]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_the_derived_key_check_tells_a_planted_key_from_irlumes() {
+        let persisted = || {
+            let mut ctx = open_context().expect("context");
+            let wanted = TpmHandle::Persistent(persistent_srk_handle().expect("handle"));
+            let object = ctx.tr_from_tpm_public(wanted).expect("a key at the handle");
+            let (public, _, _) = ctx
+                .read_public(KeyHandle::from(ESYS_TR::from(object)))
+                .expect("read public");
+            (ctx, public)
+        };
+        seal_with_pcrs(b"irlume-derived-key-check-secret!", &[7]).expect("seal");
+        let (mut ctx, public) = persisted();
+        assert!(derives_from_srk_template(&mut ctx, &public).expect("derive"));
+        drop(ctx);
+
+        plant_foreign_key_at_srk_handle(srk_template().expect("template"));
+        let (mut ctx, public) = persisted();
+        assert!(is_irlume_srk(&public).expect("template check"));
+        assert!(!derives_from_srk_template(&mut ctx, &public).expect("derive"));
+        drop(ctx);
+        remove_foreign_key_at_srk_handle();
     }
 
     /// A foreign RSA-2048 key with our exact template at our handle must

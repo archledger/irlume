@@ -4226,17 +4226,23 @@ fn tpm_lockout_check(
                 lockout.lockout_recovery
             )
         };
+        // tpm2-tools picks its TPM from `-T`, then TPM2TOOLS_TCTI, then its
+        // own defaults, so the command names the TPM irlumed reported on.
+        const ON_IRLUMES_TPM: &str =
+            "on the TPM irlumed uses (pass its IRLUME_TCTI with `-T` if it sets one)";
         let clear = if lockout.lockout_auth_set {
             format!(
                 "an administrator who knows the lockout authorization can end it at once \
-                 with `tpm2_dictionarylockout --clear-lockout --auth=file:-`, which reads \
-                 the value from standard input and keeps it off the process list; {retry}. \
-                 If another operating system set that authorization, it holds the value"
+                 with `tpm2_dictionarylockout --clear-lockout --auth=file:-` {ON_IRLUMES_TPM}, \
+                 which reads the value from standard input and keeps it off the process \
+                 list; {retry}. If another operating system set that authorization, it \
+                 holds the value"
             )
         } else {
-            "no lockout authorization value is set, so `tpm2_dictionarylockout \
-             --clear-lockout` ends it at once"
-                .to_owned()
+            format!(
+                "no lockout authorization value is set, so `tpm2_dictionarylockout \
+                 --clear-lockout` {ON_IRLUMES_TPM} ends it at once"
+            )
         };
         return (
             State::Warn,
@@ -6655,6 +6661,7 @@ mod tests {
         assert_eq!(reading, State::Warn);
         assert!(detail.contains("use the password"), "{detail}");
         assert!(detail.contains("--auth=file:-"), "{detail}");
+        assert!(detail.contains("IRLUME_TCTI with `-T`"), "{detail}");
         assert!(detail.contains("within 7200 s"), "{detail}");
         assert!(detail.contains("another try for 86400 s"), "{detail}");
         assert!(detail.contains("keep the machine running"), "{detail}");
@@ -6669,6 +6676,7 @@ mod tests {
         let (reading, detail) = state(0x200, 32, false);
         assert_eq!(reading, State::Warn);
         assert!(detail.contains("no lockout authorization"), "{detail}");
+        assert!(detail.contains("IRLUME_TCTI with `-T`"), "{detail}");
         assert!(!detail.contains("--auth"), "{detail}");
         let (reading, detail) = state(0x0, 3, false);
         assert_eq!(reading, State::Info);

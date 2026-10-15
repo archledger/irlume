@@ -163,6 +163,11 @@ pub const PACKAGED_ORT_PATHS: &[&str] = &[
     "/opt/irlume/onnxruntime/lib/libonnxruntime.so",
 ];
 
+/// The `lockout` part of a `TpmReadiness` reply from a daemon that predates it.
+fn lockout_not_reported() -> std::result::Result<tpm_readiness::TpmLockout, String> {
+    Err("this irlumed predates the TPM lockout report".to_owned())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2178,6 +2183,10 @@ pub enum Response {
         identity: std::result::Result<tpm_readiness::TpmIdentity, String>,
         pcr_bank: std::result::Result<tpm_readiness::PcrBankReadiness, String>,
         storage_key: std::result::Result<tpm_readiness::StorageKeyCheck, String>,
+        /// The dictionary-attack lockout state (ADR-0034 §4). A daemon from
+        /// before the field sends none, which reads as the reason it predates.
+        #[serde(default = "lockout_not_reported")]
+        lockout: std::result::Result<tpm_readiness::TpmLockout, String>,
     },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
@@ -2898,7 +2907,12 @@ mod tests {
         let reply = serde_json::json!({"TpmReadiness": {
             "identity": {"Ok": {"manufacturer": "STM", "vendor": "ST33TPHF2XSPI", "firmware": [1, 769]}},
             "pcr_bank": {"Ok": {"Missing": [7]}},
-            "storage_key": {"Err": "no TPM device"}
+            "storage_key": {"Err": "no TPM device"},
+            "lockout": {"Ok": {
+                "lockout_auth_set": true, "in_lockout": false, "failed_tries": 3,
+                "max_tries": 32, "recovery_time": 7200, "lockout_recovery": 86400,
+                "storage_key_no_da": false
+            }}
         }});
         let parsed = serde_json::from_value::<Response>(reply.clone()).expect("the reply decodes");
         assert_eq!(serde_json::to_value(&parsed).unwrap(), reply);
@@ -2906,6 +2920,7 @@ mod tests {
             identity,
             pcr_bank,
             storage_key,
+            lockout,
         } = parsed
         else {
             panic!("a TpmReadiness reply");
@@ -2916,6 +2931,26 @@ mod tests {
             Ok(tpm_readiness::PcrBankReadiness::Missing(vec![7]))
         );
         assert_eq!(storage_key, Err("no TPM device".to_owned()));
+        let lockout = lockout.expect("the lockout state");
+        assert!(lockout.lockout_auth_set && !lockout.in_lockout);
+        assert_eq!((lockout.failed_tries, lockout.max_tries), (3, 32));
+    }
+
+    /// A daemon from before the lockout report sends a `TpmReadiness` reply
+    /// without `lockout`: it still decodes, and the part reads as the reason.
+    #[test]
+    fn a_tpm_readiness_reply_without_the_lockout_part_reads_as_predating_it() {
+        let older = serde_json::json!({"TpmReadiness": {
+            "identity": {"Err": "no TPM device"},
+            "pcr_bank": {"Err": "no TPM device"},
+            "storage_key": {"Err": "no TPM device"}
+        }});
+        let Response::TpmReadiness { lockout, .. } =
+            serde_json::from_value::<Response>(older).expect("an older reply decodes")
+        else {
+            panic!("a TpmReadiness reply");
+        };
+        assert!(lockout.unwrap_err().contains("predates"));
     }
 
     #[test]

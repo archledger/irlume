@@ -518,7 +518,16 @@ installs and loads by hand.
   A false acceptance already defeats the authentication boundary; resetting after
   genuine success does not establish safety against that case. Root deletion,
   disk rollback and the ambiguity between socket delivery and durable reset are
-  outside an exactly-once guarantee. Ordinary password login remains available.
+  outside an exactly-once guarantee. The TPM does not count face attempts
+  ([ADR-0034](adr/0034-attempt-limiting-stays-in-software.md)): it checks
+  secrets and policies, not faces, so the record is the only count. It resists
+  neither root, nor an offline change of the state directory, nor a boot of an
+  older or writes-discarded copy of that directory on a boot chain the seal
+  accepts. The last case stays open: full-disk encryption unlocked by a
+  passphrase or PIN under `/var/lib/irlume` narrows it to boots that someone who
+  knows the secret unlocks, but gives the record no freshness, and a verified
+  root or a pcrlock policy does not narrow it. Ordinary password login remains
+  available.
 - **Socket connection limits.** The daemon socket is mode 0666 and every
   request is authorized by the peer's `SO_PEERCRED`, so any local account can
   open connections. irlumed serves at most 64 at once. 16 of those slots are

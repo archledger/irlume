@@ -2,9 +2,10 @@
 // Copyright the irlume contributors.
 
 //! What the daemon reads about its TPM for `irlume doctor`: its identity and
-//! firmware, whether its SHA-256 bank can carry a seal, and whether irlume's
-//! storage key carries the ROCA fingerprint. Shared so the daemon, which alone
-//! opens the TPM, and the CLI, which words the result, agree.
+//! firmware, whether its SHA-256 bank can carry a seal, whether irlume's
+//! storage key carries the ROCA fingerprint, and its dictionary-attack
+//! lockout state (ADR-0034 §4). Shared so the daemon, which alone opens the
+//! TPM, and the CLI, which words the result, agree.
 
 use serde::{Deserialize, Serialize};
 
@@ -164,9 +165,92 @@ pub fn roca_fingerprint(modulus: &[u8]) -> bool {
     })
 }
 
+/// `TPMA_PERMANENT` bit 2, lockoutAuthSet: `TPM2_HierarchyChangeAuth` set the
+/// lockout authorization since the last `TPM2_Clear` (TPM 2.0 Library Part 2
+/// version 185, table 40).
+const LOCKOUT_AUTH_SET: u32 = 1 << 2;
+/// `TPMA_PERMANENT` bit 9, inLockout: the TPM is in lockout, "when failedTries
+/// is equal to maxTries" (Part 2 version 185, table 40).
+const IN_LOCKOUT: u32 = 1 << 9;
+
+/// The TPM's dictionary-attack (DA) state for `irlume doctor`'s `tpm-lockout`
+/// check (ADR-0034 §4). The counters are TPM-wide: every DA-protected
+/// authorization on the machine shares them, so a lockout another user of the
+/// TPM caused (wrong disk unlock PINs, a Windows Hello PIN) blocks every key
+/// that is not DA-exempt, irlume's storage key included until it moves to one
+/// with `noDA` (ADR-0034 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TpmLockout {
+    /// `TPMA_PERMANENT.lockoutAuthSet`. Without it any process that can open
+    /// the TPM can reset the lockout or change its parameters.
+    pub lockout_auth_set: bool,
+    /// `TPMA_PERMANENT.inLockout`.
+    pub in_lockout: bool,
+    /// `TPM_PT_LOCKOUT_COUNTER`, the TPM's `failedTries`.
+    pub failed_tries: u32,
+    /// `TPM_PT_MAX_AUTH_FAIL`, the TPM's `maxTries`: the lockout starts when
+    /// the counter reaches it.
+    pub max_tries: u32,
+    /// `TPM_PT_LOCKOUT_INTERVAL` in seconds, the TPM's `recoveryTime`: the
+    /// counter falls by one after this much powered-on time without a failure,
+    /// which ends a lockout.
+    pub recovery_time: u32,
+    /// `TPM_PT_LOCKOUT_RECOVERY` in seconds: the wait after a wrong lockout
+    /// authorization before it may be tried again.
+    pub lockout_recovery: u32,
+    /// Whether the storage key irlume seals under has `noDA`, so a lockout
+    /// does not block irlume's seals and unseals.
+    pub storage_key_no_da: bool,
+}
+
+impl TpmLockout {
+    /// The state from the raw property values: `permanent` is
+    /// `TPM_PT_PERMANENT` (the `TPMA_PERMANENT` bits), the rest are as named.
+    pub fn from_properties(
+        permanent: u32,
+        failed_tries: u32,
+        max_tries: u32,
+        recovery_time: u32,
+        lockout_recovery: u32,
+        storage_key_no_da: bool,
+    ) -> Self {
+        Self {
+            lockout_auth_set: permanent & LOCKOUT_AUTH_SET != 0,
+            in_lockout: permanent & IN_LOCKOUT != 0,
+            failed_tries,
+            max_tries,
+            recovery_time,
+            lockout_recovery,
+            storage_key_no_da,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two `TPMA_PERMANENT` bits read are bit 2 and bit 9; the others
+    /// (ownerAuthSet, endorsementAuthSet, disableClear, tpmGeneratedEPS) do
+    /// not leak into them.
+    #[test]
+    fn lockout_state_reads_only_lockout_auth_set_and_in_lockout() {
+        let none = TpmLockout::from_properties(0, 0, 32, 7200, 86400, false);
+        assert!(!none.lockout_auth_set && !none.in_lockout);
+        let others = 1 | 1 << 1 | 1 << 8 | 1 << 10;
+        let unrelated = TpmLockout::from_properties(others, 0, 32, 7200, 86400, false);
+        assert!(!unrelated.lockout_auth_set && !unrelated.in_lockout);
+        let both = TpmLockout::from_properties(0x204, 32, 32, 7200, 86400, true);
+        assert!(both.lockout_auth_set && both.in_lockout);
+        assert_eq!(
+            (both.failed_tries, both.max_tries, both.recovery_time),
+            (32, 32, 7200)
+        );
+        assert_eq!(both.lockout_recovery, 86400);
+        assert!(both.storage_key_no_da);
+        assert!(TpmLockout::from_properties(0x200, 2, 2, 20, 20, false).in_lockout);
+        assert!(TpmLockout::from_properties(0x4, 0, 3, 1000, 1000, false).lockout_auth_set);
+    }
 
     fn hex(text: &[&str]) -> Vec<u8> {
         let text: String = text.concat();

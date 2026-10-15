@@ -4231,31 +4231,81 @@ fn certificate_rollover_check(
 
 /// The firmware event log as `doctor` could read it, for `pcr7-binding`.
 enum EventLogRead {
-    Bytes(Vec<u8>),
+    /// The log, with PCR 7's SHA-256 value or why that could not be read.
+    Bytes(Vec<u8>, Result<[u8; 32], String>),
     Absent,
+    /// securityfs is not mounted, so a missing log says nothing.
+    NoSecurityfs,
     NotRoot,
     Unreadable(String),
 }
 
 fn read_event_log() -> EventLogRead {
-    match std::fs::read(irlume_common::event_log::EVENT_LOG) {
-        Ok(bytes) => EventLogRead::Bytes(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => EventLogRead::Absent,
+    use irlume_common::event_log::{
+        pcr_value, securityfs_shown, EVENT_LOG, PCR7_SHA256, SECURITYFS,
+    };
+    match std::fs::read(EVENT_LOG) {
+        Ok(bytes) => {
+            let value = std::fs::read_to_string(PCR7_SHA256)
+                .map_err(|e| format!("{PCR7_SHA256}: {e}"))
+                .and_then(|text| {
+                    pcr_value(&text).ok_or_else(|| format!("{PCR7_SHA256} holds no SHA-256 value"))
+                });
+            EventLogRead::Bytes(bytes, value)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if securityfs_shown(std::path::Path::new(SECURITYFS)) {
+                EventLogRead::Absent
+            } else {
+                EventLogRead::NoSecurityfs
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => EventLogRead::NotRoot,
         Err(e) => EventLogRead::Unreadable(e.to_string()),
     }
 }
 
+/// Firmware-written text from the event log (a UEFI variable name) as
+/// visible ASCII on one bounded line: anything else shows as `?`.
+fn firmware_text(text: &str) -> String {
+    const MAX: usize = 32;
+    let mut out: String = text
+        .chars()
+        .take(MAX)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if text.chars().count() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 /// The `pcr7-binding` check: what PCR 7 bound in this boot, from the
-/// firmware's event log, judged as BitLocker judges "PCR7 binding possible".
+/// firmware's event log once it accounts for PCR 7's value, judged against
+/// the PCR 7 measurements Microsoft's BitLocker guidance lists.
 fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, String) {
     use crate::doctor_report::State;
-    let bytes = match read {
-        EventLogRead::Bytes(bytes) => bytes,
+    use irlume_common::event_log::Untrusted;
+    let (bytes, value) = match read {
+        EventLogRead::Bytes(bytes, value) => (bytes, value),
         EventLogRead::Absent => {
             return (
                 State::Info,
                 "no firmware event log: the kernel exposes none for this TPM".to_owned(),
+            )
+        }
+        EventLogRead::NoSecurityfs => {
+            return (
+                State::Unknown,
+                "securityfs is not mounted at /sys/kernel/security (a container or a \
+                 chroot), so the firmware event log could not be looked for"
+                    .to_owned(),
             )
         }
         EventLogRead::NotRoot => {
@@ -4271,15 +4321,41 @@ fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, Stri
             )
         }
     };
-    match irlume_common::event_log::events(bytes) {
-        Some((events, complete)) => {
-            pcr7_binding_verdict(&irlume_common::event_log::pcr7(&events), complete)
+    let value = match value {
+        Ok(value) => value,
+        Err(e) => {
+            return (
+                State::Unknown,
+                format!(
+                    "PCR 7's value, which the firmware event log must account for, could not \
+                     be read: {e}"
+                ),
+            )
         }
-        None => (
-            State::Unknown,
-            "the firmware event log is not in the crypto-agile format".to_owned(),
+    };
+    let why = match irlume_common::event_log::verified_pcr7(bytes, value) {
+        Ok(pcr7) => return pcr7_binding_verdict(&pcr7),
+        Err(Untrusted::NotCryptoAgile) => {
+            "the firmware event log is not in the crypto-agile format".to_owned()
+        }
+        Err(Untrusted::Incomplete) => "the firmware event log ends in an event that does not \
+                                       parse, so the events after it are unread"
+            .to_owned(),
+        Err(Untrusted::NoSha256) => "a PCR 7 event in the firmware event log carries no \
+                                     SHA-256 digest, so the log cannot be checked against \
+                                     PCR 7"
+            .to_owned(),
+        Err(Untrusted::Replay) => "the firmware event log does not account for the value \
+                                   PCR 7 holds: replaying its SHA-256 digests gives another \
+                                   value, so PCR 7 was extended with something the log does \
+                                   not show"
+            .to_owned(),
+        Err(Untrusted::Payload(count)) => format!(
+            "{count} PCR 7 event(s) in the firmware event log do not hash to their recorded \
+             digest, so the log does not show what PCR 7 was extended with"
         ),
-    }
+    };
+    (State::Unknown, why)
 }
 
 /// The 2023 certificate that takes over signing from a 2011 Microsoft CA that
@@ -4292,15 +4368,17 @@ fn signing_ca_successor(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The `pcr7-binding` verdict from what PCR 7 recorded. `complete` is false
-/// when the log ended in an event that did not parse.
+/// The `pcr7-binding` verdict from what PCR 7 recorded, in a log already
+/// shown to account for PCR 7's value.
 fn pcr7_binding_verdict(
     pcr7: &irlume_common::event_log::Pcr7<'_>,
-    complete: bool,
 ) -> (crate::doctor_report::State, String) {
     use crate::doctor_report::State;
     const AFTER: &str = "Turn it back on in the firmware setup. That changes PCR 7, so set a \
                          recovery passphrase first (`irlume recovery setup`)";
+    // Microsoft's BitLocker guidance: these, in this order, then an optional
+    // separator, then the authorities.
+    const CONFIGURATION: [&str; 5] = ["SecureBoot", "PK", "KEK", "db", "dbx"];
     if pcr7.actions.iter().any(|a| a == "UEFI Debug Mode") {
         return (
             State::Warn,
@@ -4321,39 +4399,68 @@ fn pcr7_binding_verdict(
             ),
         );
     }
-    match pcr7.secure_boot {
-        Some(true) => {}
-        Some(false) => {
-            return (
-                State::Warn,
-                "Secure Boot was measured as off, so PCR 7 binds no signature check and \
-                 a seal bound to it does not depend on what boots"
-                    .to_owned(),
-            )
-        }
-        None => {
-            return (
-                State::Unknown,
-                "the firmware measured no SecureBoot variable into PCR 7".to_owned(),
-            )
-        }
+    if pcr7.secure_boot == Some(false) {
+        return (
+            State::Warn,
+            "Secure Boot was measured as off, so PCR 7 binds no signature check and a \
+             seal bound to it does not depend on what boots"
+                .to_owned(),
+        );
+    }
+    let measured: Vec<&str> = pcr7
+        .configuration
+        .iter()
+        .take(CONFIGURATION.len())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if measured != CONFIGURATION {
+        let measured = if pcr7.configuration.is_empty() {
+            "nothing".to_owned()
+        } else {
+            let mut names: Vec<String> = pcr7
+                .configuration
+                .iter()
+                .take(8)
+                .map(|(name, _)| firmware_text(name))
+                .collect();
+            if pcr7.configuration.len() > 8 {
+                names.push("...".to_owned());
+            }
+            names.join(", ")
+        };
+        return (
+            State::Warn,
+            format!(
+                "the firmware measured the Secure Boot configuration into PCR 7 as \
+                 {measured}, not SecureBoot, PK, KEK, db and dbx in that order, so PCR 7 \
+                 may not bind the Secure Boot policy (BitLocker does not bind to PCR 7 over \
+                 such a log)"
+            ),
+        );
+    }
+    let empty: Vec<&str> = pcr7.configuration[..3]
+        .iter()
+        .filter(|(_, data)| !data)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !empty.is_empty() {
+        return (
+            State::Warn,
+            format!(
+                "the firmware measured {} into PCR 7 with no data, so PCR 7 does not bind \
+                 who may change the Secure Boot databases (BitLocker counts that as \
+                 missing)",
+                empty.join(" and ")
+            ),
+        );
     }
     if pcr7.authorities.is_empty() {
-        return if complete {
-            (
-                State::Warn,
-                "no authority was measured into PCR 7: nothing verified what booted, so a \
-                 seal bound to PCR 7 binds no boot chain"
-                    .to_owned(),
-            )
-        } else {
-            (
-                State::Unknown,
-                "the firmware event log ends in an event that does not parse, before any \
-                 authority was read"
-                    .to_owned(),
-            )
-        };
+        return (
+            State::Warn,
+            "no authority was measured into PCR 7: nothing verified what booted, so a \
+             seal bound to PCR 7 binds no boot chain"
+                .to_owned(),
+        );
     }
     let mut names: Vec<String> = Vec::new();
     let mut successors: Vec<&str> = Vec::new();
@@ -4377,7 +4484,7 @@ fn pcr7_binding_verdict(
             }
             "Shim" => "shim's built-in certificate".to_owned(),
             "SbatLevel" => "shim's SBAT revocation level".to_owned(),
-            other => other.to_owned(),
+            other => format!("an authority from `{}`", firmware_text(other)),
         };
         if !names.contains(&name) {
             names.push(name);
@@ -6399,9 +6506,8 @@ mod tests {
         let shim = || Pcr7 {
             secure_boot: Some(true),
             configuration: ["SecureBoot", "PK", "KEK", "db", "dbx"]
-                .map(String::from)
+                .map(|name| (name.to_owned(), true))
                 .to_vec(),
-            separator: true,
             authorities: vec![
                 Authority {
                     variable: "db".into(),
@@ -6417,8 +6523,9 @@ mod tests {
                 },
             ],
             actions: vec![],
+            unverified: 0,
         };
-        let (state, detail) = pcr7_binding_verdict(&shim(), true);
+        let (state, detail) = pcr7_binding_verdict(&shim());
         assert_eq!(state, State::Pass, "{detail}");
         for needle in [
             "a db certificate that is not Microsoft's",
@@ -6435,24 +6542,83 @@ mod tests {
         ] {
             let mut weakened = shim();
             weakened.actions.push(action.into());
-            let (state, detail) = pcr7_binding_verdict(&weakened, true);
+            let (state, detail) = pcr7_binding_verdict(&weakened);
             assert_eq!(state, State::Warn, "{action}");
             assert!(detail.contains(needle) && detail.contains("`irlume recovery setup`"));
         }
         let mut off = shim();
         off.secure_boot = Some(false);
-        assert_eq!(pcr7_binding_verdict(&off, true).0, State::Warn);
-        off.secure_boot = None;
-        assert_eq!(pcr7_binding_verdict(&off, true).0, State::Unknown);
+        off.configuration[0].1 = false;
+        let (state, detail) = pcr7_binding_verdict(&off);
+        assert_eq!(state, State::Warn);
+        assert!(detail.contains("measured as off"), "{detail}");
         let mut unverified = shim();
         unverified.authorities.clear();
-        let (state, detail) = pcr7_binding_verdict(&unverified, true);
+        let (state, detail) = pcr7_binding_verdict(&unverified);
         assert_eq!(state, State::Warn);
         assert!(detail.contains("binds no boot chain"), "{detail}");
+
+        // Microsoft's order: SecureBoot, PK, KEK, db, dbx, with PK and KEK
+        // holding data.
+        let mut no_kek = shim();
+        no_kek.configuration.remove(2);
+        let (state, detail) = pcr7_binding_verdict(&no_kek);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("as SecureBoot, PK, db, dbx, not SecureBoot, PK, KEK, db and dbx"),
+            "{detail}"
+        );
+        let mut none = shim();
+        none.configuration.clear();
+        none.secure_boot = None;
+        let (state, detail) = pcr7_binding_verdict(&none);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(detail.contains("as nothing,"), "{detail}");
+        let mut swapped = shim();
+        swapped.configuration.swap(3, 4);
+        assert_eq!(pcr7_binding_verdict(&swapped).0, State::Warn);
+        let mut extra = shim();
+        extra.configuration.push(("dbt".to_owned(), true));
         assert_eq!(
-            pcr7_binding_verdict(&unverified, false).0,
-            State::Unknown,
-            "a log cut short before any authority proves nothing"
+            pcr7_binding_verdict(&extra).0,
+            State::Pass,
+            "more variables after dbx"
+        );
+        let mut empty = shim();
+        empty.configuration[1].1 = false;
+        empty.configuration[2].1 = false;
+        let (state, detail) = pcr7_binding_verdict(&empty);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("measured PK and KEK into PCR 7 with no data"),
+            "{detail}"
+        );
+        let mut blank = shim();
+        blank.secure_boot = None;
+        blank.configuration[0].1 = false;
+        let (state, detail) = pcr7_binding_verdict(&blank);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("measured SecureBoot into PCR 7 with no data"),
+            "{detail}"
+        );
+
+        // Firmware-written names reach the output as visible ASCII only.
+        let mut odd = shim();
+        odd.authorities[2].variable = "Mok\u{1b}[2J\nList\u{202e}".into();
+        let (state, detail) = pcr7_binding_verdict(&odd);
+        assert_eq!(state, State::Pass);
+        assert!(
+            detail.contains("an authority from `Mok?[2J?List?`"),
+            "{detail}"
+        );
+        let mut forged = shim();
+        forged.configuration[2].0 = "K\u{7}EK".into();
+        let (_, detail) = pcr7_binding_verdict(&forged);
+        assert!(detail.contains("PK, K?EK, db"), "{detail}");
+        assert_eq!(
+            firmware_text(&"x".repeat(40)),
+            format!("{}...", "x".repeat(32))
         );
 
         assert_eq!(
@@ -6466,12 +6632,17 @@ mod tests {
         assert_eq!(signing_ca_successor("Microsoft UEFI CA 2023"), None);
 
         assert_eq!(pcr7_binding_check(&EventLogRead::Absent).0, State::Info);
-        assert_eq!(pcr7_binding_check(&EventLogRead::NotRoot).0, State::Unknown);
-        assert_eq!(
-            pcr7_binding_check(&EventLogRead::Bytes(vec![0; 64])).0,
-            State::Unknown,
-            "a log without the crypto-agile header"
-        );
+        for read in [
+            EventLogRead::NoSecurityfs,
+            EventLogRead::NotRoot,
+            EventLogRead::Unreadable("EIO".into()),
+            EventLogRead::Bytes(vec![0; 64], Err("no pcr-sha256".into())),
+        ] {
+            assert_eq!(pcr7_binding_check(&read).0, State::Unknown);
+        }
+        let (state, detail) = pcr7_binding_check(&EventLogRead::Bytes(vec![0; 64], Ok([0; 32])));
+        assert_eq!(state, State::Unknown);
+        assert!(detail.contains("crypto-agile"), "{detail}");
     }
 
     #[test]

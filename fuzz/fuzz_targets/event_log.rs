@@ -6,8 +6,10 @@
 //! doctor runs it as root over /sys/kernel/security/tpm0/binary_bios_measurements.
 //! Firmware writes that log, but some event data comes from devices (device
 //! paths, option ROM descriptions), so the parser must answer on every byte
-//! string, the same way each time, with every event inside the input.
-use irlume_common::event_log::{authority_certificate, events, pcr7};
+//! string, the same way each time, with every event inside the input, and
+//! read PCR 7 from a log only when it replays and each event matches its
+//! digest.
+use irlume_common::event_log::{authority_certificate, events, pcr7, replay, verified_pcr7};
 use irlume_common::secureboot::microsoft_certificate;
 use libfuzzer_sys::fuzz_target;
 
@@ -29,7 +31,7 @@ fn header() -> Vec<u8> {
 fn check(log: &[u8]) {
     let parsed = events(log);
     assert_eq!(parsed, events(log), "parsing is deterministic");
-    let Some((list, _complete)) = parsed else {
+    let Some((list, complete)) = parsed else {
         return;
     };
     let range = log.as_ptr_range();
@@ -39,9 +41,20 @@ fn check(log: &[u8]) {
             "event data lies inside the log"
         );
         assert!(event.data.len() <= log.len());
+        if let Some(digest) = event.sha256 {
+            assert!(range.contains(&digest.as_ptr()) && digest.len() == 32);
+        }
     }
     let measured = pcr7(&list);
     assert_eq!(measured, pcr7(&list));
+    // Checked against the value its own digests replay to, a complete log is
+    // read exactly when every PCR 7 event it reads matches its digest.
+    if let (true, Some(value)) = (complete, replay(&list, 7)) {
+        match verified_pcr7(log, &value) {
+            Ok(verified) => assert!(verified == measured && measured.unverified == 0),
+            Err(_) => assert!(measured.unverified > 0),
+        }
+    }
     for authority in &measured.authorities {
         if let Some(certificate) = authority_certificate(authority) {
             assert_eq!(

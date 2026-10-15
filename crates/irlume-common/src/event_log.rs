@@ -7,26 +7,38 @@
 //! what PCR 7 binds. Firmware writes the log, but some event data (device
 //! paths, option ROM descriptions) comes from devices, so every length is
 //! checked and nothing here panics on any input (the `event_log` fuzz target).
+//! Nothing in the log is taken on trust: [`verified_pcr7`] reads PCR 7 from
+//! it only when its SHA-256 digests replay to the value PCR 7 holds and each
+//! event it reads hashes to its digest, as systemd-pcrlock checks them.
+
+use sha2::Digest as _;
 
 /// Where the kernel exposes the log (root only).
 pub const EVENT_LOG: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
+/// Where the kernel exposes PCR 7's SHA-256 value, as hex (Linux 5.12+).
+pub const PCR7_SHA256: &str = "/sys/class/tpm/tpm0/pcr-sha256/7";
+/// Where securityfs, which holds the log, is mounted.
+pub const SECURITYFS: &str = "/sys/kernel/security";
 
 const EV_NO_ACTION: u32 = 0x0000_0003;
 const EV_SEPARATOR: u32 = 0x0000_0004;
 const EV_EFI_VARIABLE_DRIVER_CONFIG: u32 = 0x8000_0001;
 const EV_EFI_ACTION: u32 = 0x8000_0007;
 const EV_EFI_VARIABLE_AUTHORITY: u32 = 0x8000_00e0;
+const TPM_ALG_SHA256: u16 = 0x000b;
 
 /// The signature that opens the first event of a crypto-agile log.
 const SPEC_ID_EVENT03: &[u8; 16] = b"Spec ID Event03\0";
 /// More events than any firmware writes; a longer log is not read further.
 const MAX_EVENTS: usize = 100_000;
 
-/// One event of the log: its PCR, its type and its event data.
+/// One event of the log: its PCR, its type, its SHA-256 digest (`None` when
+/// it carries none) and its event data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event<'a> {
     pub pcr: u32,
     pub kind: u32,
+    pub sha256: Option<&'a [u8]>,
     pub data: &'a [u8],
 }
 
@@ -94,17 +106,39 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
 /// One TCG_PCR_EVENT2: PCR, type, a digest per algorithm, then the event data.
 fn event2<'a>(r: &mut Reader<'a>, sizes: &[(u16, usize)]) -> Option<Event<'a>> {
     let (pcr, kind, count) = (r.u32()?, r.u32()?, r.u32()?);
+    let mut sha256 = None;
     for _ in 0..count {
         let algorithm = r.u16()?;
         let size = sizes.iter().find(|(id, _)| *id == algorithm)?.1;
-        r.take(size)?;
+        let digest = r.take(size)?;
+        if algorithm == TPM_ALG_SHA256 && size == 32 {
+            sha256 = Some(digest);
+        }
     }
     let size = r.u32()? as usize;
     Some(Event {
         pcr,
         kind,
+        sha256,
         data: r.take(size)?,
     })
+}
+
+/// The SHA-256 value `pcr` holds after the log's events for it, each digest
+/// extended in turn from zero (EV_NO_ACTION events are not extended). `None`
+/// when one of them carries no SHA-256 digest.
+pub fn replay(events: &[Event<'_>], pcr: u32) -> Option<[u8; 32]> {
+    let mut value = [0u8; 32];
+    for event in events
+        .iter()
+        .filter(|e| e.pcr == pcr && e.kind != EV_NO_ACTION)
+    {
+        let mut hash = sha2::Sha256::new();
+        hash.update(value);
+        hash.update(event.sha256?);
+        value = hash.finalize().into();
+    }
+    Some(value)
 }
 
 /// A UEFI_VARIABLE_DATA event: the variable's name and its data. The vendor
@@ -137,15 +171,20 @@ pub struct Pcr7<'a> {
     /// The SecureBoot variable as measured: `Some(true)` when it was 1.
     pub secure_boot: Option<bool>,
     /// The Secure Boot configuration variables measured (SecureBoot, PK,
-    /// KEK, db, dbx, and any others), in order.
-    pub configuration: Vec<String>,
-    /// Whether the separator that ends the configuration was measured.
-    pub separator: bool,
+    /// KEK, db, dbx, and any others), in order, each with whether it held
+    /// data: Microsoft's BitLocker guidance counts a PK or KEK measured empty
+    /// or as zeros as missing.
+    pub configuration: Vec<(String, bool)>,
     /// The authorities that verified images, in order.
     pub authorities: Vec<Authority<'a>>,
     /// EV_EFI_ACTION strings, such as "UEFI Debug Mode" and "DMA Protection
     /// Disabled", which the firmware measures when it runs that way.
     pub actions: Vec<String>,
+    /// How many of the PCR 7 events read here (configuration, separator,
+    /// authority, action) have data that does not hash to their SHA-256
+    /// digest, or no such digest: what PCR 7 was extended with is then not
+    /// what the event says.
+    pub unverified: usize,
 }
 
 /// The PCR 7 events of `events`, read into [`Pcr7`]. Events that do not parse
@@ -153,16 +192,25 @@ pub struct Pcr7<'a> {
 pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
     let mut out = Pcr7::default();
     for event in events.iter().filter(|e| e.pcr == 7) {
+        if matches!(
+            event.kind,
+            EV_EFI_VARIABLE_DRIVER_CONFIG
+                | EV_SEPARATOR
+                | EV_EFI_VARIABLE_AUTHORITY
+                | EV_EFI_ACTION
+        ) && event.sha256 != Some(&sha2::Sha256::digest(event.data)[..])
+        {
+            out.unverified += 1;
+        }
         match event.kind {
             EV_EFI_VARIABLE_DRIVER_CONFIG => {
                 if let Some((name, data)) = variable(event.data) {
                     if name == "SecureBoot" {
                         out.secure_boot = data.first().map(|&v| v == 1);
                     }
-                    out.configuration.push(name);
+                    out.configuration.push((name, data.iter().any(|&b| b != 0)));
                 }
             }
-            EV_SEPARATOR => out.separator = true,
             EV_EFI_VARIABLE_AUTHORITY => {
                 if let Some((variable, data)) = variable(event.data) {
                     out.authorities.push(Authority { variable, data });
@@ -178,9 +226,72 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
 }
 
 /// The certificate an authority from `db` measured: its EFI_SIGNATURE_DATA is
-/// the owner GUID followed by the certificate.
+/// the owner GUID followed by the certificate, or by the bare RSA-2048 modulus
+/// of an `EFI_CERT_RSA2048_GUID` entry.
 pub fn authority_certificate<'a>(authority: &Authority<'a>) -> Option<&'a [u8]> {
     authority.data.get(16..).filter(|c| !c.is_empty())
+}
+
+/// Why the log's account of PCR 7 is not relied on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untrusted {
+    /// The log does not open with a Spec ID Event03 header: a SHA-1-only log,
+    /// or not an event log at all.
+    NotCryptoAgile,
+    /// An event runs past the end or uses a digest algorithm the header did
+    /// not declare, so the events after it are unread.
+    Incomplete,
+    /// A PCR 7 event carries no SHA-256 digest.
+    NoSha256,
+    /// Extending the logged SHA-256 digests does not give the value PCR 7
+    /// holds: PCR 7 was extended with something the log does not show.
+    Replay,
+    /// This many PCR 7 events have data that does not hash to their digest.
+    Payload(usize),
+}
+
+/// What PCR 7 recorded in this boot, read from `log` only once the log is
+/// shown to account for `value`, the SHA-256 value PCR 7 holds: every event
+/// parses, the PCR 7 digests replay to `value`, and each PCR 7 event read
+/// hashes to its digest.
+///
+/// # Errors
+///
+/// [`Untrusted`] says which of those the log fails.
+pub fn verified_pcr7<'a>(log: &'a [u8], value: &[u8; 32]) -> Result<Pcr7<'a>, Untrusted> {
+    let (events, complete) = events(log).ok_or(Untrusted::NotCryptoAgile)?;
+    if !complete {
+        return Err(Untrusted::Incomplete);
+    }
+    if replay(&events, 7).ok_or(Untrusted::NoSha256)? != *value {
+        return Err(Untrusted::Replay);
+    }
+    let pcr7 = pcr7(&events);
+    if pcr7.unverified > 0 {
+        return Err(Untrusted::Payload(pcr7.unverified));
+    }
+    Ok(pcr7)
+}
+
+/// A PCR value as the kernel's `pcr-sha256` files print it: 64 hex digits.
+pub fn pcr_value(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    if text.len() != 64 || !text.is_ascii() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Whether securityfs shows at `dir` ([`SECURITYFS`]): mounted, it always
+/// lists entries (at least `lsm`, the active security modules), while the
+/// bare mount point, unmounted or covered (a container, a chroot), is empty.
+/// Without it a missing log says nothing about the machine.
+pub fn securityfs_shown(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 #[cfg(test)]
@@ -188,7 +299,8 @@ pub(crate) mod tests {
     use super::*;
 
     /// A crypto-agile log: the Spec ID header declaring SHA-1 and SHA-256,
-    /// then `events` as (PCR, type, data), each with both digests zeroed.
+    /// then `events` as (PCR, type, data), each with its SHA-256 digest and a
+    /// zeroed SHA-1 one (only SHA-256 is checked).
     pub(crate) fn log(events: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
         let mut spec = SPEC_ID_EVENT03.to_vec();
         spec.extend_from_slice(&[0, 0, 0, 0, 0, 2, 0, 2]);
@@ -211,7 +323,7 @@ pub(crate) mod tests {
             out.extend_from_slice(&0x0004u16.to_le_bytes());
             out.extend_from_slice(&[0; 20]);
             out.extend_from_slice(&0x000bu16.to_le_bytes());
-            out.extend_from_slice(&[0; 32]);
+            out.extend_from_slice(&sha2::Sha256::digest(data));
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(data);
         }
@@ -265,8 +377,10 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 11);
         let pcr7 = pcr7(&events);
         assert_eq!(pcr7.secure_boot, Some(true));
-        assert_eq!(pcr7.configuration, ["SecureBoot", "PK", "KEK", "db", "dbx"]);
-        assert!(pcr7.separator);
+        let names: Vec<&str> = pcr7.configuration.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["SecureBoot", "PK", "KEK", "db", "dbx"]);
+        assert!(pcr7.configuration.iter().all(|(_, data)| *data));
+        assert_eq!(pcr7.unverified, 0);
         let names: Vec<&str> = pcr7
             .authorities
             .iter()
@@ -307,6 +421,92 @@ pub(crate) mod tests {
         let at = unknown.len() - 4 - 4 - 32 - 2 - 20 - 2;
         unknown[at..at + 2].copy_from_slice(&0x0012u16.to_le_bytes());
         assert_eq!(events(&unknown), Some((vec![], false)));
+    }
+
+    /// The log is read only when it accounts for the value PCR 7 holds.
+    #[test]
+    fn pcr_7_is_read_only_from_a_log_that_replays_to_it() {
+        let data = shim_boot(b"c", &[]);
+        let value = replay(&events(&data).unwrap().0, 7).expect("SHA-256 digests");
+        let read = verified_pcr7(&data, &value).expect("a log that replays");
+        assert_eq!(read.authorities.len(), 3);
+        // Extended by hand from zero, PCR 7's events give the same value.
+        let mut db = vec![0x77; 16];
+        db.extend_from_slice(b"c");
+        let pcr7_events = [
+            var("SecureBoot", &[1]),
+            var("PK", &[0x30; 40]),
+            var("KEK", &[0x30; 40]),
+            var("db", &[0x30; 40]),
+            var("dbx", &[0x30; 40]),
+            vec![0; 4],
+            var("db", &db),
+            var("SbatLevel", b"sbat,1,2024010900\n"),
+            var("MokListRT", &[0x30; 64]),
+        ];
+        let by_hand = pcr7_events.iter().fold([0u8; 32], |pcr, event| {
+            sha2::Sha256::new()
+                .chain_update(pcr)
+                .chain_update(sha2::Sha256::digest(event))
+                .finalize()
+                .into()
+        });
+        assert_eq!(value, by_hand);
+
+        let mut other = value;
+        other[0] ^= 1;
+        assert_eq!(verified_pcr7(&data, &other), Err(Untrusted::Replay));
+        assert_eq!(
+            verified_pcr7(&[0; 64], &value),
+            Err(Untrusted::NotCryptoAgile)
+        );
+        let mut cut = data.clone();
+        cut.truncate(cut.len() - 10);
+        assert_eq!(verified_pcr7(&cut, &value), Err(Untrusted::Incomplete));
+
+        // Data changed after its digest was taken: the digests still replay,
+        // but the data is not what PCR 7 was extended with.
+        let mut forged = data.clone();
+        let at = forged
+            .windows(11)
+            .position(|w| w == b"sbat,1,2024")
+            .expect("the SBAT level");
+        forged[at + 7] = b'9';
+        assert_eq!(verified_pcr7(&forged, &value), Err(Untrusted::Payload(1)));
+
+        // A PCR 7 event with only a SHA-1 digest cannot be replayed.
+        let mut sha1_only = log(&[]);
+        for field in [7, EV_SEPARATOR, 1] {
+            sha1_only.extend_from_slice(&field.to_le_bytes());
+        }
+        sha1_only.extend_from_slice(&0x0004u16.to_le_bytes());
+        sha1_only.extend_from_slice(&[0; 20]);
+        sha1_only.extend_from_slice(&4u32.to_le_bytes());
+        sha1_only.extend_from_slice(&[0; 4]);
+        let (read, complete) = events(&sha1_only).unwrap();
+        assert!(complete);
+        assert_eq!(read[0].sha256, None);
+        assert_eq!(verified_pcr7(&sha1_only, &value), Err(Untrusted::NoSha256));
+    }
+
+    #[test]
+    fn a_pcr_value_and_securityfs_are_read_as_the_kernel_shows_them() {
+        let hex = "1978E012D5A034C47F8F877A3A7E706C2A2587141837E343417B48BAAF2B4559\n";
+        let value = pcr_value(hex).expect("64 hex digits");
+        assert_eq!(value[0], 0x19);
+        assert_eq!(value[31], 0x59);
+        assert_eq!(pcr_value("19"), None);
+        assert_eq!(pcr_value(&"zz".repeat(32)), None);
+        assert_eq!(pcr_value(&"é".repeat(32)), None);
+
+        let dir = std::env::temp_dir().join(format!("irlume-securityfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!securityfs_shown(&dir), "no directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!securityfs_shown(&dir), "an empty mount point");
+        std::fs::write(dir.join("lsm"), b"capability,selinux").unwrap();
+        assert!(securityfs_shown(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

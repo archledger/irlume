@@ -329,14 +329,23 @@ fn signer_names_in(data: &[u8], known: &[KnownCertificate]) -> Vec<String> {
         .collect()
 }
 
-/// The name of the Microsoft Secure Boot certificate `certificate` (DER, with
-/// any bytes after the encoding ignored) is, by its hash.
-pub fn microsoft_certificate(certificate: &[u8]) -> Option<&'static str> {
+/// The name of the Microsoft Secure Boot certificate a signature entry holds,
+/// by hash: a certificate (DER, with any bytes after the encoding ignored), or
+/// the bare 256-byte RSA modulus an `EFI_CERT_RSA2048_GUID` entry holds.
+pub fn microsoft_certificate(entry: &[u8]) -> Option<&'static str> {
     use sha2::Digest as _;
-    let digest: [u8; 32] = sha2::Sha256::digest(der_encoding(certificate)?).into();
-    MICROSOFT_CERTIFICATES
-        .iter()
-        .find(|k| k.der == digest)
+    let sha256 = |bytes: &[u8]| -> [u8; 32] { sha2::Sha256::digest(bytes).into() };
+    let by_certificate = der_encoding(entry).and_then(|der| {
+        let digest = sha256(der);
+        MICROSOFT_CERTIFICATES.iter().find(|k| k.der == digest)
+    });
+    by_certificate
+        .or_else(|| {
+            let digest = sha256(entry);
+            (entry.len() == 256)
+                .then(|| MICROSOFT_CERTIFICATES.iter().find(|k| k.modulus == digest))
+                .flatten()
+        })
         .map(|k| k.name)
 }
 
@@ -672,6 +681,16 @@ mod tests {
         );
         assert_eq!(microsoft_certificate(&[0xff; 10]), None);
         assert_eq!(microsoft_certificate(&[]), None);
+        // A key held as a bare RSA-2048 modulus is named by its hash.
+        let modulus = kek_2023_modulus();
+        assert_eq!(
+            microsoft_certificate(&modulus),
+            Some("Microsoft Corporation KEK 2K CA 2023")
+        );
+        assert_eq!(microsoft_certificate(&modulus[1..]), None, "not 256 bytes");
+        let mut altered = modulus;
+        altered[255] ^= 1;
+        assert_eq!(microsoft_certificate(&altered), None);
     }
 
     /// Every name the rollover uses is in the table once, no two entries

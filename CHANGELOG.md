@@ -8,13 +8,17 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - `irlume doctor` reports, as `pcr7-binding`, what PCR 7 bound in this boot,
-  read from the firmware's TCG event log as BitLocker judges "PCR7 binding
-  possible". It warns when the firmware recorded UEFI debug mode or disabled
-  pre-boot DMA protection in PCR 7, when Secure Boot was measured as off, or
-  when no authority verified the boot, and otherwise names the authorities
-  (Microsoft's certificates by hash). When a 2011 Microsoft CA signed the
-  boot loader it notes that one signed by the 2023 replacement, as
-  distributions ship after the 2011 CAs' expiry, changes PCR 7.
+  read from the firmware's TCG event log once the log's SHA-256 digests
+  replay to the value PCR 7 holds and each event it reads matches its digest,
+  and judged against the PCR 7 measurements Microsoft's BitLocker guidance
+  lists. It warns when the firmware recorded UEFI debug mode or disabled
+  pre-boot DMA protection in PCR 7, when Secure Boot was measured as off, when
+  SecureBoot, PK, KEK, db and dbx were not measured in that order or one of
+  the first three held no data, or when no authority verified the boot. It
+  otherwise names the authorities (Microsoft's certificates by hash, also
+  one `db` holds as a bare RSA key). When a 2011 Microsoft CA signed the boot
+  loader it notes that one signed by the 2023 replacement, as distributions
+  ship after the 2011 CAs' expiry, changes PCR 7 (#1080).
 
 - `irlume doctor` warns, as `shim-validation`, when shim's Secure Boot
   validation is disabled (`mokutil --disable-validation`). shim then loads

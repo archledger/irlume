@@ -15,6 +15,11 @@ attributes of irlume's storage key and so needs a migration of every sealed
 envelope; section 3.4 leaves evicting the old key to the daemon-performed
 eviction tracked in #1073.
 
+Amended 2026-10-15 by the [new key's template
+record](#amendment-2026-10-15-the-new-storage-keys-template-carries-an-irlume-label)
+below: the new storage key's template also carries an irlume label in
+`unique`, so that no other stack's storage key is irlume's by derivation.
+
 ## Context
 
 ### What irlume limits today
@@ -308,8 +313,9 @@ today, and doctor says so (section 4).
 1. **Template.** The storage key template becomes today's `srk_template`
    plus `noDA`: still RSA-2048, AES-128-CFB, SHA-256 name, empty authValue
    and empty authPolicy. These are the TCG storage-key attributes for RSA.
-   The algorithm does not change here; an ECC storage key is a separate
-   decision and would reuse this migration.
+   Amended 2026-10-15 (below): the template also sets `unique` to an
+   irlume label. The algorithm does not change here; an ECC storage key is
+   a separate decision and would reuse this migration.
 2. **Handle.** The new key is persisted at a handle of its own, so both
    keys can exist during the migration. The preferred handle is the one
    next to the old key's: 0x81010003 by default; with an
@@ -668,3 +674,52 @@ so that only an administrator can reset a lockout.
   `NvIndexType::Counter` (source-shape test, as the repository's other
   source scans).
 - THREAT_MODEL.md and DISABLE.md carry the section 5 wording.
+
+## Amendment 2026-10-15: the new storage key's template carries an irlume label
+
+Found while starting Phase 2. Section 3.1's template, today's `srk_template`
+plus `noDA` with an empty `unique`, is field for field the RSA storage key
+template systemd derives (`tpm2_get_srk_template` in
+`src/shared/tpm2-util.c`), which follows the TCG shared SRK template
+(Provisioning Guidance 7.5.1, Table 1). systemd persists that key at
+0x81000001 when that handle is empty and the TPM does not support its ECC
+template (`tpm2_get_or_create_srk`, `tpm2_get_best_srk_template`).
+TPM2_CreatePrimary seeds the derivation with
+the hierarchy's seed and a hash of the whole template, `unique` included
+(Part 1 24.6.3; the reference code's `CreatePrimary.c` uses the template's
+Name), so the same template on the same TPM gives the same key. With the
+template as written, exact identity would not tell irlume's new key from that
+systemd key, or from another stack's TCG storage key with an empty `unique`:
+the adoption of section 3.2 could take another stack's key for irlume's, and
+an eviction against the new template (section 3.4, and uninstall) could remove
+it.
+
+The new template therefore sets `unique` to the ASCII text
+`irlume ADR-0034 storage key` followed by zero bytes to 256 bytes, the size of
+an RSA-2048 modulus, as the EK Credential Profile pads its nonce for template
+L-1. Part 1 24.2.7 lets the caller place any value in `unique` that is
+structured as the TPM's own; the TPM replaces it with the modulus. The label
+is fixed, since changing it changes the key. The attributes, algorithm and
+authorization of section 3.1 are unchanged, and so is the old template.
+
+The shape check that picks candidates (attributes, name hash, authPolicy and
+key size) cannot see the label, because a key's public area holds the
+modulus in `unique`, so it still matches another stack's TCG storage key. As
+sections 3.2 and 3.4 already require, only a comparison with a fresh
+derivation of the template decides that a key is irlume's.
+
+Uninstall finds the new key by scanning the owner persistent handles, since
+its handle is recorded in the state directory, which the wipe has removed by
+then, and evicts only a key whose modulus equals a fresh derivation. A handle
+scan reads every page the TPM reports through moreData; tpm2-tools'
+vacant-handle search reads only the first.
+
+Acceptance tests (added):
+
+- The new template is the old one with `noDA` and the label, and nothing
+  else, and the old template is unchanged (unit tests on the built
+  templates).
+- On swtpm, with the TCG RSA template's key persisted at 0x81000001, irlume's
+  new key at another owner handle and a key with the new template but a
+  random modulus at a third: the TCG key's modulus differs from irlume's, the
+  eviction removes irlume's key only, and a second eviction finds nothing.

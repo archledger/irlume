@@ -174,8 +174,8 @@ mod tests {
     #[test]
     fn environment_review_two_attempts_keep_unit_after_custom_unlink_failure() {
         use super::super::{
-            finish_teardown, removal_refusal, retention::Retention, unit_env_under, SrkOutcome,
-            TeardownReport,
+            finish_teardown, removal_refusal, retention::Retention, unit_env_under,
+            DaExemptSrkOutcome, SrkOutcome, TeardownReport,
         };
         let (root, uid) = fixture("two-attempts");
         let store = root.join("custom");
@@ -223,6 +223,7 @@ mod tests {
             data_wiped: false,
             data_left: left,
             srk_eviction: SrkOutcome::Kept,
+            da_exempt_srk: DaExemptSrkOutcome::Kept,
             retention: super::super::RetentionState::Retained,
         };
         assert_eq!(

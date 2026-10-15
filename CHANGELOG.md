@@ -138,6 +138,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume uninstall` also evicts irlume's DA-exempt storage key (ADR-0034
+  §3), which it finds by scanning the owner persistent handles, and names
+  the handles in a `DA-exempt TPM storage key` line. A key counts as irlume's
+  only when its modulus equals a fresh derivation of the template, and the
+  template now carries an irlume label in `unique` (ADR-0034, amendment
+  2026-10-15), so another stack's storage key built from the TCG template,
+  such as systemd's RSA key at 0x81000001, never matches it. Nothing seals
+  under the new key yet.
+
 - When irlume's storage key carries the ROCA fingerprint, `irlume doctor`'s
   `tpm-firmware` check now derives the key irlume's template gives and
   compares the two. It names the eviction command when they match, and when

@@ -53,6 +53,10 @@ pub struct TeardownReport {
     /// after a fully completed wipe: sealed envelopes are children of that
     /// key, so kept or leftover data must keep it (audit F4, 2026-09-17).
     pub srk_eviction: SrkOutcome,
+    /// What happened to irlume's DA-exempt storage key (ADR-0034 §3), which
+    /// can sit at any owner persistent handle. Attempted just before
+    /// `srk_eviction`, under the same conditions.
+    pub da_exempt_srk: DaExemptSrkOutcome,
     /// Established from the held record, never inferred from wipe intent.
     pub retention: RetentionState,
 }
@@ -228,6 +232,9 @@ pub fn run(args: &[String]) -> ExitCode {
         "[uninstall] TPM storage root key: {}",
         srk_outcome_line(&report.srk_eviction)
     );
+    if let Some(line) = da_exempt_srk_line(&report.da_exempt_srk) {
+        println!("[uninstall] DA-exempt TPM storage key: {line}");
+    }
 
     // A stack the disable had to leave as it is still names pam_irlume.so.
     // Removing the module under it would turn that rule into one PAM cannot
@@ -809,6 +816,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
                     terminal_safe(&e)
                 )],
                 srk_eviction: SrkOutcome::Kept,
+                da_exempt_srk: DaExemptSrkOutcome::Kept,
                 retention: RetentionState::Unverified,
             }
         }
@@ -967,6 +975,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             data_wiped: false,
             data_left: vec!["daemon did not stop; data left in place".into()],
             srk_eviction: SrkOutcome::Kept,
+            da_exempt_srk: DaExemptSrkOutcome::Kept,
             retention: RetentionState::Unverified,
         };
     }
@@ -989,6 +998,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
                 "remaining state/config trees kept because selected keyring disarm was incomplete".into()
             )).collect(),
             srk_eviction: SrkOutcome::Kept,
+            da_exempt_srk: DaExemptSrkOutcome::Kept,
             retention: RetentionState::Unverified,
         };
     }
@@ -1112,15 +1122,22 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
     } else {
         false
     };
-    let srk_eviction = if record_ready {
-        match irlume_core::tpm::evict_persistent_srk() {
+    // The DA-exempt key first: it can be at any owner handle, the original
+    // key's included, so the original key's line then describes what is left.
+    let (da_exempt_srk, srk_eviction) = if record_ready {
+        let da_exempt = match irlume_core::tpm::evict_da_exempt_srks() {
+            Ok(handles) => DaExemptSrkOutcome::Evicted(handles),
+            Err(e) => DaExemptSrkOutcome::Failed(e.to_string()),
+        };
+        let original = match irlume_core::tpm::evict_persistent_srk() {
             Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
             Ok(irlume_core::tpm::SrkEviction::Absent) => SrkOutcome::Absent,
             Ok(irlume_core::tpm::SrkEviction::Foreign) => SrkOutcome::Foreign,
             Err(e) => SrkOutcome::Failed(e.to_string()),
-        }
+        };
+        (da_exempt, original)
     } else {
-        SrkOutcome::Kept
+        (DaExemptSrkOutcome::Kept, SrkOutcome::Kept)
     };
     let mut report = TeardownReport {
         pam_unwired,
@@ -1130,6 +1147,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
         data_wiped,
         data_left,
         srk_eviction,
+        da_exempt_srk,
         retention: RetentionState::Unverified,
     };
     if finish_teardown(&report, finish_services) == Some(false) {
@@ -1150,6 +1168,7 @@ fn refused_teardown(keep_data: bool, reason: String) -> TeardownReport {
         data_wiped: false,
         data_left: vec![terminal_safe(&reason)],
         srk_eviction: SrkOutcome::Kept,
+        da_exempt_srk: DaExemptSrkOutcome::Kept,
         retention: RetentionState::Unverified,
     }
 }
@@ -2491,6 +2510,39 @@ pub enum SrkOutcome {
     Failed(String),
 }
 
+/// What the teardown did about irlume's DA-exempt storage key (ADR-0034 §3),
+/// found by scanning the owner persistent handles: its handle is recorded in
+/// the state directory, which the wipe has removed by then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaExemptSrkOutcome {
+    /// No attempt, for the reasons [`SrkOutcome::Kept`] gives.
+    Kept,
+    /// The handles it was evicted from; none when no handle held it.
+    Evicted(Vec<u32>),
+    /// The scan or an eviction failed. Non-fatal, as [`SrkOutcome::Failed`].
+    Failed(String),
+}
+
+/// The line for a [`DaExemptSrkOutcome`], or `None` when the storage root
+/// key's line already says it all: no attempt, or no such key.
+fn da_exempt_srk_line(outcome: &DaExemptSrkOutcome) -> Option<String> {
+    match outcome {
+        DaExemptSrkOutcome::Kept => None,
+        DaExemptSrkOutcome::Evicted(handles) if handles.is_empty() => None,
+        DaExemptSrkOutcome::Evicted(handles) => Some(format!(
+            "evicted from {}",
+            handles
+                .iter()
+                .map(|handle| format!("{handle:#010x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        DaExemptSrkOutcome::Failed(e) => Some(format!(
+            "could not check or evict ({e}); a benign orphan unless removed by hand"
+        )),
+    }
+}
+
 /// One honest line per [`SrkOutcome`]. `Kept` and `Failed` must never read as
 /// "cleaned": the exit code and the operator's next decision both hang on the
 /// difference.
@@ -2621,6 +2673,26 @@ mod tests {
             foreign.contains("not irlume's"),
             "Foreign must say the key is not ours"
         );
+    }
+
+    /// The DA-exempt key adds a line only when there is something to say:
+    /// handles it was evicted from, or a failure, never a cleaned-sounding
+    /// line for a run that did not look.
+    #[test]
+    fn the_da_exempt_key_line_names_handles_and_failures_only() {
+        use super::{da_exempt_srk_line, DaExemptSrkOutcome};
+        assert_eq!(da_exempt_srk_line(&DaExemptSrkOutcome::Kept), None);
+        assert_eq!(
+            da_exempt_srk_line(&DaExemptSrkOutcome::Evicted(Vec::new())),
+            None
+        );
+        assert_eq!(
+            da_exempt_srk_line(&DaExemptSrkOutcome::Evicted(vec![0x8101_0003])),
+            Some("evicted from 0x81010003".to_string())
+        );
+        let failed = da_exempt_srk_line(&DaExemptSrkOutcome::Failed("no TPM device".into()))
+            .expect("a failure is reported");
+        assert!(failed.contains("no TPM device") && failed.contains("benign orphan"));
     }
 
     /// The Bitwarden polkit notice names the exact file only when it exists,
@@ -2880,6 +2952,11 @@ mod tests {
                 SrkOutcome::Absent
             } else {
                 SrkOutcome::Kept
+            },
+            da_exempt_srk: if wiped {
+                DaExemptSrkOutcome::Evicted(Vec::new())
+            } else {
+                DaExemptSrkOutcome::Kept
             },
             retention: if wiped {
                 RetentionState::Clean

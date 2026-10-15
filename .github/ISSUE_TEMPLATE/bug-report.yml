@@ -23,6 +23,29 @@ body:
       placeholder: "Fedora 44 KDE (Wayland)"
     validations:
       required: true
+  # Each option is an issue_area in .github/labels.toml, which turns the
+  # answer into labels (scripts/ci/test-auto-label.py keeps the two in step).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Where the problem shows up, if you know. Pick any that apply.
+      multiple: true
+      options:
+        - Login, lock screen, sudo or polkit (PAM)
+        - Enrollment
+        - Face recognition or matching
+        - Liveness or anti-spoofing
+        - Camera or IR emitter
+        - TPM or Secure Boot
+        - Keyring or wallet unlock
+        - Fingerprint
+        - The irlume command or its TUI
+        - KDE System Settings module
+        - Installing or packaging
+        - Not sure
+    validations:
+      required: false
   - type: textarea
     id: problem
     attributes:

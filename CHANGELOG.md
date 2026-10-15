@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Issues and pull requests are labeled automatically from their titles, the
+  files a pull request changes and the bug report's new Area field, with
+  twelve new area and kind labels (daemon, cli, auth, vision, enrollment,
+  keyring, fingerprint, desktop, tests, maintenance, release, design). Labels
+  are only added, and one removed by hand stays removed. Labels and rules
+  live in `.github/labels.toml` (#1074).
+
 - `irlume doctor` reports three TPM and Secure Boot checks.
   - `secure-boot-certificates` says whether Microsoft's 2023 Secure Boot
     certificates replace the 2011 ones, which expire in 2026. Enrolling them,

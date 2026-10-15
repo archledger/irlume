@@ -195,3 +195,44 @@ against a fake `gh` and the repository's real workflow files, including the
 2026-09-15 to 09-24 advisory audit failures and a runner that stays offline. It
 needs `jq`, and compares the schedule reader with PyYAML: locally the
 comparison is skipped when PyYAML is missing, under Actions the test fails.
+
+## Auto-label
+
+`auto-label.py` is the logic of `.github/workflows/auto-label.yml` (issue and
+pull request events) and `auto-label-sweep.yml` (hourly sweep, manual sweep or
+backfill), and `.github/labels.toml` holds every label of the repository with
+the rules that apply it: changed paths for pull requests (any file, or every
+file for the labels a change is only sometimes about, such as tests, CI and
+docs), the words of a conventional title prefix, a pattern searched in an
+issue's title, and the bug report's Area answer. Issue bodies are not read,
+since pasted `irlume doctor` output names every subsystem. A label added to
+the file is created on the next run; editing one on GitHub is not undone, and
+a run that finds a label another run just created carries on. To change what
+gets labeled, edit the file and extend the cases in the test.
+
+The bot only adds labels, and does not add back one that anybody removed from
+that issue or pull request. The event workflow runs the script and rules of
+the default branch, so a pull request that changes them takes effect only
+once merged. Same-repository pull requests and every issue are labeled when
+opened or edited, judged as they are when the run starts (an event's own
+copy may be older); a fork's or Dependabot's pull request runs `pull_request`
+with a read-only token, so the sweep labels it instead. Each sweep covers
+every open item plus everything updated in the last 3 hours, so a late or
+missed sweep loses nothing, and as the only scheduled half it is what
+`ci-alert.yml` judges. A manual run sweeps, or backfills every issue and pull
+request from oldest, as a dry run unless told otherwise. A backfill paces
+itself at 5 s per request (720 an hour, leaving the other workflows part of
+the token's shared 1,000), reading lists a page of 100 at a time, waits out a
+spent allowance until it resets, and names its resume point (`from`), the
+first failed item if any. GitHub lists at most 3,000 files of a pull request;
+past that, the labels any listed file earns are added and no every-file rule
+is applied.
+
+`python3 scripts/ci/test-auto-label.py` runs both workflows' steps as written
+against a fake `gh` that pages like GitHub, the real rules file and the real
+issue form, with titles and paths of real issues and pull requests. It also
+pins the workflows' shape: no `pull_request_target` or `workflow_run`
+trigger, the event workflow on the default branch's code, only the sweep
+scheduled, least-privilege permissions, and no expression inside `run:`.
+The step and shape cases need PyYAML: they skip locally without it and fail
+under Actions.

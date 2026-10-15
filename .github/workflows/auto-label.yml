@@ -1,0 +1,64 @@
+# Auto-label issues and pull requests as they open or change
+#
+# Adds labels by the rules in .github/labels.toml: the files a pull request
+# changes, a conventional title's type and scopes, words in an issue's title,
+# and the bug report's Area field. A label defined there and missing from the
+# repository is created. Labels are only added: one already present stays,
+# one anybody removed is not added back, and nothing is renamed or deleted.
+# Logic: scripts/ci/auto-label.py, tested with fixtures and a fake gh by
+# scripts/ci/test-auto-label.py in ci.yml.
+#
+# `issues` and same-repository `pull_request` events label at once. A pull
+# request from a fork, or one Dependabot opens, runs `pull_request` with a
+# read-only token, so auto-label-sweep.yml labels it within the hour.
+# pull_request_target and workflow_run are deliberately not used: zizmor's
+# dangerous-triggers audit flags both, and nothing here needs a fork's event
+# to write. Labels added with the workflow token start no other workflow
+# (GitHub docs, "Triggering a workflow"), and no workflow here runs on
+# `labeled`.
+#
+# The script and rules always come from the default branch, never from the
+# pull request being labeled: a change to them takes effect when it merges,
+# so an unmerged one cannot create or apply labels. This file itself runs
+# from the pull request, as every pull_request workflow does; that branch
+# was pushed by someone with write access, whose push already runs any
+# workflow on it with its declared permissions, and CODEOWNERS covers
+# changes to it. Each run reads the item afresh, so a run queued behind a
+# later edit judges the current title, body and labels.
+name: Auto-label
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+# One run per issue or pull request at a time, so two quick edits cannot
+# both decide to add the same label.
+concurrency:
+  group: auto-label-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    name: add labels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write # add labels to issues, and create a defined label the repository lacks
+      pull-requests: write # add labels to pull requests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Add labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/ci/auto-label.py --repo "$REPO" --mode event

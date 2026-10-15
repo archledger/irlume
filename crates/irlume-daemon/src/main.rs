@@ -6018,6 +6018,58 @@ fn tpm_readiness_report() -> Response {
     }
 }
 
+/// Whether `req` captures faces into an enrollment: a new one, more scans for
+/// one, or an added camera group, on any route.
+fn captures_enrollment(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::Enroll { .. }
+            | Request::EnrollOn { .. }
+            | Request::EnrollSplitOn { .. }
+            | Request::EnrollmentSession { .. }
+            | Request::AddScan { .. }
+            | Request::AddCameraGroup { .. }
+            | Request::AddCameraGroupOn { .. }
+            | Request::AddSplitCameraGroupOn { .. }
+    )
+}
+
+/// The account whose enrollment `req` captures for, or frames for: a capture
+/// into an enrollment ([`captures_enrollment`]), or the enrollment guide's
+/// framing session or sample, which the TUI runs first with a camera open.
+/// A framing request names its account only for a peer that may act for it,
+/// so its answer says nothing about another account's key.
+fn enrollment_capture_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str> {
+    match req {
+        Request::PositionSample { user: Some(user) }
+        | Request::PositionSession { user: Some(user) } => {
+            authorized_for(peer, user).then_some(user.as_str())
+        }
+        _ if captures_enrollment(req) => enrollment_mutating_user(req),
+        _ => None,
+    }
+}
+
+/// The refusal for an enrollment capture whose new template key could not be
+/// sealed: the account has no sealed key, no pcrlock policy may seal one, and
+/// the SHA-256 PCR bank has no value for a literal policy PCR, so the seal
+/// would refuse once the scans were taken (#1071;
+/// `irlume_core::template_key::new_key_seal_blocked`). A bank that cannot be
+/// read refuses nothing; the seal then reports what it finds.
+fn enrollment_seal_refusal(
+    blocked: impl FnOnce() -> irlume_common::Result<Option<Vec<u32>>>,
+) -> Option<String> {
+    match blocked() {
+        Ok(Some(pcrs)) => Some(format!(
+            "enrollment refused before capture: the TPM's SHA-256 PCR bank has no value \
+             for PCRs {pcrs:?}, so a template key cannot be sealed; activate the SHA-256 \
+             bank in the firmware setup's TPM options (`sudo irlume doctor` reports \
+             tpm-pcr-bank)"
+        )),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 /// The account whose published summary may no longer describe the enrollment
 /// on disk once this request has run, from the [`posture`] table. The worker
 /// invalidates before running it; re-publishing happens on the next
@@ -8869,6 +8921,17 @@ fn dispatch_scoped_session_inner(
             .and_then(|grant| grant.consume(&req, peer));
         if let Err(error) = result {
             return Response::Error(error);
+        }
+    }
+    // A capture into an enrollment that must seal a new template key cannot
+    // finish when the SHA-256 PCR bank cannot carry that seal. Refuse it, and
+    // the enrollment guide's framing before it, before any camera opens rather
+    // than after the scans.
+    if let Some(user) = enrollment_capture_user(&req, peer) {
+        if let Some(refusal) =
+            enrollment_seal_refusal(|| irlume_core::template_key::new_key_seal_blocked(user))
+        {
+            return Response::Error(refusal);
         }
     }
     if let Request::EnrollSplitOn { pair, .. } | Request::AddSplitCameraGroupOn { pair, .. } = &req
@@ -13942,6 +14005,116 @@ mod tests {
             assert_eq!(identity, Err("no TPM device".into()));
             assert_eq!(pcr_bank, Err("no TPM device".into()));
             assert_eq!(storage_key, Err("no TPM device".into()));
+        }
+    }
+
+    /// The early TPM refusal covers exactly the captures into an enrollment,
+    /// each of them an enrollment write, and no other request.
+    #[test]
+    fn the_enrollment_seal_refusal_gates_only_face_captures() {
+        let mut captures: Vec<&str> = named_samples(SAMPLE_USER)
+            .iter()
+            .filter(|(_, req)| captures_enrollment(req))
+            .map(|(name, _)| *name)
+            .collect();
+        captures.sort_unstable();
+        captures.dedup();
+        assert_eq!(
+            captures,
+            [
+                "AddCameraGroup",
+                "AddCameraGroupOn",
+                "AddScan",
+                "AddSplitCameraGroupOn",
+                "Enroll",
+                "EnrollOn",
+                "EnrollSplitOn",
+                "EnrollmentSession",
+            ]
+        );
+        for req in &request_samples() {
+            if captures_enrollment(req) {
+                assert!(
+                    enrollment_mutating_user(req).is_some(),
+                    "{} captures into an enrollment but is not an enrollment write",
+                    variant_name(req)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_blocked_new_key_seal_refuses_an_enrollment_capture() {
+        let refusal =
+            enrollment_seal_refusal(|| Ok(Some(vec![7]))).expect("a blocked seal refuses");
+        for needle in ["before capture", "PCRs [7]", "tpm-pcr-bank"] {
+            assert!(refusal.contains(needle), "{needle}: {refusal}");
+        }
+        assert_eq!(
+            enrollment_seal_refusal(|| Ok(None)),
+            None,
+            "an existing key, a pcrlock policy or a ready bank seals"
+        );
+        assert_eq!(
+            enrollment_seal_refusal(|| Err(irlume_common::Error::Tpm("busy".into()))),
+            None,
+            "an unread bank refuses nothing; the seal reports"
+        );
+    }
+
+    /// The enrollment guide's framing is checked for its own account only, and
+    /// only for a peer that may act for it; other requests are not checked.
+    #[test]
+    fn the_enrollment_guide_is_checked_for_an_account_its_peer_may_act_for() {
+        let _passwd = passwd_lock();
+        let user = || Some(SAMPLE_USER.to_owned());
+        for guide in [
+            Request::PositionSession { user: user() },
+            Request::PositionSample { user: user() },
+        ] {
+            assert_eq!(enrollment_capture_user(&guide, &peer(0)), Some(SAMPLE_USER));
+            assert_eq!(enrollment_capture_user(&guide, &peer(4_000_000)), None);
+        }
+        assert_eq!(
+            enrollment_capture_user(&Request::PositionSession { user: None }, &peer(0)),
+            None
+        );
+        for req in &request_samples() {
+            let checked = enrollment_capture_user(req, &peer(0)).is_some();
+            let guide = matches!(
+                req,
+                Request::PositionSession { user: Some(_) }
+                    | Request::PositionSample { user: Some(_) }
+            );
+            assert_eq!(
+                checked,
+                captures_enrollment(req) || guide,
+                "{}",
+                variant_name(req)
+            );
+        }
+    }
+
+    /// The refusal runs after the request's authorization and before any
+    /// camera is prepared on every route.
+    #[test]
+    fn the_enrollment_seal_refusal_runs_before_the_cameras_open() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn dispatch_scoped_session_inner(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("dispatch_scoped_session_inner");
+        let refusal = body
+            .find("irlume_core::template_key::new_key_seal_blocked(user)")
+            .expect("the dispatch refuses an unsealable capture");
+        assert!(body.find("grant.consume(").expect("authorization") < refusal);
+        for camera in [
+            "prepare_split_enrollment_camera(",
+            "prepare_enrollment_camera(",
+            "prepare_camera_request()",
+        ] {
+            assert!(refusal < body.find(camera).expect(camera), "{camera}");
         }
     }
 

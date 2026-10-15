@@ -215,6 +215,52 @@ pub fn has_key(user: &str) -> bool {
     key_path(user).exists()
 }
 
+/// The policy PCRs with no SHA-256 value when the next enrollment write for
+/// `user` would have to seal a new template key and that seal would refuse
+/// (#1071). `None` on a host without a TPM, when the write would keep the
+/// account's sealed key (`reusable_key`; it unseals under its own envelope's
+/// PCRs), when a provisioned pcrlock policy may seal the new key instead
+/// ([`tpm::seal`] tries it first), or when every literal policy PCR has a
+/// SHA-256 value. Reads the TPM only in the last case.
+///
+/// # Errors
+/// Returns an error when the SHA-256 bank cannot be read.
+pub fn new_key_seal_blocked(user: &str) -> Result<Option<Vec<u32>>> {
+    if !tpm_available() {
+        return Ok(None);
+    }
+    new_key_seal_blocked_with(
+        reusable_key(user),
+        tpm::pcrlock_for_sealing().is_some(),
+        tpm::pcr_bank_readiness,
+    )
+}
+
+/// Whether an enrollment write for `user` would keep the account's sealed key
+/// rather than seal a new one: a key is stored and is not recorded for another
+/// uid, the check the save makes before any unseal (a name now held by another
+/// account gets a key of its own, `storage::first_save`). A key recorded
+/// without a uid that the save, once it has unsealed it, finds to be another
+/// account's is not seen here; that write still fails at the seal, as it did
+/// before this check.
+fn reusable_key(user: &str) -> bool {
+    has_key(user) && !key_is_for_another_account(user, &mut Account::new(user))
+}
+
+fn new_key_seal_blocked_with(
+    reuses_key: bool,
+    pcrlock: bool,
+    readiness: impl FnOnce() -> Result<tpm::PcrBankReadiness>,
+) -> Result<Option<Vec<u32>>> {
+    if reuses_key || pcrlock {
+        return Ok(None);
+    }
+    Ok(match readiness()? {
+        tpm::PcrBankReadiness::Missing(pcrs) => Some(pcrs),
+        tpm::PcrBankReadiness::Ready(_) | tpm::PcrBankReadiness::Unextended(_) => None,
+    })
+}
+
 /// Whether `user`'s sealed template key was recorded for another uid
 /// ([`crate::account`]), as `account` resolves it; `false` when there is no
 /// key or it cannot be read.
@@ -1247,6 +1293,73 @@ fn set_0600(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    /// The preflight counts a stored key as kept only when the save would keep
+    /// it. One recorded for another uid (the name now belongs to another
+    /// account) is replaced by a fresh seal, so a missing SHA-256 value still
+    /// refuses; one recorded for this uid, or for none, is kept.
+    #[test]
+    fn a_key_recorded_for_another_uid_does_not_exempt_a_new_seal() {
+        use tpm::PcrBankReadiness::Missing;
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("preflight-reuse"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let user = "preflight-reuse-owner";
+        let _now = crate::account::remember(user, 4142);
+        let write = |uid: Option<u32>| {
+            let mut env: SealedEnvelope =
+                serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)
+                    .unwrap();
+            env.uid = uid;
+            env.save(&key_path(user)).unwrap();
+        };
+        let blocked =
+            || new_key_seal_blocked_with(reusable_key(user), false, || Ok(Missing(vec![7])));
+        assert!(!reusable_key(user), "no key is stored");
+        assert_eq!(blocked().unwrap(), Some(vec![7]));
+        write(Some(4141));
+        assert!(
+            !reusable_key(user),
+            "a key sealed for the name's former uid is replaced"
+        );
+        assert_eq!(blocked().unwrap(), Some(vec![7]));
+        for uid in [Some(4142), None] {
+            write(uid);
+            assert!(reusable_key(user), "{uid:?}");
+            assert_eq!(blocked().unwrap(), None, "{uid:?}");
+        }
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The enrollment preflight refuses only a new key that must take the
+    /// literal seal while the SHA-256 bank lacks a policy PCR.
+    #[test]
+    fn a_new_key_seal_is_blocked_only_on_the_literal_path_with_a_missing_bank() {
+        use tpm::PcrBankReadiness::{Missing, Ready, Unextended};
+        let never = || -> Result<tpm::PcrBankReadiness> { panic!("the TPM is not read") };
+        assert_eq!(new_key_seal_blocked_with(true, false, never).unwrap(), None);
+        assert_eq!(new_key_seal_blocked_with(false, true, never).unwrap(), None);
+        assert_eq!(
+            new_key_seal_blocked_with(false, false, || Ok(Missing(vec![7]))).unwrap(),
+            Some(vec![7])
+        );
+        assert_eq!(
+            new_key_seal_blocked_with(false, false, || Ok(Ready(vec![7]))).unwrap(),
+            None
+        );
+        assert_eq!(
+            new_key_seal_blocked_with(false, false, || Ok(Unextended(vec![7]))).unwrap(),
+            None
+        );
+        assert!(
+            new_key_seal_blocked_with(false, false, || Err(Error::Tpm("busy".into()))).is_err()
+        );
+    }
+
     use super::*;
 
     /// A resolution that found no key is remembered: a host without a TPM

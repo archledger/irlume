@@ -578,8 +578,11 @@ Deliberate residuals include the persistent synchronization/retention file
 `/var/lib/irlume-uninstall-srk-retention`, and the Bitwarden polkit action when
 present (`irlume bitwarden setup --apply` writes Bitwarden's own policy file).
 The retention file remains even when clean; do not unlink its lock-bearing
-inode. Kept state keeps its TPM storage root key (SRK). A fully completed,
-eligible wipe attempts SRK eviction; its result is reported separately.
+inode. Kept state keeps its TPM storage root keys (SRKs). A fully completed,
+eligible wipe attempts their eviction: the original key at its handle, and
+the DA-exempt key of ADR-0034 §3 at any owner handle, each only when a fresh
+derivation of its template gives the same key. The results are reported
+separately.
 Journald logs, filesystem snapshots and backups also survive.
 
 ### Manual uninstall recovery

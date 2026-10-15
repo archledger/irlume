@@ -37,7 +37,7 @@ use zeroize::Zeroizing;
 use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
 use tss_esapi::constants::tss::{
     TPM2_HR_HMAC_SESSION, TPM2_HR_NV_INDEX, TPM2_HR_PERSISTENT, TPM2_HR_POLICY_SESSION,
-    TPM2_HR_TRANSIENT,
+    TPM2_HR_TRANSIENT, TPM2_PERSISTENT_FIRST, TPM2_PERSISTENT_LAST,
 };
 use tss_esapi::constants::{CapabilityType, PropertyTag, SessionType};
 use tss_esapi::handles::{
@@ -90,6 +90,22 @@ const DEFAULT_PCRS: &[u32] = &[7];
 /// collide with another stack's storage key. Override with `IRLUME_SRK_HANDLE`
 /// (hex) if needed.
 const PERSISTENT_SRK_HANDLE: u32 = 0x8101_0002;
+
+/// The persistent handles Owner Authorization may assign (Part 1 34.3);
+/// 0x81800000 to 0x81FFFFFF need Platform Authorization.
+const OWNER_PERSISTENT: std::ops::RangeInclusive<u32> = 0x8100_0000..=0x817F_FFFF;
+
+/// The start of the `unique` of irlume's DA-exempt storage key template
+/// ([`da_exempt_srk_template`]), zero-padded to [`RSA_2048_MODULUS_BYTES`].
+/// Never change it: it decides which key the template derives.
+const DA_EXEMPT_SRK_LABEL: &[u8] = b"irlume ADR-0034 storage key";
+
+/// The size of an RSA-2048 modulus, which the TPM writes into `unique`.
+const RSA_2048_MODULUS_BYTES: usize = 256;
+
+/// Handles asked for per GetCapability page: as many as one capability
+/// buffer of the TSS's size holds. A TPM may return fewer and set moreData.
+const HANDLES_PER_PAGE: u32 = HandleList::MAX_SIZE as u32;
 
 fn tpm_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Tpm(e.to_string())
@@ -541,16 +557,29 @@ fn roca_verdict(
 /// placed by another tool or derived before a firmware update changed the key
 /// generation. Derives a transient primary to compare and flushes it.
 fn derived_srk(ctx: &mut Context, persisted: &Public) -> Result<DerivedKey> {
-    let transient = create_srk(ctx)?;
+    let derived = derive_public(ctx, srk_template()?)?;
+    Ok(compare_moduli(persisted, &derived))
+}
+
+/// The public area of the key `template` derives under the owner hierarchy
+/// today. Derives a transient primary, reads it and flushes it.
+fn derive_public(ctx: &mut Context, template: Public) -> Result<Public> {
+    let transient = create_storage_key(ctx, template)?;
     let derived = ctx.read_public(transient);
     let _ = ctx.flush_context(transient.into());
     // A read failure is a transport error, not evidence about identity (the
     // #757 review caught every-error-is-foreign).
     let (derived, _, _) = derived.map_err(tpm_err)?;
-    Ok(match (rsa_modulus(persisted), rsa_modulus(&derived)) {
+    Ok(derived)
+}
+
+/// [`DerivedKey::compare`] of two keys' moduli; a non-RSA key is
+/// [`DerivedKey::Other`].
+fn compare_moduli(persisted: &Public, derived: &Public) -> DerivedKey {
+    match (rsa_modulus(persisted), rsa_modulus(derived)) {
         (Some(persisted), Some(derived)) => DerivedKey::compare(persisted, derived),
         _ => DerivedKey::Other,
-    })
+    }
 }
 
 /// Whether `persisted` is the key irlume's [`srk_template`] derives today
@@ -627,12 +656,43 @@ fn pcr_slot(index: u32) -> Result<PcrSlot> {
     })
 }
 
+/// The template of the storage key every irlume envelope so far is sealed
+/// under. It lacks noDA, so a TPM in dictionary-attack lockout refuses to
+/// load children under it (ADR-0034, "A gap found while checking").
 fn srk_template() -> Result<Public> {
+    storage_key_template(false, PublicKeyRsa::default())
+}
+
+/// The DA-exempt storage key template of ADR-0034 §3.1: [`srk_template`] with
+/// noDA set and [`da_exempt_srk_unique`] in `unique`. Without the label it
+/// would be the TCG shared storage key template (Provisioning Guidance
+/// 7.5.1) that systemd and other stacks derive and persist, and CreatePrimary
+/// derives the same key from the same template, so a key matching it would
+/// not have to be irlume's (the section's 2026-10-15 amendment).
+fn da_exempt_srk_template() -> Result<Public> {
+    storage_key_template(true, da_exempt_srk_unique()?)
+}
+
+/// [`DA_EXEMPT_SRK_LABEL`] followed by zero bytes to the size of an RSA-2048
+/// modulus, as the EK Credential Profile pads its nonce for template L-1.
+/// Part 1 24.2.7 lets a caller place any value in `unique` that is structured
+/// like the one the TPM writes there.
+fn da_exempt_srk_unique() -> Result<PublicKeyRsa> {
+    let mut unique = vec![0u8; RSA_2048_MODULUS_BYTES];
+    unique[..DA_EXEMPT_SRK_LABEL.len()].copy_from_slice(DA_EXEMPT_SRK_LABEL);
+    PublicKeyRsa::try_from(unique).map_err(tpm_err)
+}
+
+/// An RSA-2048 storage key template with the TCG storage key attributes,
+/// noDA as `no_da` says, and `unique`, which CreatePrimary hashes into the
+/// key's derivation with the rest of the template.
+fn storage_key_template(no_da: bool, unique: PublicKeyRsa) -> Result<Public> {
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(no_da)
         .with_restricted(true)
         .with_decrypt(true)
         .build()
@@ -650,7 +710,7 @@ fn srk_template() -> Result<Public> {
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(attrs)
         .with_rsa_parameters(params)
-        .with_rsa_unique_identifier(tss_esapi::structures::PublicKeyRsa::default())
+        .with_rsa_unique_identifier(unique)
         .build()
         .map_err(tpm_err)
 }
@@ -844,10 +904,15 @@ fn sealed_template(policy_digest: Digest) -> Result<Public> {
 }
 
 fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
-    let tmpl = srk_template()?;
+    create_storage_key(ctx, srk_template()?)
+}
+
+/// Derive the primary key `template` describes under the owner hierarchy, as
+/// a transient object, with an empty owner authorization.
+fn create_storage_key(ctx: &mut Context, template: Public) -> Result<KeyHandle> {
     let primary = ctx
         .execute_with_nullauth_session(|ctx| {
-            ctx.create_primary(Hierarchy::Owner, tmpl, None, None, None, None)
+            ctx.create_primary(Hierarchy::Owner, template, None, None, None, None)
         })
         .map_err(tpm_err)?;
     Ok(primary.key_handle)
@@ -941,12 +1006,120 @@ pub fn evict_persistent_srk() -> Result<SrkEviction> {
     Ok(SrkEviction::Evicted)
 }
 
-/// True iff `public` is irlume's own SRK: RSA, our [`srk_template`] attributes,
-/// SHA-256 name hash, an empty authPolicy, and a 2048-bit key. A non-match means
-/// another stack's key is squatting our persistent handle (clevis /
-/// systemd-cryptenroll keys carry a non-empty authPolicy, and may be ECC), so it
-/// fails the comparison and we fall back to a transient SRK.
+/// Evict irlume's DA-exempt storage key (ADR-0034 §3, the template
+/// `da_exempt_srk_template` builds) from every owner persistent handle that
+/// holds it, and return those handles; none is a success.
+///
+/// The key's handle is recorded in irlume's state directory, which uninstall
+/// wipes first, so the handles are scanned instead. A key with the template's
+/// shape is compared with one fresh derivation of the template and evicted
+/// only when its modulus is the same, the rule of [`evict_persistent_srk`];
+/// the label in the template's `unique` keeps another stack's TCG storage key
+/// from matching. The derivation runs only when some key has that shape.
+///
+/// # Errors
+///
+/// `Error::Tpm` when the TPM cannot be opened, a handle or public area cannot
+/// be read, the comparison key cannot be derived, or an eviction is refused.
+/// Handles evicted before the error are not reported; a later call finds the
+/// rest.
+pub fn evict_da_exempt_srks() -> Result<Vec<u32>> {
+    let mut ctx = open_context()?;
+    let template = da_exempt_srk_template()?;
+    let mut derived: Option<Public> = None;
+    let mut evicted = Vec::new();
+    for handle in persistent_handles(&mut ctx)? {
+        if !OWNER_PERSISTENT.contains(&handle) {
+            continue;
+        }
+        let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+        let object = ctx
+            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+            .map_err(tpm_err)?;
+        let key_handle = KeyHandle::from(ESYS_TR::from(object));
+        // As in `evict_persistent_srk`, a read failure is not evidence.
+        let (public, _, _) = ctx.read_public(key_handle).map_err(tpm_err)?;
+        if !has_template_shape(&public, &template) {
+            continue;
+        }
+        if derived.is_none() {
+            derived = Some(derive_public(&mut ctx, template.clone())?);
+        }
+        let Some(derived) = &derived else {
+            continue;
+        };
+        if compare_moduli(&public, derived) != DerivedKey::Same {
+            continue;
+        }
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                key_handle.into(),
+                Persistent::Persistent(persistent),
+            )
+        })
+        .map_err(tpm_err)?;
+        evicted.push(handle);
+    }
+    Ok(evicted)
+}
+
+/// Every persistent handle the TPM reports, in order. A TPM returns at most
+/// one capability buffer per GetCapability and sets moreData when handles
+/// remain, so this asks again from the handle after the last one until it
+/// does not (tpm2-tools' vacant-handle search reads one page only).
+fn persistent_handles(ctx: &mut Context) -> Result<Vec<u32>> {
+    let mut handles = Vec::new();
+    let mut from = TPM2_PERSISTENT_FIRST;
+    loop {
+        let (data, more) = ctx
+            .get_capability(CapabilityType::Handles, from, HANDLES_PER_PAGE)
+            .map_err(tpm_err)?;
+        let CapabilityData::Handles(list) = data else {
+            return Err(Error::Tpm(
+                "TPM returned a non-handle capability for a handle query".into(),
+            ));
+        };
+        let page: Vec<u32> = list.into_inner().into_iter().map(u32::from).collect();
+        let next = next_handle_page(more, from, &page)?;
+        handles.extend(page);
+        match next {
+            Some(next) => from = next,
+            None => return Ok(handles),
+        }
+    }
+}
+
+/// Where the next page of a persistent handle scan starts, or `None` when the
+/// TPM said it returned the last. A page that claims more but does not move
+/// past `from` is an error, not a loop.
+fn next_handle_page(more: bool, from: u32, page: &[u32]) -> Result<Option<u32>> {
+    if !more {
+        return Ok(None);
+    }
+    match page.last() {
+        Some(&last) if last >= from && last < TPM2_PERSISTENT_LAST => Ok(Some(last + 1)),
+        _ => Err(Error::Tpm(format!(
+            "TPM reported more persistent handles after {from:#010x} but returned none past it"
+        ))),
+    }
+}
+
+/// Whether `public` has the shape of irlume's original SRK: RSA, our
+/// [`srk_template`] attributes, SHA-256 name hash, an empty authPolicy, and a
+/// 2048-bit key. A non-match means another stack's key is squatting our
+/// persistent handle (clevis / systemd-cryptenroll keys carry a non-empty
+/// authPolicy, and may be ECC), so it fails the comparison and we fall back to
+/// a transient SRK. A match is enough to use the key as a parent, not to
+/// destroy it ([`evict_persistent_srk`] derives the key to compare).
 fn is_irlume_srk(public: &Public) -> Result<bool> {
+    Ok(has_template_shape(public, &srk_template()?))
+}
+
+/// Whether `public` has `template`'s RSA attributes, name hash, authPolicy and
+/// key size. Another stack's key can have the same shape, so this picks a
+/// parent to use or a candidate to compare, never a key to destroy.
+fn has_template_shape(public: &Public, template: &Public) -> bool {
     let Public::Rsa {
         object_attributes,
         name_hashing_algorithm,
@@ -955,7 +1128,7 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
         ..
     } = public
     else {
-        return Ok(false);
+        return false;
     };
     let Public::Rsa {
         object_attributes: want_attrs,
@@ -963,19 +1136,19 @@ fn is_irlume_srk(public: &Public) -> Result<bool> {
         auth_policy: want_policy,
         parameters: want_params,
         ..
-    } = srk_template()?
+    } = template
     else {
-        return Ok(false);
+        return false;
     };
     // Compare key size, not the whole `parameters` struct: a TPM normalizes the
     // template's default RSA exponent (0) to 65537 on read-back, so a full
     // equality check would reject our OWN key and force the slow transient path
-    // on every call. Attributes + empty authPolicy + RSA-2048 is already an
-    // unambiguous signature.
-    Ok(*object_attributes == want_attrs
-        && *name_hashing_algorithm == want_hash
-        && *auth_policy == want_policy
-        && parameters.key_bits() == want_params.key_bits())
+    // on every call. Attributes, authPolicy and key size are enough to choose
+    // a parent; only a derivation tells whose key it is.
+    object_attributes == want_attrs
+        && name_hashing_algorithm == want_hash
+        && auth_policy == want_policy
+        && parameters.key_bits() == want_params.key_bits()
 }
 
 /// Get irlume's SRK, persisting it on first use.
@@ -3062,6 +3235,114 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// The TCG shared storage key template for RSA (Provisioning Guidance
+    /// 7.5.1, Table 1): what systemd's `tpm2_get_srk_template` builds for RSA,
+    /// and persists at 0x81000001 when that handle is empty and the TPM does
+    /// not support its ECC template (`tpm2_get_or_create_srk`).
+    fn tcg_shared_rsa_srk_template() -> Public {
+        storage_key_template(true, PublicKeyRsa::default()).expect("template")
+    }
+
+    /// Every irlume envelope so far is sealed under the key this template
+    /// derives, and CreatePrimary hashes the marshaled template into the
+    /// derivation, so its bytes must never change: RSA, SHA-256, fixedTPM,
+    /// fixedParent, sensitiveDataOrigin, userWithAuth, restricted and decrypt
+    /// (0x00030072), no noDA, an empty authPolicy, AES-128-CFB, a null scheme,
+    /// 2048 bits, the default exponent and an empty `unique`.
+    #[test]
+    fn the_original_storage_key_template_is_unchanged() {
+        let bytes = srk_template()
+            .expect("template")
+            .marshall()
+            .expect("marshal");
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "0001000b00030072000000060080004300100800000000000000");
+    }
+
+    /// ADR-0034 §3.1 and its 2026-10-15 amendment: the new template is the
+    /// original with noDA and irlume's label in `unique`, and nothing else.
+    /// Without the label it would be the TCG shared template, which has the
+    /// same shape: only a derivation, which hashes `unique` in, tells them
+    /// apart.
+    #[test]
+    fn the_da_exempt_template_is_the_original_with_no_da_and_irlumes_label() {
+        let original = srk_template().expect("template");
+        let exempt = da_exempt_srk_template().expect("template");
+        assert_eq!(
+            u32::from(exempt.object_attributes()),
+            u32::from(original.object_attributes()) | (1 << 10),
+            "the only attribute added is noDA (bit 10)"
+        );
+        let (
+            Public::Rsa {
+                name_hashing_algorithm: original_hash,
+                auth_policy: original_policy,
+                parameters: original_parameters,
+                ..
+            },
+            Public::Rsa {
+                name_hashing_algorithm,
+                auth_policy,
+                parameters,
+                unique,
+                ..
+            },
+        ) = (&original, &exempt)
+        else {
+            panic!("both storage keys are RSA");
+        };
+        assert_eq!(name_hashing_algorithm, original_hash);
+        assert_eq!(auth_policy, original_policy);
+        assert_eq!(parameters, original_parameters);
+        let mut label = DA_EXEMPT_SRK_LABEL.to_vec();
+        label.resize(256, 0);
+        assert_eq!(unique.value(), label.as_slice());
+
+        // The derivation input, pinned: the label decides the key, so a
+        // change here would leave every envelope under the new key behind.
+        let marshaled = exempt.marshall().expect("marshal");
+        assert_eq!(marshaled.len(), 282);
+        assert_eq!(
+            irlume_common::sha256_hex(&marshaled),
+            "a2d290239a5dccbd8d9b4a9982352741847f55939e559d3ffc3a00b282a11543"
+        );
+
+        let shared = tcg_shared_rsa_srk_template();
+        assert!(has_template_shape(&shared, &exempt));
+        assert_ne!(
+            shared.marshall().expect("marshal"),
+            marshaled,
+            "the label must make the template, and so the key, irlume's own"
+        );
+        assert!(
+            !is_irlume_srk(&exempt).expect("shape"),
+            "a DA-exempt key is never a parent for an envelope under the original key"
+        );
+    }
+
+    /// A handle scan asks again after the last handle of a page while the TPM
+    /// says more remain, and stops when it does not; a page that claims more
+    /// without moving on is an error, not an endless loop.
+    #[test]
+    fn a_persistent_handle_scan_pages_until_the_tpm_has_no_more() {
+        let first = TPM2_PERSISTENT_FIRST;
+        assert_eq!(
+            next_handle_page(false, first, &[]).expect("last page"),
+            None
+        );
+        assert_eq!(
+            next_handle_page(false, first, &[0x8100_0001]).expect("last page"),
+            None
+        );
+        assert_eq!(
+            next_handle_page(true, first, &[0x8100_0001, 0x8101_0002]).expect("next page"),
+            Some(0x8101_0003)
+        );
+        assert!(next_handle_page(true, first, &[]).is_err());
+        assert!(next_handle_page(true, 0x8101_0003, &[0x8100_0001]).is_err());
+        assert!(next_handle_page(true, first, &[TPM2_PERSISTENT_LAST]).is_err());
+    }
+
     #[test]
     fn property_words_read_as_trimmed_ascii() {
         assert_eq!(property_text(&[u32::from_be_bytes(*b"STM ")]), "STM");
@@ -3614,6 +3895,94 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             evict_persistent_srk().expect("post-cleanup probe"),
             SrkEviction::Absent
         );
+    }
+
+    /// Persists `object` at `handle` with an empty owner authorization and
+    /// flushes the transient copy.
+    fn persist_at(ctx: &mut Context, object: KeyHandle, handle: u32) {
+        let persistent = PersistentTpmHandle::new(handle).expect("handle");
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                object.into(),
+                Persistent::Persistent(persistent),
+            )
+        })
+        .expect("persist the fixture key");
+        let _ = ctx.flush_context(object.into());
+    }
+
+    /// Evicts whatever a fixture left at `handle`; a free handle is fine, and
+    /// is probed first so that esys logs no error for it (#601).
+    fn evict_fixture_at(handle: u32) {
+        let mut ctx = open_context().expect("context");
+        let persistent = PersistentTpmHandle::new(handle).expect("handle");
+        let wanted = TpmHandle::Persistent(persistent);
+        if !tpm_handle_exists(&mut ctx, TPM2_HR_PERSISTENT, wanted).expect("handle probe") {
+            return;
+        }
+        let Ok(object) = ctx.tr_from_tpm_public(wanted) else {
+            return;
+        };
+        let _ = ctx.execute_with_nullauth_session(|ctx| {
+            ctx.evict_control(
+                Provision::Owner,
+                ObjectHandle::from(ESYS_TR::from(object)),
+                Persistent::Persistent(persistent),
+            )
+        });
+    }
+
+    /// ADR-0034 §3 and its 2026-10-15 amendment: the DA-exempt key is found
+    /// at any owner handle and evicted, while another stack's TCG storage key
+    /// (systemd's RSA key at 0x81000001) and a key with irlume's DA-exempt
+    /// template but a random modulus stay. The label gives irlume a key of its
+    /// own, so the TCG key's modulus differs from irlume's.
+    #[test]
+    #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_only_irlumes_da_exempt_key_is_evicted() {
+        const SHARED: u32 = 0x8100_0001;
+        const OURS: u32 = 0x8101_0003;
+        const PLANTED: u32 = 0x8101_0004;
+        let exempt = da_exempt_srk_template().expect("template");
+        let mut ctx = open_context().expect("context");
+        let shared =
+            create_storage_key(&mut ctx, tcg_shared_rsa_srk_template()).expect("TCG storage key");
+        let (shared_public, _, _) = ctx.read_public(shared).expect("read the TCG key");
+        persist_at(&mut ctx, shared, SHARED);
+        let ours = create_storage_key(&mut ctx, exempt.clone()).expect("irlume's key");
+        let (ours_public, _, _) = ctx.read_public(ours).expect("read irlume's key");
+        persist_at(&mut ctx, ours, OURS);
+        let parent = create_srk(&mut ctx).expect("transient parent");
+        let planted = ctx
+            .execute_with_nullauth_session(|ctx| {
+                let created = ctx.create(parent, exempt, None, None, None, None)?;
+                ctx.load(parent, created.out_private, created.out_public)
+            })
+            .expect("planted key");
+        persist_at(&mut ctx, planted, PLANTED);
+        let _ = ctx.flush_context(parent.into());
+        drop(ctx);
+
+        let first = evict_da_exempt_srks();
+        let second = evict_da_exempt_srks();
+        let left = open_context().and_then(|mut ctx| persistent_handles(&mut ctx));
+        for handle in [SHARED, OURS, PLANTED] {
+            evict_fixture_at(handle);
+        }
+
+        assert_ne!(
+            rsa_modulus(&shared_public),
+            rsa_modulus(&ours_public),
+            "the TCG template and irlume's must derive different keys"
+        );
+        assert_eq!(first.expect("first scan"), vec![OURS]);
+        assert_eq!(second.expect("second scan"), Vec::<u32>::new());
+        let left = left.expect("handle scan");
+        assert!(left.contains(&SHARED), "another stack's key stays");
+        assert!(left.contains(&PLANTED), "a key with another modulus stays");
+        assert!(!left.contains(&OURS));
     }
 
     /// Our SRK template with a non-empty authPolicy, as another stack's

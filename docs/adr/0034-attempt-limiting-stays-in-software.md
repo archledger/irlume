@@ -372,7 +372,11 @@ today, and doctor says so (section 4).
    recorded name, else derives the template whose key has that name (old
    or new), checks the name, persists it by the rule of section 3.2, and
    moves the envelope. An authentication uses only a key whose name
-   matches and never derives one. This extends the
+   matches. It never derives the new key and never recovers a parent by
+   name, which happens only at irlumed's start; it derives the old key per
+   call only where the section 3.2 fallback applies (no persisted irlume
+   key), as `load_or_create_srk` does today when another stack's key holds
+   the handle ("a read-only unseal takes this path too"). This extends the
    record #1073 proposes, the persisted key's TPM name kept once per host,
    to every envelope. An envelope under the old key moves at the points
    where envelopes already move to a stronger policy: the template key at
@@ -438,15 +442,25 @@ reply (an older daemon's reply reads as unknown):
 - whether the storage key irlume seals under is DA-exempt, and, when the
   new key could not be persisted (section 3.2), why.
 
-Readings, the first that applies:
+Readings, the first that applies. A Pass or Info reading counts in neither
+doctor's closing summary nor the `doctor --check` exit code (0 clean, 1
+warnings only, 2 any failure; `doctor_report.rs` `Summary`), so every
+reading that needs action is a warning:
 
 - **Unknown:** no TPM, the daemon could not read it, or an older daemon.
-- **Warn:** in lockout while any irlume envelope is still under the old key:
-  face login and fingerprint keyring unlock use the password until the
-  lockout ends, one lockout interval of powered-on time after the last
-  failure.
+- **Warn:** in lockout while some irlume envelopes are still under the old
+  key. The detail names each account and envelope kind still under the old
+  key and what the lockout blocks for it until it ends, one lockout
+  interval of powered-on time after the last failure: a template key,
+  that account's face login; a keyring secret, that account's credential
+  release after a face or fingerprint login. Envelopes already on the new
+  key are not named, since the lockout does not block them.
 - **Warn:** in lockout with every envelope on the new key: irlume is not
   affected, but disk unlock PINs and other TPM PIN users on this machine are.
+- **Warn:** not in lockout, but the new key could not be persisted
+  (section 3.2), so the envelopes named stay on the old key and the next
+  lockout would block them; the detail gives the refusal (for example
+  `TPM_RC_NV_SPACE`, or no free owner handle).
 - **Info:** a lockout authorization is not set, so any process that can open
   the TPM can reset the lockout or change its parameters. This describes the
   machine, not irlume, which does not rely on it.
@@ -538,7 +552,10 @@ so that only an administrator can reset a lockout.
   `VisibleNotDurable` result is reported as visible, not as a failure. An
   envelope that no longer unseals keeps the old key reported as needed.
   With an envelope under the old key, irlumed's start persists the new
-  key, and no login derives a key.
+  key. No login or authentication derives the new key or recovers a parent
+  by name; with no persisted irlume key (the section 3.2 fallback), an
+  authentication of an envelope under the old key still succeeds through
+  today's per-call derivation of the old key.
 - With the preferred handle held by another stack's key, the new key is
   persisted at the next free owner handle and found there again after a
   restart through the recorded handle. A power loss after
@@ -580,9 +597,13 @@ so that only an administrator can reset a lockout.
   copy of the state directory opens at irlumed's next start, which derives
   and persists the old key again and moves the envelope, with no recovery
   step (swtpm).
-- `tpm-lockout` readings for pass, both warnings, info and unknown come from
-  synthetic capability values; a `TpmReadiness` reply without the new field
-  parses and reads unknown; the CLI never opens the TPM for it.
+- `tpm-lockout` readings for pass, the three warnings, info and unknown come
+  from synthetic capability values. The lockout warning names only the
+  accounts and envelope kinds still under the old key (a template key
+  alone names face login, a keyring secret alone names credential
+  release); a refused persist without a lockout is a warning, so `doctor
+  --check` exits 1. A `TpmReadiness` reply without the new field parses
+  and reads unknown; the CLI never opens the TPM for it.
 - No non-test code calls `Esys_DictionaryAttackLockReset` or
   `Esys_DictionaryAttackParameters` (the pinned tss-esapi has no safe
   wrapper for either), `nv_increment`, or `nv_define_space` with

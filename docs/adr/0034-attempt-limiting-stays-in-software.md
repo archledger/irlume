@@ -291,9 +291,14 @@ sends no `TPM2_DictionaryAttackLockReset` or
 `TPM2_DictionaryAttackParameters` (the pinned tss-esapi has no wrapper for
 either, so a call would go through raw `Esys_` bindings), defines no NV
 counter, and never asks for, stores or derives `lockoutAuth`. irlume
-therefore never spends the budget that disk unlock PINs and Windows Hello
-depend on: none of its authorizations checks a secret that can be wrong.
-A DA failure elsewhere on the machine stops touching irlume once its
+never causes an authorization failure in the budget that disk unlock PINs
+and Windows Hello depend on: none of its authorizations checks a secret
+that can be wrong. Under the new key it also uses no DA-protected object.
+While envelopes or seals still use the old key it does, so on a TPM that
+implements the 16.8.6 note's alternative a non-orderly shutdown after that
+use counts one failure; under the clause's base rule a non-orderly startup
+counts one whatever irlume did. A DA failure elsewhere on the machine
+stops touching irlume once its
 envelopes are on the new key. While the section 3.2 fallback keeps an
 envelope, or new seals, on the old key, a lockout still blocks them, as
 today, and doctor says so (section 4).
@@ -415,9 +420,16 @@ today, and doctor says so (section 4).
    and keeps the key. Evicting it then uses the daemon request #1073
    proposes for a key with the ROCA fingerprint (item 2: a root-only
    request on the worker that checks the key is still irlume's, as
-   `evict_persistent_srk` does), extended to the old key, with the
-   uninstall path's rule: exact identity by derived modulus, never a shape
-   match. Uninstall evicts both keys under that rule.
+   `evict_persistent_srk` does), extended to the old key, with exact
+   identity, never a shape match: either today's derivation of the old
+   template gives the same modulus (the uninstall path's rule), or the
+   key's TPM name equals the one irlumed recorded in its state file while
+   that derivation still matched. Phase 2 records it at the first start
+   that verifies the old key by derivation, the record #1073 proposes, so a
+   firmware update that changes derivation between Phase 2 and Phase 3 does
+   not strand the old key's handle. An old key that no longer matches when
+   Phase 2 first runs is not recorded and keeps the #1079 manual path.
+   Uninstall evicts both keys under that rule.
 
    Eviction frees a persistent handle; it does not destroy the key. The old
    template derives the same key bit for bit on the same TPM (`tpm.rs`:
@@ -588,7 +600,9 @@ so that only an administrator can reset a lockout.
   refuses (`TPM_RC_NV_SPACE` on swtpm once its capacity is used) or no
   owner handle is free, new seals and moves stay on the persisted old key,
   no envelope is written under a transiently derived key while a persisted
-  irlume key exists, and the next start tries again. With neither key
+  irlume key exists, and the first start in a later boot, or a start that
+  reads `TPM_PT_HR_PERSISTENT_AVAIL` of at least 1, tries again. With
+  neither key
   persisted (another stack's key on the old key's handle and the new key
   refused), enrollment and keyring seals still succeed through today's
   per-call derivation of the old key, nothing moves, doctor reports it,
@@ -608,6 +622,12 @@ so that only an administrator can reset a lockout.
   override in the platform range (0x81800000 to 0x81FFFFFF), outside the
   persistent range, or that does not parse as hex is refused and logged,
   and new seals stay on the old key.
+- Phase 2 records the old key's TPM name at the first start whose
+  derivation matches it. Phase 3 and uninstall evict a key at the old
+  handle that matches either today's derivation or that recorded name,
+  and never one that matches neither. The test stands in for a derivation
+  change with a key at the old handle that today's derivation does not
+  reproduce but whose name was recorded.
 - Phase 3, under #1073: a move whose write reports
   `AtomicWrite::VisibleNotDurable` keeps the old key needed; with every move
   durable, the old key is not evicted in the boot that made the last move,

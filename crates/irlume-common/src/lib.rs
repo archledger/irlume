@@ -16,6 +16,7 @@ pub mod client;
 pub mod config;
 pub mod dbglog;
 pub mod diagnostics;
+pub mod event_log;
 pub mod gkr_wire;
 pub mod journal_out;
 pub mod live;

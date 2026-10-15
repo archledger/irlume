@@ -329,6 +329,17 @@ fn signer_names_in(data: &[u8], known: &[KnownCertificate]) -> Vec<String> {
         .collect()
 }
 
+/// The name of the Microsoft Secure Boot certificate `certificate` (DER, with
+/// any bytes after the encoding ignored) is, by its hash.
+pub fn microsoft_certificate(certificate: &[u8]) -> Option<&'static str> {
+    use sha2::Digest as _;
+    let digest: [u8; 32] = sha2::Sha256::digest(der_encoding(certificate)?).into();
+    MICROSOFT_CERTIFICATES
+        .iter()
+        .find(|k| k.der == digest)
+        .map(|k| k.name)
+}
+
 /// The DER encoding an X.509 entry starts with, without any bytes after it.
 fn der_encoding(entry: &[u8]) -> Option<&[u8]> {
     let (_, _, rest) = der_element(entry)?;
@@ -651,6 +662,16 @@ mod tests {
         assert!(signer_names_in(&[], &known).is_empty());
         // Microsoft's own table names none of these synthetic certificates.
         assert!(signer_names_in(&data, &MICROSOFT_CERTIFICATES).is_empty());
+    }
+
+    #[test]
+    fn microsoft_certificate_names_only_microsofts_certificates() {
+        assert_eq!(
+            microsoft_certificate(&certificate("Microsoft UEFI CA 2023")),
+            None
+        );
+        assert_eq!(microsoft_certificate(&[0xff; 10]), None);
+        assert_eq!(microsoft_certificate(&[]), None);
     }
 
     /// Every name the rollover uses is in the table once, no two entries

@@ -593,6 +593,7 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
         "secure-boot",
         "secure-boot-certificates",
         "shim-validation",
+        "pcr7-binding",
         "boot-mode",
         "signed-pcr-policy",
         "pcrlock",

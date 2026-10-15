@@ -851,13 +851,13 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, PCR-signature, and UVC-illumination parsers
+      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, and event-log parsers
         working-directory: fuzz
         run: |
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
-          for t in ipc_request pcr_signature sealed_envelope uvc_illumination; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true

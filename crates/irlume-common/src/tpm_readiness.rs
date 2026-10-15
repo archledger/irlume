@@ -86,7 +86,49 @@ pub enum StorageKeyCheck {
     /// vulnerable Infineon library, whatever the firmware is now, and stays
     /// weak until it is regenerated. `handle` is the persistent handle it was
     /// read at: irlumed's `IRLUME_SRK_HANDLE`, `0x81010002` by default.
-    RocaFingerprint { handle: u32 },
+    /// `derived` compares it with the key irlume's template derives today:
+    /// irlume seals under a key with its template either way, but one it did
+    /// not derive may have been placed by another tool. `None` when the
+    /// comparison could not be made (deriving failed, or a daemon from before
+    /// the field answered), which the eviction advice treats like
+    /// [`DerivedKey::Other`].
+    RocaFingerprint {
+        handle: u32,
+        #[serde(default)]
+        derived: Option<DerivedKey>,
+    },
+}
+
+/// How a persisted storage key with the ROCA fingerprint compares with the key
+/// irlume's template derives from the same seed today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DerivedKey {
+    /// The same key: irlume derived it, and the firmware still generates keys
+    /// with the fingerprint.
+    Same,
+    /// Another key, without the fingerprint: what the TPM derives once a
+    /// firmware update has fixed its key generation (the TPM 2.0 library spec
+    /// lets a field upgrade change a primary key), so the persisted key most
+    /// likely dates from before that update. Another tool may also have
+    /// placed it.
+    Unaffected,
+    /// Another key that also carries the fingerprint: the firmware still
+    /// generates affected keys and this is not irlume's, so another tool may
+    /// have placed it.
+    Other,
+}
+
+impl DerivedKey {
+    /// Compare the moduli of the persisted key and the key derived today.
+    pub fn compare(persisted: &[u8], derived: &[u8]) -> Self {
+        if persisted == derived {
+            Self::Same
+        } else if roca_fingerprint(derived) {
+            Self::Other
+        } else {
+            Self::Unaffected
+        }
+    }
 }
 
 /// The primes of the ROCA fingerprint test (Nemec et al., CCS 2017; the
@@ -167,6 +209,15 @@ mod tests {
         let mut one = vec![0u8; 256];
         one[255] = 1;
         assert!(roca_fingerprint(&one));
+
+        // A key the TPM still derives is irlume's; another one is what a
+        // fixed firmware derives only when it lacks the fingerprint.
+        assert_eq!(DerivedKey::compare(&flagged, &flagged), DerivedKey::Same);
+        assert_eq!(
+            DerivedKey::compare(&flagged, &clean),
+            DerivedKey::Unaffected
+        );
+        assert_eq!(DerivedKey::compare(&flagged, &one), DerivedKey::Other);
     }
 
     fn identity(manufacturer: &str, firmware: (u16, u16)) -> TpmIdentity {

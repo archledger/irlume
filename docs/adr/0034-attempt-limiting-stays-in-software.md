@@ -242,28 +242,37 @@ budget that disk unlock PINs and Windows Hello depend on.
    and empty authPolicy. These are the TCG storage-key attributes for RSA.
    The algorithm does not change here; an ECC storage key is a separate
    decision and would reuse this migration.
-2. **Handle.** The new key is persisted next to the old key's handle, so
-   both can exist during the migration: 0x81010003 by default; with an
+2. **Handle.** The new key is persisted at a handle of its own, so both
+   keys can exist during the migration. The preferred handle is the one
+   next to the old key's: 0x81010003 by default; with an
    `IRLUME_SRK_HANDLE` override, which keeps naming the old key's handle,
    the handle after it, or the one before it for an override at the top of
-   the owner persistent range (0x817FFFFF), so the new key's handle always
-   stays in 0x81000000 to 0x817FFFFF. If that handle holds another stack's
-   key, the new key is derived transiently for each call, as the old one is
-   today when its handle is taken. irlume keeps its own handles rather than
-   the shared 0x81000001: systemd puts an ECC key there when the TPM
+   the owner persistent range (0x817FFFFF). When another stack's key holds
+   the preferred handle, irlumed takes the first free handle above it,
+   wrapping within 0x81000000 to 0x817FFFFF, so the new key's handle never
+   leaves the owner range. It records the chosen handle in a root-only
+   state file under `/var/lib/irlume`, which later starts read first. When
+   no owner handle is free, new seals stay on the persisted old key and
+   nothing moves: an envelope is never written under a transiently derived
+   key while a persisted key exists, since deriving one per call takes
+   longer than the PAM client allows. irlume keeps its own handles rather
+   than the shared 0x81000001: systemd puts an ECC key there when the TPM
    supports one (`tpm2_get_best_srk_template`), and it is another stack's
-   to manage.
-   Deriving an RSA-2048 primary takes more than 10 seconds on slow firmware
-   TPMs (`load_or_create_srk`), so irlumed derives and persists the new key
-   when it starts and finds an envelope under the old key, and no login pays
-   for it. Recognizing a key as irlume's (`is_irlume_srk`,
-   `derives_from_srk_template`, the doctor's storage-key check of #1079)
-   knows both templates; the old one is accepted for loading only.
-3. **Envelopes.** New seals use the new key. A sealed envelope records which
-   key it was sealed under, in a new optional field that older releases
-   ignore, so a load goes straight to the right parent; an envelope without
-   the field is under the old key. An envelope under the old key moves at the
-   points where envelopes already move to a stronger policy: the template
+   to manage. Deriving an RSA-2048 primary takes more than 10 seconds on
+   slow firmware TPMs (`load_or_create_srk`), so irlumed derives and
+   persists the new key when it starts and finds an envelope under the old
+   key, and no login pays for it. Recognizing a key as irlume's
+   (`is_irlume_srk`, `derives_from_srk_template`, the doctor's storage-key
+   check of #1079) knows both templates; the old one is accepted for
+   loading only.
+3. **Envelopes.** New seals use the new key once it is persisted. A sealed
+   envelope records the handle and TPM name of the key it was sealed under,
+   in a new optional field that older releases ignore (the provenance
+   record #1073 asks for), so a load goes straight to the right parent and
+   checks that the key there is the one it was sealed under; an envelope
+   without the field is under the old key. An envelope under the old key
+   moves at the points where envelopes already move to a stronger policy:
+   the template
    key when irlumed starts (`move_best_effort` in `template_key.rs`, never
    inside an authentication request, ADR-0025), and a keyring secret at the
    next verified password login (`keyring::reseal_password`). Being under the
@@ -283,6 +292,18 @@ budget that disk unlock PINs and Windows Hello depend on.
    eviction tracked in #1073, with the uninstall path's rule: exact identity
    by derived modulus, never a shape match. Uninstall evicts both keys
    under that rule.
+
+   Eviction frees a persistent handle; it does not destroy the key. The old
+   template derives the same key bit for bit on the same TPM (`tpm.rs`:
+   deriving it "also opens one sealed under a persistent SRK that has since
+   been evicted"), so an envelope under the old key that comes back after
+   the eviction, from an older copy of the state directory (Context) or a
+   restored backup, still opens. irlumed's start, finding such an envelope
+   and no persisted old key, derives the old key once, persists it again by
+   the rule of section 3.2, and moves the envelope; no recovery passphrase
+   or re-enrollment is needed. Only what would orphan any envelope today
+   orphans it: a cleared TPM, or a firmware update that changes how the TPM
+   derives keys (the ROCA case of #1079).
 
 ### 4. doctor reports the TPM lockout
 
@@ -339,8 +360,9 @@ so that only an administrator can reset a lockout.
   new key. Until an envelope moves, a lockout still stops it, as today.
 - The migration costs one storage key derivation per host (more than 10
   seconds on slow firmware TPMs, paid once at irlumed's first start after
-  the upgrade), one more persistent handle while both keys exist, and one
-  rewrite of each envelope.
+  the upgrade), one more persistent handle while both keys exist, one
+  root-only state file naming the new key's handle, and one rewrite of
+  each envelope.
 - A downgrade to a release before section 3 cannot open an envelope already
   moved: the keyring secret reseals under the old key at the next password
   login, and the template key needs `irlume recovery restore` or a
@@ -375,9 +397,14 @@ so that only an administrator can reset a lockout.
 - A move that fails its round trip leaves the old envelope in place and
   loadable; an envelope that no longer unseals keeps the old key reported
   as needed. With an envelope under the old key, irlumed's start persists
-  the new key; with the new key's handle taken by another stack's key, a
-  password login leaves the keyring envelope under the old key and derives
-  nothing.
+  the new key, and no login derives a key.
+- With the preferred handle held by another stack's key, the new key is
+  persisted at the next free owner handle and found there again after a
+  restart through the recorded handle; with no owner handle free, new
+  seals and moves stay on the persisted old key, and no envelope is ever
+  written under a transiently derived key.
+- An envelope records its parent's handle and TPM name; a load that finds
+  another key at that handle refuses it, as for a foreign key today.
 - `is_irlume_srk`, `derives_from_srk_template`, `evict_persistent_srk` and
   the doctor storage-key check (#1079) recognize both templates; a key
   matching neither stays foreign.
@@ -389,6 +416,10 @@ so that only an administrator can reset a lockout.
   durable, the old key is not evicted in the boot that made the last move,
   only after a scan in a later boot finds no envelope naming it; an envelope
   under the old key restored by a simulated power loss keeps the old key.
+  After the eviction, an envelope under the old key restored from an older
+  copy of the state directory opens at irlumed's next start, which derives
+  and persists the old key again and moves the envelope, with no recovery
+  step (swtpm).
 - `tpm-lockout` readings for pass, both warnings, info and unknown come from
   synthetic capability values; a `TpmReadiness` reply without the new field
   parses and reads unknown; the CLI never opens the TPM for it.

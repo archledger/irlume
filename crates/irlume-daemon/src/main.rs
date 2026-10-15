@@ -4916,6 +4916,15 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
             camera: NoCapture,
         },
+        // Reads the TPM's identity, its SHA-256 bank and irlume's storage key.
+        TpmReadiness => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "TPM readiness",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
         SplitStatus => RequestPosture {
             user: None,
             privilege: RootOnly {
@@ -5986,6 +5995,27 @@ fn cached_enrollment_summary(user: &str) -> Option<EnrollmentSummary> {
         .unwrap_or_else(|e| e.into_inner())
         .get(user)
         .cloned()
+}
+
+/// What this daemon reads about its TPM for `irlume doctor` (`TpmReadiness`),
+/// with its own TPM and PCR settings, from the worker that serializes TPM use.
+fn tpm_readiness_report() -> Response {
+    // An explicit transport (`IRLUME_TCTI`, swtpm or a device elsewhere) is
+    // tried even with no standard device node; the reads say what failed.
+    if std::env::var_os("IRLUME_TCTI").is_none() && !irlume_core::template_key::tpm_available() {
+        let none = "no TPM device".to_owned();
+        return Response::TpmReadiness {
+            identity: Err(none.clone()),
+            pcr_bank: Err(none.clone()),
+            storage_key: Err(none),
+        };
+    }
+    let text = |e: irlume_common::Error| e.to_string();
+    Response::TpmReadiness {
+        identity: irlume_core::tpm::tpm_identity().map_err(text),
+        pcr_bank: irlume_core::tpm::pcr_bank_readiness().map_err(text),
+        storage_key: irlume_core::tpm::storage_key_check().map_err(text),
+    }
 }
 
 /// The account whose published summary may no longer describe the enrollment
@@ -7512,6 +7542,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | FaceSensorStatus { .. }
         | PreferencesStatus
         | SealedStorage
+        | TpmReadiness
         | LastAttempts { .. }
         | ListProfiles { .. }
         | DeleteProfile { .. }
@@ -9206,6 +9237,7 @@ fn dispatch_after_authorization(
                 sensor_preflight_with(policy, || engine.ir_only_preflight_details(&user)),
             )
         }
+        Request::TpmReadiness => tpm_readiness_report(),
         Request::KeyringInfo { user } => keyring_info(&user, |env| {
             irlume_core::tpm::diagnose_pcrs(env)
                 .ok()
@@ -13731,6 +13763,7 @@ mod tests {
         IdentifyFor => Request::IdentifyFor { user: u() },
         PreferencesStatus => Request::PreferencesStatus,
         SealedStorage => Request::SealedStorage,
+        TpmReadiness => Request::TpmReadiness,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },
@@ -13881,6 +13914,34 @@ mod tests {
                 name,
                 "the sample catalogued as {name} builds a different variant"
             );
+        }
+    }
+
+    /// `irlume doctor` gets the TPM readiness report from root only, and a
+    /// host without a TPM device answers it with every part unread.
+    #[test]
+    fn the_tpm_readiness_report_is_root_only_and_reads_no_absent_tpm() {
+        let _passwd = passwd_lock();
+        match pregate(&Request::TpmReadiness, &peer(1000)) {
+            Some(Response::Error(error)) => {
+                assert_eq!(error, "TPM readiness requires root (peer uid 1000)");
+            }
+            other => panic!("a non-root peer is refused: {other:?}"),
+        }
+        assert!(pregate(&Request::TpmReadiness, &peer(0)).is_none());
+        if std::env::var_os("IRLUME_TCTI").is_none() && !irlume_core::template_key::tpm_available()
+        {
+            let Response::TpmReadiness {
+                identity,
+                pcr_bank,
+                storage_key,
+            } = tpm_readiness_report()
+            else {
+                panic!("a TpmReadiness reply");
+            };
+            assert_eq!(identity, Err("no TPM device".into()));
+            assert_eq!(pcr_bank, Err("no TPM device".into()));
+            assert_eq!(storage_key, Err("no TPM device".into()));
         }
     }
 
@@ -16431,6 +16492,8 @@ mod tests {
         // one command at a time, so it serves from the worker with the
         // other TPM users, not from a connection thread.
         assert_eq!(classify(&Request::KeyringInfo { user: u() }), Class::Plain);
+        // So does the TPM readiness report doctor asks for.
+        assert_eq!(classify(&Request::TpmReadiness), Class::Plain);
         for req in [
             Request::CaptureEarMedian { user: u() },
             Request::SetClosureCalibration {

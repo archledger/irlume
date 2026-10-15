@@ -7,6 +7,28 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` reports three TPM and Secure Boot checks.
+  - `secure-boot-certificates` says whether Microsoft's 2023 Secure Boot
+    certificates replace the 2011 ones, which expire in 2026. Enrolling them,
+    for example with `fwupdmgr update` (fwupd 2.0.8 or later) or a firmware
+    update, changes PCR 7. Until then the check warns that a seal bound to
+    PCR 7 will stop opening, and to set a recovery passphrase first. A KEK
+    held as a bare RSA key is recognized by Microsoft's published key, and a
+    machine with only the 2023 certificates counts as updated.
+  - `tpm-firmware` names the TPM's maker and firmware version. It warns for an
+    Infineon version listed under CVE-2017-15361 (ROCA), since irlume's
+    storage key is an RSA key the TPM generated, and whenever that key
+    carries the ROCA fingerprint, which a later firmware update does not
+    remove. It notes a version listed under CVE-2019-16863 (TPM-FAIL), which
+    affects signing irlume does not do.
+  - `tpm-pcr-bank` fails when the SHA-256 PCR bank has no value for a PCR
+    irlumed is configured for, since sealing then refuses, and warns when a
+    firmware-measured PCR was never extended.
+
+  The TPM checks come from irlumed's new root-only `TpmReadiness` request,
+  answered from its worker with its own settings; the CLI never opens the
+  TPM. The Secure Boot check reads efivarfs.
+
 - Attested YUYV-only IR cameras, such as the ThinkPad T480's (5986:1141),
   can now release credentials as the IR side of a split pair under the
   experimental opt-in: a burst gets a clipping ceiling of 235 on raw luma

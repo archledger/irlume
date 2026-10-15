@@ -35,6 +35,7 @@ pub mod split_wire;
 #[cfg(test)]
 mod guarded_split_wire_tests;
 pub mod storage_encryption;
+pub mod tpm_readiness;
 
 pub use storage_encryption::StorageDirectory;
 
@@ -965,6 +966,12 @@ pub enum Request {
     /// installed system without reading account data or opening the TPM.
     /// Unprivileged: any local peer. An older daemon answers `Error("bad request")`.
     SealedStorage,
+    /// What irlumed reads about its TPM for `irlume doctor`: identity and
+    /// firmware, whether the SHA-256 bank can carry a seal over the PCRs the
+    /// daemon is configured for, and whether irlume's storage key carries the
+    /// ROCA fingerprint. Read-only; answered from the worker with the other
+    /// TPM users. Root only. An older daemon answers `Error("bad request")`.
+    TpmReadiness,
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
     /// sibling of `HasSealedPassword` for status surfaces (the envelope file
@@ -2164,6 +2171,13 @@ pub enum Response {
         template_key: StorageDirectory,
         system: Vec<StorageDirectory>,
     },
+    /// Reply to [`Request::TpmReadiness`]. Each part is what was read, or why
+    /// it could not be.
+    TpmReadiness {
+        identity: std::result::Result<tpm_readiness::TpmIdentity, String>,
+        pcr_bank: std::result::Result<tpm_readiness::PcrBankReadiness, String>,
+        storage_key: std::result::Result<tpm_readiness::StorageKeyCheck, String>,
+    },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
     /// Outcome of a `ResealPassword`. `changed` is true when the envelope was
@@ -2873,6 +2887,34 @@ mod tests {
         let back: super::CameraGroupProfileSummary =
             serde_json::from_value(serde_json::to_value(&group).unwrap()).unwrap();
         assert_eq!(back, group);
+    }
+
+    #[test]
+    fn tpm_readiness_round_trips_each_reading_or_its_reason() {
+        let wire = r#""TpmReadiness""#;
+        let request = serde_json::from_str::<super::Request>(wire).expect("a request of its own");
+        assert_eq!(serde_json::to_string(&request).unwrap(), wire);
+        let reply = serde_json::json!({"TpmReadiness": {
+            "identity": {"Ok": {"manufacturer": "STM", "vendor": "ST33TPHF2XSPI", "firmware": [1, 769]}},
+            "pcr_bank": {"Ok": {"Missing": [7]}},
+            "storage_key": {"Err": "no TPM device"}
+        }});
+        let parsed = serde_json::from_value::<Response>(reply.clone()).expect("the reply decodes");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), reply);
+        let Response::TpmReadiness {
+            identity,
+            pcr_bank,
+            storage_key,
+        } = parsed
+        else {
+            panic!("a TpmReadiness reply");
+        };
+        assert_eq!(identity.unwrap().firmware, (1, 769));
+        assert_eq!(
+            pcr_bank,
+            Ok(tpm_readiness::PcrBankReadiness::Missing(vec![7]))
+        );
+        assert_eq!(storage_key, Err("no TPM device".to_owned()));
     }
 
     #[test]

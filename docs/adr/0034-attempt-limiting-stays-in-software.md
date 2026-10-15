@@ -335,8 +335,12 @@ today, and doctor says so (section 4).
    `TPM2_EvictControl` whenever a free owner handle exists. Only when that
    refuses (for example `TPM_RC_NV_SPACE`, seen on swtpm once the property
    reached 0) or no owner handle is free do new seals stay on the persisted
-   old key, with nothing moving; irlumed retries at its next start, and
-   doctor reports it. Deriving an RSA-2048 primary takes more than 10
+   old key, with nothing moving, and doctor reports it. Each attempt
+   derives the new key first, so after a refusal irlumed records it with
+   the boot ID in its state file and tries again only at its first start
+   in a later boot, or sooner when `TPM_PT_HR_PERSISTENT_AVAIL` reads at
+   least 1, which guarantees room; a daemon restart within the same boot
+   pays no derivation. Deriving an RSA-2048 primary takes more than 10
    seconds on slow firmware TPMs (`load_or_create_srk`), which would
    consume most of the authentication window (about 15 seconds at login, 10
    at `sudo` and polkit prompts, `irlume-auth`) on every authentication. So
@@ -370,8 +374,12 @@ today, and doctor says so (section 4).
    eviction freed. When the key at the recorded handle is absent or has
    another name, irlumed's start looks for a persisted key with the
    recorded name, else derives the template whose key has that name (old
-   or new), checks the name, persists it by the rule of section 3.2, and
-   moves the envelope. An authentication uses only a key whose name
+   or new) and checks the name. An envelope under the old key then moves
+   straight to the new key through that transient old key when the new key
+   is persisted, and nothing is persisted for the old one; otherwise the
+   derived key is persisted by the rule of section 3.2 and an old-key
+   envelope moves once the new key can be. An authentication uses only a
+   key whose name
    matches. It never derives the new key and never recovers a parent by
    name, which happens only at irlumed's start; it derives the old key per
    call only where the section 3.2 fallback applies (no persisted irlume
@@ -417,18 +425,29 @@ today, and doctor says so (section 4).
    been evicted"), so an envelope under the old key that comes back after
    the eviction, from an older copy of the state directory (Context) or a
    restored backup, still opens. irlumed's start, finding such an envelope
-   and no persisted old key, derives the old key once, persists it again by
-   the rule of section 3.2, and moves the envelope; no recovery passphrase
-   or re-enrollment is needed. Where the TPM has no room to persist it,
-   the envelope stays loadable through today's per-call derivation of the
-   old key and moves once a key can be persisted. Eviction adds one
-   exposure that a persisted key does not have: today a firmware update
-   that changes how the TPM derives keys (the ROCA case of #1079) leaves
-   the persisted key, and so its envelopes, usable; once the old key is
-   evicted, such an update makes it impossible to re-derive, and an
-   envelope under it that comes back afterwards needs `irlume recovery
-   restore` or a re-enrollment, as after a cleared TPM. Phase 3 therefore
-   states it in the eviction's log line and in doctor.
+   and no persisted old key, derives the old key once and moves the
+   envelope through it to the persisted new key, persisting nothing for
+   the old key (section 3.3); no recovery passphrase or re-enrollment is
+   needed. Only when the new key is not persisted either does it persist
+   the old key again by the rule of section 3.2, or, without room, leave
+   the envelope to today's per-call derivation (no persisted irlume key)
+   until a key can be persisted.
+
+   Eviction adds exposures that a persisted key does not have, because a
+   returning old-key envelope then depends on re-deriving the old key:
+   - a firmware update that changes how the TPM derives keys (the ROCA case
+     of #1079): today it leaves the persisted key, and so its envelopes,
+     usable; after the eviction the old key no longer re-derives;
+   - an owner authorization set after the eviction, by another operating
+     system or a provisioning tool: irlume derives and persists its keys
+     with an empty owner authorization (`create_srk` and both
+     `evict_control` calls use a null-auth session on the owner
+     hierarchy), so it can then neither re-derive the old key nor persist a
+     new one.
+
+   In either case an old-key envelope that comes back afterwards needs
+   `irlume recovery restore` or a re-enrollment, as after a cleared TPM.
+   Phase 3 states both in the eviction's log line and in doctor.
 
 ### 4. doctor reports the TPM lockout
 
@@ -502,11 +521,12 @@ so that only an administrator can reset a lockout.
 - No change to how many face attempts an account gets, or when they reset.
 - irlume keeps working through a TPM lockout once its envelopes are on the
   new key. Until an envelope moves, a lockout still stops it, as today.
-- The migration costs one storage key derivation per host (more than 10
-  seconds on slow firmware TPMs, paid once at irlumed's first start after
-  the upgrade), one more persistent handle while both keys exist, one
-  root-only state file naming the new key's handle, and one rewrite of
-  each envelope.
+- The migration costs one storage key derivation per host when the new
+  key persists (more than 10 seconds on slow firmware TPMs, at irlumed's
+  first start after the upgrade), and while the TPM refuses to persist it,
+  one derivation at most per boot (section 3.2); one more persistent
+  handle while both keys exist; one root-only state file naming the new
+  key's handle and any refusal; and one rewrite of each envelope.
 - A downgrade to a release before section 3 cannot open an envelope already
   moved: the keyring secret reseals under the old key at the next login
   that runs pam_irlume's `reseal` line, and the template key needs
@@ -594,9 +614,18 @@ so that only an administrator can reset a lockout.
   only after a scan in a later boot finds no envelope naming it; an envelope
   under the old key restored by a simulated power loss keeps the old key.
   After the eviction, an envelope under the old key restored from an older
-  copy of the state directory opens at irlumed's next start, which derives
-  and persists the old key again and moves the envelope, with no recovery
-  step (swtpm).
+  copy of the state directory, with another stack's key on the old handle
+  and no room to persist anything, is moved at irlumed's next start
+  through a transient old key to the persisted new key, persisting nothing
+  for the old key, with no recovery step (swtpm); an authentication before
+  that start does not derive it. With an owner authorization set after
+  the eviction (`tpm2_changeauth -c o` on swtpm), the same restored
+  envelope is reported by doctor and the start log as needing `irlume
+  recovery restore` or a re-enrollment.
+- A refused persist of the new key is recorded with the boot ID: a daemon
+  restart in the same boot derives nothing; the first start in a later
+  boot, or a start that reads `TPM_PT_HR_PERSISTENT_AVAIL` of at least 1,
+  derives and tries again.
 - `tpm-lockout` readings for pass, the three warnings, info and unknown come
   from synthetic capability values. The lockout warning names only the
   accounts and envelope kinds still under the old key (a template key

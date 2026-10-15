@@ -175,6 +175,7 @@ an older retry record but cannot otherwise control the running system:
 | Root on the running system | Can delete records, read daemon memory, or unseal directly (PCR policy, no authValue). | Nothing: root needs no face attempts. |
 | Physical access, state on full-disk encryption unlocked by a passphrase or PIN | Cannot read or rewrite the record offline; restoring an older image of the whole volume is the last row. | Nothing beyond the last row. |
 | Physical access, no such encryption | Can rewrite the record offline, and the rest of the installed system with it, for example `/etc/shadow`, the PAM stack or irlumed ("the installed system can be changed offline", SECURITY_AT_REST.md "Disk-theft test"). | Nothing that matters: the machine is already open. |
+| Physical access, a verified root (dm-verity) covering the system and `/etc`, the state directory writable and not encrypted | Can rewrite the record offline, but not the verified system. | Nothing that matters: the same writer can replace the other state irlume reads there, the enrollment and the sealed template key, which carry no authenticity check an offline writer cannot meet (below). |
 | Physical access that can boot an older or writes-discarded copy of the state directory on a boot chain the seal accepts, and nothing more (for example a boot menu that offers file-system snapshots but locks command-line editing) | Each such boot starts from the older record. | Closes this case. |
 
 The last row is narrow: on most installs the same position, an editable
@@ -193,6 +194,22 @@ that directory from the current one, since the same boot loader boots
 both (a policy that covers PCR 4 "never closes" offline change, layer 3).
 Only a monotonic counter outside the disk, such as the TPM's, would close
 it.
+
+The verified-root row needs its reason spelled out. The template key is
+loaded from its envelope after a check of the envelope's `uid` field and an
+unseal (`template_key.rs` `load_key_with`); the enrollment is decrypted with
+that key and its own `uid` field checked (`storage.rs`
+`load_path_with_source`). Both fields are in files under
+`/var/lib/irlume`. Creating a sealed object under irlume's storage key
+needs no secret, since its authValue is empty, and accepts any policy,
+including one copied from an existing envelope's public area; such an
+object unseals under the same PCR state (swtpm, 2026-10-15). So on that
+configuration the state directory is trusted input that an offline writer
+controls, and the rollback of one record is not the weakest point.
+SECURITY_AT_REST.md layer 3 offers a verified root as a remedy for the
+offline change of the installed system; it does not protect the writable
+state directory, which needs full-disk encryption unlocked by a passphrase
+or PIN for any at-rest guarantee about its contents. Section 5 says so.
 
 Against that, a counter costs: an NV index that can fail to allocate (the
 Zenbook has no orderly one left) and that competes with systemd; one NV
@@ -301,20 +318,27 @@ never spends the budget that disk unlock PINs and Windows Hello depend on.
    override outside 0x81000000 to 0x817FFFFF, the range Owner
    Authorization may assign (Part 1 34.3; 0x81800000 to 0x81FFFFFF needs
    Platform Authorization), or one that does not parse, is refused and
-   logged, and new seals stay on the old key. When another
-   stack's key holds
-   the preferred handle, irlumed takes the first free handle above it,
-   wrapping within 0x81000000 to 0x817FFFFF, so the new key's handle never
-   leaves the owner range. It records the chosen handle in a root-only
-   state file under `/var/lib/irlume`, which later starts read first. A free
-   handle number does not mean the TPM has room: persistent objects use NV
-   memory, and `TPM_PT_HR_PERSISTENT_AVAIL` is "the number of additional
-   persistent objects that could be loaded into NV memory", an estimate
-   (Part 2 version 185, table 28). So whenever the new key cannot be
-   persisted, because that property reads 0, no owner handle is free, or
-   `TPM2_EvictControl` refuses (for example `TPM_RC_NV_SPACE`), new seals
-   stay on the persisted old key and nothing moves; irlumed retries at its
-   next start, and doctor reports it. Deriving an RSA-2048 primary takes
+   logged, and new seals stay on the old key. When another stack's key
+   holds the preferred handle, irlumed takes the first free handle above
+   it, wrapping within 0x81000000 to 0x817FFFFF, so the new key's handle
+   never leaves the owner range. It records the chosen handle in a
+   root-only state file under `/var/lib/irlume`, which later starts read
+   first. Before it persists the new key it looks for a copy already
+   persisted: it enumerates the owner persistent handles and adopts one
+   whose public area equals its derivation of the new template (exact
+   identity, as `evict_persistent_srk` compares), so a power loss between
+   `TPM2_EvictControl` and the state file never leaves a second copy taking
+   persistent capacity. A free handle number does not mean the TPM has
+   room, and `TPM_PT_HR_PERSISTENT_AVAIL` does not settle it either: it is
+   "the number of additional persistent objects that could be loaded into
+   NV memory", which "is an estimate", and "If this value is at least 1,
+   then at least one object of any type may be made persistent" (Part 2
+   version 185, table 28), so a 0 promises nothing. irlumed therefore tries
+   `TPM2_EvictControl` whenever a free owner handle exists. Only when that
+   refuses (for example `TPM_RC_NV_SPACE`, seen on swtpm once the property
+   reached 0) or no owner handle is free do new seals stay on the persisted
+   old key, with nothing moving; irlumed retries at its next start, and
+   doctor reports it. Deriving an RSA-2048 primary takes
    more than 10 seconds on slow firmware TPMs (`load_or_create_srk`), which
    would consume most of the authentication window (about 15 seconds at
    login, 10 at `sudo` and polkit prompts, `irlume-auth`) on every
@@ -332,13 +356,22 @@ never spends the budget that disk unlock PINs and Windows Hello depend on.
    Recognizing a key as irlume's (`is_irlume_srk`,
    `derives_from_srk_template`, and the #1079 storage-key comparison
    `storage_key_check`, which doctor reports under `tpm-firmware`) knows
-   both templates; the old one is accepted for loading only.
+   both templates. The old one seals only while the new key cannot be
+   persisted (the fallback above); once the new key is persisted, the old
+   one only loads.
 3. **Envelopes.** New seals use the new key once it is persisted. A sealed
    envelope records the handle and TPM name of the key it was sealed under,
    in a new optional field that older releases ignore (`SealedEnvelope` has
    no `deny_unknown_fields`), so a load goes straight to the right parent
    and checks that the key there is the one it was sealed under; an
-   envelope without the field is under the old key. This extends the
+   envelope without the field is under the old key. The recorded name
+   decides and the handle is a hint: another stack may take a handle an
+   eviction freed. When the key at the recorded handle is absent or has
+   another name, irlumed's start looks for a persisted key with the
+   recorded name, else derives the template whose key has that name (old
+   or new), checks the name, persists it by the rule of section 3.2, and
+   moves the envelope. An authentication uses only a key whose name
+   matches and never derives one. This extends the
    record #1073 proposes, the persisted key's TPM name kept once per host,
    to every envelope. An envelope under the old key moves at the points
    where envelopes already move to a stronger policy: the template key at
@@ -432,6 +465,12 @@ chain the seal accepts. They say that the last case stays open: full-disk
 encryption unlocked by a passphrase or PIN under `/var/lib/irlume` narrows
 it to boots someone who knows the secret unlocks, but gives the record no
 freshness, and a verified root or a pcrlock policy does not narrow it.
+SECURITY_AT_REST.md layer 3 and its "Disk-theft test" row say that a
+verified root protects the installed system, not the writable state
+directory: on a host whose `/var/lib/irlume` is not on full-disk
+encryption unlocked by a passphrase or PIN, an offline writer controls the
+state irlume reads there, so a verified root alone gives no at-rest
+guarantee about irlume's enrollments, sealed keys or retry records.
 
 ### 6. When to revisit
 
@@ -474,9 +513,10 @@ so that only an administrator can reset a lockout.
 
 ## Acceptance tests
 
-- `sealed_template` and the new storage key template both set `noDA`; the
-  old template is accepted only to load, never to seal (unit tests on the
-  built attributes).
+- `sealed_template` and the new storage key template both set `noDA` (unit
+  tests on the built attributes). The old template seals only while the
+  new key cannot be persisted; once the new key is persisted, a seal never
+  uses the old one.
 - In a dedicated swtpm, with the DA parameters lowered and a throwaway
   DA-protected object failed until `inLockout` is set: a seal and an unseal
   of each envelope kind under the new key succeed for Tier 3, and for Tier 2
@@ -498,14 +538,23 @@ so that only an administrator can reset a lockout.
   key, and no login derives a key.
 - With the preferred handle held by another stack's key, the new key is
   persisted at the next free owner handle and found there again after a
-  restart through the recorded handle. When the new key cannot be
-  persisted (`TPM_PT_HR_PERSISTENT_AVAIL` 0 with numerically free handles,
-  no owner handle free, or `TPM2_EvictControl` returning `TPM_RC_NV_SPACE`
-  on swtpm or a fake), new seals and moves stay on the persisted old key,
+  restart through the recorded handle. A power loss after
+  `TPM2_EvictControl` and before the state file is written (simulated by
+  stopping between the two steps) leaves the next start adopting the
+  persisted key, with no second copy persisted.
+- `TPM_PT_HR_PERSISTENT_AVAIL` reading 0 does not stop the attempt: with a
+  free owner handle, `TPM2_EvictControl` is tried (a fake that reports 0
+  and accepts ends with the key persisted). When `TPM2_EvictControl`
+  refuses (`TPM_RC_NV_SPACE` on swtpm once its capacity is used) or no
+  owner handle is free, new seals and moves stay on the persisted old key,
   no envelope is ever written under a transiently derived key, and the
   next start tries again.
 - An envelope records its parent's handle and TPM name; a load that finds
-  another key at that handle refuses it, as for a foreign key today.
+  no key, or a key with another name, at that handle does not use it. At
+  irlumed's start, an envelope whose recorded handle now holds another
+  stack's key is recovered by its recorded name: the matching template is
+  derived, its name checked, the key persisted by the section 3.2 rule and
+  the envelope moved (swtpm).
 - `is_irlume_srk`, `derives_from_srk_template`, `evict_persistent_srk` and
   `storage_key_check` (#1079) recognize both templates; a key matching
   neither stays foreign.

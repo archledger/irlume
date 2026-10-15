@@ -107,6 +107,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume doctor`'s `secure-boot-certificates` check recognizes Microsoft's
+  Secure Boot certificates by their SHA-256 hashes, as published in
+  microsoft/secureboot_objects, instead of by subject name, which any
+  certificate can carry. A `db` certificate that firmware holds as a bare
+  RSA-2048 key now counts too, as Microsoft's key guidance allows for every
+  one of them (#1073).
+
 - An enrollment capture (`irlume enroll`, a guided enrollment from its
   framing guide on, more scans, an added camera, a split pair) is refused
   before any camera opens when it would seal a new template key under the

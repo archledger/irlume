@@ -129,19 +129,59 @@ const EFI_CERT_RSA2048_GUID: [u8; 16] = [
     0xe8, 0x66, 0x57, 0x3c, 0x9c, 0x26, 0x34, 0x4e, 0xaa, 0x14, 0xed, 0x77, 0x6e, 0x85, 0xb3, 0xb6,
 ];
 
-/// The Microsoft KEKs a firmware may hold as a bare RSA-2048 key instead of a
-/// certificate, which Microsoft's Secure Boot key guidance allows: SHA-256 of
-/// the modulus of each certificate in microsoft/secureboot_objects
-/// (PreSignedObjects/KEK/Certificates), with that certificate's subject.
-const MICROSOFT_RSA_KEKS: [([u8; 32], &str); 2] = [
-    (
-        hex32("e8ff8556639b4a435958ecf65a36caa281c0da3d3b5ebafcad1a6d261bb6e15c"),
-        "Microsoft Corporation KEK CA 2011",
-    ),
-    (
-        hex32("f19c4ead7e9748b95b6281006d52858531095d5821a11f3392db3b51c97b79e9"),
-        "Microsoft Corporation KEK 2K CA 2023",
-    ),
+/// A Secure Boot certificate known by its hashes rather than its subject,
+/// which any certificate can carry.
+struct KnownCertificate {
+    /// SHA-256 of the certificate's DER encoding: an `EFI_CERT_X509_GUID` entry.
+    der: [u8; 32],
+    /// SHA-256 of its RSA-2048 modulus, big-endian: an `EFI_CERT_RSA2048_GUID`
+    /// entry. Microsoft's Secure Boot key guidance (sections 1.3.4.3 and 1.4.1)
+    /// allows either form for each of these, in `KEK` and in `db`.
+    modulus: [u8; 32],
+    /// Its subject common name, the name the rollover table uses.
+    name: &'static str,
+}
+
+/// Microsoft's Secure Boot certificates, from microsoft/secureboot_objects
+/// (PreSignedObjects/{KEK,DB}/Certificates, main as of 2026-10-13). Each SHA-1
+/// thumbprint of these files matches the one Microsoft's key guidance
+/// publishes, where it publishes one (#1073).
+const MICROSOFT_CERTIFICATES: [KnownCertificate; 7] = [
+    KnownCertificate {
+        der: hex32("a1117f516a32cefcba3f2d1ace10a87972fd6bbe8fe0d0b996e09e65d802a503"),
+        modulus: hex32("e8ff8556639b4a435958ecf65a36caa281c0da3d3b5ebafcad1a6d261bb6e15c"),
+        name: "Microsoft Corporation KEK CA 2011",
+    },
+    KnownCertificate {
+        der: hex32("3cd3f0309edae228767a976dd40d9f4affc4fbd5218f2e8cc3c9dd97e8ac6f9d"),
+        modulus: hex32("f19c4ead7e9748b95b6281006d52858531095d5821a11f3392db3b51c97b79e9"),
+        name: "Microsoft Corporation KEK 2K CA 2023",
+    },
+    KnownCertificate {
+        der: hex32("e8e95f0733a55e8bad7be0a1413ee23c51fcea64b3c8fa6a786935fddcc71961"),
+        modulus: hex32("2053fa5432ba5fdf7b7ce7d782c734404fada258f8b4ccd4fdfdaca89917fa35"),
+        name: "Microsoft Windows Production PCA 2011",
+    },
+    KnownCertificate {
+        der: hex32("076f1fea90ac29155ebf77c17682f75f1fdd1be196da302dc8461e350a9ae330"),
+        modulus: hex32("d4396d6c331e345201357f743874c1e0fc0bd5e00b446fa35c6baa023e8df987"),
+        name: "Windows UEFI CA 2023",
+    },
+    KnownCertificate {
+        der: hex32("48e99b991f57fc52f76149599bff0a58c47154229b9f8d603ac40d3500248507"),
+        modulus: hex32("98fdfcc9c113e49d094022789c7363eefad08e27b2ffcdbef4e1c07c475af132"),
+        name: "Microsoft Corporation UEFI CA 2011",
+    },
+    KnownCertificate {
+        der: hex32("f6124e34125bee3fe6d79a574eaa7b91c0e7bd9d929c1a321178efd611dad901"),
+        modulus: hex32("8e92a30e2b9ea38ebffcc451db81f475dcf5b973bfa5a1a6bead953ad0328b09"),
+        name: "Microsoft UEFI CA 2023",
+    },
+    KnownCertificate {
+        der: hex32("e5be3e64c6e66a281457ecdece0d6d0787577aad2a3a0144262c10c14ba8d8f1"),
+        modulus: hex32("5b99b849da7ef928709220b54799a0dd5808dd487b3f220b4cf4cacfd56019be"),
+        name: "Microsoft Option ROM UEFI CA 2023",
+    },
 ];
 
 /// A 64-digit hex string as 32 bytes, at compile time.
@@ -212,10 +252,10 @@ pub enum CertificateRollover {
 
 /// Microsoft's 2026 Secure Boot certificate rollover on this machine.
 pub fn certificate_rollover() -> CertificateRollover {
-    certificate_rollover_in(Path::new(EFIVARS))
+    certificate_rollover_in(Path::new(EFIVARS), &MICROSOFT_CERTIFICATES)
 }
 
-fn certificate_rollover_in(efivars: &Path) -> CertificateRollover {
+fn certificate_rollover_in(efivars: &Path, known: &[KnownCertificate]) -> CertificateRollover {
     if !efivars.is_dir() {
         return CertificateRollover::NotUefi;
     }
@@ -225,7 +265,7 @@ fn certificate_rollover_in(efivars: &Path) -> CertificateRollover {
         if !efivar_exists_in(efivars, name) {
             return Some(None);
         }
-        read_efivar_bytes_in(efivars, name).map(|b| Some(signer_names(&b)))
+        read_efivar_bytes_in(efivars, name).map(|b| Some(signer_names_in(&b, known)))
     };
     let (Some(kek), Some(db)) = (names(KEK_VAR), names(DB_VAR)) else {
         return CertificateRollover::Unreadable;
@@ -266,22 +306,33 @@ fn certificate_rollover_in(efivars: &Path) -> CertificateRollover {
     }
 }
 
-/// The signers in an EFI signature database: each X.509 certificate's subject
-/// common name, and for each bare RSA-2048 key, the subject of the Microsoft
-/// KEK certificate with that modulus ([`MICROSOFT_RSA_KEKS`]).
-fn signer_names(data: &[u8]) -> Vec<String> {
-    let mut names = x509_subject_names(data);
-    names.extend(
-        signature_entries(data, EFI_CERT_RSA2048_GUID).filter_map(|key| {
-            use sha2::Digest as _;
-            let digest: [u8; 32] = sha2::Sha256::digest(key).into();
-            MICROSOFT_RSA_KEKS
-                .iter()
-                .find(|(known, _)| *known == digest)
-                .map(|(_, name)| (*name).to_owned())
-        }),
-    );
-    names
+/// The known certificates in an EFI signature database, by name: an X.509
+/// entry whose DER encoding hashes to a known certificate's, and a bare
+/// RSA-2048 key whose modulus does. A certificate that only carries a known
+/// subject names nothing.
+fn signer_names_in(data: &[u8], known: &[KnownCertificate]) -> Vec<String> {
+    use sha2::Digest as _;
+    let sha256 = |bytes: &[u8]| -> [u8; 32] { sha2::Sha256::digest(bytes).into() };
+    let certificates = signature_entries(data, EFI_CERT_X509_GUID)
+        .filter_map(der_encoding)
+        .filter_map(|der| {
+            let digest = sha256(der);
+            known.iter().find(|k| k.der == digest)
+        });
+    let keys = signature_entries(data, EFI_CERT_RSA2048_GUID).filter_map(|modulus| {
+        let digest = sha256(modulus);
+        known.iter().find(|k| k.modulus == digest)
+    });
+    certificates
+        .chain(keys)
+        .map(|k| k.name.to_owned())
+        .collect()
+}
+
+/// The DER encoding an X.509 entry starts with, without any bytes after it.
+fn der_encoding(entry: &[u8]) -> Option<&[u8]> {
+    let (_, _, rest) = der_element(entry)?;
+    Some(&entry[..entry.len() - rest.len()])
 }
 
 /// The data of each signature of type `kind` in an EFI signature database (a
@@ -316,14 +367,6 @@ fn signature_entries(mut data: &[u8], kind: [u8; 16]) -> impl Iterator<Item = &[
     entries.into_iter()
 }
 
-/// The subject common names of the X.509 certificates in an EFI signature
-/// database. Lists of other types and anything that does not parse are skipped.
-fn x509_subject_names(data: &[u8]) -> Vec<String> {
-    signature_entries(data, EFI_CERT_X509_GUID)
-        .filter_map(certificate_subject_cn)
-        .collect()
-}
-
 /// One DER element: its tag, its contents and what follows it.
 fn der_element(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let (&tag, rest) = data.split_first()?;
@@ -341,45 +384,6 @@ fn der_element(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
         (len, &rest[count..])
     };
     (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
-}
-
-/// The subject commonName of a DER X.509 certificate.
-fn certificate_subject_cn(cert: &[u8]) -> Option<String> {
-    const SEQUENCE: u8 = 0x30;
-    let (SEQUENCE, certificate, _) = der_element(cert)? else {
-        return None;
-    };
-    let (SEQUENCE, tbs, _) = der_element(certificate)? else {
-        return None;
-    };
-    // tbsCertificate: [0] version (optional), serialNumber, signature,
-    // issuer, validity, subject.
-    let (tag, _, mut rest) = der_element(tbs)?;
-    if tag != 0xa0 {
-        rest = tbs;
-    }
-    for _ in 0..4 {
-        rest = der_element(rest)?.2;
-    }
-    let (SEQUENCE, mut rdns, _) = der_element(rest)? else {
-        return None;
-    };
-    // Name: SET OF AttributeTypeAndValue { type OID, value }.
-    const COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
-    while let Some((_, set, next)) = der_element(rdns) {
-        let mut attributes = set;
-        while let Some((_, attribute, after)) = der_element(attributes) {
-            if let Some((0x06, oid, value)) = der_element(attribute) {
-                if oid == COMMON_NAME {
-                    let (_, text, _) = der_element(value)?;
-                    return String::from_utf8(text.to_vec()).ok();
-                }
-            }
-            attributes = after;
-        }
-        rdns = next;
-    }
-    None
 }
 
 /// shim's `MokSBStateRT`, which shim creates while its Secure Boot validation
@@ -534,9 +538,18 @@ mod tests {
         )
     }
 
-    /// A certificate whose issuer and subject differ, so a parser that read
-    /// the issuer would name the wrong certificate.
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes).into()
+    }
+
+    /// A synthetic certificate with this subject. Its issuer differs from the
+    /// subject; `serial` makes another certificate with the same subject.
     fn certificate(subject: &str) -> Vec<u8> {
+        certificate_with(subject, 0x01)
+    }
+
+    fn certificate_with(subject: &str, serial: u8) -> Vec<u8> {
         let algorithm = der(
             0x30,
             &der(
@@ -548,7 +561,7 @@ mod tests {
             0x30,
             &[
                 der(0xa0, &der(0x02, &[2])),
-                der(0x02, &[0x33, 0x01]),
+                der(0x02, &[0x33, serial]),
                 algorithm.clone(),
                 name("Microsoft RSA Devices Root CA 2021"),
                 der(
@@ -579,6 +592,20 @@ mod tests {
         out
     }
 
+    /// Microsoft's table with each certificate's DER hash taken from the
+    /// synthetic certificate of that subject; the modulus hashes stay the real
+    /// ones.
+    fn known() -> Vec<KnownCertificate> {
+        MICROSOFT_CERTIFICATES
+            .iter()
+            .map(|k| KnownCertificate {
+                der: sha256(&certificate(k.name)),
+                modulus: k.modulus,
+                name: k.name,
+            })
+            .collect()
+    }
+
     fn database(certificates: &[&str]) -> Vec<u8> {
         let sha256_guid = [
             0x26, 0x16, 0xc4, 0xc1, 0x4c, 0x50, 0x92, 0x40, 0xac, 0xa9, 0x41, 0xf9, 0x36, 0x93,
@@ -592,22 +619,59 @@ mod tests {
     }
 
     #[test]
-    fn signature_databases_yield_their_certificate_subjects() {
+    fn signature_databases_name_certificates_by_their_hash() {
+        let known = known();
         let data = database(&["Windows UEFI CA 2023", "Microsoft UEFI CA 2023"]);
         assert_eq!(
-            x509_subject_names(&data),
+            signer_names_in(&data, &known),
             ["Windows UEFI CA 2023", "Microsoft UEFI CA 2023"],
-            "subjects in order, hash lists skipped, never the issuer"
+            "known certificates in order, hash lists skipped"
         );
         let mut truncated = data.clone();
         truncated.truncate(data.len() - 40);
         assert_eq!(
-            x509_subject_names(&truncated),
+            signer_names_in(&truncated, &known),
             ["Windows UEFI CA 2023"],
             "a list that runs past the end is not read"
         );
-        assert!(x509_subject_names(&[0xff; 27]).is_empty());
-        assert!(x509_subject_names(&[]).is_empty());
+        // Another certificate with a Microsoft subject is not Microsoft's.
+        let impostor = signature_list(
+            EFI_CERT_X509_GUID,
+            &[certificate_with("Windows UEFI CA 2023", 0x02)],
+        );
+        assert!(signer_names_in(&impostor, &known).is_empty());
+        // Bytes after the DER encoding do not change which certificate it is.
+        let mut padded = certificate("Windows UEFI CA 2023");
+        padded.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            signer_names_in(&signature_list(EFI_CERT_X509_GUID, &[padded]), &known),
+            ["Windows UEFI CA 2023"]
+        );
+        assert!(signer_names_in(&[0xff; 27], &known).is_empty());
+        assert!(signer_names_in(&[], &known).is_empty());
+        // Microsoft's own table names none of these synthetic certificates.
+        assert!(signer_names_in(&data, &MICROSOFT_CERTIFICATES).is_empty());
+    }
+
+    /// Every name the rollover uses is in the table once, no two entries
+    /// share a hash, and the real KEK 2023 modulus hashes to its entry.
+    #[test]
+    fn the_microsoft_certificate_table_is_consistent() {
+        let names: Vec<&str> = MICROSOFT_CERTIFICATES.iter().map(|k| k.name).collect();
+        for (_, old, new) in MICROSOFT_ROLLOVER {
+            assert_eq!(names.iter().filter(|n| **n == old).count(), 1, "{old}");
+            assert_eq!(names.iter().filter(|n| **n == new).count(), 1, "{new}");
+        }
+        let mut hashes: Vec<[u8; 32]> = MICROSOFT_CERTIFICATES
+            .iter()
+            .flat_map(|k| [k.der, k.modulus])
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 2 * MICROSOFT_CERTIFICATES.len());
+        let [_, kek_2023, ..] = &MICROSOFT_CERTIFICATES;
+        assert_eq!(kek_2023.name, "Microsoft Corporation KEK 2K CA 2023");
+        assert_eq!(sha256(&kek_2023_modulus()), kek_2023.modulus);
     }
 
     /// The modulus of Microsoft Corporation KEK 2K CA 2023
@@ -637,16 +701,25 @@ mod tests {
         let mut kek = database(&["Microsoft Corporation KEK CA 2011"]);
         kek.extend(signature_list(EFI_CERT_RSA2048_GUID, &[modulus.clone()]));
         assert_eq!(
-            signer_names(&kek),
+            signer_names_in(&kek, &known()),
             [
                 "Microsoft Corporation KEK CA 2011",
                 "Microsoft Corporation KEK 2K CA 2023"
             ]
         );
+        assert_eq!(
+            signer_names_in(
+                &signature_list(EFI_CERT_RSA2048_GUID, &[modulus.clone()]),
+                &MICROSOFT_CERTIFICATES
+            ),
+            ["Microsoft Corporation KEK 2K CA 2023"],
+            "Microsoft's own table names the real key"
+        );
         let mut altered = modulus;
         altered[0] ^= 1;
         assert!(
-            signer_names(&signature_list(EFI_CERT_RSA2048_GUID, &[altered])).is_empty(),
+            signer_names_in(&signature_list(EFI_CERT_RSA2048_GUID, &[altered]), &known())
+                .is_empty(),
             "an unknown key names nothing"
         );
 
@@ -660,7 +733,43 @@ mod tests {
                 "Windows UEFI CA 2023",
             ]),
         );
-        assert_eq!(certificate_rollover_in(&dir), CertificateRollover::Updated);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known()),
+            CertificateRollover::Updated
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Microsoft's guidance allows the db certificates as bare RSA-2048 keys
+    /// too, so a replacement held that way counts.
+    #[test]
+    fn a_db_certificate_held_as_a_bare_rsa_key_is_named_by_its_modulus() {
+        let modulus = vec![0x5a; 256];
+        let mut known = known();
+        known
+            .iter_mut()
+            .find(|k| k.name == "Windows UEFI CA 2023")
+            .unwrap()
+            .modulus = sha256(&modulus);
+        let dir = scratch("rsa-db");
+        write_var(
+            &dir,
+            KEK_VAR,
+            &database(&["Microsoft Corporation KEK 2K CA 2023"]),
+        );
+        let windows_2011 = database(&["Microsoft Windows Production PCA 2011"]);
+        write_var(&dir, DB_VAR, &windows_2011);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known),
+            CertificateRollover::Pending(vec![("db", "Windows UEFI CA 2023")])
+        );
+        let mut db = windows_2011;
+        db.extend(signature_list(EFI_CERT_RSA2048_GUID, &[modulus]));
+        write_var(&dir, DB_VAR, &db);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known),
+            CertificateRollover::Updated
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -677,7 +786,10 @@ mod tests {
             DB_VAR,
             &database(&["Windows UEFI CA 2023", "Microsoft UEFI CA 2023"]),
         );
-        assert_eq!(certificate_rollover_in(&dir), CertificateRollover::Updated);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known()),
+            CertificateRollover::Updated
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -685,23 +797,23 @@ mod tests {
     fn the_2026_rollover_is_read_from_kek_and_db() {
         let dir = scratch("rollover");
         assert_eq!(
-            certificate_rollover_in(&dir.join("absent")),
+            certificate_rollover_in(&dir.join("absent"), &known()),
             CertificateRollover::NotUefi
         );
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Unreadable,
             "no variables at all: efivarfs may be unmounted"
         );
         write_var(&dir, SETUPMODE_VAR, &[0]);
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Unreadable,
             "empty databases in user mode are not proof of no keys"
         );
         write_var(&dir, SETUPMODE_VAR, &[1]);
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::NoKeys,
             "setup mode, as on archhost and minihost: no KEK or db at all"
         );
@@ -716,19 +828,19 @@ mod tests {
         ]);
         write_var(&dir, KEK_VAR, &kek_2011);
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Pending(vec![("KEK", "Microsoft Corporation KEK 2K CA 2023")]),
             "an absent db holds nothing to replace"
         );
         std::fs::write(dir.join(DB_VAR), [0x07]).unwrap();
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Unreadable,
             "a db that is there but does not read is not taken as empty"
         );
         write_var(&dir, DB_VAR, &db_2011);
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Pending(vec![
                 ("KEK", "Microsoft Corporation KEK 2K CA 2023"),
                 ("db", "Windows UEFI CA 2023"),
@@ -754,7 +866,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::Pending(vec![("KEK", "Microsoft Corporation KEK 2K CA 2023")])
         );
 
@@ -766,7 +878,10 @@ mod tests {
                 "Microsoft Corporation KEK 2K CA 2023",
             ]),
         );
-        assert_eq!(certificate_rollover_in(&dir), CertificateRollover::Updated);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known()),
+            CertificateRollover::Updated
+        );
 
         // A Windows-only db needs only the Windows replacement.
         write_var(
@@ -777,12 +892,15 @@ mod tests {
                 "Windows UEFI CA 2023",
             ]),
         );
-        assert_eq!(certificate_rollover_in(&dir), CertificateRollover::Updated);
+        assert_eq!(
+            certificate_rollover_in(&dir, &known()),
+            CertificateRollover::Updated
+        );
 
         write_var(&dir, KEK_VAR, &database(&["Owner KEK"]));
         write_var(&dir, DB_VAR, &database(&["Owner db"]));
         assert_eq!(
-            certificate_rollover_in(&dir),
+            certificate_rollover_in(&dir, &known()),
             CertificateRollover::NotMicrosoft
         );
         let _ = std::fs::remove_dir_all(&dir);

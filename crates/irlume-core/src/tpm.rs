@@ -3938,15 +3938,37 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// (systemd's RSA key at 0x81000001) and a key with irlume's DA-exempt
     /// template but a random modulus stay. The label gives irlume a key of its
     /// own, so the TCG key's modulus differs from irlume's.
+    ///
+    /// swtpm only. The fixture persists keys at three fixed handles and
+    /// evicts what is there afterwards, and the eviction under test removes
+    /// irlume's DA-exempt key wherever it is. On a real machine 0x81000001
+    /// usually holds systemd's storage key, so the test refuses any transport
+    /// but swtpm ([`open_context`] obeys an explicit `IRLUME_TCTI` alone), and
+    /// any handle of its own that is already taken, before it writes anything.
     #[test]
-    #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
     fn tpm_only_irlumes_da_exempt_key_is_evicted() {
         const SHARED: u32 = 0x8100_0001;
         const OURS: u32 = 0x8101_0003;
         const PLANTED: u32 = 0x8101_0004;
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this fixture writes persistent handles: run it on swtpm, never on a real TPM"
+        );
         let exempt = da_exempt_srk_template().expect("template");
         let mut ctx = open_context().expect("context");
+        let taken: Vec<String> = persistent_handles(&mut ctx)
+            .expect("handle scan")
+            .into_iter()
+            .filter(|handle| [SHARED, OURS, PLANTED].contains(handle))
+            .map(|handle| format!("{handle:#010x}"))
+            .collect();
+        assert!(
+            taken.is_empty(),
+            "the fixture's handles {} are taken; it touches nothing it did not place",
+            taken.join(", ")
+        );
         let shared =
             create_storage_key(&mut ctx, tcg_shared_rsa_srk_template()).expect("TCG storage key");
         let (shared_public, _, _) = ctx.read_public(shared).expect("read the TCG key");

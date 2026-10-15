@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` warns, as `shim-validation`, when shim's Secure Boot
+  validation is disabled (`mokutil --disable-validation`). shim then loads
+  images without checking them and measures no authority into PCR 7, so a
+  seal bound to PCR 7 binds no boot chain. The check names
+  `sudo mokutil --enable-validation` and, since that changes PCR 7, setting a
+  recovery passphrase first. It passes when the boot went through shim with
+  validation on (#1076).
+
 - Issues and pull requests are labeled automatically from their titles, the
   files a pull request changes and the bug report's new Area field, with
   twelve new area and kind labels (daemon, cli, auth, vision, enrollment,

@@ -382,6 +382,66 @@ fn certificate_subject_cn(cert: &[u8]) -> Option<String> {
     None
 }
 
+/// shim's `MokSBStateRT`, which shim creates while its Secure Boot validation
+/// is disabled (`mokutil --disable-validation`). mokutil reports validation
+/// as disabled whenever it exists, whatever its value.
+const MOK_SB_STATE_RT_VAR: &str = "MokSBStateRT-605dab50-e046-4300-abb6-3dd810dd8b23";
+/// Variables shim mirrors at every boot with boot-service and runtime access
+/// but not non-volatile, so they exist only when this boot went through shim.
+const SHIM_RT_VARS: [&str; 2] = [
+    "MokListRT-605dab50-e046-4300-abb6-3dd810dd8b23",
+    "SbatLevelRT-605dab50-e046-4300-abb6-3dd810dd8b23",
+];
+
+/// Whether shim, when this boot went through it, verifies what it loads.
+/// shim measures the certificate that verified each image it loads into
+/// PCR 7; with validation disabled it verifies, and so measures, none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShimValidation {
+    /// shim verifies the boot loader and kernel it loads.
+    Enforcing,
+    /// shim's validation is disabled: PCR 7 records that setting but no
+    /// authority for what booted.
+    Disabled,
+    /// Secure Boot is not enforcing (off, or setup mode), so shim verifies
+    /// nothing either way.
+    SecureBootOff,
+    /// This boot did not go through shim.
+    NotShim,
+    /// Not a UEFI boot.
+    NotUefi,
+    /// efivarfs is there but the SecureBoot variable does not read.
+    Unreadable,
+}
+
+/// Whether shim verifies what it loads in this boot, from efivarfs.
+pub fn shim_validation() -> ShimValidation {
+    shim_validation_in(Path::new(EFIVARS))
+}
+
+fn shim_validation_in(efivars: &Path) -> ShimValidation {
+    if !efivars.is_dir() {
+        return ShimValidation::NotUefi;
+    }
+    if !secure_boot_present_in(efivars) {
+        return ShimValidation::Unreadable;
+    }
+    // mokutil's condition: SecureBoot 1 and SetupMode 0.
+    if !secure_boot_enabled_in(efivars) {
+        return ShimValidation::SecureBootOff;
+    }
+    if efivar_exists_in(efivars, MOK_SB_STATE_RT_VAR) {
+        ShimValidation::Disabled
+    } else if SHIM_RT_VARS
+        .iter()
+        .any(|name| efivar_exists_in(efivars, name))
+    {
+        ShimValidation::Enforcing
+    } else {
+        ShimValidation::NotShim
+    }
+}
+
 fn efivar_exists_in(efivars: &Path, name: &str) -> bool {
     efivars.join(name).exists()
 }
@@ -761,6 +821,63 @@ mod tests {
         assert!(!secure_boot_enabled_in(&empty));
         assert!(!setup_mode_in(&empty));
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// Each shim state from the variables shim and the firmware leave, as the
+    /// laptop showed on 2026-10-15 (MokListRT, MokListXRT, MokListTrustedRT,
+    /// SbatLevelRT; no MokSBStateRT) and mokutil 0.7.2 reads them.
+    #[test]
+    fn shim_validation_reads_shim_and_secure_boot_variables() {
+        let dir = scratch("shim");
+        let reset = |vars: &[(&str, &[u8])]| {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+            for (name, value) in vars {
+                write_var(&dir, name, value);
+            }
+            shim_validation_in(&dir)
+        };
+        let on: [(&str, &[u8]); 2] = [(SECUREBOOT_VAR, &[1]), (SETUPMODE_VAR, &[0])];
+        let mok_list = (SHIM_RT_VARS[0], &[0u8; 4][..]);
+        let sbat = (SHIM_RT_VARS[1], &b"sbat,1,2024010900"[..]);
+        let disabled = (MOK_SB_STATE_RT_VAR, &[1u8][..]);
+        assert_eq!(
+            reset(&[on[0], on[1], mok_list, sbat]),
+            ShimValidation::Enforcing
+        );
+        assert_eq!(reset(&[on[0], on[1], sbat]), ShimValidation::Enforcing);
+        assert_eq!(
+            reset(&[on[0], on[1], mok_list, disabled]),
+            ShimValidation::Disabled
+        );
+        // mokutil does not read the value: present is disabled.
+        let zero = (MOK_SB_STATE_RT_VAR, &[0u8][..]);
+        assert_eq!(
+            reset(&[on[0], on[1], mok_list, zero]),
+            ShimValidation::Disabled
+        );
+        assert_eq!(reset(&[on[0], on[1]]), ShimValidation::NotShim);
+        assert_eq!(
+            reset(&[(SECUREBOOT_VAR, &[0]), mok_list, disabled]),
+            ShimValidation::SecureBootOff
+        );
+        assert_eq!(
+            reset(&[
+                (SECUREBOOT_VAR, &[1]),
+                (SETUPMODE_VAR, &[1]),
+                mok_list,
+                disabled
+            ]),
+            ShimValidation::SecureBootOff,
+            "setup mode enforces nothing"
+        );
+        assert_eq!(reset(&[mok_list]), ShimValidation::Unreadable);
+        assert_eq!(
+            shim_validation_in(&dir.join("absent")),
+            ShimValidation::NotUefi
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

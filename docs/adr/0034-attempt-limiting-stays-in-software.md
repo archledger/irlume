@@ -151,10 +151,15 @@ an older retry record but cannot otherwise control the running system:
 | Physical access that can boot an older or writes-discarded copy of the state directory on a boot chain the seal accepts, and nothing more (for example a boot menu that offers file-system snapshots but locks command-line editing) | Each such boot starts from the older record. | Closes this case. |
 
 The last row is narrow: on most installs the same position, an editable
-boot menu or no disk-encryption PIN, already gives root. Its remedies are
-the ones SECURITY_AT_REST.md layer 3 names for offline change: full-disk
-encryption unlocked by a passphrase or PIN, or a pcrlock policy that covers
-the boot loader.
+boot menu or no disk-encryption PIN, already gives root. What closes it is
+full-disk encryption unlocked by a passphrase or PIN under
+`/var/lib/irlume`, so no copy of the state opens without the secret (a
+volume the TPM or a key file unlocks alone does not count, as
+SECURITY_AT_REST.md layer 3 says). The other layer 3 remedies do not: a
+verified root does not cover the writable state directory, and a pcrlock
+policy over the boot loader cannot tell an older copy of that directory
+from the current one, since the same boot loader boots both (a policy that
+covers PCR 4 "never closes" offline change, layer 3).
 
 Against that, a counter costs: an NV index that can fail to allocate (the
 Zenbook has no orderly one left) and that competes with systemd; one NV
@@ -215,9 +220,9 @@ default or as an option. Against Microsoft's three failure modes:
   reboot restarts a recorded cooldown (unchanged).
 - **Rollback:** not covered. The record resists neither root nor offline
   change, as documented; the Context table shows that only the narrow
-  older-copy boot is an attacker a TPM counter would stop, and its remedies
-  are disk encryption with a PIN or a pcrlock policy over the boot loader.
-  Section 5 makes the documentation say so.
+  older-copy boot is an attacker a TPM counter would stop, and what closes
+  it is full-disk encryption unlocked by a passphrase or PIN under the state
+  directory. Section 5 makes the documentation say so.
 
 ### 2. irlume stays out of the DA counter
 
@@ -237,14 +242,17 @@ budget that disk unlock PINs and Windows Hello depend on.
    and empty authPolicy. These are the TCG storage-key attributes for RSA.
    The algorithm does not change here; an ECC storage key is a separate
    decision and would reuse this migration.
-2. **Handle.** The new key is persisted at the handle after the old key's,
-   so both can exist during the migration: 0x81010003 by default, or the one
-   after an `IRLUME_SRK_HANDLE` override, which keeps naming the old key's
-   handle. If that handle holds another stack's key, the new key is derived
-   transiently for each call, as the old one is today when its handle is
-   taken. irlume keeps its own handles rather than the shared 0x81000001:
-   systemd puts an ECC key there when the TPM supports one
-   (`tpm2_get_best_srk_template`), and it is another stack's to manage.
+2. **Handle.** The new key is persisted next to the old key's handle, so
+   both can exist during the migration: 0x81010003 by default; with an
+   `IRLUME_SRK_HANDLE` override, which keeps naming the old key's handle,
+   the handle after it, or the one before it for an override at the top of
+   the owner persistent range (0x817FFFFF), so the new key's handle always
+   stays in 0x81000000 to 0x817FFFFF. If that handle holds another stack's
+   key, the new key is derived transiently for each call, as the old one is
+   today when its handle is taken. irlume keeps its own handles rather than
+   the shared 0x81000001: systemd puts an ECC key there when the TPM
+   supports one (`tpm2_get_best_srk_template`), and it is another stack's
+   to manage.
    Deriving an RSA-2048 primary takes more than 10 seconds on slow firmware
    TPMs (`load_or_create_srk`), so irlumed derives and persists the new key
    when it starts and finds an envelope under the old key, and no login pays
@@ -265,9 +273,16 @@ budget that disk unlock PINs and Windows Hello depend on.
    envelope, and a failed move leaves the old envelope in use.
 4. **The old key.** It stays persisted while any envelope on the host names
    it, including envelopes that no longer unseal because their PCRs moved.
-   Evicting it once none does is the daemon-performed eviction tracked in
-   #1073, with the uninstall path's rule: exact identity by derived modulus,
-   never a shape match. Uninstall evicts both keys under that rule.
+   A move is not durable just because the new envelope is visible: when
+   syncing the directory fails (`AtomicWrite::VisibleNotDurable`), a power
+   loss can bring back the envelope under the old key (`move_with` in
+   `template_key.rs`). So "none names it" counts only when every move off
+   the old key reported a durable write and a scan in a later boot (another
+   boot ID) still finds no envelope naming it; a restored envelope is found
+   first and keeps the key. Evicting it then is the daemon-performed
+   eviction tracked in #1073, with the uninstall path's rule: exact identity
+   by derived modulus, never a shape match. Uninstall evicts both keys
+   under that rule.
 
 ### 4. doctor reports the TPM lockout
 
@@ -305,9 +320,9 @@ THREAT_MODEL.md ("Consecutive unsuccessful request ceiling") and DISABLE.md
 ("Persistent retry records") say that, by this ADR, the TPM does not count
 face attempts; that the record does not resist root, offline change, or a
 boot of an older or writes-discarded copy of the state directory on a boot
-chain the seal accepts; and which configurations close the last case
-(full-disk encryption unlocked by a passphrase or PIN, or a pcrlock policy
-that covers the boot loader).
+chain the seal accepts; and that only full-disk encryption unlocked by a
+passphrase or PIN under `/var/lib/irlume` closes the last case, which a
+verified root or a pcrlock policy does not.
 
 ### 6. When to revisit
 
@@ -366,6 +381,14 @@ so that only an administrator can reset a lockout.
 - `is_irlume_srk`, `derives_from_srk_template`, `evict_persistent_srk` and
   the doctor storage-key check (#1079) recognize both templates; a key
   matching neither stays foreign.
+- The new key's handle is 0x81010003 by default, the override's next
+  handle for an `IRLUME_SRK_HANDLE` override, and 0x817FFFFE for an
+  override of 0x817FFFFF: never outside the owner persistent range.
+- Phase 3, under #1073: a move whose write reports
+  `AtomicWrite::VisibleNotDurable` keeps the old key needed; with every move
+  durable, the old key is not evicted in the boot that made the last move,
+  only after a scan in a later boot finds no envelope naming it; an envelope
+  under the old key restored by a simulated power loss keeps the old key.
 - `tpm-lockout` readings for pass, both warnings, info and unknown come from
   synthetic capability values; a `TpmReadiness` reply without the new field
   parses and reads unknown; the CLI never opens the TPM for it.

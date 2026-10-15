@@ -6007,7 +6007,8 @@ fn tpm_readiness_report() -> Response {
         return Response::TpmReadiness {
             identity: Err(none.clone()),
             pcr_bank: Err(none.clone()),
-            storage_key: Err(none),
+            storage_key: Err(none.clone()),
+            lockout: Err(none),
         };
     }
     let text = |e: irlume_common::Error| e.to_string();
@@ -6015,6 +6016,7 @@ fn tpm_readiness_report() -> Response {
         identity: irlume_core::tpm::tpm_identity().map_err(text),
         pcr_bank: irlume_core::tpm::pcr_bank_readiness().map_err(text),
         storage_key: irlume_core::tpm::storage_key_check().map_err(text),
+        lockout: irlume_core::tpm::lockout_state().map_err(text),
     }
 }
 
@@ -13998,6 +14000,7 @@ mod tests {
                 identity,
                 pcr_bank,
                 storage_key,
+                lockout,
             } = tpm_readiness_report()
             else {
                 panic!("a TpmReadiness reply");
@@ -14005,7 +14008,34 @@ mod tests {
             assert_eq!(identity, Err("no TPM device".into()));
             assert_eq!(pcr_bank, Err("no TPM device".into()));
             assert_eq!(storage_key, Err("no TPM device".into()));
+            assert_eq!(lockout, Err("no TPM device".into()));
         }
+    }
+
+    /// ADR-0034 §4 against a software TPM: the readiness report carries the
+    /// dictionary-attack state, read with GetCapability alone (nothing is
+    /// changed), and today's storage key is not DA-exempt, which ADR-0034 §3
+    /// changes.
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_readiness_report_carries_the_lockout_state() {
+        let _g = env_lock();
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this test only runs against swtpm"
+        );
+        let Response::TpmReadiness { lockout, .. } = tpm_readiness_report() else {
+            panic!("a TpmReadiness reply");
+        };
+        let lockout = lockout.expect("swtpm reports its lockout state");
+        assert!(lockout.max_tries > 0, "{lockout:?}");
+        assert!(lockout.failed_tries <= lockout.max_tries, "{lockout:?}");
+        assert_eq!(
+            lockout.in_lockout,
+            lockout.failed_tries == lockout.max_tries,
+            "{lockout:?}"
+        );
+        assert!(!lockout.storage_key_no_da, "{lockout:?}");
     }
 
     /// The early TPM refusal covers exactly the captures into an enrollment,

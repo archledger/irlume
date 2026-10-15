@@ -3999,6 +3999,7 @@ struct TpmReport {
     identity: Result<irlume_common::tpm_readiness::TpmIdentity, String>,
     pcr_bank: Result<irlume_common::tpm_readiness::PcrBankReadiness, String>,
     storage_key: Result<irlume_common::tpm_readiness::StorageKeyCheck, String>,
+    lockout: Result<irlume_common::tpm_readiness::TpmLockout, String>,
 }
 
 /// Ask irlumed for its TPM readiness. Every way of getting no report (an
@@ -4013,11 +4014,13 @@ fn tpm_readiness(
             identity,
             pcr_bank,
             storage_key,
+            lockout,
         }) => {
             return TpmReport {
                 identity,
                 pcr_bank,
                 storage_key,
+                lockout,
             }
         }
         Ok(Response::Error(error)) if error == "bad request" => {
@@ -4033,7 +4036,8 @@ fn tpm_readiness(
     TpmReport {
         identity: Err(reason.clone()),
         pcr_bank: Err(reason.clone()),
-        storage_key: Err(reason),
+        storage_key: Err(reason.clone()),
+        lockout: Err(reason),
     }
 }
 
@@ -4174,6 +4178,90 @@ fn pcr_bank_check(
         ),
         Err(e) => (State::Unknown, format!("PCRs not read: {e}")),
     }
+}
+
+/// The `tpm-lockout` check (ADR-0034 §4): the TPM's dictionary-attack state.
+/// Its counter is shared by the whole TPM, so a lockout another TPM user
+/// caused (wrong disk unlock PINs, a Windows Hello PIN on dual boot) blocks
+/// every key that is not DA-exempt. A pass or info reading counts in neither
+/// doctor's closing summary nor the `doctor --check` exit code, so every
+/// reading that needs action is a warning.
+fn tpm_lockout_check(
+    lockout: &Result<irlume_core::tpm::TpmLockout, String>,
+) -> (crate::doctor_report::State, String) {
+    use crate::doctor_report::State;
+    let lockout = match lockout {
+        Ok(lockout) => lockout,
+        Err(e) => return (State::Unknown, format!("lockout state not read: {e}")),
+    };
+    let counts = format!(
+        "{} of {} failures, recovery interval {} s",
+        lockout.failed_tries, lockout.max_tries, lockout.recovery_time
+    );
+    if lockout.in_lockout {
+        let effect = if lockout.storage_key_no_da {
+            "irlume's storage key is DA-exempt, so irlume is not affected, but disk \
+             unlock PINs and other TPM PIN users on this machine are"
+        } else {
+            "irlume's storage key is not DA-exempt yet (ADR-0034 §3), so face login \
+             and the release of sealed keyring secrets use the password until it ends"
+        };
+        // The TPM keeps no "time left" value: a lockout ends one recovery
+        // interval of powered-on time after the last failure, and a power
+        // interruption can restart that wait (TPM 2.0 Library Part 1, 16.8.2;
+        // a TPM may keep the elapsed time across a shutdown).
+        let wait = format!(
+            "It ends within {} s of powered-on time without another failure, and a power \
+             cycle can restart that wait, so keep the machine running",
+            lockout.recovery_time
+        );
+        // After a wrong lockout authorization the TPM refuses another try for
+        // the lockout recovery time, or until a restart when that is 0
+        // (Part 1, 16.8.2 and 16.8.5), and no property shows that state.
+        let retry = if lockout.lockout_recovery == 0 {
+            "a wrong value blocks another try until the next restart".to_owned()
+        } else {
+            format!(
+                "a wrong value blocks another try for {} s",
+                lockout.lockout_recovery
+            )
+        };
+        let clear = if lockout.lockout_auth_set {
+            format!(
+                "an administrator who knows the lockout authorization can end it at once \
+                 with `tpm2_dictionarylockout --clear-lockout --auth=file:-`, which reads \
+                 the value from standard input and keeps it off the process list; {retry}. \
+                 If another operating system set that authorization, it holds the value"
+            )
+        } else {
+            "no lockout authorization value is set, so `tpm2_dictionarylockout \
+             --clear-lockout` ends it at once"
+                .to_owned()
+        };
+        return (
+            State::Warn,
+            format!(
+                "the TPM is in dictionary-attack lockout ({counts}): {effect}. {wait}. Or \
+                 {clear}. Clearing the TPM also ends it but destroys every key sealed to \
+                 it, irlume's included"
+            ),
+        );
+    }
+    if !lockout.lockout_auth_set {
+        return (
+            State::Info,
+            format!(
+                "not in lockout ({counts}); no lockout authorization value is set, so any \
+                 process that can open the TPM can reset the lockout or change its \
+                 parameters. This describes the machine, not irlume, which does not rely \
+                 on the lockout"
+            ),
+        );
+    }
+    (
+        State::Pass,
+        format!("not in lockout ({counts}); a lockout authorization value is set"),
+    )
 }
 
 /// The `secure-boot-certificates` check: where this machine stands in
@@ -5187,6 +5275,7 @@ fn doctor_run(
             tpm_firmware_check(&tpm.identity, &tpm.storage_key),
         ),
         ("tpm-pcr-bank", pcr_bank_check(&tpm.pcr_bank)),
+        ("tpm-lockout", tpm_lockout_check(&tpm.lockout)),
         (
             "secure-boot-certificates",
             certificate_rollover_check(&secureboot::certificate_rollover()),
@@ -6531,16 +6620,65 @@ mod tests {
         )))
         .contains("requires root"));
         assert!(reason(Ok(Response::Pong)).contains("unexpected"));
+        let lockout = irlume_common::tpm_readiness::TpmLockout::from_properties(
+            0x4, 1, 32, 7200, 86400, false,
+        );
         let report = tpm_readiness(|_| {
             Ok(Response::TpmReadiness {
                 identity: Err("busy".into()),
                 pcr_bank: Ok(PcrBankReadiness::Ready(vec![7])),
                 storage_key: Ok(StorageKeyCheck::Clean),
+                lockout: Ok(lockout),
             })
         });
         assert_eq!(report.pcr_bank, Ok(PcrBankReadiness::Ready(vec![7])));
         assert_eq!(report.storage_key, Ok(StorageKeyCheck::Clean));
+        assert_eq!(report.lockout, Ok(lockout));
         assert_eq!(report.identity.unwrap_err(), "busy");
+        let unreachable = tpm_readiness(|_| Err(std::io::ErrorKind::NotFound.into()));
+        assert!(unreachable.lockout.unwrap_err().contains("not running"));
+    }
+
+    /// ADR-0034 §4: a lockout is a warning whichever key irlume seals under,
+    /// worded for whether it blocks irlume; no lockout authorization is info;
+    /// otherwise pass; a lockout state not read is unknown.
+    #[test]
+    fn tpm_lockout_warns_in_lockout_and_says_whom_it_blocks() {
+        use crate::doctor_report::State;
+        use irlume_core::tpm::TpmLockout;
+        let state = |permanent, failed, no_da| {
+            tpm_lockout_check(&Ok(TpmLockout::from_properties(
+                permanent, failed, 32, 7200, 86400, no_da,
+            )))
+        };
+        let (reading, detail) = state(0x204, 32, false);
+        assert_eq!(reading, State::Warn);
+        assert!(detail.contains("use the password"), "{detail}");
+        assert!(detail.contains("--auth=file:-"), "{detail}");
+        assert!(detail.contains("within 7200 s"), "{detail}");
+        assert!(detail.contains("another try for 86400 s"), "{detail}");
+        assert!(detail.contains("keep the machine running"), "{detail}");
+        assert!(detail.contains("destroys every key"), "{detail}");
+        let (_, detail) = tpm_lockout_check(&Ok(TpmLockout::from_properties(
+            0x204, 32, 32, 7200, 0, false,
+        )));
+        assert!(detail.contains("until the next restart"), "{detail}");
+        let (reading, detail) = state(0x204, 32, true);
+        assert_eq!(reading, State::Warn);
+        assert!(detail.contains("irlume is not affected"), "{detail}");
+        let (reading, detail) = state(0x200, 32, false);
+        assert_eq!(reading, State::Warn);
+        assert!(detail.contains("no lockout authorization"), "{detail}");
+        assert!(!detail.contains("--auth"), "{detail}");
+        let (reading, detail) = state(0x0, 3, false);
+        assert_eq!(reading, State::Info);
+        assert!(detail.contains("any process"), "{detail}");
+        let (reading, detail) = state(0x4, 3, false);
+        assert_eq!(reading, State::Pass);
+        assert!(detail.contains("3 of 32 failures"), "{detail}");
+        let (reading, detail) = tpm_lockout_check(&Err("irlumed is not running".into()));
+        assert_eq!(reading, State::Unknown);
+        assert!(detail.contains("not running"), "{detail}");
     }
 
     #[test]

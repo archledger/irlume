@@ -344,6 +344,7 @@ fn note_marker_unavailable_once(path: &std::path::Path) {
 
 pub use irlume_common::tpm_readiness::{
     roca_fingerprint, DerivedKey, FirmwareAdvisory, PcrBankReadiness, StorageKeyCheck, TpmIdentity,
+    TpmLockout,
 };
 
 /// The ASCII text of TPM property words: printable characters only, runs of
@@ -375,6 +376,68 @@ pub fn tpm_identity() -> Result<TpmIdentity> {
         ],
         property(PropertyTag::FirmwareVersion1)?,
     )
+}
+
+/// Read this TPM's dictionary-attack lockout state (ADR-0034 §4):
+/// `TPM_PT_PERMANENT` and the four lockout properties, with
+/// `GetCapability`, which needs no authorization. Creates and changes nothing,
+/// and works while the TPM is in lockout.
+///
+/// # Errors
+///
+/// [`Error::Tpm`] when the TPM cannot be opened or read, or leaves out one of
+/// the properties, which every TPM 2.0 reports.
+pub fn lockout_state() -> Result<TpmLockout> {
+    // A context of its own: tss-esapi's `get_tpm_property` caches what it
+    // read for the context's life, so a reused one could return a stale
+    // counter. The four lockout properties come back in one GetCapability
+    // page from the counter on, so they are one reading.
+    let mut ctx = open_context()?;
+    let mut property = |tag| ctx.get_tpm_property(tag).map_err(tpm_err);
+    let permanent = property(PropertyTag::Permanent)?;
+    let failed_tries = property(PropertyTag::LockoutCounter)?;
+    let max_tries = property(PropertyTag::MaxAuthFail)?;
+    let recovery_time = property(PropertyTag::LockoutInterval)?;
+    let lockout_recovery = property(PropertyTag::LockoutRecovery)?;
+    lockout_from(
+        [
+            permanent,
+            failed_tries,
+            max_tries,
+            recovery_time,
+            lockout_recovery,
+        ],
+        srk_template()?.object_attributes().no_da(),
+    )
+}
+
+/// A [`TpmLockout`] from the properties `GetCapability` returned, in the
+/// order `TPM_PT_PERMANENT`, `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
+/// `TPM_PT_LOCKOUT_INTERVAL`, `TPM_PT_LOCKOUT_RECOVERY`. Every one is
+/// required. `storage_key_no_da` is whether the storage key irlume seals under
+/// has `noDA`: every irlume seal and unseal goes through a key derived from
+/// [`srk_template`], persisted or not, so its template decides.
+fn lockout_from(properties: [Option<u32>; 5], storage_key_no_da: bool) -> Result<TpmLockout> {
+    const NAMES: [&str; 5] = [
+        "permanent attributes",
+        "lockout counter",
+        "maximum authorization failures",
+        "lockout interval",
+        "lockout recovery time",
+    ];
+    let mut values = [0u32; 5];
+    for (slot, (value, name)) in values.iter_mut().zip(properties.into_iter().zip(NAMES)) {
+        *slot = value.ok_or_else(|| Error::Tpm(format!("the TPM did not report its {name}")))?;
+    }
+    let [permanent, failed_tries, max_tries, recovery_time, lockout_recovery] = values;
+    Ok(TpmLockout::from_properties(
+        permanent,
+        failed_tries,
+        max_tries,
+        recovery_time,
+        lockout_recovery,
+        storage_key_no_da,
+    ))
 }
 
 /// A [`TpmIdentity`] from the properties `GetCapability` returned. The
@@ -2939,6 +3002,56 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(
             missing.to_string().contains("firmware version"),
             "{missing}"
+        );
+    }
+
+    /// Every lockout property is required, each missing one is named, and the
+    /// values land in the right fields.
+    #[test]
+    fn a_tpm_without_its_lockout_properties_reports_no_lockout_state() {
+        let all = [Some(0x204), Some(2), Some(32), Some(7200), Some(86400)];
+        let lockout = lockout_from(all, false).expect("read");
+        assert!(lockout.lockout_auth_set && lockout.in_lockout);
+        assert_eq!(
+            (
+                lockout.failed_tries,
+                lockout.max_tries,
+                lockout.recovery_time,
+                lockout.lockout_recovery
+            ),
+            (2, 32, 7200, 86400)
+        );
+        assert!(!lockout.storage_key_no_da);
+        for (i, name) in [
+            "permanent attributes",
+            "lockout counter",
+            "maximum authorization failures",
+            "lockout interval",
+            "lockout recovery time",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut missing = all;
+            missing[i] = None;
+            let error = lockout_from(missing, false).unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
+    /// ADR-0034 §2: the objects irlume seals its secrets in are DA-exempt
+    /// (`noDA`), and their empty authValue cannot authorize them
+    /// (`userWithAuth` clear), so only their policy can. A lockout then never
+    /// blocks them, and no wrong secret can count against the TPM's
+    /// dictionary-attack counter through them.
+    #[test]
+    fn sealed_objects_are_da_exempt_and_open_only_by_policy() {
+        let zero = Digest::try_from(vec![0u8; 32]).expect("digest");
+        let attributes = sealed_template(zero).expect("template").object_attributes();
+        assert!(attributes.no_da(), "a sealed object must have noDA");
+        assert!(
+            !attributes.user_with_auth(),
+            "a sealed object must open only by its policy"
         );
     }
 

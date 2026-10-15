@@ -481,9 +481,17 @@ retry support do not enforce this limit. Do not delete records or restore older,
 smaller counts as part of a binary rollback.
 
 Write-ahead charges survive crashes and reboot, but cannot resist root deletion
-or disk rollback. Fifty bounds requested composite authentication decisions, not
-individual frames/comparisons or a qualified false-accept probability. The
-independent reset-password budget below also reserves before verification.
+or disk rollback. The TPM does not count face attempts
+([ADR-0034](adr/0034-attempt-limiting-stays-in-software.md)), so these records
+are the only count: they resist neither root, nor an offline change of
+`/var/lib/irlume`, nor a boot of an older or writes-discarded copy of it on a
+boot chain the seal accepts. Full-disk encryption unlocked by a passphrase or
+PIN under `/var/lib/irlume` narrows the last case to boots that someone who
+knows the secret unlocks, but gives the records no freshness; a verified root
+or a pcrlock policy does not narrow it. Fifty bounds requested composite
+authentication decisions, not individual frames/comparisons or a qualified
+false-accept probability. The independent reset-password budget below also
+reserves before verification.
 
 ### Password-verified retry reset
 

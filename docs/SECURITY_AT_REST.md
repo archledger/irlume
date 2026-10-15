@@ -117,6 +117,12 @@ matching also requires passing IR liveness; an inverted RGB image can't.)
    offline change but not the second path. A root hash on a unified kernel
    image's command line is covered with that image; a GRUB command line is
    measured into PCR 8, which a pcrlock policy leaves out by default. A
+   verified root protects the installed system, not the writable state
+   directory: where `/var/lib/irlume` is not on full-disk encryption unlocked
+   by a passphrase or PIN, an offline writer controls the state irlume reads
+   there, so a verified root alone gives no at-rest guarantee about irlume's
+   enrollments, sealed keys or retry records
+   ([ADR-0034](adr/0034-attempt-limiting-stays-in-software.md)). A
    pcrlock policy is worth having in addition to encryption, not instead of
    it. Once one is provisioned, existing seals move to it: the keyring secret
    at `irlume keyring arm` or its next re-seal at a password login, the
@@ -369,7 +375,7 @@ So the realistic attacks and their outcomes:
 | Normal user account on the box | Can't read either file (0600 root) |
 | Steals the disk / backup image (**TPM host**) | Encrypted primary and migrated secondary ciphertext will not unseal on another TPM; unmigrated v0.13.0 secondary files and old plaintext backups remain exposed |
 | Steals the disk / backup image (**no-TPM host**) | Templates are root-only but **plaintext** (see "Degraded hosts" below): recoverable 512-D embeddings, not an image |
-| Steals disk AND has the physical machine, no root | The seal binds the boot chain, not the root filesystem. Where the state directory is not on full-disk encryption unlocked by a passphrase or PIN, the installed system can be changed offline and booted on the unchanged boot chain, which unseals the template key and any armed keyring secret under any policy. A policy that does not cover the boot loader (PCR 4), such as the literal PCR 7 policy (Tier 3), adds a second path: another operating system signed with the same keys reproduces it and unseals them directly; a pcrlock policy (Tier 2) that covers PCR 4 closes that one. Remedies: full-disk encryption unlocked by a passphrase or PIN, or a verified root (dm-verity) whose root hash a pcrlock policy or a signature binds (layer 3 above) |
+| Steals disk AND has the physical machine, no root | The seal binds the boot chain, not the root filesystem. Where the state directory is not on full-disk encryption unlocked by a passphrase or PIN, the installed system can be changed offline and booted on the unchanged boot chain, which unseals the template key and any armed keyring secret under any policy. A policy that does not cover the boot loader (PCR 4), such as the literal PCR 7 policy (Tier 3), adds a second path: another operating system signed with the same keys reproduces it and unseals them directly; a pcrlock policy (Tier 2) that covers PCR 4 closes that one. Remedies: full-disk encryption unlocked by a passphrase or PIN, or a verified root (dm-verity) whose root hash a pcrlock policy or a signature binds (layer 3 above); a verified root does not cover the writable state directory, which still needs that encryption for irlume's state there (ADR-0034) |
 | Root on the live original machine | Game over: root can ask the daemon to unseal (true of any at-rest scheme; root is the trust boundary) |
 | Recovers only the embedding plaintext (somehow) | Gets a 512-float vector, not a photo; can't replay it past IR liveness |
 

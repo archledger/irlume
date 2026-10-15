@@ -7,6 +7,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` reports, as `tpm-lockout`, the TPM's dictionary-attack
+  lockout state: whether a lockout authorization is set, whether the TPM is in
+  lockout, and its failure counter, maximum and recovery interval, read by
+  irlumed without changing anything. The counter is shared by everything that
+  uses the TPM, so a lockout another user caused (wrong disk unlock PINs, a
+  Windows Hello PIN) also blocks irlume's storage key until ADR-0034 §3 moves it
+  to a DA-exempt one: in lockout the check warns that face login and the
+  release of sealed keyring secrets use the password until it ends, and says
+  how an administrator clears it. With no lockout authorization set it notes
+  that any process with TPM access can reset the lockout. THREAT_MODEL.md,
+  DISABLE.md and SECURITY_AT_REST.md now say that the TPM does not count face
+  attempts, which configurations narrow the rollback of a retry record, and
+  that a verified root does not protect the writable state directory
+  (ADR-0034 §4, §5).
+
 - `irlume doctor` reports, as `pcr7-binding`, what PCR 7 bound in this boot,
   read from the firmware's TCG event log once the log's SHA-256 digests
   replay to the value PCR 7 holds and each event it reads matches its digest,

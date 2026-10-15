@@ -109,10 +109,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 - When irlume's storage key carries the ROCA fingerprint, `irlume doctor`'s
   `tpm-firmware` check now derives the key irlume's template gives and
-  compares the two. It names the eviction command only when they match. A
-  key with irlume's template that irlume did not derive, which another tool
-  may have placed at the handle, gets a warning to find what uses it first
-  (#1073).
+  compares the two. It names the eviction command when they match, and when
+  the TPM now derives a key without the fingerprint, as it does after a
+  firmware update fixed its key generation. A key with irlume's template that
+  irlume did not derive, on firmware that still generates affected keys, may
+  have been placed at the handle by another tool and gets a warning to find
+  what uses it first (#1073).
 
 - `irlume doctor`'s `secure-boot-certificates` check recognizes Microsoft's
   Secure Boot certificates by their SHA-256 hashes, as published in

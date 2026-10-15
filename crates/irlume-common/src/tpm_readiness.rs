@@ -226,6 +226,58 @@ impl TpmLockout {
     }
 }
 
+/// irlume's DA-exempt storage key (ADR-0034 §3.2) as irlumed last recorded
+/// it: persisted at a handle, refused, or neither because no envelope needed
+/// it yet. Optional fields, so a newer daemon's additions never stop an older
+/// client from reading the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaExemptKey {
+    /// The owner persistent handle the key is persisted at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    /// Why the last attempt to persist it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<KeyRefusal>,
+}
+
+/// A refused persist of the DA-exempt storage key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRefusal {
+    pub reason: RefusalReason,
+    /// The TPM's or the transport's own words.
+    pub detail: String,
+}
+
+/// Why the DA-exempt storage key could not be persisted (#1083).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// `TPM_RC_NV_SPACE`: no room for another persistent object.
+    NoSpace,
+    /// Every owner persistent handle is taken.
+    NoFreeHandle,
+    /// An owner authorization is set. irlume derives and persists its keys
+    /// with an empty one, so it can do neither.
+    OwnerAuthorization,
+    /// `IRLUME_SRK_HANDLE` does not parse, or names a handle outside the
+    /// owner persistent range.
+    HandleOverride,
+    /// Any other refusal.
+    Other,
+    /// A reason this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+impl RefusalReason {
+    /// Whether the refusal was for lack of room. Only then may irlumed try
+    /// again in the same boot, once `TPM_PT_HR_PERSISTENT_AVAIL` reads at
+    /// least 1 (#1083).
+    pub fn is_capacity(self) -> bool {
+        matches!(self, Self::NoSpace | Self::NoFreeHandle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1526,6 +1526,37 @@ fn main() {
                         ),
                     }
                 }
+                // irlume's DA-exempt storage key (ADR-0034 §3.2): found, or
+                // derived and persisted, here at startup, so no login pays
+                // for the derivation. It runs only while an envelope is under
+                // the original key, and after a refusal it derives nothing
+                // again in the same boot unless the TPM now has room (#1083).
+                // Nothing seals under the key yet.
+                use irlume_core::storage_key::Outcome;
+                match irlume_core::storage_key::ensure_at_start() {
+                    Ok(None | Some(Outcome::Present { .. } | Outcome::Deferred(_))) => {}
+                    Ok(Some(Outcome::Adopted { handle } | Outcome::Persisted { handle })) => {
+                        jout_notice!(
+                            "irlumed: irlume's DA-exempt storage key is persisted at \
+                             {handle:#010x} (ADR-0034 §3)"
+                        );
+                    }
+                    Ok(Some(Outcome::Refused(refusal))) => jout_warn!(
+                        "irlumed: could not persist irlume's DA-exempt storage key ({}); \
+                         envelopes stay on the original key, which a TPM lockout blocks; \
+                         irlumed tries again {}",
+                        refusal.detail,
+                        if refusal.reason.is_capacity() {
+                            "once the TPM has room, or at its first start in a later boot"
+                        } else {
+                            "at its first start in a later boot"
+                        }
+                    ),
+                    Err(e) => jout_warn!(
+                        "irlumed: could not check irlume's DA-exempt storage key ({e}); \
+                         envelopes stay on the original key"
+                    ),
+                }
             }
 
             // SO_PEERCRED is the authorization boundary, and the socket mode must not
@@ -6008,7 +6039,8 @@ fn tpm_readiness_report() -> Response {
             identity: Err(none.clone()),
             pcr_bank: Err(none.clone()),
             storage_key: Err(none.clone()),
-            lockout: Err(none),
+            lockout: Err(none.clone()),
+            da_exempt_key: Err(none),
         };
     }
     let text = |e: irlume_common::Error| e.to_string();
@@ -6017,6 +6049,7 @@ fn tpm_readiness_report() -> Response {
         pcr_bank: irlume_core::tpm::pcr_bank_readiness().map_err(text),
         storage_key: irlume_core::tpm::storage_key_check().map_err(text),
         lockout: irlume_core::tpm::lockout_state().map_err(text),
+        da_exempt_key: irlume_core::storage_key::report().map_err(text),
     }
 }
 
@@ -14001,6 +14034,7 @@ mod tests {
                 pcr_bank,
                 storage_key,
                 lockout,
+                da_exempt_key,
             } = tpm_readiness_report()
             else {
                 panic!("a TpmReadiness reply");
@@ -14009,6 +14043,7 @@ mod tests {
             assert_eq!(pcr_bank, Err("no TPM device".into()));
             assert_eq!(storage_key, Err("no TPM device".into()));
             assert_eq!(lockout, Err("no TPM device".into()));
+            assert_eq!(da_exempt_key, Err("no TPM device".into()));
         }
     }
 

@@ -168,6 +168,12 @@ fn lockout_not_reported() -> std::result::Result<tpm_readiness::TpmLockout, Stri
     Err("this irlumed predates the TPM lockout report".to_owned())
 }
 
+/// The `da_exempt_key` part of a `TpmReadiness` reply from a daemon that
+/// predates it.
+fn da_exempt_key_not_reported() -> std::result::Result<tpm_readiness::DaExemptKey, String> {
+    Err("this irlumed predates the DA-exempt storage key report".to_owned())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -197,6 +203,29 @@ pub fn state_dir_from_override(value: Option<&std::ffi::OsStr>) -> std::path::Pa
     value
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(STATE_DIR))
+}
+
+/// This boot's ID: `/proc/sys/kernel/random/boot_id`, a UUID the kernel
+/// "generated the first time this is retrieved, and unvarying after that"
+/// (Documentation/admin-guide/sysctl/kernel.rst), so it changes with every
+/// boot. `None` when it cannot be read or is not shaped like a UUID.
+pub fn boot_id() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = text.trim();
+    is_boot_id(id).then(|| id.to_owned())
+}
+
+/// Whether `id` has the kernel's boot ID shape: 36 characters, hex digits
+/// with hyphens at 8, 13, 18 and 23.
+fn is_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Hex sha256 of a byte slice.
@@ -2187,6 +2216,10 @@ pub enum Response {
         /// before the field sends none, which reads as the reason it predates.
         #[serde(default = "lockout_not_reported")]
         lockout: std::result::Result<tpm_readiness::TpmLockout, String>,
+        /// irlume's DA-exempt storage key (ADR-0034 §3.2, §4). A daemon from
+        /// before the field sends none, which reads as the reason it predates.
+        #[serde(default = "da_exempt_key_not_reported")]
+        da_exempt_key: std::result::Result<tpm_readiness::DaExemptKey, String>,
     },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
@@ -2912,6 +2945,9 @@ mod tests {
                 "lockout_auth_set": true, "in_lockout": false, "failed_tries": 3,
                 "max_tries": 32, "recovery_time": 7200, "lockout_recovery": 86400,
                 "storage_key_no_da": false
+            }},
+            "da_exempt_key": {"Ok": {
+                "refused": {"reason": "no_space", "detail": "insufficient space for NV allocation"}
             }}
         }});
         let parsed = serde_json::from_value::<Response>(reply.clone()).expect("the reply decodes");
@@ -2921,6 +2957,7 @@ mod tests {
             pcr_bank,
             storage_key,
             lockout,
+            da_exempt_key,
         } = parsed
         else {
             panic!("a TpmReadiness reply");
@@ -2934,6 +2971,49 @@ mod tests {
         let lockout = lockout.expect("the lockout state");
         assert!(lockout.lockout_auth_set && !lockout.in_lockout);
         assert_eq!((lockout.failed_tries, lockout.max_tries), (3, 32));
+        let key = da_exempt_key.expect("the DA-exempt key state");
+        assert_eq!(key.handle, None);
+        assert_eq!(
+            key.refused.map(|refused| refused.reason),
+            Some(tpm_readiness::RefusalReason::NoSpace)
+        );
+    }
+
+    /// A newer daemon may give a refusal reason this build does not know, or
+    /// add a field: the reply still decodes, with the reason unknown.
+    #[test]
+    fn a_da_exempt_key_state_from_a_newer_daemon_still_decodes() {
+        let newer = serde_json::json!({
+            "handle": 2_164_326_403_u32,
+            "refused": {"reason": "a_reason_added_later", "detail": "x"},
+            "added_later": true
+        });
+        let key: tpm_readiness::DaExemptKey =
+            serde_json::from_value(newer).expect("a newer state decodes");
+        assert_eq!(key.handle, Some(0x8101_0003));
+        assert_eq!(
+            key.refused.map(|refused| refused.reason),
+            Some(tpm_readiness::RefusalReason::Unknown)
+        );
+        assert_eq!(
+            serde_json::to_value(tpm_readiness::DaExemptKey::default()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn a_boot_id_has_the_kernel_uuid_shape() {
+        assert!(super::is_boot_id("0a1b2c3d-4e5f-6789-abcd-ef0123456789"));
+        for bad in [
+            "",
+            "0a1b2c3d4e5f6789abcdef0123456789",
+            "0a1b2c3d-4e5f-6789-abcd-ef012345678",
+            "0a1b2c3d-4e5f-6789-abcd-ef01234567890",
+            "0a1b2c3d_4e5f-6789-abcd-ef0123456789",
+            "0a1b2c3d-4e5f-6789-abcd-ef012345678g",
+        ] {
+            assert!(!super::is_boot_id(bad), "{bad:?}");
+        }
     }
 
     /// A daemon from before the lockout report sends a `TpmReadiness` reply
@@ -2945,12 +3025,16 @@ mod tests {
             "pcr_bank": {"Err": "no TPM device"},
             "storage_key": {"Err": "no TPM device"}
         }});
-        let Response::TpmReadiness { lockout, .. } =
-            serde_json::from_value::<Response>(older).expect("an older reply decodes")
+        let Response::TpmReadiness {
+            lockout,
+            da_exempt_key,
+            ..
+        } = serde_json::from_value::<Response>(older).expect("an older reply decodes")
         else {
             panic!("a TpmReadiness reply");
         };
         assert!(lockout.unwrap_err().contains("predates"));
+        assert!(da_exempt_key.unwrap_err().contains("predates"));
     }
 
     #[test]

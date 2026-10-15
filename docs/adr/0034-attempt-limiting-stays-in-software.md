@@ -20,19 +20,30 @@ eviction tracked in #1073.
 ### What irlume limits today
 
 Each account has a durable budget of 50 consecutive unsuccessful requests,
-shared by face verification and credential release, with short strikes of
-5 failures and then a 30-second wait before each further attempt
-(`crates/irlume-daemon/src/retry_throttle.rs`). The charge is written before
-any engine work, so a crash, an error, a cancellation or a reboot keeps it.
-Cooldowns use `CLOCK_MONOTONIC` and the boot ID, so a civil-clock change
-does not shorten them, and a reboot restarts a recorded cooldown for its
-full length. Only a written face grant, a verified password reset or an
-administrator reset clears the count. Records are 0600 root files under the
-0700 root-owned `/var/lib/irlume/retry`. The password-verified reset has its
-own budget with the same shape (`<uid>.reset.json`: 5, 30 s, ceiling 50).
+shared by face verification and credential release
+(`crates/irlume-daemon/src/retry_throttle.rs`, `FACE_LIMIT`). Inside it,
+short strikes add rests: by default every 5 striking outcomes (a spoof, a
+below-threshold match, an expired deadline, an unavailable runtime or
+another denial; no face, an uncertain result and the setup outcomes charge
+the budget without striking) start a 30-second cooldown, after which the
+strikes start again from zero
+(`IRLUME_RATE_LIMIT` 1 to 5, `IRLUME_RATE_COOLDOWN_SECS` 30 to 86400). The
+charge is written before any engine work, so a crash, an error, a
+cancellation or a reboot keeps it. Cooldowns use `CLOCK_MONOTONIC` and the
+boot ID, so a civil-clock change does not shorten them, and a reboot
+restarts a recorded cooldown for its full length. Only a written face
+grant, a verified password reset or an administrator reset clears the
+count. Records are 0600 root files under the 0700 root-owned
+`/var/lib/irlume/retry`. The password-verified reset has a budget of its
+own (`<uid>.reset.json`, `retry_throttle/recovery.rs`): after 5 failed
+checks each further check waits 30 seconds, and at 50 an administrator
+must reset it.
 
-THREAT_MODEL.md and DISABLE.md state the limit: "Write-ahead charges survive
-crashes and reboot, but cannot resist root deletion or disk rollback."
+DISABLE.md ("Persistent retry records") states the limit: "Write-ahead
+charges survive crashes and reboot, but cannot resist root deletion or disk
+rollback." THREAT_MODEL.md puts "Root deletion, disk rollback and the
+ambiguity between socket delivery and durable reset" outside "an
+exactly-once guarantee".
 
 ### The question
 
@@ -45,22 +56,29 @@ Windows uses the Trusted Platform Module", Platform Crypto Provider). A
 TPM 2.0 offers two mechanisms irlume could use (TPM 2.0 Library Part 1,
 version 185, clause numbers below):
 
-- **Dictionary-attack (DA) protection on an authorization value.** The TPM
-  counts failed authorizations of every object without `noDA` and every NV
-  index without `TPMA_NV_NO_DA` (16.8.1), in one set of counters for the
-  whole chip (16.8.2). While `failedTries` equals `maxTries`, "any use of a
-  DA-protected authValue will return TPM_RC_LOCKOUT" (16.8.3).
-  `failedTries` falls by one after each `recoveryTime` of powered-on time
-  without a failure (16.8.2), and a non-orderly shutdown after DA use adds
-  one (16.8.6). Resetting the counter, or changing the parameters, needs
-  `lockoutAuth`, and a wrong `lockoutAuth` blocks further attempts for
-  `lockoutRecovery` (16.8.4, 16.8.5).
+- **Dictionary-attack (DA) protection on an authorization value.** The
+  authValue of every object without `noDA` and every NV index without
+  `TPMA_NV_NO_DA` "receives DA protection" (16.8.1). One set of counters
+  serves the whole chip (16.8.2), and it counts failed authValue checks:
+  `failedTries` "is incremented when the TPM returns TPM_RC_AUTH_FAIL"
+  (16.8.2), while a failed policy returns `TPM_RC_POLICY` "to indicate that
+  dictionary attack protection was not involved" (16.8.3). While
+  `failedTries` equals `maxTries`, "any use of a DA-protected authValue
+  will return TPM_RC_LOCKOUT" (16.8.3). `failedTries` falls by one after
+  each `recoveryTime` without a failure or a power interruption (16.8.2),
+  and a TPM that starts after a non-orderly shutdown counts one more
+  failure (16.8.6; a note there allows counting it only when a DA-protected
+  object was used in that boot). `TPM2_DictionaryAttackLockReset` (16.8.4)
+  and `TPM2_DictionaryAttackParameters` (16.8.2) need Lockout
+  Authorization, `lockoutAuth` or `lockoutPolicy`, and a wrong
+  `lockoutAuth` blocks further attempts until `lockoutRecovery` has passed
+  or `lockoutPolicy` succeeds (16.8.5).
 - **An NV counter in the release policy.** A `TPM_NT_COUNTER` index changes
   only through `TPM2_NV_Increment` and starts above any value a counter of
   the same name ever had (34.2.6.3); `TPM2_PolicyNV` can make an unseal
-  conditional on its value (34.2.7). A PIN Fail index gives one secret a
-  failure count of its own, outside the global one (34.2.8.2), but it too
-  counts failures of a secret the user enters.
+  conditional on its value (34.2.7). A PIN Fail index gives one "authValue
+  (PIN)" a failure count of its own, outside the global one (34.2.8.2), but
+  it too counts failures of a secret the user enters.
 
 ### Measured on the maintainer's machines
 
@@ -74,23 +92,29 @@ NOTES.md section 7):
 | `MAX_AUTH_FAIL` / `LOCKOUT_INTERVAL` / `LOCKOUT_RECOVERY` | 32 / 7200 s / 86400 s | 32 / 7200 s / 86400 s |
 | NV counters defined / `NV_COUNTERS_AVAIL` / `NV_COUNTERS_MAX` | 5 / 0 / 128 | 4 / 12 / 0 (no limit) |
 
-Both TPMs carry a lockout authorization this Linux install does not know,
-most likely set by the Windows install each machine shipped with: since
-1703 Windows keeps the lockout authorization in its own registry
-(Microsoft Learn, "TPM Group Policy settings", level 5). Their parameters
-are the Windows 8 certification values "32, 7200, and 86400" (TCG TPM v2.0
-Provisioning Guidance 1.0 r1.0, 7.7), Windows' legacy profile: 32 failures,
-then one attempt every 2 hours. A lockout on these machines cannot be reset
-from Linux without clearing the TPM. Where Linux provisioned the TPM itself,
-`lockoutAuth` is usually empty (a cleared TPM's is EmptyAuth, Part 1
-10.8.1), and then any process that can open the TPM can reset the lockout
-or change its parameters. The Zenbook has no room for another orderly NV
-counter (`NV_COUNTERS_AVAIL` counts indexes "with ... the TPMA_NV_ORDERLY
-attribute SET", Part 2 version 185, table 28). A counter without
-`TPMA_NV_ORDERLY` writes NV on every increment (Part 1 34.2.4.3), an
-orderly one jumps forward to its next stored boundary after a power loss
-(34.2.6.3), the TPM may refuse a write with `TPM_RC_NV_RATE`, and the
-specification gives no endurance figure (34.6).
+Both TPMs carry a lockout authorization this Linux install does not know.
+Who set it is not established. Windows is a candidate: since 1703 its
+default keeps the lockout authorization ("For TPM 2.0, a value of 5 means
+keep the lockout authorization", Microsoft Learn, "TPM Group Policy
+settings"). The parameters are the Windows 8 certification values "32,
+7200, and 86400" (TCG TPM v2.0 Provisioning Guidance 1.0 r1.0, 7.7), the
+profile of Windows 10 1607 and earlier ("32 PIN guesses immediately, and
+then only one more guess every two hours", "TPM fundamentals"); current
+Windows instead configures the TPM "to lock after 32 authorization failures
+and to forget one authorization failure every 10 minutes" (same page). A
+lockout on these machines cannot be reset from Linux without clearing the
+TPM. Where Linux provisioned the TPM itself, `lockoutAuth` is usually
+empty (a cleared TPM's is EmptyAuth, Part 1 10.8.1), and then any process
+that can open the TPM can reset the lockout or change its parameters, as
+the swtpm test below did. The Zenbook reports no room for another orderly
+NV counter (`NV_COUNTERS_AVAIL` counts indexes "with their TPM_NT of
+TPM_NV_COUNTER and the TPMA_NV_ORDERLY attribute SET" and "is an
+estimate", Part 2 version 185, table 28). A counter without
+`TPMA_NV_ORDERLY` writes NV on every increment (Part 1 34.2.4.3); after a
+non-orderly shutdown an orderly one is set to its stored value ORed with
+`MAX_ORDERLY_COUNT`, a jump of up to that many counts (34.2.6.3); the TPM
+may refuse a write with `TPM_RC_NV_RATE`, and the specification gives no
+endurance figure (34.6).
 
 ### Who else uses the DA counter and NV space
 
@@ -98,9 +122,10 @@ specification gives no endurance figure (34.6).
   attack lockout mechanism, and may lock out users for a prolonged time ...
   The lockout mechanism is a global property of the TPM, systemd-cryptenroll
   does not control or configure the lockout mechanism"
-  (`man/systemd-cryptenroll.xml`, systemd main at b44cca76b958).
-  `src/shared/tpm2-util.c` sets `TPMA_OBJECT_NODA` on every object except
-  one protected by a PIN.
+  (`man/systemd-cryptenroll.xml`, systemd main at b44cca76b958). In
+  `src/shared/tpm2-util.c`, `tpm2_seal` sets `TPMA_OBJECT_NODA` on its
+  sealed object unless a PIN is used (`hmac_attributes |= pin ? 0 :
+  TPMA_OBJECT_NODA;`), and its storage key template sets it.
 - Windows Hello on a dual-boot machine: the PIN protector is "a TPM seal
   operation using the PIN as entropy", so each wrong PIN is a DA failure
   against the same counter (Microsoft Learn, "How Windows Hello for
@@ -116,8 +141,9 @@ specification gives no endurance figure (34.6).
   mode, it's global for all users" ("TPM Group Policy settings"). TCG
   expects this: "the operating system will layer additional anti-hammering
   protection atop that provided by the TPM" (Part 1 16.8.8.1).
-- systemd allocates NV indexes for pcrlock and its NvPCRs, and records NV
-  exhaustion separately for orderly and non-orderly indexes
+- systemd allocates NV indexes for pcrlock and for its NvPCRs, and flags NV
+  index space found exhausted in a boot, separately for orderly and
+  non-orderly NvPCRs
   (`/run/systemd/tpm2-nv-space-exhausted-{orderly,non-orderly}`).
 
 ### What the TPM can and cannot check
@@ -125,7 +151,8 @@ specification gives no endurance figure (34.6).
 The TPM verifies secrets (an authValue, through an HMAC or password
 session) and policies. It cannot judge a face. irlume's face decision is
 made in software by irlumed, and the credential it then releases is sealed
-under a PCR policy with no authValue (`tpm.rs` `sealed_template`). So:
+in an object authorized only by its PCR policy (`tpm.rs` `sealed_template`
+leaves `userWithAuth` clear, so its empty authValue cannot be used). So:
 
 - A DA-protected authValue limits guesses of a secret. The face path has no
   such secret. Adding one would mean a PIN for every face login, a different
@@ -146,20 +173,26 @@ an older retry record but cannot otherwise control the running system:
 |---|---|---|
 | Local account without root | Enforced: records are root-only. | Nothing. |
 | Root on the running system | Can delete records, read daemon memory, or unseal directly (PCR policy, no authValue). | Nothing: root needs no face attempts. |
-| Physical access, state on full-disk encryption unlocked by a passphrase or PIN | Cannot rewrite the record offline. | Nothing. |
-| Physical access, no such encryption | Can rewrite the record offline, and also `/etc/shadow`, the PAM stack and irlumed itself (SECURITY_AT_REST.md "Disk-theft test"). | Nothing that matters: the machine is already open. |
+| Physical access, state on full-disk encryption unlocked by a passphrase or PIN | Cannot read or rewrite the record offline; restoring an older image of the whole volume is the last row. | Nothing beyond the last row. |
+| Physical access, no such encryption | Can rewrite the record offline, and the rest of the installed system with it, for example `/etc/shadow`, the PAM stack or irlumed ("the installed system can be changed offline", SECURITY_AT_REST.md "Disk-theft test"). | Nothing that matters: the machine is already open. |
 | Physical access that can boot an older or writes-discarded copy of the state directory on a boot chain the seal accepts, and nothing more (for example a boot menu that offers file-system snapshots but locks command-line editing) | Each such boot starts from the older record. | Closes this case. |
 
 The last row is narrow: on most installs the same position, an editable
-boot menu or no disk-encryption PIN, already gives root. What closes it is
-full-disk encryption unlocked by a passphrase or PIN under
-`/var/lib/irlume`, so no copy of the state opens without the secret (a
-volume the TPM or a key file unlocks alone does not count, as
-SECURITY_AT_REST.md layer 3 says). The other layer 3 remedies do not: a
-verified root does not cover the writable state directory, and a pcrlock
-policy over the boot loader cannot tell an older copy of that directory
-from the current one, since the same boot loader boots both (a policy that
-covers PCR 4 "never closes" offline change, layer 3).
+boot menu or no disk-encryption PIN, already gives root. No configuration
+irlume can check closes it. Full-disk encryption unlocked by a passphrase
+or PIN under `/var/lib/irlume` (a volume the TPM or a key file unlocks
+alone does not count, SECURITY_AT_REST.md layer 3) narrows it: an older
+copy, even a block-level image restored without the key, then boots only
+when someone who knows the secret unlocks it, and the owner loses every
+change made since that copy. It does not make the record fresh: dm-crypt
+"provides transparent encryption of block devices" (kernel dm-crypt
+documentation), with no counter, so a restored valid older volume unlocks
+as usual. A verified root does not cover the writable state directory,
+and a pcrlock policy over the boot loader cannot tell an older copy of
+that directory from the current one, since the same boot loader boots
+both (a policy that covers PCR 4 "never closes" offline change, layer 3).
+Only a monotonic counter outside the disk, such as the TPM's, would close
+it.
 
 Against that, a counter costs: an NV index that can fail to allocate (the
 Zenbook has no orderly one left) and that competes with systemd; one NV
@@ -181,27 +214,40 @@ Guidance 7.5.1; `tpm2_get_srk_template` in `tpm2-util.c`: "TPMA_OBJECT_NODA
 is added"). irlume's key has the same empty authValue, so its DA
 protection guards no secret.
 
-Tested on a throwaway swtpm 0.10.2 (libtpms 0.10.2) with no host TPM
-visible, 2026-10-15 (evidence: `research-item5-2026-10-15/swtpm-da-lockout/`
-in the same directory, script, log and checksums):
-after two wrong PINs on a DA-protected test object put the TPM in lockout,
-`TPM2_Load` and `TPM2_Create` under a key made from irlume's `srk_template`
-both failed with `TPM_RC_LOCKOUT` (0x921). The same `noDA` PolicyPCR object
-under a key with `noDA` set loaded and unsealed. `TPM2_CreatePrimary` under
-the owner hierarchy still worked. This is the specified behavior: lockout
-makes no exception for an empty authValue (16.8.3; the TCG reference code's
-`CheckAuthSession`: "The authValue is going to be "used" even if it is an
-EmptyAuth"), while a `noDA` object is "not subject to lockout" (22.2.6), a
-permanent hierarchy other than lockout gets no DA protection (16.8.1), and
-an unbound policy session that does not use `PolicyAuthValue` or
-`PolicyPassword` is not checked (reference code). The Tier 2 policy's
-owner-authorized `PolicyAuthorizeNV` is therefore not blocked; the storage
-key is. So a lockout caused by anything else on the machine, such as wrong
-LUKS TPM2 PINs typed at boot or a Windows Hello PIN on dual boot, stops
-irlume's face login and fingerprint keyring unlock until it ends: one
-`recoveryTime` of powered-on time after the last failure, 2 hours on the
-machines above, which a power cycle can restart. The failure is closed, to
-the password, so it is an availability defect, not a bypass.
+Tested on a throwaway swtpm 0.10.2 (libtpms 0.10.2, tpm2-tools 5.8) with no
+host TPM visible, 2026-10-15 (evidence: `research-item5-2026-10-15/` in the
+same directory, `swtpm-da-lockout/` and `swtpm-audit-2026-10-15/`, scripts,
+logs and checksums). After two wrong PINs on a DA-protected test object put
+the TPM in lockout:
+
+- `TPM2_Load` and `TPM2_Create` under a key made from irlume's
+  `srk_template` failed with `TPM_RC_LOCKOUT` (0x921), for a Tier 3
+  (PolicyPCR) and a Tier 2 (owner-authorized `PolicyAuthorizeNV` over an
+  owner-read NV index) object alike.
+- Objects with the same templates and policies under a key with `noDA` set
+  loaded and unsealed, with the policy session unsalted, salted with that
+  key (as irlume's `with_session` salts with the storage key, unbound), or
+  salted and bound to it. Starting a session salted with the `srk_template`
+  key also succeeded; only the `Load` under it failed.
+- `TPM2_CreatePrimary` under the owner hierarchy, and
+  `TPM2_DictionaryAttackLockReset` with an empty `lockoutAuth`, worked.
+- The lockout ended one `recoveryTime` after the last failure, the counter
+  then one below the maximum.
+
+This matches the specification. Lockout makes no exception for an empty
+authValue (16.8.3; the TCG reference code's `CheckAuthSession` marks a
+password session's authValue used and calls `CheckLockedOut` for any handle
+`IsDAExempted` rejects), a `noDA` object is "not subject to lockout"
+(22.2.6), a permanent hierarchy other than lockout gets no DA protection
+(16.8.1), and the reference code notes that "a policy is still usable even
+if the object is DA protected and the TPM is in lockout" when the policy
+uses neither `PolicyAuthValue` nor `PolicyPassword`. So a lockout caused by
+anything else on the machine, such as wrong LUKS TPM2 PINs typed at boot or
+a Windows Hello PIN on dual boot, stops irlume's face login and fingerprint
+keyring unlock until it ends: one `recoveryTime` of powered-on time after
+the last failure, 2 hours on the machines above, which a power interruption
+can restart (16.8.2). The failure is closed, to the password, so it is an
+availability defect, not a bypass.
 
 ## Decision
 
@@ -210,19 +256,20 @@ the password, so it is an availability defect, not a bypass.
 The consecutive unsuccessful request ceiling and the reset-password budget
 stay irlume's only attempt limits, as shipped in #683 to the design in
 `docs/superpowers/specs/2026-09-08-cumulative-retry-recovery-design.md`.
-irlume does not
-add a DA-protected authValue or an NV counter to any release path, by
-default or as an option. Against Microsoft's three failure modes:
+irlume does not add a DA-protected authValue or an NV counter to any
+release path, by default or as an option. Against Microsoft's three
+failure modes:
 
 - **Restart:** the charge is written before engine work and survives
   crashes and reboots (unchanged).
 - **Clock change:** cooldowns use the monotonic clock and the boot ID, and a
   reboot restarts a recorded cooldown (unchanged).
-- **Rollback:** not covered. The record resists neither root nor offline
-  change, as documented; the Context table shows that only the narrow
-  older-copy boot is an attacker a TPM counter would stop, and what closes
-  it is full-disk encryption unlocked by a passphrase or PIN under the state
-  directory. Section 5 makes the documentation say so.
+- **Rollback:** not covered, and accepted as a residual. The record resists
+  neither root nor offline change, as documented; the Context table shows
+  that only the narrow older-copy boot is an attacker a TPM counter would
+  stop. Full-disk encryption unlocked by a passphrase or PIN under the
+  state directory narrows that case to boots someone who knows the secret
+  unlocks, but does not close it. Section 5 makes the documentation say so.
 
 ### 2. irlume stays out of the DA counter
 
@@ -230,10 +277,11 @@ Every TPM object irlume creates for its own seals is DA-exempt: the sealed
 objects (already `noDA`) and, from section 3, its storage key. No object
 irlume creates has a secret authValue (the storage key's is empty). irlume
 sends no `TPM2_DictionaryAttackLockReset` or
-`TPM2_DictionaryAttackParameters`, and never asks for, stores or derives
-`lockoutAuth`. A DA failure anywhere else
-on the machine therefore never touches irlume, and irlume never spends the
-budget that disk unlock PINs and Windows Hello depend on.
+`TPM2_DictionaryAttackParameters` (the pinned tss-esapi has no wrapper for
+either, so a call would go through raw `Esys_` bindings), defines no NV
+counter, and never asks for, stores or derives `lockoutAuth`. A DA failure
+anywhere else on the machine therefore never touches irlume, and irlume
+never spends the budget that disk unlock PINs and Windows Hello depend on.
 
 ### 3. The storage key moves to `noDA`
 
@@ -247,51 +295,83 @@ budget that disk unlock PINs and Windows Hello depend on.
    next to the old key's: 0x81010003 by default; with an
    `IRLUME_SRK_HANDLE` override, which keeps naming the old key's handle,
    the handle after it, or the one before it for an override at the top of
-   the owner persistent range (0x817FFFFF). When another stack's key holds
+   the owner persistent range (0x817FFFFF). Today the override accepts any
+   persistent handle, platform range included, and an unparsable value
+   silently becomes 0x81010002 (`persistent_srk_raw`); with this change an
+   override outside 0x81000000 to 0x817FFFFF, the range Owner
+   Authorization may assign (Part 1 34.3; 0x81800000 to 0x81FFFFFF needs
+   Platform Authorization), or one that does not parse, is refused and
+   logged, and new seals stay on the old key. When another
+   stack's key holds
    the preferred handle, irlumed takes the first free handle above it,
    wrapping within 0x81000000 to 0x817FFFFF, so the new key's handle never
    leaves the owner range. It records the chosen handle in a root-only
-   state file under `/var/lib/irlume`, which later starts read first. When
-   no owner handle is free, new seals stay on the persisted old key and
-   nothing moves: an envelope is never written under a transiently derived
-   key while a persisted key exists, since deriving one per call takes
-   longer than the PAM client allows. irlume keeps its own handles rather
-   than the shared 0x81000001: systemd puts an ECC key there when the TPM
-   supports one (`tpm2_get_best_srk_template`), and it is another stack's
-   to manage. Deriving an RSA-2048 primary takes more than 10 seconds on
-   slow firmware TPMs (`load_or_create_srk`), so irlumed derives and
-   persists the new key when it starts and finds an envelope under the old
-   key, and no login pays for it. Recognizing a key as irlume's
-   (`is_irlume_srk`, `derives_from_srk_template`, the doctor's storage-key
-   check of #1079) knows both templates; the old one is accepted for
-   loading only.
+   state file under `/var/lib/irlume`, which later starts read first. A free
+   handle number does not mean the TPM has room: persistent objects use NV
+   memory, and `TPM_PT_HR_PERSISTENT_AVAIL` is "the number of additional
+   persistent objects that could be loaded into NV memory", an estimate
+   (Part 2 version 185, table 28). So whenever the new key cannot be
+   persisted, because that property reads 0, no owner handle is free, or
+   `TPM2_EvictControl` refuses (for example `TPM_RC_NV_SPACE`), new seals
+   stay on the persisted old key and nothing moves; irlumed retries at its
+   next start, and doctor reports it. Deriving an RSA-2048 primary takes
+   more than 10 seconds on slow firmware TPMs (`load_or_create_srk`), which
+   would consume most of the authentication window (about 15 seconds at
+   login, 10 at `sudo` and polkit prompts, `irlume-auth`) on every
+   authentication. So no new envelope is written under a transiently
+   derived key while a persisted key exists. Today irlume does derive one
+   per call when another stack's key holds its handle (`load_or_create_srk`:
+   "correct, just slower"); that fallback stays for the old key and is not
+   extended to the new one. irlume keeps its own handles rather than the
+   shared 0x81000001 (`TPM2_SRK_HANDLE` in systemd's `tpm2-util.h`;
+   Provisioning Guidance table 2): systemd creates an ECC key there when
+   the handle is empty and the TPM supports one
+   (`tpm2_get_best_srk_template`), and it is another stack's to manage.
+   irlumed derives and persists the new key when it starts and finds an
+   envelope under the old key, so no login pays for the derivation.
+   Recognizing a key as irlume's (`is_irlume_srk`,
+   `derives_from_srk_template`, and the #1079 storage-key comparison
+   `storage_key_check`, which doctor reports under `tpm-firmware`) knows
+   both templates; the old one is accepted for loading only.
 3. **Envelopes.** New seals use the new key once it is persisted. A sealed
    envelope records the handle and TPM name of the key it was sealed under,
-   in a new optional field that older releases ignore (the provenance
-   record #1073 asks for), so a load goes straight to the right parent and
-   checks that the key there is the one it was sealed under; an envelope
-   without the field is under the old key. An envelope under the old key
-   moves at the points where envelopes already move to a stronger policy:
-   the template
-   key when irlumed starts (`move_best_effort` in `template_key.rs`, never
-   inside an authentication request, ADR-0025), and a keyring secret at the
-   next verified password login (`keyring::reseal_password`). Being under the
-   old key counts as a reason to move, like a weaker tier. A move happens
-   only when the new key is persisted, so a move never pays for a
-   derivation. A move is round-trip verified before it replaces the
-   envelope, and a failed move leaves the old envelope in use.
+   in a new optional field that older releases ignore (`SealedEnvelope` has
+   no `deny_unknown_fields`), so a load goes straight to the right parent
+   and checks that the key there is the one it was sealed under; an
+   envelope without the field is under the old key. This extends the
+   record #1073 proposes, the persisted key's TPM name kept once per host,
+   to every envelope. An envelope under the old key moves at the points
+   where envelopes already move to a stronger policy: the template key at
+   irlumed's start (`move_to_stronger_policy`, through `move_with`) and best
+   effort on the other non-authentication loads and writes that already
+   call `move_best_effort`, never inside an authentication request
+   (ADR-0025: at most one unseal); a keyring secret at `irlume keyring arm`
+   or at the next login whose PAM session runs pam_irlume's `reseal` line
+   (`ResealPassword`, root-only, `keyring::reseal_password`). Being under
+   the old key counts as a reason to move, like a weaker tier. A move
+   happens only when the new key is persisted, so a move never pays for a
+   derivation. Today only a Tier 2 seal is round-trip verified (`tpm::seal`
+   unseals a pcrlock candidate; the literal PCR seal is not unsealed before
+   use), so the move to the new key adds its own round trip: the candidate
+   is unsealed and compared before it replaces the envelope. Every move
+   writes with `save_reporting`, which tells a visible but not durable
+   write (`AtomicWrite::VisibleNotDurable`) from a failed one, where
+   `save` reports both as an error. A failed move leaves the old envelope
+   in use.
 4. **The old key.** It stays persisted while any envelope on the host names
    it, including envelopes that no longer unseal because their PCRs moved.
    A move is not durable just because the new envelope is visible: when
    syncing the directory fails (`AtomicWrite::VisibleNotDurable`), a power
    loss can bring back the envelope under the old key (`move_with` in
-   `template_key.rs`). So "none names it" counts only when every move off
-   the old key reported a durable write and a scan in a later boot (another
-   boot ID) still finds no envelope naming it; a restored envelope is found
-   first and keeps the key. Evicting it then is the daemon-performed
-   eviction tracked in #1073, with the uninstall path's rule: exact identity
-   by derived modulus, never a shape match. Uninstall evicts both keys
-   under that rule.
+   `template_key.rs`). So the old key counts as unused only when every move
+   off it reported a durable write and a scan in a later boot (another boot
+   ID) still finds no envelope naming it; a restored envelope is found first
+   and keeps the key. Evicting it then uses the daemon request #1073
+   proposes for a key with the ROCA fingerprint (item 2: a root-only
+   request on the worker that checks the key is still irlume's, as
+   `evict_persistent_srk` does), extended to the old key, with the
+   uninstall path's rule: exact identity by derived modulus, never a shape
+   match. Uninstall evicts both keys under that rule.
 
    Eviction frees a persistent handle; it does not destroy the key. The old
    template derives the same key bit for bit on the same TPM (`tpm.rs`:
@@ -301,9 +381,14 @@ budget that disk unlock PINs and Windows Hello depend on.
    restored backup, still opens. irlumed's start, finding such an envelope
    and no persisted old key, derives the old key once, persists it again by
    the rule of section 3.2, and moves the envelope; no recovery passphrase
-   or re-enrollment is needed. Only what would orphan any envelope today
-   orphans it: a cleared TPM, or a firmware update that changes how the TPM
-   derives keys (the ROCA case of #1079).
+   or re-enrollment is needed. Eviction adds one exposure that a persisted
+   key does not have: today a firmware update that changes how the TPM
+   derives keys (the ROCA case of #1079) leaves the persisted key, and so
+   its envelopes, usable; once the old key is evicted, such an update makes
+   it impossible to re-derive, and an envelope under it that comes back
+   afterwards needs `irlume recovery restore` or a re-enrollment, as after
+   a cleared TPM. Phase 3 therefore states it in the eviction's log line
+   and in doctor.
 
 ### 4. doctor reports the TPM lockout
 
@@ -314,7 +399,8 @@ reply (an older daemon's reply reads as unknown):
 - `lockoutAuthSet` and `inLockout` from `TPM_PT_PERMANENT`, and
   `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`, `TPM_PT_LOCKOUT_INTERVAL`
   and `TPM_PT_LOCKOUT_RECOVERY`;
-- whether the storage key irlume seals under is DA-exempt.
+- whether the storage key irlume seals under is DA-exempt, and, when the
+  new key could not be persisted (section 3.2), why.
 
 Readings, the first that applies:
 
@@ -337,13 +423,15 @@ authorization is known, and otherwise the operating system that holds it.
 
 ### 5. The documentation names the rollback limit precisely
 
-THREAT_MODEL.md ("Consecutive unsuccessful request ceiling") and DISABLE.md
-("Persistent retry records") say that, by this ADR, the TPM does not count
+THREAT_MODEL.md (the "Consecutive unsuccessful request ceiling" bullet of
+"Intent, throttling, and privilege elevation") and DISABLE.md ("Persistent
+retry records") say that, by this ADR, the TPM does not count
 face attempts; that the record does not resist root, offline change, or a
 boot of an older or writes-discarded copy of the state directory on a boot
-chain the seal accepts; and that only full-disk encryption unlocked by a
-passphrase or PIN under `/var/lib/irlume` closes the last case, which a
-verified root or a pcrlock policy does not.
+chain the seal accepts. They say that the last case stays open: full-disk
+encryption unlocked by a passphrase or PIN under `/var/lib/irlume` narrows
+it to boots someone who knows the secret unlocks, but gives the record no
+freshness, and a verified root or a pcrlock policy does not narrow it.
 
 ### 6. When to revisit
 
@@ -364,12 +452,16 @@ so that only an administrator can reset a lockout.
   root-only state file naming the new key's handle, and one rewrite of
   each envelope.
 - A downgrade to a release before section 3 cannot open an envelope already
-  moved: the keyring secret reseals under the old key at the next password
-  login, and the template key needs `irlume recovery restore` or a
-  re-enrollment. Section 3's CHANGELOG entry says so.
+  moved: the keyring secret reseals under the old key at the next login
+  that runs pam_irlume's `reseal` line, and the template key needs
+  `irlume recovery restore` or a re-enrollment. Section 3's CHANGELOG entry
+  says so.
+- After Phase 3 evicts the old key, a firmware update that changes key
+  derivation makes a returning old-key envelope need recovery
+  (section 3.4); until then the persisted old key protects against it.
 - doctor gains one read-only check and the `TpmReadiness` reply one field.
-- The rollback residual stays, and is now described in terms of the
-  configurations that close it.
+- The rollback residual stays, and is now described precisely: what
+  narrows it, and that nothing irlume can check closes it.
 
 ## Phasing
 
@@ -377,8 +469,8 @@ so that only an administrator can reset a lockout.
   section 2, and the documentation of section 5.
 - **Phase 2:** the storage key move (section 3.1 to 3.3), with the swtpm
   lockout test below.
-- **Phase 3:** evicting the old key (section 3.4), decided and implemented
-  under #1073.
+- **Phase 3:** evicting the old key (section 3.4) with the daemon request
+  #1073 proposes, extended to the old key.
 
 ## Acceptance tests
 
@@ -392,25 +484,37 @@ so that only an administrator can reset a lockout.
   the old key fails to load while locked out, then moves to the new key at
   its move point once the lockout is cleared and unseals in a later lockout.
   The test restores the parameters, or runs in its own swtpm instance, so
-  no other test sees the lockout. It runs in the CI swtpm lane by its
-  `tpm_` name.
-- A move that fails its round trip leaves the old envelope in place and
-  loadable; an envelope that no longer unseals keeps the old key reported
-  as needed. With an envelope under the old key, irlumed's start persists
-  the new key, and no login derives a key.
+  no other test sees the lockout. It is added by name to the irlume-core
+  list of the "test (TPM-gated, against swtpm)" step in `ci.yml` (that
+  lane runs listed names; only the irlume-daemon lane selects by the
+  `tpm_` substring).
+- The move to the new key unseals and compares its candidate before
+  replacing the envelope, for Tier 3 as for Tier 2; a candidate that does
+  not unseal to the same secret leaves the old envelope in place and
+  loadable. Every move writes with `save_reporting`, and a
+  `VisibleNotDurable` result is reported as visible, not as a failure. An
+  envelope that no longer unseals keeps the old key reported as needed.
+  With an envelope under the old key, irlumed's start persists the new
+  key, and no login derives a key.
 - With the preferred handle held by another stack's key, the new key is
   persisted at the next free owner handle and found there again after a
-  restart through the recorded handle; with no owner handle free, new
-  seals and moves stay on the persisted old key, and no envelope is ever
-  written under a transiently derived key.
+  restart through the recorded handle. When the new key cannot be
+  persisted (`TPM_PT_HR_PERSISTENT_AVAIL` 0 with numerically free handles,
+  no owner handle free, or `TPM2_EvictControl` returning `TPM_RC_NV_SPACE`
+  on swtpm or a fake), new seals and moves stay on the persisted old key,
+  no envelope is ever written under a transiently derived key, and the
+  next start tries again.
 - An envelope records its parent's handle and TPM name; a load that finds
   another key at that handle refuses it, as for a foreign key today.
 - `is_irlume_srk`, `derives_from_srk_template`, `evict_persistent_srk` and
-  the doctor storage-key check (#1079) recognize both templates; a key
-  matching neither stays foreign.
+  `storage_key_check` (#1079) recognize both templates; a key matching
+  neither stays foreign.
 - The new key's handle is 0x81010003 by default, the override's next
   handle for an `IRLUME_SRK_HANDLE` override, and 0x817FFFFE for an
-  override of 0x817FFFFF: never outside the owner persistent range.
+  override of 0x817FFFFF: never outside the owner persistent range. An
+  override in the platform range (0x81800000 to 0x81FFFFFF), outside the
+  persistent range, or that does not parse as hex is refused and logged,
+  and new seals stay on the old key.
 - Phase 3, under #1073: a move whose write reports
   `AtomicWrite::VisibleNotDurable` keeps the old key needed; with every move
   durable, the old key is not evicted in the boot that made the last move,
@@ -423,8 +527,9 @@ so that only an administrator can reset a lockout.
 - `tpm-lockout` readings for pass, both warnings, info and unknown come from
   synthetic capability values; a `TpmReadiness` reply without the new field
   parses and reads unknown; the CLI never opens the TPM for it.
-- No non-test code calls `dictionary_attack_lock_reset`,
-  `dictionary_attack_parameters`, `nv_increment` or `nv_define_space` with
-  a counter type (source-shape test, as the repository's other source
-  scans).
+- No non-test code calls `Esys_DictionaryAttackLockReset` or
+  `Esys_DictionaryAttackParameters` (the pinned tss-esapi has no safe
+  wrapper for either), `nv_increment`, or `nv_define_space` with
+  `NvIndexType::Counter` (source-shape test, as the repository's other
+  source scans).
 - THREAT_MODEL.md and DISABLE.md carry the section 5 wording.

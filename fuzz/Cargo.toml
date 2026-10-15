@@ -4,7 +4,8 @@
 # IPC request line on /run/irlume.sock (any local process can write it), the
 # sealed envelope on disk, and the systemd PCR-signature file. A panic or
 # memory error in any of those parsers is a local denial of service against a
-# root daemon, so each gets a target here.
+# root daemon, so each gets a target here. `irlume doctor`, run as root, also
+# parses the firmware event log, some of whose data comes from devices.
 #
 # This is its own workspace (the empty [workspace] table below) so the stable
 # MSRV build of the main workspace never pulls in libfuzzer-sys, which needs
@@ -53,6 +54,13 @@ bench = false
 [[bin]]
 name = "sealed_envelope"
 path = "fuzz_targets/sealed_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_log"
+path = "fuzz_targets/event_log.rs"
 test = false
 doc = false
 bench = false

@@ -4475,6 +4475,17 @@ fn pcr7_binding_verdict(
             ),
         );
     }
+    if pcr7.authorities.iter().any(|a| a.disables_validation()) {
+        return (
+            State::Warn,
+            "shim measured MokSBState into PCR 7: its validation is disabled \
+             (`mokutil --disable-validation`), so it loads images without checking them \
+             and PCR 7 binds no boot chain past shim. `sudo mokutil --enable-validation` \
+             turns it back on. That changes PCR 7, so set a recovery passphrase first \
+             (`irlume recovery setup`)"
+                .to_owned(),
+        );
+    }
     if !pcr7.authorities.iter().any(|a| a.verifies_images()) {
         let detail = if pcr7.authorities.is_empty() {
             "no authority was measured into PCR 7: nothing verified what booted, so a \
@@ -4495,7 +4506,10 @@ fn pcr7_binding_verdict(
         };
         return (State::Warn, detail);
     }
+    // Firmware decides how many authorities there are: name at most eight.
+    const MAX_NAMES: usize = 8;
     let mut names: Vec<String> = Vec::new();
+    let mut unnamed = 0usize;
     let mut successors: Vec<&str> = Vec::new();
     for authority in &pcr7.authorities {
         let name = match authority.variable.as_str() {
@@ -4505,7 +4519,9 @@ fn pcr7_binding_verdict(
                 // A boot loader signed by the 2011 CA's 2023 replacement is
                 // measured with that certificate instead, which moves PCR 7.
                 if let Some(successor) = microsoft.and_then(signing_ca_successor) {
-                    successors.push(successor);
+                    if !successors.contains(&successor) {
+                        successors.push(successor);
+                    }
                 }
                 microsoft.map_or_else(
                     || "a db certificate that is not Microsoft's".to_owned(),
@@ -4524,9 +4540,17 @@ fn pcr7_binding_verdict(
             }
             other => format!("an authority from `{}`", firmware_text(other)),
         };
-        if !names.contains(&name) {
-            names.push(name);
+        if names.contains(&name) {
+            continue;
         }
+        if names.len() < MAX_NAMES {
+            names.push(name);
+        } else {
+            unnamed += 1;
+        }
+    }
+    if unnamed > 0 {
+        names.push(format!("{unnamed} more"));
     }
     let mut detail = format!(
         "PCR 7 binds Secure Boot on, its databases and the authorities that verified this \
@@ -6568,7 +6592,7 @@ mod tests {
                 Authority {
                     guid: SHIM_LOCK,
                     variable: "MokListRT".into(),
-                    data: b"key",
+                    data: &[0x77; 40],
                 },
             ],
             actions: vec![],
@@ -6613,6 +6637,45 @@ mod tests {
         assert_eq!(state, State::Warn, "{detail}");
         assert!(
             detail.contains("no authority that verified an image, only policy (`SbatLevel`)"),
+            "{detail}"
+        );
+        // shim with its validation disabled measures MokSBState: the db entry
+        // that verified shim does not cover what shim loads then.
+        let mut disabled = shim();
+        disabled.authorities.push(Authority {
+            guid: SHIM_LOCK,
+            variable: "MokSBState".into(),
+            data: &[1],
+        });
+        let (state, detail) = pcr7_binding_verdict(&disabled);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("validation is disabled")
+                && detail.contains("`sudo mokutil --enable-validation`"),
+            "{detail}"
+        );
+        // An image authority without its signature data verified nothing.
+        let mut hollow = shim();
+        hollow.authorities.retain(|a| a.variable == "db");
+        hollow.authorities[0].data = &[0x77; 16];
+        assert_eq!(pcr7_binding_verdict(&hollow).0, State::Warn);
+        // Firmware decides how many authorities there are; at most eight are
+        // named, the rest counted.
+        let mut many = shim();
+        let names: Vec<String> = (0..20).map(|i| format!("Vendor{i}")).collect();
+        for name in &names {
+            many.authorities.push(Authority {
+                guid: SHIM_LOCK,
+                variable: name.clone(),
+                data: &[1],
+            });
+        }
+        let (state, detail) = pcr7_binding_verdict(&many);
+        assert_eq!(state, State::Pass, "{detail}");
+        assert!(
+            detail.contains("`Vendor4`")
+                && !detail.contains("`Vendor5`")
+                && detail.contains("; 15 more"),
             "{detail}"
         );
         // A db authority under another GUID is not the signature database.

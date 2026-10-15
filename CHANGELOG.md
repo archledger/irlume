@@ -15,8 +15,9 @@ All notable changes to irlume are documented here. This project adheres to
   pre-boot DMA protection in PCR 7, when Secure Boot was measured as off, when
   SecureBoot, PK, KEK, db and dbx (under their UEFI vendor GUIDs) were not
   measured first, in that order with nothing in between, or one of the first
-  three held no data, or when no authority that verifies an image was
-  measured (shim's SBAT level is policy). It otherwise names the authorities
+  three held no data, when shim measured its validation as disabled
+  (`MokSBState`), or when no authority that verifies an image was measured
+  (shim's SBAT level is policy). It otherwise names the authorities
   (Microsoft's certificates by hash, also one `db` holds as a bare RSA key). When a 2011 Microsoft CA signed the boot
   loader it notes that one signed by the 2023 replacement, as distributions
   ship after the 2011 CAs' expiry, changes PCR 7 (#1080).

@@ -136,9 +136,12 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
     for _ in 0..count {
         sizes.push((spec.u16()?, usize::from(spec.u16()?)));
     }
-    // vendorInfoSize and vendorInfo close the header.
+    // vendorInfoSize and vendorInfo close the header, with nothing after.
     let vendor_info = usize::from(spec.take(1)?[0]);
     spec.take(vendor_info)?;
+    if !spec.0.is_empty() {
+        return None;
+    }
     let mut out = Vec::new();
     while !r.0.is_empty() {
         if out.len() >= MAX_EVENTS {
@@ -192,7 +195,8 @@ pub fn replay(events: &[Event<'_>], pcr: u32) -> Option<[u8; 32]> {
 
 /// A UEFI_VARIABLE_DATA event: the variable's vendor GUID, its name and its
 /// data. The GUID is part of the variable's identity: a `db` under another
-/// GUID is not the signature database.
+/// GUID is not the signature database. An event whose size is not exactly
+/// what the structure declares does not parse (as systemd-pcrlock checks).
 fn variable(data: &[u8]) -> Option<([u8; 16], String, &[u8])> {
     let mut r = Reader(data);
     let guid: [u8; 16] = r.take(16)?.try_into().ok()?;
@@ -203,7 +207,11 @@ fn variable(data: &[u8]) -> Option<([u8; 16], String, &[u8])> {
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    Some((guid, String::from_utf16(&name).ok()?, r.take(data_len)?))
+    let data = r.take(data_len)?;
+    if !r.0.is_empty() {
+        return None;
+    }
+    Some((guid, String::from_utf16(&name).ok()?, data))
 }
 
 /// An authority measured into PCR 7: the variable, with its vendor GUID, and
@@ -221,13 +229,23 @@ pub struct Authority<'a> {
 impl Authority<'_> {
     /// Whether this authority verified an image, as the firmware's `db` and
     /// shim's `vendor_db`, `MokListRT` and `Shim` measurements do (shim's
-    /// verify.c, rhboot/shim main 2026-10-01).
+    /// verify.c, rhboot/shim main 2026-10-01). The first three measure an
+    /// EFI_SIGNATURE_DATA (owner GUID, then the signature), `Shim` shim's
+    /// built-in certificate; one without that data verified nothing.
     pub fn verifies_images(&self) -> bool {
         match self.variable.as_str() {
-            "db" | "vendor_db" => self.guid == EFI_IMAGE_SECURITY_DATABASE,
-            "MokListRT" | "Shim" => self.guid == SHIM_LOCK,
+            "db" | "vendor_db" => self.guid == EFI_IMAGE_SECURITY_DATABASE && self.data.len() > 16,
+            "MokListRT" => self.guid == SHIM_LOCK && self.data.len() > 16,
+            "Shim" => self.guid == SHIM_LOCK && !self.data.is_empty(),
             _ => false,
         }
+    }
+
+    /// Whether this is shim's `MokSBState`, which shim measures when its
+    /// validation is disabled (`mokutil --disable-validation`): it then
+    /// loads images without checking them.
+    pub fn disables_validation(&self) -> bool {
+        self.variable == "MokSBState" && self.guid == SHIM_LOCK
     }
 }
 
@@ -311,9 +329,14 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
                     });
                 }
             }
-            EV_EFI_ACTION => out
-                .actions
-                .push(String::from_utf8_lossy(event.data).into_owned()),
+            // Some firmware ends the string with NULs (a Dell log in fwupd
+            // discussion 8760 measures "DMA Protection Disabled\0").
+            EV_EFI_ACTION => {
+                let text = event.data;
+                let end = text.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                out.actions
+                    .push(String::from_utf8_lossy(&text[..end]).into_owned());
+            }
             _ => {}
         }
     }
@@ -543,7 +566,7 @@ pub(crate) mod tests {
             ),
             (7, EV_EFI_VARIABLE_DRIVER_CONFIG, var("KEK", &[0x30; 4])),
         ];
-        measured.push((7, EV_EFI_VARIABLE_AUTHORITY, var("MokListRT", b"key")));
+        measured.push((7, EV_EFI_VARIABLE_AUTHORITY, var("MokListRT", &[0x77; 40])));
         let data = log(&measured);
         let pcr7 = pcr7(&events(&data).unwrap().0);
         assert_eq!(pcr7.secure_boot, None, "a SecureBoot under another GUID");
@@ -579,6 +602,9 @@ pub(crate) mod tests {
         let mut short_vendor_info = spec_id(2, &algorithms);
         short_vendor_info.extend_from_slice(&[3, b'a']);
         assert_eq!(events(&header(&short_vendor_info)), None);
+        let mut trailing = spec_id(2, &algorithms);
+        trailing.extend_from_slice(&[0, 0xff]);
+        assert_eq!(events(&header(&trailing)), None, "bytes after vendorInfo");
         let mut too_many = spec_id(MAX_ALGORITHMS + 1, &[(0x000b, 32); 65]);
         too_many.push(0);
         assert_eq!(events(&header(&too_many)), None);
@@ -589,9 +615,36 @@ pub(crate) mod tests {
 
     #[test]
     fn firmware_actions_in_pcr_7_are_kept() {
-        let data = shim_boot(b"c", &["UEFI Debug Mode", "DMA Protection Disabled"]);
+        let data = shim_boot(b"c", &["UEFI Debug Mode", "DMA Protection Disabled\0\0"]);
         let pcr7 = pcr7(&events(&data).unwrap().0);
-        assert_eq!(pcr7.actions, ["UEFI Debug Mode", "DMA Protection Disabled"]);
+        assert_eq!(
+            pcr7.actions,
+            ["UEFI Debug Mode", "DMA Protection Disabled"],
+            "trailing NULs are not part of the action"
+        );
+    }
+
+    /// An authority counts as verifying an image only with the data such a
+    /// measurement carries; shim's MokSBState is told apart.
+    #[test]
+    fn an_authority_verifies_images_only_with_its_signature_data() {
+        let authority = |variable: &str, guid, data: &'static [u8]| Authority {
+            guid,
+            variable: variable.to_owned(),
+            data,
+        };
+        let entry: &[u8] = &[0x77; 17];
+        assert!(authority("db", EFI_IMAGE_SECURITY_DATABASE, entry).verifies_images());
+        assert!(!authority("db", EFI_IMAGE_SECURITY_DATABASE, &[0x77; 16]).verifies_images());
+        assert!(!authority("db", EFI_IMAGE_SECURITY_DATABASE, &[]).verifies_images());
+        assert!(authority("vendor_db", EFI_IMAGE_SECURITY_DATABASE, entry).verifies_images());
+        assert!(authority("MokListRT", SHIM_LOCK, entry).verifies_images());
+        assert!(!authority("MokListRT", SHIM_LOCK, &[0x77; 16]).verifies_images());
+        assert!(authority("Shim", SHIM_LOCK, b"c").verifies_images());
+        assert!(!authority("Shim", SHIM_LOCK, &[]).verifies_images());
+        assert!(!authority("SbatLevel", SHIM_LOCK, entry).verifies_images());
+        assert!(authority("MokSBState", SHIM_LOCK, &[1]).disables_validation());
+        assert!(!authority("MokSBState", EFI_GLOBAL_VARIABLE, &[1]).disables_validation());
     }
 
     #[test]
@@ -709,6 +762,9 @@ pub(crate) mod tests {
             variable(&long),
             Some((EFI_IMAGE_SECURITY_DATABASE, "db".to_owned(), &b"x"[..]))
         );
+        let mut padded = long.clone();
+        padded.push(0);
+        assert_eq!(variable(&padded), None, "bytes past the declared data");
         long[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(variable(&long), None);
         let mut odd = var("db", b"x");

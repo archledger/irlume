@@ -421,15 +421,21 @@ today, and doctor says so (section 4).
    proposes for a key with the ROCA fingerprint (item 2: a root-only
    request on the worker that checks the key is still irlume's, as
    `evict_persistent_srk` does), extended to the old key, with exact
-   identity, never a shape match: either today's derivation of the old
-   template gives the same modulus (the uninstall path's rule), or the
-   key's TPM name equals the one irlumed recorded in its state file while
-   that derivation still matched. Phase 2 records it at the first start
-   that verifies the old key by derivation, the record #1073 proposes, so a
-   firmware update that changes derivation between Phase 2 and Phase 3 does
-   not strand the old key's handle. An old key that no longer matches when
+   identity, never a shape match. Only a fresh derivation proves it on its
+   own: Phase 3 and uninstall evict the old key automatically only when
+   today's derivation of the old template gives the same modulus (the
+   uninstall path's rule), and uninstall evicts the new key by the same
+   rule against the new template. Phase 2 also records the old key's TPM name at
+   the first start that verifies it by derivation, the record #1073
+   proposes, but that record lives in the state directory, which section 5
+   treats as untrusted on hosts where it is writable offline, so it is
+   advisory and never by itself authorizes destroying a key. When only the
+   recorded name matches, as after a firmware update that changed
+   derivation between Phase 2 and Phase 3, doctor and uninstall report the
+   handle and the key's name, and the key is evicted only after an
+   administrator confirms it explicitly with a root-only request that
+   names that handle and name. An old key that no longer matches when
    Phase 2 first runs is not recorded and keeps the #1079 manual path.
-   Uninstall evicts both keys under that rule.
 
    Eviction frees a persistent handle; it does not destroy the key. The old
    template derives the same key bit for bit on the same TPM (`tpm.rs`:
@@ -624,10 +630,13 @@ so that only an administrator can reset a lockout.
   and new seals stay on the old key.
 - Phase 2 records the old key's TPM name at the first start whose
   derivation matches it. Phase 3 and uninstall evict a key at the old
-  handle that matches either today's derivation or that recorded name,
-  and never one that matches neither. The test stands in for a derivation
+  handle on their own only when today's derivation matches it. A key that
+  matches only the recorded name (the test stands in for a derivation
   change with a key at the old handle that today's derivation does not
-  reproduce but whose name was recorded.
+  reproduce but whose name was recorded) is reported with its handle and
+  name and evicted only after the administrator's explicit root-only
+  confirmation naming both; a record edited to name another stack's key
+  at that handle evicts nothing without that confirmation.
 - Phase 3, under #1073: a move whose write reports
   `AtomicWrite::VisibleNotDurable` keeps the old key needed; with every move
   durable, the old key is not evicted in the boot that made the last move,

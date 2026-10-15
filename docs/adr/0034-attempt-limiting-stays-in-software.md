@@ -175,7 +175,7 @@ an older retry record but cannot otherwise control the running system:
 | Root on the running system | Can delete records, read daemon memory, or unseal directly (PCR policy, no authValue). | Nothing: root needs no face attempts. |
 | Physical access, state on full-disk encryption unlocked by a passphrase or PIN | Cannot read or rewrite the record offline; restoring an older image of the whole volume is the last row. | Nothing beyond the last row. |
 | Physical access, no such encryption | Can rewrite the record offline, and the rest of the installed system with it, for example `/etc/shadow`, the PAM stack or irlumed ("the installed system can be changed offline", SECURITY_AT_REST.md "Disk-theft test"). | Nothing that matters: the machine is already open. |
-| Physical access, a verified root (dm-verity) covering the system and `/etc`, the state directory writable and not encrypted | Can rewrite the record offline, but not the verified system. | Nothing that matters: the same writer can replace the other state irlume reads there, the enrollment and the sealed template key, which carry no authenticity check an offline writer cannot meet (below). |
+| Physical access, a verified root (dm-verity) covering the system and `/etc`, the state directory writable and not encrypted | Can rewrite the record offline, but not the verified system. | Nothing that matters: on that configuration the whole state directory is untrusted input that the offline writer controls (below). |
 | Physical access that can boot an older or writes-discarded copy of the state directory on a boot chain the seal accepts, and nothing more (for example a boot menu that offers file-system snapshots but locks command-line editing) | Each such boot starts from the older record. | Closes this case. |
 
 The last row is narrow: on most installs the same position, an editable
@@ -195,21 +195,15 @@ both (a policy that covers PCR 4 "never closes" offline change, layer 3).
 Only a monotonic counter outside the disk, such as the TPM's, would close
 it.
 
-The verified-root row needs its reason spelled out. The template key is
-loaded from its envelope after a check of the envelope's `uid` field and an
-unseal (`template_key.rs` `load_key_with`); the enrollment is decrypted with
-that key and its own `uid` field checked (`storage.rs`
-`load_path_with_source`). Both fields are in files under
-`/var/lib/irlume`. Creating a sealed object under irlume's storage key
-needs no secret, since its authValue is empty, and accepts any policy,
-including one copied from an existing envelope's public area; such an
-object unseals under the same PCR state (swtpm, 2026-10-15). So on that
-configuration the state directory is trusted input that an offline writer
-controls, and the rollback of one record is not the weakest point.
-SECURITY_AT_REST.md layer 3 offers a verified root as a remedy for the
-offline change of the installed system; it does not protect the writable
-state directory, which needs full-disk encryption unlocked by a passphrase
-or PIN for any at-rest guarantee about its contents. Section 5 says so.
+The verified-root row: what irlume reads from `/var/lib/irlume`, the
+enrollments and sealed keys as well as the retry records, is state an
+offline writer of that directory controls, so on that configuration the
+state directory is untrusted input and the rollback of one record is not
+the weakest point. SECURITY_AT_REST.md layer 3 offers a verified root as a
+remedy for the offline change of the installed system; it does not
+protect the writable state directory, which needs full-disk encryption
+unlocked by a passphrase or PIN for any at-rest guarantee about its
+contents. Section 5 says so.
 
 Against that, a counter costs: an NV index that can fail to allocate (the
 Zenbook has no orderly one left) and that competes with systemd; one NV
@@ -296,9 +290,13 @@ irlume creates has a secret authValue (the storage key's is empty). irlume
 sends no `TPM2_DictionaryAttackLockReset` or
 `TPM2_DictionaryAttackParameters` (the pinned tss-esapi has no wrapper for
 either, so a call would go through raw `Esys_` bindings), defines no NV
-counter, and never asks for, stores or derives `lockoutAuth`. A DA failure
-anywhere else on the machine therefore never touches irlume, and irlume
-never spends the budget that disk unlock PINs and Windows Hello depend on.
+counter, and never asks for, stores or derives `lockoutAuth`. irlume
+therefore never spends the budget that disk unlock PINs and Windows Hello
+depend on: none of its authorizations checks a secret that can be wrong.
+A DA failure elsewhere on the machine stops touching irlume once its
+envelopes are on the new key. While the section 3.2 fallback keeps an
+envelope, or new seals, on the old key, a lockout still blocks them, as
+today, and doctor says so (section 4).
 
 ### 3. The storage key moves to `noDA`
 
@@ -338,15 +336,18 @@ never spends the budget that disk unlock PINs and Windows Hello depend on.
    refuses (for example `TPM_RC_NV_SPACE`, seen on swtpm once the property
    reached 0) or no owner handle is free do new seals stay on the persisted
    old key, with nothing moving; irlumed retries at its next start, and
-   doctor reports it. Deriving an RSA-2048 primary takes
-   more than 10 seconds on slow firmware TPMs (`load_or_create_srk`), which
-   would consume most of the authentication window (about 15 seconds at
-   login, 10 at `sudo` and polkit prompts, `irlume-auth`) on every
-   authentication. So no new envelope is written under a transiently
-   derived key while a persisted key exists. Today irlume does derive one
-   per call when another stack's key holds its handle (`load_or_create_srk`:
-   "correct, just slower"); that fallback stays for the old key and is not
-   extended to the new one. irlume keeps its own handles rather than the
+   doctor reports it. Deriving an RSA-2048 primary takes more than 10
+   seconds on slow firmware TPMs (`load_or_create_srk`), which would
+   consume most of the authentication window (about 15 seconds at login, 10
+   at `sudo` and polkit prompts, `irlume-auth`) on every authentication. So
+   no new envelope is written under a transiently derived key while a
+   persisted irlume key exists. Today irlume does derive the old key per
+   call when another stack's key holds its handle (`load_or_create_srk`:
+   "correct, just slower"). That fallback stays, for the old key only: when
+   neither key is persisted (another stack's key on the old key's handle
+   and no room for the new one), seals and loads keep today's per-call
+   derivation of the old key, nothing moves, and doctor reports it. The new
+   key is never derived per call. irlume keeps its own handles rather than the
    shared 0x81000001 (`TPM2_SRK_HANDLE` in systemd's `tpm2-util.h`;
    Provisioning Guidance table 2): systemd creates an ECC key there when
    the handle is empty and the TPM supports one
@@ -414,14 +415,16 @@ never spends the budget that disk unlock PINs and Windows Hello depend on.
    restored backup, still opens. irlumed's start, finding such an envelope
    and no persisted old key, derives the old key once, persists it again by
    the rule of section 3.2, and moves the envelope; no recovery passphrase
-   or re-enrollment is needed. Eviction adds one exposure that a persisted
-   key does not have: today a firmware update that changes how the TPM
-   derives keys (the ROCA case of #1079) leaves the persisted key, and so
-   its envelopes, usable; once the old key is evicted, such an update makes
-   it impossible to re-derive, and an envelope under it that comes back
-   afterwards needs `irlume recovery restore` or a re-enrollment, as after
-   a cleared TPM. Phase 3 therefore states it in the eviction's log line
-   and in doctor.
+   or re-enrollment is needed. Where the TPM has no room to persist it,
+   the envelope stays loadable through today's per-call derivation of the
+   old key and moves once a key can be persisted. Eviction adds one
+   exposure that a persisted key does not have: today a firmware update
+   that changes how the TPM derives keys (the ROCA case of #1079) leaves
+   the persisted key, and so its envelopes, usable; once the old key is
+   evicted, such an update makes it impossible to re-derive, and an
+   envelope under it that comes back afterwards needs `irlume recovery
+   restore` or a re-enrollment, as after a cleared TPM. Phase 3 therefore
+   states it in the eviction's log line and in doctor.
 
 ### 4. doctor reports the TPM lockout
 
@@ -547,8 +550,12 @@ so that only an administrator can reset a lockout.
   and accepts ends with the key persisted). When `TPM2_EvictControl`
   refuses (`TPM_RC_NV_SPACE` on swtpm once its capacity is used) or no
   owner handle is free, new seals and moves stay on the persisted old key,
-  no envelope is ever written under a transiently derived key, and the
-  next start tries again.
+  no envelope is written under a transiently derived key while a persisted
+  irlume key exists, and the next start tries again. With neither key
+  persisted (another stack's key on the old key's handle and the new key
+  refused), enrollment and keyring seals still succeed through today's
+  per-call derivation of the old key, nothing moves, doctor reports it,
+  and the new key is never derived per call.
 - An envelope records its parent's handle and TPM name; a load that finds
   no key, or a key with another name, at that handle does not use it. At
   irlumed's start, an envelope whose recorded handle now holds another

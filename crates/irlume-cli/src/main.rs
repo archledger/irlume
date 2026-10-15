@@ -4204,7 +4204,8 @@ fn tpm_lockout_check(
              unlock PINs and other TPM PIN users on this machine are"
         } else {
             "irlume's storage key is not DA-exempt yet (ADR-0034 §3), so face login \
-             and the release of sealed keyring secrets use the password until it ends"
+             with an encrypted enrollment (one a TPM-sealed template key protects) and \
+             the release of sealed keyring secrets use the password until it ends"
         };
         // The TPM keeps no "time left" value: a lockout ends one recovery
         // interval of powered-on time after the last failure, and a power
@@ -6660,6 +6661,7 @@ mod tests {
         let (reading, detail) = state(0x204, 32, false);
         assert_eq!(reading, State::Warn);
         assert!(detail.contains("use the password"), "{detail}");
+        assert!(detail.contains("encrypted enrollment"), "{detail}");
         assert!(detail.contains("--auth=file:-"), "{detail}");
         assert!(detail.contains("IRLUME_TCTI with `-T`"), "{detail}");
         assert!(detail.contains("within 7200 s"), "{detail}");

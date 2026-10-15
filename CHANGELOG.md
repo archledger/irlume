@@ -13,10 +13,11 @@ All notable changes to irlume are documented here. This project adheres to
   irlumed without changing anything. The counter is shared by everything that
   uses the TPM, so a lockout another user caused (wrong disk unlock PINs, a
   Windows Hello PIN) also blocks irlume's storage key until ADR-0034 §3 moves it
-  to a DA-exempt one: in lockout the check warns that face login and the
-  release of sealed keyring secrets use the password until it ends, and says
-  how an administrator clears it. With no lockout authorization set it notes
-  that any process with TPM access can reset the lockout. THREAT_MODEL.md,
+  to a DA-exempt one: in lockout the check warns that face login with an
+  encrypted enrollment and the release of sealed keyring secrets use the
+  password until it ends, and says how an administrator clears it. With no
+  lockout authorization set it notes that any process with TPM access can
+  reset the lockout. THREAT_MODEL.md,
   DISABLE.md and SECURITY_AT_REST.md now say that the TPM does not count face
   attempts, which configurations narrow the rollback of a retry record, and
   that a verified root does not protect the writable state directory

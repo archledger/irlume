@@ -379,33 +379,40 @@ pub fn tpm_identity() -> Result<TpmIdentity> {
 }
 
 /// Read this TPM's dictionary-attack lockout state (ADR-0034 §4):
-/// `TPM_PT_PERMANENT` and the four lockout properties, with
-/// `GetCapability`, which needs no authorization. Creates and changes nothing,
-/// and works while the TPM is in lockout.
+/// `TPM_PT_PERMANENT` and the four lockout properties, in one `GetCapability`
+/// command, which needs no authorization. Creates and changes nothing, and
+/// works while the TPM is in lockout.
 ///
 /// # Errors
 ///
 /// [`Error::Tpm`] when the TPM cannot be opened or read, or leaves out one of
 /// the properties, which every TPM 2.0 reports.
 pub fn lockout_state() -> Result<TpmLockout> {
-    // A context of its own: tss-esapi's `get_tpm_property` caches what it
-    // read for the context's life, so a reused one could return a stale
-    // counter. The four lockout properties come back in one GetCapability
-    // page from the counter on, so they are one reading.
     let mut ctx = open_context()?;
-    let mut property = |tag| ctx.get_tpm_property(tag).map_err(tpm_err);
-    let permanent = property(PropertyTag::Permanent)?;
-    let failed_tries = property(PropertyTag::LockoutCounter)?;
-    let max_tries = property(PropertyTag::MaxAuthFail)?;
-    let recovery_time = property(PropertyTag::LockoutInterval)?;
-    let lockout_recovery = property(PropertyTag::LockoutRecovery)?;
+    // One command from TPM_PT_PERMANENT (0x200) through
+    // TPM_PT_LOCKOUT_RECOVERY (0x211), so the lockout bit and the counter
+    // are one reading: separate reads (tss-esapi's `get_tpm_property` asks
+    // for four properties at a time) could straddle a failure or a recovery
+    // and disagree. A context of its own also keeps `get_tpm_property`'s
+    // per-context cache out of the way.
+    let first = u32::from(PropertyTag::Permanent);
+    let last = u32::from(PropertyTag::LockoutRecovery);
+    let (data, _more) = ctx
+        .get_capability(CapabilityType::TpmProperties, first, last - first + 1)
+        .map_err(tpm_err)?;
+    let CapabilityData::TpmProperties(list) = data else {
+        return Err(Error::Tpm(
+            "TPM returned a non-property capability for a property query".into(),
+        ));
+    };
+    let value = |tag| list.find(tag).map(|property| property.value());
     lockout_from(
         [
-            permanent,
-            failed_tries,
-            max_tries,
-            recovery_time,
-            lockout_recovery,
+            value(PropertyTag::Permanent),
+            value(PropertyTag::LockoutCounter),
+            value(PropertyTag::MaxAuthFail),
+            value(PropertyTag::LockoutInterval),
+            value(PropertyTag::LockoutRecovery),
         ],
         srk_template()?.object_attributes().no_da(),
     )

@@ -107,6 +107,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- An enrollment capture (`irlume enroll`, a guided enrollment from its
+  framing guide on, more scans, an added camera, a split pair) is refused
+  before any camera opens when it would seal a new template key under the
+  literal PCR policy and the TPM's SHA-256 PCR bank has no value for a
+  configured PCR. That seal would refuse, and until now that showed only
+  after the scans. A sealed key the account keeps (one not recorded for
+  another uid), a provisioned pcrlock policy, or a bank that cannot be read
+  does not refuse; the seal still reports what it finds (#1071).
+
 - Split camera pairs use built-in cameras: both sides must report
   `removable: fixed`, as a Windows Hello sensor group requires, or the
   choice refuses before any camera opens. `allow_external_split_cameras=1`

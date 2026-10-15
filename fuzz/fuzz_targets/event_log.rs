@@ -48,11 +48,13 @@ fn check(log: &[u8]) {
     let measured = pcr7(&list);
     assert_eq!(measured, pcr7(&list));
     // Checked against the value its own digests replay to, a complete log is
-    // read exactly when every PCR 7 event it reads matches its digest.
+    // read exactly when every PCR 7 event it reads matches its digest and
+    // parses.
     if let (true, Some(value)) = (complete, replay(&list, 7)) {
+        let clean = measured.unverified == 0 && measured.malformed == 0;
         match verified_pcr7(log, &value) {
-            Ok(verified) => assert!(verified == measured && measured.unverified == 0),
-            Err(_) => assert!(measured.unverified > 0),
+            Ok(verified) => assert!(verified == measured && clean),
+            Err(_) => assert!(!clean),
         }
     }
     for authority in &measured.authorities {

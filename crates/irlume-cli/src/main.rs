@@ -4354,6 +4354,11 @@ fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, Stri
             "{count} PCR 7 event(s) in the firmware event log do not hash to their recorded \
              digest, so the log does not show what PCR 7 was extended with"
         ),
+        Err(Untrusted::Malformed(count)) => format!(
+            "{count} PCR 7 configuration or authority event(s) in the firmware event log do \
+             not parse as UEFI variable data, so the log does not show what PCR 7 was \
+             extended with"
+        ),
     };
     (State::Unknown, why)
 }
@@ -4524,12 +4529,12 @@ fn pcr7_binding_verdict(
                     }
                 }
                 microsoft.map_or_else(
-                    || "a db certificate that is not Microsoft's".to_owned(),
+                    || "a db entry that is not Microsoft's".to_owned(),
                     |name| format!("{name} (db)"),
                 )
             }
             "MokListRT" if authority.verifies_images() => {
-                "a certificate from shim's MokList (its vendor's or an enrolled MOK)".to_owned()
+                "an entry of shim's MokList (its vendor's or an enrolled MOK)".to_owned()
             }
             "vendor_db" if authority.verifies_images() => {
                 "an entry of shim's built-in vendor database".to_owned()
@@ -6597,11 +6602,12 @@ mod tests {
             ],
             actions: vec![],
             unverified: 0,
+            malformed: 0,
         };
         let (state, detail) = pcr7_binding_verdict(&shim());
         assert_eq!(state, State::Pass, "{detail}");
         for needle in [
-            "a db certificate that is not Microsoft's",
+            "a db entry that is not Microsoft's",
             "shim's SBAT revocation level",
             "shim's MokList",
         ] {

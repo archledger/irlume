@@ -119,11 +119,17 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
     let mut r = Reader(log);
     // The header is a TCG_PCR_EVENT: PCR, type, a SHA-1 digest, then the
     // Spec ID event data.
-    let (_pcr, kind) = (r.u32()?, r.u32()?);
-    r.take(20)?;
+    // The TCG PC Client profile fixes it as PCR 0, EV_NO_ACTION and a zero
+    // SHA-1 digest.
+    let (pcr, kind) = (r.u32()?, r.u32()?);
+    let digest = r.take(20)?;
     let size = r.u32()? as usize;
     let mut spec = Reader(r.take(size)?);
-    if kind != EV_NO_ACTION || spec.take(16)? != SPEC_ID_EVENT03 {
+    if pcr != 0
+        || kind != EV_NO_ACTION
+        || digest.iter().any(|&b| b != 0)
+        || spec.take(16)? != SPEC_ID_EVENT03
+    {
         return None;
     }
     // platformClass, specVersionMinor/Major, specErrata, uintnSize.
@@ -282,10 +288,14 @@ pub struct Pcr7<'a> {
     /// digest, or no such digest: what PCR 7 was extended with is then not
     /// what the event says.
     pub unverified: usize,
+    /// How many PCR 7 configuration or authority events do not parse as
+    /// UEFI_VARIABLE_DATA: PCR 7 was extended with something the lists above
+    /// leave out.
+    pub malformed: usize,
 }
 
-/// The PCR 7 events of `events`, read into [`Pcr7`]. Events that do not parse
-/// are skipped.
+/// The PCR 7 events of `events`, read into [`Pcr7`]. Configuration and
+/// authority events that do not parse are counted in `malformed`.
 pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
     let mut out = Pcr7::default();
     let mut leading = true;
@@ -318,6 +328,8 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
                         name,
                         data: data.iter().any(|&b| b != 0),
                     });
+                } else {
+                    out.malformed += 1;
                 }
             }
             EV_EFI_VARIABLE_AUTHORITY => {
@@ -327,6 +339,8 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
                         variable,
                         data,
                     });
+                } else {
+                    out.malformed += 1;
                 }
             }
             // Some firmware ends the string with NULs (a Dell log in fwupd
@@ -366,12 +380,16 @@ pub enum Untrusted {
     Replay,
     /// This many PCR 7 events have data that does not hash to their digest.
     Payload(usize),
+    /// This many PCR 7 configuration or authority events do not parse as
+    /// UEFI_VARIABLE_DATA.
+    Malformed(usize),
 }
 
 /// What PCR 7 recorded in this boot, read from `log` only once the log is
 /// shown to account for `value`, the SHA-256 value PCR 7 holds: every event
-/// parses, the PCR 7 digests replay to `value`, and each PCR 7 event read
-/// hashes to its digest.
+/// parses, the PCR 7 digests replay to `value`, each PCR 7 event read hashes
+/// to its digest, and each configuration and authority event parses as
+/// UEFI_VARIABLE_DATA.
 ///
 /// # Errors
 ///
@@ -387,6 +405,9 @@ pub fn verified_pcr7<'a>(log: &'a [u8], value: &[u8; 32]) -> Result<Pcr7<'a>, Un
     let pcr7 = pcr7(&events);
     if pcr7.unverified > 0 {
         return Err(Untrusted::Payload(pcr7.unverified));
+    }
+    if pcr7.malformed > 0 {
+        return Err(Untrusted::Malformed(pcr7.malformed));
     }
     Ok(pcr7)
 }
@@ -602,6 +623,13 @@ pub(crate) mod tests {
         let mut short_vendor_info = spec_id(2, &algorithms);
         short_vendor_info.extend_from_slice(&[3, b'a']);
         assert_eq!(events(&header(&short_vendor_info)), None);
+        // PCR 0, EV_NO_ACTION and a zero SHA-1 digest, as the profile fixes.
+        let mut fixed = header(&good);
+        fixed[0] = 1;
+        assert_eq!(events(&fixed), None, "a header in PCR 1");
+        let mut fixed = header(&good);
+        fixed[8] = 1;
+        assert_eq!(events(&fixed), None, "a header with a SHA-1 digest");
         let mut trailing = spec_id(2, &algorithms);
         trailing.extend_from_slice(&[0, 0xff]);
         assert_eq!(events(&header(&trailing)), None, "bytes after vendorInfo");
@@ -719,6 +747,20 @@ pub(crate) mod tests {
             .expect("the SBAT level");
         forged[at + 7] = b'9';
         assert_eq!(verified_pcr7(&forged, &value), Err(Untrusted::Payload(1)));
+
+        // A configuration event that does not parse as a variable: its digest
+        // matches, so it replays, but the configuration would lose it.
+        let mut malformed = vec![(7, EV_EFI_VARIABLE_DRIVER_CONFIG, var("SecureBoot", &[1]))];
+        malformed.push((7, EV_EFI_VARIABLE_DRIVER_CONFIG, vec![0xff; 20]));
+        for name in ["PK", "KEK", "db", "dbx"] {
+            malformed.push((7, EV_EFI_VARIABLE_DRIVER_CONFIG, var(name, &[0x30; 4])));
+        }
+        let malformed = log(&malformed);
+        let value = replay(&events(&malformed).unwrap().0, 7).unwrap();
+        assert_eq!(
+            verified_pcr7(&malformed, &value),
+            Err(Untrusted::Malformed(1))
+        );
 
         // A PCR 7 event with only a SHA-1 digest cannot be replayed.
         let mut sha1_only = log(&[]);

@@ -55,6 +55,10 @@ Your PR description says briefly whether and how an AI tool helped.
   `feat(tui):`, `docs:`, and so on).
   You do not need to squash your branch yourself; review happens on your
   commits, the squash happens at merge.
+- Labels are added for you, from that title prefix and the files a PR
+  changes, and on issues from the title and the bug report's Area field
+  (rules in `.github/labels.toml`). A wrong one can simply be removed; it is
+  not added back.
 - **First PR from a fork**: GitHub holds a fork's workflows (CI, CodeQL, DCO)
   in *action required* until a maintainer approves them to run. If the checks
   panel looks empty a few minutes after opening, that is why; it is not a

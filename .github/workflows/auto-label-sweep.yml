@@ -1,0 +1,73 @@
+# Auto-label sweep and backfill
+#
+# The scheduled half of auto-label.yml, with the same script and rules
+# (scripts/ci/auto-label.py, .github/labels.toml). Every hour it labels each
+# open issue and pull request and each one updated in the last 3 hours. That
+# reaches what the event workflow cannot: pull requests from forks and from
+# Dependabot, whose `pull_request` runs get a read-only token, and issues
+# opened by other workflows, since events made with the workflow token start
+# no workflow. Covering every open item, not only a time window, means a
+# sweep that runs late or not at all for a while still reaches what it
+# missed. Kept apart from the event workflow so that ci-alert.yml, which
+# watches every scheduled workflow, judges the sweep by its own runs.
+#
+# workflow_dispatch runs a sweep, or a backfill of every existing issue and
+# pull request, as a dry run by default. A backfill waits 5 s before each API
+# request, a page of 100 at a time: 720 requests an hour leaves the other
+# workflows part of the token's 1,000 an hour, which every workflow of the
+# repository shares, and stays under GitHub's 500 content-creating requests
+# an hour. About 1,000 items take about four hours; a spent allowance is
+# waited out until it resets. `from` resumes a backfill where an earlier one
+# stopped.
+name: Auto-label sweep
+
+on:
+  schedule:
+    - cron: "37 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sweep = open items and items updated in the last 3 hours; backfill = every issue and pull request"
+        default: sweep
+        type: choice
+        options: [sweep, backfill]
+      dry_run:
+        description: "print the labels that would be added and change nothing"
+        default: true
+        type: boolean
+      from:
+        description: "backfill: start at this issue or pull request number (resume point)"
+        default: "0"
+        type: string
+
+permissions: {}
+
+# One sweep or backfill at a time. A sweep queued behind a long backfill
+# waits; GitHub keeps one pending run and cancels older pending ones.
+concurrency:
+  group: auto-label-sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: sweep labels
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.mode == 'backfill' && 340 || 15 }}
+    permissions:
+      contents: read
+      issues: write # add labels to issues, and create a defined label the repository lacks
+      pull-requests: write # add labels to pull requests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Add labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode || 'sweep' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          FROM: ${{ inputs.from || '0' }}
+        run: |
+          python3 scripts/ci/auto-label.py --repo "$REPO" --mode "$MODE" --dry-run "$DRY_RUN" --from "$FROM"

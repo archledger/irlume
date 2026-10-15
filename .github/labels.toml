@@ -1,0 +1,256 @@
+# Labels of this repository, and the rules scripts/ci/auto-label.py applies
+# them by (.github/workflows/auto-label.yml).
+#
+# Every label the repository uses is defined here. A label missing from the
+# repository is created with this color and description; an existing one is
+# never renamed, recolored or deleted from here, so an edit made on GitHub
+# stands. The bot only adds labels: it never removes one, and it does not add
+# back a label anyone removed from that issue or pull request.
+#
+# Rules, all optional; a label with none is applied by people only:
+#
+#   paths        a pull request gets the label when ANY changed file matches.
+#   only_paths   a pull request gets the label when EVERY changed file matches.
+#   title_tokens the words of a conventional title prefix, `type(scope, ...):`,
+#                for pull requests and issues alike. `feat(tpm, cli): ...`
+#                gives the tokens feat, tpm and cli. A title written as
+#                `camera: ...` gives the token camera.
+#   issue_title  a case-insensitive regular expression searched in an issue's
+#                title. Issue bodies are not read: pasted `irlume doctor`
+#                output names every subsystem.
+#   issue_area   option texts of the bug report's "Area" dropdown.
+#
+# Path patterns are fnmatch patterns over the repository path, where `*` also
+# matches `/`: `crates/irlume-camera/*` is every file under that crate.
+
+# ---- Kind of change ----------------------------------------------------------
+
+[labels.bug]
+color = "d73a4a"
+description = "Confirmed or suspected incorrect behavior; use the Bug report template"
+title_tokens = ["fix"]
+
+[labels.enhancement]
+color = "a2eeef"
+description = "New feature or behavior improvement"
+title_tokens = ["feat"]
+
+[labels.documentation]
+color = "0075ca"
+description = "Docs, guides, README, and documentation drift"
+title_tokens = ["docs", "readme"]
+only_paths = ["docs/*", "*.md", "CITATION.cff"]
+issue_title = '\b(docs?|documentation|README)\b'
+
+[labels.performance]
+color = "7ee787"
+description = "Latency, throughput, startup time"
+title_tokens = ["perf", "bench", "timing"]
+paths = ["benchmarks/*", "scripts/timing-report.py"]
+issue_title = '\b(latency|slow(er|ly|ness)?|performance|speed ?up|startup time|throughput)\b'
+
+[labels.dependencies]
+color = "0366d6"
+description = "Dependency updates (dependabot and friends)"
+title_tokens = ["deps"]
+only_paths = ["Cargo.lock", "fuzz/Cargo.lock", "flake.lock"]
+
+[labels.tests]
+color = "c5def5"
+description = "Tests, fuzzing, test harnesses and flaky tests"
+title_tokens = ["test", "tests", "fuzz"]
+# Most changes carry tests; only a change made of nothing else is about them.
+only_paths = ["fuzz/*", "crates/*/tests/*", "scripts/test-*", "scripts/ci/test-*", "scripts/run-tests-guarded.sh", "kcm/tests/*", "nix/tests/*"]
+issue_title = '\b(flaky|flakes?|fuzz\w*|test suite|unit tests?|integration tests?|tests)\b'
+
+[labels.maintenance]
+color = "ededed"
+description = "Refactors, cleanup and build housekeeping with no behavior change"
+title_tokens = ["chore", "refactor", "build", "style"]
+
+[labels.release]
+color = "5319e7"
+description = "Release preparation, provenance, SBOM and release verification"
+title_tokens = ["release"]
+paths = ["docs/RELEASING.md", "scripts/*release*", "scripts/generate-vex.py", ".github/workflows/slsa-provenance.yml", ".github/workflows/verify-release.yml"]
+# Not the bare word: irlume releases credentials and buffers too.
+issue_title = '\b(SBOM|VEX|SLSA|slsa-provenance|release (assets|signing|notes|tooling|workflow)|releasing)\b'
+
+[labels.design]
+color = "d4c5f9"
+description = "Architecture decision records and design proposals"
+title_tokens = ["adr", "design"]
+paths = ["docs/adr/*"]
+issue_title = '\b(ADR|design proposal)\b'
+
+[labels.github_actions]
+color = "2088ff"
+description = "CI workflows, GitHub configuration, and repo automation"
+title_tokens = ["ci", "runners"]
+# A change that also adds a CI step for its own tests is not about CI.
+only_paths = [".github/*", "scripts/ci/*", "scripts/check-action-pins.sh", "scripts/ci-bubblewrap.sh"]
+issue_title = '\b(CI|workflows?|GitHub Actions|runners?|Dependabot|CodeQL|zizmor|actionlint)\b'
+
+# ---- Area of the code --------------------------------------------------------
+
+[labels.camera]
+color = "00b8d9"
+description = "Capture path, streams, and camera subsystem code"
+title_tokens = ["camera", "ir", "emitter", "capture", "census", "split"]
+paths = ["crates/irlume-camera/*", "crates/irlume-core/src/multi_camera*", "crates/irlume-common/src/live_camera.rs", "crates/irlume-common/src/split_*", "scripts/emitter-lock-tests.sh", "scripts/diagnose-missing-camera.sh", "scripts/ir-evaluation/*", "docs/IR_ONLY_QUALIFICATION.md"]
+issue_title = '\b(cameras?|webcam|IR[- ]only|IR (node|camera|emitter|stream)s?|emitters?|UVC|V4L2|YUYV|NV12|MJPEG|streams?|capture)\b'
+issue_area = ["Camera or IR emitter"]
+
+[labels.pam]
+color = "1d76db"
+description = "PAM integration: greeters, lock screens, sudo, polkit"
+title_tokens = ["pam", "pamwire", "polkit", "lightdm", "greeter"]
+paths = ["crates/irlume-pam/*", "crates/irlume-pam-view/*", "crates/irlume-common/src/pam_*", "packaging/pam/*", "packaging/lightdm/*", "packaging/polkit/*", "docs/INTEGRATION.md", "docs/DESKTOP-AUTH.md"]
+issue_title = '\b(PAM|pamwire|greeters?|lock ?screens?|sudo|polkit|SDDM|GDM|LightDM|login managers?|hyprlock|swaylock|kscreenlocker)\b'
+issue_area = ["Login, lock screen, sudo or polkit (PAM)"]
+
+[labels.tpm]
+color = "5319e7"
+description = "TPM sealing, PCRs, keyring release"
+title_tokens = ["tpm", "pcrsig", "pcrlock", "seal", "secureboot"]
+paths = ["crates/irlume-core/src/tpm*", "crates/irlume-core/src/pcrsig.rs", "crates/irlume-core/src/template_key.rs", "crates/irlume-common/src/tpm*", "crates/irlume-common/src/secureboot.rs", "scripts/*swtpm*", "scripts/tpm-*"]
+issue_title = '\b(TPM|PCRs?\s*\d*|seal(ed|ing)?|unseal\w*|Secure Boot|swtpm|pcrlock)\b'
+issue_area = ["TPM or Secure Boot"]
+
+[labels.pad]
+color = "bfe5bf"
+description = "Presentation-attack detection and liveness (ISO/IEC 30107-3)"
+title_tokens = ["pad", "liveness"]
+paths = ["crates/irlume-liveness/*", "crates/irlume-core/src/pad.rs", "docs/PAD_SELFTEST.md", "docs/pad-results/*"]
+issue_title = '\b(liveness|PAD|anti-?spoof\w*|presentation[- ]attacks?|spoof\w*)\b'
+issue_area = ["Liveness or anti-spoofing"]
+
+[labels.models]
+color = "fef2c0"
+description = "ONNX and TFLite models, weights, and the model BOM"
+title_tokens = ["models", "model"]
+paths = ["models/*", "scripts/fetch-models.sh"]
+issue_title = '\b(ONNX|TFLite|recogni[sz]ers?|model (weights|BOM|files?))\b'
+
+[labels.packaging]
+color = "d4c5f9"
+description = "Distro lanes: Fedora and Copr, Debian and PPA, Arch and AUR, Nix"
+title_tokens = ["packaging", "ppa", "rpm", "deb", "arch", "fedora", "nix", "packit", "apparmor", "selinux", "copr", "aur", "install"]
+paths = ["packaging/*", "nix/*", "flake.nix", ".packit.yaml", "scripts/build-ppa-source.sh", "scripts/install.sh", "scripts/install-host.sh", "scripts/check-packaging-parity.sh", "scripts/verify-ppa-publish.py", "scripts/test-ppa-*", "scripts/test-package-*", "scripts/check-upgrade-*", "docs/NIXOS.md"]
+issue_title = '\b(packag(e|es|ing)|Copr|PPA|AUR|RPM|deb|Debian|Ubuntu|Fedora|Arch|NixOS|Nix|flake|installer|install\.sh|AppArmor|SELinux)\b'
+issue_area = ["Installing or packaging"]
+
+[labels.hardware]
+color = "fbca04"
+description = "Camera, IR emitter, fingerprint reader, or TPM behavior on a specific machine"
+paths = ["docs/hardware/*", "docs/HARDWARE.md", "scripts/hardware/*", "scripts/generate-hardware-matrix.py"]
+# A USB vendor:product pair, such as 04f2:b74f, names a specific device.
+issue_title = '(^\[hw\]|\b[0-9a-f]{4}:[0-9a-f]{4}\b)'
+
+[labels.daemon]
+color = "0e8a16"
+description = "irlumed: the socket service, its request handling, worker and authorization"
+title_tokens = ["daemon", "irlumed", "client"]
+paths = ["crates/irlume-daemon/*", "crates/irlume-password-verify/*", "crates/irlume-common/src/client*", "packaging/systemd/*", "packaging/tmpfiles.d/*"]
+issue_title = '\b(daemon|irlumed|socket)\b'
+
+[labels.cli]
+color = "bfd4f2"
+description = "The irlume command and its TUI: setup, doctor, status, uninstall, machine API"
+title_tokens = ["cli", "tui", "doctor", "uninstall", "setup", "machine-api", "machine", "diagnostics", "diag", "status"]
+paths = ["crates/irlume-cli/*", "schemas/*", "docs/COMMANDS.md", "docs/TUI.md", "docs/MACHINE-API.md", "scripts/machine-api-conformance.py"]
+issue_title = '\b(CLI|TUI|doctor|setup wizard|status --json|machine[- ]API|irlume (setup|enroll|auth|status|doctor|uninstall|recovery))\b'
+issue_area = ["The irlume command or its TUI"]
+
+[labels.auth]
+color = "c2e0c6"
+description = "The authentication engine: from frames to a verdict, matching and biometric policy"
+title_tokens = ["auth", "engine", "biopolicy", "fusion"]
+paths = ["crates/irlume-auth/*", "crates/irlume-core/src/biopolicy.rs", "crates/irlume-core/src/policy.rs", "crates/irlume-core/src/fusion.rs", "crates/irlume-core/src/calib.rs"]
+issue_title = '\b(authenticat\w+|match(ing|er)|false (accept|reject)\w*|FAR|FRR|threshold)\b'
+issue_area = ["Face recognition or matching"]
+
+[labels.vision]
+color = "f9d0c4"
+description = "Face detection, landmarks and recognition inference; CPU, GPU and NPU execution"
+title_tokens = ["vision", "npu", "gpu", "detection", "recognition", "ort", "openvino"]
+paths = ["crates/irlume-vision/*", "docs/NPU.md", "docs/recognition-results/*", "scripts/fetch-ort.sh", "scripts/build-tflite-runtime*"]
+issue_title = '\b(NPU|GPU|OpenVINO|onnxruntime|execution providers?|inference|face detect\w*|landmarks?|face mesh)\b'
+
+[labels.enrollment]
+color = "fbca04"
+description = "Enrolling faces, stored templates and profiles, and their data at rest"
+title_tokens = ["enroll", "enrollment", "storage", "profiles", "recovery"]
+paths = ["crates/irlume-core/src/storage.rs", "crates/irlume-core/src/account.rs", "crates/irlume-core/src/envelope.rs", "crates/irlume-core/src/crypto.rs", "crates/irlume-core/src/replacement.rs", "crates/irlume-core/src/recovery.rs", "crates/irlume-common/src/storage_encryption.rs", "docs/SECURITY_AT_REST.md"]
+issue_title = '\b(enrol(l|ls|led|ling|ment|ments)?|re-?enrol\w*|templates?|profiles?)\b'
+issue_area = ["Enrollment"]
+
+[labels.keyring]
+color = "fef2c0"
+description = "Login keyring release: GNOME Keyring, KWallet and Bitwarden helpers"
+title_tokens = ["keyring", "gkr", "gkr-unlock", "kwallet", "bitwarden"]
+paths = ["crates/irlume-gkr-unlock/*", "crates/irlume-kwallet-init/*", "crates/irlume-core/src/keyring*", "crates/irlume-core/src/kwallet.rs", "crates/irlume-common/src/gkr_wire.rs", "scripts/*keyring*", "scripts/gkr-*", "scripts/kwallet-*"]
+issue_title = '\b(keyrings?|KWallet|GNOME Keyring|gkr|Bitwarden|wallet)\b'
+issue_area = ["Keyring or wallet unlock"]
+
+[labels.fingerprint]
+color = "e99695"
+description = "The fprintd companion and fingerprint sign-in"
+title_tokens = ["fingerprint", "fprintd"]
+paths = ["crates/irlume-fingerprint/*"]
+issue_title = '\b(fingerprints?|fprintd)\b'
+issue_area = ["Fingerprint"]
+
+[labels.desktop]
+color = "c5def5"
+description = "Desktop integration: the KDE System Settings module and desktop entries"
+title_tokens = ["kcm", "desktop"]
+paths = ["kcm/*", "packaging/desktop/*", "nix/package-kcm.nix", "docs/KCM.md"]
+issue_title = '\b(KCM|System Settings|Plasma|KDE)\b'
+issue_area = ["KDE System Settings module"]
+
+# ---- Applied by people only --------------------------------------------------
+
+[labels.security]
+color = "b60205"
+description = "Security posture discussion; real vulnerabilities go through SECURITY.md, never issues"
+
+[labels.regression]
+color = "e99695"
+description = "Worked before, broken now"
+
+[labels.release-blocker]
+color = "d93f0b"
+description = "Must be resolved before the next release"
+
+[labels.rust]
+color = "dea584"
+description = "Rust implementation detail that is not user-facing"
+
+[labels."good first issue"]
+color = "0e8a16"
+description = "Self-contained and scoped; see CONTRIBUTING.md before starting"
+
+[labels."help wanted"]
+color = "008672"
+description = "Extra attention or verification welcome from anyone"
+
+[labels.question]
+color = "d876e3"
+description = "Usage question; usually redirects to Discussions"
+
+[labels.duplicate]
+color = "cfd3d7"
+description = "Same as another issue"
+
+[labels.invalid]
+color = "e4e669"
+description = "Not an issue (spam, misuse, wrong repo)"
+
+[labels.wontfix]
+color = "ffffff"
+description = "Will not be addressed"
+
+[labels.ci-alert]
+color = "b60205"
+description = "open while a watched CI workflow is failing or stale"

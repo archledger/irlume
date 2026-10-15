@@ -666,6 +666,16 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
           python3 scripts/ci/test-ci-alert.py
 
+      # auto-label.yml labels every new issue and pull request, and a wrong
+      # rule shows up as a wrong label rather than a failed run. Its step runs
+      # here against a fake gh, the real .github/labels.toml and the real bug
+      # report form: fixtures only, no network, no label changes.
+      - name: Auto-label rules and step (fixtures only, no network)
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
+          python3 scripts/ci/test-auto-label.py
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

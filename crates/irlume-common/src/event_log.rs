@@ -27,6 +27,49 @@ const EV_EFI_ACTION: u32 = 0x8000_0007;
 const EV_EFI_VARIABLE_AUTHORITY: u32 = 0x8000_00e0;
 const TPM_ALG_SHA256: u16 = 0x000b;
 
+/// A GUID as UEFI stores it: the first three fields little-endian.
+const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
+    let (a, b, c) = (a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes());
+    [
+        a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+        d[7],
+    ]
+}
+
+/// `EFI_GLOBAL_VARIABLE`, the vendor GUID of SecureBoot, PK and KEK.
+pub const EFI_GLOBAL_VARIABLE: [u8; 16] = guid(
+    0x8be4_df61,
+    0x93ca,
+    0x11d2,
+    [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c],
+);
+/// `EFI_IMAGE_SECURITY_DATABASE_GUID`, the vendor GUID of db and dbx (and of
+/// shim's built-in `vendor_db`).
+pub const EFI_IMAGE_SECURITY_DATABASE: [u8; 16] = guid(
+    0xd719_b2cb,
+    0x3d3a,
+    0x4596,
+    [0xa3, 0xbc, 0xda, 0xd0, 0x0e, 0x67, 0x65, 0x6f],
+);
+/// `SHIM_LOCK_GUID`, the vendor GUID of shim's variables.
+pub const SHIM_LOCK: [u8; 16] = guid(
+    0x605d_ab50,
+    0xe046,
+    0x4300,
+    [0xab, 0xb6, 0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23],
+);
+/// The Secure Boot configuration PCR 7 opens with, in Microsoft's order
+/// ("BitLocker drive encryption in Windows 11 for OEMs").
+pub const SECURE_BOOT_CONFIGURATION: [(&str, [u8; 16]); 5] = [
+    ("SecureBoot", EFI_GLOBAL_VARIABLE),
+    ("PK", EFI_GLOBAL_VARIABLE),
+    ("KEK", EFI_GLOBAL_VARIABLE),
+    ("db", EFI_IMAGE_SECURITY_DATABASE),
+    ("dbx", EFI_IMAGE_SECURITY_DATABASE),
+];
+/// More digest algorithms than a Spec ID header declares in practice.
+const MAX_ALGORITHMS: u32 = 64;
+
 /// The signature that opens the first event of a crypto-agile log.
 const SPEC_ID_EVENT03: &[u8; 16] = b"Spec ID Event03\0";
 /// More events than any firmware writes; a longer log is not read further.
@@ -86,10 +129,16 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
     // platformClass, specVersionMinor/Major, specErrata, uintnSize.
     spec.take(8)?;
     let count = spec.u32()?;
+    if count > MAX_ALGORITHMS {
+        return None;
+    }
     let mut sizes = Vec::new();
-    for _ in 0..count.min(64) {
+    for _ in 0..count {
         sizes.push((spec.u16()?, usize::from(spec.u16()?)));
     }
+    // vendorInfoSize and vendorInfo close the header.
+    let vendor_info = usize::from(spec.take(1)?[0]);
+    spec.take(vendor_info)?;
     let mut out = Vec::new();
     while !r.0.is_empty() {
         if out.len() >= MAX_EVENTS {
@@ -141,11 +190,12 @@ pub fn replay(events: &[Event<'_>], pcr: u32) -> Option<[u8; 32]> {
     Some(value)
 }
 
-/// A UEFI_VARIABLE_DATA event: the variable's name and its data. The vendor
-/// GUID is not kept.
-fn variable(data: &[u8]) -> Option<(String, &[u8])> {
+/// A UEFI_VARIABLE_DATA event: the variable's vendor GUID, its name and its
+/// data. The GUID is part of the variable's identity: a `db` under another
+/// GUID is not the signature database.
+fn variable(data: &[u8]) -> Option<([u8; 16], String, &[u8])> {
     let mut r = Reader(data);
-    r.take(16)?;
+    let guid: [u8; 16] = r.take(16)?.try_into().ok()?;
     let name_len = usize::try_from(r.u64()?).ok()?;
     let data_len = usize::try_from(r.u64()?).ok()?;
     let name = r.take(name_len.checked_mul(2)?)?;
@@ -153,29 +203,58 @@ fn variable(data: &[u8]) -> Option<(String, &[u8])> {
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-    Some((String::from_utf16(&name).ok()?, r.take(data_len)?))
+    Some((guid, String::from_utf16(&name).ok()?, r.take(data_len)?))
 }
 
-/// An authority measured into PCR 7: the variable that held what verified an
-/// image (`db`, shim's `MokListRT`, its built-in certificate as `Shim`, or
-/// shim's `SbatLevel`) and the signature data it measured.
+/// An authority measured into PCR 7: the variable, with its vendor GUID, and
+/// the data measured. Most name what verified an image: an entry of `db`,
+/// shim's `MokListRT` or its built-in `vendor_db`, or shim's built-in
+/// certificate as `Shim`. shim also measures policy this way (`SbatLevel`,
+/// `MokSBState`), which verifies nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authority<'a> {
+    pub guid: [u8; 16],
     pub variable: String,
     pub data: &'a [u8],
+}
+
+impl Authority<'_> {
+    /// Whether this authority verified an image, as the firmware's `db` and
+    /// shim's `vendor_db`, `MokListRT` and `Shim` measurements do (shim's
+    /// verify.c, rhboot/shim main 2026-10-01).
+    pub fn verifies_images(&self) -> bool {
+        match self.variable.as_str() {
+            "db" | "vendor_db" => self.guid == EFI_IMAGE_SECURITY_DATABASE,
+            "MokListRT" | "Shim" => self.guid == SHIM_LOCK,
+            _ => false,
+        }
+    }
+}
+
+/// A Secure Boot configuration variable as PCR 7 measured it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    pub guid: [u8; 16],
+    pub name: String,
+    /// Whether it held data: Microsoft's BitLocker guidance counts a PK or
+    /// KEK measured empty or as zeros as missing.
+    pub data: bool,
 }
 
 /// What PCR 7 recorded in this boot.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Pcr7<'a> {
-    /// The SecureBoot variable as measured: `Some(true)` when it was 1.
+    /// The SecureBoot variable (under `EFI_GLOBAL_VARIABLE`) as measured:
+    /// `Some(true)` when it was 1.
     pub secure_boot: Option<bool>,
     /// The Secure Boot configuration variables measured (SecureBoot, PK,
-    /// KEK, db, dbx, and any others), in order, each with whether it held
-    /// data: Microsoft's BitLocker guidance counts a PK or KEK measured empty
-    /// or as zeros as missing.
-    pub configuration: Vec<(String, bool)>,
-    /// The authorities that verified images, in order.
+    /// KEK, db, dbx, and any others), in order.
+    pub configuration: Vec<Setting>,
+    /// How many configuration events PCR 7 opens with before any other event:
+    /// Microsoft's guidance wants the five of [`SECURE_BOOT_CONFIGURATION`]
+    /// with nothing in between.
+    pub leading_configuration: usize,
+    /// The authorities measured, in order.
     pub authorities: Vec<Authority<'a>>,
     /// EV_EFI_ACTION strings, such as "UEFI Debug Mode" and "DMA Protection
     /// Disabled", which the firmware measures when it runs that way.
@@ -191,7 +270,15 @@ pub struct Pcr7<'a> {
 /// are skipped.
 pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
     let mut out = Pcr7::default();
-    for event in events.iter().filter(|e| e.pcr == 7) {
+    let mut leading = true;
+    for event in events
+        .iter()
+        .filter(|e| e.pcr == 7 && e.kind != EV_NO_ACTION)
+    {
+        leading &= event.kind == EV_EFI_VARIABLE_DRIVER_CONFIG;
+        if leading {
+            out.leading_configuration += 1;
+        }
         if matches!(
             event.kind,
             EV_EFI_VARIABLE_DRIVER_CONFIG
@@ -204,16 +291,24 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
         }
         match event.kind {
             EV_EFI_VARIABLE_DRIVER_CONFIG => {
-                if let Some((name, data)) = variable(event.data) {
-                    if name == "SecureBoot" {
+                if let Some((guid, name, data)) = variable(event.data) {
+                    if name == "SecureBoot" && guid == EFI_GLOBAL_VARIABLE {
                         out.secure_boot = data.first().map(|&v| v == 1);
                     }
-                    out.configuration.push((name, data.iter().any(|&b| b != 0)));
+                    out.configuration.push(Setting {
+                        guid,
+                        name,
+                        data: data.iter().any(|&b| b != 0),
+                    });
                 }
             }
             EV_EFI_VARIABLE_AUTHORITY => {
-                if let Some((variable, data)) = variable(event.data) {
-                    out.authorities.push(Authority { variable, data });
+                if let Some((guid, variable, data)) = variable(event.data) {
+                    out.authorities.push(Authority {
+                        guid,
+                        variable,
+                        data,
+                    });
                 }
             }
             EV_EFI_ACTION => out
@@ -302,20 +397,9 @@ pub(crate) mod tests {
     /// then `events` as (PCR, type, data), each with its SHA-256 digest and a
     /// zeroed SHA-1 one (only SHA-256 is checked).
     pub(crate) fn log(events: &[(u32, u32, Vec<u8>)]) -> Vec<u8> {
-        let mut spec = SPEC_ID_EVENT03.to_vec();
-        spec.extend_from_slice(&[0, 0, 0, 0, 0, 2, 0, 2]);
-        spec.extend_from_slice(&2u32.to_le_bytes());
-        for (id, size) in [(0x0004u16, 20u16), (0x000b, 32)] {
-            spec.extend_from_slice(&id.to_le_bytes());
-            spec.extend_from_slice(&size.to_le_bytes());
-        }
+        let mut spec = spec_id(2, &[(0x0004, 20), (0x000b, 32)]);
         spec.push(0);
-        let mut out = Vec::new();
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&EV_NO_ACTION.to_le_bytes());
-        out.extend_from_slice(&[0; 20]);
-        out.extend_from_slice(&(spec.len() as u32).to_le_bytes());
-        out.extend_from_slice(&spec);
+        let mut out = header(&spec);
         for (pcr, kind, data) in events {
             out.extend_from_slice(&pcr.to_le_bytes());
             out.extend_from_slice(&kind.to_le_bytes());
@@ -330,10 +414,45 @@ pub(crate) mod tests {
         out
     }
 
-    /// UEFI_VARIABLE_DATA for `name` holding `data`.
+    /// A Spec ID Event03 up to its algorithm table: `count` declared, then
+    /// `algorithms` as (id, digest size). The caller adds vendorInfoSize.
+    fn spec_id(count: u32, algorithms: &[(u16, u16)]) -> Vec<u8> {
+        let mut spec = SPEC_ID_EVENT03.to_vec();
+        spec.extend_from_slice(&[0, 0, 0, 0, 0, 2, 0, 2]);
+        spec.extend_from_slice(&count.to_le_bytes());
+        for (id, size) in algorithms {
+            spec.extend_from_slice(&id.to_le_bytes());
+            spec.extend_from_slice(&size.to_le_bytes());
+        }
+        spec
+    }
+
+    /// The TCG_PCR_EVENT that opens a log, carrying `spec`.
+    fn header(spec: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&EV_NO_ACTION.to_le_bytes());
+        out.extend_from_slice(&[0; 20]);
+        out.extend_from_slice(&(spec.len() as u32).to_le_bytes());
+        out.extend_from_slice(spec);
+        out
+    }
+
+    /// UEFI_VARIABLE_DATA for `name` holding `data`, under the vendor GUID
+    /// the firmware or shim uses for it.
     pub(crate) fn var(name: &str, data: &[u8]) -> Vec<u8> {
+        let guid = match name {
+            "SecureBoot" | "PK" | "KEK" => EFI_GLOBAL_VARIABLE,
+            "db" | "dbx" | "vendor_db" => EFI_IMAGE_SECURITY_DATABASE,
+            _ => SHIM_LOCK,
+        };
+        var_in(guid, name, data)
+    }
+
+    /// UEFI_VARIABLE_DATA for `name` under `guid`, holding `data`.
+    pub(crate) fn var_in(guid: [u8; 16], name: &str, data: &[u8]) -> Vec<u8> {
         let name: Vec<u16> = name.encode_utf16().collect();
-        let mut out = vec![0x61; 16];
+        let mut out = guid.to_vec();
         out.extend_from_slice(&(name.len() as u64).to_le_bytes());
         out.extend_from_slice(&(data.len() as u64).to_le_bytes());
         for unit in name {
@@ -377,10 +496,21 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 11);
         let pcr7 = pcr7(&events);
         assert_eq!(pcr7.secure_boot, Some(true));
-        let names: Vec<&str> = pcr7.configuration.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["SecureBoot", "PK", "KEK", "db", "dbx"]);
-        assert!(pcr7.configuration.iter().all(|(_, data)| *data));
+        let configuration: Vec<(&str, [u8; 16])> = pcr7
+            .configuration
+            .iter()
+            .map(|s| (s.name.as_str(), s.guid))
+            .collect();
+        assert_eq!(configuration, SECURE_BOOT_CONFIGURATION);
+        assert!(pcr7.configuration.iter().all(|s| s.data));
+        assert_eq!(pcr7.leading_configuration, 5);
         assert_eq!(pcr7.unverified, 0);
+        let verifying: Vec<bool> = pcr7
+            .authorities
+            .iter()
+            .map(Authority::verifies_images)
+            .collect();
+        assert_eq!(verifying, [true, false, true], "SbatLevel is policy");
         let names: Vec<&str> = pcr7
             .authorities
             .iter()
@@ -392,6 +522,69 @@ pub(crate) mod tests {
             Some(&b"certificate"[..])
         );
         assert!(pcr7.actions.is_empty());
+    }
+
+    /// A variable is the one its vendor GUID says, and the configuration
+    /// counts as leading PCR 7 only until another event comes in between.
+    #[test]
+    fn variables_are_known_by_guid_and_name_and_their_place_is_kept() {
+        let elsewhere = guid(1, 2, 3, [4; 8]);
+        let mut measured = vec![
+            (
+                7,
+                EV_EFI_VARIABLE_DRIVER_CONFIG,
+                var_in(elsewhere, "SecureBoot", &[1]),
+            ),
+            (7, EV_EFI_VARIABLE_DRIVER_CONFIG, var("PK", &[0x30; 4])),
+            (
+                7,
+                EV_EFI_VARIABLE_AUTHORITY,
+                var_in(elsewhere, "db", b"cert"),
+            ),
+            (7, EV_EFI_VARIABLE_DRIVER_CONFIG, var("KEK", &[0x30; 4])),
+        ];
+        measured.push((7, EV_EFI_VARIABLE_AUTHORITY, var("MokListRT", b"key")));
+        let data = log(&measured);
+        let pcr7 = pcr7(&events(&data).unwrap().0);
+        assert_eq!(pcr7.secure_boot, None, "a SecureBoot under another GUID");
+        assert_eq!(pcr7.configuration[0].guid, elsewhere);
+        assert_eq!(pcr7.leading_configuration, 2);
+        assert_eq!(pcr7.configuration.len(), 3);
+        assert!(
+            !pcr7.authorities[0].verifies_images(),
+            "a db under another GUID"
+        );
+        assert!(pcr7.authorities[1].verifies_images());
+        assert_eq!(
+            [
+                EFI_GLOBAL_VARIABLE[0],
+                EFI_GLOBAL_VARIABLE[3],
+                EFI_GLOBAL_VARIABLE[15]
+            ],
+            [0x61, 0x8b, 0x8c],
+            "stored little-endian"
+        );
+    }
+
+    /// The Spec ID header is read to its end: a declared algorithm table it
+    /// does not hold, too many algorithms, or no vendorInfoSize are refused.
+    #[test]
+    fn a_spec_id_header_is_read_to_its_end() {
+        let algorithms = [(0x0004, 20), (0x000b, 32)];
+        let mut good = spec_id(2, &algorithms);
+        good.extend_from_slice(&[3, b'a', b'b', b'c']);
+        assert_eq!(events(&header(&good)), Some((vec![], true)));
+        let no_vendor_info = spec_id(2, &algorithms);
+        assert_eq!(events(&header(&no_vendor_info)), None);
+        let mut short_vendor_info = spec_id(2, &algorithms);
+        short_vendor_info.extend_from_slice(&[3, b'a']);
+        assert_eq!(events(&header(&short_vendor_info)), None);
+        let mut too_many = spec_id(MAX_ALGORITHMS + 1, &[(0x000b, 32); 65]);
+        too_many.push(0);
+        assert_eq!(events(&header(&too_many)), None);
+        let mut missing = spec_id(3, &algorithms);
+        missing.push(0);
+        assert_eq!(events(&header(&missing)), None, "fewer than declared");
     }
 
     #[test]
@@ -512,6 +705,10 @@ pub(crate) mod tests {
     #[test]
     fn variable_data_lengths_are_checked() {
         let mut long = var("db", b"x");
+        assert_eq!(
+            variable(&long),
+            Some((EFI_IMAGE_SECURITY_DATABASE, "db".to_owned(), &b"x"[..]))
+        );
         long[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(variable(&long), None);
         let mut odd = var("db", b"x");

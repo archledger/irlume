@@ -4376,9 +4376,7 @@ fn pcr7_binding_verdict(
     use crate::doctor_report::State;
     const AFTER: &str = "Turn it back on in the firmware setup. That changes PCR 7, so set a \
                          recovery passphrase first (`irlume recovery setup`)";
-    // Microsoft's BitLocker guidance: these, in this order, then an optional
-    // separator, then the authorities.
-    const CONFIGURATION: [&str; 5] = ["SecureBoot", "PK", "KEK", "db", "dbx"];
+    use irlume_common::event_log::SECURE_BOOT_CONFIGURATION;
     if pcr7.actions.iter().any(|a| a == "UEFI Debug Mode") {
         return (
             State::Warn,
@@ -4407,13 +4405,16 @@ fn pcr7_binding_verdict(
                 .to_owned(),
         );
     }
-    let measured: Vec<&str> = pcr7
-        .configuration
-        .iter()
-        .take(CONFIGURATION.len())
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if measured != CONFIGURATION {
+    // Microsoft's BitLocker guidance: SecureBoot, PK, KEK, db and dbx under
+    // their UEFI GUIDs, in this order with nothing in between, then an
+    // optional separator, then the authorities.
+    let in_order = pcr7.configuration.len() >= SECURE_BOOT_CONFIGURATION.len()
+        && pcr7
+            .configuration
+            .iter()
+            .zip(SECURE_BOOT_CONFIGURATION)
+            .all(|(setting, (name, guid))| setting.name == name && setting.guid == guid);
+    if !in_order {
         let measured = if pcr7.configuration.is_empty() {
             "nothing".to_owned()
         } else {
@@ -4421,7 +4422,18 @@ fn pcr7_binding_verdict(
                 .configuration
                 .iter()
                 .take(8)
-                .map(|(name, _)| firmware_text(name))
+                .map(|setting| {
+                    let name = firmware_text(&setting.name);
+                    let known = SECURE_BOOT_CONFIGURATION
+                        .iter()
+                        .find(|(n, _)| *n == setting.name);
+                    match known {
+                        Some((_, guid)) if *guid != setting.guid => {
+                            format!("{name} (under another vendor GUID)")
+                        }
+                        _ => name,
+                    }
+                })
                 .collect();
             if pcr7.configuration.len() > 8 {
                 names.push("...".to_owned());
@@ -4438,10 +4450,19 @@ fn pcr7_binding_verdict(
             ),
         );
     }
+    if pcr7.leading_configuration < SECURE_BOOT_CONFIGURATION.len() {
+        return (
+            State::Warn,
+            "the firmware measured other events into PCR 7 before or between SecureBoot, \
+             PK, KEK, db and dbx, so PCR 7 may not bind the Secure Boot policy as \
+             measured (BitLocker does not bind to PCR 7 over such a log)"
+                .to_owned(),
+        );
+    }
     let empty: Vec<&str> = pcr7.configuration[..3]
         .iter()
-        .filter(|(_, data)| !data)
-        .map(|(name, _)| name.as_str())
+        .filter(|setting| !setting.data)
+        .map(|setting| setting.name.as_str())
         .collect();
     if !empty.is_empty() {
         return (
@@ -4454,19 +4475,31 @@ fn pcr7_binding_verdict(
             ),
         );
     }
-    if pcr7.authorities.is_empty() {
-        return (
-            State::Warn,
+    if !pcr7.authorities.iter().any(|a| a.verifies_images()) {
+        let detail = if pcr7.authorities.is_empty() {
             "no authority was measured into PCR 7: nothing verified what booted, so a \
              seal bound to PCR 7 binds no boot chain"
-                .to_owned(),
-        );
+                .to_owned()
+        } else {
+            let names: Vec<String> = pcr7
+                .authorities
+                .iter()
+                .take(8)
+                .map(|a| format!("`{}`", firmware_text(&a.variable)))
+                .collect();
+            format!(
+                "PCR 7 records no authority that verified an image, only policy ({}): \
+                 nothing verified what booted, so a seal bound to PCR 7 binds no boot chain",
+                names.join(", ")
+            )
+        };
+        return (State::Warn, detail);
     }
     let mut names: Vec<String> = Vec::new();
     let mut successors: Vec<&str> = Vec::new();
     for authority in &pcr7.authorities {
         let name = match authority.variable.as_str() {
-            "db" => {
+            "db" if authority.verifies_images() => {
                 let microsoft = irlume_common::event_log::authority_certificate(authority)
                     .and_then(irlume_common::secureboot::microsoft_certificate);
                 // A boot loader signed by the 2011 CA's 2023 replacement is
@@ -4479,11 +4512,16 @@ fn pcr7_binding_verdict(
                     |name| format!("{name} (db)"),
                 )
             }
-            "MokListRT" => {
+            "MokListRT" if authority.verifies_images() => {
                 "a certificate from shim's MokList (its vendor's or an enrolled MOK)".to_owned()
             }
-            "Shim" => "shim's built-in certificate".to_owned(),
-            "SbatLevel" => "shim's SBAT revocation level".to_owned(),
+            "vendor_db" if authority.verifies_images() => {
+                "an entry of shim's built-in vendor database".to_owned()
+            }
+            "Shim" if authority.verifies_images() => "shim's built-in certificate".to_owned(),
+            "SbatLevel" if authority.guid == irlume_common::event_log::SHIM_LOCK => {
+                "shim's SBAT revocation level".to_owned()
+            }
             other => format!("an authority from `{}`", firmware_text(other)),
         };
         if !names.contains(&name) {
@@ -6500,24 +6538,35 @@ mod tests {
     #[test]
     fn pcr7_binding_names_what_weakens_or_anchors_pcr_7() {
         use crate::doctor_report::State;
-        use irlume_common::event_log::{Authority, Pcr7};
+        use irlume_common::event_log::{
+            Authority, Pcr7, Setting, EFI_IMAGE_SECURITY_DATABASE, SECURE_BOOT_CONFIGURATION,
+            SHIM_LOCK,
+        };
         let not_microsoft =
             b"\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77\x77certificate";
         let shim = || Pcr7 {
             secure_boot: Some(true),
-            configuration: ["SecureBoot", "PK", "KEK", "db", "dbx"]
-                .map(|name| (name.to_owned(), true))
+            configuration: SECURE_BOOT_CONFIGURATION
+                .map(|(name, guid)| Setting {
+                    guid,
+                    name: name.to_owned(),
+                    data: true,
+                })
                 .to_vec(),
+            leading_configuration: 5,
             authorities: vec![
                 Authority {
+                    guid: EFI_IMAGE_SECURITY_DATABASE,
                     variable: "db".into(),
                     data: not_microsoft,
                 },
                 Authority {
+                    guid: SHIM_LOCK,
                     variable: "SbatLevel".into(),
                     data: b"sbat,1",
                 },
                 Authority {
+                    guid: SHIM_LOCK,
                     variable: "MokListRT".into(),
                     data: b"key",
                 },
@@ -6548,7 +6597,7 @@ mod tests {
         }
         let mut off = shim();
         off.secure_boot = Some(false);
-        off.configuration[0].1 = false;
+        off.configuration[0].data = false;
         let (state, detail) = pcr7_binding_verdict(&off);
         assert_eq!(state, State::Warn);
         assert!(detail.contains("measured as off"), "{detail}");
@@ -6557,9 +6606,23 @@ mod tests {
         let (state, detail) = pcr7_binding_verdict(&unverified);
         assert_eq!(state, State::Warn);
         assert!(detail.contains("binds no boot chain"), "{detail}");
+        // shim's SBAT level is policy: it verified no image.
+        let mut sbat_only = shim();
+        sbat_only.authorities.retain(|a| a.variable == "SbatLevel");
+        let (state, detail) = pcr7_binding_verdict(&sbat_only);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("no authority that verified an image, only policy (`SbatLevel`)"),
+            "{detail}"
+        );
+        // A db authority under another GUID is not the signature database.
+        let mut stray = shim();
+        stray.authorities.retain(|a| a.variable == "db");
+        stray.authorities[0].guid = SHIM_LOCK;
+        assert_eq!(pcr7_binding_verdict(&stray).0, State::Warn);
 
-        // Microsoft's order: SecureBoot, PK, KEK, db, dbx, with PK and KEK
-        // holding data.
+        // Microsoft's order: SecureBoot, PK, KEK, db, dbx under their GUIDs,
+        // nothing in between, with PK and KEK holding data.
         let mut no_kek = shim();
         no_kek.configuration.remove(2);
         let (state, detail) = pcr7_binding_verdict(&no_kek);
@@ -6577,16 +6640,37 @@ mod tests {
         let mut swapped = shim();
         swapped.configuration.swap(3, 4);
         assert_eq!(pcr7_binding_verdict(&swapped).0, State::Warn);
+        let mut vendor = shim();
+        vendor.configuration[1].guid = SHIM_LOCK;
+        let (state, detail) = pcr7_binding_verdict(&vendor);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("PK (under another vendor GUID)"),
+            "{detail}"
+        );
+        let mut interleaved = shim();
+        interleaved.leading_configuration = 3;
+        let (state, detail) = pcr7_binding_verdict(&interleaved);
+        assert_eq!(state, State::Warn, "{detail}");
+        assert!(
+            detail.contains("other events into PCR 7 before or between"),
+            "{detail}"
+        );
         let mut extra = shim();
-        extra.configuration.push(("dbt".to_owned(), true));
+        extra.configuration.push(Setting {
+            guid: EFI_IMAGE_SECURITY_DATABASE,
+            name: "dbt".to_owned(),
+            data: true,
+        });
+        extra.leading_configuration = 6;
         assert_eq!(
             pcr7_binding_verdict(&extra).0,
             State::Pass,
             "more variables after dbx"
         );
         let mut empty = shim();
-        empty.configuration[1].1 = false;
-        empty.configuration[2].1 = false;
+        empty.configuration[1].data = false;
+        empty.configuration[2].data = false;
         let (state, detail) = pcr7_binding_verdict(&empty);
         assert_eq!(state, State::Warn, "{detail}");
         assert!(
@@ -6595,7 +6679,7 @@ mod tests {
         );
         let mut blank = shim();
         blank.secure_boot = None;
-        blank.configuration[0].1 = false;
+        blank.configuration[0].data = false;
         let (state, detail) = pcr7_binding_verdict(&blank);
         assert_eq!(state, State::Warn, "{detail}");
         assert!(
@@ -6613,7 +6697,7 @@ mod tests {
             "{detail}"
         );
         let mut forged = shim();
-        forged.configuration[2].0 = "K\u{7}EK".into();
+        forged.configuration[2].name = "K\u{7}EK".into();
         let (_, detail) = pcr7_binding_verdict(&forged);
         assert!(detail.contains("PK, K?EK, db"), "{detail}");
         assert_eq!(

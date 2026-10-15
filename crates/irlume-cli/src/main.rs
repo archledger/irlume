@@ -4196,6 +4196,46 @@ fn certificate_rollover_check(
     }
 }
 
+/// The `shim-validation` check: whether shim verifies what it loads. shim
+/// measures into PCR 7 the certificate that verified each image; with its
+/// validation disabled it measures none, so PCR 7 binds no boot chain.
+fn shim_validation_check(
+    validation: irlume_common::secureboot::ShimValidation,
+) -> (crate::doctor_report::State, String) {
+    use crate::doctor_report::State;
+    use irlume_common::secureboot::ShimValidation;
+    match validation {
+        ShimValidation::Enforcing => (
+            State::Pass,
+            "shim verifies the boot loader and kernel it loads".to_owned(),
+        ),
+        ShimValidation::Disabled => (
+            State::Warn,
+            "shim's Secure Boot validation is disabled (`mokutil --disable-validation`): \
+             shim loads images without checking their signatures, so PCR 7 records that \
+             setting but no boot chain, and a seal bound to PCR 7 does not depend on what \
+             boots. Turn it back on with `sudo mokutil --enable-validation`, confirmed in \
+             MokManager at the next boot. That changes PCR 7, so set a recovery passphrase \
+             first (`irlume recovery setup`): face login then needs `irlume recovery \
+             restore` or a re-enrollment, and the keyring secret reseals at the next \
+             password login"
+                .to_owned(),
+        ),
+        ShimValidation::SecureBootOff => (
+            State::Info,
+            "Secure Boot is not enforcing, so shim verifies nothing either way (see \
+             secure-boot)"
+                .to_owned(),
+        ),
+        ShimValidation::NotShim => (State::Info, "this boot did not go through shim".to_owned()),
+        ShimValidation::NotUefi => (State::Info, "not a UEFI boot".to_owned()),
+        ShimValidation::Unreadable => (
+            State::Unknown,
+            "the SecureBoot variable could not be read from efivarfs".to_owned(),
+        ),
+    }
+}
+
 /// What `doctor` observed about the active camera pair's capture mode. Kept as
 /// a value so the wording is decided by a pure function and tested, separately
 /// from the root check and config reads that produce it.
@@ -4772,6 +4812,10 @@ fn doctor_run(
         (
             "secure-boot-certificates",
             certificate_rollover_check(&secureboot::certificate_rollover()),
+        ),
+        (
+            "shim-validation",
+            shim_validation_check(secureboot::shim_validation()),
         ),
     ] {
         let mark = match state {
@@ -6084,6 +6128,38 @@ mod tests {
         );
         assert_eq!(
             pcr_bank_check(&Err("no TPM device".into())).0,
+            State::Unknown
+        );
+    }
+
+    #[test]
+    fn shim_validation_wording_warns_only_when_shim_verifies_nothing() {
+        use crate::doctor_report::State;
+        use irlume_common::secureboot::ShimValidation;
+        assert_eq!(
+            shim_validation_check(ShimValidation::Enforcing).0,
+            State::Pass
+        );
+        let (state, detail) = shim_validation_check(ShimValidation::Disabled);
+        assert_eq!(state, State::Warn);
+        for needle in [
+            "PCR 7",
+            "no boot chain",
+            "`sudo mokutil --enable-validation`",
+            "MokManager",
+            "`irlume recovery setup`",
+        ] {
+            assert!(detail.contains(needle), "{needle}: {detail}");
+        }
+        for info in [
+            ShimValidation::SecureBootOff,
+            ShimValidation::NotShim,
+            ShimValidation::NotUefi,
+        ] {
+            assert_eq!(shim_validation_check(info).0, State::Info, "{info:?}");
+        }
+        assert_eq!(
+            shim_validation_check(ShimValidation::Unreadable).0,
             State::Unknown
         );
     }

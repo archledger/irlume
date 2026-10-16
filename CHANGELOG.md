@@ -383,6 +383,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The AppArmor profile for a source install's `/usr/local/bin/irlumed`
+  (`packaging/apparmor/usr.local.bin.irlumed`, loaded by hand) now has the
+  two rules the packaged profile gained in #640: the `rwk` lock on the
+  template-key flocks, without which an enforcing profile fails every
+  enrollment read with "lock state transaction ... Permission denied", and
+  `/dev/media[0-9]* r`, without which camera classification falls back to
+  opening video nodes. The packaging parity check now requires both rules
+  in both profiles.
+
 - A literal PCR seal now computes the policy it commits to from the PCR
   values it reads, by TCG Part 3 §23.7, instead of asking the TPM in a trial
   session. The STMicroelectronics TPM in a ThinkPad T480 left the PCR values

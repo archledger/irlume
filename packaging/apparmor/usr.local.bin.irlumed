@@ -135,6 +135,14 @@ profile irlumed /usr/local/bin/irlumed {
   /var/ r,
   /var/lib/ r,
   /dev/video[0-9]* rw,
+  # Media-controller nodes: camera classification's no-open path (#428) reads
+  # the media graph to decide a video node's role WITHOUT opening it (a video
+  # open powers the camera up pre-6.16 = privacy-LED blink per scan, and the
+  # udev lifecycle thread re-reads the graph on every hot-plug event). Under
+  # enforce without this rule the read fails and classification silently
+  # falls back to the legacy open probe. Found by the 0.11.0rc3 complain-mode
+  # audit: the ONLY denial class across a full exercise battery.
+  /dev/media[0-9]* r,
   /sys/class/video4linux/ r,
   /sys/class/video4linux/** r,
   /sys/devices/** r,
@@ -177,6 +185,14 @@ profile irlumed /usr/local/bin/irlumed {
   # enforcing host (found by a 10-iteration tune stress run; issue #589,
   # the #580 shape one directory deeper).
   /var/lib/irlume/capture-qualifications/*.lock rwk,
+
+  # The deferred template-key loader's per-user flock (same lesson as the
+  # emitter rule above: the state tree's ** rule grants rw without the
+  # flock 'k' permission). Found when the 0.11.0rc1 Arch install loaded this
+  # profile into enforce mode and every enrollment read failed with
+  # "lock state transaction ... Permission denied": fail-closed, but wrong.
+  /var/lib/irlume/template-keys/.locks/*.lock rwk,
+  /var/lib/irlume/template-keys/.locks/ rw,
 
   /dev/tpmrm[0-9] rw,
   /dev/tpm[0-9] rw,

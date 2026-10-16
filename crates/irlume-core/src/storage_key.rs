@@ -707,13 +707,39 @@ fn publish_with(
     mut save: impl FnMut(&Record) -> Result<()>,
     write: impl FnOnce(&crate::envelope::SealedEnvelope, &Path) -> Result<irlume_common::AtomicWrite>,
 ) -> Result<irlume_common::AtomicWrite> {
+    let Some(to) = &next.parent else {
+        return write(next, path);
+    };
+    let off_original = under_original_key(path);
+    let moves_key = off_original
+        || crate::envelope::SealedEnvelope::load(path)
+            .ok()
+            .and_then(|current| current.parent)
+            .is_some_and(|from| from.name != to.name);
     // Checked before the lock, which a host with no record never creates.
-    if next.parent.is_none() || !under_original_key(path) || load_record().persisted.is_none() {
+    if !moves_key || load_record().persisted.is_none() {
         return write(next, path);
     }
+    // One transaction with the start-up step, which holds the same lock: the
+    // move lands only on the key the record holds now, so a start that
+    // superseded the candidate's key since it was sealed (an overlapping
+    // start replacing a weak key) makes it no move, and the next move point
+    // seals again.
+    let _lock = RecordLock::acquire()?;
+    let mut record = load_record();
+    if record
+        .persisted
+        .as_ref()
+        .map(|persisted| persisted.name.as_str())
+        != Some(to.name.as_str())
     {
-        let _lock = RecordLock::acquire()?;
-        let mut record = load_record();
+        return Err(Error::Tpm(
+            "the storage key this envelope was sealed under is no longer the one irlumed \
+             records; it moves at its next move point"
+                .into(),
+        ));
+    }
+    if off_original {
         record.unused_since = None;
         record
             .moves
@@ -726,9 +752,15 @@ fn publish_with(
         save(&record)?;
     }
     let written = write(next, path)?;
-    if matches!(written, irlume_common::AtomicWrite::Durable) {
+    if off_original && matches!(written, irlume_common::AtomicWrite::Durable) {
         // An entry left behind only delays the retirement by a boot.
-        let _ = settle_move(user, kind, &mut save);
+        let before = record.moves.len();
+        record
+            .moves
+            .retain(|entry| !(entry.user == user && entry.kind == kind));
+        if record.moves.len() != before {
+            let _ = save(&record);
+        }
     }
     Ok(written)
 }
@@ -740,26 +772,6 @@ fn under_original_key(path: &Path) -> bool {
         Ok(envelope) => envelope.parent.is_none(),
         Err(_) => std::fs::symlink_metadata(path).is_ok(),
     }
-}
-
-/// Remove `user`'s entry of `kind`: its move off the original key is
-/// durable, which makes the envelope's state durable whatever earlier move
-/// set the entry.
-fn settle_move(
-    user: &str,
-    kind: EnvelopeKind,
-    save: &mut impl FnMut(&Record) -> Result<()>,
-) -> Result<()> {
-    let _lock = RecordLock::acquire()?;
-    let mut record = load_record();
-    let before = record.moves.len();
-    record
-        .moves
-        .retain(|entry| !(entry.user == user && entry.kind == kind));
-    if record.moves.len() != before {
-        save(&record)?;
-    }
-    Ok(())
 }
 
 /// What irlumed's start found about the original storage key's use, after
@@ -1501,7 +1513,7 @@ fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) ->
         let Some(name) = unhex(&next.superseded[index].name) else {
             continue;
         };
-        if tpm.name_at(next.superseded[index].handle)?.as_deref() == Some(name.as_slice()) {
+        if tpm.holds_da_exempt_key(next.superseded[index].handle, &name)? {
             continue;
         }
         if let Some(handle) = persisted_by_name(tpm, &mut owners, &name)? {
@@ -1511,8 +1523,10 @@ fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) ->
     Ok(())
 }
 
-/// The owner persistent handle the key with TPM name `name` is at, from one
-/// scan of them per start (`owners`).
+/// The owner persistent handle a key with TPM name `name` is at where irlume
+/// can seal under it ([`KeyTpm::holds_da_exempt_key`]: the name does not
+/// cover the authorization value), from one scan of them per start
+/// (`owners`).
 fn persisted_by_name(
     tpm: &mut impl KeyTpm,
     owners: &mut Option<Vec<(u32, Vec<u8>)>>,
@@ -1521,31 +1535,43 @@ fn persisted_by_name(
     if owners.is_none() {
         *owners = Some(tpm.owner_names()?);
     }
-    Ok(owners
+    let candidates: Vec<u32> = owners
         .iter()
         .flatten()
-        .find(|(_, found)| found.as_slice() == name)
-        .map(|(handle, _)| *handle))
+        .filter(|(_, found)| found.as_slice() == name)
+        .map(|(handle, _)| *handle)
+        .collect();
+    for handle in candidates {
+        if tpm.holds_da_exempt_key(handle, name)? {
+            return Ok(Some(handle));
+        }
+    }
+    Ok(None)
 }
 
 /// The DA-exempt keys the recorded one superseded, as their handles and TPM
 /// names, while the record keeps them; envelopes that name one move onto
 /// the recorded DA-exempt key ([`crate::tpm::move_available`]). One that
 /// names the recorded key itself is left out. Reads the record only.
-pub(crate) fn superseded_keys() -> Vec<(u32, String)> {
+pub(crate) fn superseded_keys() -> Vec<KeyAt> {
     da_exempt_keys().1
 }
 
-/// The recorded DA-exempt key's TPM name in hex, and the keys it superseded
-/// ([`superseded_keys`]), from one read of the record, so a caller that
-/// compares them sees one state of it.
-pub(crate) fn da_exempt_keys() -> (Option<String>, Vec<(u32, String)>) {
+/// A key irlumed records: its handle and its TPM name in hex.
+pub(crate) type KeyAt = (u32, String);
+
+/// The recorded DA-exempt key and the keys it superseded
+/// ([`superseded_keys`]), from one read of the record, so a caller that uses
+/// both sees one state of it.
+pub(crate) fn da_exempt_keys() -> (Option<KeyAt>, Vec<KeyAt>) {
     let record = load_record();
-    let recorded = record.persisted.map(|persisted| persisted.name);
+    let recorded = record
+        .persisted
+        .map(|persisted| (persisted.handle, persisted.name));
     let superseded = record
         .superseded
         .into_iter()
-        .filter(|kept| recorded.as_deref() != Some(kept.name.as_str()))
+        .filter(|kept| recorded.as_ref().map(|(_, name)| name.as_str()) != Some(kept.name.as_str()))
         .map(|kept| (kept.handle, kept.name))
         .collect();
     (recorded, superseded)
@@ -2885,13 +2911,14 @@ mod tests {
         }
     }
 
-    /// An envelope under the DA-exempt key (`on_key`) or the original one.
+    /// An envelope under the DA-exempt key (`on_key`), as the tests' records
+    /// name it (`persisted_record(0x8101_0003, b"ours")`), or the original one.
     fn envelope(on_key: bool) -> crate::envelope::SealedEnvelope {
         let mut value = serde_json::json!({
             "version": 1, "pcrs": [7], "public": "", "private": ""
         });
         if on_key {
-            value["parent"] = serde_json::json!({"handle": 0x8101_0003_u32, "name": "aa"});
+            value["parent"] = serde_json::json!({"handle": 0x8101_0003_u32, "name": hex(b"ours")});
         }
         serde_json::from_value(value).unwrap()
     }
@@ -3080,6 +3107,101 @@ mod tests {
         assert!(on_key.is_ok() && onto_original.is_ok() && unrecorded.is_ok());
         assert_eq!(saves.get(), 0, "no record write without a move off the key");
         assert!(no_lock, "no lock without a recorded DA-exempt key");
+    }
+
+    /// A write that moves an envelope to another key publishes only onto the
+    /// key the record holds now, checked under the record lock that the
+    /// start-up step holds, so a start that superseded the candidate's key
+    /// since it was sealed makes it no move: the envelope stays as it was. A
+    /// write that keeps the envelope's key is not a move.
+    #[test]
+    fn a_move_publishes_only_onto_the_recorded_key() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-move-target");
+        save_record(&Record {
+            superseded: vec![Persisted {
+                handle: 0x8101_0004,
+                name: hex(b"weak"),
+            }],
+            ..persisted_record(0x8101_0003, b"ours")
+        })
+        .unwrap();
+        let under = |name: &[u8]| {
+            let mut env = envelope(true);
+            if let Some(parent) = env.parent.as_mut() {
+                parent.name = hex(name);
+            }
+            env
+        };
+        let write = |env: &crate::envelope::SealedEnvelope, path: &Path| env.save_reporting(path);
+        let kind = EnvelopeKind::KeyringSecret;
+        let alice = keyring::envelope_path("alice");
+        let bob = keyring::envelope_path("bob");
+        let carol = keyring::envelope_path("carol");
+        envelope(false).save(&alice).unwrap();
+        under(b"weak").save(&bob).unwrap();
+        under(b"ours").save(&carol).unwrap();
+        let bytes = |path: &Path| std::fs::read(path).unwrap();
+        let (alice_before, carol_before) = (bytes(&alice), bytes(&carol));
+        let record_before = load_record();
+
+        let onto_unrecorded = publish_with(
+            &alice,
+            kind,
+            "alice",
+            &under(b"theirs"),
+            Some(BOOT),
+            save_record,
+            write,
+        );
+        let alice_kept = bytes(&alice) == alice_before;
+        let record_kept = load_record() == record_before;
+        let off_superseded = publish_with(
+            &bob,
+            kind,
+            "bob",
+            &under(b"ours"),
+            Some(BOOT),
+            save_record,
+            write,
+        );
+        let onto_superseded = publish_with(
+            &carol,
+            kind,
+            "carol",
+            &under(b"weak"),
+            Some(BOOT),
+            save_record,
+            write,
+        );
+        let carol_kept = bytes(&carol) == carol_before;
+        let rewrap = publish_with(
+            &carol,
+            kind,
+            "carol",
+            &under(b"ours"),
+            Some(BOOT),
+            save_record,
+            write,
+        );
+        drop(sandbox);
+
+        assert!(
+            onto_unrecorded.is_err(),
+            "onto a key the record does not hold"
+        );
+        assert!(alice_kept && record_kept, "nothing is written for it");
+        assert!(
+            off_superseded.is_ok(),
+            "off a superseded key onto the recorded one"
+        );
+        assert!(
+            onto_superseded.is_err() && carol_kept,
+            "never onto a superseded key"
+        );
+        assert!(rewrap.is_ok(), "a write that keeps its key is not a move");
     }
 
     /// Condition 1's census: an envelope under the original key clears the
@@ -3931,14 +4053,14 @@ mod tests {
         ));
     }
 
-    /// A start-up step that records another DA-exempt key than the record
-    /// did, because the recorded one was away from its handle, keeps the old
-    /// key as superseded while it is persisted elsewhere, found by its TPM
-    /// name, so its envelopes move off it and load through it until they
-    /// do. A key persisted nowhere, the same key persisted again, or one
-    /// kept already adds nothing.
+    /// The recorded key away from its handle is followed by its TPM name
+    /// where irlume can seal under it, with nothing derived; a copy irlume
+    /// cannot seal under is replaced by today's derivation and not kept, nor
+    /// is a key persisted nowhere. A kept superseded key that moved is
+    /// recorded where irlume can seal under it, and one found nowhere keeps
+    /// its entry.
     #[test]
-    fn a_recorded_key_found_away_from_its_handle_is_kept_as_superseded() {
+    fn a_recorded_key_away_from_its_handle_is_followed_by_name() {
         const ELSEWHERE: u32 = 0x8101_0009;
         let record = persisted_record(DA_EXEMPT, b"weak");
         let start = |tpm: &mut FakeTpm| {
@@ -3963,17 +4085,16 @@ mod tests {
         assert_eq!(followed.persisted, Some(relocated.clone()));
         assert!(followed.superseded.is_empty() && tpm.derived == 0);
 
-        // Where irlume cannot seal under it, today's derivation takes its
-        // place, and it is kept as superseded while it is persisted.
+        // Where irlume cannot seal under it (a copy with another
+        // authorization value), today's derivation takes its place, and it is
+        // not kept: nothing could load under it either.
         let mut unusable = FakeTpm::new();
         unusable.objects.insert(ELSEWHERE, b"weak".to_vec());
         unusable.other_auth.push(ELSEWHERE);
         unusable.derive = Ok(b"clean".to_vec());
-        let (mut next, outcome) = start(&mut unusable);
+        let (next, outcome) = start(&mut unusable);
         assert_eq!(outcome, Outcome::Persisted { handle: DA_EXEMPT });
-        assert_eq!(next.superseded, vec![relocated.clone()]);
-        keep_superseded(&mut unusable, &record, &mut next).expect("kept");
-        assert_eq!(next.superseded.len(), 1, "kept once");
+        assert!(next.superseded.is_empty());
 
         let mut gone = FakeTpm::new();
         gone.derive = Ok(b"clean".to_vec());

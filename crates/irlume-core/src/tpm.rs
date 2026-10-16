@@ -1771,10 +1771,14 @@ fn with_envelope_parent<T>(
     // superseded (whose envelopes move off it at their move points), that is
     // the parent.
     let mut key = da_exempt_key_at(ctx, parent.handle, &name, false)?;
-    let superseded = storage_key::superseded_keys()
+    // Both from one read of the record, so a start that supersedes the
+    // recorded key meanwhile cannot hide it from both.
+    let (recorded, superseded) = storage_key::da_exempt_keys();
+    let known = recorded
         .into_iter()
+        .chain(superseded)
         .filter_map(|(handle, hex)| storage_key::unhex(&hex).map(|raw| (handle, raw)));
-    for (handle, recorded) in storage_key::recorded_key().into_iter().chain(superseded) {
+    for (handle, recorded) in known {
         if key.is_some() {
             break;
         }
@@ -1940,7 +1944,7 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
         let from = current.parent.as_ref().map(|from| from.name.as_str());
         if from != Some(to.name.as_str()) {
             let (recorded, superseded) = storage_key::da_exempt_keys();
-            if recorded.as_deref() != Some(to.name.as_str()) {
+            if recorded.as_ref().map(|(_, name)| name.as_str()) != Some(to.name.as_str()) {
                 return None;
             }
             off_superseded =

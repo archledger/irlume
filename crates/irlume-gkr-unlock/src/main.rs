@@ -353,6 +353,10 @@ impl waiter::World for System<'_> {
         change
     }
 
+    fn owner_pid(&mut self, owner: &str) -> Option<u32> {
+        self.bus.as_ref()?.pid_of(owner)
+    }
+
     fn identify(&mut self, owner: &str) -> Identity {
         let Some(bus) = &self.bus else {
             return Identity::Gone;
@@ -1344,6 +1348,9 @@ mod tests {
                 }
                 std::thread::sleep(timeout);
                 Ok(None)
+            }
+            fn owner_pid(&mut self, _: &str) -> Option<u32> {
+                unreachable!("no owner ever appears")
             }
             fn identify(&mut self, _: &str) -> Identity {
                 unreachable!("no owner ever appears")

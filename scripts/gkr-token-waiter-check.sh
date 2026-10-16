@@ -689,6 +689,12 @@ case_worst-client() {
         if [[ "$HRC" != 0 || "$p" != 0 || "$got" == *"dismissed=True"* ]]; then
             failed=$((failed + 1))
             note "run $run: helper ${HRC:-?}, prompts $p, client '$got'"
+            # The helper's own lines time its delivery: one far past the
+            # client's start says it was late to the bus, not to the race.
+            local line
+            while IFS= read -r line; do
+                note "run $run: helper: ${line#irlume-gkr-unlock: }"
+            done <"$DIR/helper.err"
         fi
         stop_daemon
     done

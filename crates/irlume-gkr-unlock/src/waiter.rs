@@ -22,6 +22,16 @@
 //! that finds the collection unlocked and shows nothing
 //! (`daemon/dbus/gkd-secret-unlock.c`).
 //!
+//! The check asks gnome-keyring nothing when it can avoid it. INITIALIZE runs
+//! to its end before gnome-keyring's main loop answers anything, and by then
+//! a session's first client may have its `Unlock` and `Prompt` queued behind
+//! the name it claims next. So when the control socket's listener is the
+//! owner itself (by the pid the bus reports and the socket's peer
+//! credentials), as for the `--login` daemon, that match is the check, and
+//! `CHANGE` is queued before INITIALIZE returns. The owner is asked for its
+//! control directory only when another process listens: this user's systemd
+//! manager for a socket-activated socket, which names no daemon.
+//!
 //! The bus is only a trigger. The token goes to the control socket and
 //! nowhere else. Every call on the bus goes to the bus itself or to the name's
 //! current owner and carries `NO_AUTO_START`, so the waiter never starts
@@ -78,9 +88,13 @@ pub(crate) enum Identity {
 /// Which control-socket listener may receive the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Expect {
+    /// The process that owns `org.gnome.keyring` itself: a daemon that
+    /// listens on its own control socket, as `--login` does.
+    Owner { owner_pid: u32 },
     /// The process that owns `org.gnome.keyring`, or this user's systemd
     /// manager when the socket is socket-activated (the manager listens on
-    /// the daemon's behalf).
+    /// the daemon's behalf). Only for an owner that reported this user's
+    /// control directory.
     OwnerOrManager { owner_pid: u32 },
     /// Exactly the listener an earlier request on this path reached.
     Peer(u32),
@@ -104,6 +118,7 @@ impl Expect {
             return false;
         }
         match self {
+            Expect::Owner { owner_pid } => peer_pid == owner_pid,
             Expect::OwnerOrManager { owner_pid } => peer_pid == owner_pid || is_manager(peer_pid),
             Expect::Peer(pid) => peer_pid == pid,
             Expect::AnyPeer => true,
@@ -160,6 +175,11 @@ pub(crate) trait World {
     /// a new owner, `Some(None)` when the name was released, `None` when
     /// nothing changed.
     fn next_owner_change(&mut self, timeout: Duration) -> Result<Option<Option<String>>, BusLost>;
+    /// The pid of `owner`, a unique name, as the bus itself reports it;
+    /// `None` when it left the bus or its pid could not be read.
+    fn owner_pid(&mut self, owner: &str) -> Option<u32>;
+    /// The owner's pid, and whether it reports this user's control
+    /// directory: a call gnome-keyring answers from its main loop.
     fn identify(&mut self, owner: &str) -> Identity;
     /// Connect to the control socket, check its listener against `expect`,
     /// and only then send `op` with `args`.
@@ -346,8 +366,8 @@ impl Event {
     }
 }
 
-/// What to do after a `CHANGE(token, token)` sent to an owner whose control
-/// directory matched.
+/// What to do after a `CHANGE(token, token)` sent to an owner that is the
+/// control socket's listener, or whose control directory matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AfterChange {
     /// The keyring is unlocked and keyed to the token: follow with `UNLOCK`
@@ -495,24 +515,38 @@ fn on_bus(world: &mut impl World, token: &[u8], plan: &Plan) -> Outcome {
 }
 
 fn try_owner(world: &mut impl World, token: &[u8], owner: &str, plan: &Plan) -> Attempt {
-    let owner_pid = match world.identify(owner) {
-        Identity::Serves { owner_pid } => owner_pid,
-        Identity::Mismatch { owner_pid } => {
-            return Attempt::Mismatch {
-                owner_pid,
-                peer_pid: None,
-            }
-        }
-        Identity::Gone => return Attempt::Retry,
+    // The bus answers at once; gnome-keyring answers nothing before
+    // INITIALIZE has returned to its main loop.
+    let Some(owner_pid) = world.owner_pid(owner) else {
+        return Attempt::Retry;
     };
     if !world.keyring_exists() {
         return Attempt::Done(Outcome::KeyringMissing);
     }
-    let sent = world.send(
-        Op::Change,
-        &[token, token],
-        Expect::OwnerOrManager { owner_pid },
-    );
+    // A listener that is the owner itself serves this user's control socket
+    // by definition, so nothing more is asked of it (the module comment).
+    let sent = match world.send(Op::Change, &[token, token], Expect::Owner { owner_pid }) {
+        // Another process listens, and nothing was written: the user's
+        // systemd manager for a socket-activated socket, which names no
+        // daemon, so the owner must first report this user's control
+        // directory.
+        Sent::PeerMismatch { .. } => match world.identify(owner) {
+            Identity::Serves { owner_pid: checked } if checked == owner_pid => world.send(
+                Op::Change,
+                &[token, token],
+                Expect::OwnerOrManager { owner_pid },
+            ),
+            Identity::Mismatch { owner_pid } => {
+                return Attempt::Mismatch {
+                    owner_pid,
+                    peer_pid: None,
+                }
+            }
+            // Gone, or the name changed hands meanwhile.
+            Identity::Serves { .. } | Identity::Gone => return Attempt::Retry,
+        },
+        sent => sent,
+    };
     match after_change(sent) {
         AfterChange::Unlock { peer_pid } => {
             // The CHANGE already unlocked the keyring; this UNLOCK only clears
@@ -608,6 +642,8 @@ mod tests {
         keyring: bool,
         stop_at: Option<Duration>,
         sent: Vec<(Op, usize, Expect)>,
+        /// How many times an owner was asked for its control directory.
+        identified: usize,
         logs: Vec<Event>,
         reports: Vec<Status>,
     }
@@ -628,6 +664,7 @@ mod tests {
                 keyring: true,
                 stop_at: None,
                 sent: Vec::new(),
+                identified: 0,
                 logs: Vec::new(),
                 reports: Vec::new(),
             }
@@ -737,7 +774,16 @@ mod tests {
                 }
             }
         }
+        fn owner_pid(&mut self, owner: &str) -> Option<u32> {
+            match self.identities.iter().find(|(name, _)| name == owner) {
+                Some((_, Identity::Serves { owner_pid } | Identity::Mismatch { owner_pid })) => {
+                    Some(*owner_pid)
+                }
+                Some((_, Identity::Gone)) | None => None,
+            }
+        }
         fn identify(&mut self, owner: &str) -> Identity {
+            self.identified += 1;
             self.identities
                 .iter()
                 .find(|(name, _)| name == owner)
@@ -784,6 +830,13 @@ mod tests {
         assert!(!owner.accepts(55, UID, UID, manager), "a third process");
         assert!(!owner.accepts(DAEMON, 0, UID, manager), "another uid");
         assert!(!owner.accepts(0, UID, UID, |_| true), "no pid at all");
+        let itself = Expect::Owner { owner_pid: DAEMON };
+        assert!(itself.accepts(DAEMON, UID, UID, manager));
+        assert!(
+            !itself.accepts(99, UID, UID, manager),
+            "the manager only after the directory check"
+        );
+        assert!(!itself.accepts(DAEMON, 0, UID, manager), "another uid");
         assert!(Expect::Peer(55).accepts(55, UID, UID, |_| false));
         assert!(!Expect::Peer(55).accepts(56, UID, UID, |_| true));
         assert!(Expect::AnyPeer.accepts(56, UID, UID, |_| false));
@@ -831,14 +884,72 @@ mod tests {
         assert_eq!(
             w.ops(),
             [
-                (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                (Op::Change, Expect::Owner { owner_pid: DAEMON }),
                 (Op::Unlock, Expect::Peer(DAEMON)),
             ]
+        );
+        assert_eq!(
+            w.identified, 0,
+            "a listener that is the owner is not asked for its directory"
         );
         assert_eq!(w.sent[0].1, 2, "CHANGE carries the token twice");
         assert_eq!(w.sent[1].1, 1, "UNLOCK carries it once");
         assert_eq!(w.reports, [Status::Waiting, Status::Delivered]);
         assert_eq!(outcome.exit_code(), 0);
+    }
+
+    /// A socket-activated socket: the user's systemd manager listens, so the
+    /// owner is asked for its control directory, and the token goes to the
+    /// manager's socket only once the owner reports this user's.
+    #[test]
+    fn a_manager_listener_is_sent_to_after_the_owner_reports_this_directory() {
+        const MANAGER: u32 = 99;
+        let mut w = Script::new()
+            .change_at(2.0, Some(OWNER))
+            .serves(OWNER, DAEMON)
+            .reply(Sent::PeerMismatch { peer_pid: MANAGER })
+            .reply(Sent::Answered {
+                result: ControlResult::Ok,
+                peer_pid: MANAGER,
+            })
+            .reply(Sent::Answered {
+                result: ControlResult::Ok,
+                peer_pid: MANAGER,
+            });
+        let outcome = w.run();
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Delivered {
+                    daemon_pid: DAEMON,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            w.ops(),
+            [
+                (Op::Change, Expect::Owner { owner_pid: DAEMON }),
+                (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                (Op::Unlock, Expect::Peer(MANAGER)),
+            ]
+        );
+        assert_eq!(w.identified, 1);
+
+        // An owner that reports another directory gets nothing more.
+        let mut w = Script::new()
+            .change_at(2.0, Some(OWNER))
+            .reply(Sent::PeerMismatch { peer_pid: MANAGER });
+        w.identities
+            .push((OWNER.into(), Identity::Mismatch { owner_pid: DAEMON }));
+        let outcome = w.run();
+        assert!(matches!(outcome, Outcome::GaveUp { .. }), "{outcome:?}");
+        assert_eq!(w.ops(), [(Op::Change, Expect::Owner { owner_pid: DAEMON })]);
+        assert!(w.logs.contains(&Event::IdentityMismatch {
+            owner_pid: DAEMON,
+            peer_pid: None
+        }));
     }
 
     #[test]
@@ -863,7 +974,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Stale { daemon_pid: DAEMON });
         assert_eq!(
             w.ops(),
-            [(Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON })],
+            [(Op::Change, Expect::Owner { owner_pid: DAEMON })],
             "no UNLOCK after a stale CHANGE"
         );
         assert_eq!(w.logs.last(), Some(&Event::Stale { daemon_pid: DAEMON }));
@@ -879,6 +990,11 @@ mod tests {
             .change_at(3.0, Some(":1.10"))
             .change_at(4.0, Some(OWNER))
             .serves(OWNER, DAEMON)
+            // :1.9's listener is not :1.9, and :1.9 serves another directory.
+            .reply(Sent::PeerMismatch { peer_pid: 29 })
+            // :1.10 serves this directory, but neither it nor the manager
+            // listens: a third process does, twice.
+            .reply(Sent::PeerMismatch { peer_pid: 31 })
             .reply(Sent::PeerMismatch { peer_pid: 31 })
             .reply(answered(ControlResult::Ok))
             .reply(answered(ControlResult::Ok));
@@ -905,21 +1021,30 @@ mod tests {
             }],
             "logged once, for the first mismatch"
         );
-        // The directory mismatch sends nothing. The listener mismatch is
-        // refused inside `send`, before anything is written.
+        // Every refused attempt is refused inside `send`, before anything is
+        // written; the directory mismatch is asked after the first one and
+        // ends the attempt at that owner.
         assert_eq!(
             w.ops(),
             [
+                (Op::Change, Expect::Owner { owner_pid: 30 }),
+                (
+                    Op::Change,
+                    Expect::Owner {
+                        owner_pid: DAEMON + 1
+                    }
+                ),
                 (
                     Op::Change,
                     Expect::OwnerOrManager {
                         owner_pid: DAEMON + 1
                     }
                 ),
-                (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                (Op::Change, Expect::Owner { owner_pid: DAEMON }),
                 (Op::Unlock, Expect::Peer(DAEMON)),
             ]
         );
+        assert_eq!(w.identified, 2, "only the owners that are not the listener");
     }
 
     /// A daemon that times out or answers FAILED keeps its name, so no owner
@@ -948,8 +1073,8 @@ mod tests {
             assert_eq!(
                 w.ops(),
                 [
-                    (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
-                    (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                    (Op::Change, Expect::Owner { owner_pid: DAEMON }),
+                    (Op::Change, Expect::Owner { owner_pid: DAEMON }),
                     (Op::Unlock, Expect::Peer(DAEMON)),
                 ],
                 "{first:?}"
@@ -986,10 +1111,10 @@ mod tests {
         assert_eq!(
             w.ops(),
             [
-                (Op::Change, Expect::OwnerOrManager { owner_pid: DAEMON }),
+                (Op::Change, Expect::Owner { owner_pid: DAEMON }),
                 (
                     Op::Change,
-                    Expect::OwnerOrManager {
+                    Expect::Owner {
                         owner_pid: DAEMON + 2
                     }
                 ),

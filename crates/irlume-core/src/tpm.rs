@@ -27,7 +27,7 @@
 //! expose only a handful of session/transient-object slots, so leaking them
 //! bricks the daemon after a few operations.
 
-use crate::envelope::{PcrValue, PolicyKind, SealedEnvelope};
+use crate::envelope::{ParentKey, PcrValue, PolicyKind, SealedEnvelope};
 use crate::storage_key;
 use irlume_common::{Error, Result};
 use sha2::{Digest as _, Sha256};
@@ -431,16 +431,28 @@ pub fn lockout_state() -> Result<TpmLockout> {
             value(PropertyTag::LockoutInterval),
             value(PropertyTag::LockoutRecovery),
         ],
-        srk_template()?.object_attributes().no_da(),
+        lockout_spares_irlume(&mut ctx),
     )
+}
+
+/// Whether a TPM lockout blocks none of irlume's envelopes: the DA-exempt key
+/// irlumed recorded is at its handle with its name and shape, and every
+/// envelope records it as its parent, so new seals and every unseal go
+/// through it. An envelope store that cannot be read, or a TPM read that
+/// fails, answers no, which keeps doctor's lockout warning.
+fn lockout_spares_irlume(ctx: &mut Context) -> bool {
+    let Some((handle, name)) = storage_key::recorded_key() else {
+        return false;
+    };
+    da_exempt_key_at(ctx, handle, &name, true).is_ok_and(|key| key.is_some())
+        && storage_key::every_envelope_on(&storage_key::hex(&name)).unwrap_or(false)
 }
 
 /// A [`TpmLockout`] from the properties `GetCapability` returned, in the
 /// order `TPM_PT_PERMANENT`, `TPM_PT_LOCKOUT_COUNTER`, `TPM_PT_MAX_AUTH_FAIL`,
 /// `TPM_PT_LOCKOUT_INTERVAL`, `TPM_PT_LOCKOUT_RECOVERY`. Every one is
-/// required. `storage_key_no_da` is whether the storage key irlume seals under
-/// has `noDA`: every irlume seal and unseal goes through a key derived from
-/// [`srk_template`], persisted or not, so its template decides.
+/// required. `storage_key_no_da` is whether a lockout blocks none of
+/// irlume's envelopes ([`lockout_spares_irlume`]).
 fn lockout_from(properties: [Option<u32>; 5], storage_key_no_da: bool) -> Result<TpmLockout> {
     const NAMES: [&str; 5] = [
         "permanent attributes",
@@ -1470,6 +1482,95 @@ fn with_srk_mode<T>(
     result
 }
 
+/// The parent for a new seal (ADR-0034 §3.3): irlume's DA-exempt storage key
+/// when irlumed recorded it and the key at that handle has the recorded TPM
+/// name and the DA-exempt template's shape, with the record to keep in the
+/// envelope; otherwise the original key, as [`with_srk`] finds or persists it.
+/// A key with that shape has a sensitive area the TPM generated and never
+/// releases (fixedTPM, sensitiveDataOrigin), so even a planted one keeps what
+/// is sealed under it secret. The new key is never derived here: only
+/// irlumed's start-up step persists it.
+fn with_seal_parent<T>(
+    ctx: &mut Context,
+    body: impl FnOnce(&mut Context, &KeyHandle, Option<ParentKey>) -> Result<T>,
+) -> Result<T> {
+    if let Some((handle, name)) = storage_key::recorded_key() {
+        if let Some(key) = da_exempt_key_at(ctx, handle, &name, true)? {
+            let parent = ParentKey {
+                handle,
+                name: storage_key::hex(&name),
+            };
+            return body(ctx, &key, Some(parent));
+        }
+    }
+    with_srk(ctx, |ctx, srk| body(ctx, srk, None))
+}
+
+/// The parent to load `env`'s object under: the key the envelope records,
+/// found at its handle with its TPM name, or for an envelope without a record
+/// the original key in `mode`. A recorded key that is not there is an error:
+/// no other key can load the object, and finding the key by its name is
+/// irlumed's start-up step's work, never an authentication's.
+fn with_envelope_parent<T>(
+    ctx: &mut Context,
+    env: &SealedEnvelope,
+    mode: SrkMode,
+    body: impl FnOnce(&mut Context, &KeyHandle) -> Result<T>,
+) -> Result<T> {
+    let Some(parent) = &env.parent else {
+        return with_srk_mode(ctx, mode, body);
+    };
+    let name = storage_key::unhex(&parent.name)
+        .ok_or_else(|| Error::Protocol("the envelope's storage key name is not hex".into()))?;
+    // The handle is a hint and the name decides (ADR-0034 §3.3): when the key
+    // is no longer at the envelope's handle but irlumed recorded the same key
+    // at another one, that is the parent.
+    let mut key = da_exempt_key_at(ctx, parent.handle, &name, false)?;
+    if key.is_none() {
+        if let Some((handle, recorded)) = storage_key::recorded_key() {
+            if recorded == name && handle != parent.handle {
+                key = da_exempt_key_at(ctx, handle, &name, false)?;
+            }
+        }
+    }
+    let key = key.ok_or_else(|| {
+        Error::Tpm(format!(
+            "the storage key this envelope is sealed under is not at {:#010x}",
+            parent.handle
+        ))
+    })?;
+    body(ctx, &key)
+}
+
+/// The persistent key at `handle` when its TPM name is `name` and, with
+/// `check_shape`, it has the DA-exempt template's shape; `None` otherwise.
+/// The handle is probed first, so that a free one logs no esys error (#601).
+/// A persistent object is never flushed.
+fn da_exempt_key_at(
+    ctx: &mut Context,
+    handle: u32,
+    name: &[u8],
+    check_shape: bool,
+) -> Result<Option<KeyHandle>> {
+    if !OWNER_PERSISTENT.contains(&handle) || !persistent_handle_present(ctx, handle)? {
+        return Ok(None);
+    }
+    let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+    let object = ctx
+        .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+        .map_err(tpm_err)?;
+    let key = KeyHandle::from(ESYS_TR::from(object));
+    let (public, found, _) = ctx.read_public(key).map_err(tpm_err)?;
+    if found.value() != name
+        || (check_shape && !has_template_shape(&public, &da_exempt_srk_template()?))
+    {
+        return Ok(None);
+    }
+    // The key's authValue is empty; tell ESYS so, as for the original key.
+    ctx.tr_set_auth(object, Auth::default()).map_err(tpm_err)?;
+    Ok(Some(key))
+}
+
 /// True when this machine could seal under a strictly stronger policy than
 /// `current` right now. Used by the login-time self-heal to auto-upgrade an
 /// envelope sealed under a weaker policy (a signed Tier 1 envelope from an
@@ -1595,7 +1696,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     let pcrs = pcrs.to_vec();
     let mut ctx = open_context()?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    with_seal_parent(&mut ctx, |ctx, srk, parent| {
         // Read right before the object is created: the policy commits to these
         // values, and the copy stashed for diagnosis is the same reading.
         let pcr_values = read_pcr_values(ctx, &pcrs)?;
@@ -1620,6 +1721,7 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
             pcr_values,
             password_wrap: None,
             uid: None,
+            parent,
         })
     })
 }
@@ -1741,6 +1843,7 @@ mod envelope_version_tests {
             pcr_values,
             password_wrap: None,
             uid: None,
+            parent: None,
         }
     }
 
@@ -1816,7 +1919,7 @@ where
 fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
-    with_srk_mode(&mut ctx, mode, |ctx, srk| {
+    with_envelope_parent(&mut ctx, env, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
 
@@ -1899,6 +2002,7 @@ pub(crate) fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
             pcr_values: pcr_values.clone(),
             password_wrap: None,
             uid: None,
+            parent: None,
         })
     })
 }
@@ -1916,7 +2020,7 @@ fn unseal_authorized(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let mut ctx = open_context()?;
 
-    with_srk_mode(&mut ctx, mode, |ctx, srk| {
+    with_envelope_parent(&mut ctx, env, mode, |ctx, srk| {
         with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
             let policy_session = PolicySession::try_from(session).map_err(tpm_err)?;
 
@@ -2566,7 +2670,7 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
     let nv = nv_index_handle(&mut ctx, nv_index)?;
     let auth_policy = pcrlock_auth_policy(&mut ctx, nv)?;
 
-    with_srk(&mut ctx, |ctx, srk| {
+    with_seal_parent(&mut ctx, |ctx, srk, parent| {
         let tmpl = sealed_template(auth_policy.clone())?;
         let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
         let created = ctx
@@ -2587,6 +2691,7 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
             pcr_values: pcr_values.clone(),
             password_wrap: None,
             uid: None,
+            parent,
         })
     })
 }
@@ -2604,7 +2709,7 @@ fn unseal_pcrlock(
     let nv = nv_index_handle(&mut ctx, nv_index)?;
     let super_pcr = build_super_pcr(&plock)?;
 
-    with_srk_mode(&mut ctx, mode, |ctx, srk| {
+    with_envelope_parent(&mut ctx, env, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
         let sealed_handle = ctx
@@ -4374,6 +4479,273 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(reason(&full), RefusalReason::NoSpace);
         assert_eq!(reason(&owner), RefusalReason::OwnerAuthorization);
         assert_eq!(after, before, "the test leaves the TPM as it found it");
+    }
+
+    /// The state, template-key and keyring directories pointed at a fresh
+    /// temporary tree until dropped. Hold `testenv::ENV_LOCK` first.
+    struct StateDirs {
+        dir: String,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl StateDirs {
+        fn new(name: &str) -> Self {
+            let dir = crate::test_tmp_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(format!("{dir}/keyring")).expect("keyring dir");
+            std::fs::create_dir_all(format!("{dir}/template-keys")).expect("template key dir");
+            let vars = [
+                ("IRLUME_STATE_DIR", dir.clone()),
+                ("IRLUME_KEYRING_DIR", format!("{dir}/keyring")),
+                ("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys")),
+            ];
+            let previous = vars
+                .iter()
+                .map(|(var, _)| (*var, std::env::var_os(var)))
+                .collect();
+            for (var, value) in &vars {
+                std::env::set_var(var, value);
+            }
+            Self { dir, previous }
+        }
+
+        /// Writes `env` as `user`'s keyring envelope.
+        fn store(&self, user: &str, env: &SealedEnvelope) {
+            let bytes = serde_json::to_vec(env).expect("envelope json");
+            std::fs::write(format!("{}/keyring/{user}.json", self.dir), bytes)
+                .expect("write the envelope");
+        }
+    }
+
+    impl Drop for StateDirs {
+        fn drop(&mut self) {
+            for (var, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn require_swtpm() {
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this test writes persistent handles: run it on swtpm, never on a real TPM"
+        );
+    }
+
+    /// ADR-0034 §3.3 on swtpm: before irlumed persists the DA-exempt key a
+    /// seal records no parent and uses the original key; once the start-up
+    /// step persisted it, new seals record it and unseal through it while an
+    /// envelope sealed before still unseals through the original key. A
+    /// lockout spares irlume only once every envelope is on the new key. The
+    /// envelope's handle is a hint: with the key re-persisted at another
+    /// handle the recorded key opens it; with the key gone the load fails, and
+    /// a new seal falls back to the original key.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_new_seals_go_under_the_da_exempt_key_once_it_is_persisted() {
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("seal-parent");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED) && !before.contains(&(PREFERRED + 1)),
+            "the handles this test uses are taken: {before:x?}"
+        );
+
+        let old = seal_with_pcrs(b"sealed before", &[]).expect("seal");
+        dirs.store("alice", &old);
+        let persisted = crate::storage_key::ensure_at_start();
+        let new = seal_with_pcrs(b"sealed after", &[]).expect("seal");
+        let new_open = unseal(&new).map(|s| s.to_vec());
+        let new_read_only = unseal_read_only(&new).map(|s| s.to_vec());
+        let old_open = unseal(&old).map(|s| s.to_vec());
+        let spared_mixed = lockout_state().map(|l| l.storage_key_no_da);
+        dirs.store("alice", &new);
+        let spared_all = lockout_state().map(|l| l.storage_key_no_da);
+
+        let removed = evict_da_exempt_srks();
+        persist_child_at(da_exempt_srk_template().expect("template"), PREFERRED);
+        let moved = crate::storage_key::ensure_at_start();
+        let through_record = unseal(&new).map(|s| s.to_vec());
+        let removed_again = evict_da_exempt_srks();
+        let gone = unseal(&new);
+        let fallback = seal_with_pcrs(b"sealed without it", &[]);
+        evict_fixture_at(PREFERRED);
+        let after = handles();
+        drop(dirs);
+
+        assert!(
+            old.parent.is_none(),
+            "no parent before the key is persisted"
+        );
+        assert_eq!(
+            persisted.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
+        );
+        let parent = new.parent.clone().expect("a new seal records its parent");
+        assert_eq!(parent.handle, PREFERRED);
+        assert_eq!(new_open.expect("unseal under the new key"), b"sealed after");
+        assert_eq!(new_read_only.expect("read-only unseal"), b"sealed after");
+        assert_eq!(
+            old_open.expect("the original key still opens"),
+            b"sealed before"
+        );
+        assert!(
+            !spared_mixed.expect("lockout state"),
+            "an envelope on the original key"
+        );
+        assert!(
+            spared_all.expect("lockout state"),
+            "every envelope on the new key"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert_eq!(
+            moved.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted {
+                handle: PREFERRED + 1
+            })
+        );
+        assert_eq!(
+            through_record.expect("the recorded key opens it at its new handle"),
+            b"sealed after"
+        );
+        assert_eq!(removed_again.expect("evict"), vec![PREFERRED + 1]);
+        assert!(
+            gone.is_err(),
+            "no other key opens an envelope with a parent"
+        );
+        assert!(
+            fallback.expect("seal").parent.is_none(),
+            "without the key a seal uses the original key"
+        );
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// Fails the authorization of a DA-protected object (no noDA, an
+    /// authValue) under `parent` until the TPM answers `TPM_RC_LOCKOUT`.
+    /// swtpm starts with maxTries 3 (ADR-0034's swtpm experiments).
+    fn fail_until_lockout(ctx: &mut Context, parent: KeyHandle) {
+        use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
+        let attrs = ObjectAttributesBuilder::new()
+            .with_fixed_tpm(true)
+            .with_fixed_parent(true)
+            .with_user_with_auth(true)
+            .build()
+            .expect("attributes");
+        let template = PublicBuilder::new()
+            .with_public_algorithm(PublicAlgorithm::KeyedHash)
+            .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+            .with_object_attributes(attrs)
+            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+            .with_keyed_hash_unique_identifier(Digest::default())
+            .build()
+            .expect("template");
+        let right = Auth::try_from(b"right".to_vec()).expect("auth");
+        let object = ctx
+            .execute_with_nullauth_session(|ctx| {
+                let created = ctx.create(
+                    parent,
+                    template,
+                    Some(right),
+                    Some(SensitiveData::try_from(b"x".to_vec())?),
+                    None,
+                    None,
+                )?;
+                ctx.load(parent, created.out_private, created.out_public)
+            })
+            .expect("a DA-protected object");
+        ctx.tr_set_auth(
+            object.into(),
+            Auth::try_from(b"wrong".to_vec()).expect("auth"),
+        )
+        .expect("set the wrong auth");
+        let mut locked = false;
+        for _ in 0..16 {
+            match ctx.execute_with_nullauth_session(|ctx| ctx.unseal(object.into())) {
+                Ok(_) => panic!("a wrong authValue unsealed"),
+                Err(tss_esapi::Error::Tss2Error(code))
+                    if code.kind() == Some(Tss2ResponseCodeKind::Lockout) =>
+                {
+                    locked = true;
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        let _ = ctx.flush_context(object.into());
+        assert!(locked, "the TPM reached lockout");
+    }
+
+    /// ADR-0034 acceptance, in a swtpm of its own (the lockout lasts 1000 s
+    /// on a fresh swtpm, so the shared lane never runs it): with the TPM in
+    /// dictionary-attack lockout, a seal and an unseal under the DA-exempt key
+    /// succeed, and an envelope under the original key does not load.
+    #[test]
+    #[ignore = "needs a swtpm of its own (IRLUME_TEST_OWN_SWTPM=1 with \
+                scripts/with-swtpm.sh); CI runs it so"]
+    fn tpm_the_da_exempt_key_keeps_irlume_working_through_a_lockout() {
+        require_swtpm();
+        assert_eq!(
+            std::env::var("IRLUME_TEST_OWN_SWTPM").as_deref(),
+            Ok("1"),
+            "this test puts the TPM in lockout: give it a swtpm of its own"
+        );
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("lockout");
+        let old = seal_with_pcrs(b"on the original key", &[]).expect("seal");
+        dirs.store("alice", &old);
+        let persisted = crate::storage_key::ensure_at_start().expect("the step");
+        let new = seal_with_pcrs(b"on the DA-exempt key", &[]).expect("seal");
+        let (handle, name) = crate::storage_key::recorded_key().expect("recorded");
+        let mut ctx = open_context().expect("context");
+        let key = da_exempt_key_at(&mut ctx, handle, &name, true)
+            .expect("probe")
+            .expect("the DA-exempt key");
+        fail_until_lockout(&mut ctx, key);
+        drop(ctx);
+
+        let state = lockout_state().expect("lockout state");
+        let opened = unseal(&new).map(|s| s.to_vec());
+        let during = seal_with_pcrs(b"sealed in lockout", &[]);
+        let during_opened = during
+            .as_ref()
+            .ok()
+            .map(|env| unseal(env).map(|s| s.to_vec()));
+        let blocked = unseal(&old);
+        drop(dirs);
+
+        assert!(matches!(
+            persisted,
+            Some(crate::storage_key::Outcome::Persisted { .. })
+        ));
+        assert!(state.in_lockout, "the TPM is in lockout");
+        assert_eq!(
+            opened.expect("unseal under the new key"),
+            b"on the DA-exempt key"
+        );
+        assert!(during.expect("seal in lockout").parent.is_some());
+        assert_eq!(
+            during_opened.expect("sealed").expect("unseal in lockout"),
+            b"sealed in lockout"
+        );
+        assert!(blocked.is_err(), "the original key is blocked in lockout");
     }
 
     /// Our SRK template with a non-empty authPolicy, as another stack's

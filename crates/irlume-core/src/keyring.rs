@@ -890,6 +890,7 @@ mod tests {
             pcr_values: Vec::new(),
             password_wrap,
             uid,
+            parent: None,
         }
         .save(&envelope_path(user))
         .unwrap();
@@ -1103,6 +1104,7 @@ mod tests {
                 pcr_values: Vec::new(),
                 password_wrap: None,
                 uid: None,
+                parent: None,
             }
             .save(&envelope_path(user))
             .unwrap();

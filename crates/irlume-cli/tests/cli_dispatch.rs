@@ -286,6 +286,7 @@ fn write_test_seal_without_pcr_snapshot(path: &Path) {
         pcr_values: Vec::new(),
         password_wrap: None,
         uid: None,
+        parent: None,
     };
     std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
 }

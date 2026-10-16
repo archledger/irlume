@@ -4220,9 +4220,10 @@ fn tpm_lockout_check(
             "irlume's storage key is DA-exempt, so irlume is not affected, but disk \
              unlock PINs and other TPM PIN users on this machine are"
         } else {
-            "irlume's storage key is not DA-exempt yet (ADR-0034 §3), so face login \
-             with an encrypted enrollment (one a TPM-sealed template key protects) and \
-             the release of sealed keyring secrets use the password until it ends"
+            "not every irlume envelope is on its DA-exempt storage key yet (ADR-0034 §3), \
+             so face login with an encrypted enrollment (one a TPM-sealed template key \
+             protects) and the release of sealed keyring secrets whose envelopes are still \
+             on the original key use the password until it ends"
         };
         // The TPM keeps no "time left" value: a lockout ends one recovery
         // interval of powered-on time after the last failure, and a power

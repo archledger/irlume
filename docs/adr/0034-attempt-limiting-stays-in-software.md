@@ -785,33 +785,43 @@ authentication. It needs no client: the start already holds the record, opens
 the TPM, and runs before any request. The key is retired when all of these
 hold:
 
-1. **Unused across boots.** The record holds two boot IDs for the key:
-   `unused_since`, set by a start whose census finds no envelope under it
-   (none without a recorded parent; an envelope it cannot read counts as
-   under it), and `moved_in`, the boot of a move off it that was not yet
-   shown durable. The order of writes is what makes them safe:
+1. **Unused across boots.** The record holds, for the key, `unused_since`,
+   the boot ID of a start whose census found no envelope under it (none
+   without a recorded parent; an envelope it cannot read counts as under it),
+   and `moves`, one entry per envelope (by account and kind) whose move off
+   the key is not yet shown durable, each with the boot of that move. The
+   order of writes is what makes them safe:
    - Before a move off the key publishes its new envelope, the record is
-     written with `unused_since` cleared and `moved_in` set to this boot. When
-     the move's write is durable, `moved_in` is cleared again; when it reports
-     `AtomicWrite::VisibleNotDurable`, `moved_in` stays, since after a power
-     loss the envelope under the key can come back.
+     written with `unused_since` cleared and that envelope's entry set to
+     this boot. When the move's write is durable, that entry is removed; when
+     it reports `AtomicWrite::VisibleNotDurable`, it stays, since after a
+     power loss the envelope under the key can come back. A durable move
+     removes only its own envelope's entry, so a durable move of one envelope
+     never hides an earlier move of another that was not durable; a later
+     durable move of the same envelope removes it, since that write makes
+     the envelope's state durable.
    - A start whose census finds an envelope under the key clears
      `unused_since` before it moves anything.
    - A start whose census is empty sets `unused_since` to its boot only when
-     `moved_in` is not this boot.
+     no entry names this boot, and drops the entries that name another boot,
+     since its census read what the disk kept of that boot's writes.
    - A start retires the key only when its census is empty and `unused_since`
      names another boot. A boot ID that cannot be read is no other boot.
 
-   Each of these record writes is made durable (written atomically and its
-   directory synced) before the step that relies on it, and one that reports
+   Each update reads, changes and writes the record under the record lock, so
+   the moves of different envelopes (template keys at a start, a keyring
+   secret at a login) never undo each other's entries. Each of these record
+   writes is made durable (written atomically and its directory synced)
+   before the step that relies on it, and one that reports
    `VisibleNotDurable` counts as failed: the move is not made, or the key is
    not retired. A crash between a move and the record update therefore leaves
-   `moved_in` set or `unused_since` cleared, never a mark that outlives an
-   envelope. A template key moved durably at a start in boot A can be retired
-   at the first start in a later boot; a key whose last envelope moved after
-   the start (a keyring secret at a login) is marked at the next start and
-   retired at a start in a boot after the mark's; a move that was not durable
-   adds a boot.
+   the envelope's entry set or `unused_since` cleared, never a mark that
+   outlives an envelope. A template key moved durably at a start in boot A can
+   be retired at the first start in a later boot; a key whose last envelope
+   moved after the start (a keyring secret at a login) is marked at the next
+   start and retired at a start in a boot after the mark's; any move in a
+   boot that was not durable adds a boot, whatever other moves in that boot
+   did.
 2. **Proof.** The key at the original handle has the name the record kept,
    and a fresh derivation of the original template at this start gives the
    same modulus, as uninstall compares it. The derivation runs only at a
@@ -871,8 +881,9 @@ an envelope names:
   a power loss kept it from the record, as section 3.2 adopts a first key;
   only without one does it persist the derivation at the next free owner
   handle. It records the new key as the DA-exempt key, keeping the weak key's
-  handle and name in the record. An envelope whose parent is the weak key counts as having a reason
-  to move, like one on the original key, and moves at its move point. Once no
+  handle and name in the record. An envelope whose parent is the weak key
+  counts as having a reason to move, like one on the original key, and moves
+  at its move point. Once no
   envelope names the weak key, across boots as in condition 1, doctor reports
   it for the manual path; irlume does not evict it, since a fresh derivation
   no longer reproduces it. If the new key cannot be persisted
@@ -923,7 +934,8 @@ action and its `docs/TUI.md` row in the same change.
 ### What doctor reports
 
 The `tpm-lockout` reading is unchanged. A storage key waiting to be retired is
-reported with its handle, its name and what it waits for: a later boot, an
+reported with its handle, its name and what it waits for: a later boot (and,
+after a move not yet shown durable, which envelope, by account and kind), an
 envelope that still names it (by account and kind), or the DA-exempt key it
 needs. A key irlume will not evict because a derivation does not reproduce it
 is reported, once no envelope names it, with the manual command and its
@@ -935,7 +947,9 @@ Acceptance tests (added, Phase 3):
 - With fake boot IDs: a template key moved durably at a start is retired at
   the first start in a later boot whose census is still empty; a keyring
   secret moved after the start delays that by one boot; a move that reported
-  `VisibleNotDurable` delays it by one more; an envelope restored by a
+  `VisibleNotDurable` delays it by one more, and so does one followed in the
+  same boot by a durable move of another envelope (the mixed case, through an
+  irlumed restart between them); an envelope restored by a
   simulated power loss keeps the key; an envelope that cannot be parsed keeps
   it; an unreadable boot ID retires nothing; with an old `unused_since` from
   another boot, a returning envelope whose move is stopped between publishing

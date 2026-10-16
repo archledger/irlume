@@ -4859,6 +4859,106 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// ADR-0034 §3.3 acceptance on swtpm, recovery by name: an envelope
+    /// records the DA-exempt key at 0x81010003; the key leaves that handle
+    /// and another stack's key takes it. irlumed's start persists the key
+    /// again by the section 3.2 rule (at 0x81010004, the next free handle),
+    /// and the envelope then records that handle and opens through it with
+    /// irlumed's record gone, where its old handle no longer opens it. A
+    /// second start finds nothing stale; with the key gone too, the envelope
+    /// is reported missing.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_an_envelope_whose_handle_another_stack_took_is_recovered_by_name() {
+        use crate::storage_key::{RepointOutcome, Repointed};
+        use irlume_common::tpm_readiness::EnvelopeKind;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("repoint");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        // The first seal persists the original key when no earlier test did,
+        // so the handles are taken after it.
+        let original = seal_with_pcrs(b"on the original key", &[]).expect("seal");
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED) && !before.contains(&(PREFERRED + 1)),
+            "the handles this test uses are taken: {before:x?}"
+        );
+        dirs.store("alice", &original);
+        let first = crate::storage_key::ensure_at_start();
+        let sealed = seal_with_pcrs(b"recorded at 0x81010003", &[]).expect("seal");
+        dirs.store("alice", &sealed);
+
+        let left = evict_da_exempt_srks();
+        persist_child_at(srk_template().expect("template"), PREFERRED);
+        let again = crate::storage_key::ensure_at_start();
+        let repointed = crate::storage_key::repoint_at_start();
+        let recorded = SealedEnvelope::load(&crate::keyring::envelope_path("alice"));
+        std::fs::remove_file(format!("{}/tpm-storage-key", dirs.dir)).expect("drop the record");
+        let opened = recorded.as_ref().ok().map(unseal);
+        let stale = unseal(&sealed);
+        let nothing_stale = crate::storage_key::repoint_at_start();
+        let gone = evict_da_exempt_srks();
+        let missing = crate::storage_key::repoint_at_start();
+        evict_fixture_at(PREFERRED);
+        let after = handles();
+        drop(dirs);
+
+        assert_eq!(
+            first.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
+        );
+        assert_eq!(sealed.parent.as_ref().map(|p| p.handle), Some(PREFERRED));
+        assert_eq!(left.expect("evict"), vec![PREFERRED]);
+        assert_eq!(
+            again.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted {
+                handle: PREFERRED + 1
+            })
+        );
+        let entry = |outcome| Repointed {
+            user: "alice".into(),
+            kind: EnvelopeKind::KeyringSecret,
+            from: PREFERRED,
+            outcome,
+        };
+        assert_eq!(
+            repointed.expect("recovery by name"),
+            [entry(RepointOutcome::Moved(PREFERRED + 1))]
+        );
+        let recorded = recorded.expect("the envelope");
+        assert_eq!(
+            recorded.parent.as_ref().map(|p| (p.handle, &p.name)),
+            sealed.parent.as_ref().map(|p| (PREFERRED + 1, &p.name)),
+            "the handle changes and the name stays"
+        );
+        assert_eq!(
+            opened
+                .expect("parsed")
+                .expect("it opens by its own handle")
+                .as_slice(),
+            b"recorded at 0x81010003"
+        );
+        assert!(stale.is_err(), "the old handle holds another stack's key");
+        assert_eq!(nothing_stale.expect("the next start"), []);
+        assert_eq!(gone.expect("evict"), vec![PREFERRED + 1]);
+        let missing = missing.expect("the step");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].outcome, RepointOutcome::Missing);
+        assert_eq!(missing[0].from, PREFERRED + 1);
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
     /// Fails the authorization of a DA-protected object (no noDA, an
     /// authValue) under `parent` until the TPM answers `TPM_RC_LOCKOUT`.
     /// swtpm starts with maxTries 3 (ADR-0034's swtpm experiments).

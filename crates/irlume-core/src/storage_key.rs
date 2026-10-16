@@ -288,6 +288,161 @@ pub(crate) fn on_original_key() -> Result<OriginalKeyEnvelopes> {
     Ok(OriginalKeyEnvelopes { named, total })
 }
 
+/// An envelope whose recorded parent handle no longer holds a key with its
+/// recorded TPM name, and what irlumed's start did about it (ADR-0034 §3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repointed {
+    /// The account the envelope belongs to.
+    pub user: String,
+    /// What it holds.
+    pub kind: EnvelopeKind,
+    /// The handle it recorded.
+    pub from: u32,
+    /// What happened.
+    pub outcome: RepointOutcome,
+}
+
+/// What irlumed's start did for a [`Repointed`] envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepointOutcome {
+    /// A key with the recorded name is persisted at this handle, which the
+    /// envelope now records.
+    Moved(u32),
+    /// No persisted owner key has the recorded name, so the envelope cannot
+    /// load until it is sealed again.
+    Missing,
+    /// A key with the recorded name is persisted at this handle, but the
+    /// envelope could not be rewritten; the next start tries again.
+    Unwritten(u32, String),
+}
+
+/// irlumed's start-up recovery by name (ADR-0034 §3.3: the recorded name
+/// decides and the handle is a hint). An envelope that records a parent whose
+/// handle does not hold a key with the recorded TPM name, as when another
+/// stack took the handle after the key left it, records instead the owner
+/// handle where a key with that name is persisted. Only the handle in the
+/// envelope changes: the sealed object is not touched, so nothing is unsealed
+/// or sealed. It runs after [`ensure_at_start`], which persists the
+/// DA-exempt key again when it went missing, so the envelope finds the key
+/// where that step put it. With no envelope recording a parent it asks the
+/// TPM nothing. An authentication never does this: it uses only the key at
+/// the envelope's handle, or at the handle irlumed recorded for the same name.
+///
+/// # Errors
+///
+/// When an envelope directory cannot be read, or the TPM cannot be opened or
+/// read. An envelope that cannot be rewritten is reported in the result.
+pub fn repoint_at_start() -> Result<Vec<Repointed>> {
+    let envelopes = recorded_parents()?;
+    if envelopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tpm = tpm::DaExemptKeyTpm::open()?;
+    repoint_with(&mut tpm, envelopes)
+}
+
+/// An envelope file that records a parent: its path, kind, account and the
+/// parent it records.
+pub(crate) type RecordedParent = (PathBuf, EnvelopeKind, String, crate::envelope::ParentKey);
+
+/// The envelopes that record a parent, in the template-key and keyring stores.
+/// Only a file named for an account name irlumed accepts is taken: irlume
+/// writes no other, and the state directory is untrusted where it is
+/// writable offline (§5). An envelope that cannot be parsed is left alone.
+pub(crate) fn recorded_parents() -> Result<Vec<RecordedParent>> {
+    let mut found = Vec::new();
+    for (dir, kind) in [
+        (template_key::key_dir(), EnvelopeKind::TemplateKey),
+        (keyring::keyring_dir(), EnvelopeKind::KeyringSecret),
+    ] {
+        for path in envelope_paths(&dir)? {
+            let user = path.file_stem().and_then(|stem| stem.to_str());
+            let Some(user) = user.filter(|user| is_account_name(user)).map(str::to_owned) else {
+                continue;
+            };
+            let parent = crate::envelope::SealedEnvelope::load(&path)
+                .ok()
+                .and_then(|envelope| envelope.parent);
+            if let Some(parent) = parent {
+                found.push((path, kind, user, parent));
+            }
+        }
+    }
+    found.sort_by(|a, b| (&a.2, a.1).cmp(&(&b.2, b.1)));
+    Ok(found)
+}
+
+/// [`repoint_at_start`] over `tpm` for `envelopes`. The owner handles are
+/// scanned at most once, and only when an envelope's handle is stale.
+pub(crate) fn repoint_with(
+    tpm: &mut impl KeyTpm,
+    envelopes: Vec<RecordedParent>,
+) -> Result<Vec<Repointed>> {
+    let mut owners: Option<Vec<(u32, Vec<u8>)>> = None;
+    let mut repointed = Vec::new();
+    for (path, kind, user, parent) in envelopes {
+        // A name that is not hex names no key, at its handle or elsewhere.
+        let name = unhex(&parent.name);
+        if let Some(name) = &name {
+            if tpm::OWNER_PERSISTENT.contains(&parent.handle)
+                && tpm.name_at(parent.handle)?.as_deref() == Some(name.as_slice())
+            {
+                continue;
+            }
+        }
+        let found = match &name {
+            Some(name) => {
+                if owners.is_none() {
+                    owners = Some(tpm.owner_names()?);
+                }
+                owners
+                    .iter()
+                    .flatten()
+                    .find(|(_, owner)| owner == name)
+                    .map(|(handle, _)| *handle)
+            }
+            None => None,
+        };
+        let outcome = match found {
+            Some(to) => match record_parent_handle(&path, kind, &user, &parent, to) {
+                Ok(()) => RepointOutcome::Moved(to),
+                Err(e) => RepointOutcome::Unwritten(to, e.to_string()),
+            },
+            None => RepointOutcome::Missing,
+        };
+        repointed.push(Repointed {
+            user,
+            kind,
+            from: parent.handle,
+            outcome,
+        });
+    }
+    Ok(repointed)
+}
+
+/// Rewrite the envelope at `path` to record `handle` for its parent, under the
+/// user state lock for a template key, when it still records `parent`'s name.
+/// A visible write counts, as for a move: the old handle is only a hint.
+fn record_parent_handle(
+    path: &Path,
+    kind: EnvelopeKind,
+    user: &str,
+    parent: &crate::envelope::ParentKey,
+    handle: u32,
+) -> Result<()> {
+    let _state = match kind {
+        EnvelopeKind::TemplateKey => Some(template_key::UserStateLock::acquire(user)?),
+        EnvelopeKind::KeyringSecret | EnvelopeKind::Unknown => None,
+    };
+    let mut envelope = crate::envelope::SealedEnvelope::load(path)?;
+    match envelope.parent.as_mut() {
+        Some(recorded) if recorded.name == parent.name => recorded.handle = handle,
+        // Rewritten since the scan: what it records now is not this one.
+        _ => return Ok(()),
+    }
+    envelope.save_reporting(path).map(|_| ())
+}
+
 /// Whether `name` is an account name irlumed accepts in a request (its
 /// `valid_username`): 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `.`
 /// and `$`, not starting with `-` or `.`.
@@ -623,6 +778,8 @@ mod tests {
         /// A `Taken` answer means another start persisted this same key
         /// there a moment earlier.
         concurrent: bool,
+        /// How many times the owner handles were scanned.
+        scans: usize,
     }
 
     impl FakeTpm {
@@ -635,6 +792,7 @@ mod tests {
                 derived: 0,
                 persisted: Vec::new(),
                 concurrent: false,
+                scans: 0,
             }
         }
     }
@@ -658,6 +816,7 @@ mod tests {
             self.derive.clone()
         }
         fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
+            self.scans += 1;
             Ok(self.objects.iter().map(|(h, n)| (*h, n.clone())).collect())
         }
         fn persist(&mut self, handle: u32) -> std::result::Result<(), Failure> {
@@ -1094,6 +1253,132 @@ mod tests {
         let many = many.expect("census");
         assert_eq!(many.named.len(), MAX_NAMED_ENVELOPES);
         assert_eq!(many.total, 4 + MAX_NAMED_ENVELOPES as u32);
+    }
+
+    /// ADR-0034 §3.3, recovery by name with the TPM faked: an envelope whose
+    /// recorded handle holds another key records the handle where a key with
+    /// its name is, keeping everything else; one whose key is at its handle
+    /// is not rewritten; one whose key is nowhere, or whose name is not hex,
+    /// is reported missing and left as it was; an envelope with no parent, one
+    /// that cannot be parsed and a file that is no account's are left alone.
+    /// The owner handles are scanned once.
+    #[test]
+    fn an_envelope_whose_handle_another_key_took_records_where_its_key_is() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_tmp_dir("storage-key-repoint");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+        std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+        let vars = ["IRLUME_TEMPLATE_KEY_DIR", "IRLUME_KEYRING_DIR"];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let envelope = |parent: Option<(u32, &str)>| {
+            let mut value = serde_json::json!({
+                "version": 1, "pcrs": [7], "public": "", "private": "", "uid": 4170
+            });
+            if let Some((handle, name)) = parent {
+                value["parent"] = serde_json::json!({"handle": handle, "name": name});
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        let path = |name: &str| format!("{dir}/{name}");
+        let write = |name: &str, bytes: &[u8]| std::fs::write(path(name), bytes).unwrap();
+        let read = |name: &str| std::fs::read(path(name)).unwrap();
+        write(
+            "template-keys/alice.json",
+            &envelope(Some((0x8101_0003, "aa"))),
+        );
+        write("keyring/alice.json", &envelope(Some((0x8101_0004, "aa"))));
+        write("keyring/bob.json", &envelope(Some((0x8101_0003, "bb"))));
+        write("keyring/carol.json", &envelope(None));
+        write(
+            "keyring/dave.json",
+            &envelope(Some((0x8101_0004, "not hex"))),
+        );
+        write("keyring/erin.json", b"not an envelope");
+        write(
+            "keyring/-planted.json",
+            &envelope(Some((0x8101_0003, "aa"))),
+        );
+        let untouched: Vec<_> = [
+            "keyring/alice.json",
+            "keyring/bob.json",
+            "keyring/carol.json",
+            "keyring/dave.json",
+            "keyring/erin.json",
+            "keyring/-planted.json",
+        ]
+        .into_iter()
+        .map(|name| (name, read(name)))
+        .collect();
+        let mut tpm = FakeTpm::new();
+        // Another stack's key took the handle; irlume's key is at the next.
+        tpm.objects.insert(0x8101_0003, b"theirs".to_vec());
+        tpm.objects.insert(0x8101_0004, vec![0xaa]);
+        let repointed = recorded_parents().and_then(|found| repoint_with(&mut tpm, found));
+        let moved =
+            crate::envelope::SealedEnvelope::load(Path::new(&path("template-keys/alice.json")));
+        let unchanged: Vec<_> = untouched
+            .iter()
+            .filter(|(name, before)| read(name) != *before)
+            .map(|(name, _)| *name)
+            .collect();
+        let mut again = FakeTpm::new();
+        again.objects = tpm.objects.clone();
+        let second = recorded_parents().and_then(|found| repoint_with(&mut again, found));
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let entry = |user: &str, kind, from, outcome| Repointed {
+            user: user.into(),
+            kind,
+            from,
+            outcome,
+        };
+        assert_eq!(
+            repointed.expect("the step"),
+            [
+                entry(
+                    "alice",
+                    EnvelopeKind::TemplateKey,
+                    0x8101_0003,
+                    RepointOutcome::Moved(0x8101_0004)
+                ),
+                entry(
+                    "bob",
+                    EnvelopeKind::KeyringSecret,
+                    0x8101_0003,
+                    RepointOutcome::Missing
+                ),
+                entry(
+                    "dave",
+                    EnvelopeKind::KeyringSecret,
+                    0x8101_0004,
+                    RepointOutcome::Missing
+                ),
+            ]
+        );
+        assert_eq!(tpm.scans, 1, "the owner handles are scanned once");
+        let moved = moved.expect("the rewritten envelope");
+        let parent = moved.parent.expect("its parent");
+        assert_eq!((parent.handle, parent.name.as_str()), (0x8101_0004, "aa"));
+        assert_eq!(moved.uid, Some(4170), "everything else is kept");
+        assert!(unchanged.is_empty(), "rewritten: {unchanged:?}");
+        let second = second.expect("the next start");
+        assert!(
+            second
+                .iter()
+                .all(|entry| entry.outcome == RepointOutcome::Missing),
+            "only the missing ones again: {second:?}"
+        );
     }
 
     /// An oversized envelope or record in the state directory is refused by

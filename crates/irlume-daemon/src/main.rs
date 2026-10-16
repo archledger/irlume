@@ -1628,6 +1628,10 @@ fn main() {
                 }
                 match ensured.map(|(outcome, _)| outcome) {
                     Ok(None | Some(Outcome::Present { .. } | Outcome::Deferred(_))) => {}
+                    Ok(Some(Outcome::Found { handle })) => jout_notice!(
+                        "irlumed: irlume's DA-exempt storage key was away from its recorded \
+                         handle and is at {handle:#010x}, found by its TPM name (ADR-0034 §3.3)"
+                    ),
                     Ok(Some(Outcome::Adopted { handle } | Outcome::Persisted { handle })) => {
                         jout_notice!(
                             "irlumed: irlume's DA-exempt storage key is persisted at \

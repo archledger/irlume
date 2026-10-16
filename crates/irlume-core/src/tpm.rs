@@ -1929,6 +1929,24 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
     if current.parent.is_some() && candidate.parent.is_none() {
         return None;
     }
+    // A candidate under another key than `current` must be under the key the
+    // record holds now: a start that superseded the candidate's key since it
+    // was sealed (an overlapping start replacing a weak key, say) makes it
+    // no move, whatever it gains, and the next move point seals again. The
+    // recorded key and the superseded ones are read from one state of the
+    // record.
+    let mut off_superseded = false;
+    if let Some(to) = &candidate.parent {
+        let from = current.parent.as_ref().map(|from| from.name.as_str());
+        if from != Some(to.name.as_str()) {
+            let (recorded, superseded) = storage_key::da_exempt_keys();
+            if recorded.as_deref() != Some(to.name.as_str()) {
+                return None;
+            }
+            off_superseded =
+                from.is_some_and(|from| superseded.iter().any(|(_, name)| name == from));
+        }
+    }
     let binding = if matches!(candidate.policy, PolicyKind::PcrlockNv { .. })
         || matches!(current.policy, PolicyKind::PcrlockNv { .. })
     {
@@ -1939,17 +1957,7 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
     let candidate_rank = current_strength_rank(candidate, binding.as_ref())?;
     let current_rank = current_strength_rank(current, binding.as_ref())?;
     // Onto the DA-exempt key from the original key, or from a key the
-    // recorded one superseded onto the recorded key itself, read with the
-    // superseded keys from one state of the record: a start that superseded
-    // the candidate's key since it was sealed makes this no move.
-    let off_superseded = match (&current.parent, &candidate.parent) {
-        (Some(from), Some(to)) if from.name != to.name => {
-            let (recorded, superseded) = storage_key::da_exempt_keys();
-            recorded.as_deref() == Some(to.name.as_str())
-                && superseded.iter().any(|(_, name)| *name == from.name)
-        }
-        _ => false,
-    };
+    // recorded one superseded.
     let to_da_exempt_key =
         (current.parent.is_none() && candidate.parent.is_some()) || off_superseded;
     match (candidate_rank.cmp(&current_rank), to_da_exempt_key) {
@@ -6778,6 +6786,20 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// envelope off that key, even for a stronger policy.
     #[test]
     fn a_move_gains_the_da_exempt_key_and_never_gives_it_up() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The record names the key the candidates are under: a move onto
+        // another key is none (`an_envelope_on_a_superseded_key_moves_onto_the_recorded_one`).
+        let state = crate::test_tmp_dir("move-gain");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let previous = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+        let json = serde_json::json!({
+            "version": 1, "persisted": {"handle": 0x8101_0003_u32, "name": "000b00"}
+        });
+        std::fs::write(format!("{state}/tpm-storage-key"), json.to_string()).unwrap();
         let envelope = |pcrs: &[u32], on_key: bool| {
             let mut env: SealedEnvelope = serde_json::from_value(serde_json::json!({
                 "version": 1, "pcrs": pcrs, "public": "", "private": ""
@@ -6792,33 +6814,51 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // Literal seals: PCR 7 binds the firmware state, no PCR binds nothing.
         let firmware = |on_key| envelope(&[7], on_key);
         let unbound = |on_key| envelope(&[], on_key);
-        assert_eq!(
+        let gains = [
             move_gain(&firmware(true), &firmware(false)),
-            Some(MoveGain::DaExemptKey)
-        );
-        assert_eq!(
             move_gain(&firmware(true), &unbound(false)),
-            Some(MoveGain::Both)
-        );
-        assert_eq!(
             move_gain(&firmware(true), &unbound(true)),
-            Some(MoveGain::StrongerPolicy)
-        );
-        assert_eq!(
             move_gain(&firmware(false), &unbound(false)),
-            Some(MoveGain::StrongerPolicy)
-        );
-        assert_eq!(move_gain(&firmware(true), &firmware(true)), None);
-        assert_eq!(move_gain(&firmware(false), &firmware(false)), None);
-        assert_eq!(
+            move_gain(&firmware(true), &firmware(true)),
+            move_gain(&firmware(false), &firmware(false)),
             move_gain(&unbound(true), &firmware(false)),
-            None,
+            move_gain(&firmware(false), &unbound(true)),
+        ];
+        // A candidate under a key the record does not hold.
+        let mut elsewhere = firmware(true);
+        elsewhere.parent = Some(ParentKey {
+            handle: 0x8101_0004,
+            name: "000b99".into(),
+        });
+        let onto_another = [
+            move_gain(&elsewhere, &firmware(false)),
+            move_gain(&elsewhere, &unbound(true)),
+        ];
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
+
+        assert_eq!(gains[0], Some(MoveGain::DaExemptKey));
+        assert_eq!(gains[1], Some(MoveGain::Both));
+        assert_eq!(gains[2], Some(MoveGain::StrongerPolicy));
+        assert_eq!(gains[3], Some(MoveGain::StrongerPolicy));
+        assert_eq!(gains[4], None);
+        assert_eq!(gains[5], None);
+        assert_eq!(
+            gains[6], None,
             "a weaker policy is no move, even onto the DA-exempt key"
         );
         assert_eq!(
-            move_gain(&firmware(false), &unbound(true)),
-            None,
+            gains[7], None,
             "never off the DA-exempt key, even for a stronger policy"
+        );
+        assert_eq!(
+            onto_another,
+            [None, None],
+            "onto a key the record does not hold, from the original key or for a \
+             stronger policy, is no move"
         );
     }
 

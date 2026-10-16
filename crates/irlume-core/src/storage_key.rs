@@ -278,6 +278,10 @@ pub enum Outcome {
     Adopted { handle: u32 },
     /// Derived and persisted now.
     Persisted { handle: u32 },
+    /// The recorded key was away from its recorded handle and was found by
+    /// its TPM name at `handle`, where it is now recorded. Nothing was
+    /// derived.
+    Found { handle: u32 },
     /// Refused now, and recorded with the boot.
     Refused(KeyRefusal),
     /// A refusal earlier in this boot stands. Nothing was derived.
@@ -385,7 +389,7 @@ pub fn ensure_at_start_reporting() -> Result<(Option<Outcome>, bool)> {
             keep_superseded(&mut tpm, &record, &mut next)?;
             // A weak key found at its handle is replaced by moving its
             // envelopes first (ADR-0034, Phase 3 amendment, #1073 item 2).
-            if matches!(outcome, Outcome::Present { .. }) {
+            if matches!(outcome, Outcome::Present { .. } | Outcome::Found { .. }) {
                 if let Some((replaced, replacement)) =
                     replace_weak_with(&mut tpm, &next, boot.as_deref(), *chosen)?
                 {
@@ -647,7 +651,7 @@ fn ensure_keeping_use(
     // derivation is the one the recorded firmware gave.
     next.superseded.clone_from(&record.superseded);
     next.weak_derivation.clone_from(&record.weak_derivation);
-    if matches!(outcome, Outcome::Present { .. }) {
+    if matches!(outcome, Outcome::Present { .. } | Outcome::Found { .. }) {
         next.replacement_refused
             .clone_from(&record.replacement_refused);
     }
@@ -1282,6 +1286,23 @@ pub(crate) fn ensure_with(
                 },
             ));
         }
+        // The handle is a hint and the name decides (ADR-0034 §3.3): the
+        // recorded key persisted at another handle, where irlume can still
+        // seal under it, is followed there rather than replaced, so the
+        // envelopes under it keep their key and nothing is derived.
+        if let Some(name) = unhex(&persisted.name) {
+            for (handle, found) in tpm.owner_names()? {
+                if found == name && tpm.holds_da_exempt_key(handle, &name)? {
+                    let mut next = record.clone();
+                    next.persisted = Some(Persisted {
+                        handle,
+                        name: persisted.name.clone(),
+                    });
+                    next.refused = None;
+                    return Ok((next, Outcome::Found { handle }));
+                }
+            }
+        }
     }
     if let Some(refused) = &record.refused {
         // An unreadable boot ID, now or then, may be another boot: try again.
@@ -1544,11 +1565,17 @@ enum Placed {
 /// second copy, or persist it at the first free owner handle from
 /// `plan.preferred`, never the original key's. A taken handle that turns out
 /// to hold the same key, which another start persisted a moment earlier, is
-/// adopted; another is stepped past.
+/// adopted; another is stepped past. A copy is adopted only where irlume can
+/// seal under it ([`KeyTpm::holds_da_exempt_key`]).
 fn place_derived(tpm: &mut impl KeyTpm, plan: Plan, name: &[u8]) -> Result<Placed> {
     let in_use = tpm.owner_names()?;
-    if let Some((handle, _)) = in_use.iter().find(|(_, used)| used.as_slice() == name) {
-        return Ok(Placed::Adopted(*handle));
+    // The TPM name covers the public area only: a copy another stack
+    // persisted with its own authorization value has the same name, so a
+    // copy is adopted only where irlume can seal under it.
+    for (handle, used) in &in_use {
+        if used.as_slice() == name && tpm.holds_da_exempt_key(*handle, name)? {
+            return Ok(Placed::Adopted(*handle));
+        }
     }
     let mut taken: Vec<u32> = in_use.into_iter().map(|(handle, _)| handle).collect();
     for _ in 0..PERSIST_ATTEMPTS {
@@ -1564,7 +1591,9 @@ fn place_derived(tpm: &mut impl KeyTpm, plan: Plan, name: &[u8]) -> Result<Place
             // derivation is deterministic, so adopt it rather than persist a
             // second copy.
             Err(failure) if failure.class == FailureClass::Taken => {
-                if tpm.name_at(handle)?.as_deref() == Some(name) {
+                if tpm.name_at(handle)?.as_deref() == Some(name)
+                    && tpm.holds_da_exempt_key(handle, name)?
+                {
                     return Ok(Placed::Adopted(handle));
                 }
                 taken.push(handle);
@@ -1585,6 +1614,7 @@ fn derived_now(outcome: &Outcome) -> bool {
     !matches!(
         outcome,
         Outcome::Present { .. }
+            | Outcome::Found { .. }
             | Outcome::Deferred(_)
             | Outcome::WeakKept { .. }
             | Outcome::ReplacementDeferred { .. }
@@ -3922,13 +3952,27 @@ mod tests {
             name: hex(b"weak"),
         };
 
+        // Followed by its name, where irlume can seal under it: nothing is
+        // derived or superseded.
         let mut tpm = FakeTpm::new();
         tpm.objects.insert(ELSEWHERE, b"weak".to_vec());
         tpm.derive = Ok(b"clean".to_vec());
-        let (mut next, outcome) = start(&mut tpm);
+        let (followed, outcome) = start(&mut tpm);
+        assert_eq!(outcome, Outcome::Found { handle: ELSEWHERE });
+        assert!(!derived_now(&outcome));
+        assert_eq!(followed.persisted, Some(relocated.clone()));
+        assert!(followed.superseded.is_empty() && tpm.derived == 0);
+
+        // Where irlume cannot seal under it, today's derivation takes its
+        // place, and it is kept as superseded while it is persisted.
+        let mut unusable = FakeTpm::new();
+        unusable.objects.insert(ELSEWHERE, b"weak".to_vec());
+        unusable.other_auth.push(ELSEWHERE);
+        unusable.derive = Ok(b"clean".to_vec());
+        let (mut next, outcome) = start(&mut unusable);
         assert_eq!(outcome, Outcome::Persisted { handle: DA_EXEMPT });
         assert_eq!(next.superseded, vec![relocated.clone()]);
-        keep_superseded(&mut tpm, &record, &mut next).expect("kept");
+        keep_superseded(&mut unusable, &record, &mut next).expect("kept");
         assert_eq!(next.superseded.len(), 1, "kept once");
 
         let mut gone = FakeTpm::new();
@@ -3937,13 +3981,6 @@ mod tests {
             start(&mut gone).0.superseded.is_empty(),
             "persisted nowhere"
         );
-
-        let mut same = FakeTpm::new();
-        same.objects.insert(ELSEWHERE, b"weak".to_vec());
-        same.derive = Ok(b"weak".to_vec());
-        let (again, outcome) = start(&mut same);
-        assert_eq!(outcome, Outcome::Adopted { handle: ELSEWHERE });
-        assert!(again.superseded.is_empty(), "the same key, adopted again");
 
         // A kept key found at another handle since is recorded there; one
         // found nowhere keeps its entry.
@@ -4048,6 +4085,20 @@ mod tests {
             }
         );
         assert!(copied.persisted.is_empty(), "no second copy");
+        // A copy irlume cannot seal under (another stack's, persisted with its
+        // own authorization value) is not adopted: a usable one is persisted.
+        let mut foreign_copy = weak_tpm();
+        foreign_copy.objects.insert(0x8101_0007, b"clean".to_vec());
+        foreign_copy.other_auth.push(0x8101_0007);
+        let (_, outcome) = replace(&mut foreign_copy, &weak_record, BOOT).expect("replaced");
+        assert_eq!(
+            outcome,
+            Outcome::Replaced {
+                handle: NEXT,
+                from: DA_EXEMPT
+            }
+        );
+        assert_eq!(foreign_copy.persisted, [NEXT]);
 
         // Today's derivation is weak too, or gives the weak key itself.
         for (derive, derived_weak) in [(b"clean".to_vec(), true), (b"weak".to_vec(), false)] {

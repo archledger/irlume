@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- irlumed keeps an account of the original storage key's use for its
+  coming retirement (ADR-0034, Phase 3 amendment, condition 1; #1073).
+  After its template key moves, irlumed's start counts the envelopes still
+  under that key, and an envelope it cannot read counts as one. While none
+  is found, the record keeps the boot of the start that first found none.
+  Every write that moves an envelope off the key first records that move,
+  with its boot, and clears that mark; the entry goes once the envelope's
+  write is durable. A move whose write was visible but not durable keeps
+  its entry, so a start in that boot marks nothing, whatever other moves
+  in the boot did. A record write that fails, or is not durable, stops the
+  move. This happens only once irlumed has recorded the DA-exempt key.
+  Nothing is retired yet.
+
 - irlumed records the TPM name of irlume's original storage key once
   today's derivation of the original template gives that key (ADR-0034
   §3.4), for the later eviction of that key (#1073). It checks at a start

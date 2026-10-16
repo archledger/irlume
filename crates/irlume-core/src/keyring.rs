@@ -107,7 +107,29 @@ fn seal_secret_for(
     let mut env = tpm::seal(secret)?;
     env.secret = kind;
     env.uid = uid;
-    env.save(&envelope_path(user))
+    save_envelope(user, &env)
+}
+
+/// Write `env` as `user`'s keyring envelope through
+/// `storage_key::publish_envelope`, which records a move off the original
+/// storage key (ADR-0034, Phase 3 amendment). A write that is visible but not
+/// durable is an error, as for [`SealedEnvelope::save`].
+fn save_envelope(user: &str, env: &SealedEnvelope) -> Result<()> {
+    match publish_envelope(user, env)? {
+        irlume_common::AtomicWrite::Durable => Ok(()),
+        irlume_common::AtomicWrite::VisibleNotDurable(e) => Err(Error::Io(e.to_string())),
+    }
+}
+
+/// [`save_envelope`], telling a visible write from one that published
+/// nothing, as [`SealedEnvelope::save_reporting`] does.
+fn publish_envelope(user: &str, env: &SealedEnvelope) -> Result<irlume_common::AtomicWrite> {
+    crate::storage_key::publish_envelope(
+        &envelope_path(user),
+        irlume_common::tpm_readiness::EnvelopeKind::KeyringSecret,
+        user,
+        env,
+    )
 }
 
 /// Length in bytes of entropy behind a GNOME keyring token; the token itself is
@@ -154,7 +176,7 @@ pub fn arm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<String>>
     env.secret = SecretKind::GnomeKeyringToken;
     env.password_wrap = Some(crate::recovery::wrap(password, token.as_bytes())?);
     env.uid = uid;
-    env.save(&envelope_path(user))?;
+    save_envelope(user, &env)?;
     Ok(token)
 }
 
@@ -202,7 +224,7 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
     fresh.secret = SecretKind::GnomeKeyringToken;
     fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
     fresh.uid = uid;
-    fresh.save(&path)?;
+    save_envelope(user, &fresh)?;
     Ok(token)
 }
 
@@ -641,9 +663,7 @@ fn check_round_trip(candidate: &SealedEnvelope, secret: &[u8]) -> Result<()> {
 /// error here must mean the old one is still in place. A power loss may
 /// bring the old envelope back, which unseals too.
 fn publish_move(user: &str, candidate: &SealedEnvelope, gain: tpm::MoveGain) -> Result<()> {
-    if let irlume_common::AtomicWrite::VisibleNotDurable(e) =
-        candidate.save_reporting(&envelope_path(user))?
-    {
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = publish_envelope(user, candidate)? {
         eprintln!(
             "irlume: moved the keyring secret of '{user}' to {}, but syncing its directory \
              failed ({e}); after a power loss the previous envelope, which still unseals, may \
@@ -722,7 +742,7 @@ fn reseal_token(
                 env.uid = account.uid_to_record(Record::KeyringToken, env.uid)?;
                 match climbed_token(&env, &token, account) {
                     Ok(Some((stronger, gain))) => publish_move(user, &stronger, gain)?,
-                    _ => env.save(&envelope_path(user))?,
+                    _ => save_envelope(user, &env)?,
                 }
                 return Ok(Reseal::Resealed);
             }
@@ -756,7 +776,7 @@ fn reseal_token(
             fresh.secret = SecretKind::GnomeKeyringToken;
             fresh.password_wrap = Some(crate::recovery::wrap(password, &token)?);
             fresh.uid = uid;
-            fresh.save(&envelope_path(user))?;
+            save_envelope(user, &fresh)?;
             Ok(Reseal::Resealed)
         }
     }

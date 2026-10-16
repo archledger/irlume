@@ -54,6 +54,29 @@ pub(crate) struct Record {
     /// itself authorizes evicting a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original: Option<Original>,
+    /// The boot of the start whose census last found no envelope under the
+    /// original storage key, with none found since (ADR-0034, Phase 3
+    /// amendment, condition 1). Cleared before a move off the key publishes,
+    /// and by a start whose census finds an envelope under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unused_since: Option<String>,
+    /// One entry per envelope whose move off the original key is not yet
+    /// shown durable, with the boot of that move (condition 1). A census in
+    /// that boot marks nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    moves: Vec<UnsettledMove>,
+}
+
+/// An envelope whose move off the original storage key was not yet shown
+/// durable: its account and kind, and the boot of the move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UnsettledMove {
+    user: String,
+    kind: EnvelopeKind,
+    /// `None` when the boot ID could not be read, which may be any boot, so
+    /// the entry is never dropped as another boot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
 }
 
 /// The key at the original key's handle, by its TPM name, and whether today's
@@ -251,7 +274,8 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
             let mut tpm = tpm::DaExemptKeyTpm::open()?;
             // `ensure_with` decides the DA-exempt key's part of the record;
             // the original key's part is decided here.
-            let (mut next, outcome) = ensure_with(&mut tpm, &record, boot.as_deref(), &plan)?;
+            let (mut next, outcome) =
+                ensure_keeping_use(&mut tpm, &record, boot.as_deref(), &plan)?;
             // Advisory, so a failure to check costs nothing but a later try.
             next.original = original_with(
                 &mut tpm,
@@ -263,7 +287,8 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
             (next, outcome)
         }
         Err(_) => {
-            let (mut next, outcome) = ensure_with(&mut Unopened, &record, boot.as_deref(), &plan)?;
+            let (mut next, outcome) =
+                ensure_keeping_use(&mut Unopened, &record, boot.as_deref(), &plan)?;
             next.original = record.original.clone();
             (next, outcome)
         }
@@ -342,6 +367,217 @@ pub(crate) fn on_original_key() -> Result<OriginalKeyEnvelopes> {
     named.sort();
     named.truncate(MAX_NAMED_ENVELOPES);
     Ok(OriginalKeyEnvelopes { named, total })
+}
+
+/// [`ensure_with`], keeping `record`'s account of the original key's use
+/// (`unused_since` and the unsettled moves) in the record it builds for the
+/// DA-exempt key.
+fn ensure_keeping_use(
+    tpm: &mut impl KeyTpm,
+    record: &Record,
+    boot: Option<&str>,
+    plan: &std::result::Result<Plan, String>,
+) -> Result<(Record, Outcome)> {
+    let (mut next, outcome) = ensure_with(tpm, record, boot, plan)?;
+    next.unused_since.clone_from(&record.unused_since);
+    next.moves.clone_from(&record.moves);
+    Ok((next, outcome))
+}
+
+/// Publish `next` as `user`'s envelope of `kind` at `path`, as every writer
+/// of an envelope does (ADR-0034, Phase 3 amendment, condition 1). A write
+/// that takes the envelope off the original storage key (the envelope there
+/// records no parent, or cannot be read, and `next` records one) is preceded
+/// by a durable record write that clears `unused_since` and sets this
+/// envelope's entry to this boot. The entry is removed once the envelope's
+/// write is durable, and stays when it is visible but not durable, since
+/// after a power loss the envelope under the key can come back. A record
+/// write that fails, or is not durable, stops the move: nothing is published.
+///
+/// Only while irlumed has recorded a DA-exempt key: the original key is
+/// retired only beside one, and a move off it goes nowhere else.
+///
+/// # Errors
+///
+/// When the record cannot be locked or made durable before a move, and when
+/// the envelope is not published; [`AtomicWrite::VisibleNotDurable`] is a
+/// publication, as for [`SealedEnvelope::save_reporting`].
+///
+/// [`AtomicWrite::VisibleNotDurable`]: irlume_common::AtomicWrite::VisibleNotDurable
+/// [`SealedEnvelope::save_reporting`]: crate::envelope::SealedEnvelope::save_reporting
+pub(crate) fn publish_envelope(
+    path: &Path,
+    kind: EnvelopeKind,
+    user: &str,
+    next: &crate::envelope::SealedEnvelope,
+) -> Result<irlume_common::AtomicWrite> {
+    publish_with(
+        path,
+        kind,
+        user,
+        next,
+        irlume_common::boot_id().as_deref(),
+        save_record,
+        |envelope, path| envelope.save_reporting(path),
+    )
+}
+
+/// [`publish_envelope`] in boot `boot`, with the record written by `save`
+/// and the envelope by `write`.
+fn publish_with(
+    path: &Path,
+    kind: EnvelopeKind,
+    user: &str,
+    next: &crate::envelope::SealedEnvelope,
+    boot: Option<&str>,
+    mut save: impl FnMut(&Record) -> Result<()>,
+    write: impl FnOnce(&crate::envelope::SealedEnvelope, &Path) -> Result<irlume_common::AtomicWrite>,
+) -> Result<irlume_common::AtomicWrite> {
+    // Checked before the lock, which a host with no record never creates.
+    if next.parent.is_none() || !under_original_key(path) || load_record().persisted.is_none() {
+        return write(next, path);
+    }
+    {
+        let _lock = RecordLock::acquire()?;
+        let mut record = load_record();
+        record.unused_since = None;
+        record
+            .moves
+            .retain(|entry| !(entry.user == user && entry.kind == kind));
+        record.moves.push(UnsettledMove {
+            user: user.to_owned(),
+            kind,
+            boot_id: boot.map(str::to_owned),
+        });
+        save(&record)?;
+    }
+    let written = write(next, path)?;
+    if matches!(written, irlume_common::AtomicWrite::Durable) {
+        // An entry left behind only delays the retirement by a boot.
+        let _ = settle_move(user, kind, &mut save);
+    }
+    Ok(written)
+}
+
+/// Whether the envelope at `path` is under the original storage key for the
+/// census: it records no parent, or it exists and cannot be read.
+fn under_original_key(path: &Path) -> bool {
+    match crate::envelope::SealedEnvelope::load(path) {
+        Ok(envelope) => envelope.parent.is_none(),
+        Err(_) => std::fs::symlink_metadata(path).is_ok(),
+    }
+}
+
+/// Remove `user`'s entry of `kind`: its move off the original key is
+/// durable, which makes the envelope's state durable whatever earlier move
+/// set the entry.
+fn settle_move(
+    user: &str,
+    kind: EnvelopeKind,
+    save: &mut impl FnMut(&Record) -> Result<()>,
+) -> Result<()> {
+    let _lock = RecordLock::acquire()?;
+    let mut record = load_record();
+    let before = record.moves.len();
+    record
+        .moves
+        .retain(|entry| !(entry.user == user && entry.kind == kind));
+    if record.moves.len() != before {
+        save(&record)?;
+    }
+    Ok(())
+}
+
+/// What irlumed's start found about the original storage key's use, after
+/// its template key moves (ADR-0034, Phase 3 amendment, condition 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Census {
+    /// An envelope is under the original key, or cannot be read.
+    InUse,
+    /// No envelope is under it, and it has been unused since the start in
+    /// the boot named.
+    Unused { since: String },
+    /// No envelope is under it, but a move off it in this boot is not yet
+    /// shown durable, or this boot or the move's cannot be read, so this
+    /// start marks nothing.
+    Unsettled,
+}
+
+/// irlumed's start, after its template key moves: count the envelopes under
+/// the original storage key and keep the record of its use (ADR-0034, Phase
+/// 3 amendment, condition 1), under the record lock. A census that finds one
+/// clears `unused_since`. An empty one drops the entries of moves that name
+/// another boot, since it read what the disk kept of that boot's writes, and
+/// sets `unused_since` to this boot when no entry is left that may be this
+/// boot's and none is set already. `None` without a recorded DA-exempt key,
+/// beside which alone the key is retired.
+///
+/// # Errors
+///
+/// When an envelope directory cannot be read, or the record cannot be locked
+/// or written.
+pub fn mark_at_start() -> Result<Option<Census>> {
+    mark_in(irlume_common::boot_id().as_deref())
+}
+
+/// [`mark_at_start`] in boot `boot`.
+fn mark_in(boot: Option<&str>) -> Result<Option<Census>> {
+    if load_record().persisted.is_none() {
+        return Ok(None);
+    }
+    let _lock = RecordLock::acquire()?;
+    let record = load_record();
+    let in_use = any_under_original_key()?;
+    let (next, census) = mark_with(&record, in_use, boot);
+    if next != record {
+        save_record(&next)?;
+    }
+    Ok(Some(census))
+}
+
+/// The record after a census that found an envelope under the original key
+/// (`in_use`) or none, in boot `boot`, and what it found.
+fn mark_with(record: &Record, in_use: bool, boot: Option<&str>) -> (Record, Census) {
+    let mut next = record.clone();
+    if in_use {
+        next.unused_since = None;
+        return (next, Census::InUse);
+    }
+    if let Some(boot) = boot {
+        next.moves
+            .retain(|entry| entry.boot_id.as_deref().is_none_or(|then| then == boot));
+    }
+    if let Some(since) = &next.unused_since {
+        let census = Census::Unused {
+            since: since.clone(),
+        };
+        return (next, census);
+    }
+    match boot {
+        Some(boot) if next.moves.is_empty() => {
+            next.unused_since = Some(boot.to_owned());
+            let census = Census::Unused {
+                since: boot.to_owned(),
+            };
+            (next, census)
+        }
+        _ => (next, Census::Unsettled),
+    }
+}
+
+/// Whether some envelope is under the original storage key for the census:
+/// one that records no parent, or one that cannot be read, whatever its file
+/// is named.
+fn any_under_original_key() -> Result<bool> {
+    for dir in [template_key::key_dir(), keyring::keyring_dir()] {
+        if envelope_paths(&dir)?
+            .iter()
+            .any(|path| under_original_key(path))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// An envelope whose recorded parent handle no longer holds a key with its
@@ -543,7 +779,7 @@ pub(crate) fn ensure_with(
                 detail,
                 boot_id: boot.map(str::to_owned),
             }),
-            original: None,
+            ..Record::default()
         };
         (record, Outcome::Refused(refusal))
     };
@@ -693,8 +929,7 @@ fn persisted_record(handle: u32, name: &[u8]) -> Record {
             handle,
             name: hex(name),
         }),
-        refused: None,
-        original: None,
+        ..Record::default()
     }
 }
 
@@ -785,10 +1020,13 @@ fn record_path() -> PathBuf {
     irlume_common::state_dir().join("tpm-storage-key")
 }
 
-/// An exclusive `flock` on `state_dir()/.tpm-storage-key.lock` for the
-/// start-up step's read, decision and write of the record, held until it is
-/// dropped. Like `template_key::UserStateLock`, every acquisition opens the
-/// file anew, so it also excludes another thread of this process.
+/// An exclusive `flock` on `state_dir()/.tpm-storage-key.lock` for each
+/// read, decision and write of the record (the start-up steps, and an
+/// envelope writer's account of a move off the original key), held until it
+/// is dropped. Like `template_key::UserStateLock`, every acquisition opens
+/// the file anew, so it also excludes another thread of this process; for
+/// the same reason nothing takes it while holding it, since a second
+/// acquisition in the same thread would wait on the first.
 struct RecordLock(std::fs::File);
 
 impl RecordLock {
@@ -1231,6 +1469,7 @@ mod tests {
                 detail: "refused".into(),
                 boot_id: Some(BOOT.into()),
             }),
+            ..Record::default()
         };
         save_record(&refused).expect("saved");
         let reported = report();
@@ -1800,6 +2039,406 @@ mod tests {
 
     /// The record is not a `*.json` file in the state directory, which
     /// `storage::list_users` would read as an account, and it round-trips.
+    /// The state, template-key and keyring directories in a fresh temporary
+    /// tree until dropped. Hold `testenv::ENV_LOCK` first.
+    struct Sandbox {
+        dir: String,
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            let dir = crate::test_tmp_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+            std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+            let vars = [
+                ("IRLUME_STATE_DIR", dir.clone()),
+                ("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys")),
+                ("IRLUME_KEYRING_DIR", format!("{dir}/keyring")),
+            ];
+            let previous = vars
+                .iter()
+                .map(|(var, _)| (*var, std::env::var_os(var)))
+                .collect();
+            for (var, value) in &vars {
+                std::env::set_var(var, value);
+            }
+            Self { dir, previous }
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            for (var, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// An envelope under the DA-exempt key (`on_key`) or the original one.
+    fn envelope(on_key: bool) -> crate::envelope::SealedEnvelope {
+        let mut value = serde_json::json!({
+            "version": 1, "pcrs": [7], "public": "", "private": ""
+        });
+        if on_key {
+            value["parent"] = serde_json::json!({"handle": 0x8101_0003_u32, "name": "aa"});
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The unsettled moves the record on disk holds, by account, kind and boot.
+    fn entries() -> Vec<(String, EnvelopeKind, Option<String>)> {
+        load_record()
+            .moves
+            .into_iter()
+            .map(|entry| (entry.user, entry.kind, entry.boot_id))
+            .collect()
+    }
+
+    fn entry(user: &str, kind: EnvelopeKind, boot: &str) -> (String, EnvelopeKind, Option<String>) {
+        (user.to_owned(), kind, Some(boot.to_owned()))
+    }
+
+    /// Publishes `next` at `path` in `boot`, through the real record, with a
+    /// write that answers `durable` or a visible write whose sync failed.
+    /// Returns what the record held when the envelope was written, or `None`
+    /// when the write did not run.
+    fn publish_in(
+        path: &Path,
+        kind: EnvelopeKind,
+        user: &str,
+        next: &crate::envelope::SealedEnvelope,
+        boot: &str,
+        durable: bool,
+    ) -> (Result<irlume_common::AtomicWrite>, Option<Record>) {
+        let mut seen = None;
+        let result = publish_with(
+            path,
+            kind,
+            user,
+            next,
+            Some(boot),
+            save_record,
+            |env, path| {
+                seen = Some(load_record());
+                env.save(path)?;
+                Ok(if durable {
+                    irlume_common::AtomicWrite::Durable
+                } else {
+                    irlume_common::AtomicWrite::VisibleNotDurable(std::io::Error::other(
+                        "the directory sync failed",
+                    ))
+                })
+            },
+        );
+        (result, seen)
+    }
+
+    /// ADR-0034, Phase 3 amendment, condition 1: a move off the original key
+    /// writes the record first, with `unused_since` cleared and the
+    /// envelope's entry set to its boot; a durable write removes only its own
+    /// envelope's entry, one that is not durable keeps it, and a later
+    /// durable move of the same envelope removes it. A record write that
+    /// fails stops the move. A write that is not a move off the key, or one
+    /// with no DA-exempt key recorded, writes no record and takes no lock.
+    #[test]
+    fn a_move_off_the_original_key_is_recorded_before_it_publishes() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-move-entries");
+        save_record(&Record {
+            unused_since: Some(BOOT.into()),
+            ..persisted_record(0x8101_0003, b"ours")
+        })
+        .unwrap();
+        let alice = template_key::key_path("alice");
+        let bob = keyring::envelope_path("bob");
+        let carol = keyring::envelope_path("carol");
+        envelope(false).save(&alice).unwrap();
+        envelope(false).save(&bob).unwrap();
+        std::fs::write(&carol, b"not an envelope").unwrap();
+        let (template, keyring) = (EnvelopeKind::TemplateKey, EnvelopeKind::KeyringSecret);
+
+        let (not_durable, seen_first) =
+            publish_in(&alice, template, "alice", &envelope(true), BOOT, false);
+        let after_first = entries();
+        let (durable, seen_second) = publish_in(&bob, keyring, "bob", &envelope(true), BOOT, true);
+        let after_second = entries();
+        // The unreadable envelope counts as under the original key.
+        let (unreadable, _) = publish_in(&carol, keyring, "carol", &envelope(true), BOOT, true);
+        let after_unreadable = entries();
+        // A power loss brings alice's old envelope back; its next move is durable.
+        envelope(false).save(&alice).unwrap();
+        let (again, _) = publish_in(&alice, template, "alice", &envelope(true), LATER_BOOT, true);
+        let after_again = entries();
+        // A record write that fails stops the move.
+        envelope(false).save(&bob).unwrap();
+        let before_refused = std::fs::read(&bob).unwrap();
+        let mut wrote = false;
+        let refused = publish_with(
+            &bob,
+            keyring,
+            "bob",
+            &envelope(true),
+            Some(BOOT),
+            |_| Err(Error::Io("no space".into())),
+            |_, _| {
+                wrote = true;
+                Ok(irlume_common::AtomicWrite::Durable)
+            },
+        );
+        let bob_unchanged = std::fs::read(&bob).unwrap() == before_refused;
+        // Not a move off the key: already on the DA-exempt key, or onto the
+        // original key again.
+        let saves = std::cell::Cell::new(0);
+        let counting = |record: &Record| {
+            saves.set(saves.get() + 1);
+            save_record(record)
+        };
+        let written =
+            |_: &crate::envelope::SealedEnvelope, _: &Path| Ok(irlume_common::AtomicWrite::Durable);
+        let on_key = publish_with(
+            &alice,
+            template,
+            "alice",
+            &envelope(true),
+            Some(BOOT),
+            counting,
+            written,
+        );
+        let onto_original = publish_with(
+            &bob,
+            keyring,
+            "bob",
+            &envelope(false),
+            Some(BOOT),
+            counting,
+            written,
+        );
+        // No DA-exempt key recorded: no record write, and no lock taken.
+        let _ = std::fs::remove_file(record_path());
+        let lock = irlume_common::state_dir().join(".tpm-storage-key.lock");
+        let _ = std::fs::remove_file(&lock);
+        let unrecorded = publish_with(
+            &bob,
+            keyring,
+            "bob",
+            &envelope(true),
+            Some(BOOT),
+            counting,
+            written,
+        );
+        let no_lock = !lock.exists();
+        drop(sandbox);
+
+        assert!(matches!(
+            not_durable.expect("published"),
+            irlume_common::AtomicWrite::VisibleNotDurable(_)
+        ));
+        let seen_first = seen_first.expect("the write ran");
+        assert_eq!(seen_first.unused_since, None, "cleared before the write");
+        assert_eq!(seen_first.moves.len(), 1, "the entry before the write");
+        assert_eq!(
+            after_first,
+            [entry("alice", template, BOOT)],
+            "a write that is not durable keeps it"
+        );
+        assert!(matches!(
+            durable.expect("published"),
+            irlume_common::AtomicWrite::Durable
+        ));
+        assert_eq!(seen_second.expect("the write ran").moves.len(), 2);
+        assert_eq!(
+            after_second,
+            [entry("alice", template, BOOT)],
+            "a durable move removes only its own entry"
+        );
+        assert!(unreadable.is_ok());
+        assert_eq!(
+            after_unreadable, after_second,
+            "the unreadable one moved durably"
+        );
+        assert!(again.is_ok());
+        assert_eq!(
+            after_again,
+            [],
+            "a later durable move of the same envelope settles it"
+        );
+        assert!(refused.is_err(), "a failed record write stops the move");
+        assert!(!wrote && bob_unchanged, "nothing is published");
+        assert!(on_key.is_ok() && onto_original.is_ok() && unrecorded.is_ok());
+        assert_eq!(saves.get(), 0, "no record write without a move off the key");
+        assert!(no_lock, "no lock without a recorded DA-exempt key");
+    }
+
+    /// Condition 1's census: an envelope under the original key clears the
+    /// mark; an empty census drops the entries of another boot's moves and
+    /// marks this boot when no entry that may be this boot's is left, keeps
+    /// an earlier mark, and marks nothing in a boot it cannot read.
+    #[test]
+    fn a_census_marks_the_original_key_unused_outside_an_unsettled_boot() {
+        let kind = EnvelopeKind::KeyringSecret;
+        let pending = |boot: Option<&str>| UnsettledMove {
+            user: "bob".into(),
+            kind,
+            boot_id: boot.map(str::to_owned),
+        };
+        let with = |unused_since: Option<&str>, moves: Vec<UnsettledMove>| Record {
+            unused_since: unused_since.map(str::to_owned),
+            moves,
+            ..persisted_record(0x8101_0003, b"ours")
+        };
+        let unused = |since: &str| Census::Unused {
+            since: since.into(),
+        };
+
+        let (in_use, census) = mark_with(&with(Some(BOOT), vec![]), true, Some(LATER_BOOT));
+        assert_eq!((in_use.unused_since, census), (None, Census::InUse));
+
+        let (marked, census) = mark_with(&with(None, vec![]), false, Some(BOOT));
+        assert_eq!(
+            (marked.unused_since.as_deref(), census),
+            (Some(BOOT), unused(BOOT))
+        );
+
+        let (kept, census) = mark_with(&with(Some(BOOT), vec![]), false, Some(LATER_BOOT));
+        assert_eq!(
+            (kept.unused_since.as_deref(), census),
+            (Some(BOOT), unused(BOOT))
+        );
+
+        let (unsettled, census) =
+            mark_with(&with(None, vec![pending(Some(BOOT))]), false, Some(BOOT));
+        assert_eq!(
+            census,
+            Census::Unsettled,
+            "a move in this boot is not yet durable"
+        );
+        assert_eq!((unsettled.unused_since, unsettled.moves.len()), (None, 1));
+
+        let (dropped, census) = mark_with(
+            &with(None, vec![pending(Some(BOOT))]),
+            false,
+            Some(LATER_BOOT),
+        );
+        assert_eq!(
+            census,
+            unused(LATER_BOOT),
+            "another boot's move is on disk now"
+        );
+        assert!(dropped.moves.is_empty());
+
+        let (unknown, census) =
+            mark_with(&with(None, vec![pending(None)]), false, Some(LATER_BOOT));
+        assert_eq!(
+            census,
+            Census::Unsettled,
+            "a move whose boot was unreadable may be this boot's"
+        );
+        assert_eq!(unknown.moves.len(), 1, "and is kept");
+
+        let (no_boot, census) = mark_with(&with(None, vec![]), false, None);
+        assert_eq!((no_boot.unused_since, census), (None, Census::Unsettled));
+    }
+
+    /// Condition 1 over boots, with fake boot IDs: a durable move is marked
+    /// at a start in its boot, a move that is not durable is marked only in
+    /// the next boot, and a durable move of another envelope in the same
+    /// boot, after a restart, does not change that. A census that finds an
+    /// envelope, or one it cannot read, marks nothing; with no DA-exempt key
+    /// recorded nothing is counted or written.
+    #[test]
+    fn the_original_key_is_marked_unused_a_boot_later_after_a_move_that_was_not_durable() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-marks");
+        let unrecorded = mark_in(Some(BOOT));
+        let no_record = !record_path().exists();
+        save_record(&persisted_record(0x8101_0003, b"ours")).unwrap();
+        let (template, keyring) = (EnvelopeKind::TemplateKey, EnvelopeKind::KeyringSecret);
+        let alice = template_key::key_path("alice");
+        let bob = keyring::envelope_path("bob");
+        let carol = keyring::envelope_path("carol");
+        envelope(false).save(&alice).unwrap();
+        envelope(false).save(&bob).unwrap();
+        envelope(true).save(&carol).unwrap();
+
+        // Boot A's start moves alice's template key; bob's keyring waits.
+        let (moved, _) = publish_in(&alice, template, "alice", &envelope(true), BOOT, true);
+        let first_start = mark_in(Some(BOOT));
+        // A login moves bob's keyring secret, and its sync fails.
+        let (login, _) = publish_in(&bob, keyring, "bob", &envelope(true), BOOT, false);
+        let restart = mark_in(Some(BOOT));
+        // After another restart, carol's keyring moves durably in the same boot.
+        envelope(false).save(&carol).unwrap();
+        let (carol_moved, _) = publish_in(&carol, keyring, "carol", &envelope(true), BOOT, true);
+        let mixed = mark_in(Some(BOOT));
+        // The next boot's start reads what the disk kept.
+        let next_boot = mark_in(Some(LATER_BOOT));
+        let marked = load_record();
+        // An envelope that cannot be read counts as under the original key.
+        std::fs::write(&carol, b"not an envelope").unwrap();
+        let unreadable = mark_in(Some(LATER_BOOT));
+        let cleared = load_record();
+        drop(sandbox);
+
+        assert_eq!(unrecorded.expect("the census"), None);
+        assert!(no_record, "nothing is written without a recorded key");
+        assert!(moved.is_ok() && login.is_ok() && carol_moved.is_ok());
+        assert_eq!(first_start.expect("the census"), Some(Census::InUse));
+        assert_eq!(restart.expect("the census"), Some(Census::Unsettled));
+        assert_eq!(mixed.expect("the census"), Some(Census::Unsettled));
+        assert_eq!(
+            next_boot.expect("the census"),
+            Some(Census::Unused {
+                since: LATER_BOOT.into()
+            })
+        );
+        assert!(
+            marked.moves.is_empty(),
+            "the earlier boot's entry is dropped"
+        );
+        assert_eq!(unreadable.expect("the census"), Some(Census::InUse));
+        assert_eq!(cleared.unused_since, None);
+    }
+
+    /// The start-up step decides the DA-exempt key's part of the record and
+    /// keeps the account of the original key's use as it found it.
+    #[test]
+    fn the_start_up_step_keeps_the_original_keys_use() {
+        let pending = UnsettledMove {
+            user: "bob".into(),
+            kind: EnvelopeKind::KeyringSecret,
+            boot_id: Some(BOOT.into()),
+        };
+        let record = Record {
+            version: RECORD_VERSION,
+            unused_since: Some(BOOT.into()),
+            moves: vec![pending],
+            ..Record::default()
+        };
+        let mut persists = FakeTpm::new();
+        let (persisted, outcome) =
+            ensure_keeping_use(&mut persists, &record, Some(LATER_BOOT), &Ok(PLAN)).unwrap();
+        assert!(matches!(outcome, Outcome::Persisted { .. }), "{outcome:?}");
+        let mut refuses = FakeTpm::new();
+        refuses.derive = Err(failure(FailureClass::NoSpace));
+        let (refused, outcome) =
+            ensure_keeping_use(&mut refuses, &record, Some(LATER_BOOT), &Ok(PLAN)).unwrap();
+        assert!(matches!(outcome, Outcome::Refused(_)), "{outcome:?}");
+        for next in [persisted, refused] {
+            assert_eq!(next.unused_since, record.unused_since);
+            assert_eq!(next.moves, record.moves);
+        }
+    }
+
     #[test]
     fn the_record_is_not_an_account_and_round_trips() {
         let _env = crate::testenv::ENV_LOCK

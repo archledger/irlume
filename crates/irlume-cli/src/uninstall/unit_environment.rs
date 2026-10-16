@@ -213,9 +213,16 @@ pub(super) const STORE_VARS: [&str; 4] = [
     "IRLUME_TEMPLATE_KEY_DIR",
 ];
 
+/// The variables that choose irlumed's TPM: its transport, and the handle of
+/// its original storage key. The storage keys are evicted through what they
+/// select, not through what the uninstall process happens to carry (#1088).
+pub(super) const TPM_VARS: [&str; 2] = ["IRLUME_TCTI", "IRLUME_SRK_HANDLE"];
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Disk {
     pub values: [Option<PathBuf>; 4],
+    /// `TPM_VARS`, as the unit sets them.
+    pub tpm: [Option<String>; 2],
     pub installed: bool,
     fingerprint: Vec<u8>,
 }
@@ -228,40 +235,87 @@ pub(super) fn snapshot(root: &Path) -> Result<Disk, String> {
     let texts = super::unit_texts_under(root)?;
     let mut cache = std::collections::BTreeMap::new();
     let mut values = [None, None, None, None];
+    let mut read = |path: &Path, optional: bool| {
+        if !cache.contains_key(path) {
+            let text = if optional
+                && matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            {
+                None
+            } else {
+                Some(read_text(path)?)
+            };
+            cache.insert(path.to_path_buf(), text);
+        }
+        let text = cache.get(path).cloned().flatten();
+        if !optional && text.is_none() {
+            return Err("required environment file is absent".into());
+        }
+        Ok(text)
+    };
     for (index, var) in STORE_VARS.iter().enumerate() {
-        values[index] = value_with(root, &texts, var, |path, optional| {
-            if !cache.contains_key(path) {
-                let text = if optional
-                    && matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-                {
-                    None
-                } else {
-                    Some(read_text(path)?)
-                };
-                cache.insert(path.to_path_buf(), text);
-            }
-            let text = cache.get(path).cloned().flatten();
-            if !optional && text.is_none() {
-                return Err("required environment file is absent".into());
-            }
-            Ok(text)
-        })?;
+        values[index] = value_with(root, &texts, var, &mut read)?;
+    }
+    let mut tpm = [None, None];
+    for (index, var) in TPM_VARS.iter().enumerate() {
+        tpm[index] = setting_with(root, &texts, var, &mut read)?;
     }
     let bytes =
         zeroize::Zeroizing::new(serde_json::to_vec(&(&texts, &cache)).map_err(|e| e.to_string())?);
     Ok(Disk {
         values,
+        tpm,
         installed: !texts.is_empty(),
         fingerprint: Sha256::digest(&*bytes).to_vec(),
     })
+}
+
+/// A `TPM_VARS` value, as [`value_with`] resolves a directory but kept as the
+/// text irlumed reads: one line of at most [`MAX_SETTING_CHARS`] characters
+/// with no control character, or refused, so that nothing a unit sets is
+/// printed or used unchecked.
+fn setting_with(
+    root: &Path,
+    texts: &[String],
+    var: &str,
+    read: impl FnMut(&Path, bool) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    let Some(value) = raw_value_with(root, texts, var, read)? else {
+        return Ok(None);
+    };
+    setting(&value, var).map(Some)
+}
+
+/// The longest `TPM_VARS` value uninstall uses or prints.
+const MAX_SETTING_CHARS: usize = 256;
+
+/// `value` when it is a usable `TPM_VARS` setting for `var`.
+pub(super) fn setting(value: &str, var: &str) -> Result<String, String> {
+    if value.chars().count() > MAX_SETTING_CHARS || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{var} is not one line of at most {MAX_SETTING_CHARS} characters"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn value_with(
     root: &Path,
     texts: &[String],
     var: &str,
-    mut read: impl FnMut(&Path, bool) -> Result<Option<String>, String>,
+    read: impl FnMut(&Path, bool) -> Result<Option<String>, String>,
 ) -> Result<Option<PathBuf>, String> {
+    raw_value_with(root, texts, var, read)?
+        .map(|s| absolute(&s, var))
+        .transpose()
+}
+
+/// The value the unit texts give `var`, before it is read as a directory.
+fn raw_value_with(
+    root: &Path,
+    texts: &[String],
+    var: &str,
+    mut read: impl FnMut(&Path, bool) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
     let mut found = None;
     let mut files = Vec::new();
     let mut unsets = Vec::new();
@@ -335,7 +389,7 @@ fn value_with(
     if found.is_none() && passed.iter().any(|name| name == var) {
         return Err(format!("{var} is inherited from the service manager"));
     }
-    found.map(|s| absolute(&s, var)).transpose()
+    Ok(found)
 }
 
 pub(super) fn absolute(value: &str, var: &str) -> Result<PathBuf, String> {

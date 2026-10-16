@@ -581,8 +581,10 @@ The retention file remains even when clean; do not unlink its lock-bearing
 inode. Kept state keeps its TPM storage root keys (SRKs). A fully completed,
 eligible wipe attempts their eviction: the original key at its handle, and
 the DA-exempt key of ADR-0034 §3 at any owner handle, each only when a fresh
-derivation of its template gives the same key. The results are reported
-separately.
+derivation of its template gives the same key. Both go through the TPM
+irlumed uses: its unit's `IRLUME_TCTI`, and its `IRLUME_SRK_HANDLE` for the
+original key, checked against the running daemon (#1088). The results are
+reported separately, with that transport and handle.
 Journald logs, filesystem snapshots and backups also survive.
 
 ### Manual uninstall recovery

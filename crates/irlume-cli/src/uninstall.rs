@@ -57,6 +57,8 @@ pub struct TeardownReport {
     /// can sit at any owner persistent handle. Attempted just before
     /// `srk_eviction`, under the same conditions.
     pub da_exempt_srk: DaExemptSrkOutcome,
+    /// The TPM both evictions went through, when they were attempted (#1088).
+    pub tpm_target: Option<runtime_environment::TpmTarget>,
     /// Established from the held record, never inferred from wipe intent.
     pub retention: RetentionState,
 }
@@ -234,6 +236,9 @@ pub fn run(args: &[String]) -> ExitCode {
     );
     if let Some(line) = da_exempt_srk_line(&report.da_exempt_srk) {
         println!("[uninstall] DA-exempt TPM storage key: {line}");
+    }
+    if let Some(target) = &report.tpm_target {
+        println!("[uninstall] TPM checked: {}", tpm_target_line(target));
     }
 
     // A stack the disable had to leave as it is still names pam_irlume.so.
@@ -817,6 +822,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
                 )],
                 srk_eviction: SrkOutcome::Kept,
                 da_exempt_srk: DaExemptSrkOutcome::Kept,
+                tpm_target: None,
                 retention: RetentionState::Unverified,
             }
         }
@@ -976,6 +982,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             data_left: vec!["daemon did not stop; data left in place".into()],
             srk_eviction: SrkOutcome::Kept,
             da_exempt_srk: DaExemptSrkOutcome::Kept,
+            tpm_target: None,
             retention: RetentionState::Unverified,
         };
     }
@@ -999,6 +1006,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             )).collect(),
             srk_eviction: SrkOutcome::Kept,
             da_exempt_srk: DaExemptSrkOutcome::Kept,
+            tpm_target: None,
             retention: RetentionState::Unverified,
         };
     }
@@ -1124,20 +1132,25 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
     };
     // The DA-exempt key first: it can be at any owner handle, the original
     // key's included, so the original key's line then describes what is left.
-    let (da_exempt_srk, srk_eviction) = if record_ready {
-        let da_exempt = match irlume_core::tpm::evict_da_exempt_srks() {
+    // Both go through irlumed's TPM and its original key's handle, as its
+    // unit sets them, not through what this process carries (#1088).
+    let (da_exempt_srk, srk_eviction, tpm_target) = if record_ready {
+        let target = snapshot.tpm_target();
+        let tcti = target.tcti.as_deref();
+        let da_exempt = match irlume_core::tpm::evict_da_exempt_srks_through(tcti) {
             Ok(handles) => DaExemptSrkOutcome::Evicted(handles),
             Err(e) => DaExemptSrkOutcome::Failed(e.to_string()),
         };
-        let original = match irlume_core::tpm::evict_persistent_srk() {
+        let handle = irlume_core::tpm::srk_handle_for(target.srk_handle.as_deref());
+        let original = match irlume_core::tpm::evict_persistent_srk_through(tcti, handle) {
             Ok(irlume_core::tpm::SrkEviction::Evicted) => SrkOutcome::Evicted,
             Ok(irlume_core::tpm::SrkEviction::Absent) => SrkOutcome::Absent,
             Ok(irlume_core::tpm::SrkEviction::Foreign) => SrkOutcome::Foreign,
             Err(e) => SrkOutcome::Failed(e.to_string()),
         };
-        (da_exempt, original)
+        (da_exempt, original, Some(target))
     } else {
-        (DaExemptSrkOutcome::Kept, SrkOutcome::Kept)
+        (DaExemptSrkOutcome::Kept, SrkOutcome::Kept, None)
     };
     let mut report = TeardownReport {
         pam_unwired,
@@ -1148,6 +1161,7 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
         data_left,
         srk_eviction,
         da_exempt_srk,
+        tpm_target,
         retention: RetentionState::Unverified,
     };
     if finish_teardown(&report, finish_services) == Some(false) {
@@ -1169,6 +1183,7 @@ fn refused_teardown(keep_data: bool, reason: String) -> TeardownReport {
         data_left: vec![terminal_safe(&reason)],
         srk_eviction: SrkOutcome::Kept,
         da_exempt_srk: DaExemptSrkOutcome::Kept,
+        tpm_target: None,
         retention: RetentionState::Unverified,
     }
 }
@@ -2543,6 +2558,31 @@ fn da_exempt_srk_line(outcome: &DaExemptSrkOutcome) -> Option<String> {
     }
 }
 
+/// Which TPM the evictions went through and which handle the original key was
+/// looked for at (#1088), so that a check that reached another TPM never reads
+/// as "already clean" without saying so. The values come from irlumed's unit
+/// or this process, and are printed through [`terminal_safe`].
+fn tpm_target_line(target: &runtime_environment::TpmTarget) -> String {
+    let source = if target.from_unit {
+        "irlumed's unit"
+    } else {
+        "this process (no irlumed unit is installed)"
+    };
+    let transport = match &target.tcti {
+        Some(tcti) => format!("IRLUME_TCTI={}", terminal_safe(tcti)),
+        None => "the default transport (/dev/tpm0, then /dev/tpmrm0)".to_string(),
+    };
+    let handle = irlume_core::tpm::srk_handle_for(target.srk_handle.as_deref());
+    let named = match &target.srk_handle {
+        Some(value) => format!(" (IRLUME_SRK_HANDLE={})", terminal_safe(value)),
+        None => String::new(),
+    };
+    format!(
+        "{transport}, original key at {handle:#010x}{named}, as {source} sets them; the \
+         DA-exempt key is looked for at every owner handle"
+    )
+}
+
 /// One honest line per [`SrkOutcome`]. `Kept` and `Failed` must never read as
 /// "cleaned": the exit code and the operator's next decision both hang on the
 /// difference.
@@ -2637,6 +2677,49 @@ mod tests {
     /// non-cleaned outcomes (`Kept`, `Failed`) must never be mistakable for a
     /// cleaned one (the PR #337 rule, applied to the TPM key: a state that
     /// leaves residue may not borrow the success phrasing).
+    /// #1088: the report names the TPM the evictions went through and the
+    /// handle the original key was looked for at, with the source of both,
+    /// and prints a unit's value only as one safe line.
+    #[test]
+    fn the_report_names_the_tpm_the_evictions_went_through() {
+        use super::runtime_environment::TpmTarget;
+        let line = super::tpm_target_line(&TpmTarget {
+            tcti: Some("swtpm:host=127.0.0.1,port=2331".into()),
+            srk_handle: Some("0x81010010".into()),
+            from_unit: true,
+        });
+        assert!(
+            line.contains("IRLUME_TCTI=swtpm:host=127.0.0.1,port=2331"),
+            "{line}"
+        );
+        assert!(
+            line.contains("original key at 0x81010010 (IRLUME_SRK_HANDLE=0x81010010)"),
+            "{line}"
+        );
+        assert!(line.contains("as irlumed's unit sets them"), "{line}");
+        let line = super::tpm_target_line(&TpmTarget {
+            tcti: None,
+            srk_handle: None,
+            from_unit: false,
+        });
+        assert!(line.contains("the default transport"), "{line}");
+        assert!(line.contains("original key at 0x81010002,"), "{line}");
+        assert!(
+            line.contains("this process (no irlumed unit is installed)"),
+            "{line}"
+        );
+        let line = super::tpm_target_line(&TpmTarget {
+            tcti: Some("swtpm:\u{1b}[2J".into()),
+            srk_handle: Some("junk".into()),
+            from_unit: true,
+        });
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(
+            line.contains("original key at 0x81010002 (IRLUME_SRK_HANDLE=junk)"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn srk_outcome_lines_are_distinct_and_honest() {
         let evicted = super::srk_outcome_line(&super::SrkOutcome::Evicted);
@@ -2958,6 +3041,7 @@ mod tests {
             } else {
                 DaExemptSrkOutcome::Kept
             },
+            tpm_target: None,
             retention: if wiped {
                 RetentionState::Clean
             } else {

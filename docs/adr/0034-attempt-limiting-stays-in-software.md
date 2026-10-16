@@ -434,8 +434,10 @@ today, and doctor says so (section 4).
    proposes for a key with the ROCA fingerprint (item 2: a root-only
    request on the worker that checks the key is still irlume's, as
    `evict_persistent_srk` does), extended to the old key, with exact
-   identity, never a shape match. Only a fresh derivation proves it on its
-   own: Phase 3 and uninstall evict the old key automatically only when
+   identity, never a shape match. (Amended 2026-10-16, below: irlumed's
+   start retires the key itself, and no daemon request ships.) Only a fresh
+   derivation proves it on its own: Phase 3 and uninstall evict the old key
+   automatically only when
    today's derivation of the old template gives the same modulus (the
    uninstall path's rule), and uninstall evicts the new key by the same
    rule against the new template. Phase 2 also records the old key's TPM name at
@@ -580,7 +582,11 @@ so that only an administrator can reset a lockout.
 - **Phase 2:** the storage key move (section 3.1 to 3.3), with the swtpm
   lockout test below.
 - **Phase 3:** evicting the old key (section 3.4) with the daemon request
-  #1073 proposes, extended to the old key.
+  #1073 proposes, extended to the old key. (Amended 2026-10-16, below:
+  irlumed's start retires the old key itself when a fresh derivation proves
+  it irlume's, a key nothing proves irlume's is left for a manual eviction,
+  and no daemon request or wire change ships for it; Phase 3 also replaces a
+  weak storage key by moving its envelopes first.)
 
 ## Acceptance tests
 
@@ -779,19 +785,33 @@ authentication. It needs no client: the start already holds the record, opens
 the TPM, and runs before any request. The key is retired when all of these
 hold:
 
-1. **Unused across boots.** The first start whose census finds no envelope
-   under the original key (none without a recorded parent; an envelope it
-   cannot read counts as under it) records its boot ID. A later start in
-   another boot whose census is still empty may retire the key; a start that
-   finds an envelope clears the mark, and a boot ID that cannot be read is no
-   other boot. A move whose write reports `AtomicWrite::VisibleNotDurable`
-   clears the mark and records its own boot ID, and no start in that boot may
-   set the mark, since after a power loss the envelope under the key can come
-   back. A template key moved durably at a start in boot A can therefore be
-   retired at the first start in a later boot; a key whose last envelope
-   moved after the start (a keyring secret at a login) is marked at the first
-   start of the next boot and retired in a boot after that; a move that was
-   not durable adds a boot.
+1. **Unused across boots.** The record holds two boot IDs for the key:
+   `unused_since`, set by a start whose census finds no envelope under it
+   (none without a recorded parent; an envelope it cannot read counts as
+   under it), and `moved_in`, the boot of a move off it that was not yet
+   shown durable. The order of writes is what makes them safe:
+   - Before a move off the key publishes its new envelope, the record is
+     written with `unused_since` cleared and `moved_in` set to this boot. When
+     the move's write is durable, `moved_in` is cleared again; when it reports
+     `AtomicWrite::VisibleNotDurable`, `moved_in` stays, since after a power
+     loss the envelope under the key can come back.
+   - A start whose census finds an envelope under the key clears
+     `unused_since` before it moves anything.
+   - A start whose census is empty sets `unused_since` to its boot only when
+     `moved_in` is not this boot.
+   - A start retires the key only when its census is empty and `unused_since`
+     names another boot. A boot ID that cannot be read is no other boot.
+
+   Each of these record writes is made durable (written atomically and its
+   directory synced) before the step that relies on it, and one that reports
+   `VisibleNotDurable` counts as failed: the move is not made, or the key is
+   not retired. A crash between a move and the record update therefore leaves
+   `moved_in` set or `unused_since` cleared, never a mark that outlives an
+   envelope. A template key moved durably at a start in boot A can be retired
+   at the first start in a later boot; a key whose last envelope moved after
+   the start (a keyring secret at a login) is marked at the next start and
+   retired at a start in a boot after the mark's; a move that was not durable
+   adds a boot.
 2. **Proof.** The key at the original handle has the name the record kept,
    and a fresh derivation of the original template at this start gives the
    same modulus, as uninstall compares it. The derivation runs only at a
@@ -846,9 +866,12 @@ an envelope names:
   generation changes the derivation, so a weak original key usually is).
 - **The DA-exempt key is weak** (persisted before a firmware update fixed key
   generation) **and today's derivation of its template is not.** irlumed's
-  start persists the new derivation at the next free owner handle and records
-  it as the DA-exempt key, keeping the weak key's handle and name in the
-  record. An envelope whose parent is the weak key counts as having a reason
+  start looks for that new derivation among the owner persistent handles
+  first, by its TPM name, and adopts a copy an earlier start persisted before
+  a power loss kept it from the record, as section 3.2 adopts a first key;
+  only without one does it persist the derivation at the next free owner
+  handle. It records the new key as the DA-exempt key, keeping the weak key's
+  handle and name in the record. An envelope whose parent is the weak key counts as having a reason
   to move, like one on the original key, and moves at its move point. Once no
   envelope names the weak key, across boots as in condition 1, doctor reports
   it for the manual path; irlume does not evict it, since a fresh derivation
@@ -914,8 +937,11 @@ Acceptance tests (added, Phase 3):
   secret moved after the start delays that by one boot; a move that reported
   `VisibleNotDurable` delays it by one more; an envelope restored by a
   simulated power loss keeps the key; an envelope that cannot be parsed keeps
-  it; an unreadable boot ID retires nothing (fake TPM, and swtpm for the
-  eviction).
+  it; an unreadable boot ID retires nothing; with an old `unused_since` from
+  another boot, a returning envelope whose move is stopped between publishing
+  and the record update leaves a same-boot restart retiring nothing; a record
+  write that reports `VisibleNotDurable` makes no move and no retirement
+  (fake TPM, and swtpm for the eviction).
 - A start that derived the DA-exempt key does not retire in the same start.
 - A key at the original handle that the record kept as matched but today's
   derivation does not reproduce (a key the test persists from another
@@ -930,6 +956,8 @@ Acceptance tests (added, Phase 3):
   and falls back to the password (swtpm).
 - A recorded DA-exempt key with the ROCA fingerprint, with today's derivation
   clean, is replaced at the next start by a new key at the next free handle;
+  a start stopped between persisting that key and writing the record is
+  followed by one that adopts it, with no second copy persisted;
   its envelopes move at their move points, and the weak key is then reported
   for the manual path and not evicted; with the TPM full or no owner handle
   free, the refusal is recorded and the weak key stays in use; with today's

@@ -1113,6 +1113,37 @@ fn log_census(census: &irlume_core::storage_key::Census) {
     }
 }
 
+/// What irlumed's start did about retiring the original storage key. The
+/// details come from the TPM or the record, as one bounded line each.
+fn log_retirement(retirement: &irlume_core::storage_key::Retirement) {
+    use irlume_core::storage_key::Retirement;
+    match retirement {
+        Retirement::Retired { handle } => jout_notice!(
+            "irlumed: retired irlume's original storage key at {handle:#010x}: no envelope has \
+             been under it since a start in an earlier boot, and today's derivation gives it \
+             (ADR-0034); irlume's DA-exempt key remains"
+        ),
+        Retirement::NotReproduced { handle } => jout_warn!(
+            "irlumed: the key at {handle:#010x}, irlume's original storage key, is not the key \
+             today's derivation gives, so irlume does not evict it; once no envelope is under \
+             it, and after checking that nothing else uses it, it can be evicted by hand with \
+             `sudo tpm2_evictcontrol -C o -c {handle:#010x}` on the TPM irlumed uses"
+        ),
+        Retirement::Failed { handle, detail } => jout_warn!(
+            "irlumed: could not retire irlume's original storage key at {handle:#010x} \
+             ({detail}); irlumed tries again at its first start in a later boot"
+        ),
+        Retirement::Deferred { handle, detail } => jout_debug!(
+            "irlumed: the retirement of irlume's original storage key at {handle:#010x} failed \
+             earlier in this boot ({detail}); irlumed tries again in a later boot"
+        ),
+        Retirement::Unchecked { detail } => jout_warn!(
+            "irlumed: could not check irlume's storage keys to retire the original one \
+             ({detail}); irlumed checks again at the next start"
+        ),
+    }
+}
+
 /// The journal line for an envelope irlumed's start found with a stale
 /// parent handle (ADR-0034 §3.3). Account names reach here only when the
 /// envelope's file is named for one irlumed accepts.
@@ -1585,9 +1616,17 @@ fn main() {
             // step records the original key's TPM name once its derivation
             // matches (§3.4), with or without an envelope. Both run when the
             // TPM is reachable (`startup_tpm_reachable`).
+            // Whether this start derived a key, which the retirement after
+            // the moves then does not do in the same start (ADR-0034, Phase
+            // 3 amendment); a step that failed counts as one.
+            let mut derived_at_start = true;
             if startup_tpm_reachable() {
                 use irlume_core::storage_key::Outcome;
-                match irlume_core::storage_key::ensure_at_start() {
+                let ensured = irlume_core::storage_key::ensure_at_start_reporting();
+                if let Ok((_, derived)) = &ensured {
+                    derived_at_start = *derived;
+                }
+                match ensured.map(|(outcome, _)| outcome) {
                     Ok(None | Some(Outcome::Present { .. } | Outcome::Deferred(_))) => {}
                     Ok(Some(Outcome::Adopted { handle } | Outcome::Persisted { handle })) => {
                         jout_notice!(
@@ -1653,12 +1692,18 @@ fn main() {
             }
 
             // After the moves, count the envelopes still under the original
-            // storage key and keep the record of its use (ADR-0034, Phase 3
-            // amendment, condition 1): a key unused since a start in an
-            // earlier boot is the one a later start may retire.
+            // storage key and keep the record of its use, then retire the
+            // key when no envelope has been under it since a start in an
+            // earlier boot and a fresh derivation proves it irlume's
+            // (ADR-0034, Phase 3 amendment).
             if startup_tpm_reachable() {
-                match irlume_core::storage_key::mark_at_start() {
-                    Ok(Some(census)) => log_census(&census),
+                match irlume_core::storage_key::settle_at_start(derived_at_start) {
+                    Ok(Some(settled)) => {
+                        log_census(&settled.census);
+                        if let Some(retirement) = &settled.retirement {
+                            log_retirement(retirement);
+                        }
+                    }
                     Ok(None) => {}
                     Err(e) => jout_warn!(
                         "irlumed: could not count the envelopes under irlume's original storage \

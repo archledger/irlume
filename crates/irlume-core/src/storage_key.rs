@@ -65,6 +65,21 @@ pub(crate) struct Record {
     /// that boot marks nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     moves: Vec<UnsettledMove>,
+    /// The last retirement of the original key that failed (its proof or
+    /// its eviction), with the boot it failed in: tried again only at the
+    /// first start in a later boot, so a restart in the same boot pays no
+    /// derivation (condition 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement_failed: Option<FailedRetirement>,
+}
+
+/// A retirement of the original key that failed: the error, and the boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FailedRetirement {
+    detail: String,
+    /// `None` when the boot ID could not be read, which may be another boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
 }
 
 /// An envelope whose move off the original storage key was not yet shown
@@ -156,6 +171,10 @@ pub(crate) trait KeyTpm {
     /// when the handle is free or the key there does not have the original
     /// template's shape, and then nothing is derived.
     fn derives_original(&mut self, handle: u32) -> Result<Option<bool>>;
+    /// Evict the persistent key at `handle` when its TPM name is `name`;
+    /// `false`, evicting nothing, when the handle is free or holds another
+    /// key.
+    fn evict(&mut self, handle: u32, name: &[u8]) -> Result<bool>;
 }
 
 /// The [`KeyTpm`] for a refused override, which [`ensure_with`] records
@@ -179,6 +198,9 @@ impl KeyTpm for Unopened {
         Err(unopened_failure())
     }
     fn derives_original(&mut self, _: u32) -> Result<Option<bool>> {
+        Err(unopened())
+    }
+    fn evict(&mut self, _: u32, _: &[u8]) -> Result<bool> {
         Err(unopened())
     }
 }
@@ -236,6 +258,18 @@ pub enum Outcome {
 /// read, or the record cannot be written. A key persisted before a failed
 /// write is adopted at the next start.
 pub fn ensure_at_start() -> Result<Option<Outcome>> {
+    ensure_at_start_reporting().map(|(outcome, _)| outcome)
+}
+
+/// [`ensure_at_start`], and whether this start derived an RSA-2048 key: the
+/// DA-exempt key, or the original key for its record. [`settle_at_start`]
+/// derives nothing in a start that did (ADR-0034, Phase 3 amendment,
+/// condition 2). A check of the original key that fails counts as one.
+///
+/// # Errors
+///
+/// As [`ensure_at_start`].
+pub fn ensure_at_start_reporting() -> Result<(Option<Outcome>, bool)> {
     let envelope = any_envelope()?;
     // One transaction: two starts that overlap (a direct start beside the
     // service) would each read, decide and write the record, and a refusal
@@ -246,13 +280,14 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
     let plan = tpm::da_exempt_key_plan();
     if !envelope {
         // This start derives nothing else, so it may check the original key.
-        let original = match &plan {
-            Ok(chosen) => tpm::DaExemptKeyTpm::open()
-                .and_then(|mut tpm| {
+        let (original, derived) = match &plan {
+            Ok(chosen) => checked_original(
+                tpm::DaExemptKeyTpm::open().and_then(|mut tpm| {
                     original_with(&mut tpm, chosen.original, record.original.clone(), false)
-                })
-                .unwrap_or_else(|_| record.original.clone()),
-            Err(_) => record.original.clone(),
+                }),
+                &record,
+            ),
+            Err(_) => (record.original.clone(), false),
         };
         // Written only when it changes, so a host with nothing to record
         // gets no record file.
@@ -264,12 +299,12 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
                 ..record
             })?;
         }
-        return Ok(None);
+        return Ok((None, derived));
     }
     let boot = irlume_common::boot_id();
     // A refused override needs no TPM, so a transport that cannot be opened
     // does not hide it: `ensure_with` records it before any TPM call.
-    let (next, outcome) = match &plan {
+    let next = match &plan {
         Ok(chosen) => {
             let mut tpm = tpm::DaExemptKeyTpm::open()?;
             // `ensure_with` decides the DA-exempt key's part of the record;
@@ -277,26 +312,48 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
             let (mut next, outcome) =
                 ensure_keeping_use(&mut tpm, &record, boot.as_deref(), &plan)?;
             // Advisory, so a failure to check costs nothing but a later try.
-            next.original = original_with(
-                &mut tpm,
-                chosen.original,
-                record.original.clone(),
-                derived_now(&outcome),
-            )
-            .unwrap_or_else(|_| record.original.clone());
-            (next, outcome)
+            let (original, derived_original) = checked_original(
+                original_with(
+                    &mut tpm,
+                    chosen.original,
+                    record.original.clone(),
+                    derived_now(&outcome),
+                ),
+                &record,
+            );
+            next.original = original;
+            let derived = derived_now(&outcome) || derived_original;
+            (next, outcome, derived)
         }
         Err(_) => {
             let (mut next, outcome) =
                 ensure_keeping_use(&mut Unopened, &record, boot.as_deref(), &plan)?;
             next.original = record.original.clone();
-            (next, outcome)
+            (next, outcome, false)
         }
     };
+    let (next, outcome, derived) = next;
     if next != record {
         save_record(&next)?;
     }
-    Ok(Some(outcome))
+    Ok((Some(outcome), derived))
+}
+
+/// The original key's entry after [`original_with`]'s `checked` answer,
+/// and whether that check derived the original key: it did when the entry
+/// changed (a check that derives nothing returns the recorded entry), and a
+/// check that failed counts as one, since it may have failed part way.
+fn checked_original(
+    checked: Result<Option<Original>>,
+    record: &Record,
+) -> (Option<Original>, bool) {
+    match checked {
+        Ok(original) => {
+            let derived = original != record.original;
+            (original, derived)
+        }
+        Err(_) => (record.original.clone(), true),
+    }
 }
 
 /// What `irlume doctor` reports (ADR-0034 §4): the record, with the recorded
@@ -503,36 +560,212 @@ pub enum Census {
     Unsettled,
 }
 
-/// irlumed's start, after its template key moves: count the envelopes under
-/// the original storage key and keep the record of its use (ADR-0034, Phase
-/// 3 amendment, condition 1), under the record lock. A census that finds one
-/// clears `unused_since`. An empty one drops the entries of moves that name
-/// another boot, since it read what the disk kept of that boot's writes, and
-/// sets `unused_since` to this boot when no entry is left that may be this
-/// boot's and none is set already. `None` without a recorded DA-exempt key,
-/// beside which alone the key is retired.
+/// What irlumed's start did about the original storage key after its
+/// template key moves: the census, and the retirement when one was due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub census: Census,
+    /// `None` when no retirement was due: the key is in use, was marked
+    /// unused only in this boot, this start derived a key already, the
+    /// DA-exempt key is not at its recorded handle, or the original key is
+    /// not the one the record kept as matching today's derivation.
+    pub retirement: Option<Retirement>,
+}
+
+/// A retirement of the original storage key that was due at this start
+/// (ADR-0034, Phase 3 amendment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retirement {
+    /// Proved by a fresh derivation and evicted from `handle`.
+    Retired { handle: u32 },
+    /// Today's derivation does not give the key at `handle`, so irlume
+    /// never evicts it; the record keeps it as not matching, and nothing is
+    /// derived for it again. Once no envelope is under it, doctor names the
+    /// manual command (the #1079 path).
+    NotReproduced { handle: u32 },
+    /// The proof or the eviction failed (an owner authorization set since,
+    /// a TPM error): recorded with this boot and tried again only at the
+    /// first start in a later boot.
+    Failed { handle: u32, detail: String },
+    /// A retirement failed earlier in this boot, so this start derives
+    /// nothing for it.
+    Deferred { handle: u32, detail: String },
+    /// The TPM could not be opened or read to check the keys; tried again
+    /// at the next start.
+    Unchecked { detail: String },
+}
+
+/// irlumed's start, after its template key moves, under the record lock
+/// (ADR-0034, Phase 3 amendment). First the census of the original storage
+/// key's use (condition 1): one that finds an envelope under the key, or one
+/// it cannot read, clears `unused_since`; an empty one drops the entries of
+/// moves that name another boot, since it read what the disk kept of that
+/// boot's writes, and sets `unused_since` to this boot when no entry is left
+/// that may be this boot's and none is set already.
+///
+/// Then the retirement, only when the census is empty and `unused_since`
+/// names another boot (a boot ID that cannot be read is no other boot), in a
+/// start that derived no key (`derived`, from
+/// [`ensure_at_start_reporting`]), with the DA-exempt key at its recorded
+/// handle with its recorded name (condition 3), and with the key at the
+/// original handle the one the record kept as matching today's derivation.
+/// A fresh derivation of the original template then proves it (condition 2)
+/// before it is evicted. The TPM is opened only then, so an ordinary start
+/// does no TPM work here.
+///
+/// `None` without a recorded DA-exempt key, beside which alone the key is
+/// retired.
 ///
 /// # Errors
 ///
 /// When an envelope directory cannot be read, or the record cannot be locked
-/// or written.
-pub fn mark_at_start() -> Result<Option<Census>> {
-    mark_in(irlume_common::boot_id().as_deref())
+/// or written. A TPM that cannot be opened or read is
+/// [`Retirement::Unchecked`].
+pub fn settle_at_start(derived: bool) -> Result<Option<Settled>> {
+    settle_in(
+        irlume_common::boot_id().as_deref(),
+        derived,
+        tpm::DaExemptKeyTpm::open,
+        save_record,
+    )
 }
 
-/// [`mark_at_start`] in boot `boot`.
-fn mark_in(boot: Option<&str>) -> Result<Option<Census>> {
+/// [`settle_at_start`] in boot `boot`, with the TPM `open` gives and the
+/// record written by `save`. What the census changed is made durable before
+/// anything is evicted, and a write that fails, or is not durable, retires
+/// nothing.
+pub(crate) fn settle_in<T: KeyTpm>(
+    boot: Option<&str>,
+    derived: bool,
+    open: impl FnOnce() -> Result<T>,
+    mut save: impl FnMut(&Record) -> Result<()>,
+) -> Result<Option<Settled>> {
     if load_record().persisted.is_none() {
         return Ok(None);
     }
     let _lock = RecordLock::acquire()?;
     let record = load_record();
     let in_use = any_under_original_key()?;
-    let (next, census) = mark_with(&record, in_use, boot);
+    let (mut next, census) = mark_with(&record, in_use, boot);
     if next != record {
-        save_record(&next)?;
+        save(&next)?;
     }
-    Ok(Some(census))
+    let marked = next.clone();
+    let retirement = match (&census, boot) {
+        (Census::Unused { since }, Some(boot)) if since != boot && !derived => {
+            match tpm::da_exempt_key_plan() {
+                Ok(plan) => match open() {
+                    Ok(mut tpm) => retire_with(&mut tpm, &mut next, plan.original, boot)
+                        .unwrap_or_else(|e| {
+                            Some(Retirement::Unchecked {
+                                detail: irlume_common::single_line(
+                                    &e.to_string(),
+                                    MAX_DETAIL_CHARS,
+                                ),
+                            })
+                        }),
+                    Err(e) => Some(Retirement::Unchecked {
+                        detail: irlume_common::single_line(&e.to_string(), MAX_DETAIL_CHARS),
+                    }),
+                },
+                // A refused IRLUME_SRK_HANDLE names no original key to retire.
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+    if next != marked {
+        save(&next)?;
+    }
+    Ok(Some(Settled { census, retirement }))
+}
+
+/// [`settle_at_start`] in boot `boot`, for a TPM test that needs another
+/// boot than this one.
+#[cfg(test)]
+pub(crate) fn settle_at_start_in(boot: Option<&str>, derived: bool) -> Result<Option<Settled>> {
+    settle_in(boot, derived, tpm::DaExemptKeyTpm::open, save_record)
+}
+
+/// The retirement of the original key at `handle`, its handle today, over
+/// `tpm` in boot `boot`, once the census allows one; `next` is the record to
+/// keep. `None` when condition 3, or the record's account of the key, does
+/// not hold.
+fn retire_with(
+    tpm: &mut impl KeyTpm,
+    next: &mut Record,
+    handle: u32,
+    boot: &str,
+) -> Result<Option<Retirement>> {
+    // Condition 3: the DA-exempt key, which an envelope that comes back
+    // moves to, is at its recorded handle with its recorded name.
+    let Some(persisted) = &next.persisted else {
+        return Ok(None);
+    };
+    let Some(da_exempt) = unhex(&persisted.name) else {
+        return Ok(None);
+    };
+    if tpm.name_at(persisted.handle)?.as_deref() != Some(da_exempt.as_slice()) {
+        return Ok(None);
+    }
+    // The key at the original handle is the one the record kept as matching
+    // today's derivation. The record is advisory: what follows proves it.
+    let Some(original) = next
+        .original
+        .as_ref()
+        .filter(|original| original.matched && original.handle == handle)
+    else {
+        return Ok(None);
+    };
+    let Some(name) = unhex(&original.name) else {
+        return Ok(None);
+    };
+    if tpm.name_at(handle)?.as_deref() != Some(name.as_slice()) {
+        return Ok(None);
+    }
+    if let Some(failed) = &next.retirement_failed {
+        if failed.boot_id.as_deref() == Some(boot) {
+            return Ok(Some(Retirement::Deferred {
+                handle,
+                detail: irlume_common::single_line(&failed.detail, MAX_DETAIL_CHARS),
+            }));
+        }
+    }
+    // Condition 2: a fresh derivation of the original template gives the
+    // same key.
+    match tpm.derives_original(handle) {
+        Ok(Some(true)) => {}
+        Ok(Some(false)) => {
+            next.retirement_failed = None;
+            if let Some(original) = next.original.as_mut() {
+                original.matched = false;
+            }
+            return Ok(Some(Retirement::NotReproduced { handle }));
+        }
+        // The key there is not the original template's shape after all.
+        Ok(None) => return Ok(None),
+        Err(e) => return Ok(Some(failed_retirement(next, handle, boot, &e))),
+    }
+    match tpm.evict(handle, &name) {
+        Ok(true) => {
+            next.retirement_failed = None;
+            Ok(Some(Retirement::Retired { handle }))
+        }
+        // It left the handle since: nothing to retire.
+        Ok(false) => Ok(None),
+        Err(e) => Ok(Some(failed_retirement(next, handle, boot, &e))),
+    }
+}
+
+/// Record in `next` that the retirement of the key at `handle` failed with
+/// `error` in boot `boot`, and say so.
+fn failed_retirement(next: &mut Record, handle: u32, boot: &str, error: &Error) -> Retirement {
+    let detail = irlume_common::single_line(&error.to_string(), MAX_DETAIL_CHARS);
+    next.retirement_failed = Some(FailedRetirement {
+        detail: detail.clone(),
+        boot_id: Some(boot.to_owned()),
+    });
+    Retirement::Failed { handle, detail }
 }
 
 /// The record after a census that found an envelope under the original key
@@ -1132,6 +1365,12 @@ mod tests {
         /// derivation answers, and how many times it was asked.
         original: Option<bool>,
         original_derivations: usize,
+        /// An error the comparison answers instead, as for an owner
+        /// authorization set since.
+        original_error: Option<String>,
+        /// The handles evicted, and an error eviction answers instead.
+        evicted: Vec<u32>,
+        evict_error: Option<String>,
     }
 
     impl FakeTpm {
@@ -1147,6 +1386,9 @@ mod tests {
                 scans: 0,
                 original: Some(true),
                 original_derivations: 0,
+                original_error: None,
+                evicted: Vec::new(),
+                evict_error: None,
             }
         }
     }
@@ -1174,7 +1416,21 @@ mod tests {
                 return Ok(None);
             }
             self.original_derivations += 1;
+            if let Some(error) = &self.original_error {
+                return Err(Error::Tpm(error.clone()));
+            }
             Ok(self.original)
+        }
+        fn evict(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+            if let Some(error) = &self.evict_error {
+                return Err(Error::Tpm(error.clone()));
+            }
+            if self.objects.get(&handle).map(Vec::as_slice) != Some(name) {
+                return Ok(false);
+            }
+            self.objects.remove(&handle);
+            self.evicted.push(handle);
+            Ok(true)
         }
         fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
             self.scans += 1;
@@ -2347,6 +2603,17 @@ mod tests {
         assert_eq!((no_boot.unused_since, census), (None, Census::Unsettled));
     }
 
+    /// The census of [`settle_in`] in boot `boot`, where no retirement is due.
+    fn mark_in(boot: Option<&str>) -> Result<Option<Census>> {
+        settle_in(
+            boot,
+            false,
+            || -> Result<FakeTpm> { panic!("no retirement is due, so no TPM is opened") },
+            save_record,
+        )
+        .map(|settled| settled.map(|settled| settled.census))
+    }
+
     /// Condition 1 over boots, with fake boot IDs: a durable move is marked
     /// at a start in its boot, a move that is not durable is marked only in
     /// the next boot, and a durable move of another envelope in the same
@@ -2407,6 +2674,406 @@ mod tests {
         );
         assert_eq!(unreadable.expect("the census"), Some(Census::InUse));
         assert_eq!(cleared.unused_since, None);
+    }
+
+    /// A borrowed fake, so a test can open it for [`settle_in`] and read it
+    /// after.
+    impl KeyTpm for &mut FakeTpm {
+        fn name_at(&mut self, handle: u32) -> Result<Option<Vec<u8>>> {
+            (**self).name_at(handle)
+        }
+        fn persistent_avail(&mut self) -> Result<u32> {
+            (**self).persistent_avail()
+        }
+        fn derive(&mut self) -> std::result::Result<Vec<u8>, Failure> {
+            (**self).derive()
+        }
+        fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
+            (**self).owner_names()
+        }
+        fn persist(&mut self, handle: u32) -> std::result::Result<(), Failure> {
+            (**self).persist(handle)
+        }
+        fn derives_original(&mut self, handle: u32) -> Result<Option<bool>> {
+            (**self).derives_original(handle)
+        }
+        fn evict(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+            (**self).evict(handle, name)
+        }
+    }
+
+    const ORIGINAL: u32 = 0x8101_0002;
+    const DA_EXEMPT: u32 = 0x8101_0003;
+
+    /// A record of a persisted DA-exempt key and an original key kept as
+    /// matching today's derivation, unused since `since`.
+    fn retiring_record(since: Option<&str>) -> Record {
+        Record {
+            original: Some(Original {
+                handle: ORIGINAL,
+                name: hex(b"orig"),
+                matched: true,
+            }),
+            unused_since: since.map(str::to_owned),
+            ..persisted_record(DA_EXEMPT, b"ours")
+        }
+    }
+
+    /// A TPM holding both keys as [`retiring_record`] names them.
+    fn retiring_tpm() -> FakeTpm {
+        let mut tpm = FakeTpm::new();
+        tpm.objects.insert(DA_EXEMPT, b"ours".to_vec());
+        tpm.objects.insert(ORIGINAL, b"orig".to_vec());
+        tpm
+    }
+
+    /// [`settle_in`] over `tpm` in `boot`, through the real record.
+    fn settle(tpm: &mut FakeTpm, boot: Option<&str>, derived: bool) -> Settled {
+        settle_in(boot, derived, || Ok(tpm), save_record)
+            .expect("the step runs")
+            .expect("a DA-exempt key is recorded")
+    }
+
+    /// ADR-0034, Phase 3 amendment: an original key unused since a start in
+    /// an earlier boot is proved by a fresh derivation and evicted at the
+    /// first start in a later boot, and not in the boot of the mark, not in
+    /// a start that derived a key, and not in a boot that cannot be read.
+    /// Once it is gone nothing is derived for it.
+    #[test]
+    fn the_original_key_is_retired_at_a_start_in_a_later_boot_once_proved() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-retire");
+        envelope(true)
+            .save(&template_key::key_path("alice"))
+            .unwrap();
+        save_record(&retiring_record(None)).unwrap();
+        let mut tpm = retiring_tpm();
+
+        let marking = settle(&mut tpm, Some(BOOT), false);
+        let derived_after_mark = tpm.original_derivations;
+        let unreadable = settle(&mut tpm, None, false);
+        let after_derivation = settle(&mut tpm, Some(LATER_BOOT), true);
+        let derived_while_deriving = tpm.original_derivations;
+        let retired = settle(&mut tpm, Some(LATER_BOOT), false);
+        let derived_once = tpm.original_derivations;
+        let gone = settle(&mut tpm, Some(LATER_BOOT), false);
+        let kept = load_record();
+        drop(sandbox);
+
+        let unused = Census::Unused { since: BOOT.into() };
+        assert_eq!(
+            marking,
+            Settled {
+                census: unused.clone(),
+                retirement: None
+            }
+        );
+        assert_eq!(
+            derived_after_mark, 0,
+            "nothing is derived in the boot of the mark"
+        );
+        assert_eq!(
+            unreadable.retirement, None,
+            "an unreadable boot is no other boot"
+        );
+        assert_eq!(
+            after_derivation.retirement, None,
+            "a start that derived a key"
+        );
+        assert_eq!(derived_while_deriving, 0);
+        assert_eq!(
+            retired.retirement,
+            Some(Retirement::Retired { handle: ORIGINAL })
+        );
+        assert_eq!(derived_once, 1, "one fresh derivation proves it");
+        assert_eq!(tpm.evicted, [ORIGINAL]);
+        assert!(
+            tpm.objects.contains_key(&DA_EXEMPT),
+            "the DA-exempt key stays"
+        );
+        assert_eq!(gone.retirement, None, "nothing left to retire");
+        assert_eq!(tpm.original_derivations, 1, "and nothing derived for it");
+        assert_eq!(kept.unused_since.as_deref(), Some(BOOT));
+        assert_eq!(
+            kept.original,
+            retiring_record(None).original,
+            "the entry stays"
+        );
+    }
+
+    /// Conditions 2 and 3: no retirement without the DA-exempt key at its
+    /// recorded handle with its recorded name, or without the original key
+    /// the record kept as matching at the original handle. A key today's
+    /// derivation does not give is kept as not matching and never derived
+    /// for again; one without the original template's shape is left.
+    #[test]
+    fn a_retirement_needs_the_da_exempt_key_and_the_kept_original_key() {
+        let record = retiring_record(Some(BOOT));
+        let retire = |tpm: &mut FakeTpm, record: &Record| {
+            let mut next = record.clone();
+            let retirement = retire_with(tpm, &mut next, ORIGINAL, LATER_BOOT).expect("checked");
+            (retirement, next)
+        };
+        let mut no_da_exempt = retiring_tpm();
+        no_da_exempt.objects.remove(&DA_EXEMPT);
+        assert_eq!(retire(&mut no_da_exempt, &record).0, None);
+        let mut other_da_exempt = retiring_tpm();
+        other_da_exempt
+            .objects
+            .insert(DA_EXEMPT, b"theirs".to_vec());
+        assert_eq!(retire(&mut other_da_exempt, &record).0, None);
+        let mut other_original = retiring_tpm();
+        other_original.objects.insert(ORIGINAL, b"another".to_vec());
+        assert_eq!(retire(&mut other_original, &record).0, None);
+        let unmatched = Record {
+            original: record.original.clone().map(|original| Original {
+                matched: false,
+                ..original
+            }),
+            ..record.clone()
+        };
+        assert_eq!(retire(&mut retiring_tpm(), &unmatched).0, None);
+        let mut elsewhere = retiring_tpm();
+        let mut next = record.clone();
+        assert_eq!(
+            retire_with(&mut elsewhere, &mut next, 0x8101_0010, LATER_BOOT).expect("checked"),
+            None,
+            "the original key's handle is not the one the record kept"
+        );
+        for tpm in [&no_da_exempt, &other_da_exempt, &other_original, &elsewhere] {
+            assert_eq!((tpm.original_derivations, tpm.evicted.len()), (0, 0));
+        }
+
+        let mut not_reproduced = retiring_tpm();
+        not_reproduced.original = Some(false);
+        let (retirement, next) = retire(&mut not_reproduced, &record);
+        assert_eq!(
+            retirement,
+            Some(Retirement::NotReproduced { handle: ORIGINAL })
+        );
+        assert!(!next.original.as_ref().expect("kept").matched);
+        assert_eq!(
+            retire(&mut not_reproduced, &next).0,
+            None,
+            "not derived again"
+        );
+        assert_eq!(not_reproduced.original_derivations, 1);
+        assert!(not_reproduced.evicted.is_empty());
+
+        let mut other_shape = retiring_tpm();
+        other_shape.original = None;
+        assert_eq!(retire(&mut other_shape, &record).0, None);
+        assert!(other_shape.evicted.is_empty());
+    }
+
+    /// Condition 2: a derivation that fails proves nothing. The failure is
+    /// recorded with its boot and not tried again in that boot, so a restart
+    /// pays no derivation, and is tried again in a later boot. An eviction
+    /// that fails is recorded the same way.
+    #[test]
+    fn a_failed_retirement_is_tried_again_only_in_a_later_boot() {
+        let record = retiring_record(Some(BOOT));
+        let mut tpm = retiring_tpm();
+        tpm.original_error = Some("TPM_RC_BAD_AUTH".into());
+        let mut next = record.clone();
+        let failed = retire_with(&mut tpm, &mut next, ORIGINAL, LATER_BOOT).expect("checked");
+        assert!(
+            matches!(&failed, Some(Retirement::Failed { handle: ORIGINAL, detail }) if detail.contains("TPM_RC_BAD_AUTH")),
+            "{failed:?}"
+        );
+        let recorded = next.retirement_failed.clone().expect("recorded");
+        assert_eq!(recorded.boot_id.as_deref(), Some(LATER_BOOT));
+        let deferred = retire_with(&mut tpm, &mut next, ORIGINAL, LATER_BOOT).expect("checked");
+        assert!(
+            matches!(deferred, Some(Retirement::Deferred { .. })),
+            "{deferred:?}"
+        );
+        assert_eq!(
+            tpm.original_derivations, 1,
+            "a restart in the same boot derives nothing"
+        );
+        tpm.original_error = None;
+        const THIRD_BOOT: &str = "2a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        let retried = retire_with(&mut tpm, &mut next, ORIGINAL, THIRD_BOOT).expect("checked");
+        assert_eq!(retried, Some(Retirement::Retired { handle: ORIGINAL }));
+        assert_eq!(tpm.original_derivations, 2, "a later boot derives again");
+        assert_eq!(next.retirement_failed, None, "cleared once it succeeds");
+
+        let mut refuses = retiring_tpm();
+        refuses.evict_error = Some("TPM_RC_BAD_AUTH".into());
+        let mut next = record.clone();
+        let evict_failed =
+            retire_with(&mut refuses, &mut next, ORIGINAL, LATER_BOOT).expect("checked");
+        assert!(
+            matches!(evict_failed, Some(Retirement::Failed { .. })),
+            "{evict_failed:?}"
+        );
+        assert!(next.retirement_failed.is_some());
+        assert!(refuses.objects.contains_key(&ORIGINAL));
+    }
+
+    /// The amendment's acceptance tests for condition 1 with retirement,
+    /// over fake boot IDs: a template key moved durably at a start is
+    /// retired at the first start in a later boot; a keyring secret moved
+    /// after the start delays that by one boot, and a move that was not
+    /// durable by one more; an envelope restored by a simulated power loss,
+    /// and one that cannot be parsed, keep the key; a returning envelope
+    /// whose move stopped between publishing and the record update leaves a
+    /// same-boot restart retiring nothing; a record write that fails retires
+    /// nothing.
+    #[test]
+    fn the_original_key_is_retired_only_a_boot_after_every_move_off_it_is_durable() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        const BOOT_C: &str = "2a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        let (template, keyring) = (EnvelopeKind::TemplateKey, EnvelopeKind::KeyringSecret);
+        let retired = Some(Retirement::Retired { handle: ORIGINAL });
+
+        // A template key moved durably at a start in boot A.
+        let sandbox = Sandbox::new("storage-key-retire-timeline");
+        save_record(&retiring_record(None)).unwrap();
+        let alice = template_key::key_path("alice");
+        envelope(false).save(&alice).unwrap();
+        let mut tpm = retiring_tpm();
+        let (moved, _) = publish_in(&alice, template, "alice", &envelope(true), BOOT, true);
+        assert!(moved.is_ok());
+        assert_eq!(settle(&mut tpm, Some(BOOT), false).retirement, None);
+        assert_eq!(
+            settle(&mut tpm, Some(LATER_BOOT), false).retirement,
+            retired
+        );
+        drop(sandbox);
+
+        // A keyring secret moved at a login after the start, durably or not.
+        for durable in [true, false] {
+            let sandbox = Sandbox::new("storage-key-retire-keyring");
+            save_record(&retiring_record(None)).unwrap();
+            let bob = keyring::envelope_path("bob");
+            envelope(false).save(&bob).unwrap();
+            let mut tpm = retiring_tpm();
+            assert_eq!(settle(&mut tpm, Some(BOOT), false).census, Census::InUse);
+            let (login, _) = publish_in(&bob, keyring, "bob", &envelope(true), BOOT, durable);
+            assert!(login.is_ok());
+            let restart = settle(&mut tpm, Some(BOOT), false);
+            let next_boot = settle(&mut tpm, Some(LATER_BOOT), false);
+            let after = settle(&mut tpm, Some(BOOT_C), false);
+            drop(sandbox);
+            if durable {
+                // Marked at the restart in boot A, retired in boot B.
+                assert_eq!(restart.census, Census::Unused { since: BOOT.into() });
+                assert_eq!(next_boot.retirement, retired);
+            } else {
+                // The restart marks nothing, boot B marks, boot C retires.
+                assert_eq!(restart.census, Census::Unsettled);
+                assert_eq!(
+                    next_boot.census,
+                    Census::Unused {
+                        since: LATER_BOOT.into()
+                    }
+                );
+                assert_eq!(next_boot.retirement, None);
+                assert_eq!(after.retirement, retired);
+            }
+            assert_eq!(tpm.evicted, [ORIGINAL], "retired once");
+        }
+
+        // An envelope a power loss brings back, and one that cannot be parsed.
+        let under_original = serde_json::to_vec(&envelope(false)).unwrap();
+        for restored in [under_original, b"not an envelope".to_vec()] {
+            let sandbox = Sandbox::new("storage-key-retire-restored");
+            save_record(&retiring_record(Some(BOOT))).unwrap();
+            std::fs::write(keyring::envelope_path("bob"), &restored).unwrap();
+            let mut tpm = retiring_tpm();
+            let kept = settle(&mut tpm, Some(LATER_BOOT), false);
+            let record = load_record();
+            drop(sandbox);
+            assert_eq!((kept.census, kept.retirement), (Census::InUse, None));
+            assert_eq!(record.unused_since, None);
+            assert!(tpm.evicted.is_empty() && tpm.original_derivations == 0);
+        }
+
+        // A returning envelope whose move stops between publishing and the
+        // record update, with an old mark from boot A: a restart in boot B
+        // retires nothing.
+        let sandbox = Sandbox::new("storage-key-retire-stopped");
+        save_record(&retiring_record(Some(BOOT))).unwrap();
+        let carol = template_key::key_path("carol");
+        envelope(false).save(&carol).unwrap();
+        let mut saves = 0;
+        let stopped = publish_with(
+            &carol,
+            template,
+            "carol",
+            &envelope(true),
+            Some(LATER_BOOT),
+            |record| {
+                saves += 1;
+                if saves == 1 {
+                    save_record(record)
+                } else {
+                    Err(Error::Io("stopped before the record update".into()))
+                }
+            },
+            |env, path| env.save_reporting(path),
+        );
+        let mut tpm = retiring_tpm();
+        let restart = settle(&mut tpm, Some(LATER_BOOT), false);
+        drop(sandbox);
+        assert!(stopped.is_ok(), "the envelope was published");
+        assert_eq!(
+            (restart.census, restart.retirement),
+            (Census::Unsettled, None)
+        );
+        assert!(tpm.evicted.is_empty());
+
+        // A record write that fails before the retirement retires nothing.
+        let sandbox = Sandbox::new("storage-key-retire-unwritten");
+        save_record(&Record {
+            moves: vec![UnsettledMove {
+                user: "dave".into(),
+                kind: keyring,
+                boot_id: Some(BOOT.into()),
+            }],
+            ..retiring_record(Some(BOOT))
+        })
+        .unwrap();
+        let mut tpm = retiring_tpm();
+        let unwritten = settle_in(
+            Some(LATER_BOOT),
+            false,
+            || Ok(&mut tpm),
+            |_| Err(Error::Io("the directory sync failed".into())),
+        );
+        drop(sandbox);
+        assert!(unwritten.is_err());
+        assert!(tpm.evicted.is_empty() && tpm.original_derivations == 0);
+    }
+
+    /// A check of the original key that changes its entry derived it, one
+    /// that fails counts as one, and one that leaves it derived nothing.
+    #[test]
+    fn a_check_of_the_original_key_says_whether_it_derived() {
+        let record = retiring_record(None);
+        let changed = Some(Original {
+            handle: ORIGINAL,
+            name: hex(b"new"),
+            matched: true,
+        });
+        assert_eq!(
+            checked_original(Ok(record.original.clone()), &record),
+            (record.original.clone(), false)
+        );
+        assert_eq!(
+            checked_original(Ok(changed.clone()), &record),
+            (changed, true)
+        );
+        assert_eq!(
+            checked_original(Err(Error::Tpm("read failed".into())), &record),
+            (record.original.clone(), true)
+        );
     }
 
     /// The start-up step decides the DA-exempt key's part of the record and

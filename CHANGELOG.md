@@ -7,6 +7,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- irlumed retires irlume's original storage key itself, at its start, once
+  nothing needs it (ADR-0034, Phase 3 amendment; #1073): the key no
+  longer holds an owner persistent handle that a TPM lockout makes useless.
+  The start evicts it after its template key moves when all of these hold:
+  - no envelope has been under it since a start in an earlier boot;
+  - irlume's DA-exempt key is at its recorded handle with its recorded name;
+  - the key at the original handle is the one the record kept as matching
+    today's derivation;
+  - a fresh derivation at this start gives the same key.
+
+  A start that already derived an RSA-2048 key does not, so no start pays
+  for two. A key today's derivation does not give is never evicted and is
+  not derived for again; the journal names the manual command, to run once
+  no envelope is under it and nothing else uses it. A derivation or eviction that fails, as with
+  an owner authorization set since, is recorded with the boot and tried
+  again only at the first start in a later boot. A template key that comes
+  back under the retired key moves onto the DA-exempt key at the next
+  start, as before.
+
 - irlumed keeps an account of the original storage key's use for its
   coming retirement (ADR-0034, Phase 3 amendment, condition 1; #1073).
   After its template key moves, irlumed's start counts the envelopes still

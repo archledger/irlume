@@ -1092,6 +1092,17 @@ fn carry_camera_pair(
     fresh
 }
 
+/// Whether irlumed's start-up TPM steps run: the one that persists
+/// irlume's DA-exempt storage key and the template key moves after it. A
+/// standard device node counts, and so does an explicit transport
+/// (`IRLUME_TCTI`: swtpm, or a device elsewhere) without one, as for the
+/// readiness report: keyring secrets seal through it, and template keys
+/// sealed before load through it. One condition for both steps, so that
+/// envelopes move onto a key the first step persisted (ADR-0034 §3.3).
+fn startup_tpm_reachable() -> bool {
+    std::env::var_os("IRLUME_TCTI").is_some() || irlume_core::template_key::tpm_available()
+}
+
 fn main() {
     // Before any model, template or request is touched: no core dumps
     // (`disable_core_dumps`). A daemon that stays dumpable does not start:
@@ -1512,12 +1523,9 @@ fn main() {
             // refusal it derives nothing again in the same boot unless the
             // TPM now has room (#1083). New seals go under the key once it is
             // persisted, and this runs before the template key moves below,
-            // so their envelopes can move onto it in this start. An explicit
-            // transport counts, as for the readiness report: keyring secrets
-            // seal through it with no device node.
-            if std::env::var_os("IRLUME_TCTI").is_some()
-                || irlume_core::template_key::tpm_available()
-            {
+            // so their envelopes can move onto it in this start. Both run
+            // when the TPM is reachable (`startup_tpm_reachable`).
+            if startup_tpm_reachable() {
                 use irlume_core::storage_key::Outcome;
                 match irlume_core::storage_key::ensure_at_start() {
                     Ok(None | Some(Outcome::Present { .. } | Outcome::Deferred(_))) => {}
@@ -1551,7 +1559,7 @@ fn main() {
             // new envelope. With no move available only the envelope, the
             // policy files and the storage-key record are read, so an ordinary
             // start does no TPM work here.
-            if irlume_core::template_key::tpm_available() {
+            if startup_tpm_reachable() {
                 for user in irlume_core::storage::list_users() {
                     match irlume_core::template_key::move_to_stronger_policy(&user) {
                         Ok(Some(gain)) => jout_notice!(
@@ -27126,6 +27134,33 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    /// irlumed's start-up TPM steps run with an explicit transport and no
+    /// standard device node, and the step that persists the DA-exempt key
+    /// and the template key moves after it share that one condition
+    /// (ADR-0034 §3.3).
+    #[test]
+    fn an_explicit_transport_runs_the_startup_tpm_steps_without_a_device_node() {
+        let _g = env_lock();
+        let _no_tpm = irlume_core::template_key::test_support::TpmPresence::force(false);
+        let previous = std::env::var_os("IRLUME_TCTI");
+        std::env::remove_var("IRLUME_TCTI");
+        let without = startup_tpm_reachable();
+        std::env::set_var("IRLUME_TCTI", "swtpm:host=127.0.0.1,port=2321");
+        let with = startup_tpm_reachable();
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TCTI", value),
+            None => std::env::remove_var("IRLUME_TCTI"),
+        }
+        assert!(!without, "no device node and no transport");
+        assert!(with, "an explicit transport");
+        let gate = concat!("if startup_tpm_", "reachable() {");
+        assert_eq!(
+            include_str!("main.rs").matches(gate).count(),
+            2,
+            "the persist step and the template key moves"
+        );
     }
 
     #[test]

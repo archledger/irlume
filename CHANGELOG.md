@@ -442,6 +442,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume-gkr-unlock` sends the GNOME keyring token as soon as the control
+  socket's listener is the owner of `org.gnome.keyring` itself, as for the
+  `--login` daemon, without first asking gnome-keyring for its control
+  directory (#850). gnome-keyring answers that only once INITIALIZE has
+  returned to its main loop, by when a session's first Secret Service client
+  may have queued `Unlock` and `Prompt`, so a client that prompts at once
+  could still see an unlock prompt. A socket-activated socket, whose
+  listener is the user's systemd manager, still gets the token only after
+  the owner reports this user's control directory.
+
 - The AppArmor profile for a source install's `/usr/local/bin/irlumed`
   (`packaging/apparmor/usr.local.bin.irlumed`, loaded by hand) now has the
   two rules the packaged profile gained in #640: the `rwk` lock on the

@@ -4921,7 +4921,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// unseal; a second pass finds nothing to move, and a lockout then spares
     /// irlume. doctor's report names all three before the moves and none
     /// after (§4). The ladder is pinned to the literal PCR 7 seal, so only the
-    /// storage key changes.
+    /// storage key changes. Each move clears the record's mark of the
+    /// original key's disuse before it publishes (the Phase 3 amendment's
+    /// condition 1), and the census after the moves marks this boot.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
@@ -4974,11 +4976,24 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 .collect::<Vec<_>>()
         };
         let sealed_before = parents();
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        let record = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&record_path).expect("record")).expect("json")
+        };
+        let mark = |since: &str| {
+            let mut value = record();
+            value["unused_since"] = serde_json::json!(since);
+            std::fs::write(&record_path, serde_json::to_vec(&value).unwrap()).expect("mark");
+        };
+        const STALE_BOOT: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
 
         let persisted = crate::storage_key::ensure_at_start();
         let reported_before = crate::storage_key::report();
+        mark(STALE_BOOT);
         let template_move = crate::template_key::move_to_stronger_policy("alice");
+        let after_template_move = record();
         let template_again = crate::template_key::move_to_stronger_policy("alice");
+        mark(STALE_BOOT);
         let template_key = crate::template_key::load_key("alice");
         let password_move = reseal_password("alice", b"alice-password", None);
         let password_again = reseal_password("alice", b"alice-password", None);
@@ -4988,6 +5003,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let token_open = unseal_password("bob");
         let token_env = SealedEnvelope::load(&envelope_path("bob"));
         let moved = parents();
+        let after_keyring_moves = record();
+        let census = crate::storage_key::mark_at_start();
+        let marked = record();
         let reported_after = crate::storage_key::report();
         let spared = lockout_state().map(|l| l.storage_key_no_da);
         let removed = evict_da_exempt_srks();
@@ -5009,6 +5027,26 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             Some(MoveGain::DaExemptKey)
         );
         assert_eq!(template_again.expect("a second start"), None);
+        // Each move cleared the mark before it published, and settled its
+        // entry once its write was durable.
+        for after_move in [&after_template_move, &after_keyring_moves] {
+            assert!(after_move.get("unused_since").is_none(), "{after_move}");
+            assert!(after_move.get("moves").is_none(), "{after_move}");
+        }
+        let boot = irlume_common::boot_id();
+        assert_eq!(
+            census.expect("the census"),
+            Some(match &boot {
+                Some(boot) => crate::storage_key::Census::Unused {
+                    since: boot.clone()
+                },
+                None => crate::storage_key::Census::Unsettled,
+            })
+        );
+        assert_eq!(
+            marked.get("unused_since").and_then(|v| v.as_str()),
+            boot.as_deref()
+        );
         assert_eq!(template_key.expect("load").as_slice(), key.as_slice());
         assert_eq!(
             password_move.expect("the reseal"),

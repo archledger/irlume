@@ -944,7 +944,12 @@ fn publish_move(
     candidate: &SealedEnvelope,
     gain: tpm::MoveGain,
 ) -> Result<()> {
-    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = candidate.save_reporting(path)? {
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = crate::storage_key::publish_envelope(
+        path,
+        irlume_common::tpm_readiness::EnvelopeKind::TemplateKey,
+        user,
+        candidate,
+    )? {
         eprintln!(
             "irlume: moved the template key of '{user}' to {}, but syncing its directory \
              failed ({e}); after a power loss the previous envelope, which still unseals, may \
@@ -1070,9 +1075,21 @@ fn reseal_key_unlocked(user: &str, key: &[u8], uid: Option<u32>) -> Result<()> {
     std::fs::create_dir_all(&dir).map_err(|e| Error::Io(e.to_string()))?;
     let mut env = tpm::seal(key)?;
     env.uid = uid;
-    env.save(&key_path(user))?;
-    set_0600(&key_path(user));
-    Ok(())
+    // Through the storage key record, which records a move off the original
+    // storage key (ADR-0034, Phase 3 amendment); a write that is visible but
+    // not durable is an error, as for `SealedEnvelope::save`.
+    let path = key_path(user);
+    let written = crate::storage_key::publish_envelope(
+        &path,
+        irlume_common::tpm_readiness::EnvelopeKind::TemplateKey,
+        user,
+        &env,
+    )?;
+    set_0600(&path);
+    match written {
+        irlume_common::AtomicWrite::Durable => Ok(()),
+        irlume_common::AtomicWrite::VisibleNotDurable(e) => Err(Error::Io(e.to_string())),
+    }
 }
 
 /// Erase `user`'s sealed template key (e.g. when their enrollment is deleted).

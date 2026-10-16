@@ -17,7 +17,7 @@
 //! the worker, not the process.
 
 use irlume_common::pam_service::ServiceKind;
-use irlume_common::{jout_err, jout_info, jout_notice, jout_warn};
+use irlume_common::{jout_debug, jout_err, jout_info, jout_notice, jout_warn};
 use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -1092,6 +1092,27 @@ fn carry_camera_pair(
     fresh
 }
 
+/// What irlumed's start found about the original storage key's use.
+fn log_census(census: &irlume_core::storage_key::Census) {
+    use irlume_core::storage_key::Census;
+    match census {
+        Census::InUse => {
+            jout_debug!("irlumed: an envelope is still under irlume's original storage key")
+        }
+        // The boot ID comes from the record, in the state directory, which is
+        // untrusted where it is writable offline (ADR-0034 §5).
+        Census::Unused { since } => jout_info!(
+            "irlumed: no envelope is under irlume's original storage key, none since a start \
+             in boot {}",
+            irlume_common::single_line(since, 64)
+        ),
+        Census::Unsettled => jout_info!(
+            "irlumed: no envelope is under irlume's original storage key, but a move off it in \
+             this boot is not yet shown durable; the next boot's start counts again"
+        ),
+    }
+}
+
 /// The journal line for an envelope irlumed's start found with a stale
 /// parent handle (ADR-0034 §3.3). Account names reach here only when the
 /// envelope's file is named for one irlumed accepts.
@@ -1628,6 +1649,21 @@ fn main() {
                              was not changed"
                         ),
                     }
+                }
+            }
+
+            // After the moves, count the envelopes still under the original
+            // storage key and keep the record of its use (ADR-0034, Phase 3
+            // amendment, condition 1): a key unused since a start in an
+            // earlier boot is the one a later start may retire.
+            if startup_tpm_reachable() {
+                match irlume_core::storage_key::mark_at_start() {
+                    Ok(Some(census)) => log_census(&census),
+                    Ok(None) => {}
+                    Err(e) => jout_warn!(
+                        "irlumed: could not count the envelopes under irlume's original storage \
+                         key ({e}); they are counted again at the next start"
+                    ),
                 }
             }
 
@@ -27192,9 +27228,10 @@ mod tests {
     }
 
     /// irlumed's start-up TPM steps run with an explicit transport and no
-    /// standard device node, and the step that persists the DA-exempt key
-    /// and the template key moves after it share that one condition
-    /// (ADR-0034 §3.3).
+    /// standard device node, and the step that persists the DA-exempt key,
+    /// the template key moves after it and the census of the original key's
+    /// use after those share that one condition (ADR-0034 §3.3 and the
+    /// Phase 3 amendment).
     #[test]
     fn an_explicit_transport_runs_the_startup_tpm_steps_without_a_device_node() {
         let _g = env_lock();
@@ -27213,8 +27250,8 @@ mod tests {
         let gate = concat!("if startup_tpm_", "reachable() {");
         assert_eq!(
             include_str!("main.rs").matches(gate).count(),
-            2,
-            "the persist step and the template key moves"
+            3,
+            "the persist step, the template key moves and the census"
         );
     }
 

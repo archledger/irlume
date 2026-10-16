@@ -1057,6 +1057,26 @@ impl storage_key::KeyTpm for DaExemptKeyTpm {
         Ok(name.value().to_vec())
     }
 
+    fn derives_original(&mut self, handle: u32) -> Result<Option<bool>> {
+        // Probed first, so that a free handle logs no esys error (#601).
+        if !persistent_handle_present(&mut self.ctx, handle)? {
+            return Ok(None);
+        }
+        let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+        let object = self
+            .ctx
+            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+            .map_err(tpm_err)?;
+        let (public, _, _) = self
+            .ctx
+            .read_public(KeyHandle::from(ESYS_TR::from(object)))
+            .map_err(tpm_err)?;
+        if !is_irlume_srk(&public)? {
+            return Ok(None);
+        }
+        derives_from_srk_template(&mut self.ctx, &public).map(Some)
+    }
+
     fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
         let mut names = Vec::new();
         for handle in persistent_handles(&mut self.ctx)? {
@@ -4986,6 +5006,75 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 ),
             ]
         );
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// ADR-0034 §3.4 on swtpm: irlumed's start records the original key's
+    /// TPM name once today's derivation of the original template gives that
+    /// key, at a start that derived nothing else: not at the start that
+    /// persisted the DA-exempt key, but at the next one.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_the_original_key_name_is_recorded_at_a_start_that_derives_nothing_else() {
+        use crate::storage_key::KeyTpm as _;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("original-record");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        // The first seal persists the original key when no earlier test did,
+        // so the handles are taken after it.
+        let original = seal_with_pcrs(b"on the original key", &[]).expect("seal");
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED),
+            "the handle this test uses is taken: {before:x?}"
+        );
+        dirs.store("alice", &original);
+        let record = || {
+            let bytes = std::fs::read(format!("{}/tpm-storage-key", dirs.dir)).expect("record");
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("record json")
+        };
+        let first = crate::storage_key::ensure_at_start();
+        let after_first = record();
+        let second = crate::storage_key::ensure_at_start();
+        let after_second = record();
+        let name = DaExemptKeyTpm::open()
+            .and_then(|mut tpm| tpm.name_at(PERSISTENT_SRK_HANDLE))
+            .map(|name| name.map(|name| crate::storage_key::hex(&name)));
+        let removed = evict_da_exempt_srks();
+        let after = handles();
+        drop(dirs);
+
+        assert_eq!(
+            first.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
+        );
+        assert!(
+            after_first.get("original").is_none(),
+            "the start that derived the DA-exempt key leaves it: {after_first}"
+        );
+        assert_eq!(
+            second.expect("the step"),
+            Some(crate::storage_key::Outcome::Present { handle: PREFERRED })
+        );
+        let name = name.expect("read").expect("the original key");
+        assert_eq!(
+            after_second["original"],
+            serde_json::json!({
+                "handle": PERSISTENT_SRK_HANDLE, "name": name, "matched": true
+            })
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"

@@ -1143,6 +1143,10 @@ impl storage_key::KeyTpm for DaExemptKeyTpm {
         Ok(true)
     }
 
+    fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+        Ok(da_exempt_key_at(&mut self.ctx, handle, name, true)?.is_some())
+    }
+
     fn persist(&mut self, handle: u32) -> std::result::Result<(), storage_key::Failure> {
         let Some(derived) = self.derived else {
             return Err(other_failure("no derived key to persist"));
@@ -5395,7 +5399,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// unused, and the first start in boot B proves it by a fresh derivation
     /// and evicts it from the TPM. The template key still unseals through
     /// the DA-exempt key, which stays; a start that derived a key retires
-    /// nothing.
+    /// nothing, and so does one whose record was edited to name the original
+    /// key itself as the DA-exempt key, which lacks that key's shape.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
@@ -5432,6 +5437,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let marked = settle_at_start_in(Some(BOOT_A), true);
         let same_boot = settle_at_start_in(Some(BOOT_A), false);
         let deriving = settle_at_start_in(Some(BOOT_B), true);
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        let kept_record = std::fs::read(&record_path).expect("record");
+        let mut edited: serde_json::Value = serde_json::from_slice(&kept_record).expect("json");
+        edited["persisted"] = serde_json::json!({
+            "handle": original,
+            "name": storage_key::hex(&name_at_handle(original).expect("the original key")),
+        });
+        std::fs::write(&record_path, serde_json::to_vec(&edited).unwrap()).expect("edit");
+        let names_itself = settle_at_start_in(Some(BOOT_B), false);
+        std::fs::write(&record_path, &kept_record).expect("restore the record");
         let retired = settle_at_start_in(Some(BOOT_B), false);
         let after_retirement = handles();
         let template_key = crate::template_key::load_key("alice");
@@ -5467,6 +5482,11 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             retirement(deriving),
             None,
             "not in a start that derived a key"
+        );
+        assert_eq!(
+            retirement(names_itself),
+            None,
+            "not beside a recorded key without the DA-exempt shape"
         );
         assert_eq!(
             retirement(retired),

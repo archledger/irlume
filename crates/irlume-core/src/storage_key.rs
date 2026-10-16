@@ -7,9 +7,10 @@
 //! nothing, unless the refusal was for lack of room and the TPM now reports
 //! room (#1083).
 //!
-//! Nothing seals under the key yet. The envelopes' record of their parent and
-//! the moves to the new key follow; persisting the key first costs one owner
-//! persistent handle, and uninstall evicts it (`tpm::evict_da_exempt_srks`).
+//! New seals go under the key once it is persisted, and each envelope records
+//! it as its parent (`crate::tpm`, ADR-0034 §3.3). Moving the envelopes sealed
+//! before follows. The key costs one owner persistent handle, and uninstall
+//! evicts it (`tpm::evict_da_exempt_srks`).
 
 use crate::{keyring, template_key, tpm};
 use irlume_common::tpm_readiness::{DaExemptKey, KeyRefusal, RefusalReason};
@@ -152,11 +153,11 @@ pub enum Outcome {
     Deferred(KeyRefusal),
 }
 
-/// irlumed's start-up step (ADR-0034 §3.2). It runs only while some envelope
-/// is under the original key, which in this phase is every envelope. With
-/// none it returns `None` and asks the TPM nothing, and a refusal recorded
-/// earlier is cleared, since no envelope is left for it to keep on the
-/// original key.
+/// irlumed's start-up step (ADR-0034 §3.2). It runs while any envelope
+/// exists: those on the original key need the DA-exempt key persisted for
+/// their move, and those on it need it still there. With none it returns
+/// `None` and asks the TPM nothing, and a refusal recorded earlier is cleared,
+/// since no envelope is left for it to concern.
 ///
 /// The key is derived at most once, and only when the recorded key is not at
 /// its handle and no refusal earlier in this boot stands. A copy already
@@ -173,7 +174,7 @@ pub enum Outcome {
 /// read, or the record cannot be written. A key persisted before a failed
 /// write is adopted at the next start.
 pub fn ensure_at_start() -> Result<Option<Outcome>> {
-    let envelope = envelope_under_original_key()?;
+    let envelope = any_envelope()?;
     if !envelope && load_record().refused.is_none() {
         return Ok(None);
     }
@@ -212,7 +213,7 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
 
 /// What `irlume doctor` reports (ADR-0034 §4): the record, with the recorded
 /// handle kept only while the key there has the recorded name, and a
-/// recorded refusal only while some envelope is under the original key.
+/// recorded refusal only while any envelope exists.
 ///
 /// # Errors
 ///
@@ -220,7 +221,7 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
 /// and the TPM cannot be opened or read.
 pub fn report() -> Result<DaExemptKey> {
     let mut record = load_record();
-    if !envelope_under_original_key()? {
+    if !any_envelope()? {
         record.refused = None;
     }
     let handle = match &record.persisted {
@@ -380,13 +381,76 @@ fn tpm_name_hex(tpm: &mut impl KeyTpm, handle: u32) -> Result<Option<String>> {
     Ok(tpm.name_at(handle)?.map(|name| hex(&name)))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// The DA-exempt key irlumed recorded, as its handle and TPM name: what a
+/// seal checks at that handle before it seals under it ([`crate::tpm`]).
+/// `None` without a record of a persisted key, or with a name that is not
+/// hex. Reads the record only.
+pub(crate) fn recorded_key() -> Option<(u32, Vec<u8>)> {
+    let persisted = load_record().persisted?;
+    Some((persisted.handle, unhex(&persisted.name)?))
+}
+
+/// Whether every envelope (sealed template key or keyring secret) records
+/// `name`, a TPM name in hex, as its parent, so that a TPM lockout blocks
+/// none of them. An envelope that cannot be parsed counts as not on it.
+pub(crate) fn every_envelope_on(name: &str) -> Result<bool> {
+    for dir in [template_key::key_dir(), keyring::keyring_dir()] {
+        for path in envelope_paths(&dir)? {
+            let on_key = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<crate::envelope::SealedEnvelope>(&bytes).ok()
+                })
+                .and_then(|envelope| envelope.parent)
+                .is_some_and(|parent| parent.name == name);
+            if !on_key {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// The `*.json` envelope files in `dir`; none for a missing directory, and
+/// an error for one that cannot be read.
+fn envelope_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    let io = |e: std::io::Error| Error::Io(format!("{}: {e}", dir.display()));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(e)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(io)?.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+/// `bytes` in lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Whether some envelope is under the original key. Every envelope is, until
-/// envelopes record their parent: a sealed template key or keyring secret.
-fn envelope_under_original_key() -> Result<bool> {
+/// `text` read as hex ([`hex`]), or `None` when it is not.
+pub(crate) fn unhex(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Whether some envelope exists: a sealed template key or keyring secret.
+/// Envelopes on the original key need the DA-exempt key persisted for their
+/// move, and envelopes on the DA-exempt key need it still there, so the
+/// start-up step runs while any exists.
+fn any_envelope() -> Result<bool> {
     Ok(has_envelope(&template_key::key_dir())? || has_envelope(&keyring::keyring_dir())?)
 }
 
@@ -394,19 +458,7 @@ fn envelope_under_original_key() -> Result<bool> {
 /// error is returned, so that an unreadable store never reads as empty and
 /// skips the step.
 fn has_envelope(dir: &Path) -> Result<bool> {
-    let io = |e: std::io::Error| Error::Io(format!("{}: {e}", dir.display()));
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(io(e)),
-    };
-    for entry in entries {
-        let path = entry.map_err(io)?.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(!envelope_paths(dir)?.is_empty())
 }
 
 fn record_path() -> PathBuf {
@@ -851,6 +903,72 @@ mod tests {
         assert_eq!(reported.expect("report").refused, None);
         assert_eq!(outcome.expect("the step"), None);
         assert_eq!(kept.refused, None);
+    }
+
+    #[test]
+    fn a_tpm_name_round_trips_through_hex() {
+        let name = [0x00, 0x0b, 0xde, 0xad, 0xbe, 0xef];
+        assert_eq!(hex(&name), "000bdeadbeef");
+        assert_eq!(unhex("000bdeadbeef").as_deref(), Some(&name[..]));
+        assert_eq!(unhex("000BDEADBEEF").as_deref(), Some(&name[..]));
+        for bad in ["0", "0g", "000bdeadbee", "é0"] {
+            assert_eq!(unhex(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The census behind doctor's lockout reading: every envelope must name
+    /// the key, an envelope without a parent or that cannot be parsed keeps
+    /// it from counting, and empty stores count.
+    #[test]
+    fn every_envelope_must_name_the_key_for_a_lockout_to_spare_irlume() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_tmp_dir("storage-key-census");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+        std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+        let vars = ["IRLUME_TEMPLATE_KEY_DIR", "IRLUME_KEYRING_DIR"];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let envelope = |parent: Option<&str>| {
+            let mut value = serde_json::json!({
+                "version": 1, "pcrs": [7], "public": "", "private": ""
+            });
+            if let Some(name) = parent {
+                value["parent"] = serde_json::json!({"handle": 0x8101_0003_u32, "name": name});
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        let empty = every_envelope_on("aa");
+        std::fs::write(format!("{dir}/keyring/alice.json"), envelope(Some("aa"))).unwrap();
+        std::fs::write(format!("{dir}/template-keys/alice.json"), envelope(None)).unwrap();
+        let mixed = every_envelope_on("aa");
+        std::fs::write(
+            format!("{dir}/template-keys/alice.json"),
+            envelope(Some("aa")),
+        )
+        .unwrap();
+        let all = every_envelope_on("aa");
+        let other = every_envelope_on("bb");
+        std::fs::write(format!("{dir}/keyring/bob.json"), b"not an envelope").unwrap();
+        let unparsable = every_envelope_on("aa");
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(empty.expect("census"), "no envelope blocks nothing");
+        assert!(!mixed.expect("census"), "an envelope on the original key");
+        assert!(all.expect("census"), "every envelope names the key");
+        assert!(!other.expect("census"), "another key's name");
+        assert!(
+            !unparsable.expect("census"),
+            "an envelope that cannot be read"
+        );
     }
 
     /// The record lock excludes a second holder until the first is dropped,

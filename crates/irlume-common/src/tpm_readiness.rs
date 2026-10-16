@@ -198,8 +198,10 @@ pub struct TpmLockout {
     /// `TPM_PT_LOCKOUT_RECOVERY` in seconds: the wait after a wrong lockout
     /// authorization before it may be tried again.
     pub lockout_recovery: u32,
-    /// Whether the storage key irlume seals under has `noDA`, so a lockout
-    /// does not block irlume's seals and unseals.
+    /// Whether a lockout blocks none of irlume's seals and unseals: new
+    /// seals and every envelope are on irlume's DA-exempt storage key
+    /// (ADR-0034 §3). False while any envelope is still on the original key,
+    /// so a client never reads irlume as unaffected while one is.
     pub storage_key_no_da: bool,
 }
 

@@ -178,6 +178,24 @@ pub struct SealedEnvelope {
     /// write records it. Older releases ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
+    /// The storage key this envelope is sealed under, when it is irlume's
+    /// DA-exempt one (ADR-0034 §3.3): its handle and TPM name. A load uses
+    /// only a key with that name at that handle. Absent: the original key,
+    /// found as before. Older releases ignore the field, so they cannot open
+    /// an envelope that has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentKey>,
+}
+
+/// The storage key an envelope is sealed under ([`SealedEnvelope::parent`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentKey {
+    /// The owner persistent handle the key was at when the envelope was
+    /// sealed. A hint: the name decides.
+    pub handle: u32,
+    /// The key's TPM name in hex: its name algorithm and the hash of its
+    /// public area.
+    pub name: String,
 }
 
 /// Whether a literal policy over `pcrs` binds anything the firmware measured:
@@ -346,6 +364,30 @@ mod b64 {
 mod tests {
     use super::*;
 
+    /// ADR-0034 §3.3: an envelope written before the parent record parses
+    /// with none, which means the original key, and is written back without
+    /// the field; one with a parent keeps it.
+    #[test]
+    fn an_envelope_records_its_parent_and_an_older_one_parses_without() {
+        let older = serde_json::json!({
+            "version": 1, "pcrs": [7], "public": "", "private": ""
+        });
+        let env: SealedEnvelope = serde_json::from_value(older).expect("an older envelope");
+        assert!(env.parent.is_none());
+        assert!(serde_json::to_value(&env).unwrap().get("parent").is_none());
+        let parent = ParentKey {
+            handle: 0x8101_0003,
+            name: format!("000b{}", "ab".repeat(32)),
+        };
+        let env = SealedEnvelope {
+            parent: Some(parent.clone()),
+            ..env
+        };
+        let back: SealedEnvelope =
+            serde_json::from_slice(&serde_json::to_vec(&env).unwrap()).expect("round trip");
+        assert_eq!(back.parent, Some(parent));
+    }
+
     /// The largest envelope an earlier release could write, from a
     /// 128 KiB `IRLUME_PCRS` of repeated PCRs stored one value each, still
     /// loads.
@@ -371,6 +413,7 @@ mod tests {
                 .collect(),
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let path = dir.join("legacy.json");
         // Written the way an earlier release did: no size check.
@@ -398,6 +441,7 @@ mod tests {
             pcr_values,
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         envelope(vec![7], Vec::new()).save(&path).unwrap();
         let before = fs::read(&path).unwrap();
@@ -435,6 +479,7 @@ mod tests {
             pcr_values: Vec::new(),
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let signed = PolicyKind::Authorized {
             pubkey_pem: String::new(),
@@ -493,6 +538,7 @@ mod tests {
             }],
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         let back: SealedEnvelope = serde_json::from_str(&s).unwrap();
@@ -552,6 +598,7 @@ mod tests {
             pcr_values: vec![],
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         assert!(s.contains(r#""kind":"Authorized""#), "{s}");
@@ -572,6 +619,7 @@ mod tests {
             pcr_values: vec![],
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let s2 = serde_json::to_string(&env2).unwrap();
         assert!(!s2.contains("policy_ref"), "{s2}");
@@ -612,6 +660,7 @@ mod tests {
             }],
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         env.save(&p).unwrap();
 
@@ -705,6 +754,7 @@ mod tests {
                 uid: Some(u32::MAX),
             }),
             uid: Some(u32::MAX),
+            parent: None,
         }
     }
 

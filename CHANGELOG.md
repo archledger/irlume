@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- New seals go under irlume's DA-exempt storage key once irlumed has
+  persisted it, and each envelope records that key's handle and TPM name
+  (ADR-0034 §3.3). A load uses only the key the envelope records, so a TPM in
+  dictionary-attack lockout no longer blocks face login or the release of a
+  keyring secret sealed this way; envelopes sealed before stay on the original
+  key and still load through it. A seal checks the recorded key's name and
+  the DA-exempt template's shape at its handle and otherwise uses the original
+  key; it never derives the new key. A downgrade to a release before this one
+  cannot open an envelope sealed under the new key: a keyring secret reseals
+  under the original key at the next login that runs pam_irlume's `reseal`
+  line, and a template key needs `irlume recovery restore` or a re-enrollment.
+
 - irlumed persists irlume's DA-exempt storage key at start while any
   envelope is under the original key (ADR-0034 §3.2). It goes to the owner
   handle after the original key's, or the next free one; a copy an earlier

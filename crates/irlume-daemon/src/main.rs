@@ -21969,6 +21969,7 @@ mod tests {
             pcr_values: Vec::new(),
             password_wrap: None,
             uid: Some(4242),
+            parent: None,
         };
         envelope
             .save(&irlume_core::keyring::envelope_path(&user))
@@ -24250,6 +24251,7 @@ mod tests {
             }],
             password_wrap: None,
             uid: None,
+            parent: None,
         };
         let path = irlume_core::keyring::envelope_path("carol");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

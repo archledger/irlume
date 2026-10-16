@@ -65,21 +65,25 @@ pub(crate) struct Record {
     /// that boot marks nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     moves: Vec<UnsettledMove>,
-    /// The last retirement of the original key that failed (its proof or
-    /// its eviction), with the boot it failed in: tried again only at the
-    /// first start in a later boot, so a restart in the same boot pays no
-    /// derivation (condition 2).
+    /// The last retirement of the original key that was attempted and did
+    /// not succeed (its proof or its eviction failed, or it stopped part
+    /// way), with its boot: tried again only at the first start in a later
+    /// boot, so a restart in the same boot pays no derivation (condition 2).
+    /// Written before the proof's derivation, so it stands even when the
+    /// write of the outcome fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    retirement_failed: Option<FailedRetirement>,
+    retirement_attempt: Option<RetirementAttempt>,
 }
 
-/// A retirement of the original key that failed: the error, and the boot.
+/// A retirement of the original key that was attempted: its boot, and the
+/// error once it failed (`None` while it ran, or if it stopped part way).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FailedRetirement {
-    detail: String,
+struct RetirementAttempt {
     /// `None` when the boot ID could not be read, which may be another boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
 }
 
 /// An envelope whose move off the original storage key was not yet shown
@@ -434,7 +438,7 @@ pub(crate) fn on_original_key() -> Result<OriginalKeyEnvelopes> {
 }
 
 /// [`ensure_with`], keeping `record`'s account of the original key's use
-/// (`unused_since`, the unsettled moves and a failed retirement) in the
+/// (`unused_since`, the unsettled moves and a retirement attempt) in the
 /// record it builds for the DA-exempt key.
 fn ensure_keeping_use(
     tpm: &mut impl KeyTpm,
@@ -445,7 +449,8 @@ fn ensure_keeping_use(
     let (mut next, outcome) = ensure_with(tpm, record, boot, plan)?;
     next.unused_since.clone_from(&record.unused_since);
     next.moves.clone_from(&record.moves);
-    next.retirement_failed.clone_from(&record.retirement_failed);
+    next.retirement_attempt
+        .clone_from(&record.retirement_attempt);
     Ok((next, outcome))
 }
 
@@ -595,8 +600,8 @@ pub enum Retirement {
     /// a TPM error): recorded with this boot and tried again only at the
     /// first start in a later boot.
     Failed { handle: u32, detail: String },
-    /// A retirement failed earlier in this boot, so this start derives
-    /// nothing for it.
+    /// A retirement was attempted earlier in this boot and failed or did not
+    /// finish, so this start derives nothing for it.
     Deferred { handle: u32, detail: String },
     /// The TPM could not be opened or read to check the keys; tried again
     /// at the next start.
@@ -693,16 +698,18 @@ pub(crate) fn settle_at_start_in(boot: Option<&str>, derived: bool) -> Result<Op
 
 /// The retirement of the original key at `handle`, its handle today, over
 /// `tpm` in boot `boot`, once the census allows one; `next` is the record,
-/// and `save` makes each change to it durable before what relies on it. A
-/// failure recorded earlier is cleared durably before the eviction, so no
-/// write after the eviction can leave the record claiming a retirement
-/// still pending. `None` when condition 3, or the record's account of the
-/// key, does not hold.
+/// and `save` writes it. The attempt is recorded with its boot, durably,
+/// before the proof's derivation: a write that fails then derives and evicts
+/// nothing, and once it is written a restart in the same boot is
+/// [`Retirement::Deferred`] however the attempt ended, even when the write of
+/// its outcome fails. A successful retirement clears the attempt; should that
+/// write fail, the next start that finds the key gone from its handle drops
+/// it. `None` when condition 3, or the record's account of the key, does not
+/// hold.
 ///
 /// # Errors
 ///
-/// When the TPM cannot be read, or a record write fails; nothing is evicted
-/// after a write that failed.
+/// When the TPM cannot be read, or the attempt cannot be recorded.
 fn retire_with(
     tpm: &mut impl KeyTpm,
     next: &mut Record,
@@ -712,7 +719,7 @@ fn retire_with(
 ) -> Result<Option<Retirement>> {
     // Condition 3: the DA-exempt key, which an envelope that comes back
     // moves to, is at its recorded handle with its recorded name and the
-    // DA-exempt template's shape, as a seal requires of it. The record is
+    // DA-exempt template's shape, and irlume can seal under it. The record is
     // in the state directory, so it could name any key, the original one
     // included.
     let Some(persisted) = &next.persisted else {
@@ -721,9 +728,7 @@ fn retire_with(
     let Some(da_exempt) = unhex(&persisted.name) else {
         return Ok(None);
     };
-    if !tpm.holds_da_exempt_key(persisted.handle, &da_exempt)? {
-        return Ok(None);
-    }
+    let da_exempt_handle = persisted.handle;
     // The key at the original handle is the one the record kept as matching
     // today's derivation. The record is advisory: what follows proves it.
     let Some(original) = next
@@ -737,64 +742,82 @@ fn retire_with(
         return Ok(None);
     };
     if tpm.name_at(handle)?.as_deref() != Some(name.as_slice()) {
-        // The key left the handle (evicted by hand, or another stack's key
-        // is there now): an earlier failure concerns nothing any more.
-        if next.retirement_failed.take().is_some() {
+        // The key left the handle (retired, evicted by hand, or another
+        // stack's key is there now): an earlier attempt concerns nothing.
+        if next.retirement_attempt.take().is_some() {
             save(next)?;
         }
         return Ok(None);
     }
-    if let Some(failed) = &next.retirement_failed {
-        if failed.boot_id.as_deref() == Some(boot) {
-            return Ok(Some(Retirement::Deferred {
-                handle,
-                detail: irlume_common::single_line(&failed.detail, MAX_DETAIL_CHARS),
-            }));
+    if let Some(attempt) = &next.retirement_attempt {
+        if attempt.boot_id.as_deref() == Some(boot) {
+            let detail = attempt.failure.as_deref().map_or_else(
+                || "an attempt earlier in this boot did not finish".to_owned(),
+                |failure| irlume_common::single_line(failure, MAX_DETAIL_CHARS),
+            );
+            return Ok(Some(Retirement::Deferred { handle, detail }));
         }
     }
+    if !tpm.holds_da_exempt_key(da_exempt_handle, &da_exempt)? {
+        return Ok(None);
+    }
+    next.retirement_attempt = Some(RetirementAttempt {
+        boot_id: Some(boot.to_owned()),
+        failure: None,
+    });
+    save(next)?;
     // Condition 2: a fresh derivation of the original template gives the
     // same key.
     match tpm.derives_original(handle) {
         Ok(Some(true)) => {}
         Ok(Some(false)) => {
-            next.retirement_failed = None;
+            next.retirement_attempt = None;
             if let Some(original) = next.original.as_mut() {
                 original.matched = false;
             }
-            save(next)?;
+            // Should this fail, the attempt stands for this boot and the
+            // next boot's start finds the same.
+            let _ = save(next);
             return Ok(Some(Retirement::NotReproduced { handle }));
         }
         // The key there is not the original template's shape after all.
-        Ok(None) => return Ok(None),
-        Err(e) => {
-            let failed = failed_retirement(next, handle, boot, &e);
-            save(next)?;
-            return Ok(Some(failed));
+        Ok(None) => {
+            next.retirement_attempt = None;
+            let _ = save(next);
+            return Ok(None);
         }
-    }
-    if next.retirement_failed.take().is_some() {
-        save(next)?;
+        Err(e) => return Ok(Some(failed_retirement(next, handle, &e, save))),
     }
     match tpm.evict(handle, &name) {
-        Ok(true) => Ok(Some(Retirement::Retired { handle })),
-        // It left the handle since: nothing to retire.
-        Ok(false) => Ok(None),
-        Err(e) => {
-            let failed = failed_retirement(next, handle, boot, &e);
-            save(next)?;
-            Ok(Some(failed))
+        Ok(true) => {
+            next.retirement_attempt = None;
+            let _ = save(next);
+            Ok(Some(Retirement::Retired { handle }))
         }
+        // It left the handle since: nothing to retire.
+        Ok(false) => {
+            next.retirement_attempt = None;
+            let _ = save(next);
+            Ok(None)
+        }
+        Err(e) => Ok(Some(failed_retirement(next, handle, &e, save))),
     }
 }
 
-/// Record in `next` that the retirement of the key at `handle` failed with
-/// `error` in boot `boot`, and say so.
-fn failed_retirement(next: &mut Record, handle: u32, boot: &str, error: &Error) -> Retirement {
+/// Record in `next`, already holding this boot's attempt, that the
+/// retirement of the key at `handle` failed with `error`, and say so. Should
+/// the write fail, the attempt written before still stands for this boot.
+fn failed_retirement(
+    next: &mut Record,
+    handle: u32,
+    error: &Error,
+    save: &mut impl FnMut(&Record) -> Result<()>,
+) -> Retirement {
     let detail = irlume_common::single_line(&error.to_string(), MAX_DETAIL_CHARS);
-    next.retirement_failed = Some(FailedRetirement {
-        detail: detail.clone(),
-        boot_id: Some(boot.to_owned()),
-    });
+    if let Some(attempt) = next.retirement_attempt.as_mut() {
+        attempt.failure = Some(detail.clone());
+    }
+    let _ = save(next);
     Retirement::Failed { handle, detail }
 }
 
@@ -1401,8 +1424,10 @@ mod tests {
         /// The handles evicted, and an error eviction answers instead.
         evicted: Vec<u32>,
         evict_error: Option<String>,
-        /// The handles whose key lacks the DA-exempt template's shape.
+        /// The handles whose key lacks the DA-exempt template's shape, and
+        /// those whose key refuses irlume's empty authorization.
         other_shape: Vec<u32>,
+        other_auth: Vec<u32>,
     }
 
     impl FakeTpm {
@@ -1422,6 +1447,7 @@ mod tests {
                 evicted: Vec::new(),
                 evict_error: None,
                 other_shape: Vec::new(),
+                other_auth: Vec::new(),
             }
         }
     }
@@ -1467,7 +1493,8 @@ mod tests {
         }
         fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
             Ok(self.objects.get(&handle).map(Vec::as_slice) == Some(name)
-                && !self.other_shape.contains(&handle))
+                && !self.other_shape.contains(&handle)
+                && !self.other_auth.contains(&handle))
         }
         fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
             self.scans += 1;
@@ -2875,6 +2902,11 @@ mod tests {
         let mut other_shape = retiring_tpm();
         other_shape.other_shape.push(DA_EXEMPT);
         assert_eq!(retire(&mut other_shape, &record).0, None);
+        // The same key persisted with an authorization value irlume does not
+        // hold has the same name and shape, but irlume cannot seal under it.
+        let mut other_auth = retiring_tpm();
+        other_auth.other_auth.push(DA_EXEMPT);
+        assert_eq!(retire(&mut other_auth, &record).0, None);
         // A record edited to name the original key itself as the DA-exempt
         // one: no key would be left for an envelope that comes back.
         let mut itself = retiring_tpm();
@@ -2916,6 +2948,7 @@ mod tests {
             &no_da_exempt,
             &other_da_exempt,
             &other_shape,
+            &other_auth,
             &itself,
             &other_original,
             &elsewhere,
@@ -2945,40 +2978,38 @@ mod tests {
         assert!(not_original_shape.evicted.is_empty());
     }
 
-    /// Condition 2: a derivation that fails proves nothing. The failure is
-    /// recorded with its boot and not tried again in that boot, so a restart
-    /// pays no derivation, and is tried again in a later boot. An eviction
-    /// that fails is recorded the same way.
+    /// Condition 2: a derivation that fails proves nothing. The attempt is
+    /// recorded with its boot before the derivation, so a write that fails
+    /// there derives nothing, and a restart in the same boot derives nothing
+    /// however the attempt ended, even when the write of its outcome failed.
+    /// A later boot derives again; a success clears the attempt, and an
+    /// attempt whose key has left the handle is dropped. An eviction that
+    /// fails is recorded the same way.
     #[test]
     fn a_failed_retirement_is_tried_again_only_in_a_later_boot() {
+        const THIRD_BOOT: &str = "2a1b2c3d-4e5f-6789-abcd-ef0123456789";
         let record = retiring_record(Some(BOOT));
+        let ok = |_: &Record| -> Result<()> { Ok(()) };
+
+        // The derivation fails: the failure is recorded with the boot.
         let mut tpm = retiring_tpm();
         tpm.original_error = Some("TPM_RC_BAD_AUTH".into());
         let mut next = record.clone();
-        let failed = retire_with(
-            &mut tpm,
-            &mut next,
-            ORIGINAL,
-            LATER_BOOT,
-            &mut |_: &Record| Ok(()),
-        )
-        .expect("checked");
+        let failed =
+            retire_with(&mut tpm, &mut next, ORIGINAL, LATER_BOOT, &mut { ok }).expect("checked");
         assert!(
             matches!(&failed, Some(Retirement::Failed { handle: ORIGINAL, detail }) if detail.contains("TPM_RC_BAD_AUTH")),
             "{failed:?}"
         );
-        let recorded = next.retirement_failed.clone().expect("recorded");
-        assert_eq!(recorded.boot_id.as_deref(), Some(LATER_BOOT));
-        let deferred = retire_with(
-            &mut tpm,
-            &mut next,
-            ORIGINAL,
-            LATER_BOOT,
-            &mut |_: &Record| Ok(()),
-        )
-        .expect("checked");
+        let attempt = next.retirement_attempt.clone().expect("recorded");
+        assert_eq!(attempt.boot_id.as_deref(), Some(LATER_BOOT));
+        assert!(attempt
+            .failure
+            .is_some_and(|failure| failure.contains("TPM_RC_BAD_AUTH")));
+        let deferred =
+            retire_with(&mut tpm, &mut next, ORIGINAL, LATER_BOOT, &mut { ok }).expect("checked");
         assert!(
-            matches!(deferred, Some(Retirement::Deferred { .. })),
+            matches!(&deferred, Some(Retirement::Deferred { detail, .. }) if detail.contains("TPM_RC_BAD_AUTH")),
             "{deferred:?}"
         );
         assert_eq!(
@@ -2986,83 +3017,92 @@ mod tests {
             "a restart in the same boot derives nothing"
         );
         tpm.original_error = None;
-        const THIRD_BOOT: &str = "2a1b2c3d-4e5f-6789-abcd-ef0123456789";
-        let retried = retire_with(
-            &mut tpm,
-            &mut next,
-            ORIGINAL,
-            THIRD_BOOT,
-            &mut |_: &Record| Ok(()),
-        )
-        .expect("checked");
+        let retried =
+            retire_with(&mut tpm, &mut next, ORIGINAL, THIRD_BOOT, &mut { ok }).expect("checked");
         assert_eq!(retried, Some(Retirement::Retired { handle: ORIGINAL }));
         assert_eq!(tpm.original_derivations, 2, "a later boot derives again");
-        assert_eq!(next.retirement_failed, None, "cleared once it succeeds");
+        assert_eq!(next.retirement_attempt, None, "cleared once it succeeds");
 
-        // A failure from an earlier boot is cleared durably before the
-        // eviction: a write that fails then evicts nothing, and with the
-        // write done nothing is left to write after the eviction.
-        let failed_earlier = Record {
-            retirement_failed: Some(FailedRetirement {
-                detail: "TPM_RC_BAD_AUTH".into(),
-                boot_id: Some(BOOT.into()),
-            }),
-            ..record.clone()
-        };
+        // The attempt cannot be recorded: nothing is derived or evicted.
         let mut unwritten = retiring_tpm();
-        let mut next = failed_earlier.clone();
+        let mut next = record.clone();
         let refused = retire_with(&mut unwritten, &mut next, ORIGINAL, LATER_BOOT, &mut |_| {
             Err(Error::Io("the directory sync failed".into()))
         });
         assert!(refused.is_err());
-        assert!(
-            unwritten.evicted.is_empty(),
-            "nothing is evicted after a failed write"
-        );
-        let mut written = retiring_tpm();
-        let mut saved = Vec::new();
-        let mut next = failed_earlier.clone();
-        let retired = retire_with(
-            &mut written,
-            &mut next,
-            ORIGINAL,
-            LATER_BOOT,
-            &mut |record| {
-                saved.push(record.clone());
-                Ok(())
-            },
-        );
         assert_eq!(
-            retired.expect("checked"),
-            Some(Retirement::Retired { handle: ORIGINAL })
+            (unwritten.original_derivations, unwritten.evicted.len()),
+            (0, 0)
         );
-        assert_eq!(saved.len(), 1, "one write, before the eviction");
-        assert_eq!(saved[0].retirement_failed, None);
-        // A failure whose key has left the handle is dropped.
-        let mut gone = retiring_tpm();
-        gone.objects.remove(&ORIGINAL);
-        let mut next = failed_earlier.clone();
-        let stale = retire_with(&mut gone, &mut next, ORIGINAL, LATER_BOOT, &mut |_| Ok(()));
-        assert_eq!(stale.expect("checked"), None);
-        assert_eq!(next.retirement_failed, None);
 
+        // The eviction fails and so does the write of that failure: the
+        // attempt recorded before the proof keeps a restart from retrying.
         let mut refuses = retiring_tpm();
         refuses.evict_error = Some("TPM_RC_BAD_AUTH".into());
+        let mut written = Vec::new();
         let mut next = record.clone();
-        let evict_failed = retire_with(
-            &mut refuses,
-            &mut next,
-            ORIGINAL,
-            LATER_BOOT,
-            &mut |_: &Record| Ok(()),
-        )
-        .expect("checked");
+        let evict_failed = retire_with(&mut refuses, &mut next, ORIGINAL, LATER_BOOT, &mut |r| {
+            if written.is_empty() {
+                written.push(r.clone());
+                Ok(())
+            } else {
+                Err(Error::Io("the directory sync failed".into()))
+            }
+        });
         assert!(
-            matches!(evict_failed, Some(Retirement::Failed { .. })),
+            matches!(evict_failed, Ok(Some(Retirement::Failed { .. }))),
             "{evict_failed:?}"
         );
-        assert!(next.retirement_failed.is_some());
         assert!(refuses.objects.contains_key(&ORIGINAL));
+        let mut on_disk = written[0].clone();
+        assert_eq!(
+            on_disk.retirement_attempt,
+            Some(RetirementAttempt {
+                boot_id: Some(LATER_BOOT.into()),
+                failure: None
+            }),
+            "the attempt was durable before the proof"
+        );
+        refuses.evict_error = None;
+        let restart = retire_with(&mut refuses, &mut on_disk, ORIGINAL, LATER_BOOT, &mut {
+            ok
+        })
+        .expect("checked");
+        assert!(
+            matches!(&restart, Some(Retirement::Deferred { detail, .. }) if detail.contains("did not finish")),
+            "{restart:?}"
+        );
+        assert_eq!(
+            refuses.original_derivations, 1,
+            "no second proof in the boot"
+        );
+
+        // A success whose last write fails leaves the attempt; the next start
+        // that finds the key gone drops it.
+        let mut retires = retiring_tpm();
+        let mut stale = None;
+        let mut next = record.clone();
+        let retired = retire_with(&mut retires, &mut next, ORIGINAL, LATER_BOOT, &mut |r| {
+            if stale.is_none() {
+                stale = Some(r.clone());
+                Ok(())
+            } else {
+                Err(Error::Io("the directory sync failed".into()))
+            }
+        });
+        assert_eq!(
+            retired.expect("retired whatever the last write did"),
+            Some(Retirement::Retired { handle: ORIGINAL })
+        );
+        let mut stale = stale.expect("the attempt");
+        assert!(stale.retirement_attempt.is_some());
+        let dropped = retire_with(&mut retires, &mut stale, ORIGINAL, THIRD_BOOT, &mut { ok })
+            .expect("checked");
+        assert_eq!(dropped, None);
+        assert_eq!(
+            stale.retirement_attempt, None,
+            "dropped once the key is gone"
+        );
     }
 
     /// The amendment's acceptance tests for condition 1 with retirement,
@@ -3241,9 +3281,9 @@ mod tests {
             version: RECORD_VERSION,
             unused_since: Some(BOOT.into()),
             moves: vec![pending],
-            retirement_failed: Some(FailedRetirement {
-                detail: "TPM_RC_BAD_AUTH".into(),
+            retirement_attempt: Some(RetirementAttempt {
                 boot_id: Some(BOOT.into()),
+                failure: Some("TPM_RC_BAD_AUTH".into()),
             }),
             ..Record::default()
         };
@@ -3259,7 +3299,7 @@ mod tests {
         for next in [persisted, refused] {
             assert_eq!(next.unused_since, record.unused_since);
             assert_eq!(next.moves, record.moves);
-            assert_eq!(next.retirement_failed, record.retirement_failed);
+            assert_eq!(next.retirement_attempt, record.retirement_attempt);
         }
     }
 

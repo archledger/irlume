@@ -1144,7 +1144,26 @@ impl storage_key::KeyTpm for DaExemptKeyTpm {
     }
 
     fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
-        Ok(da_exempt_key_at(&mut self.ctx, handle, name, true)?.is_some())
+        let Some(key) = da_exempt_key_at(&mut self.ctx, handle, name, true)? else {
+            return Ok(false);
+        };
+        // The name covers the public area only, so a key from the same
+        // template persisted with another authorization value has the same
+        // name and shape. Creating a child under it with irlume's empty
+        // authorization shows irlume can seal under it; the child is
+        // discarded. The key's noDA attribute, part of the shape checked
+        // above, keeps a refused authorization from counting toward a
+        // lockout.
+        let template = sealed_template(Digest::default())?;
+        let sensitive =
+            SensitiveData::try_from(b"irlume: can seal here".to_vec()).map_err(tpm_err)?;
+        match self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.create(key, template, None, Some(sensitive), None, None)
+        }) {
+            Ok(_) => Ok(true),
+            Err(error) if is_auth_failure(&error) => Ok(false),
+            Err(error) => Err(tpm_err(error)),
+        }
     }
 
     fn persist(&mut self, handle: u32) -> std::result::Result<(), storage_key::Failure> {
@@ -1189,6 +1208,16 @@ fn classify_failure(error: tss_esapi::Error) -> storage_key::Failure {
         class,
         detail: error.to_string(),
     }
+}
+
+/// Whether `error` is the TPM refusing an authorization (`TPM_RC_BAD_AUTH`
+/// or `TPM_RC_AUTH_FAIL`), as [`classify_failure`] reads it.
+fn is_auth_failure(error: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind as Kind;
+    matches!(
+        error,
+        tss_esapi::Error::Tss2Error(code) if matches!(code.kind(), Some(Kind::BadAuth | Kind::AuthFail))
+    )
 }
 
 fn other_failure(detail: impl std::fmt::Display) -> storage_key::Failure {
@@ -5400,7 +5429,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// and evicts it from the TPM. The template key still unseals through
     /// the DA-exempt key, which stays; a start that derived a key retires
     /// nothing, and so does one whose record was edited to name the original
-    /// key itself as the DA-exempt key, which lacks that key's shape.
+    /// key itself as the DA-exempt key, which lacks that key's shape, or a
+    /// copy of the DA-exempt key persisted with an authorization value irlume
+    /// does not hold, which has its name and shape.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
@@ -5446,6 +5477,56 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         });
         std::fs::write(&record_path, serde_json::to_vec(&edited).unwrap()).expect("edit");
         let names_itself = settle_at_start_in(Some(BOOT_B), false);
+        // A copy of the DA-exempt key persisted with an authorization value
+        // irlume does not hold: the same template gives the same name and
+        // shape, but irlume cannot seal under it.
+        const COPY: u32 = 0x8101_0012;
+        let copy_name = {
+            let mut ctx = open_context().expect("context");
+            let auth = Auth::try_from(b"someone else's".to_vec()).expect("auth");
+            let primary = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.create_primary(
+                        Hierarchy::Owner,
+                        da_exempt_srk_template().expect("the template"),
+                        Some(auth),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .expect("the copy");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    primary.key_handle.into(),
+                    Persistent::Persistent(PersistentTpmHandle::new(COPY).expect("handle")),
+                )
+            })
+            .expect("persist the copy");
+            let _ = ctx.flush_context(primary.key_handle.into());
+            name_at_handle(COPY).expect("the copy's name")
+        };
+        edited["persisted"] = serde_json::json!({
+            "handle": COPY, "name": storage_key::hex(&copy_name),
+        });
+        std::fs::write(&record_path, serde_json::to_vec(&edited).unwrap()).expect("edit");
+        let names_copy = settle_at_start_in(Some(BOOT_B), false);
+        {
+            let mut ctx = open_context().expect("context");
+            let persistent = PersistentTpmHandle::new(COPY).expect("handle");
+            let object = ctx
+                .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+                .expect("the copy");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    ObjectHandle::from(ESYS_TR::from(object)),
+                    Persistent::Persistent(persistent),
+                )
+            })
+            .expect("evict the copy");
+        }
         std::fs::write(&record_path, &kept_record).expect("restore the record");
         let retired = settle_at_start_in(Some(BOOT_B), false);
         let after_retirement = handles();
@@ -5487,6 +5568,11 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             retirement(names_itself),
             None,
             "not beside a recorded key without the DA-exempt shape"
+        );
+        assert_eq!(
+            retirement(names_copy),
+            None,
+            "not beside a recorded key irlume cannot seal under"
         );
         assert_eq!(
             retirement(retired),
@@ -5737,7 +5823,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             "{failed:?}"
         );
         assert_eq!(
-            failure_recorded["retirement_failed"]["boot_id"],
+            failure_recorded["retirement_attempt"]["boot_id"],
             serde_json::json!(BOOT_B)
         );
         let restart = retirement(restart);
@@ -5750,7 +5836,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             retirement(retried),
             Some(Retirement::Retired { handle: original })
         );
-        assert!(cleared.get("retirement_failed").is_none(), "{cleared}");
+        assert!(cleared.get("retirement_attempt").is_none(), "{cleared}");
         assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert!(put_back.is_ok());
         assert_eq!(

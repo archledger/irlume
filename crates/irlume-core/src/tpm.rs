@@ -1767,13 +1767,21 @@ fn with_envelope_parent<T>(
         .ok_or_else(|| Error::Protocol("the envelope's storage key name is not hex".into()))?;
     // The handle is a hint and the name decides (ADR-0034 §3.3): when the key
     // is no longer at the envelope's handle but irlumed recorded the same key
-    // at another one, that is the parent.
+    // at another one, as its DA-exempt key or as the weak key a replacement
+    // superseded (whose envelopes move off it at their move points), that is
+    // the parent.
     let mut key = da_exempt_key_at(ctx, parent.handle, &name, false)?;
-    if key.is_none() {
-        if let Some((handle, recorded)) = storage_key::recorded_key() {
-            if recorded == name && handle != parent.handle {
-                key = da_exempt_key_at(ctx, handle, &name, false)?;
-            }
+    let superseded = storage_key::superseded_key()
+        .and_then(|(handle, hex)| storage_key::unhex(&hex).map(|raw| (handle, raw)));
+    for (handle, recorded) in [storage_key::recorded_key(), superseded]
+        .into_iter()
+        .flatten()
+    {
+        if key.is_some() {
+            break;
+        }
+        if recorded == name && handle != parent.handle {
+            key = da_exempt_key_at(ctx, handle, &name, false)?;
         }
     }
     let key = key.ok_or_else(|| {
@@ -5970,9 +5978,12 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// since no TPM it reaches generates one), with today's derivation clean,
     /// is replaced at the next start by that derivation at the next free
     /// handle. The template key sealed under the weak key moves onto the new
-    /// one at irlumed's start, keeping its key; new seals go under the new
-    /// key; the weak key stays persisted, never evicted, and a lockout spares
-    /// irlume through both. A second start replaces nothing. With the TPM
+    /// one at irlumed's start, keeping its key; a keyring password under the
+    /// weak key whose recorded handle another stack took is released through
+    /// the superseded key, found by name, and moves at the next login's
+    /// reseal; new seals go under the new key; the weak key stays persisted,
+    /// never evicted, and a lockout spares irlume through both. A second
+    /// start replaces nothing. With the TPM
     /// full, the replacement is refused and recorded, and the weak key stays
     /// the parent of new seals.
     #[test]
@@ -6024,11 +6035,26 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         crate::template_key::reseal_key("alice", &key).expect("seal the template key");
         let alice = crate::template_key::key_path("alice");
         let sealed_under = parent(&alice);
+        // A keyring password under the weak key whose recorded handle another
+        // stack took: it loads by name, and a keyring envelope is not
+        // repointed at start.
+        crate::keyring::seal_password("alice", b"alice-password").expect("arm the password");
+        let keyring = crate::keyring::envelope_path("alice");
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&keyring).expect("envelope")).expect("json");
+        stale["parent"]["handle"] = serde_json::json!(0x8101_0020_u32);
+        std::fs::write(&keyring, serde_json::to_vec(&stale).unwrap()).expect("stale handle");
+        let before_replacement = crate::keyring::unseal_password("alice");
 
         let replaced = ensure_at_start_reporting();
         let after_replacement = record();
         let moved = crate::template_key::move_to_stronger_policy("alice");
         let moved_under = parent(&alice);
+        // Credential release before the login's reseal, through the
+        // superseded key found by name; then the reseal moves it.
+        let released = crate::keyring::unseal_password("alice");
+        let login = crate::keyring::reseal_password("alice", b"alice-password", None);
+        let keyring_under = parent(&keyring);
         let template_key = crate::template_key::load_key("alice");
         let new_seal = seal_with_pcrs(b"a seal after the replacement", &[7]).map(|env| env.parent);
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -6082,6 +6108,19 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             .to_owned();
         assert_eq!(moved.expect("the move"), Some(MoveGain::DaExemptKey));
         assert_eq!(moved_under.as_deref(), Some(new_hex.as_str()));
+        assert_eq!(
+            before_replacement.expect("unseal by name").as_slice(),
+            b"alice-password"
+        );
+        assert_eq!(
+            released.expect("the superseded key by name").as_slice(),
+            b"alice-password"
+        );
+        assert_eq!(
+            login.expect("the reseal"),
+            crate::keyring::Reseal::MovedToDaExemptKey
+        );
+        assert_eq!(keyring_under.as_deref(), Some(new_hex.as_str()));
         assert_eq!(template_key.expect("the key").as_slice(), key.as_slice());
         assert_eq!(
             new_seal.expect("a seal").map(|p| p.name).as_deref(),

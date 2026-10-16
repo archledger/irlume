@@ -1641,6 +1641,31 @@ fn main() {
                         refusal.detail,
                         refusal.reason.when_retried()
                     ),
+                    // A weak DA-exempt key (ADR-0034, Phase 3 amendment, #1073
+                    // item 2) is replaced by moving its envelopes first.
+                    Ok(Some(Outcome::Replaced { handle, from })) => jout_notice!(
+                        "irlumed: irlume's DA-exempt storage key at {from:#010x} carries the \
+                         ROCA fingerprint (CVE-2017-15361) and today's derivation does not, so \
+                         the new key at {handle:#010x} replaces it; envelopes under the weak \
+                         key move onto it at their move points, and irlume does not evict the \
+                         weak key"
+                    ),
+                    Ok(Some(Outcome::DerivationWeak { handle })) => jout_warn!(
+                        "irlumed: irlume's DA-exempt storage key at {handle:#010x} carries the \
+                         ROCA fingerprint (CVE-2017-15361), and so does today's derivation of \
+                         its template, so nothing replaces it: update the TPM firmware with the \
+                         machine vendor's tool; irlumed derives again once the TPM reports \
+                         another firmware version"
+                    ),
+                    Ok(Some(Outcome::WeakKept { .. })) => {}
+                    Ok(Some(Outcome::ReplacementRefused { from, refusal })) => jout_warn!(
+                        "irlumed: could not persist the replacement for irlume's weak DA-exempt \
+                         storage key at {from:#010x} ({}); the weak key stays in use, and \
+                         irlumed tries again {}",
+                        refusal.detail,
+                        refusal.reason.when_retried()
+                    ),
+                    Ok(Some(Outcome::ReplacementDeferred { .. })) => {}
                     Err(e) => jout_warn!(
                         "irlumed: could not check irlume's DA-exempt storage key ({e}); \
                          envelopes stay on the original key"

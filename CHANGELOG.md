@@ -7,6 +7,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- irlumed replaces a weak DA-exempt storage key by moving its envelopes
+  first (ADR-0034, Phase 3 amendment; #1073 item 2). When the key at its
+  recorded handle carries the ROCA fingerprint (CVE-2017-15361) and
+  today's derivation of its template does not, as after a TPM firmware
+  update that fixed key generation, irlumed's start does three things:
+  - it adopts that derivation by its TPM name if an earlier start
+    persisted it, or persists it at the next free owner handle;
+  - it records it as the DA-exempt key, and keeps the weak key as
+    superseded;
+  - it moves a template key under the weak key onto the new one at that
+    start; a keyring secret moves at the next login's reseal.
+
+  New seals go under the new key. The weak key is never evicted, since no
+  derivation gives it now, and a lockout spares irlume through either key.
+  When today's derivation is weak too, nothing is replaced, the firmware
+  version is recorded, and no start derives for it again until the TPM
+  reports another version. A replacement that cannot be persisted (no room,
+  no free handle, an owner authorization) is recorded with the boot and
+  tried again by the rules for the DA-exempt key itself; the weak key stays
+  in use meanwhile. irlumed's journal says which of these happened.
+
 - `irlume doctor` gains a `tpm-storage-keys` check (ADR-0034, Phase 3
   amendment; #1073). It reports whether irlume's original storage key is
   retired, and otherwise names the key's handle and TPM name and what its

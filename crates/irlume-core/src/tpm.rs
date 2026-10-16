@@ -443,15 +443,29 @@ pub fn lockout_state() -> Result<TpmLockout> {
 
 /// Whether a TPM lockout blocks none of irlume's envelopes: the DA-exempt key
 /// irlumed recorded is at its handle with its name and shape, and every
-/// envelope records it as its parent, so new seals and every unseal go
-/// through it. An envelope store that cannot be read, or a TPM read that
-/// fails, answers no, which keeps doctor's lockout warning.
+/// envelope records it as its parent, or the weak DA-exempt key it
+/// superseded while that key is still at its handle with its name and shape
+/// (it is DA-exempt too), so new seals and every unseal go through a key a
+/// lockout does not block. An envelope store that cannot be read, or a TPM
+/// read that fails, answers no, which keeps doctor's lockout warning.
 fn lockout_spares_irlume(ctx: &mut Context) -> bool {
     let Some((handle, name)) = storage_key::recorded_key() else {
         return false;
     };
-    da_exempt_key_at(ctx, handle, &name, true).is_ok_and(|key| key.is_some())
-        && storage_key::every_envelope_on(&storage_key::hex(&name)).unwrap_or(false)
+    if !da_exempt_key_at(ctx, handle, &name, true).is_ok_and(|key| key.is_some()) {
+        return false;
+    }
+    let mut names = vec![storage_key::hex(&name)];
+    if let Some((superseded, superseded_name)) = storage_key::superseded_key() {
+        let present = storage_key::unhex(&superseded_name).is_some_and(|raw| {
+            da_exempt_key_at(ctx, superseded, &raw, true).is_ok_and(|key| key.is_some())
+        });
+        if present {
+            names.push(superseded_name);
+        }
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    storage_key::every_envelope_on(&names).unwrap_or(false)
 }
 
 /// A [`TpmLockout`] from the properties `GetCapability` returned, in the
@@ -1143,6 +1157,43 @@ impl storage_key::KeyTpm for DaExemptKeyTpm {
         Ok(true)
     }
 
+    fn is_weak(&mut self, handle: u32) -> Result<bool> {
+        // Probed first, so that a free handle logs no esys error (#601).
+        if !persistent_handle_present(&mut self.ctx, handle)? {
+            return Ok(false);
+        }
+        let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+        let object = self
+            .ctx
+            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+            .map_err(tpm_err)?;
+        let (public, name, _) = self
+            .ctx
+            .read_public(KeyHandle::from(ESYS_TR::from(object)))
+            .map_err(tpm_err)?;
+        Ok(weak_key(&public, name.value()))
+    }
+
+    fn derived_is_weak(&mut self) -> Result<bool> {
+        let Some(derived) = self.derived else {
+            return Err(Error::Tpm("no derived key to check".into()));
+        };
+        let (public, name, _) = self.ctx.read_public(derived).map_err(tpm_err)?;
+        Ok(weak_key(&public, name.value()))
+    }
+
+    fn firmware(&mut self) -> Result<[u32; 2]> {
+        let first = self
+            .ctx
+            .get_tpm_property(PropertyTag::FirmwareVersion1)
+            .map_err(tpm_err)?;
+        let second = self
+            .ctx
+            .get_tpm_property(PropertyTag::FirmwareVersion2)
+            .map_err(tpm_err)?;
+        Ok([first.unwrap_or(0), second.unwrap_or(0)])
+    }
+
     fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
         let Some(key) = da_exempt_key_at(&mut self.ctx, handle, name, true)? else {
             return Ok(false);
@@ -1208,6 +1259,18 @@ fn classify_failure(error: tss_esapi::Error) -> storage_key::Failure {
         class,
         detail: error.to_string(),
     }
+}
+
+/// Whether the key with `public` and TPM name `name` carries the ROCA
+/// fingerprint. No TPM a test reaches generates such a key, so a test can
+/// name keys to count as weak (`tests::WEAK_NAMES`).
+fn weak_key(public: &Public, name: &[u8]) -> bool {
+    #[cfg(test)]
+    if tests::WEAK_NAMES.with(|weak| weak.borrow().iter().any(|weak| weak == name)) {
+        return true;
+    }
+    let _ = name;
+    matches!(public, Public::Rsa { unique, .. } if roca_fingerprint(unique.value()))
 }
 
 /// Whether `error` is the TPM refusing an authorization (`TPM_RC_BAD_AUTH`
@@ -1780,7 +1843,28 @@ pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
 /// record only. The seal checks the recorded key at its handle, and a
 /// candidate that did not land on it moves nothing (`move_gain`).
 pub fn move_available(current: &SealedEnvelope) -> bool {
-    stronger_tier_available_than(current) || on_original_key_with_da_exempt_key(current)
+    stronger_tier_available_than(current)
+        || on_original_key_with_da_exempt_key(current)
+        || on_superseded_key(current)
+}
+
+/// Whether `current` is under the weak DA-exempt key a replacement
+/// superseded (ADR-0034, Phase 3 amendment, #1073 item 2), with a policy
+/// whose rank is established: like an envelope on the original key, it has
+/// a reason to move onto the DA-exempt key irlumed now records.
+fn on_superseded_key(current: &SealedEnvelope) -> bool {
+    let Some(parent) = &current.parent else {
+        return false;
+    };
+    if storage_key::superseded_key().is_none_or(|(_, name)| name != parent.name) {
+        return false;
+    }
+    let binding = if matches!(current.policy, PolicyKind::PcrlockNv { .. }) {
+        read_pcrlock_json().ok().and_then(|p| p.binding())
+    } else {
+        None
+    };
+    current_strength_rank(current, binding.as_ref()).is_some()
 }
 
 /// Whether `current` is under the original storage key while irlumed
@@ -1845,7 +1929,17 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
     };
     let candidate_rank = current_strength_rank(candidate, binding.as_ref())?;
     let current_rank = current_strength_rank(current, binding.as_ref())?;
-    let to_da_exempt_key = current.parent.is_none() && candidate.parent.is_some();
+    // Onto the DA-exempt key from the original key, or from the weak
+    // DA-exempt key a replacement superseded onto the one now recorded.
+    let off_superseded = match (&current.parent, &candidate.parent) {
+        (Some(from), Some(to)) => {
+            from.name != to.name
+                && storage_key::superseded_key().is_some_and(|(_, name)| name == from.name)
+        }
+        _ => false,
+    };
+    let to_da_exempt_key =
+        (current.parent.is_none() && candidate.parent.is_some()) || off_superseded;
     match (candidate_rank.cmp(&current_rank), to_da_exempt_key) {
         (std::cmp::Ordering::Greater, false) => Some(MoveGain::StrongerPolicy),
         (std::cmp::Ordering::Greater, true) => Some(MoveGain::Both),
@@ -3109,6 +3203,13 @@ pub(crate) mod tests {
         );
     }
     use super::*;
+
+    thread_local! {
+        /// TPM names a test counts as carrying the ROCA fingerprint, since
+        /// neither swtpm nor any TPM a test reaches generates such a key.
+        pub(crate) static WEAK_NAMES: std::cell::RefCell<Vec<Vec<u8>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     /// A real 2048-bit RSA SubjectPublicKeyInfo PEM (openssl-generated
     /// fixture). The parser must extract the exact modulus and exponent the
@@ -5863,6 +5964,166 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// ADR-0034, Phase 3 amendment (#1073 item 2), on swtpm: a recorded
+    /// DA-exempt key with the ROCA fingerprint (a key with the DA-exempt
+    /// template's shape and another modulus, which the test names weak,
+    /// since no TPM it reaches generates one), with today's derivation clean,
+    /// is replaced at the next start by that derivation at the next free
+    /// handle. The template key sealed under the weak key moves onto the new
+    /// one at irlumed's start, keeping its key; new seals go under the new
+    /// key; the weak key stays persisted, never evicted, and a lockout spares
+    /// irlume through both. A second start replaces nothing. With the TPM
+    /// full, the replacement is refused and recorded, and the weak key stays
+    /// the parent of new seals.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_weak_da_exempt_key_is_replaced_and_its_envelopes_move() {
+        use crate::storage_key::{ensure_at_start_reporting, Outcome};
+        use irlume_common::tpm_readiness::RefusalReason;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("replace-weak-key");
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED) && !before.contains(&(PREFERRED + 1)),
+            "the handles this test uses are taken: {before:x?}"
+        );
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        let record = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&record_path).expect("record")).expect("json")
+        };
+        let record_weak = |name: &[u8]| {
+            let json = serde_json::json!({
+                "version": 1,
+                "persisted": {"handle": PREFERRED, "name": storage_key::hex(name)},
+            });
+            std::fs::write(&record_path, json.to_string()).expect("the record");
+        };
+        let parent = |path: &std::path::Path| {
+            SealedEnvelope::load(path)
+                .ok()
+                .and_then(|env| env.parent)
+                .map(|parent| parent.name)
+        };
+
+        persist_child_at(da_exempt_srk_template().expect("template"), PREFERRED);
+        let weak = name_at_handle(PREFERRED).expect("the weak key");
+        WEAK_NAMES.with(|names| names.borrow_mut().push(weak.clone()));
+        record_weak(&weak);
+        let _alice = crate::account::remember("alice", 4180);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        let alice = crate::template_key::key_path("alice");
+        let sealed_under = parent(&alice);
+
+        let replaced = ensure_at_start_reporting();
+        let after_replacement = record();
+        let moved = crate::template_key::move_to_stronger_policy("alice");
+        let moved_under = parent(&alice);
+        let template_key = crate::template_key::load_key("alice");
+        let new_seal = seal_with_pcrs(b"a seal after the replacement", &[7]).map(|env| env.parent);
+        let spared = lockout_state().map(|l| l.storage_key_no_da);
+        let again = ensure_at_start_reporting();
+        let weak_stays = name_at_handle(PREFERRED) == Some(weak.clone());
+
+        // The replacement refused for lack of room: the weak key stays.
+        let new_key_removed = evict_da_exempt_srks();
+        record_weak(&weak);
+        let filled = fill_persistent_capacity();
+        let full = ensure_at_start_reporting();
+        let after_refusal = record();
+        let seal_while_refused =
+            seal_with_pcrs(b"a seal while the replacement is refused", &[7]).map(|env| env.parent);
+        for handle in &filled {
+            evict_fixture_at(*handle);
+        }
+
+        WEAK_NAMES.with(|names| names.borrow_mut().clear());
+        evict_fixture_at(PREFERRED);
+        let leftover = evict_da_exempt_srks();
+        let after = handles();
+        drop(dirs);
+
+        let weak_hex = storage_key::hex(&weak);
+        assert_eq!(
+            sealed_under.as_deref(),
+            Some(weak_hex.as_str()),
+            "sealed under the weak key"
+        );
+        let (outcome, derived) = replaced.expect("the step");
+        assert_eq!(
+            outcome,
+            Some(Outcome::Replaced {
+                handle: PREFERRED + 1,
+                from: PREFERRED
+            })
+        );
+        assert!(derived, "the replacement derived a key");
+        assert_eq!(
+            after_replacement["superseded"]["name"],
+            serde_json::json!(weak_hex)
+        );
+        assert_eq!(
+            after_replacement["persisted"]["handle"],
+            serde_json::json!(PREFERRED + 1)
+        );
+        let new_hex = after_replacement["persisted"]["name"]
+            .as_str()
+            .expect("the new key")
+            .to_owned();
+        assert_eq!(moved.expect("the move"), Some(MoveGain::DaExemptKey));
+        assert_eq!(moved_under.as_deref(), Some(new_hex.as_str()));
+        assert_eq!(template_key.expect("the key").as_slice(), key.as_slice());
+        assert_eq!(
+            new_seal.expect("a seal").map(|p| p.name).as_deref(),
+            Some(new_hex.as_str()),
+            "new seals go under the new key"
+        );
+        assert!(spared.expect("lockout state"), "a lockout spares irlume");
+        assert!(
+            matches!(again.expect("the step").0, Some(Outcome::Present { handle }) if handle == PREFERRED + 1),
+            "a second start replaces nothing"
+        );
+        assert!(weak_stays, "the weak key is not evicted");
+        assert_eq!(new_key_removed.expect("evict"), vec![PREFERRED + 1]);
+        assert!(!filled.is_empty(), "the TPM had room before it was filled");
+        assert!(
+            matches!(
+                full.expect("the step").0,
+                Some(Outcome::ReplacementRefused { from: PREFERRED, ref refusal })
+                    if refusal.reason == RefusalReason::NoSpace
+            ),
+            "refused for lack of room"
+        );
+        assert_eq!(
+            after_refusal["persisted"]["name"],
+            serde_json::json!(weak_hex)
+        );
+        assert!(after_refusal["replacement_refused"]["boot_id"].is_string());
+        assert_eq!(
+            seal_while_refused
+                .expect("a seal")
+                .map(|p| p.name)
+                .as_deref(),
+            Some(weak_hex.as_str()),
+            "the weak key stays the parent of new seals"
+        );
+        assert_eq!(leftover.expect("evict"), Vec::<u32>::new());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
     /// ADR-0034 §3.3 acceptance on swtpm, recovery by name: a template key
     /// and a keyring secret record the DA-exempt key at 0x81010003; the key
     /// leaves that handle and another stack's key takes it. irlumed's start
@@ -6575,6 +6836,58 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(without, [false; 3], "no record, nothing stronger");
         assert_eq!(with, [true, false, false]);
         assert_eq!(not_hex, [false; 3], "a record naming no key is none");
+    }
+
+    /// ADR-0034, Phase 3 amendment (#1073 item 2): an envelope under the
+    /// weak DA-exempt key a replacement superseded has a reason to move, and
+    /// the move onto the recorded key gains the DA-exempt key; one on the
+    /// recorded key has none, and a move between two keys neither of which
+    /// is superseded gains nothing.
+    #[test]
+    fn an_envelope_on_a_superseded_key_moves_onto_the_recorded_one() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let prediction = PredictionFixture::new();
+        let state = crate::test_tmp_dir("move-off-superseded");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let previous = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+        let json = serde_json::json!({
+            "version": 1,
+            "persisted": {"handle": 0x8101_0004_u32, "name": "000b11"},
+            "superseded": {"handle": 0x8101_0003_u32, "name": "000b00"},
+        });
+        std::fs::write(format!("{state}/tpm-storage-key"), json.to_string()).unwrap();
+        let on = |name: &str, handle: u32| {
+            let mut env = PredictionFixture::envelope(&[7]);
+            env.policy = PolicyKind::PcrLiteral;
+            env.parent = Some(ParentKey {
+                handle,
+                name: name.into(),
+            });
+            env
+        };
+        let weak = on("000b00", 0x8101_0003);
+        let current = on("000b11", 0x8101_0004);
+        let other = on("000b22", 0x8101_0005);
+        let available = [move_available(&weak), move_available(&current)];
+        let off_weak = move_gain(&current, &weak);
+        let back_onto_weak = move_gain(&weak, &current);
+        let between_others = move_gain(&other, &current);
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
+        drop(prediction);
+
+        assert_eq!(available, [true, false]);
+        assert_eq!(off_weak, Some(MoveGain::DaExemptKey));
+        assert_eq!(back_onto_weak, None, "never back onto the superseded key");
+        assert_eq!(between_others, None);
     }
 
     #[test]

@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- At irlumed's start, a template key whose recorded storage key handle no
+  longer holds that key, as when another stack took the handle after the
+  key left it, records instead the handle where a key with its recorded TPM
+  name is persisted (ADR-0034 §3.3). It runs after the start-up step has
+  persisted irlume's DA-exempt key again, so the key is found there. Only
+  the handle in the envelope changes; nothing is unsealed or sealed, and an
+  authentication never does this. A keyring envelope is not rewritten at
+  start: it loads through irlumed's record of the same key, and the next
+  login's reseal seals it again if it does not. An envelope whose key is
+  persisted nowhere is logged with its remedy: `irlume recovery restore` or
+  a re-enrollment for a template key, the next login's reseal or `irlume
+  keyring arm` for a keyring secret.
+
 - `irlume doctor`'s `tpm-lockout` names, in lockout, each account and
   envelope kind still on irlume's original storage key and what the lockout
   blocks for it: a template key, that account's face login; a keyring

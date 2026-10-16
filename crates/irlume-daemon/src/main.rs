@@ -1092,6 +1092,43 @@ fn carry_camera_pair(
     fresh
 }
 
+/// The journal line for an envelope irlumed's start found with a stale
+/// parent handle (ADR-0034 §3.3). Account names reach here only when the
+/// envelope's file is named for one irlumed accepts.
+fn log_repointed(envelope: &irlume_core::storage_key::Repointed) {
+    use irlume_common::tpm_readiness::EnvelopeKind;
+    use irlume_core::storage_key::RepointOutcome;
+    let user = &envelope.user;
+    let (what, remedy) = match envelope.kind {
+        EnvelopeKind::TemplateKey => (
+            "template key",
+            format!("restore it with `irlume recovery restore` or enroll '{user}' again"),
+        ),
+        EnvelopeKind::KeyringSecret | EnvelopeKind::Unknown => (
+            "keyring secret",
+            "the next login that runs pam_irlume's `reseal` line seals it again, or run \
+             `irlume keyring arm`"
+                .to_owned(),
+        ),
+    };
+    let from = envelope.from;
+    match &envelope.outcome {
+        RepointOutcome::Moved(to) => jout_notice!(
+            "irlumed: the {what} of '{user}' recorded its storage key at {from:#010x}, which no \
+             longer holds it; it now records {to:#010x}, where that key is (ADR-0034 §3.3)"
+        ),
+        RepointOutcome::Missing => jout_warn!(
+            "irlumed: the {what} of '{user}' is sealed under a storage key that is no longer \
+             persisted on this TPM (it recorded {from:#010x}), so it cannot be opened: {remedy}"
+        ),
+        RepointOutcome::Unwritten(to, e) => jout_warn!(
+            "irlumed: the {what} of '{user}' records its storage key at {from:#010x}, which no \
+             longer holds it, and could not be rewritten to record {to:#010x} ({e}); irlumed \
+             tries again at its next start"
+        ),
+    }
+}
+
 /// Whether irlumed's start-up TPM steps run: the one that persists
 /// irlume's DA-exempt storage key and the template key moves after it. A
 /// standard device node counts, and so does an explicit transport
@@ -1545,6 +1582,22 @@ fn main() {
                     Err(e) => jout_warn!(
                         "irlumed: could not check irlume's DA-exempt storage key ({e}); \
                          envelopes stay on the original key"
+                    ),
+                }
+                // Recovery by name (ADR-0034 §3.3), after the step above has
+                // persisted the key again if it went missing: an envelope whose
+                // recorded handle no longer holds its key records the handle
+                // where a key with its recorded TPM name now is.
+                match irlume_core::storage_key::repoint_at_start() {
+                    Ok(repointed) => {
+                        for envelope in repointed {
+                            log_repointed(&envelope);
+                        }
+                    }
+                    Err(e) => jout_warn!(
+                        "irlumed: could not check the storage keys irlume's envelopes are \
+                         sealed under ({e}); an envelope whose key left its handle is checked \
+                         again at the next start"
                     ),
                 }
             }

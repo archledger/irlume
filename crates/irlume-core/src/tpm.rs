@@ -456,7 +456,7 @@ fn lockout_spares_irlume(ctx: &mut Context) -> bool {
         return false;
     }
     let mut names = vec![storage_key::hex(&name)];
-    if let Some((superseded, superseded_name)) = storage_key::superseded_key() {
+    for (superseded, superseded_name) in storage_key::superseded_keys() {
         let present = storage_key::unhex(&superseded_name).is_some_and(|raw| {
             da_exempt_key_at(ctx, superseded, &raw, true).is_ok_and(|key| key.is_some())
         });
@@ -1771,12 +1771,10 @@ fn with_envelope_parent<T>(
     // superseded (whose envelopes move off it at their move points), that is
     // the parent.
     let mut key = da_exempt_key_at(ctx, parent.handle, &name, false)?;
-    let superseded = storage_key::superseded_key()
-        .and_then(|(handle, hex)| storage_key::unhex(&hex).map(|raw| (handle, raw)));
-    for (handle, recorded) in [storage_key::recorded_key(), superseded]
+    let superseded = storage_key::superseded_keys()
         .into_iter()
-        .flatten()
-    {
+        .filter_map(|(handle, hex)| storage_key::unhex(&hex).map(|raw| (handle, raw)));
+    for (handle, recorded) in storage_key::recorded_key().into_iter().chain(superseded) {
         if key.is_some() {
             break;
         }
@@ -1864,7 +1862,10 @@ fn on_superseded_key(current: &SealedEnvelope) -> bool {
     let Some(parent) = &current.parent else {
         return false;
     };
-    if storage_key::superseded_key().is_none_or(|(_, name)| name != parent.name) {
+    if !storage_key::superseded_keys()
+        .iter()
+        .any(|(_, name)| *name == parent.name)
+    {
         return false;
     }
     let binding = if matches!(current.policy, PolicyKind::PcrlockNv { .. }) {
@@ -1942,7 +1943,9 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
     let off_superseded = match (&current.parent, &candidate.parent) {
         (Some(from), Some(to)) => {
             from.name != to.name
-                && storage_key::superseded_key().is_some_and(|(_, name)| name == from.name)
+                && storage_key::superseded_keys()
+                    .iter()
+                    .any(|(_, name)| *name == from.name)
         }
         _ => false,
     };
@@ -6095,7 +6098,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
         assert!(derived, "the replacement derived a key");
         assert_eq!(
-            after_replacement["superseded"]["name"],
+            after_replacement["superseded"][0]["name"],
             serde_json::json!(weak_hex)
         );
         assert_eq!(
@@ -6897,7 +6900,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let json = serde_json::json!({
             "version": 1,
             "persisted": {"handle": 0x8101_0004_u32, "name": "000b11"},
-            "superseded": {"handle": 0x8101_0003_u32, "name": "000b00"},
+            "superseded": [{"handle": 0x8101_0003_u32, "name": "000b00"}],
         });
         std::fs::write(format!("{state}/tpm-storage-key"), json.to_string()).unwrap();
         let on = |name: &str, handle: u32| {

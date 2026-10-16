@@ -73,11 +73,14 @@ pub(crate) struct Record {
     /// write of the outcome fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retirement_attempt: Option<RetirementAttempt>,
-    /// A weak DA-exempt key a replacement superseded (#1073 item 2): kept so
-    /// envelopes that still name it move off it, and so it can be reported
-    /// once none does. irlume never evicts it: no derivation gives it now.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    superseded: Option<Persisted>,
+    /// The DA-exempt keys the recorded one superseded, still persisted when
+    /// they were (#1073 item 2): a weak key a replacement superseded, or a
+    /// key the start-up step found away from its recorded handle and
+    /// replaced with today's derivation. Kept so envelopes that still name
+    /// one move off it, and so it can be reported once none does. irlume
+    /// never evicts one: no derivation gives it now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    superseded: Vec<Persisted>,
     /// The firmware version (`TPM_PT_FIRMWARE_VERSION_1` and `_2`) on which
     /// today's derivation of the DA-exempt template was weak too: no start
     /// derives for the weak key again until the TPM reads another version.
@@ -379,6 +382,7 @@ pub fn ensure_at_start_reporting() -> Result<(Option<Outcome>, bool)> {
             // the original key's part is decided here.
             let (mut next, mut outcome) =
                 ensure_keeping_use(&mut tpm, &record, boot.as_deref(), &plan)?;
+            keep_superseded(&mut tpm, &record, &mut next)?;
             // A weak key found at its handle is replaced by moving its
             // envelopes first (ADR-0034, Phase 3 amendment, #1073 item 2).
             if matches!(outcome, Outcome::Present { .. }) {
@@ -1419,7 +1423,7 @@ fn replace_weak_with(
         handle: placed,
         name: hex(&name),
     });
-    next.superseded = Some(persisted);
+    supersede(&mut next, persisted);
     next.weak_derivation = None;
     next.replacement_refused = None;
     next.refused = None;
@@ -1432,13 +1436,65 @@ fn replace_weak_with(
     )))
 }
 
-/// The weak DA-exempt key a replacement superseded, as its handle and TPM
-/// name, while the record keeps it; envelopes that name it move onto the
-/// recorded DA-exempt key ([`crate::tpm::move_available`]). Reads the record
-/// only.
-pub(crate) fn superseded_key() -> Option<(u32, String)> {
-    let superseded = load_record().superseded?;
-    Some((superseded.handle, superseded.name))
+/// Keep `old` in `next` as a superseded key, once, unless it is the key
+/// `next` records.
+fn supersede(next: &mut Record, old: Persisted) {
+    let recorded = next
+        .persisted
+        .as_ref()
+        .map(|persisted| persisted.name.as_str());
+    if recorded != Some(old.name.as_str())
+        && !next.superseded.iter().any(|kept| kept.name == old.name)
+    {
+        next.superseded.push(old);
+    }
+}
+
+/// When the start-up step recorded another DA-exempt key than `record` did
+/// (the recorded key was away from its handle, and today's derivation was
+/// adopted or persisted in its place), keep the old key as superseded while
+/// it is still persisted somewhere, found by its TPM name: its envelopes
+/// then move off it, and load through it by name until they do. A key
+/// persisted nowhere is not kept; nothing can load under it.
+fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) -> Result<()> {
+    let (Some(old), Some(new)) = (&record.persisted, &next.persisted) else {
+        return Ok(());
+    };
+    if old.name == new.name {
+        return Ok(());
+    }
+    let Some(name) = unhex(&old.name) else {
+        return Ok(());
+    };
+    if let Some((handle, _)) = tpm
+        .owner_names()?
+        .into_iter()
+        .find(|(_, found)| *found == name)
+    {
+        supersede(
+            next,
+            Persisted {
+                handle,
+                name: old.name.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The DA-exempt keys the recorded one superseded, as their handles and TPM
+/// names, while the record keeps them; envelopes that name one move onto
+/// the recorded DA-exempt key ([`crate::tpm::move_available`]). One that
+/// names the recorded key itself is left out. Reads the record only.
+pub(crate) fn superseded_keys() -> Vec<(u32, String)> {
+    let record = load_record();
+    let recorded = record.persisted.map(|persisted| persisted.name);
+    record
+        .superseded
+        .into_iter()
+        .filter(|kept| recorded.as_deref() != Some(kept.name.as_str()))
+        .map(|kept| (kept.handle, kept.name))
+        .collect()
 }
 
 /// Where a key [`KeyTpm::derive`] just derived, with TPM name `name`, ended
@@ -3812,6 +3868,64 @@ mod tests {
         ));
     }
 
+    /// A start-up step that records another DA-exempt key than the record
+    /// did, because the recorded one was away from its handle, keeps the old
+    /// key as superseded while it is persisted elsewhere, found by its TPM
+    /// name, so its envelopes move off it and load through it until they
+    /// do. A key persisted nowhere, the same key persisted again, or one
+    /// kept already adds nothing.
+    #[test]
+    fn a_recorded_key_found_away_from_its_handle_is_kept_as_superseded() {
+        const ELSEWHERE: u32 = 0x8101_0009;
+        let record = persisted_record(DA_EXEMPT, b"weak");
+        let start = |tpm: &mut FakeTpm| {
+            let (mut next, outcome) =
+                ensure_keeping_use(tpm, &record, Some(BOOT), &Ok(PLAN)).expect("the step");
+            keep_superseded(tpm, &record, &mut next).expect("kept");
+            (next, outcome)
+        };
+        let relocated = Persisted {
+            handle: ELSEWHERE,
+            name: hex(b"weak"),
+        };
+
+        let mut tpm = FakeTpm::new();
+        tpm.objects.insert(ELSEWHERE, b"weak".to_vec());
+        tpm.derive = Ok(b"clean".to_vec());
+        let (mut next, outcome) = start(&mut tpm);
+        assert_eq!(outcome, Outcome::Persisted { handle: DA_EXEMPT });
+        assert_eq!(next.superseded, vec![relocated.clone()]);
+        keep_superseded(&mut tpm, &record, &mut next).expect("kept");
+        assert_eq!(next.superseded.len(), 1, "kept once");
+
+        let mut gone = FakeTpm::new();
+        gone.derive = Ok(b"clean".to_vec());
+        assert!(
+            start(&mut gone).0.superseded.is_empty(),
+            "persisted nowhere"
+        );
+
+        let mut same = FakeTpm::new();
+        same.objects.insert(ELSEWHERE, b"weak".to_vec());
+        same.derive = Ok(b"weak".to_vec());
+        let (again, outcome) = start(&mut same);
+        assert_eq!(outcome, Outcome::Adopted { handle: ELSEWHERE });
+        assert!(again.superseded.is_empty(), "the same key, adopted again");
+
+        let mut itself = persisted_record(DA_EXEMPT, b"weak");
+        supersede(
+            &mut itself,
+            Persisted {
+                handle: DA_EXEMPT,
+                name: hex(b"weak"),
+            },
+        );
+        assert!(
+            itself.superseded.is_empty(),
+            "never the recorded key itself"
+        );
+    }
+
     /// ADR-0034, Phase 3 amendment (#1073 item 2), over a fake TPM: a weak
     /// DA-exempt key is replaced by today's derivation when that is clean,
     /// adopted by its name when a copy is persisted and persisted at the next
@@ -3856,7 +3970,12 @@ mod tests {
             persisted_record(NEXT, b"clean").persisted
         );
         assert_eq!(
-            replaced.superseded, weak_record.persisted,
+            replaced.superseded,
+            weak_record
+                .persisted
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>(),
             "the weak key is kept"
         );
         assert!(tpm.objects.contains_key(&DA_EXEMPT) && tpm.evicted.is_empty());
@@ -3894,8 +4013,8 @@ mod tests {
                 })
             );
             assert_eq!(
-                (kept.persisted.clone(), kept.superseded.clone()),
-                (weak_record.persisted.clone(), None)
+                (kept.persisted.clone(), kept.superseded.is_empty()),
+                (weak_record.persisted.clone(), true)
             );
             // Same firmware: nothing is derived again, in any boot.
             let (_, again) = replace(&mut tpm, &kept, LATER_BOOT).expect("kept");

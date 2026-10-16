@@ -22,9 +22,10 @@ below: the new storage key's template also carries an irlume label in
 
 Amended 2026-10-16 by the [Phase 3
 record](#amendment-2026-10-16-phase-3-retires-a-storage-key-at-irlumeds-start)
-below: irlumed's start retires an unused storage key itself, a root-only
-request retires one that only its recorded name identifies, and a weak
-(ROCA) storage key is replaced by moving its envelopes first (#1073).
+below: irlumed's start retires an unused storage key a derivation proves
+irlume's, a root-only request retires one only a witness object proves
+irlume's, and a weak (ROCA) storage key is replaced by moving its envelopes
+first (#1073).
 
 ## Context
 
@@ -742,59 +743,93 @@ asks what replacing a weak storage key does to the secrets sealed under it.
 This records both. "Retire" below means: evict a storage key from its owner
 persistent handle once no envelope needs it.
 
+### Proof that a key is irlume's
+
+Section 3.4 already makes a fresh derivation the only proof that stands on its
+own, and keeps the record advisory, since it lives in the state directory,
+which section 5 treats as untrusted where it is writable offline. A record
+edited offline can name any key, so a check of a key against the record, or an
+administrator confirming the handle and name doctor printed from it, proves
+nothing. For a key a derivation no longer reproduces (after a firmware update
+that changed key generation) this amendment adds a second proof, a witness:
+
+- When irlumed records a storage key (the DA-exempt key when it persists or
+  adopts it, the original key at the start whose derivation matches it), it
+  also creates a small sealed data object under that key, with an empty
+  authorization and `noDA`, and keeps its public and private areas in the
+  record. A witness is created only under a key that a fresh derivation at
+  that moment proves irlume's, never under a key the record alone names, so
+  an edited record cannot get one made under another stack's key. A key
+  recorded before Phase 3, with no witness, gets one at the first start that
+  derives nothing else and whose fresh derivation still gives that key.
+- A key is irlume's when that witness loads under it (`TPM2_Load`). The TPM
+  protects a child's private area with keys derived from its parent's seed
+  (Part 1, "Protected Storage"), so the witness loads only under the key it
+  was created under. An offline writer of the state directory can delete or
+  replace the witness, which makes the proof fail and retires nothing, but
+  cannot make one that loads under another key without that TPM.
+- A key with no loadable witness is never evicted by irlume. doctor reports
+  it with its handle, its name and the manual command, with the warning to
+  check that nothing else uses it first (the #1079 manual path).
+
 ### Who retires, and when
 
-irlumed's start retires the original key itself, in the start-up step and
-under its record lock, after the persist and recovery steps, and never in an
-authentication. It needs no client: the start already holds the record, opens
-the TPM, and runs before any request. The daemon request #1073 proposes is
-kept only for the case a start may not decide alone (below). The original key
-is retired when all of these hold:
+irlumed's start retires a key itself, in a step after the template key moves
+of the same start, under the record lock, and never in an authentication. It
+needs no client: the start already holds the record, opens the TPM, and runs
+before any request. A key is retired when all of these hold:
 
-1. **Unused across boots.** A start's census finds no envelope under the
-   original key (none without a recorded parent, and none it cannot read,
-   which counts as under it), and records that boot ID as the start of the
-   key's unused time. A start in another boot that finds none again may
-   retire it; a start that finds one clears the mark. A boot ID that cannot be
-   read is no other boot, so no start retires then. A move whose
-   write reports `AtomicWrite::VisibleNotDurable` records its boot ID too, and
-   no start in that boot may mark the key unused: after a power loss the
-   envelope under the original key can come back, and the first start in the
-   next boot finds it. So the earliest retirement is in the boot after the
-   last move, or two boots after a move that was not durable.
-2. **Exact identity.** The key at the original handle has the TPM name the
-   record kept (section 3.4), and a fresh derivation of the original template
-   at this start gives the same modulus, as uninstall compares it. The
-   derivation runs only at a start that derives nothing else, as the record's
-   own check does, so no start pays for two derivations of an RSA-2048 key.
+1. **Unused across boots.** The first start whose census finds no envelope
+   under the key (for the original key: none without a recorded parent; for a
+   weak DA-exempt key: none naming it; an envelope it cannot read counts as
+   under it) records its boot ID. A later start in another boot whose census
+   is still empty may retire the key; a start that finds an envelope clears
+   the mark, and a boot ID that cannot be read is no other boot. A move whose
+   write reports `AtomicWrite::VisibleNotDurable` clears the mark and records
+   its own boot ID, and no start in that boot may set the mark, since after a
+   power loss the envelope under the key can come back. A template key moved
+   durably at a start in boot A can therefore be retired at the first start in
+   a later boot; a key whose last envelope moved after the start (a keyring
+   secret at a login) is marked at the first start of the next boot and
+   retired in a boot after that; a move that was not durable adds a boot.
+2. **Proof.** For the original key: it has the name the record kept and a
+   fresh derivation of the original template at this start gives the same
+   modulus, as uninstall compares it. The derivation runs only at a start that
+   derives nothing else, as the record's own check does, so no start pays for
+   two derivations of an RSA-2048 key. A key that only its witness proves
+   irlume's (below) is not retired by a start.
 3. **The DA-exempt key is present** at its recorded handle with its recorded
-   name, so an envelope that comes back has a key to move to.
+   name and its witness loads, so an envelope that comes back has a key to
+   move to.
 
-A key at the original handle that only the recorded name identifies (today's
-derivation differs, as after a firmware update that changed key generation)
-is never retired by a start. doctor names its handle and name, and a root-only
-request retires it after an administrator names both: `irlume tpm retire-key
---handle <handle> --name <name>`, served on the worker. irlumed checks that the
-key at that handle has that name, that the record kept that name for it, and
-that condition 1 holds, and then evicts it; any mismatch refuses with nothing
-evicted. A record edited to name another stack's key therefore evicts nothing
-without that confirmation, and the confirmation itself names the key.
+A key that its witness proves irlume's but a derivation no longer reproduces
+is retired only on an administrator's request: `irlume tpm retire-key
+--handle <handle>`, root-only, served on the worker. irlumed checks the
+witness and condition 1, and then evicts it; a witness that does not load, or
+an envelope under the key, refuses with nothing evicted. The request is a
+consent, not the proof: such a key cannot be derived again, so an envelope
+under it that comes back later (an older copy of the state directory, a
+restored backup) needs `irlume recovery restore` or a re-enrollment, and the
+command says so before it acts.
 
 ### An envelope that comes back
 
-After the original key is retired, an envelope under it can return from an
-older copy of the state directory or a restored backup (section 3.4).
-irlumed's start finds it in the census, derives the original template as a
-transient key, which it never persists while the DA-exempt key is persisted,
-and moves the envelope through it onto the DA-exempt key at its move point
-(the template key at the start, a keyring secret at the next login's reseal).
-An authentication never derives the original key once a DA-exempt key is
-persisted: an envelope still under the retired key falls back to the password
-until the start or the reseal has moved it. Only with no persisted irlume key
-at all does the section 3.2 fallback, today's per-call derivation, apply.
-Today an unseal finding the original handle free derives the original key and
-persists it there (`load_or_create_srk` in `SrkMode::Initialize`); Phase 3
-changes that path, since otherwise the first authentication after a
+After a key a derivation reproduces is retired, an envelope under it can
+return (section 3.4). irlumed's start finds it in the census, derives the
+original template as a transient key, which it never persists while the
+DA-exempt key is persisted, and moves the envelope through it onto the
+DA-exempt key at its move point (the template key at the start, a keyring
+secret at the next login's reseal). That holds only while today's derivation
+still gives the retired key: after a firmware update that changed key
+generation, or an owner authorization set since, it does not, and the
+envelope needs `irlume recovery restore` or a re-enrollment, as section 3.4
+says. An authentication never derives the original key once a DA-exempt key
+is persisted: an envelope still under a retired key falls back to the
+password until the start or the reseal has moved it. Only with no persisted
+irlume key at all does the section 3.2 fallback, today's per-call derivation,
+apply. Today an unseal finding the original handle free derives the original
+key and persists it there (`load_or_create_srk` in `SrkMode::Initialize`);
+Phase 3 changes that path, since otherwise the first authentication after a
 retirement would persist the key again.
 
 ### A weak storage key (#1073 item 2)
@@ -806,63 +841,74 @@ envelopes first, never by evicting a key an envelope names:
 - **The original key is weak.** Its envelopes move onto the DA-exempt key as
   for any original key. When today's derivation of the DA-exempt template
   gives a key without the fingerprint, nothing more is needed; the original
-  key is then retired as above, through the confirmed request when only its
-  name identifies it.
+  key is then retired as above, or through the request when only its witness
+  proves it irlume's.
 - **The DA-exempt key is weak** (persisted before a firmware update fixed key
   generation) **and today's derivation of its template is not.** irlumed's
-  start persists the new derivation at the next free owner handle and records
-  it as the DA-exempt key, keeping the weak key's handle and name in the
-  record as a key to retire. An envelope whose parent is the weak key counts
-  as having a reason to move, like one on the original key, and moves at its
-  move point. The weak key is retired when no envelope names it, across boots
-  as in condition 1, and only through the confirmed request, since a fresh
-  derivation no longer reproduces it.
+  start persists the new derivation at the next free owner handle, with a
+  witness, and records it as the DA-exempt key, keeping the weak key's handle,
+  name and witness in the record as a key to retire. An envelope whose parent
+  is the weak key counts as having a reason to move, like one on the original
+  key, and moves at its move point. The weak key is retired through the
+  request once no envelope names it, across boots as in condition 1. If the
+  new key cannot be persisted (`TPM_RC_NV_SPACE`, no free owner handle, an
+  owner authorization), the refusal is recorded with the boot ID and retried
+  by the rules of section 3.2: the weak key stays the parent of new seals, its
+  envelopes keep loading, nothing moves, and doctor reports the refusal with
+  the weak key.
 - **Today's derivation of the DA-exempt template is weak too** (the firmware
-  is not updated). The DA-exempt key is not replaced, since a new one would
-  be as weak; doctor says to update the TPM firmware first.
+  is not updated). The DA-exempt key is not replaced, since a new one would be
+  as weak; doctor says to update the TPM firmware first.
 
-So the request never touches the secrets sealed under a key: they have moved
-before it can run. Face login needs no `irlume recovery restore` and no
-re-enrollment, unlike the manual eviction doctor advises today (#1079), and a
-keyring secret needs no reseal at a password login. The confirmation step is
-the administrator naming the handle and the name; resealing under the new key
-is the move, which is round-trip checked as section 3.3 requires.
+The secrets sealed under a weak key therefore move before any retirement: an
+envelope present when its move runs needs no `irlume recovery restore`, no
+re-enrollment and no password login, unlike the manual eviction doctor advises
+today (#1079). Resealing under the new key is the move, round-trip checked as
+section 3.3 requires. Only an envelope that comes back after its key was
+retired through the request needs recovery, as above.
 
 ### What doctor reports
 
 The `tpm-lockout` reading is unchanged. A storage key waiting to be retired is
-reported with its handle, its name and the condition it waits for: a later
-boot, an envelope that still names it (by account and kind), a derivation
-that no longer matches (with the `irlume tpm retire-key` command), or the
-DA-exempt key it needs. Uninstall, which evicts only what a fresh derivation
-gives, reports a key that only its recorded name identifies with its handle
-and name and leaves it, as section 3.4 says.
+reported with its handle, its name and what it waits for: a later boot, an
+envelope that still names it (by account and kind), the DA-exempt key it
+needs, or the administrator's request (with the `irlume tpm retire-key`
+command and its consequence). A key irlume cannot prove its own is reported
+with the manual command and its warning. Uninstall, which evicts only what a
+fresh derivation gives, leaves a key only its witness proves irlume's and
+reports it with its handle and name.
 
 Acceptance tests (added, Phase 3):
 
-- With every envelope moved by durable writes, the original key is not
-  retired at a start in the boot of the last move and is retired at the first
-  start in a later boot whose census still finds none; a move that reported
-  `VisibleNotDurable` delays it by one more boot; an envelope under the
-  original key restored by a simulated power loss keeps it; an envelope that
-  cannot be parsed keeps it; an unreadable boot ID retires nothing (fake TPM
-  and boot IDs, and swtpm).
+- With fake boot IDs: a template key moved durably at a start is retired at
+  the first start in a later boot whose census is still empty; a keyring
+  secret moved after the start delays that by one boot; a move that reported
+  `VisibleNotDurable` delays it by one more; an envelope restored by a
+  simulated power loss keeps the key; an envelope that cannot be parsed keeps
+  it; an unreadable boot ID retires nothing (fake TPM, and swtpm for the
+  eviction).
 - A start that derived the DA-exempt key does not retire in the same start.
-- A key at the original handle whose name the record kept but that today's
-  derivation does not reproduce (a key the test persists from another
-  template, its name written into the record as matched) is not retired by
-  any start; the confirmed request with its handle and name retires it; the
-  request with another handle or another name, or while an envelope is under
-  it, refuses and evicts nothing; a record edited to name another stack's key
-  evicts nothing (swtpm).
-- After the original key is retired, an envelope under it restored from an
-  older copy of the state directory is moved at the next start through a
-  transient original key onto the DA-exempt key, with nothing persisted at the
-  original handle; an authentication before that start does not derive it
-  and falls back to the password (swtpm).
+- A witness created under a key loads under it and not under another key with
+  the same template and another modulus; a witness replaced or removed in the
+  record makes the request refuse with nothing evicted; a record edited to
+  name another stack's key evicts nothing, by a start or by the request, and
+  gets no witness created under that key; a key recorded without a witness
+  gets one at a start whose derivation still gives it, and none at a start
+  whose derivation does not (swtpm).
+- A key the record kept as matched but today's derivation does not reproduce
+  (a key the test persists from another template, with a witness created
+  under it) is not retired by any start, and the request retires it once no
+  envelope is under it and refuses while one is (swtpm).
+- After a key a derivation reproduces is retired, an envelope under it
+  restored from an older copy of the state directory is moved at the next
+  start through a transient original key onto the DA-exempt key, with nothing
+  persisted at the original handle; an authentication before that start does
+  not derive it and falls back to the password (swtpm).
 - A recorded DA-exempt key with the ROCA fingerprint, with today's derivation
   clean, is replaced at the next start by a new key at the next free handle;
   its envelopes move at their move points and the weak key is kept until the
-  confirmed request retires it; with today's derivation weak too, nothing
-  moves and doctor names the firmware update (synthetic moduli for the
-  fingerprint, as `roca_verdict`'s tests use, and swtpm for the moves).
+  request retires it; with the TPM full or no owner handle free, the refusal
+  is recorded and the weak key stays in use; with today's derivation weak
+  too, nothing is replaced and doctor names the firmware update (synthetic
+  moduli for the fingerprint, as `roca_verdict`'s tests use, and swtpm for
+  the moves and the capacity).

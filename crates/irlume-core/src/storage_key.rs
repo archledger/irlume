@@ -190,8 +190,13 @@ pub enum Outcome {
 /// irlumed's start-up step (ADR-0034 §3.2). It runs while any envelope
 /// exists: those on the original key need the DA-exempt key persisted for
 /// their move, and those on it need it still there. With none it returns
-/// `None` and asks the TPM nothing, and a refusal recorded earlier is cleared,
-/// since no envelope is left for it to concern.
+/// `None` and derives or persists no DA-exempt key, and a refusal recorded
+/// earlier is cleared, since no envelope is left for it to concern.
+///
+/// Either way it keeps the record of the original key (§3.4, `original_with`):
+/// that key can outlive the last envelope, and its name must be recorded
+/// before a firmware update can change its derivation. The check is
+/// advisory, so a TPM that cannot be opened or read changes nothing there.
 ///
 /// The key is derived at most once, and only when the recorded key is not at
 /// its handle and no refusal earlier in this boot stands. A copy already
@@ -209,26 +214,35 @@ pub enum Outcome {
 /// write is adopted at the next start.
 pub fn ensure_at_start() -> Result<Option<Outcome>> {
     let envelope = any_envelope()?;
-    if !envelope && load_record().refused.is_none() {
-        return Ok(None);
-    }
     // One transaction: two starts that overlap (a direct start beside the
     // service) would each read, decide and write the record, and a refusal
     // one of them recorded last would replace the key the other persisted.
     // Under the lock the second start reads the first one's record.
     let _lock = RecordLock::acquire()?;
     let record = load_record();
+    let plan = tpm::da_exempt_key_plan();
     if !envelope {
-        if record.refused.is_some() {
+        // This start derives nothing else, so it may check the original key.
+        let original = match &plan {
+            Ok(chosen) => tpm::DaExemptKeyTpm::open()
+                .and_then(|mut tpm| {
+                    original_with(&mut tpm, chosen.original, record.original.clone(), false)
+                })
+                .unwrap_or_else(|_| record.original.clone()),
+            Err(_) => record.original.clone(),
+        };
+        // Written only when it changes, so a host with nothing to record
+        // gets no record file.
+        if record.refused.is_some() || original != record.original {
             save_record(&Record {
                 refused: None,
                 version: RECORD_VERSION,
+                original,
                 ..record
             })?;
         }
         return Ok(None);
     }
-    let plan = tpm::da_exempt_key_plan();
     let boot = irlume_common::boot_id();
     // A refused override needs no TPM, so a transport that cannot be opened
     // does not hide it: `ensure_with` records it before any TPM call.
@@ -1184,8 +1198,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With no envelope left, the start-up step clears a recorded refusal
-    /// without asking the TPM, and doctor's report no longer carries one.
+    /// With no envelope left, the start-up step clears a recorded refusal,
+    /// and doctor's report no longer carries one. A TPM that cannot be
+    /// opened stops neither: the original key's check is advisory. With
+    /// nothing to record, no record file is written.
     #[test]
     fn a_refusal_is_dropped_once_no_envelope_remains() {
         let _env = crate::testenv::ENV_LOCK
@@ -1204,6 +1220,8 @@ mod tests {
         std::env::set_var("IRLUME_STATE_DIR", &dir);
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
         std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let empty = ensure_at_start();
+        let no_file = !record_path().exists();
         let refused = Record {
             version: RECORD_VERSION,
             persisted: None,
@@ -1225,6 +1243,8 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(empty.expect("the step"), None);
+        assert!(no_file, "nothing to record writes no record");
         assert_eq!(reported.expect("report").refused, None);
         assert_eq!(outcome.expect("the step"), None);
         assert_eq!(kept.refused, None);

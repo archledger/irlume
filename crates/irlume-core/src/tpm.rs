@@ -5014,8 +5014,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
     /// ADR-0034 §3.4 on swtpm: irlumed's start records the original key's
     /// TPM name once today's derivation of the original template gives that
-    /// key, at a start that derived nothing else: not at the start that
-    /// persisted the DA-exempt key, but at the next one.
+    /// key, at a start that derived nothing else. A start with no envelope
+    /// records it too, since the key can outlive the last envelope, and
+    /// persists no DA-exempt key; the start that persists the DA-exempt key
+    /// leaves the check to the next one.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
@@ -5039,11 +5041,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             !before.contains(&PREFERRED),
             "the handle this test uses is taken: {before:x?}"
         );
-        dirs.store("alice", &original);
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
         let record = || {
-            let bytes = std::fs::read(format!("{}/tpm-storage-key", dirs.dir)).expect("record");
+            let bytes = std::fs::read(&record_path).expect("record");
             serde_json::from_slice::<serde_json::Value>(&bytes).expect("record json")
         };
+        let no_envelope = crate::storage_key::ensure_at_start();
+        let without_envelopes = record();
+        let after_no_envelope = handles();
+        dirs.store("alice", &original);
+        std::fs::remove_file(&record_path).expect("drop the record");
         let first = crate::storage_key::ensure_at_start();
         let after_first = record();
         let second = crate::storage_key::ensure_at_start();
@@ -5055,6 +5062,19 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let after = handles();
         drop(dirs);
 
+        let name = name.expect("read").expect("the original key");
+        let recorded = serde_json::json!({
+            "handle": PERSISTENT_SRK_HANDLE, "name": name, "matched": true
+        });
+        assert_eq!(no_envelope.expect("the step"), None);
+        assert_eq!(
+            without_envelopes["original"], recorded,
+            "{without_envelopes}"
+        );
+        assert_eq!(
+            after_no_envelope, before,
+            "no DA-exempt key without an envelope"
+        );
         assert_eq!(
             first.expect("the step"),
             Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
@@ -5067,13 +5087,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             second.expect("the step"),
             Some(crate::storage_key::Outcome::Present { handle: PREFERRED })
         );
-        let name = name.expect("read").expect("the original key");
-        assert_eq!(
-            after_second["original"],
-            serde_json::json!({
-                "handle": PERSISTENT_SRK_HANDLE, "name": name, "matched": true
-            })
-        );
+        assert_eq!(after_second["original"], recorded);
         assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert_eq!(
             after, before,

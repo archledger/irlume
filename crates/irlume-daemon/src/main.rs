@@ -1560,8 +1560,10 @@ fn main() {
             // refusal it derives nothing again in the same boot unless the
             // TPM now has room (#1083). New seals go under the key once it is
             // persisted, and this runs before the template key moves below,
-            // so their envelopes can move onto it in this start. Both run
-            // when the TPM is reachable (`startup_tpm_reachable`).
+            // so their envelopes can move onto it in this start. The same
+            // step records the original key's TPM name once its derivation
+            // matches (§3.4), with or without an envelope. Both run when the
+            // TPM is reachable (`startup_tpm_reachable`).
             if startup_tpm_reachable() {
                 use irlume_core::storage_key::Outcome;
                 match irlume_core::storage_key::ensure_at_start() {

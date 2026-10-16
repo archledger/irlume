@@ -11,7 +11,9 @@ All notable changes to irlume are documented here. This project adheres to
   today's derivation of the original template gives that key (ADR-0034
   §3.4), for the later eviction of that key (#1073). It checks at a start
   that derives nothing else, so no start pays for two derivations of an
-  RSA-2048 key, and not again while the key at that handle keeps its name.
+  RSA-2048 key, and not again while the key at that handle keeps its name;
+  a host with no envelope left is checked too, since the key can outlive
+  the last one.
   A key there that the derivation does not give is kept as checked but not
   recorded. The record is in the state directory, so it is advisory and
   never by itself authorizes evicting a key.

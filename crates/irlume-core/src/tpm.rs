@@ -5467,6 +5467,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // retires nothing.
         let marked = settle_at_start_in(Some(BOOT_A), true);
         let same_boot = settle_at_start_in(Some(BOOT_A), false);
+        // doctor's report, in this boot, which is not fake boot A.
+        let reported_waiting = crate::storage_key::report().map(|key| key.original_key);
         let deriving = settle_at_start_in(Some(BOOT_B), true);
         let record_path = format!("{}/tpm-storage-key", dirs.dir);
         let kept_record = std::fs::read(&record_path).expect("record");
@@ -5530,6 +5532,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         std::fs::write(&record_path, &kept_record).expect("restore the record");
         let retired = settle_at_start_in(Some(BOOT_B), false);
         let after_retirement = handles();
+        let reported_retired = crate::storage_key::report().map(|key| key.original_key);
         let template_key = crate::template_key::load_key("alice");
         let again = settle_at_start_in(Some(BOOT_C), false);
 
@@ -5581,6 +5584,21 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(
             !after_retirement.contains(&original) && after_retirement.contains(&PREFERRED),
             "the original key is evicted and the DA-exempt key stays: {after_retirement:x?}"
+        );
+        assert!(
+            matches!(
+                reported_waiting.expect("the report"),
+                Some(irlume_common::tpm_readiness::OriginalKey::Waiting {
+                    handle,
+                    wait: irlume_common::tpm_readiness::RetirementWait::NextStart,
+                    ..
+                }) if handle == original
+            ),
+            "doctor reads the retirement as due at the next start"
+        );
+        assert_eq!(
+            reported_retired.expect("the report"),
+            Some(irlume_common::tpm_readiness::OriginalKey::Retired { handle: original })
         );
         assert_eq!(template_key.expect("the key").as_slice(), key.as_slice());
         assert_eq!(retirement(again), None, "nothing left to retire");

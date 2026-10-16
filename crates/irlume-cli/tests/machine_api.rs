@@ -591,6 +591,7 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
         "tpm-firmware",
         "tpm-pcr-bank",
         "tpm-lockout",
+        "tpm-storage-keys",
         "secure-boot",
         "secure-boot-certificates",
         "shim-validation",

@@ -7,6 +7,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` gains a `tpm-storage-keys` check (ADR-0034, Phase 3
+  amendment; #1073). It reports whether irlume's original storage key is
+  retired, and otherwise names the key's handle and TPM name and what its
+  retirement at irlumed's start waits for:
+  - envelopes still under it, or a move off it in this boot not yet shown
+    durable, both named by account and kind;
+  - a count at irlumed's next start, a start in a later boot, or the next
+    start;
+  - the DA-exempt storage key;
+  - a retirement that failed, with the error and when irlumed tries again.
+    No eviction command is offered for that, since only a derivation shows
+    the key is irlume's.
+
+  A key today's derivation does not give is reported with the manual
+  `tpm2_evictcontrol` command and its warning once no envelope is under it.
+  irlumed adds the report to its root-only `TpmReadiness` reply as an
+  optional field, so an older client reads the rest as before. The TUI's
+  doctor readout runs the same check.
+
 - irlumed retires irlume's original storage key itself, at its start, once
   nothing needs it (ADR-0034, Phase 3 amendment; #1073): the key no
   longer holds an owner persistent handle that a TPM lockout makes useless.

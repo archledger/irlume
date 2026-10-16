@@ -14,8 +14,8 @@
 
 use crate::{keyring, template_key, tpm};
 use irlume_common::tpm_readiness::{
-    DaExemptKey, EnvelopeKind, KeyRefusal, OriginalKeyEnvelope, OriginalKeyEnvelopes,
-    RefusalReason, MAX_NAMED_ENVELOPES,
+    DaExemptKey, EnvelopeKind, KeyRefusal, OriginalKey, OriginalKeyEnvelope, OriginalKeyEnvelopes,
+    RefusalReason, RetirementWait, MAX_NAMED_ENVELOPES,
 };
 use irlume_common::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -369,25 +369,39 @@ fn checked_original(
 
 /// What `irlume doctor` reports (ADR-0034 §4): the record, with the recorded
 /// handle kept only while the key there has the recorded name, a recorded
-/// refusal only while any envelope exists, and the envelopes still under the
-/// original storage key (`on_original_key`).
+/// refusal only while any envelope exists, the envelopes still under the
+/// original storage key (`on_original_key`), and that key's retirement
+/// (`original_key_state`, the Phase 3 amendment).
 ///
 /// # Errors
 ///
-/// When an envelope directory cannot be read, or the record names a handle
-/// and the TPM cannot be opened or read.
+/// When an envelope directory cannot be read, or the record names a key and
+/// the TPM cannot be opened or read.
 pub fn report() -> Result<DaExemptKey> {
     let mut record = load_record();
     if !any_envelope()? {
         record.refused = None;
     }
-    let handle = match &record.persisted {
-        Some(persisted) => {
-            let mut tpm = tpm::DaExemptKeyTpm::open()?;
-            let name = tpm_name_hex(&mut tpm, persisted.handle)?;
+    let mut tpm = match (&record.persisted, &record.original) {
+        (None, None) => None,
+        _ => Some(tpm::DaExemptKeyTpm::open()?),
+    };
+    let handle = match (&record.persisted, tpm.as_mut()) {
+        (Some(persisted), Some(tpm)) => {
+            let name = tpm_name_hex(tpm, persisted.handle)?;
             (name.as_deref() == Some(persisted.name.as_str())).then_some(persisted.handle)
         }
-        None => None,
+        _ => None,
+    };
+    let original_key = match tpm.as_mut() {
+        Some(tpm) => original_key_state(
+            tpm,
+            &record,
+            any_under_original_key()?,
+            tpm::da_exempt_key_plan().ok().map(|plan| plan.original),
+            irlume_common::boot_id().as_deref(),
+        )?,
+        None => OriginalKey::NotRecorded,
     };
     Ok(DaExemptKey {
         handle,
@@ -399,7 +413,114 @@ pub fn report() -> Result<DaExemptKey> {
             detail: irlume_common::single_line(&refused.detail, MAX_DETAIL_CHARS),
         }),
         on_original_key: Some(on_original_key()?),
+        original_key: Some(original_key),
     })
+}
+
+/// The longest TPM name, in hex, a report carries: a SHA-512 name is 66
+/// bytes, so 132 characters.
+const MAX_NAME_HEX: usize = 160;
+
+/// irlume's original storage key as `record` and `tpm` show it, for doctor:
+/// retired, or what its retirement at irlumed's start waits for, in the
+/// order irlumed's start checks it ([`settle_at_start`]). `in_use` is the
+/// census (an envelope under the key, or one that cannot be read),
+/// `original_handle` the original key's handle today (`None` for a refused
+/// `IRLUME_SRK_HANDLE`), and `boot` this boot.
+fn original_key_state(
+    tpm: &mut impl KeyTpm,
+    record: &Record,
+    in_use: bool,
+    original_handle: Option<u32>,
+    boot: Option<&str>,
+) -> Result<OriginalKey> {
+    let Some(original) = &record.original else {
+        return Ok(OriginalKey::NotRecorded);
+    };
+    let handle = original.handle;
+    // The record is untrusted where it is writable offline (§5): only a
+    // bounded hex name goes out.
+    let name = if original.name.len() <= MAX_NAME_HEX
+        && original.name.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        original.name.clone()
+    } else {
+        String::new()
+    };
+    let waiting = |wait| OriginalKey::Waiting {
+        handle,
+        name: name.clone(),
+        wait,
+    };
+    if original_handle != Some(handle) {
+        return Ok(waiting(RetirementWait::HandleChanged {
+            configured: original_handle,
+        }));
+    }
+    let Some(at_handle) = tpm.name_at(handle)? else {
+        return Ok(OriginalKey::Retired { handle });
+    };
+    if unhex(&original.name).as_deref() != Some(at_handle.as_slice()) {
+        return Ok(waiting(RetirementWait::Unchecked));
+    }
+    if !original.matched {
+        return Ok(waiting(RetirementWait::NotReproduced { in_use }));
+    }
+    if in_use {
+        return Ok(waiting(RetirementWait::Envelopes));
+    }
+    if let Some(attempt) = &record.retirement_attempt {
+        let detail = attempt.failure.as_deref().map_or_else(
+            || "the attempt did not finish".to_owned(),
+            |failure| irlume_common::single_line(failure, MAX_DETAIL_CHARS),
+        );
+        let in_this_boot = boot.is_some() && attempt.boot_id.as_deref() == boot;
+        return Ok(waiting(RetirementWait::Failed {
+            detail,
+            in_this_boot,
+        }));
+    }
+    let usable = match &record.persisted {
+        Some(persisted) => match unhex(&persisted.name) {
+            Some(da_exempt) => tpm.holds_da_exempt_key(persisted.handle, &da_exempt)?,
+            None => false,
+        },
+        None => false,
+    };
+    if !usable {
+        return Ok(waiting(RetirementWait::DaExemptKey));
+    }
+    // The moves a census in this boot waits for, as `mark_with` reads them.
+    let unsettled: Vec<&UnsettledMove> = record
+        .moves
+        .iter()
+        .filter(|entry| match (boot, entry.boot_id.as_deref()) {
+            (Some(now), Some(then)) => now == then,
+            _ => true,
+        })
+        .collect();
+    if !unsettled.is_empty() {
+        // Every entry counts in the total, named or not.
+        let total = u32::try_from(unsettled.len()).unwrap_or(u32::MAX);
+        let mut envelopes: Vec<OriginalKeyEnvelope> = unsettled
+            .into_iter()
+            .filter(|entry| is_account_name(&entry.user))
+            .map(|entry| OriginalKeyEnvelope {
+                user: entry.user.clone(),
+                kind: entry.kind,
+            })
+            .collect();
+        envelopes.sort();
+        envelopes.truncate(MAX_NAMED_ENVELOPES);
+        return Ok(waiting(RetirementWait::UnsettledMoves { envelopes, total }));
+    }
+    Ok(waiting(match (record.unused_since.as_deref(), boot) {
+        (None, _) => RetirementWait::Count,
+        (Some(since), Some(now)) if since != now => RetirementWait::NextStart,
+        // Marked in this boot, or this boot cannot be read, which is no
+        // other boot.
+        (Some(_), _) => RetirementWait::LaterBoot,
+    }))
 }
 
 /// The envelopes (sealed template keys and keyring secrets) that record no
@@ -3265,6 +3386,176 @@ mod tests {
             checked_original(Err(Error::Tpm("read failed".into())), &record),
             (record.original.clone(), true)
         );
+    }
+
+    /// What doctor reads about the original key's retirement (ADR-0034,
+    /// Phase 3 amendment): each wait in the order irlumed's start checks it,
+    /// with the name sent only as bounded hex and only accepted account
+    /// names among the unsettled moves.
+    #[test]
+    fn the_original_keys_retirement_is_reported_with_what_it_waits_for() {
+        use RetirementWait::{
+            Count, DaExemptKey, Envelopes, Failed, HandleChanged, LaterBoot, NextStart,
+            NotReproduced, Unchecked, UnsettledMoves,
+        };
+        let now = Some(LATER_BOOT);
+        let state = |tpm: &mut FakeTpm, record: &Record, in_use: bool| {
+            original_key_state(tpm, record, in_use, Some(ORIGINAL), now).expect("read")
+        };
+        let waiting = |wait| OriginalKey::Waiting {
+            handle: ORIGINAL,
+            name: hex(b"orig"),
+            wait,
+        };
+        let record = retiring_record(Some(BOOT));
+        let with = |change: &dyn Fn(&mut Record)| {
+            let mut changed = record.clone();
+            change(&mut changed);
+            changed
+        };
+
+        assert_eq!(
+            state(&mut retiring_tpm(), &Record::default(), false),
+            OriginalKey::NotRecorded
+        );
+        let mut gone = retiring_tpm();
+        gone.objects.remove(&ORIGINAL);
+        assert_eq!(
+            state(&mut gone, &record, false),
+            OriginalKey::Retired { handle: ORIGINAL }
+        );
+        let mut other = retiring_tpm();
+        other.objects.insert(ORIGINAL, b"another".to_vec());
+        assert_eq!(state(&mut other, &record, false), waiting(Unchecked));
+        assert_eq!(
+            original_key_state(&mut retiring_tpm(), &record, false, Some(0x8101_0010), now)
+                .expect("read"),
+            waiting(HandleChanged {
+                configured: Some(0x8101_0010)
+            }),
+            "the original key's handle changed"
+        );
+        assert_eq!(
+            original_key_state(&mut retiring_tpm(), &record, false, None, now).expect("read"),
+            waiting(HandleChanged { configured: None }),
+            "IRLUME_SRK_HANDLE is refused"
+        );
+        let unmatched = with(&|r| {
+            if let Some(original) = r.original.as_mut() {
+                original.matched = false;
+            }
+        });
+        assert_eq!(
+            state(&mut retiring_tpm(), &unmatched, false),
+            waiting(NotReproduced { in_use: false })
+        );
+        // The census counts an envelope it cannot read, which doctor's list
+        // of envelopes does not name.
+        assert_eq!(
+            state(&mut retiring_tpm(), &unmatched, true),
+            waiting(NotReproduced { in_use: true })
+        );
+        assert_eq!(
+            state(&mut retiring_tpm(), &record, true),
+            waiting(Envelopes)
+        );
+        let failed = with(&|r| {
+            r.retirement_attempt = Some(RetirementAttempt {
+                boot_id: Some(LATER_BOOT.into()),
+                failure: Some("TPM_RC_BAD_AUTH\nforged line".into()),
+            });
+        });
+        assert_eq!(
+            state(&mut retiring_tpm(), &failed, false),
+            waiting(Failed {
+                detail: irlume_common::single_line("TPM_RC_BAD_AUTH\nforged line", 300),
+                in_this_boot: true
+            })
+        );
+        let unfinished = with(&|r| {
+            r.retirement_attempt = Some(RetirementAttempt {
+                boot_id: Some(BOOT.into()),
+                failure: None,
+            });
+        });
+        assert_eq!(
+            state(&mut retiring_tpm(), &unfinished, false),
+            waiting(Failed {
+                detail: "the attempt did not finish".into(),
+                in_this_boot: false
+            })
+        );
+        let mut no_da_exempt = retiring_tpm();
+        no_da_exempt.objects.remove(&DA_EXEMPT);
+        assert_eq!(
+            state(&mut no_da_exempt, &record, false),
+            waiting(DaExemptKey)
+        );
+        let mut other_auth = retiring_tpm();
+        other_auth.other_auth.push(DA_EXEMPT);
+        assert_eq!(state(&mut other_auth, &record, false), waiting(DaExemptKey));
+        let entry = |user: &str, boot: Option<&str>| UnsettledMove {
+            user: user.into(),
+            kind: EnvelopeKind::KeyringSecret,
+            boot_id: boot.map(str::to_owned),
+        };
+        let moving = with(&|r| {
+            r.unused_since = None;
+            r.moves = vec![
+                entry("bob", Some(LATER_BOOT)),
+                entry("-planted\u{1b}", Some(LATER_BOOT)),
+                entry("carol", Some(BOOT)),
+            ];
+        });
+        assert_eq!(
+            state(&mut retiring_tpm(), &moving, false),
+            waiting(UnsettledMoves {
+                envelopes: vec![OriginalKeyEnvelope {
+                    user: "bob".into(),
+                    kind: EnvelopeKind::KeyringSecret
+                }],
+                total: 2
+            })
+        );
+        let settled = with(&|r| {
+            r.unused_since = None;
+            r.moves = vec![entry("carol", Some(BOOT))];
+        });
+        assert_eq!(
+            state(&mut retiring_tpm(), &settled, false),
+            waiting(Count),
+            "another boot's move is on disk"
+        );
+        let marked_now = with(&|r| r.unused_since = Some(LATER_BOOT.into()));
+        assert_eq!(
+            state(&mut retiring_tpm(), &marked_now, false),
+            waiting(LaterBoot)
+        );
+        assert_eq!(
+            state(&mut retiring_tpm(), &record, false),
+            waiting(NextStart)
+        );
+        assert_eq!(
+            original_key_state(&mut retiring_tpm(), &record, false, Some(ORIGINAL), None)
+                .expect("read"),
+            waiting(LaterBoot),
+            "an unreadable boot is no other boot"
+        );
+        let unhexed = with(&|r| {
+            if let Some(original) = r.original.as_mut() {
+                original.name = "\u{1b}[31mnot hex".into();
+            }
+        });
+        let mut planted = retiring_tpm();
+        planted.objects.remove(&ORIGINAL);
+        assert_eq!(
+            state(&mut planted, &unhexed, false),
+            OriginalKey::Retired { handle: ORIGINAL }
+        );
+        assert!(matches!(
+            original_key_state(&mut retiring_tpm(), &unhexed, false, Some(0x8101_0010), now),
+            Ok(OriginalKey::Waiting { name, .. }) if name.is_empty()
+        ));
     }
 
     /// The start-up step decides the DA-exempt key's part of the record and

@@ -306,27 +306,35 @@ pub struct Repointed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepointOutcome {
     /// A key with the recorded name is persisted at this handle, which the
-    /// envelope now records.
+    /// template key now records.
     Moved(u32),
     /// No persisted owner key has the recorded name, so the envelope cannot
     /// load until it is sealed again.
     Missing,
     /// A key with the recorded name is persisted at this handle, but the
-    /// envelope could not be rewritten; the next start tries again.
+    /// template key could not be rewritten; the next start tries again.
     Unwritten(u32, String),
 }
 
 /// irlumed's start-up recovery by name (ADR-0034 §3.3: the recorded name
-/// decides and the handle is a hint). An envelope that records a parent whose
-/// handle does not hold a key with the recorded TPM name, as when another
-/// stack took the handle after the key left it, records instead the owner
-/// handle where a key with that name is persisted. Only the handle in the
-/// envelope changes: the sealed object is not touched, so nothing is unsealed
-/// or sealed. It runs after [`ensure_at_start`], which persists the
+/// decides and the handle is a hint). A template key that records a parent
+/// whose handle does not hold a key with the recorded TPM name, as when
+/// another stack took the handle after the key left it, records instead the
+/// owner handle where a key with that name is persisted. Only the handle in
+/// the envelope changes: the sealed object is not touched, so nothing is
+/// unsealed or sealed. It runs after [`ensure_at_start`], which persists the
 /// DA-exempt key again when it went missing, so the envelope finds the key
 /// where that step put it. With no envelope recording a parent it asks the
 /// TPM nothing. An authentication never does this: it uses only the key at
 /// the envelope's handle, or at the handle irlumed recorded for the same name.
+///
+/// A keyring envelope is checked but never rewritten here. Its writers
+/// (`keyring arm`, a login's reseal) take no lock of their own: irlumed's
+/// single worker is what orders them, and this step can run in a second
+/// irlumed started beside the service, where a rewrite could put back a
+/// secret the service has just replaced. One whose key is at another handle
+/// still loads through irlumed's record of that key, and one that does not
+/// load is sealed again by the next login's reseal.
 ///
 /// # Errors
 ///
@@ -403,12 +411,16 @@ pub(crate) fn repoint_with(
             }
             None => None,
         };
-        let outcome = match found {
-            Some(to) => match record_parent_handle(&path, kind, &user, &parent, to) {
-                Ok(()) => RepointOutcome::Moved(to),
-                Err(e) => RepointOutcome::Unwritten(to, e.to_string()),
-            },
-            None => RepointOutcome::Missing,
+        let outcome = match (found, kind) {
+            (Some(to), EnvelopeKind::TemplateKey) => {
+                match record_parent_handle(&path, &user, &parent, to) {
+                    Ok(()) => RepointOutcome::Moved(to),
+                    Err(e) => RepointOutcome::Unwritten(to, e.to_string()),
+                }
+            }
+            // Not rewritten outside irlumed's worker (see `repoint_at_start`).
+            (Some(_), EnvelopeKind::KeyringSecret | EnvelopeKind::Unknown) => continue,
+            (None, _) => RepointOutcome::Missing,
         };
         repointed.push(Repointed {
             user,
@@ -420,20 +432,17 @@ pub(crate) fn repoint_with(
     Ok(repointed)
 }
 
-/// Rewrite the envelope at `path` to record `handle` for its parent, under the
-/// user state lock for a template key, when it still records `parent`'s name.
-/// A visible write counts, as for a move: the old handle is only a hint.
+/// Rewrite `user`'s template key at `path` to record `handle` for its parent
+/// when it still records `parent`'s name, under the user state lock every
+/// template key writer holds. A visible write counts, as for a move: the old
+/// handle is only a hint.
 fn record_parent_handle(
     path: &Path,
-    kind: EnvelopeKind,
     user: &str,
     parent: &crate::envelope::ParentKey,
     handle: u32,
 ) -> Result<()> {
-    let _state = match kind {
-        EnvelopeKind::TemplateKey => Some(template_key::UserStateLock::acquire(user)?),
-        EnvelopeKind::KeyringSecret | EnvelopeKind::Unknown => None,
-    };
+    let _state = template_key::UserStateLock::acquire(user)?;
     let mut envelope = crate::envelope::SealedEnvelope::load(path)?;
     match envelope.parent.as_mut() {
         Some(recorded) if recorded.name == parent.name => recorded.handle = handle,
@@ -1255,13 +1264,15 @@ mod tests {
         assert_eq!(many.total, 4 + MAX_NAMED_ENVELOPES as u32);
     }
 
-    /// ADR-0034 §3.3, recovery by name with the TPM faked: an envelope whose
-    /// recorded handle holds another key records the handle where a key with
-    /// its name is, keeping everything else; one whose key is at its handle
-    /// is not rewritten; one whose key is nowhere, or whose name is not hex,
-    /// is reported missing and left as it was; an envelope with no parent, one
-    /// that cannot be parsed and a file that is no account's are left alone.
-    /// The owner handles are scanned once.
+    /// ADR-0034 §3.3, recovery by name with the TPM faked: a template key
+    /// whose recorded handle holds another key records the handle where a key
+    /// with its name is, keeping everything else; a keyring envelope in the
+    /// same state is left as it is, since its writers are ordered only by
+    /// irlumed's worker; one whose key is at its handle is not rewritten; one
+    /// whose key is nowhere, or whose name is not hex, is reported missing and
+    /// left as it was; an envelope with no parent, one that cannot be parsed
+    /// and a file that is no account's are left alone. The owner handles are
+    /// scanned once.
     #[test]
     fn an_envelope_whose_handle_another_key_took_records_where_its_key_is() {
         let _env = crate::testenv::ENV_LOCK
@@ -1293,6 +1304,7 @@ mod tests {
         );
         write("keyring/alice.json", &envelope(Some((0x8101_0004, "aa"))));
         write("keyring/bob.json", &envelope(Some((0x8101_0003, "bb"))));
+        write("keyring/frank.json", &envelope(Some((0x8101_0003, "aa"))));
         write("keyring/carol.json", &envelope(None));
         write(
             "keyring/dave.json",
@@ -1309,6 +1321,7 @@ mod tests {
             "keyring/carol.json",
             "keyring/dave.json",
             "keyring/erin.json",
+            "keyring/frank.json",
             "keyring/-planted.json",
         ]
         .into_iter()

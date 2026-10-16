@@ -4859,14 +4859,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
-    /// ADR-0034 §3.3 acceptance on swtpm, recovery by name: an envelope
-    /// records the DA-exempt key at 0x81010003; the key leaves that handle
-    /// and another stack's key takes it. irlumed's start persists the key
-    /// again by the section 3.2 rule (at 0x81010004, the next free handle),
-    /// and the envelope then records that handle and opens through it with
-    /// irlumed's record gone, where its old handle no longer opens it. A
-    /// second start finds nothing stale; with the key gone too, the envelope
-    /// is reported missing.
+    /// ADR-0034 §3.3 acceptance on swtpm, recovery by name: a template key
+    /// and a keyring secret record the DA-exempt key at 0x81010003; the key
+    /// leaves that handle and another stack's key takes it. irlumed's start
+    /// persists the key again by the section 3.2 rule (at 0x81010004, the
+    /// next free handle). The template key then records that handle and
+    /// opens through it with irlumed's record gone, where its old handle no
+    /// longer opens it. The keyring envelope is not rewritten at start (its
+    /// writers are ordered only by irlumed's worker) and opens through
+    /// irlumed's record of the key. A second start finds nothing to do; with
+    /// the key gone too, both are reported missing.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
@@ -4893,18 +4895,27 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
         dirs.store("alice", &original);
         let first = crate::storage_key::ensure_at_start();
-        let sealed = seal_with_pcrs(b"recorded at 0x81010003", &[]).expect("seal");
-        dirs.store("alice", &sealed);
+        let template_path = crate::template_key::key_path("alice");
+        let template = seal_with_pcrs(b"a template key", &[]).expect("seal");
+        template
+            .save(&template_path)
+            .expect("save the template key");
+        let keyring = seal_with_pcrs(b"a keyring secret", &[]).expect("seal");
+        dirs.store("alice", &keyring);
+        let keyring_path = crate::keyring::envelope_path("alice");
+        let keyring_bytes = std::fs::read(&keyring_path).expect("the keyring envelope");
 
         let left = evict_da_exempt_srks();
         persist_child_at(srk_template().expect("template"), PREFERRED);
         let again = crate::storage_key::ensure_at_start();
         let repointed = crate::storage_key::repoint_at_start();
-        let recorded = SealedEnvelope::load(&crate::keyring::envelope_path("alice"));
+        let recorded = SealedEnvelope::load(&template_path);
+        let keyring_kept = std::fs::read(&keyring_path).ok() == Some(keyring_bytes);
+        let keyring_open = unseal(&keyring);
         std::fs::remove_file(format!("{}/tpm-storage-key", dirs.dir)).expect("drop the record");
         let opened = recorded.as_ref().ok().map(unseal);
-        let stale = unseal(&sealed);
-        let nothing_stale = crate::storage_key::repoint_at_start();
+        let stale = unseal(&template);
+        let nothing = crate::storage_key::repoint_at_start();
         let gone = evict_da_exempt_srks();
         let missing = crate::storage_key::repoint_at_start();
         evict_fixture_at(PREFERRED);
@@ -4915,7 +4926,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             first.expect("the step"),
             Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
         );
-        assert_eq!(sealed.parent.as_ref().map(|p| p.handle), Some(PREFERRED));
+        assert_eq!(template.parent.as_ref().map(|p| p.handle), Some(PREFERRED));
         assert_eq!(left.expect("evict"), vec![PREFERRED]);
         assert_eq!(
             again.expect("the step"),
@@ -4923,20 +4934,24 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 handle: PREFERRED + 1
             })
         );
-        let entry = |outcome| Repointed {
+        let entry = |kind, from, outcome| Repointed {
             user: "alice".into(),
-            kind: EnvelopeKind::KeyringSecret,
-            from: PREFERRED,
+            kind,
+            from,
             outcome,
         };
         assert_eq!(
             repointed.expect("recovery by name"),
-            [entry(RepointOutcome::Moved(PREFERRED + 1))]
+            [entry(
+                EnvelopeKind::TemplateKey,
+                PREFERRED,
+                RepointOutcome::Moved(PREFERRED + 1)
+            )]
         );
-        let recorded = recorded.expect("the envelope");
+        let recorded = recorded.expect("the template key");
         assert_eq!(
             recorded.parent.as_ref().map(|p| (p.handle, &p.name)),
-            sealed.parent.as_ref().map(|p| (PREFERRED + 1, &p.name)),
+            template.parent.as_ref().map(|p| (PREFERRED + 1, &p.name)),
             "the handle changes and the name stays"
         );
         assert_eq!(
@@ -4944,15 +4959,33 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 .expect("parsed")
                 .expect("it opens by its own handle")
                 .as_slice(),
-            b"recorded at 0x81010003"
+            b"a template key"
         );
         assert!(stale.is_err(), "the old handle holds another stack's key");
-        assert_eq!(nothing_stale.expect("the next start"), []);
+        assert!(keyring_kept, "a keyring envelope is not rewritten at start");
+        assert_eq!(
+            keyring_open
+                .expect("it opens through irlumed's record")
+                .as_slice(),
+            b"a keyring secret"
+        );
+        assert_eq!(nothing.expect("the next start"), []);
         assert_eq!(gone.expect("evict"), vec![PREFERRED + 1]);
-        let missing = missing.expect("the step");
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].outcome, RepointOutcome::Missing);
-        assert_eq!(missing[0].from, PREFERRED + 1);
+        assert_eq!(
+            missing.expect("the step"),
+            [
+                entry(
+                    EnvelopeKind::TemplateKey,
+                    PREFERRED + 1,
+                    RepointOutcome::Missing
+                ),
+                entry(
+                    EnvelopeKind::KeyringSecret,
+                    PREFERRED,
+                    RepointOutcome::Missing
+                ),
+            ]
+        );
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"

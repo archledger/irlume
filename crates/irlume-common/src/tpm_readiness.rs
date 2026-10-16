@@ -276,6 +276,26 @@ impl RefusalReason {
     pub fn is_capacity(self) -> bool {
         matches!(self, Self::NoSpace | Self::NoFreeHandle)
     }
+
+    /// When irlumed tries again, which is only ever at one of its starts: a
+    /// refused override at the next start after it is corrected, a lack of
+    /// room at the next start after the TPM reports room, anything else at
+    /// the first start in a later boot (#1083).
+    pub fn when_retried(self) -> &'static str {
+        match self {
+            Self::HandleOverride => {
+                "at its next start once IRLUME_SRK_HANDLE is unset or names a handle from \
+                 0x81000000 to 0x817fffff"
+            }
+            Self::NoSpace | Self::NoFreeHandle => {
+                "at its next start once the TPM reports room for another persistent object, \
+                 or at its first start in a later boot"
+            }
+            Self::OwnerAuthorization | Self::Other | Self::Unknown => {
+                "at its first start in a later boot"
+            }
+        }
+    }
 }
 
 #[cfg(test)]

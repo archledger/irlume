@@ -4271,7 +4271,7 @@ fn tpm_lockout_check(
                  storage key (ADR-0034 §3): {}. irlume's envelopes stay on its original key, \
                  which the next TPM lockout would block. irlumed tries again {}",
                 refusal_text(refused),
-                refusal_retry(refused.reason)
+                refused.reason.when_retried()
             ),
         );
     }
@@ -4309,21 +4309,6 @@ fn refusal_text(refused: &irlume_common::tpm_readiness::KeyRefusal) -> String {
         RefusalReason::Other | RefusalReason::Unknown => "the TPM refused it",
     };
     format!("{reason} ({})", refused.detail)
-}
-
-/// When irlumed tries again after a refused persist (#1083).
-fn refusal_retry(reason: irlume_common::tpm_readiness::RefusalReason) -> &'static str {
-    use irlume_common::tpm_readiness::RefusalReason;
-    match reason {
-        RefusalReason::HandleOverride => {
-            "once IRLUME_SRK_HANDLE is unset or names a handle from 0x81000000 to 0x817fffff"
-        }
-        reason if reason.is_capacity() => {
-            "once the TPM reports room for another persistent object, or at its first start in \
-             a later boot"
-        }
-        _ => "at its first start in a later boot",
-    }
 }
 
 /// The `secure-boot-certificates` check: where this machine stands in
@@ -6787,13 +6772,19 @@ mod tests {
         assert!(detail.contains("no room"), "{detail}");
         assert!(detail.contains("the TPM's words"), "{detail}");
         assert!(detail.contains("next TPM lockout"), "{detail}");
-        assert!(detail.contains("reports room"), "{detail}");
+        assert!(
+            detail.contains("next start once the TPM reports room"),
+            "{detail}"
+        );
         let (_, detail) = tpm_lockout_check(&calm, &refused(RefusalReason::OwnerAuthorization));
         assert!(detail.contains("owner authorization is set"), "{detail}");
         assert!(detail.contains("later boot"), "{detail}");
         assert!(!detail.contains("reports room"), "{detail}");
         let (_, detail) = tpm_lockout_check(&calm, &refused(RefusalReason::HandleOverride));
-        assert!(detail.contains("IRLUME_SRK_HANDLE is unset"), "{detail}");
+        assert!(
+            detail.contains("next start once IRLUME_SRK_HANDLE is unset"),
+            "{detail}"
+        );
         let (_, detail) = tpm_lockout_check(&calm, &refused(RefusalReason::Unknown));
         assert!(detail.contains("refused it"), "{detail}");
         let locked = Ok(TpmLockout::from_properties(

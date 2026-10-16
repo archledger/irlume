@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright the irlume contributors.
+
 //! irlume's DA-exempt storage key at irlumed's start (ADR-0034 §3.2): find
 //! it, or derive and persist it, and record what happened. A refusal is
 //! recorded with the boot ID, so a daemon restart in the same boot derives
@@ -114,8 +117,10 @@ pub enum Outcome {
 }
 
 /// irlumed's start-up step (ADR-0034 §3.2). It runs only while some envelope
-/// is under the original key, which in this phase is every envelope; with
-/// none it returns `None` and touches nothing.
+/// is under the original key, which in this phase is every envelope. With
+/// none it returns `None` and asks the TPM nothing, and a refusal recorded
+/// earlier is cleared, since no envelope is left for it to keep on the
+/// original key.
 ///
 /// The key is derived at most once, and only when the recorded key is not at
 /// its handle and no refusal earlier in this boot stands. A copy already
@@ -127,13 +132,21 @@ pub enum Outcome {
 ///
 /// # Errors
 ///
-/// When the TPM cannot be opened or read, or the record cannot be written.
-/// A key persisted before a failed write is adopted at the next start.
+/// When an envelope directory cannot be read, the TPM cannot be opened or
+/// read, or the record cannot be written. A key persisted before a failed
+/// write is adopted at the next start.
 pub fn ensure_at_start() -> Result<Option<Outcome>> {
-    if !envelope_under_original_key() {
+    let record = load_record();
+    if !envelope_under_original_key()? {
+        if record.refused.is_some() {
+            save_record(&Record {
+                refused: None,
+                version: RECORD_VERSION,
+                ..record
+            })?;
+        }
         return Ok(None);
     }
-    let record = load_record();
     let plan = tpm::da_exempt_key_plan();
     let mut tpm = tpm::DaExemptKeyTpm::open()?;
     let boot = irlume_common::boot_id();
@@ -146,13 +159,18 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
 }
 
 /// What `irlume doctor` reports (ADR-0034 §4): the record, with the recorded
-/// handle kept only while the key there has the recorded name.
+/// handle kept only while the key there has the recorded name, and a
+/// recorded refusal only while some envelope is under the original key.
 ///
 /// # Errors
 ///
-/// When the record names a handle and the TPM cannot be opened or read.
+/// When an envelope directory cannot be read, or the record names a handle
+/// and the TPM cannot be opened or read.
 pub fn report() -> Result<DaExemptKey> {
-    let record = load_record();
+    let mut record = load_record();
+    if !envelope_under_original_key()? {
+        record.refused = None;
+    }
     let handle = match &record.persisted {
         Some(persisted) => {
             let mut tpm = tpm::DaExemptKeyTpm::open()?;
@@ -215,7 +233,14 @@ pub(crate) fn ensure_with(
             (boot, refused.boot_id.as_deref()),
             (Some(now), Some(then)) if now == then
         );
-        if same_boot && !(refused.reason.is_capacity() && tpm.persistent_avail()? >= 1) {
+        // A refused override is not the TPM's refusal: the plan above has
+        // already passed, so the override was corrected, and nothing was
+        // derived for it.
+        let tpm_refusal = refused.reason != RefusalReason::HandleOverride;
+        if same_boot
+            && tpm_refusal
+            && !(refused.reason.is_capacity() && tpm.persistent_avail()? >= 1)
+        {
             let refusal = KeyRefusal {
                 reason: refused.reason,
                 detail: refused.detail.clone(),
@@ -297,17 +322,27 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Whether some envelope is under the original key. Every envelope is, until
 /// envelopes record their parent: a sealed template key or keyring secret.
-fn envelope_under_original_key() -> bool {
-    has_envelope(&template_key::key_dir()) || has_envelope(&keyring::keyring_dir())
+fn envelope_under_original_key() -> Result<bool> {
+    Ok(has_envelope(&template_key::key_dir())? || has_envelope(&keyring::keyring_dir())?)
 }
 
-fn has_envelope(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            let path = entry.path();
-            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
-        })
-    })
+/// Whether `dir` holds an envelope. A missing directory holds none; any other
+/// error is returned, so that an unreadable store never reads as empty and
+/// skips the step.
+fn has_envelope(dir: &Path) -> Result<bool> {
+    let io = |e: std::io::Error| Error::Io(format!("{}: {e}", dir.display()));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io(e)),
+    };
+    for entry in entries {
+        let path = entry.map_err(io)?.path();
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn record_path() -> PathBuf {
@@ -580,6 +615,87 @@ mod tests {
             record.refused.expect("recorded").boot_id.as_deref(),
             Some(BOOT)
         );
+    }
+
+    /// A refused override is checked again at every start: once it is
+    /// corrected, a restart in the same boot persists the key, where a TPM
+    /// refusal would wait for a later boot.
+    #[test]
+    fn a_corrected_override_is_tried_again_in_the_same_boot() {
+        let mut tpm = FakeTpm::new();
+        let refused = Err("IRLUME_SRK_HANDLE=\"zz\" does not parse".to_owned());
+        let (record, _) =
+            ensure_with(&mut tpm, &Record::default(), Some(BOOT), &refused).expect("runs");
+        let (_, outcome) = run(&mut tpm, &record, BOOT);
+        assert_eq!(
+            outcome,
+            Outcome::Persisted {
+                handle: 0x8101_0003
+            }
+        );
+        assert_eq!(tpm.derived, 1);
+    }
+
+    /// A missing envelope directory holds no envelope; one that cannot be
+    /// read is an error, never an empty store that would skip the step.
+    #[test]
+    fn an_unreadable_envelope_store_is_an_error_not_empty() {
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("storage-key-scan"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!has_envelope(&dir.join("missing")).expect("a missing store is empty"));
+        assert!(!has_envelope(&dir).expect("an empty store"));
+        std::fs::write(dir.join("alice.json"), b"{}").unwrap();
+        assert!(has_envelope(&dir).expect("one envelope"));
+        // Not a directory: read_dir fails with something other than NotFound,
+        // as it does for root too, unlike a permission bit.
+        assert!(has_envelope(&dir.join("alice.json")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no envelope left, the start-up step clears a recorded refusal
+    /// without asking the TPM, and doctor's report no longer carries one.
+    #[test]
+    fn a_refusal_is_dropped_once_no_envelope_remains() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("storage-key-no-envelope");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vars = [
+            "IRLUME_STATE_DIR",
+            "IRLUME_TEMPLATE_KEY_DIR",
+            "IRLUME_KEYRING_DIR",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let refused = Record {
+            version: RECORD_VERSION,
+            persisted: None,
+            refused: Some(Refused {
+                reason: RefusalReason::Other,
+                detail: "refused".into(),
+                boot_id: Some(BOOT.into()),
+            }),
+        };
+        save_record(&refused).expect("saved");
+        let reported = report();
+        let outcome = ensure_at_start();
+        let kept = load_record();
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reported.expect("report").refused, None);
+        assert_eq!(outcome.expect("the step"), None);
+        assert_eq!(kept.refused, None);
     }
 
     /// The record is not a `*.json` file in the state directory, which

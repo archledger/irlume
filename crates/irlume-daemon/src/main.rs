@@ -1526,12 +1526,18 @@ fn main() {
                         ),
                     }
                 }
-                // irlume's DA-exempt storage key (ADR-0034 §3.2): found, or
-                // derived and persisted, here at startup, so no login pays
-                // for the derivation. It runs only while an envelope is under
-                // the original key, and after a refusal it derives nothing
-                // again in the same boot unless the TPM now has room (#1083).
-                // Nothing seals under the key yet.
+            }
+
+            // irlume's DA-exempt storage key (ADR-0034 §3.2): found, or
+            // derived and persisted, here at startup, so no login pays for the
+            // derivation. It runs only while an envelope is under the original
+            // key, and after a refusal it derives nothing again in the same
+            // boot unless the TPM now has room (#1083). Nothing seals under
+            // the key yet. An explicit transport counts, as for the readiness
+            // report: keyring secrets seal through it with no device node.
+            if std::env::var_os("IRLUME_TCTI").is_some()
+                || irlume_core::template_key::tpm_available()
+            {
                 use irlume_core::storage_key::Outcome;
                 match irlume_core::storage_key::ensure_at_start() {
                     Ok(None | Some(Outcome::Present { .. } | Outcome::Deferred(_))) => {}
@@ -1546,11 +1552,7 @@ fn main() {
                          envelopes stay on the original key, which a TPM lockout blocks; \
                          irlumed tries again {}",
                         refusal.detail,
-                        if refusal.reason.is_capacity() {
-                            "once the TPM has room, or at its first start in a later boot"
-                        } else {
-                            "at its first start in a later boot"
-                        }
+                        refusal.reason.when_retried()
                     ),
                     Err(e) => jout_warn!(
                         "irlumed: could not check irlume's DA-exempt storage key ({e}); \

@@ -4630,9 +4630,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         dirs.store("alice", &old);
         let persisted = crate::storage_key::ensure_at_start();
         let new = seal_with_pcrs(b"sealed after", &[]).expect("seal");
-        let new_open = unseal(&new).map(|s| s.to_vec());
-        let new_read_only = unseal_read_only(&new).map(|s| s.to_vec());
-        let old_open = unseal(&old).map(|s| s.to_vec());
+        let new_open = unseal(&new);
+        let new_read_only = unseal_read_only(&new);
+        let old_open = unseal(&old);
         let spared_mixed = lockout_state().map(|l| l.storage_key_no_da);
         dirs.store("alice", &new);
         let spared_all = lockout_state().map(|l| l.storage_key_no_da);
@@ -4640,7 +4640,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let removed = evict_da_exempt_srks();
         persist_child_at(da_exempt_srk_template().expect("template"), PREFERRED);
         let moved = crate::storage_key::ensure_at_start();
-        let through_record = unseal(&new).map(|s| s.to_vec());
+        let through_record = unseal(&new);
         let removed_again = evict_da_exempt_srks();
         let gone = unseal(&new);
         let fallback = seal_with_pcrs(b"sealed without it", &[]);
@@ -4658,10 +4658,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
         let parent = new.parent.clone().expect("a new seal records its parent");
         assert_eq!(parent.handle, PREFERRED);
-        assert_eq!(new_open.expect("unseal under the new key"), b"sealed after");
-        assert_eq!(new_read_only.expect("read-only unseal"), b"sealed after");
         assert_eq!(
-            old_open.expect("the original key still opens"),
+            new_open.expect("unseal under the new key").as_slice(),
+            b"sealed after"
+        );
+        assert_eq!(
+            new_read_only.expect("read-only unseal").as_slice(),
+            b"sealed after"
+        );
+        assert_eq!(
+            old_open.expect("the original key still opens").as_slice(),
             b"sealed before"
         );
         assert!(
@@ -4680,7 +4686,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             })
         );
         assert_eq!(
-            through_record.expect("the recorded key opens it at its new handle"),
+            through_record
+                .expect("the recorded key opens it at its new handle")
+                .as_slice(),
             b"sealed after"
         );
         assert_eq!(removed_again.expect("evict"), vec![PREFERRED + 1]);
@@ -4757,13 +4765,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let persisted = crate::storage_key::ensure_at_start();
         let template_move = crate::template_key::move_to_stronger_policy("alice");
         let template_again = crate::template_key::move_to_stronger_policy("alice");
-        let template_key = crate::template_key::load_key("alice").map(|k| k.to_vec());
+        let template_key = crate::template_key::load_key("alice");
         let password_move = reseal_password("alice", b"alice-password", None);
         let password_again = reseal_password("alice", b"alice-password", None);
-        let password = unseal_password("alice").map(|s| s.to_vec());
+        let password = unseal_password("alice");
         let token_move = reseal_password("bob", b"bob-password", None);
         let token_again = reseal_password("bob", b"bob-password", None);
-        let token_open = unseal_password("bob").map(|s| s.to_vec());
+        let token_open = unseal_password("bob");
         let token_env = SealedEnvelope::load(&envelope_path("bob"));
         let moved = parents();
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -4786,16 +4794,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             Some(MoveGain::DaExemptKey)
         );
         assert_eq!(template_again.expect("a second start"), None);
-        assert_eq!(template_key.expect("load"), key.to_vec());
+        assert_eq!(template_key.expect("load").as_slice(), key.as_slice());
         assert_eq!(
             password_move.expect("the reseal"),
             Reseal::MovedToDaExemptKey
         );
         assert_eq!(password_again.expect("a second login"), Reseal::Unchanged);
-        assert_eq!(password.expect("unseal"), b"alice-password");
+        assert_eq!(password.expect("unseal").as_slice(), b"alice-password");
         assert_eq!(token_move.expect("the reseal"), Reseal::MovedToDaExemptKey);
         assert_eq!(token_again.expect("a second login"), Reseal::Unchanged);
-        assert_eq!(token_open.expect("unseal"), token);
+        assert_eq!(token_open.expect("unseal").as_slice(), token);
         let token_env = token_env.expect("the token envelope");
         assert_eq!(token_env.secret, SecretKind::GnomeKeyringToken);
         assert_eq!(token_env.uid, Some(4151));
@@ -4924,15 +4932,12 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         drop(ctx);
 
         let state = lockout_state().expect("lockout state");
-        let opened = unseal(&new).map(|s| s.to_vec());
+        let opened = unseal(&new);
         let during = seal_with_pcrs(b"sealed in lockout", &[]);
-        let during_opened = during
-            .as_ref()
-            .ok()
-            .map(|env| unseal(env).map(|s| s.to_vec()));
+        let during_opened = during.as_ref().ok().map(unseal);
         let blocked = unseal(&old);
-        let template_opened = crate::template_key::load_key("carol").map(|k| k.to_vec());
-        let keyring_opened = crate::keyring::unseal_password("alice").map(|s| s.to_vec());
+        let template_opened = crate::template_key::load_key("carol");
+        let keyring_opened = crate::keyring::unseal_password("alice");
         let dave_before = std::fs::read(&dave).expect("the template key");
         let stuck = crate::template_key::move_to_stronger_policy("dave");
         let stuck_unchanged = std::fs::read(&dave).expect("the template key") == dave_before;
@@ -4944,12 +4949,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         ));
         assert!(state.in_lockout, "the TPM is in lockout");
         assert_eq!(
-            opened.expect("unseal under the new key"),
+            opened.expect("unseal under the new key").as_slice(),
             b"on the DA-exempt key"
         );
         assert!(during.expect("seal in lockout").parent.is_some());
         assert_eq!(
-            during_opened.expect("sealed").expect("unseal in lockout"),
+            during_opened
+                .expect("sealed")
+                .expect("unseal in lockout")
+                .as_slice(),
             b"sealed in lockout"
         );
         assert!(blocked.is_err(), "the original key is blocked in lockout");
@@ -4962,11 +4970,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             crate::keyring::Reseal::MovedToDaExemptKey
         );
         assert_eq!(
-            template_opened.expect("the moved template key in lockout"),
-            template_key.to_vec()
+            template_opened
+                .expect("the moved template key in lockout")
+                .as_slice(),
+            template_key.as_slice()
         );
         assert_eq!(
-            keyring_opened.expect("the moved keyring secret in lockout"),
+            keyring_opened
+                .expect("the moved keyring secret in lockout")
+                .as_slice(),
             b"on the original key"
         );
         assert!(

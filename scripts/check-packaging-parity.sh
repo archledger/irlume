@@ -559,6 +559,9 @@ APPARMOR_RUNTIME_RULES=(
   "deny capability sys_ptrace,"
   "deny /etc/shadow r,"
   "/dev/ r,"
+  # Camera classification reads the media graph to tell a node's role
+  # without opening it (#428); without the rule it falls back to opening.
+  "/dev/media[0-9]* r,"
   "/ r,"
   "/var/ r,"
   "/var/lib/ r,"
@@ -567,6 +570,8 @@ APPARMOR_RUNTIME_RULES=(
   "/var/lib/irlume/ir-emitter-stream/*.lock rwk,"
   "/etc/irlume/*.lock rwk,"
   "/var/lib/irlume/capture-qualifications/*.lock rwk,"
+  "/var/lib/irlume/template-keys/.locks/*.lock rwk,"
+  "/var/lib/irlume/template-keys/.locks/ rw,"
   "/var/lib/irlume/retry/ rwk,"
   "/var/lib/irlume/retry/*.operation rwk,"
   "/var/lib/irlume/.tpm-storage-key.lock rwk,"

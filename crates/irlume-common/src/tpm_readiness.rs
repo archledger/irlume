@@ -250,6 +250,83 @@ pub struct DaExemptKey {
     /// the list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_original_key: Option<OriginalKeyEnvelopes>,
+    /// irlume's original storage key and its retirement at irlumed's start
+    /// (ADR-0034, Phase 3 amendment); `None` from an irlumed that predates
+    /// the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_key: Option<OriginalKey>,
+}
+
+/// irlume's original storage key as irlumed's record and the TPM show it,
+/// for its retirement at irlumed's start (ADR-0034, Phase 3 amendment). The
+/// record is in the state directory, which is untrusted where it is
+/// writable offline (§5): irlumed sends the name only as hex of a bounded
+/// length, and a client cleans it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OriginalKey {
+    /// irlumed has recorded no key at the original handle: none was
+    /// persisted there, or no start that derives nothing else has checked it
+    /// yet.
+    NotRecorded,
+    /// The recorded key is no longer at its handle: retired at irlumed's
+    /// start, or evicted by hand.
+    Retired { handle: u32 },
+    /// The recorded key is at its handle, and its retirement waits.
+    Waiting {
+        handle: u32,
+        /// Its TPM name in hex.
+        name: String,
+        wait: RetirementWait,
+    },
+    /// A state this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the original storage key's retirement waits for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "for", rename_all = "snake_case")]
+pub enum RetirementWait {
+    /// Envelopes are still under it ([`DaExemptKey::on_original_key`]).
+    Envelopes,
+    /// A move off it in this boot is not yet shown durable, for these
+    /// envelopes; irlumed's first start in a later boot counts again.
+    UnsettledMoves {
+        #[serde(default)]
+        envelopes: Vec<OriginalKeyEnvelope>,
+    },
+    /// No envelope is under it, but no start has counted since the last one
+    /// moved off it; irlumed's next start counts.
+    Count,
+    /// No envelope has been under it since a start in this boot; irlumed
+    /// retires it at its first start in a later boot.
+    LaterBoot,
+    /// No envelope has been under it since a start in an earlier boot;
+    /// irlumed retires it at its next start.
+    NextStart,
+    /// irlumed retires it only beside irlume's DA-exempt storage key, which
+    /// is not at its recorded handle, or which irlume cannot seal under.
+    DaExemptKey,
+    /// The last retirement attempt failed or did not finish; irlumed tries
+    /// again at its first start in a later boot. Only a derivation proves
+    /// the key irlume's, so no eviction command is offered for it.
+    Failed {
+        /// The TPM's or the transport's own words.
+        detail: String,
+        /// Whether the attempt was in this boot.
+        in_this_boot: bool,
+    },
+    /// Today's derivation of irlume's template does not give the key at the
+    /// handle, so irlume never evicts it: the manual path, once no envelope
+    /// is under it (#1079).
+    NotReproduced,
+    /// Another key is at the handle now, or the original key's handle was
+    /// changed; irlumed's next start that derives nothing else checks it.
+    Unchecked,
+    /// A wait this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 /// The envelopes still under irlume's original storage key: the first ones
@@ -362,6 +439,43 @@ mod tests {
     /// The two `TPMA_PERMANENT` bits read are bit 2 and bit 9; the others
     /// (ownerAuthSet, endorsementAuthSet, disableClear, tpmGeneratedEPS) do
     /// not leak into them.
+    /// The original key's retirement report is additive: a reply from an
+    /// irlumed that predates it reads as `None`, and a state or wait a newer
+    /// irlumed adds reads as `Unknown` rather than failing the reply.
+    #[test]
+    fn the_original_key_report_reads_across_daemon_versions() {
+        let older: DaExemptKey = serde_json::from_str(r#"{"handle": 2164326403}"#).unwrap();
+        assert_eq!(older.original_key, None);
+        let newer: DaExemptKey =
+            serde_json::from_str(r#"{"original_key": {"state": "melted"}}"#).unwrap();
+        assert_eq!(newer.original_key, Some(OriginalKey::Unknown));
+        let newer_wait: DaExemptKey = serde_json::from_str(
+            r#"{"original_key": {"state": "waiting", "handle": 1, "name": "aa", "wait": {"for": "the moon"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            newer_wait.original_key,
+            Some(OriginalKey::Waiting {
+                handle: 1,
+                name: "aa".into(),
+                wait: RetirementWait::Unknown
+            })
+        );
+        let failed = DaExemptKey {
+            original_key: Some(OriginalKey::Waiting {
+                handle: 0x8101_0002,
+                name: "000b".into(),
+                wait: RetirementWait::Failed {
+                    detail: "TPM_RC_BAD_AUTH".into(),
+                    in_this_boot: true,
+                },
+            }),
+            ..DaExemptKey::default()
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        assert_eq!(serde_json::from_str::<DaExemptKey>(&json).unwrap(), failed);
+    }
+
     #[test]
     fn lockout_state_reads_only_lockout_auth_set_and_in_lockout() {
         let none = TpmLockout::from_properties(0, 0, 32, 7200, 86400, false);

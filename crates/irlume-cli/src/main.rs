@@ -4404,6 +4404,219 @@ fn original_key_envelopes(
     Some(parts.join("; "))
 }
 
+/// irlume's original storage key and its retirement at irlumed's start
+/// (ADR-0034, Phase 3 amendment), from irlumed's root-only report. A key
+/// waiting to be retired is named with its handle and TPM name and what it
+/// waits for. A key today's derivation does not give is offered the manual
+/// command, with its warning, once no envelope is under it; a failed
+/// retirement is not, since a derivation that errors says nothing about whose
+/// key it is.
+fn tpm_storage_keys_check(
+    da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+) -> (crate::doctor_report::State, String) {
+    use crate::doctor_report::State;
+    use irlume_common::tpm_readiness::{OriginalKey, RetirementWait, DA_EXEMPT_KEY_NOT_REPORTED};
+    let key = match da_exempt_key {
+        Ok(key) => key,
+        Err(e) if e == DA_EXEMPT_KEY_NOT_REPORTED => {
+            return (
+                State::Unknown,
+                "this irlumed predates the storage key report".to_owned(),
+            )
+        }
+        Err(e) => {
+            return (
+                State::Unknown,
+                format!(
+                    "irlumed could not report irlume's storage keys: {}",
+                    irlume_common::single_line(e, 300)
+                ),
+            )
+        }
+    };
+    let Some(original) = &key.original_key else {
+        return (
+            State::Unknown,
+            "this irlumed predates the report of the original storage key's retirement".to_owned(),
+        );
+    };
+    let (handle, name, wait) = match original {
+        OriginalKey::NotRecorded => {
+            return (
+                State::Info,
+                "irlumed has recorded no original storage key: none was persisted at its \
+                 handle, or no start that derives no other key has checked it yet"
+                    .to_owned(),
+            )
+        }
+        OriginalKey::Retired { handle } => {
+            return (
+                State::Pass,
+                format!(
+                    "irlume's original storage key is no longer persisted at {handle:#010x} \
+                     (retired at irlumed's start, or evicted by hand)"
+                ),
+            )
+        }
+        OriginalKey::Unknown => {
+            return (
+                State::Unknown,
+                "irlumed reported a state of the original storage key this build does not \
+                 know"
+                    .to_owned(),
+            )
+        }
+        OriginalKey::Waiting { handle, name, wait } => (handle, name, wait),
+    };
+    // irlumed sends hex; an older or altered daemon's text is cleaned again.
+    let name: String = name
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(160)
+        .collect();
+    let key = if name.is_empty() {
+        format!("irlume's original storage key at {handle:#010x}")
+    } else {
+        format!("irlume's original storage key at {handle:#010x} (TPM name {name})")
+    };
+    const ON_IRLUMES_TPM: &str =
+        "on the TPM irlumed uses (pass its IRLUME_TCTI with `-T` if it sets one)";
+    match wait {
+        RetirementWait::Envelopes => {
+            let named = original_key_envelopes(da_exempt_key, false).unwrap_or_else(|| {
+                "an envelope irlumed cannot read, which counts as one".to_owned()
+            });
+            (
+                State::Info,
+                format!(
+                    "{key} still has envelopes under it ({named}); they move onto the DA-exempt \
+                     storage key at their move points, and irlumed retires the key once none \
+                     has been under it since a start in an earlier boot"
+                ),
+            )
+        }
+        RetirementWait::UnsettledMoves { envelopes } => (
+            State::Info,
+            format!(
+                "{key} has no envelope under it, but a move off it in this boot is not yet \
+                 shown durable ({}); irlumed's first start in a later boot counts again",
+                envelope_names(envelopes)
+            ),
+        ),
+        RetirementWait::Count => (
+            State::Info,
+            format!(
+                "{key} has no envelope under it; irlumed's next start counts them, and a \
+                 start in a later boot retires it"
+            ),
+        ),
+        RetirementWait::LaterBoot => (
+            State::Info,
+            format!(
+                "{key} has had no envelope under it since a start in this boot; irlumed \
+                 retires it at its first start in a later boot"
+            ),
+        ),
+        RetirementWait::NextStart => (
+            State::Info,
+            format!(
+                "{key} has had no envelope under it since a start in an earlier boot; \
+                 irlumed retires it at its next start"
+            ),
+        ),
+        RetirementWait::DaExemptKey => (
+            State::Warn,
+            format!(
+                "{key} waits for irlume's DA-exempt storage key, which is not at its \
+                 recorded handle or which irlume cannot seal under; irlumed retires the \
+                 original key only beside it (see tpm-lockout for a refused persist)"
+            ),
+        ),
+        RetirementWait::Failed {
+            detail,
+            in_this_boot,
+        } => {
+            let when = if *in_this_boot {
+                "at its first start in a later boot"
+            } else {
+                "at its next start"
+            };
+            (
+                State::Warn,
+                format!(
+                    "the last retirement of {key} failed ({}); irlumed tries again {when}. \
+                     Only a derivation shows the key is irlume's, so evict nothing by hand \
+                     for this",
+                    irlume_common::single_line(detail, 300)
+                ),
+            )
+        }
+        RetirementWait::NotReproduced => match original_key_envelopes(da_exempt_key, false) {
+            Some(named) => (
+                State::Info,
+                format!(
+                    "{key} is not the key today's derivation of irlume's template gives, so \
+                     irlume never evicts it; envelopes are still under it ({named}) and move \
+                     onto the DA-exempt storage key first"
+                ),
+            ),
+            None => (
+                State::Warn,
+                format!(
+                    "{key} is not the key today's derivation of irlume's template gives, so \
+                     irlume never evicts it, and no envelope is under it. Find what else uses \
+                     it first (`tpm2_readpublic -c {handle:#010x}`, {ON_IRLUMES_TPM}); if \
+                     nothing does, evict it by hand with `sudo tpm2_evictcontrol -C o -c \
+                     {handle:#010x}` {ON_IRLUMES_TPM}. Do not clear the whole TPM for this: \
+                     that also drops every other key sealed in it, such as a disk's"
+                ),
+            ),
+        },
+        RetirementWait::Unchecked => (
+            State::Info,
+            format!(
+                "{key} is not the key irlumed recorded there, or the handle changed; \
+                 irlumed's next start that derives no other key checks it"
+            ),
+        ),
+        RetirementWait::Unknown => (
+            State::Unknown,
+            format!("{key} waits for something this build does not know"),
+        ),
+    }
+}
+
+/// `envelopes` by account and kind, as doctor names them: at most
+/// [`MAX_ENVELOPES_SHOWN`], each account name cleaned again.
+fn envelope_names(envelopes: &[irlume_common::tpm_readiness::OriginalKeyEnvelope]) -> String {
+    use irlume_common::tpm_readiness::EnvelopeKind;
+    if envelopes.is_empty() {
+        return "under names irlumed does not show".to_owned();
+    }
+    let mut parts: Vec<String> = envelopes
+        .iter()
+        .take(MAX_ENVELOPES_SHOWN)
+        .map(|envelope| {
+            let what = match envelope.kind {
+                EnvelopeKind::TemplateKey => "template key",
+                EnvelopeKind::KeyringSecret => "keyring secret",
+                EnvelopeKind::Unknown => "envelope",
+            };
+            format!(
+                "{}'s {what}",
+                irlume_common::single_line(&envelope.user, 64)
+            )
+        })
+        .collect();
+    if envelopes.len() > MAX_ENVELOPES_SHOWN {
+        parts.push(format!(
+            "and {} more",
+            envelopes.len() - MAX_ENVELOPES_SHOWN
+        ));
+    }
+    parts.join("; ")
+}
+
 /// Why irlume's DA-exempt storage key could not be persisted, in words, with
 /// the TPM's own as one bounded line: irlumed cleans it, and an older or
 /// altered daemon's text is cleaned again here.
@@ -5441,6 +5654,10 @@ fn doctor_run(
         (
             "tpm-lockout",
             tpm_lockout_check(&tpm.lockout, &tpm.da_exempt_key),
+        ),
+        (
+            "tpm-storage-keys",
+            tpm_storage_keys_check(&tpm.da_exempt_key),
         ),
         (
             "secure-boot-certificates",
@@ -6940,6 +7157,179 @@ mod tests {
         });
         let (_, detail) = tpm_lockout_check(&calm, &hostile);
         assert!(!detail.chars().any(char::is_control), "{detail:?}");
+    }
+
+    /// ADR-0034, Phase 3 amendment: doctor's `tpm-storage-keys` names a key
+    /// waiting to be retired with its handle, its TPM name and what it waits
+    /// for. A key today's derivation does not give gets the manual command
+    /// and its warning only once no envelope is under it; a failed
+    /// retirement never gets it. A daemon that predates the report, or
+    /// whose report could not be read, leaves it unknown, and what the
+    /// record supplied is cleaned again.
+    #[test]
+    fn tpm_storage_keys_says_what_the_original_keys_retirement_waits_for() {
+        use crate::doctor_report::State;
+        use irlume_common::tpm_readiness::{
+            DaExemptKey, EnvelopeKind, OriginalKey, OriginalKeyEnvelope, OriginalKeyEnvelopes,
+            RetirementWait, DA_EXEMPT_KEY_NOT_REPORTED,
+        };
+        let report = |original_key: Option<OriginalKey>, envelopes: Vec<OriginalKeyEnvelope>| {
+            let total = u32::try_from(envelopes.len()).unwrap();
+            Ok(DaExemptKey {
+                original_key,
+                on_original_key: Some(OriginalKeyEnvelopes {
+                    named: envelopes,
+                    total,
+                }),
+                ..Default::default()
+            })
+        };
+        let waiting = |wait| {
+            Some(OriginalKey::Waiting {
+                handle: 0x8101_0002,
+                name: "000bab".into(),
+                wait,
+            })
+        };
+        let alice = OriginalKeyEnvelope {
+            user: "alice".into(),
+            kind: EnvelopeKind::TemplateKey,
+        };
+        let check = |key| tpm_storage_keys_check(&key);
+        const EVICT: &str = "tpm2_evictcontrol";
+
+        let (state, detail) = check(Err(DA_EXEMPT_KEY_NOT_REPORTED.to_owned()));
+        assert_eq!(state, State::Unknown, "{detail}");
+        let (state, detail) = check(report(None, vec![]));
+        assert_eq!(
+            state,
+            State::Unknown,
+            "an irlumed without the report: {detail}"
+        );
+        let (state, detail) = check(Err("the store could not be read".into()));
+        assert!(
+            state == State::Unknown && detail.contains("could not report"),
+            "{detail}"
+        );
+        let (state, _) = check(report(Some(OriginalKey::NotRecorded), vec![]));
+        assert_eq!(state, State::Info);
+        let (state, detail) = check(report(
+            Some(OriginalKey::Retired {
+                handle: 0x8101_0002,
+            }),
+            vec![],
+        ));
+        assert!(
+            state == State::Pass && detail.contains("0x81010002"),
+            "{detail}"
+        );
+
+        for (wait, envelopes, want, words) in [
+            (
+                RetirementWait::Envelopes,
+                vec![alice.clone()],
+                State::Info,
+                "alice's template key",
+            ),
+            (
+                RetirementWait::Count,
+                vec![],
+                State::Info,
+                "next start counts",
+            ),
+            (
+                RetirementWait::LaterBoot,
+                vec![],
+                State::Info,
+                "first start in a later boot",
+            ),
+            (
+                RetirementWait::NextStart,
+                vec![],
+                State::Info,
+                "retires it at its next start",
+            ),
+            (
+                RetirementWait::DaExemptKey,
+                vec![],
+                State::Warn,
+                "DA-exempt storage key",
+            ),
+            (RetirementWait::Unchecked, vec![], State::Info, "checks it"),
+            (
+                RetirementWait::NotReproduced,
+                vec![alice.clone()],
+                State::Info,
+                "envelopes are still under it",
+            ),
+        ] {
+            let (state, detail) = check(report(waiting(wait.clone()), envelopes));
+            assert_eq!(state, want, "{wait:?}: {detail}");
+            assert!(detail.contains(words), "{wait:?}: {detail}");
+            assert!(
+                detail.contains("0x81010002") && detail.contains("000bab"),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains(EVICT),
+                "{wait:?} offers no eviction: {detail}"
+            );
+        }
+        let (state, detail) = check(report(
+            waiting(RetirementWait::UnsettledMoves {
+                envelopes: vec![OriginalKeyEnvelope {
+                    user: "bob\u{1b}[2J".into(),
+                    kind: EnvelopeKind::KeyringSecret,
+                }],
+            }),
+            vec![],
+        ));
+        assert_eq!(state, State::Info);
+        assert!(detail.contains("keyring secret") && !detail.chars().any(char::is_control));
+
+        let (state, detail) = check(report(waiting(RetirementWait::NotReproduced), vec![]));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("`sudo tpm2_evictcontrol -C o -c 0x81010002`")
+                && detail.contains("tpm2_readpublic -c 0x81010002")
+                && detail.contains("Do not clear the whole TPM"),
+            "the manual path, with its warning: {detail}"
+        );
+        for in_this_boot in [true, false] {
+            let (state, detail) = check(report(
+                waiting(RetirementWait::Failed {
+                    detail: "TPM_RC_BAD_AUTH\nforged".into(),
+                    in_this_boot,
+                }),
+                vec![],
+            ));
+            assert_eq!(state, State::Warn);
+            assert!(detail.contains("TPM_RC_BAD_AUTH") && !detail.contains('\n'));
+            assert!(
+                !detail.contains(EVICT),
+                "a failed proof offers no eviction: {detail}"
+            );
+            let when = if in_this_boot {
+                "first start in a later boot"
+            } else {
+                "at its next start"
+            };
+            assert!(detail.contains(when), "{detail}");
+        }
+        let (_, detail) = check(report(
+            Some(OriginalKey::Waiting {
+                handle: 0x8101_0002,
+                name: "\u{1b}]0;title\u{7}zz".into(),
+                wait: RetirementWait::Count,
+            }),
+            vec![],
+        ));
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        assert!(!detail.contains("title"), "only hex is shown: {detail}");
+        let (state, _) = check(report(Some(OriginalKey::Unknown), vec![]));
+        assert_eq!(state, State::Unknown);
+        let (state, _) = check(report(waiting(RetirementWait::Unknown), vec![]));
+        assert_eq!(state, State::Unknown);
     }
 
     /// ADR-0034 §4: in lockout, doctor names each account and envelope kind

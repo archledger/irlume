@@ -923,7 +923,16 @@ fn sealed_template(policy_digest: Digest) -> Result<Public> {
 }
 
 fn create_srk(ctx: &mut Context) -> Result<KeyHandle> {
+    #[cfg(test)]
+    ORIGINAL_DERIVATIONS.with(|count| count.set(count.get() + 1));
     create_storage_key(ctx, srk_template()?)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread derived the original storage key, so a
+    /// test can tell a call that derives it from one that does not.
+    static ORIGINAL_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Derive the primary key `template` describes under the owner hierarchy, as
@@ -1426,8 +1435,19 @@ fn has_template_shape(public: &Public, template: &Public) -> bool {
 /// is bit-for-bit identical, so envelopes sealed earlier still load.
 ///
 /// When another key holds the persistent handle, a transient SRK is derived
-/// for this call in either mode. [`SrkMode::ReadOnly`] refuses only to
-/// persist a new SRK at a free handle.
+/// for this call. [`SrkMode::ReadOnly`] and [`SrkMode::Move`] never persist
+/// a new SRK at a free handle; they derive a transient one there too.
+///
+/// While irlume's DA-exempt storage key is persisted, nothing but irlumed's
+/// start derives the original key (ADR-0034, the Phase 3 amendment): in
+/// [`SrkMode::Initialize`] and [`SrkMode::ReadOnly`], a call that finds the
+/// original key away from its handle fails instead of deriving it, so an
+/// authentication neither pays for the derivation nor persists a key a
+/// retirement removed, and the envelope moves at its move point. In
+/// [`SrkMode::Move`] a transient key is derived and nothing is persisted.
+/// Only with no persisted irlume key at all does the per-call derivation of
+/// section 3.2's fallback apply, and does [`SrkMode::Initialize`] persist the
+/// original key.
 ///
 /// Returns the handle and whether it is persistent (a persistent handle must NOT
 /// be flushed by the caller).
@@ -1458,16 +1478,19 @@ fn load_or_create_srk(ctx: &mut Context, mode: SrkMode) -> Result<(KeyHandle, bo
             // use a transient SRK this run (correct, just slower). The
             // transient key persists nothing, so a read-only unseal takes this
             // path too; only persisting a new SRK needs `SrkMode::Initialize`.
+            refuse_beside_da_exempt_key(ctx, mode)?;
             let transient = create_srk(ctx)?;
             return Ok((transient, false));
         }
     }
 
-    // A read-only unseal never persists an SRK. The deterministic template
+    refuse_beside_da_exempt_key(ctx, mode)?;
+    // A read-only unseal never persists an SRK, and a move persists none
+    // while the DA-exempt key is persisted. The deterministic template
     // derives the same primary transiently, which is the parent an envelope
     // sealed while another key held the handle has, and which also opens one
     // sealed under a persistent SRK that has since been evicted.
-    if mode == SrkMode::ReadOnly {
+    if mode == SrkMode::ReadOnly || (mode == SrkMode::Move && da_exempt_key_persisted(ctx)?) {
         let transient = create_srk(ctx)?;
         return Ok((transient, false));
     }
@@ -1508,12 +1531,47 @@ fn with_srk<T>(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SrkMode {
-    /// Persist irlume's SRK at its free handle on first use.
+    /// Persist irlume's SRK at its free handle on first use. While the
+    /// DA-exempt key is persisted, fail rather than derive the original key.
     Initialize,
     /// Never persist an SRK: use the one at the handle, or a transient one
     /// derived from the same template when the handle is free or another key
-    /// holds it.
+    /// holds it. While the DA-exempt key is persisted, fail rather than
+    /// derive the original key.
     ReadOnly,
+    /// irlumed's start moving an envelope off the original key
+    /// ([`unseal_for_move`]): as [`SrkMode::Initialize`], except that while
+    /// the DA-exempt key is persisted a transient original key is derived
+    /// and nothing is persisted.
+    Move,
+}
+
+/// Fail, in every mode but [`SrkMode::Move`], when irlume's DA-exempt key
+/// is persisted: the original key is not at its handle, and only irlumed's
+/// start derives it then (ADR-0034, the Phase 3 amendment). With no
+/// DA-exempt key persisted this returns `Ok`, and the caller derives the
+/// original key as section 3.2's fallback does.
+fn refuse_beside_da_exempt_key(ctx: &mut Context, mode: SrkMode) -> Result<()> {
+    if mode == SrkMode::Move || !da_exempt_key_persisted(ctx)? {
+        return Ok(());
+    }
+    Err(Error::Tpm(format!(
+        "irlume's original storage key is not at {:#010x}, and with its DA-exempt \
+         key persisted only irlumed's start derives it; the envelope moves onto the \
+         DA-exempt key at its move point (irlumed's start for a template key, the next \
+         password login for a keyring secret)",
+        persistent_srk_raw()
+    )))
+}
+
+/// Whether irlume's DA-exempt storage key is persisted: irlumed recorded it,
+/// and the key at the recorded handle has the recorded TPM name and the
+/// DA-exempt template's shape, as [`with_seal_parent`] requires of a parent.
+fn da_exempt_key_persisted(ctx: &mut Context) -> Result<bool> {
+    let Some((handle, name)) = storage_key::recorded_key() else {
+        return Ok(false);
+    };
+    Ok(da_exempt_key_at(ctx, handle, &name, true)?.is_some())
 }
 
 impl SrkMode {
@@ -1912,20 +1970,39 @@ pub fn is_pcr_changed_race(e: &Error) -> bool {
 /// not re-issuing the failed command. This is the same gap systemd closed in
 /// systemd/systemd#35657, where unsealing already retried but the `PolicyPCR`
 /// leg did not.
+///
+/// An envelope under the original storage key fails, deriving nothing, when
+/// that key is not at its handle while irlume's DA-exempt key is persisted:
+/// only irlumed's start derives it then (`unseal_for_move`).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn unseal(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     unseal_with_mode(env, SrkMode::Initialize)
 }
 
-/// Unseal without persisting a storage root key. Where another key holds
-/// irlume's SRK handle, this derives a transient SRK for the call, as a seal
-/// there does; it persists nothing.
+/// Unseal without persisting a storage root key. Where irlume's SRK handle
+/// is free or another key holds it, this derives a transient SRK for the
+/// call, as a seal there does; it persists nothing.
 ///
 /// # Errors
-/// Returns an error if the TPM cannot be opened, irlume's SRK handle is free
-/// (no SRK was persisted there), or policy unsealing fails.
+/// Returns an error if the TPM cannot be opened, the original key is not at
+/// its handle while irlume's DA-exempt key is persisted (as for [`unseal`]),
+/// or policy unsealing fails.
 pub(crate) fn unseal_read_only(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
     unseal_with_mode(env, SrkMode::ReadOnly)
+}
+
+/// [`unseal`] for irlumed's start moving `env` off the original storage key
+/// (ADR-0034, the Phase 3 amendment). While irlume's DA-exempt key is
+/// persisted, an envelope under the original key whose handle is free (a
+/// retired key, or one evicted by hand) or held by another stack's key is
+/// opened through a transient derivation of the original template, and
+/// nothing is persisted; every other unseal fails there instead. With no
+/// DA-exempt key persisted this is [`unseal`].
+///
+/// # Errors
+/// As [`unseal`].
+pub(crate) fn unseal_for_move(env: &SealedEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    unseal_with_mode(env, SrkMode::Move)
 }
 
 fn unseal_with_mode(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u8>>> {
@@ -4982,6 +5059,234 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let after_moves = on_original(reported_after);
         assert_eq!((after_moves.named.len(), after_moves.total), (0, 0));
         assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// ADR-0034 Phase 3 acceptance on swtpm, an envelope that comes back:
+    /// after the envelopes moved onto the DA-exempt key and the original key
+    /// was retired (evicted here, as the retirement will), an older copy of
+    /// the template key and the keyring secret, both under the original key,
+    /// comes back. An authentication before either move point derives
+    /// nothing, persists nothing and fails, so irlume falls back to the
+    /// password. irlumed's start moves the template key through one
+    /// transient derivation of the original key, with nothing persisted at
+    /// its handle, and leaves the keyring envelope as it is; the next
+    /// password login's reseal seals that again under the DA-exempt key with
+    /// no derivation. With another stack's key on the original handle
+    /// instead, an authentication still derives nothing and the start's move
+    /// still goes through a transient key, leaving that key in place.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_an_envelope_back_under_a_retired_original_key_moves_at_its_move_point() {
+        use crate::keyring::{envelope_path, reseal_password, unseal_password, Reseal};
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retired-original-comes-back");
+        // IRLUME_PCRS=7 and no prediction file: the literal PCR 7 seal.
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let derived = || ORIGINAL_DERIVATIONS.with(std::cell::Cell::get);
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4160);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        crate::keyring::seal_password("alice", b"alice-password").expect("arm the password");
+        // The first seal persists the original key when no earlier test did,
+        // so the handles are taken after it.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let paths = [
+            crate::template_key::key_path("alice"),
+            envelope_path("alice"),
+        ];
+        let older: Vec<Vec<u8>> = paths
+            .iter()
+            .map(|path| std::fs::read(path).expect("an older copy"))
+            .collect();
+        // Read without panicking: the keys are put back before anything is
+        // asserted, so a failure leaves the shared swtpm as it was.
+        let parents = || {
+            paths
+                .iter()
+                .map(|path| SealedEnvelope::load(path).map(|env| env.parent).ok())
+                .collect::<Vec<_>>()
+        };
+        let account = || crate::account::Account::new("alice");
+        let authenticate =
+            || crate::template_key::load_key_for_authentication_as("alice", &mut account());
+
+        // Phase 2's moves, then the retirement.
+        let persisted = crate::storage_key::ensure_at_start();
+        let template_moved = crate::template_key::move_to_stronger_policy("alice");
+        let keyring_moved = reseal_password("alice", b"alice-password", None);
+        let retired = evict_persistent_srk();
+        for (path, bytes) in paths.iter().zip(&older) {
+            std::fs::write(path, bytes).expect("an older copy comes back");
+        }
+        let came_back = parents();
+
+        // An authentication before the move points.
+        let at_authentication = derived();
+        let template_refused = authenticate();
+        let keyring_refused = unseal_password("alice");
+        let derived_at_authentication = derived() - at_authentication;
+        let after_authentication = handles();
+
+        // irlumed's start.
+        let at_start = derived();
+        let start_move = crate::template_key::move_to_stronger_policy("alice");
+        let derived_at_start = derived() - at_start;
+        let after_start = handles();
+        let keyring_after_start = std::fs::read(&paths[1]);
+        let template_key = authenticate();
+        let keyring_before_login = unseal_password("alice");
+
+        // The next password login.
+        let at_login = derived();
+        let login = reseal_password("alice", b"alice-password", None);
+        let derived_at_login = derived() - at_login;
+        let password = unseal_password("alice");
+        let moved = parents();
+
+        // The same copy comes back with another stack's key on the original
+        // handle: the TCG template's noDA key, which is not irlume's shape.
+        for (path, bytes) in paths.iter().zip(&older) {
+            std::fs::write(path, bytes).expect("an older copy comes back again");
+        }
+        plant_foreign_key_at_srk_handle(
+            storage_key_template(true, PublicKeyRsa::default()).expect("another stack's template"),
+        );
+        let beside_foreign = derived();
+        let foreign_refused = authenticate();
+        let foreign_keyring_refused = unseal_password("alice");
+        let derived_beside_foreign = derived() - beside_foreign;
+        let at_foreign_start = derived();
+        let foreign_start = crate::template_key::move_to_stronger_policy("alice");
+        let derived_at_foreign_start = derived() - at_foreign_start;
+        let foreign_kept = handles().contains(&original);
+        remove_foreign_key_at_srk_handle();
+
+        let removed = evict_da_exempt_srks();
+        // With no DA-exempt key persisted a seal persists the original key
+        // again, as the test found it.
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        assert_eq!(
+            persisted.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
+        );
+        assert_eq!(
+            template_moved.expect("the startup move"),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(
+            keyring_moved.expect("the reseal"),
+            Reseal::MovedToDaExemptKey
+        );
+        assert!(
+            matches!(retired.expect("the retirement"), SrkEviction::Evicted),
+            "the original key is retired"
+        );
+        assert_eq!(
+            came_back,
+            [Some(None), Some(None)],
+            "both under the original key"
+        );
+        let refusal = template_refused.expect_err("no derivation at an authentication");
+        assert!(
+            refusal
+                .to_string()
+                .contains("only irlumed's start derives it"),
+            "{refusal}"
+        );
+        assert!(
+            keyring_refused.is_err(),
+            "the keyring falls back to the password"
+        );
+        assert_eq!(
+            derived_at_authentication, 0,
+            "an authentication derives nothing"
+        );
+        assert!(
+            !after_authentication.contains(&original),
+            "an authentication persists nothing: {after_authentication:x?}"
+        );
+        assert_eq!(
+            start_move.expect("the start's move"),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(
+            derived_at_start, 1,
+            "one transient derivation of the original key"
+        );
+        assert!(
+            !after_start.contains(&original),
+            "the start persists nothing at the original handle: {after_start:x?}"
+        );
+        assert_eq!(
+            keyring_after_start.expect("the keyring envelope"),
+            older[1],
+            "the start leaves the keyring envelope as it is"
+        );
+        assert_eq!(
+            template_key.expect("the moved key").as_slice(),
+            key.as_slice()
+        );
+        assert!(
+            keyring_before_login.is_err(),
+            "the keyring waits for a login"
+        );
+        assert_eq!(login.expect("the reseal"), Reseal::Resealed);
+        assert_eq!(derived_at_login, 0, "the reseal derives nothing");
+        assert_eq!(password.expect("unseal").as_slice(), b"alice-password");
+        assert!(
+            moved.iter().all(|parent| matches!(
+                parent,
+                Some(Some(parent)) if parent.handle == PREFERRED
+            )),
+            "both on the DA-exempt key: {moved:?}"
+        );
+        let refusal = foreign_refused.expect_err("no derivation beside another stack's key");
+        assert!(
+            refusal
+                .to_string()
+                .contains("only irlumed's start derives it"),
+            "{refusal}"
+        );
+        assert!(
+            foreign_keyring_refused.is_err(),
+            "the keyring falls back to the password"
+        );
+        assert_eq!(
+            derived_beside_foreign, 0,
+            "an authentication derives nothing"
+        );
+        assert_eq!(
+            foreign_start.expect("the start's move"),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(derived_at_foreign_start, 1, "one transient derivation");
+        assert!(
+            foreign_kept,
+            "another stack's key stays at the original handle"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok(), "the original key is persisted again");
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"

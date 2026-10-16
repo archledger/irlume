@@ -140,7 +140,7 @@ profile irlumed /usr/local/bin/irlumed {
   # open powers the camera up pre-6.16 = privacy-LED blink per scan, and the
   # udev lifecycle thread re-reads the graph on every hot-plug event). Under
   # enforce without this rule the read fails and classification silently
-  # falls back to the legacy open probe — found by the 0.11.0rc3 complain-mode
+  # falls back to the legacy open probe. Found by the 0.11.0rc3 complain-mode
   # audit: the ONLY denial class across a full exercise battery.
   /dev/media[0-9]* r,
   /sys/class/video4linux/ r,
@@ -190,7 +190,7 @@ profile irlumed /usr/local/bin/irlumed {
   # emitter rule above: the state tree's ** rule grants rw without the
   # flock 'k' permission). Found when the 0.11.0rc1 Arch install loaded this
   # profile into enforce mode and every enrollment read failed with
-  # "lock state transaction ... Permission denied" — fail-closed, but wrong.
+  # "lock state transaction ... Permission denied": fail-closed, but wrong.
   /var/lib/irlume/template-keys/.locks/*.lock rwk,
   /var/lib/irlume/template-keys/.locks/ rw,
 

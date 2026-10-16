@@ -207,6 +207,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Once irlumed has persisted irlume's DA-exempt storage key, nothing but
+  irlumed's start derives the original storage key (ADR-0034, Phase 3
+  amendment). An unseal under the original key that finds it away from its
+  handle, freed or taken by another stack's key, now fails instead of
+  deriving it, so irlume falls back to the password. Before, it derived the
+  key on every call while another key held the handle (seconds on slow
+  TPMs), and with the handle free it persisted the key there again, which
+  would undo a retirement of that key (#1073). irlumed's start still moves a template key there onto the
+  DA-exempt key, through a transient derivation that persists nothing. A
+  keyring secret is sealed again under the DA-exempt key at the next
+  password login, with no derivation. With no persisted irlume key at all,
+  an unseal derives and persists the original key as before.
+
 - `irlume uninstall` also evicts irlume's DA-exempt storage key (ADR-0034
   §3), which it finds by scanning the owner persistent handles, and names
   the handles in a `DA-exempt TPM storage key` line. A key counts as irlume's

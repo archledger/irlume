@@ -869,6 +869,12 @@ pub(crate) fn move_kept_key_with(
 /// loses neither, and unseals it to the same key before it replaces the old
 /// one. `Some` with what the move gained.
 ///
+/// A key under the original storage key whose handle is free or another
+/// stack's (a retired key, and an older envelope that came back) is unsealed
+/// through a transient derivation of the original key, which only this
+/// start-up move does while the DA-exempt key is persisted
+/// (`tpm::unseal_for_move`); nothing is persisted for it.
+///
 /// # Errors
 /// Returns the lock, envelope, unseal, seal, round-trip or save error; the
 /// envelope is then left as it was.
@@ -877,7 +883,7 @@ pub fn move_to_stronger_policy(user: &str) -> Result<Option<tpm::MoveGain>> {
         return Ok(None);
     }
     let _state = UserStateLock::acquire(user)?;
-    move_with(user, tpm::unseal, tpm::move_available, tpm::seal)
+    move_with(user, tpm::unseal_for_move, tpm::move_available, tpm::seal)
 }
 
 /// [`move_to_stronger_policy`] with the TPM calls passed in. Unlike the

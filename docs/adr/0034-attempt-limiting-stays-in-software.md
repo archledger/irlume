@@ -826,7 +826,11 @@ hold:
    and a fresh derivation of the original template at this start gives the
    same modulus, as uninstall compares it. The derivation runs only at a
    start that derives nothing else, as the record's own check does, so no
-   start pays for two derivations of an RSA-2048 key.
+   start pays for two derivations of an RSA-2048 key. A derivation that
+   fails (an owner authorization set since, a TPM error) proves nothing: the
+   key is not retired, and the failure is recorded with the boot ID and its
+   error and tried again only at the first start in a later boot, as section
+   3.2 retries a refusal, so a restart in the same boot pays no derivation.
 3. **The DA-exempt key is present** at its recorded handle with its recorded
    name, so an envelope that comes back has a key to move to.
 
@@ -834,23 +838,36 @@ hold:
 
 After the original key is retired, an envelope under it can return from an
 older copy of the state directory or a restored backup (section 3.4).
-irlumed's start finds it in the census, derives the original template as a
-transient key, which it never persists while the DA-exempt key is persisted,
-and moves the envelope through it onto the DA-exempt key at its move point
-(the template key at the start, a keyring secret at the next login's reseal).
-That holds while today's derivation still gives the retired key: after a
-firmware update that changed key generation, or an owner authorization set
-since, it does not, and the envelope needs `irlume recovery restore` or a
-re-enrollment, as section 3.4 says. A key evicted by hand (the manual path
-above) gives the same result for an envelope that comes back under it. An
-authentication never derives the original key once a DA-exempt key is
-persisted: an envelope still under a retired key falls back to the password
-until the start or the reseal has moved it. Only with no persisted irlume key
-at all does the section 3.2 fallback, today's per-call derivation, apply.
-Today an unseal finding the original handle free derives the original key and
-persists it there (`load_or_create_srk` in `SrkMode::Initialize`); Phase 3
-changes that path, since otherwise the first authentication after a
-retirement would persist the key again.
+irlumed's start finds it in the census, and each kind moves at its own move
+point:
+
+- A template key moves at that start. The start derives the original
+  template as a transient key, which it never persists while the DA-exempt
+  key is persisted, and moves the envelope through it onto the DA-exempt key.
+  That holds while today's derivation still gives the retired key: after a
+  firmware update that changed key generation, or an owner authorization set
+  since, it does not, and the envelope needs `irlume recovery restore` or a
+  re-enrollment, as section 3.4 says.
+- A keyring secret is not rewritten at a start, since its writers are
+  ordered only by irlumed's worker (the recovery by name of Phase 2 checks
+  keyring envelopes and rewrites none). It is sealed again under the
+  DA-exempt key at the next password login's reseal, from what that login
+  proves, as a keyring envelope that does not load is today: a password kind
+  from the password, a GNOME keyring token from its password wrap. The
+  reseal derives nothing. A token whose wrap does not open under today's
+  password (a copy from before a password change) is left as it is, and
+  `irlume keyring arm` arms the keyring again.
+
+A key evicted by hand (the manual path above) gives the same result for an
+envelope that comes back under it. An authentication never derives the
+original key once a DA-exempt key is persisted: an envelope still under a
+retired key falls back to the password until the start or the reseal has moved
+it. Only with no persisted irlume key at all does the section 3.2 fallback,
+today's per-call derivation, apply. Today an unseal finding the original
+handle free derives the original key and persists it there
+(`load_or_create_srk` in `SrkMode::Initialize`); Phase 3 changes that path,
+since otherwise the first authentication after a retirement would persist the
+key again.
 
 ### A weak storage key (#1073 item 2)
 
@@ -936,9 +953,12 @@ action and its `docs/TUI.md` row in the same change.
 The `tpm-lockout` reading is unchanged. A storage key waiting to be retired is
 reported with its handle, its name and what it waits for: a later boot (and,
 after a move not yet shown durable, which envelope, by account and kind), an
-envelope that still names it (by account and kind), or the DA-exempt key it
-needs. A key irlume will not evict because a derivation does not reproduce it
-is reported, once no envelope names it, with the manual command and its
+envelope that still names it (by account and kind), the DA-exempt key it
+needs, or a proof that failed (the recorded error and its boot, and that the
+next try is at the first start in a later boot). A failed proof is not offered
+the manual command, since a derivation that errors says nothing about whose
+key it is. A key irlume will not evict because a derivation does not reproduce
+it is reported, once no envelope names it, with the manual command and its
 warning. Uninstall, which evicts only what a fresh derivation gives, reports
 such a key with its handle and name and leaves it, as section 3.4 says.
 
@@ -963,11 +983,18 @@ Acceptance tests (added, Phase 3):
   doctor reports it for the manual path once no envelope is under it; a
   record edited to name another stack's key, with a child of that key placed
   beside it, evicts nothing (swtpm).
-- After the original key is retired, an envelope under it restored from an
+- A derivation that fails at the proof (an owner authorization set on the
+  swtpm) retires nothing, and doctor reports the recorded error without the
+  manual command; a restart in the same boot does not derive again, and a
+  start in a later boot does (swtpm, fake boot IDs).
+- After the original key is retired, a template key under it restored from an
   older copy of the state directory is moved at the next start through a
   transient original key onto the DA-exempt key, with nothing persisted at the
-  original handle; an authentication before that start does not derive it
-  and falls back to the password (swtpm).
+  original handle; a keyring secret restored the same way is left as it is by
+  that start and sealed under the DA-exempt key at the next password login's
+  reseal, with no derivation; an authentication before each envelope's move
+  point does not derive the original key and falls back to the password
+  (swtpm).
 - A recorded DA-exempt key with the ROCA fingerprint, with today's derivation
   clean, is replaced at the next start by a new key at the next free handle;
   a start stopped between persisting that key and writing the record is

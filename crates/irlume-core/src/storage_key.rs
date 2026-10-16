@@ -8,12 +8,15 @@
 //! room (#1083).
 //!
 //! New seals go under the key once it is persisted, and each envelope records
-//! it as its parent (`crate::tpm`, ADR-0034 §3.3). Moving the envelopes sealed
-//! before follows. The key costs one owner persistent handle, and uninstall
-//! evicts it (`tpm::evict_da_exempt_srks`).
+//! it as its parent (`crate::tpm`, ADR-0034 §3.3); envelopes sealed before
+//! move onto it at their move points. The key costs one owner persistent
+//! handle, and uninstall evicts it (`tpm::evict_da_exempt_srks`).
 
 use crate::{keyring, template_key, tpm};
-use irlume_common::tpm_readiness::{DaExemptKey, KeyRefusal, RefusalReason};
+use irlume_common::tpm_readiness::{
+    DaExemptKey, EnvelopeKind, KeyRefusal, OriginalKeyEnvelope, OriginalKeyEnvelopes,
+    RefusalReason, MAX_NAMED_ENVELOPES,
+};
 use irlume_common::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -216,8 +219,9 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
 }
 
 /// What `irlume doctor` reports (ADR-0034 §4): the record, with the recorded
-/// handle kept only while the key there has the recorded name, and a
-/// recorded refusal only while any envelope exists.
+/// handle kept only while the key there has the recorded name, a recorded
+/// refusal only while any envelope exists, and the envelopes still under the
+/// original storage key (`on_original_key`).
 ///
 /// # Errors
 ///
@@ -245,7 +249,55 @@ pub fn report() -> Result<DaExemptKey> {
             // one bounded line with no control characters.
             detail: irlume_common::single_line(&refused.detail, MAX_DETAIL_CHARS),
         }),
+        on_original_key: Some(on_original_key()?),
     })
+}
+
+/// The envelopes (sealed template keys and keyring secrets) that record no
+/// parent, and so are under the original storage key, which a TPM lockout
+/// blocks (ADR-0034 §4). The file names come from the state directory, which
+/// is untrusted where it is writable offline (§5): only a file named for an
+/// account name irlumed accepts is named, at most [`MAX_NAMED_ENVELOPES`], and
+/// every one counts in the total. An envelope that cannot be parsed is not
+/// counted: it is under no key this census can tell.
+pub(crate) fn on_original_key() -> Result<OriginalKeyEnvelopes> {
+    let mut named = Vec::new();
+    let mut total = 0u32;
+    for (dir, kind) in [
+        (template_key::key_dir(), EnvelopeKind::TemplateKey),
+        (keyring::keyring_dir(), EnvelopeKind::KeyringSecret),
+    ] {
+        for path in envelope_paths(&dir)? {
+            let on_original = crate::envelope::SealedEnvelope::load(&path)
+                .is_ok_and(|envelope| envelope.parent.is_none());
+            if !on_original {
+                continue;
+            }
+            total = total.saturating_add(1);
+            let user = path.file_stem().and_then(|stem| stem.to_str());
+            if let Some(user) = user.filter(|user| is_account_name(user)) {
+                named.push(OriginalKeyEnvelope {
+                    user: user.to_owned(),
+                    kind,
+                });
+            }
+        }
+    }
+    named.sort();
+    named.truncate(MAX_NAMED_ENVELOPES);
+    Ok(OriginalKeyEnvelopes { named, total })
+}
+
+/// Whether `name` is an account name irlumed accepts in a request (its
+/// `valid_username`): 1 to 64 bytes of ASCII letters, digits, `_`, `-`, `.`
+/// and `$`, not starting with `-` or `.`.
+fn is_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['-', '.'])
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'$'))
 }
 
 /// [`ensure_at_start`] over `tpm`, from `record`, in boot `boot`, with the
@@ -973,6 +1025,75 @@ mod tests {
             !unparsable.expect("census"),
             "an envelope that cannot be read"
         );
+    }
+
+    /// ADR-0034 §4: doctor names the envelopes still under the original key,
+    /// by account and kind, sorted. An envelope on a key is not named, one
+    /// that cannot be parsed is not counted, a file name that is no account
+    /// name is counted but not named, and the names stop at the cap.
+    #[test]
+    fn the_envelopes_on_the_original_key_are_named_by_account_and_kind() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_tmp_dir("storage-key-named");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+        std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+        let vars = ["IRLUME_TEMPLATE_KEY_DIR", "IRLUME_KEYRING_DIR"];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let envelope = |on_key: bool| {
+            let mut value = serde_json::json!({
+                "version": 1, "pcrs": [7], "public": "", "private": ""
+            });
+            if on_key {
+                value["parent"] = serde_json::json!({"handle": 0x8101_0003_u32, "name": "aa"});
+            }
+            serde_json::to_vec(&value).unwrap()
+        };
+        let write = |path: &str, bytes: &[u8]| std::fs::write(format!("{dir}/{path}"), bytes);
+        let empty = on_original_key();
+        write("template-keys/carol.json", &envelope(false)).unwrap();
+        write("keyring/carol.json", &envelope(false)).unwrap();
+        write("keyring/alice.json", &envelope(false)).unwrap();
+        write("template-keys/alice.json", &envelope(true)).unwrap();
+        write("keyring/bob.json", b"not an envelope").unwrap();
+        write("keyring/-planted\u{1b}.json", &envelope(false)).unwrap();
+        let some = on_original_key();
+        for n in 0..MAX_NAMED_ENVELOPES {
+            write(&format!("keyring/user{n:02}.json"), &envelope(false)).unwrap();
+        }
+        let many = on_original_key();
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let empty = empty.expect("census");
+        assert_eq!((empty.named.len(), empty.total), (0, 0));
+        let some = some.expect("census");
+        let named: Vec<_> = some
+            .named
+            .iter()
+            .map(|envelope| (envelope.user.as_str(), envelope.kind))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("alice", EnvelopeKind::KeyringSecret),
+                ("carol", EnvelopeKind::TemplateKey),
+                ("carol", EnvelopeKind::KeyringSecret),
+            ]
+        );
+        assert_eq!(some.total, 4, "the planted name counts but is not named");
+        let many = many.expect("census");
+        assert_eq!(many.named.len(), MAX_NAMED_ENVELOPES);
+        assert_eq!(many.total, 4 + MAX_NAMED_ENVELOPES as u32);
     }
 
     /// An oversized envelope or record in the state directory is refused by

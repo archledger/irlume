@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor`'s `tpm-lockout` names, in lockout, each account and
+  envelope kind still on irlume's original storage key and what the lockout
+  blocks for it: a template key, that account's face login; a keyring
+  secret, its credential release after a face or fingerprint login
+  (ADR-0034 §4). Envelopes on the DA-exempt key are not named. The warning
+  for a refused persist of that key names the envelopes that stay on the
+  original key. irlumed reports at most 32 envelopes, each under an account
+  name it accepts, with a count of all of them, and doctor shows 12.
+
 - Envelopes sealed under the original storage key move to irlume's
   DA-exempt key once irlumed has persisted it (ADR-0034 §3.3), so a TPM
   lockout stops them no longer: a template key at irlumed's start, and on

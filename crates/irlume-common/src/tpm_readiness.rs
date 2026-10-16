@@ -245,6 +245,53 @@ pub struct DaExemptKey {
     /// Why the last attempt to persist it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<KeyRefusal>,
+    /// The envelopes still under irlume's original storage key, which a TPM
+    /// lockout blocks (ADR-0034 §4); `None` from an irlumed that predates
+    /// the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_original_key: Option<OriginalKeyEnvelopes>,
+}
+
+/// The envelopes still under irlume's original storage key: the first ones
+/// found, by account and kind, and how many there are in all. The names come
+/// from the state directory, which is untrusted where it is writable offline
+/// (ADR-0034 §5), so irlumed names at most [`MAX_NAMED_ENVELOPES`], each an
+/// account name it would accept, and a client cleans them again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginalKeyEnvelopes {
+    /// The envelopes named, sorted by account and then kind.
+    #[serde(default)]
+    pub named: Vec<OriginalKeyEnvelope>,
+    /// How many envelopes are under the original key, named or not.
+    #[serde(default)]
+    pub total: u32,
+}
+
+/// At most this many envelopes are named in [`OriginalKeyEnvelopes`].
+pub const MAX_NAMED_ENVELOPES: usize = 32;
+
+/// One envelope under irlume's original storage key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OriginalKeyEnvelope {
+    /// The account it belongs to.
+    pub user: String,
+    /// What it holds.
+    pub kind: EnvelopeKind,
+}
+
+/// What an envelope holds, and so what a TPM lockout blocks while it is under
+/// a key that is not DA-exempt (ADR-0034 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeKind {
+    /// The account's template key: face login with its encrypted enrollment.
+    TemplateKey,
+    /// A sealed keyring secret: its release after a face or fingerprint
+    /// login.
+    KeyringSecret,
+    /// A kind this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 /// A refused persist of the DA-exempt storage key.

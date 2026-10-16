@@ -2995,9 +2995,46 @@ mod tests {
             key.refused.map(|refused| refused.reason),
             Some(tpm_readiness::RefusalReason::Unknown)
         );
+        assert_eq!(key.on_original_key, None, "a daemon that predates the list");
         assert_eq!(
             serde_json::to_value(tpm_readiness::DaExemptKey::default()).unwrap(),
             serde_json::json!({})
+        );
+    }
+
+    /// ADR-0034 §4: the envelopes still under the original storage key travel
+    /// by account and kind, and a kind added later reads as unknown.
+    #[test]
+    fn the_envelopes_on_the_original_key_travel_by_account_and_kind() {
+        use tpm_readiness::{EnvelopeKind, OriginalKeyEnvelope};
+        let wire = serde_json::json!({"on_original_key": {
+            "named": [
+                {"user": "alice", "kind": "template_key"},
+                {"user": "bob", "kind": "keyring_secret"},
+                {"user": "carol", "kind": "a_kind_added_later"}
+            ],
+            "total": 4
+        }});
+        let key: tpm_readiness::DaExemptKey =
+            serde_json::from_value(wire).expect("the list decodes");
+        let list = key.on_original_key.expect("the list");
+        assert_eq!(list.total, 4);
+        assert_eq!(
+            list.named,
+            [
+                OriginalKeyEnvelope {
+                    user: "alice".into(),
+                    kind: EnvelopeKind::TemplateKey
+                },
+                OriginalKeyEnvelope {
+                    user: "bob".into(),
+                    kind: EnvelopeKind::KeyringSecret
+                },
+                OriginalKeyEnvelope {
+                    user: "carol".into(),
+                    kind: EnvelopeKind::Unknown
+                },
+            ]
         );
     }
 

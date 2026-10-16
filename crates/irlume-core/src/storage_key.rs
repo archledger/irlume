@@ -125,7 +125,8 @@ pub enum Outcome {
 /// The key is derived at most once, and only when the recorded key is not at
 /// its handle and no refusal earlier in this boot stands. A copy already
 /// persisted is adopted by its TPM name, so a power loss between
-/// `TPM2_EvictControl` and the record never leaves a second copy. Otherwise
+/// `TPM2_EvictControl` and the record never leaves a second copy, and neither
+/// does a start that overlaps this one and persists the key first. Otherwise
 /// the key is persisted at the first free owner handle from the preferred one
 /// whatever `TPM_PT_HR_PERSISTENT_AVAIL` says, since a 0 there is an estimate
 /// that promises nothing (Part 2 table 28).
@@ -274,7 +275,15 @@ pub(crate) fn ensure_with(
                     Outcome::Persisted { handle },
                 ))
             }
-            Err(failure) if failure.class == FailureClass::Taken => taken.push(handle),
+            // Another start may have just persisted the same key there: the
+            // derivation is deterministic, so adopt it rather than persist a
+            // second copy.
+            Err(failure) if failure.class == FailureClass::Taken => {
+                if tpm.name_at(handle)?.as_deref() == Some(name.as_slice()) {
+                    return Ok((persisted_record(handle, &name), Outcome::Adopted { handle }));
+                }
+                taken.push(handle);
+            }
             Err(failure) => return Ok(refuse(reason_for(failure.class), failure.detail)),
         }
     }
@@ -386,6 +395,9 @@ mod tests {
         persist: Vec<std::result::Result<(), Failure>>,
         derived: usize,
         persisted: Vec<u32>,
+        /// A `Taken` answer means another start persisted this same key
+        /// there a moment earlier.
+        concurrent: bool,
     }
 
     impl FakeTpm {
@@ -397,6 +409,7 @@ mod tests {
                 persist: Vec::new(),
                 derived: 0,
                 persisted: Vec::new(),
+                concurrent: false,
             }
         }
     }
@@ -428,10 +441,16 @@ mod tests {
             } else {
                 self.persist.remove(0)
             };
-            if answer.is_ok() {
-                let name = self.derive.clone().expect("a derived key");
-                self.objects.insert(handle, name);
-                self.persisted.push(handle);
+            let name = self.derive.clone().expect("a derived key");
+            match &answer {
+                Ok(()) => {
+                    self.objects.insert(handle, name);
+                    self.persisted.push(handle);
+                }
+                Err(failure) if failure.class == FailureClass::Taken && self.concurrent => {
+                    self.objects.insert(handle, name);
+                }
+                Err(_) => {}
             }
             answer
         }
@@ -563,6 +582,25 @@ mod tests {
             Some(0x8100_0000)
         );
         assert_eq!(first_free_owner_handle(PLAN, &[]), Some(0x8101_0003));
+    }
+
+    /// Two starts that overlap derive the same key and both see the preferred
+    /// handle free. The one whose persist finds it taken by that same key
+    /// adopts it there, and persists no second copy.
+    #[test]
+    fn a_raced_handle_holding_the_same_key_is_adopted() {
+        let mut tpm = FakeTpm::new();
+        tpm.concurrent = true;
+        tpm.persist = vec![Err(failure(FailureClass::Taken))];
+        let (record, outcome) = run(&mut tpm, &Record::default(), BOOT);
+        assert_eq!(
+            outcome,
+            Outcome::Adopted {
+                handle: 0x8101_0003
+            }
+        );
+        assert!(tpm.persisted.is_empty(), "no second copy");
+        assert_eq!(record.persisted.expect("recorded").handle, 0x8101_0003);
     }
 
     /// A power loss between `TPM2_EvictControl` and the record leaves a

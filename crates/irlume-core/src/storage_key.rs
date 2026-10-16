@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 /// The version written into new records.
 const RECORD_VERSION: u32 = 1;
 
+/// The longest refusal detail recorded or reported, in characters.
+const MAX_DETAIL_CHARS: usize = 300;
+
 /// How many taken handles a persist steps past before it gives up. Each
 /// `TPM_RC_NV_DEFINED` means another stack took the handle between the scan
 /// and the command, which systemd's `tpm2_persist_handle` also answers by
@@ -137,8 +140,17 @@ pub enum Outcome {
 /// read, or the record cannot be written. A key persisted before a failed
 /// write is adopted at the next start.
 pub fn ensure_at_start() -> Result<Option<Outcome>> {
+    let envelope = envelope_under_original_key()?;
+    if !envelope && load_record().refused.is_none() {
+        return Ok(None);
+    }
+    // One transaction: two starts that overlap (a direct start beside the
+    // service) would each read, decide and write the record, and a refusal
+    // one of them recorded last would replace the key the other persisted.
+    // Under the lock the second start reads the first one's record.
+    let _lock = RecordLock::acquire()?;
     let record = load_record();
-    if !envelope_under_original_key()? {
+    if !envelope {
         if record.refused.is_some() {
             save_record(&Record {
                 refused: None,
@@ -184,7 +196,10 @@ pub fn report() -> Result<DaExemptKey> {
         handle,
         refused: record.refused.map(|refused| KeyRefusal {
             reason: refused.reason,
-            detail: refused.detail,
+            // The record is in the state directory, which is untrusted where
+            // it is writable offline (ADR-0034 §5): what it says goes out as
+            // one bounded line with no control characters.
+            detail: irlume_common::single_line(&refused.detail, MAX_DETAIL_CHARS),
         }),
     })
 }
@@ -199,6 +214,7 @@ pub(crate) fn ensure_with(
     plan: &std::result::Result<Plan, String>,
 ) -> Result<(Record, Outcome)> {
     let refuse = |reason: RefusalReason, detail: String| {
+        let detail = irlume_common::single_line(&detail, MAX_DETAIL_CHARS);
         let refusal = KeyRefusal {
             reason,
             detail: detail.clone(),
@@ -356,6 +372,68 @@ fn has_envelope(dir: &Path) -> Result<bool> {
 
 fn record_path() -> PathBuf {
     irlume_common::state_dir().join("tpm-storage-key")
+}
+
+/// An exclusive `flock` on `state_dir()/.tpm-storage-key.lock` for the
+/// start-up step's read, decision and write of the record, held until it is
+/// dropped. Like `template_key::UserStateLock`, every acquisition opens the
+/// file anew, so it also excludes another thread of this process.
+struct RecordLock(std::fs::File);
+
+impl RecordLock {
+    fn acquire() -> Result<Self> {
+        let path = irlume_common::state_dir().join(".tpm-storage-key.lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|e| Error::Io(format!("open {}: {e}", path.display())))?;
+        let is_file = file
+            .metadata()
+            .map_err(|e| Error::Io(e.to_string()))?
+            .file_type()
+            .is_file();
+        if !is_file {
+            return Err(Error::Io(format!(
+                "the storage key lock is not a regular file: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `file` owns this open descriptor, and the guard keeps it
+            // open until the lock is released in Drop.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(Error::Io(format!(
+                    "lock {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RecordLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: the guard still owns a valid descriptor throughout Drop.
+            unsafe {
+                libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
 }
 
 /// The record, or an empty one when there is none. A record that is
@@ -734,6 +812,109 @@ mod tests {
         assert_eq!(reported.expect("report").refused, None);
         assert_eq!(outcome.expect("the step"), None);
         assert_eq!(kept.refused, None);
+    }
+
+    /// The record lock excludes a second holder until the first is dropped,
+    /// so overlapping starts run the step one after the other.
+    #[test]
+    fn the_record_lock_serializes_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_tmp_dir("storage-key-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        let first = RecordLock::acquire().expect("first holder");
+        let released = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&released);
+        let second = std::thread::spawn(move || {
+            let _lock = RecordLock::acquire().expect("second holder");
+            seen.load(Ordering::SeqCst)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        released.store(true, Ordering::SeqCst);
+        drop(first);
+        let after_release = second.join().expect("second thread");
+        match previous {
+            Some(previous) => std::env::set_var("IRLUME_STATE_DIR", previous),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            after_release,
+            "the second holder ran only after the first let go"
+        );
+    }
+
+    /// A refusal detail goes out as one bounded line with no control
+    /// characters, from the record (untrusted where the state directory is
+    /// writable offline) and from the TPM's own words alike.
+    #[test]
+    fn a_refusal_detail_is_one_bounded_line() {
+        let mut tpm = FakeTpm::new();
+        tpm.derive = Err(Failure {
+            class: FailureClass::Other,
+            detail: format!("bad\x1b[2Jdetail\n{}", "x".repeat(1000)),
+        });
+        let (record, outcome) = run(&mut tpm, &Record::default(), BOOT);
+        let Outcome::Refused(refusal) = outcome else {
+            panic!("refused");
+        };
+        for detail in [refusal.detail, record.refused.expect("recorded").detail] {
+            assert!(!detail.chars().any(char::is_control), "{detail:?}");
+            assert!(
+                detail.chars().count() <= MAX_DETAIL_CHARS + 3,
+                "{}",
+                detail.len()
+            );
+        }
+    }
+
+    /// A record edited to carry terminal control characters reaches doctor's
+    /// report as one bounded line.
+    #[test]
+    fn a_tampered_refusal_detail_is_reported_as_one_line() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("storage-key-tampered");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+        std::fs::write(format!("{dir}/template-keys/alice.json"), b"{}").unwrap();
+        let vars = [
+            "IRLUME_STATE_DIR",
+            "IRLUME_TEMPLATE_KEY_DIR",
+            "IRLUME_KEYRING_DIR",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        let tampered = format!(
+            r#"{{"version":1,"refused":{{"reason":"other","detail":"\u001b]0;owned\u0007\r\n{}"}}}}"#,
+            "y".repeat(2000)
+        );
+        std::fs::write(record_path(), tampered).unwrap();
+        let reported = report();
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let detail = reported
+            .expect("report")
+            .refused
+            .expect("the refusal is reported")
+            .detail;
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS + 3);
     }
 
     /// The record is not a `*.json` file in the state directory, which

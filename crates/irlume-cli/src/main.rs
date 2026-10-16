@@ -4195,9 +4195,21 @@ fn tpm_lockout_check(
     da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
 ) -> (crate::doctor_report::State, String) {
     use crate::doctor_report::State;
-    let lockout = match lockout {
-        Ok(lockout) => lockout,
-        Err(e) => return (State::Unknown, format!("lockout state not read: {e}")),
+    let refused = da_exempt_key
+        .as_ref()
+        .ok()
+        .and_then(|key| key.refused.as_ref());
+    let lockout = match (lockout, refused) {
+        (Ok(lockout), _) => lockout,
+        // The refusal is read from irlumed's record, not the TPM, so it stays
+        // actionable when the lockout properties could not be read.
+        (Err(e), Some(refused)) => {
+            return (
+                State::Warn,
+                format!("lockout state not read ({e}), {}", refusal_warning(refused)),
+            )
+        }
+        (Err(e), None) => return (State::Unknown, format!("lockout state not read: {e}")),
     };
     let counts = format!(
         "{} of {} failures, recovery interval {} s",
@@ -4259,20 +4271,10 @@ fn tpm_lockout_check(
             ),
         );
     }
-    if let Some(refused) = da_exempt_key
-        .as_ref()
-        .ok()
-        .and_then(|key| key.refused.as_ref())
-    {
+    if let Some(refused) = refused {
         return (
             State::Warn,
-            format!(
-                "not in lockout ({counts}), but irlumed could not persist irlume's DA-exempt \
-                 storage key (ADR-0034 §3): {}. irlume's envelopes stay on its original key, \
-                 which the next TPM lockout would block. irlumed tries again {}",
-                refusal_text(refused),
-                refused.reason.when_retried()
-            ),
+            format!("not in lockout ({counts}), {}", refusal_warning(refused)),
         );
     }
     if !lockout.lockout_auth_set {
@@ -4292,8 +4294,20 @@ fn tpm_lockout_check(
     )
 }
 
+/// The warning for a refused persist of irlume's DA-exempt storage key.
+fn refusal_warning(refused: &irlume_common::tpm_readiness::KeyRefusal) -> String {
+    format!(
+        "but irlumed could not persist irlume's DA-exempt storage key (ADR-0034 §3): {}. \
+         irlume's envelopes stay on its original key, which the next TPM lockout would \
+         block. irlumed tries again {}",
+        refusal_text(refused),
+        refused.reason.when_retried()
+    )
+}
+
 /// Why irlume's DA-exempt storage key could not be persisted, in words, with
-/// the TPM's own.
+/// the TPM's own as one bounded line: irlumed cleans it, and an older or
+/// altered daemon's text is cleaned again here.
 fn refusal_text(refused: &irlume_common::tpm_readiness::KeyRefusal) -> String {
     use irlume_common::tpm_readiness::RefusalReason;
     let reason = match refused.reason {
@@ -4308,7 +4322,10 @@ fn refusal_text(refused: &irlume_common::tpm_readiness::KeyRefusal) -> String {
         }
         RefusalReason::Other | RefusalReason::Unknown => "the TPM refused it",
     };
-    format!("{reason} ({})", refused.detail)
+    format!(
+        "{reason} ({})",
+        irlume_common::single_line(&refused.detail, 300)
+    )
 }
 
 /// The `secure-boot-certificates` check: where this machine stands in
@@ -6795,6 +6812,22 @@ mod tests {
         assert!(detail.contains("dictionary-attack lockout"), "{detail}");
         let (reading, _) = tpm_lockout_check(&calm, &Err("this irlumed predates it".into()));
         assert_eq!(reading, State::Pass);
+        let unread: Result<TpmLockout, String> = Err("the TPM did not answer".into());
+        let (reading, detail) = tpm_lockout_check(&unread, &refused(RefusalReason::NoSpace));
+        assert_eq!(reading, State::Warn, "a recorded refusal stays actionable");
+        assert!(detail.contains("lockout state not read"), "{detail}");
+        assert!(detail.contains("no room"), "{detail}");
+        let (reading, _) = tpm_lockout_check(&unread, &Ok(DaExemptKey::default()));
+        assert_eq!(reading, State::Unknown);
+        let hostile = Ok(DaExemptKey {
+            handle: None,
+            refused: Some(KeyRefusal {
+                reason: RefusalReason::Other,
+                detail: "\u{1b}]0;title\u{7}\nnext line".into(),
+            }),
+        });
+        let (_, detail) = tpm_lockout_check(&calm, &hostile);
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
     }
 
     #[test]

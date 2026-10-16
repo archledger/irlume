@@ -824,9 +824,19 @@ retirement would persist the key again.
 
 ### A weak storage key (#1073 item 2)
 
-doctor's `tpm-firmware` check also reads the DA-exempt key for the ROCA
-fingerprint, since new seals go under it. A weak key is replaced by moving its
-envelopes first, never by evicting a key an envelope names:
+doctor's `tpm-firmware` check reads every storage key irlume knows of for the
+ROCA fingerprint, not only the original key's handle: during a migration or a
+replacement the original key, the DA-exempt key and a superseded weak
+DA-exempt key can all hold envelopes, and reporting one could hide another.
+The `TpmReadiness` reply keeps its `storage_key` part, which describes the key
+at the original handle as today, for clients that predate the change, and
+gains an additive list with one entry per key: its role (original, DA-exempt
+or superseded), its handle, its name and its `StorageKeyCheck`. A client that
+predates the list reads only the part it knows, and a current doctor reports
+each weak key with the envelopes that still name it.
+
+A weak key is replaced by moving its envelopes first, never by evicting a key
+an envelope names:
 
 - **The original key is weak.** Its envelopes move onto the DA-exempt key as
   for any original key. When today's derivation of the DA-exempt template
@@ -849,7 +859,13 @@ envelopes first, never by evicting a key an envelope names:
   nothing moves, and doctor reports the refusal with the weak key.
 - **Today's derivation of the DA-exempt template is weak too** (the firmware
   is not updated). The DA-exempt key is not replaced, since a new one would be
-  as weak; doctor says to update the TPM firmware first.
+  as weak; doctor says to update the TPM firmware first. The start records
+  that result with the TPM's firmware version (`TPM_PT_FIRMWARE_VERSION_1`
+  and `_2`, which `GetCapability` reads without a derivation) and derives
+  again only at a start that reads another version, since a firmware update
+  is what changes key generation. A start that reads the recorded version
+  derives nothing for the weak key, so it does not keep the original key's
+  retirement (condition 2) from running.
 
 The secrets sealed under a weak key therefore move before any eviction: an
 envelope present when its move runs needs no `irlume recovery restore`, no
@@ -859,6 +875,27 @@ no envelope names the key. Resealing under the new key is the move,
 round-trip checked as section 3.3 requires. Only an envelope that comes back
 after its key was evicted, by hand or by a retirement a derivation no longer
 reproduces, needs recovery, as above.
+
+### Uninstall
+
+Uninstall evicts only what a fresh derivation gives (section 3.4), and it
+wipes the state directory before it scans the TPM. A superseded weak
+DA-exempt key, at whichever owner handle it was persisted at and no longer
+reproduced by a derivation, is then known only from the record. So uninstall
+reads the record's kept keys (the original key's entry and any superseded
+key) before the wipe, as it captures irlumed's unit environment before
+removing the unit, and after the eviction reports each one still persisted
+with its handle, its name and the manual command. The record read is
+advisory, as everywhere: it chooses what to report, never what to evict.
+
+### CLI and TUI parity
+
+Whatever a CLI user can do or read here, a TUI user can too. Phase 3 adds no
+command that evicts a key a derivation does not prove, on either surface. Its
+reports are doctor lines, which `irlume doctor`, the TUI's diagnostics (which
+run the same doctor code) and `irlume doctor --json` all show. Any new command
+Phase 3 adds, such as a status view of the storage keys, ships with its TUI
+action and its `docs/TUI.md` row in the same change.
 
 ### What doctor reports
 
@@ -896,6 +933,15 @@ Acceptance tests (added, Phase 3):
   its envelopes move at their move points, and the weak key is then reported
   for the manual path and not evicted; with the TPM full or no owner handle
   free, the refusal is recorded and the weak key stays in use; with today's
-  derivation weak too, nothing is replaced and doctor names the firmware
-  update (synthetic moduli for the fingerprint, as `roca_verdict`'s tests
-  use, and swtpm for the moves and the capacity).
+  derivation weak too, nothing is replaced, doctor names the firmware update,
+  and a later start with the same firmware version derives nothing for it
+  while one with another version derives again (synthetic moduli for the
+  fingerprint, as `roca_verdict`'s tests use, a fake firmware version, and
+  swtpm for the moves and the capacity).
+- doctor's `tpm-firmware` reports a weak key in each role (original,
+  DA-exempt, superseded) from the per-key list, and a reply without the list,
+  from an older irlumed, reads as today from `storage_key`.
+- Uninstall with a superseded weak key at a dynamically chosen handle reads
+  it from the record before the wipe and reports it with its handle and name
+  after, and evicts it in no case; a record edited to name another stack's
+  key only adds a report line (swtpm).

@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 /// The version written into new records.
 const RECORD_VERSION: u32 = 1;
 
+/// The largest record read, in bytes: one is a few hundred, and the state
+/// directory is untrusted where it is writable offline (ADR-0034 §5).
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
 /// The longest refusal detail recorded or reported, in characters.
 const MAX_DETAIL_CHARS: usize = 300;
 
@@ -396,11 +400,10 @@ pub(crate) fn recorded_key() -> Option<(u32, Vec<u8>)> {
 pub(crate) fn every_envelope_on(name: &str) -> Result<bool> {
     for dir in [template_key::key_dir(), keyring::keyring_dir()] {
         for path in envelope_paths(&dir)? {
-            let on_key = std::fs::read(&path)
+            // The bounded loader: an oversized, linked or unreadable file
+            // counts as not on the key, and cannot exhaust irlumed's memory.
+            let on_key = crate::envelope::SealedEnvelope::load(&path)
                 .ok()
-                .and_then(|bytes| {
-                    serde_json::from_slice::<crate::envelope::SealedEnvelope>(&bytes).ok()
-                })
                 .and_then(|envelope| envelope.parent)
                 .is_some_and(|parent| parent.name == name);
             if !on_key {
@@ -528,10 +531,11 @@ impl Drop for RecordLock {
 }
 
 /// The record, or an empty one when there is none. A record that is
-/// unreadable, malformed or from a newer release reads as none: the next step
-/// derives the key and adopts a persisted copy by its name, so nothing is lost.
+/// unreadable, larger than [`MAX_RECORD_BYTES`], malformed or from a newer
+/// release reads as none: the next step derives the key and adopts a
+/// persisted copy by its name, so nothing is lost.
 fn load_record() -> Record {
-    std::fs::read(record_path())
+    crate::envelope::read_bounded(&record_path(), MAX_RECORD_BYTES)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
         .filter(|record| record.version <= RECORD_VERSION)
@@ -968,6 +972,57 @@ mod tests {
         assert!(
             !unparsable.expect("census"),
             "an envelope that cannot be read"
+        );
+    }
+
+    /// An oversized envelope or record in the state directory is refused by
+    /// size before it is read: the census counts the envelope as not on the
+    /// key, and the record reads as none.
+    #[test]
+    fn oversized_state_files_are_refused_unread() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::test_tmp_dir("storage-key-oversized");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+        std::fs::create_dir_all(format!("{dir}/template-keys")).unwrap();
+        let vars = [
+            "IRLUME_STATE_DIR",
+            "IRLUME_TEMPLATE_KEY_DIR",
+            "IRLUME_KEYRING_DIR",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        // Sparse files: the length comes from the open file, so the test
+        // never writes or reads the bytes.
+        let sparse = |path: String, len: u64| {
+            std::fs::File::create(path).unwrap().set_len(len).unwrap();
+        };
+        sparse(
+            format!("{dir}/keyring/alice.json"),
+            crate::envelope::MAX_ENVELOPE_BYTES + 1,
+        );
+        sparse(format!("{dir}/tpm-storage-key"), MAX_RECORD_BYTES + 1);
+        let census = every_envelope_on("aa");
+        let record = load_record();
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !census.expect("census"),
+            "an oversized envelope is not on the key"
+        );
+        assert_eq!(
+            record,
+            Record::default(),
+            "an oversized record reads as none"
         );
     }
 

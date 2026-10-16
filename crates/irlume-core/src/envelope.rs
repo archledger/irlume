@@ -305,17 +305,21 @@ impl SealedEnvelope {
 }
 
 /// The bytes of the envelope file at `path`, under the rules
-/// [`SealedEnvelope::load`] states. The type and size come from the opened
-/// file itself, so nothing can be swapped in between the check and the read.
+/// [`SealedEnvelope::load`] states.
 fn read_envelope_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_bounded(path, MAX_ENVELOPE_BYTES)
+}
+
+/// The bytes of the regular file at `path`, at most `max` of them: a
+/// symbolic link is not followed, a FIFO or device is refused without
+/// blocking, and a larger file is an error. The type and size come from the
+/// opened file itself, so nothing can be swapped in between the check and the
+/// read. For files in the state directory, which is untrusted where it is
+/// writable offline (ADR-0034 §5).
+pub(crate) fn read_bounded(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error as IoError, ErrorKind, Read as _};
     use std::os::unix::fs::OpenOptionsExt as _;
-    let too_large = || {
-        IoError::new(
-            ErrorKind::FileTooLarge,
-            format!("larger than {MAX_ENVELOPE_BYTES} bytes"),
-        )
-    };
+    let too_large = || IoError::new(ErrorKind::FileTooLarge, format!("larger than {max} bytes"));
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -331,15 +335,13 @@ fn read_envelope_file(path: &Path) -> std::io::Result<Vec<u8>> {
     if !meta.is_file() {
         return Err(IoError::new(ErrorKind::InvalidInput, "not a regular file"));
     }
-    if meta.len() > MAX_ENVELOPE_BYTES {
+    if meta.len() > max {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
     // The limit holds even for a file that grows after the size check.
-    (&file)
-        .take(MAX_ENVELOPE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
+    (&file).take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
         return Err(too_large());
     }
     Ok(bytes)

@@ -1112,6 +1112,60 @@ impl storage_key::KeyTpm for DaExemptKeyTpm {
         Ok(names)
     }
 
+    fn evict(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+        // Probed first, so that a free handle logs no esys error (#601).
+        if !persistent_handle_present(&mut self.ctx, handle)? {
+            return Ok(false);
+        }
+        let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+        let object = self
+            .ctx
+            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+            .map_err(tpm_err)?;
+        let (_, found, _) = self
+            .ctx
+            .read_public(KeyHandle::from(ESYS_TR::from(object)))
+            .map_err(tpm_err)?;
+        // The name is read again just before the eviction, so a key another
+        // stack put at the handle since the proof is never evicted.
+        if found.value() != name {
+            return Ok(false);
+        }
+        self.ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    ObjectHandle::from(ESYS_TR::from(object)),
+                    Persistent::Persistent(persistent),
+                )
+            })
+            .map_err(tpm_err)?;
+        Ok(true)
+    }
+
+    fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+        let Some(key) = da_exempt_key_at(&mut self.ctx, handle, name, true)? else {
+            return Ok(false);
+        };
+        // The name covers the public area only, so a key from the same
+        // template persisted with another authorization value has the same
+        // name and shape. Creating a child under it with irlume's empty
+        // authorization shows irlume can seal under it; the child is
+        // discarded. The key's noDA attribute, part of the shape checked
+        // above, keeps a refused authorization from counting toward a
+        // lockout.
+        let template = sealed_template(Digest::default())?;
+        let sensitive =
+            SensitiveData::try_from(b"irlume: can seal here".to_vec()).map_err(tpm_err)?;
+        match self.ctx.execute_with_nullauth_session(|ctx| {
+            ctx.create(key, template, None, Some(sensitive), None, None)
+        }) {
+            Ok(_) => Ok(true),
+            Err(error) if is_auth_failure(&error) => Ok(false),
+            Err(error) => Err(tpm_err(error)),
+        }
+    }
+
     fn persist(&mut self, handle: u32) -> std::result::Result<(), storage_key::Failure> {
         let Some(derived) = self.derived else {
             return Err(other_failure("no derived key to persist"));
@@ -1154,6 +1208,16 @@ fn classify_failure(error: tss_esapi::Error) -> storage_key::Failure {
         class,
         detail: error.to_string(),
     }
+}
+
+/// Whether `error` is the TPM refusing an authorization (`TPM_RC_BAD_AUTH`
+/// or `TPM_RC_AUTH_FAIL`), as [`classify_failure`] reads it.
+fn is_auth_failure(error: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind as Kind;
+    matches!(
+        error,
+        tss_esapi::Error::Tss2Error(code) if matches!(code.kind(), Some(Kind::BadAuth | Kind::AuthFail))
+    )
 }
 
 fn other_failure(detail: impl std::fmt::Display) -> storage_key::Failure {
@@ -5004,7 +5068,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let token_env = SealedEnvelope::load(&envelope_path("bob"));
         let moved = parents();
         let after_keyring_moves = record();
-        let census = crate::storage_key::mark_at_start();
+        let settled = crate::storage_key::settle_at_start(false);
         let marked = record();
         let reported_after = crate::storage_key::report();
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -5034,15 +5098,19 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             assert!(after_move.get("moves").is_none(), "{after_move}");
         }
         let boot = irlume_common::boot_id();
+        let settled = settled
+            .expect("the census")
+            .expect("a DA-exempt key is recorded");
         assert_eq!(
-            census.expect("the census"),
-            Some(match &boot {
+            settled.census,
+            match &boot {
                 Some(boot) => crate::storage_key::Census::Unused {
                     since: boot.clone()
                 },
                 None => crate::storage_key::Census::Unsettled,
-            })
+            }
         );
+        assert_eq!(settled.retirement, None, "marked in this boot only");
         assert_eq!(
             marked.get("unused_since").and_then(|v| v.as_str()),
             boot.as_deref()
@@ -5325,6 +5393,452 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
         assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert!(put_back.is_ok(), "the original key is persisted again");
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// Fake boot IDs for the retirement tests, which need starts in more
+    /// than one boot.
+    const BOOT_A: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+    const BOOT_B: &str = "1a1b2c3d-4e5f-6789-abcd-ef0123456789";
+    const BOOT_C: &str = "2a1b2c3d-4e5f-6789-abcd-ef0123456789";
+
+    /// The TPM name of the persistent object at `handle`, if any.
+    fn name_at_handle(handle: u32) -> Option<Vec<u8>> {
+        let mut tpm = DaExemptKeyTpm::open().expect("context");
+        storage_key::KeyTpm::name_at(&mut tpm, handle).expect("read")
+    }
+
+    /// Rewrites the record's entry for the original key, as an offline edit
+    /// of the state directory would.
+    fn edit_original(record_path: &str, handle: u32, name: &[u8], matched: bool) {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(record_path).expect("record")).expect("json");
+        record["original"] = serde_json::json!({
+            "handle": handle, "name": storage_key::hex(name), "matched": matched
+        });
+        std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).expect("edit");
+    }
+
+    /// ADR-0034, Phase 3 amendment, on swtpm with fake boot IDs: a template
+    /// key moves onto the DA-exempt key, a start records the original key's
+    /// name as matching today's derivation, a start in boot A marks the key
+    /// unused, and the first start in boot B proves it by a fresh derivation
+    /// and evicts it from the TPM. The template key still unseals through
+    /// the DA-exempt key, which stays; a start that derived a key retires
+    /// nothing, and so does one whose record was edited to name the original
+    /// key itself as the DA-exempt key, which lacks that key's shape, or a
+    /// copy of the DA-exempt key persisted with an authorization value irlume
+    /// does not hold, which has its name and shape.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_the_original_key_is_retired_at_irlumeds_start_once_proved() {
+        use crate::storage_key::{ensure_at_start_reporting, settle_at_start_in, Retirement};
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retire-original");
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4170);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+
+        let persisted = ensure_at_start_reporting();
+        let moved = crate::template_key::move_to_stronger_policy("alice");
+        let recorded = ensure_at_start_reporting();
+        let quiet = ensure_at_start_reporting();
+        // A start in boot A that derived a key marks the key unused, and
+        // retires nothing.
+        let marked = settle_at_start_in(Some(BOOT_A), true);
+        let same_boot = settle_at_start_in(Some(BOOT_A), false);
+        let deriving = settle_at_start_in(Some(BOOT_B), true);
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        let kept_record = std::fs::read(&record_path).expect("record");
+        let mut edited: serde_json::Value = serde_json::from_slice(&kept_record).expect("json");
+        edited["persisted"] = serde_json::json!({
+            "handle": original,
+            "name": storage_key::hex(&name_at_handle(original).expect("the original key")),
+        });
+        std::fs::write(&record_path, serde_json::to_vec(&edited).unwrap()).expect("edit");
+        let names_itself = settle_at_start_in(Some(BOOT_B), false);
+        // A copy of the DA-exempt key persisted with an authorization value
+        // irlume does not hold: the same template gives the same name and
+        // shape, but irlume cannot seal under it.
+        const COPY: u32 = 0x8101_0012;
+        let copy_name = {
+            let mut ctx = open_context().expect("context");
+            let auth = Auth::try_from(b"someone else's".to_vec()).expect("auth");
+            let primary = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.create_primary(
+                        Hierarchy::Owner,
+                        da_exempt_srk_template().expect("the template"),
+                        Some(auth),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .expect("the copy");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    primary.key_handle.into(),
+                    Persistent::Persistent(PersistentTpmHandle::new(COPY).expect("handle")),
+                )
+            })
+            .expect("persist the copy");
+            let _ = ctx.flush_context(primary.key_handle.into());
+            name_at_handle(COPY).expect("the copy's name")
+        };
+        edited["persisted"] = serde_json::json!({
+            "handle": COPY, "name": storage_key::hex(&copy_name),
+        });
+        std::fs::write(&record_path, serde_json::to_vec(&edited).unwrap()).expect("edit");
+        let names_copy = settle_at_start_in(Some(BOOT_B), false);
+        {
+            let mut ctx = open_context().expect("context");
+            let persistent = PersistentTpmHandle::new(COPY).expect("handle");
+            let object = ctx
+                .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+                .expect("the copy");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    ObjectHandle::from(ESYS_TR::from(object)),
+                    Persistent::Persistent(persistent),
+                )
+            })
+            .expect("evict the copy");
+        }
+        std::fs::write(&record_path, &kept_record).expect("restore the record");
+        let retired = settle_at_start_in(Some(BOOT_B), false);
+        let after_retirement = handles();
+        let template_key = crate::template_key::load_key("alice");
+        let again = settle_at_start_in(Some(BOOT_C), false);
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        assert!(matches!(
+            persisted.expect("the step"),
+            (
+                Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED }),
+                true
+            )
+        ));
+        assert_eq!(moved.expect("the move"), Some(MoveGain::DaExemptKey));
+        assert!(
+            matches!(
+                recorded.expect("the step"),
+                (Some(crate::storage_key::Outcome::Present { .. }), true)
+            ),
+            "the start that records the original key derived it"
+        );
+        assert!(matches!(quiet.expect("the step"), (Some(_), false)));
+        let retirement = |settled: Result<Option<crate::storage_key::Settled>>| {
+            settled.expect("the step").expect("recorded").retirement
+        };
+        assert_eq!(retirement(marked), None, "marked in boot A");
+        assert_eq!(retirement(same_boot), None, "not in the boot of the mark");
+        assert_eq!(
+            retirement(deriving),
+            None,
+            "not in a start that derived a key"
+        );
+        assert_eq!(
+            retirement(names_itself),
+            None,
+            "not beside a recorded key without the DA-exempt shape"
+        );
+        assert_eq!(
+            retirement(names_copy),
+            None,
+            "not beside a recorded key irlume cannot seal under"
+        );
+        assert_eq!(
+            retirement(retired),
+            Some(Retirement::Retired { handle: original })
+        );
+        assert!(
+            !after_retirement.contains(&original) && after_retirement.contains(&PREFERRED),
+            "the original key is evicted and the DA-exempt key stays: {after_retirement:x?}"
+        );
+        assert_eq!(template_key.expect("the key").as_slice(), key.as_slice());
+        assert_eq!(retirement(again), None, "nothing left to retire");
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// ADR-0034, Phase 3 amendment, on swtpm: a key at the original handle
+    /// that the record kept as matching but today's derivation does not give
+    /// (a key the test persists with irlume's template shape and another
+    /// modulus) is never retired; the record then keeps it as not matching,
+    /// and no later start derives for it. A record edited to name another
+    /// stack's key there (the TCG template's noDA key), with a child of that
+    /// key placed beside it, evicts nothing either.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_key_todays_derivation_does_not_give_is_never_retired() {
+        use crate::storage_key::{ensure_at_start_reporting, settle_at_start_in, Retirement};
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retire-not-reproduced");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED),
+            "the handle this test uses is taken"
+        );
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        // An envelope on the DA-exempt key, so the start-up step runs; none
+        // is under the original key.
+        let on_key = serde_json::json!({
+            "version": 1, "pcrs": [7], "public": "", "private": "",
+            "parent": {"handle": PREFERRED, "name": "00"}
+        });
+        std::fs::write(
+            format!("{}/template-keys/bob.json", dirs.dir),
+            serde_json::to_vec(&on_key).unwrap(),
+        )
+        .expect("an envelope");
+
+        // A key with irlume's template shape and another modulus.
+        plant_foreign_key_at_srk_handle(srk_template().expect("irlume's template"));
+        let planted = name_at_handle(original).expect("the planted key");
+        let persisted = ensure_at_start_reporting();
+        edit_original(&record_path, original, &planted, true);
+        let marked = settle_at_start_in(Some(BOOT_A), false);
+        let not_reproduced = settle_at_start_in(Some(BOOT_B), false);
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("record")).expect("json");
+        let later = settle_at_start_in(Some(BOOT_C), false);
+        let planted_stays = name_at_handle(original) == Some(planted.clone());
+        remove_foreign_key_at_srk_handle();
+
+        // Another stack's key there, the record edited to name it, and a
+        // child of it beside the record.
+        plant_foreign_key_at_srk_handle(
+            storage_key_template(true, PublicKeyRsa::default()).expect("another stack's template"),
+        );
+        let theirs = name_at_handle(original).expect("their key");
+        edit_original(&record_path, original, &theirs, true);
+        let child = {
+            let mut ctx = open_context().expect("context");
+            let parent = TpmHandle::Persistent(persistent_srk_handle().expect("handle"));
+            let parent = KeyHandle::from(ESYS_TR::from(
+                ctx.tr_from_tpm_public(parent).expect("their key"),
+            ));
+            let template = sealed_template(Digest::default()).expect("a sealed template");
+            let sensitive =
+                SensitiveData::try_from(b"a child of their key".to_vec()).expect("sensitive");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.create(parent, template, None, Some(sensitive), None, None)
+            })
+            .expect("a child")
+        };
+        std::fs::write(
+            format!("{}/witness", dirs.dir),
+            [
+                child.out_public.marshall().expect("public"),
+                child.out_private.value().to_vec(),
+            ]
+            .concat(),
+        )
+        .expect("the child beside the record");
+        let edited = settle_at_start_in(Some(BOOT_B), false);
+        let theirs_stays = name_at_handle(original) == Some(theirs);
+        remove_foreign_key_at_srk_handle();
+
+        let removed = evict_da_exempt_srks();
+        let put_back = before
+            .contains(&original)
+            .then(|| seal_with_pcrs(b"puts the original key back", &[]));
+        let after = handles();
+        drop(dirs);
+
+        assert!(matches!(
+            persisted.expect("the step"),
+            (Some(crate::storage_key::Outcome::Persisted { .. }), true)
+        ));
+        let retirement = |settled: Result<Option<crate::storage_key::Settled>>| {
+            settled.expect("the step").expect("recorded").retirement
+        };
+        assert_eq!(retirement(marked), None);
+        assert_eq!(
+            retirement(not_reproduced),
+            Some(Retirement::NotReproduced { handle: original })
+        );
+        assert_eq!(kept["original"]["matched"], serde_json::json!(false));
+        assert_eq!(retirement(later), None, "nothing is derived for it again");
+        assert!(
+            planted_stays,
+            "the key today's derivation does not give stays"
+        );
+        assert_eq!(
+            retirement(edited),
+            None,
+            "another stack's key is not retired"
+        );
+        assert!(theirs_stays, "their key stays");
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_none_or(|put_back| put_back.is_ok()));
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    use tss_esapi::handles::AuthHandle;
+
+    /// Sets an owner authorization on the swtpm until dropped, through one
+    /// context, which ESYS keeps the new value in.
+    struct OwnerAuthorization(TpmContext);
+
+    impl OwnerAuthorization {
+        fn set() -> Self {
+            let mut ctx = open_context().expect("context");
+            let auth = Auth::try_from(b"an owner authorization".to_vec()).expect("auth");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.hierarchy_change_auth(AuthHandle::Owner, auth)
+            })
+            .expect("set the owner authorization");
+            Self(ctx)
+        }
+    }
+
+    impl Drop for OwnerAuthorization {
+        fn drop(&mut self) {
+            let cleared = self.0.execute_with_nullauth_session(|ctx| {
+                ctx.hierarchy_change_auth(AuthHandle::Owner, Auth::default())
+            });
+            if let Err(e) = cleared {
+                // The shared swtpm would refuse every later test's seal.
+                eprintln!("could not clear the swtpm's owner authorization: {e}");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// ADR-0034, Phase 3 amendment, on swtpm: with an owner authorization
+    /// set since the original key was recorded, the proof's derivation fails
+    /// (`TPM_RC_BAD_AUTH`, which the DA-exempt owner hierarchy counts toward
+    /// no lockout). The key is not retired, the failure is recorded, and a
+    /// restart in the same boot does not derive again. Once the
+    /// authorization is cleared, a start in a later boot derives again and
+    /// retires the key.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_failed_proof_is_recorded_and_tried_again_in_a_later_boot() {
+        use crate::storage_key::{ensure_at_start_reporting, settle_at_start_in, Retirement};
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retire-failed-proof");
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4171);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+
+        let persisted = ensure_at_start_reporting();
+        let moved = crate::template_key::move_to_stronger_policy("alice");
+        let recorded = ensure_at_start_reporting();
+        let marked = settle_at_start_in(Some(BOOT_A), false);
+        let (failed, failure_recorded, restart) = {
+            let _owner = OwnerAuthorization::set();
+            let failed = settle_at_start_in(Some(BOOT_B), false);
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record_path).expect("record"))
+                    .expect("json");
+            let restart = settle_at_start_in(Some(BOOT_B), false);
+            (failed, record, restart)
+        };
+        let still_there = handles().contains(&original);
+        let retried = settle_at_start_in(Some(BOOT_C), false);
+        let cleared: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("record")).expect("json");
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        assert!(matches!(
+            persisted.expect("the step"),
+            (Some(crate::storage_key::Outcome::Persisted { .. }), true)
+        ));
+        assert_eq!(moved.expect("the move"), Some(MoveGain::DaExemptKey));
+        assert!(recorded.is_ok());
+        let retirement = |settled: Result<Option<crate::storage_key::Settled>>| {
+            settled.expect("the step").expect("recorded").retirement
+        };
+        assert_eq!(retirement(marked), None);
+        let failed = retirement(failed);
+        assert!(
+            matches!(&failed, Some(Retirement::Failed { handle, .. }) if *handle == original),
+            "{failed:?}"
+        );
+        assert_eq!(
+            failure_recorded["retirement_attempt"]["boot_id"],
+            serde_json::json!(BOOT_B)
+        );
+        let restart = retirement(restart);
+        assert!(
+            matches!(&restart, Some(Retirement::Deferred { .. })),
+            "a restart in the same boot derives nothing: {restart:?}"
+        );
+        assert!(still_there, "a failed proof evicts nothing");
+        assert_eq!(
+            retirement(retried),
+            Some(Retirement::Retired { handle: original })
+        );
+        assert!(cleared.get("retirement_attempt").is_none(), "{cleared}");
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"

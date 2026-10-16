@@ -859,7 +859,7 @@ Set these on the service, not in a shell (`sudo systemctl edit irlumed`, then
 | `IRLUME_IR_AMBIENT_SUBTRACT` | `1` enables experimental lit-minus-ambient IR subtraction; changes the IR frames the matcher sees, so re-enroll after toggling (see [ARCHITECTURE.md](ARCHITECTURE.md)) | off |
 | `IRLUME_TCTI` | TPM transport; set to pin one (no fallback), e.g. `device:/dev/tpmrm0` to force the kernel resource manager | `device:/dev/tpm0`, falling back to `device:/dev/tpmrm0` when the raw device cannot be opened (ADR-0026) |
 | `IRLUME_PCRS` | comma-separated PCR list the sealed secret binds to (a literal seal; without a pcrlock policy covering one of PCRs 0 to 7, a list with none of them leaves a signed Tier 1 envelope as it is) | `7` |
-| `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user. irlume's DA-exempt storage key (ADR-0034 §3) goes to the handle after it, or the one before for `0x817fffff`; a value that does not parse, or is outside `0x81000000` to `0x817fffff`, keeps that key from being persisted | `0x81010002` |
+| `IRLUME_SRK_HANDLE` | persistent SRK handle (hex), if the default collides with another TPM user. irlume's DA-exempt storage key (ADR-0034 §3) goes to the handle after it, or the one before for `0x817fffff`; a value that does not parse, or is outside `0x81000000` to `0x817fffff`, keeps that key from being persisted. Once no envelope has been under the original key since a start in an earlier boot, irlumed's start evicts it from this handle when a fresh derivation proves it irlume's (ADR-0034, Phase 3 amendment) | `0x81010002` |
 | `IRLUME_METHOD_CONF` | alternate path for the method file | `/etc/irlume/method` |
 
 Liveness-cue tuning knobs and IR capture debug settings are in

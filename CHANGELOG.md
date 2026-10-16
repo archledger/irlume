@@ -442,6 +442,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume uninstall` evicts irlume's storage keys through the TPM irlumed
+  uses: the `IRLUME_TCTI` and `IRLUME_SRK_HANDLE` that irlumed's unit sets,
+  checked against the running daemon as its store directories are, not
+  whatever the uninstall process carries (#1088). Where those were set only
+  on irlumed, uninstall looked at another TPM or another handle, reported
+  the original key as already clean, and left both keys holding persistent
+  TPM capacity. The report now names the transport and handle it used. A
+  daemon whose running values differ from its unit, or a manager
+  environment that sets either, refuses the teardown as for the store
+  directories.
+
 - `irlume-gkr-unlock` sends the GNOME keyring token as soon as the control
   socket's listener is the owner of `org.gnome.keyring` itself, as for the
   `--login` daemon, without first asking gnome-keyring for its control

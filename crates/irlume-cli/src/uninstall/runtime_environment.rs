@@ -104,6 +104,23 @@ fn process_value(bytes: &[u8], var: &str) -> Result<Option<PathBuf>, String> {
     Ok(found)
 }
 
+/// A `TPM_VARS` value in a process environment, as [`process_value`] reads a
+/// directory.
+fn process_setting(bytes: &[u8], var: &str) -> Result<Option<String>, String> {
+    let prefix = format!("{var}=");
+    let mut found = None;
+    for entry in bytes.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(prefix.as_bytes()) {
+            if found.is_some() {
+                return Err("duplicate daemon TPM variable".into());
+            }
+            let value = std::str::from_utf8(value).map_err(|_| "non-UTF8 daemon TPM variable")?;
+            found = Some(super::unit_environment::setting(value, var)?);
+        }
+    }
+    Ok(found)
+}
+
 fn agree(disk: &Option<PathBuf>, running: Option<PathBuf>) -> Result<(), String> {
     if *disk != running {
         return Err(
@@ -118,6 +135,39 @@ fn agree(disk: &Option<PathBuf>, running: Option<PathBuf>) -> Result<(), String>
 pub(super) struct Snapshot {
     pub disk: super::unit_environment::Disk,
     status: Option<String>,
+}
+
+/// The TPM irlume's storage keys are evicted through (#1088): irlumed's
+/// transport, and the handle of its original storage key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmTarget {
+    /// `IRLUME_TCTI`, or `None` for the default transports.
+    pub tcti: Option<String>,
+    /// `IRLUME_SRK_HANDLE` as set, or `None` for none.
+    pub srk_handle: Option<String>,
+    /// Whether these come from irlumed's unit, not from this process.
+    pub from_unit: bool,
+}
+
+impl Snapshot {
+    /// What irlumed uses, when its unit is installed: the unit's settings,
+    /// which [`capture`] checked against the running daemon. Without a unit
+    /// (a source install whose daemon is run by hand) this process's own.
+    pub fn tpm_target(&self) -> TpmTarget {
+        if self.disk.installed {
+            let [tcti, srk_handle] = self.disk.tpm.clone();
+            return TpmTarget {
+                tcti,
+                srk_handle,
+                from_unit: true,
+            };
+        }
+        TpmTarget {
+            tcti: std::env::var("IRLUME_TCTI").ok(),
+            srk_handle: std::env::var("IRLUME_SRK_HANDLE").ok(),
+            from_unit: false,
+        }
+    }
 }
 
 pub(super) fn capture() -> Result<Snapshot, String> {
@@ -238,6 +288,16 @@ fn capture_with(
                 ));
             }
         }
+        for var in super::unit_environment::TPM_VARS {
+            if super::global_env_in(&global, var)
+                .map_err(|_| "unresolved global environment")?
+                .is_some()
+            {
+                return Err(format!(
+                    "{var} is set in the manager environment; irlumed's TPM is unresolved"
+                ));
+            }
+        }
         return finish_capture(root, disk, text, &mut show);
     };
     let dir = super::open_dir(&proc_root.join(pid.to_string()))
@@ -267,6 +327,14 @@ fn capture_with(
         .map_err(|_| "cannot read daemon environment")?;
     if bytes.len() > 1024 * 1024 {
         return Err("daemon environment exceeds observation limit".into());
+    }
+    // The storage keys are evicted through the TPM these select (#1088).
+    for (index, var) in super::unit_environment::TPM_VARS.iter().enumerate() {
+        if disk.tpm[index] != process_setting(&bytes, var)? {
+            return Err(format!(
+                "irlumed's running {var} differs from disk; reconcile it before removing stores"
+            ));
+        }
     }
     for (index, var) in super::unit_environment::STORE_VARS.iter().enumerate() {
         let value = &disk.values[index];
@@ -402,6 +470,83 @@ mod tests {
         assert_eq!(now_b.disk.values[0], Some(b));
         assert!(now_b.disk.values[1..].iter().all(Option::is_none));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// #1088: the TPM irlume's storage keys are evicted through is the one
+    /// irlumed's unit selects, checked against the running daemon: a daemon
+    /// that runs with another transport, or none, refuses the teardown, and
+    /// so does a stopped daemon whose manager environment sets one.
+    #[test]
+    fn the_tpm_target_is_the_units_and_the_running_daemon_must_agree() {
+        let root = std::env::temp_dir().join(format!("irlume-env-tpm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pid = root.join("42");
+        std::fs::create_dir_all(&pid).unwrap();
+        let uid = std::fs::metadata(&pid).unwrap().uid();
+        std::fs::write(pid.join("comm"), "irlumed\n").unwrap();
+        std::os::unix::fs::symlink("/", pid.join("root")).unwrap();
+        let state = root.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let tcti = "swtpm:host=127.0.0.1,port=2331";
+        let unit = root.join("etc/systemd/system/irlumed.service");
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(
+            &unit,
+            format!(
+                "[Service]\nEnvironment=IRLUME_STATE_DIR={} IRLUME_TCTI={tcti}\n\
+                 EnvironmentFile=/daemon.env\n",
+                state.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("daemon.env"), "IRLUME_SRK_HANDLE=0x81010010\n").unwrap();
+        let running = "LoadState=loaded\nActiveState=active\nMainPID=42\nNeedDaemonReload=no\nRootDirectory=\nRootImage=\nExecMainPID=42\nExecMainStartTimestampMonotonic=100\nInvocationID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let environ = |tpm: &str| {
+            std::fs::write(
+                pid.join("environ"),
+                format!("IRLUME_STATE_DIR={}\0{tpm}", state.display()),
+            )
+            .unwrap();
+        };
+        let capture = || capture_with(&root, &root, uid, |_| Ok(running.into()));
+
+        environ(&format!(
+            "IRLUME_TCTI={tcti}\0IRLUME_SRK_HANDLE=0x81010010\0"
+        ));
+        let agreed = capture();
+        environ("IRLUME_TCTI=device:/dev/tpmrm0\0IRLUME_SRK_HANDLE=0x81010010\0");
+        let other = capture();
+        environ("IRLUME_SRK_HANDLE=0x81010010\0");
+        let none = capture();
+        let stopped = "LoadState=loaded\nActiveState=inactive\nMainPID=0\nNeedDaemonReload=no\nRootDirectory=\nRootImage=\nExecMainPID=42\nExecMainStartTimestampMonotonic=100\nInvocationID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let global = capture_with(&root, &root, uid, |args| {
+            Ok(if args.first() == Some(&"show-environment") {
+                format!("PATH=/usr/bin\nIRLUME_TCTI={tcti}\n")
+            } else {
+                stopped.to_owned()
+            })
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            agreed.expect("the unit and the daemon agree").tpm_target(),
+            TpmTarget {
+                tcti: Some(tcti.to_owned()),
+                srk_handle: Some("0x81010010".to_owned()),
+                from_unit: true,
+            }
+        );
+        for (what, result) in [("another transport", other), ("none", none)] {
+            let error = result.expect_err(what);
+            assert!(error.contains("IRLUME_TCTI differs"), "{what}: {error}");
+        }
+        let error = global.expect_err("a manager-wide transport");
+        assert!(
+            error.contains("IRLUME_TCTI is set in the manager"),
+            "{error}"
+        );
+        assert!(super::super::unit_environment::setting("a\tb", "IRLUME_TCTI").is_err());
+        assert!(super::super::unit_environment::setting(&"x".repeat(257), "IRLUME_TCTI").is_err());
     }
 
     #[test]

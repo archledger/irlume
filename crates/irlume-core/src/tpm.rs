@@ -134,7 +134,13 @@ impl std::ops::DerefMut for TpmContext {
 }
 
 fn open_context() -> Result<TpmContext> {
-    open_context_from(std::env::var("IRLUME_TCTI").ok().as_deref(), |tcti| {
+    open_context_through(std::env::var("IRLUME_TCTI").ok().as_deref())
+}
+
+/// [`open_context`] through `tcti`, a value `IRLUME_TCTI` could hold, or the
+/// default transports for `None`.
+fn open_context_through(tcti: Option<&str>) -> Result<TpmContext> {
+    open_context_from(tcti, |tcti| {
         let conf = TctiNameConf::from_str(tcti).map_err(tpm_err)?;
         Context::new(conf).map_err(tpm_err)
     })
@@ -934,8 +940,15 @@ fn create_storage_key(ctx: &mut Context, template: Public) -> Result<KeyHandle> 
 /// irlume's persistent SRK handle: `IRLUME_SRK_HANDLE` (hex) or
 /// [`PERSISTENT_SRK_HANDLE`].
 fn persistent_srk_raw() -> u32 {
-    std::env::var("IRLUME_SRK_HANDLE")
-        .ok()
+    srk_handle_for(std::env::var("IRLUME_SRK_HANDLE").ok().as_deref())
+}
+
+/// The original storage key's handle for an `IRLUME_SRK_HANDLE` value, read
+/// as irlumed reads its own: hex, with or without `0x`, and
+/// 0x81010002 for no value or one that does not parse.
+#[must_use]
+pub fn srk_handle_for(value: Option<&str>) -> u32 {
+    value
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .unwrap_or(PERSISTENT_SRK_HANDLE)
 }
@@ -1204,8 +1217,23 @@ fn rsa_modulus(public: &Public) -> Option<&[u8]> {
 /// eviction command itself is refused; callers treat this as a non-fatal
 /// orphan (the key is harmless without irlume's data).
 pub fn evict_persistent_srk() -> Result<SrkEviction> {
-    let mut ctx = open_context()?;
-    let persistent = persistent_srk_handle()?;
+    evict_persistent_srk_through(
+        std::env::var("IRLUME_TCTI").ok().as_deref(),
+        persistent_srk_raw(),
+    )
+}
+
+/// [`evict_persistent_srk`] through the TPM transport `tcti` (a value
+/// `IRLUME_TCTI` could hold, or the default transports for `None`) and at
+/// `handle`, as irlumed's own settings name them: uninstall reads them from
+/// irlumed's unit, since its own process need not carry them (#1088).
+///
+/// # Errors
+///
+/// As [`evict_persistent_srk`], and when `handle` is not a persistent handle.
+pub fn evict_persistent_srk_through(tcti: Option<&str>, handle: u32) -> Result<SrkEviction> {
+    let mut ctx = open_context_through(tcti)?;
+    let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
     let wanted = TpmHandle::Persistent(persistent);
     if !tpm_handle_exists(&mut ctx, TPM2_HR_PERSISTENT, wanted)? {
         return Ok(SrkEviction::Absent);
@@ -1252,7 +1280,17 @@ pub fn evict_persistent_srk() -> Result<SrkEviction> {
 /// Handles evicted before the error are not reported; a later call finds the
 /// rest.
 pub fn evict_da_exempt_srks() -> Result<Vec<u32>> {
-    let mut ctx = open_context()?;
+    evict_da_exempt_srks_through(std::env::var("IRLUME_TCTI").ok().as_deref())
+}
+
+/// [`evict_da_exempt_srks`] through the TPM transport `tcti`, as
+/// [`evict_persistent_srk_through`] takes it (#1088).
+///
+/// # Errors
+///
+/// As [`evict_da_exempt_srks`].
+pub fn evict_da_exempt_srks_through(tcti: Option<&str>) -> Result<Vec<u32>> {
+    let mut ctx = open_context_through(tcti)?;
     let template = da_exempt_srk_template()?;
     let mut derived: Option<Public> = None;
     let mut evicted = Vec::new();
@@ -4414,6 +4452,77 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(left.contains(&SHARED), "another stack's key stays");
         assert!(left.contains(&PLANTED), "a key with another modulus stays");
         assert!(!left.contains(&OURS));
+    }
+
+    /// #1088 on swtpm: uninstall evicts both storage keys through the TPM
+    /// transport and original-key handle irlumed's unit names, which this
+    /// process need not carry. With this process's own `IRLUME_TCTI` pointing
+    /// nowhere (so nothing can reach another TPM by accident) and no
+    /// `IRLUME_SRK_HANDLE`, the explicit transport and a handle other than the
+    /// default reach both keys, and a second pass finds the handle clean.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_uninstall_evicts_both_keys_through_the_transport_irlumed_names() {
+        const ORIGINAL: u32 = 0x8101_0010;
+        const DA_EXEMPT: u32 = 0x8101_0011;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let before = handles();
+        assert!(
+            !before.contains(&ORIGINAL) && !before.contains(&DA_EXEMPT),
+            "the handles this test uses are taken: {before:x?}"
+        );
+        {
+            let mut ctx = open_context().expect("context");
+            let original = create_srk(&mut ctx).expect("the original template's key");
+            persist_at(&mut ctx, original, ORIGINAL);
+            let template = da_exempt_srk_template().expect("template");
+            let da_exempt = create_storage_key(&mut ctx, template).expect("the DA-exempt key");
+            persist_at(&mut ctx, da_exempt, DA_EXEMPT);
+        }
+        let tcti = std::env::var("IRLUME_TCTI").expect("the swtpm transport");
+        let handle_override = std::env::var_os("IRLUME_SRK_HANDLE");
+        std::env::remove_var("IRLUME_SRK_HANDLE");
+        let (da_exempt, original, again) = {
+            let _nowhere = crate::testenv::NoTpm::set();
+            let handle = srk_handle_for(Some("0x81010010"));
+            (
+                evict_da_exempt_srks_through(Some(&tcti)),
+                evict_persistent_srk_through(Some(&tcti), handle),
+                evict_persistent_srk_through(Some(&tcti), srk_handle_for(Some("81010010"))),
+            )
+        };
+        if let Some(value) = handle_override {
+            std::env::set_var("IRLUME_SRK_HANDLE", value);
+        }
+        evict_fixture_at(ORIGINAL);
+        evict_fixture_at(DA_EXEMPT);
+        let after = handles();
+
+        assert_eq!(da_exempt.expect("the DA-exempt scan"), vec![DA_EXEMPT]);
+        assert_eq!(original.expect("the original key"), SrkEviction::Evicted);
+        assert_eq!(again.expect("a second pass"), SrkEviction::Absent);
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// An `IRLUME_SRK_HANDLE` value reads as irlumed reads its own: hex with
+    /// or without `0x`, and the default for none or one that does not parse.
+    #[test]
+    fn an_srk_handle_value_reads_as_irlumed_reads_it() {
+        assert_eq!(srk_handle_for(None), PERSISTENT_SRK_HANDLE);
+        assert_eq!(srk_handle_for(Some("0x81010010")), 0x8101_0010);
+        assert_eq!(srk_handle_for(Some(" 81010010 ")), 0x8101_0010);
+        assert_eq!(srk_handle_for(Some("not hex")), PERSISTENT_SRK_HANDLE);
     }
 
     /// Persists a child key of `template`, with a random modulus, at `handle`.

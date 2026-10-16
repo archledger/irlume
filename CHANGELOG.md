@@ -7,6 +7,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Envelopes sealed under the original storage key move to irlume's
+  DA-exempt key once irlumed has persisted it (ADR-0034 §3.3), so a TPM
+  lockout stops them no longer: a template key at irlumed's start, and on
+  the non-authentication loads and writes that already moved a key to a
+  stronger policy, and a keyring secret at the next login that runs
+  pam_irlume's `reseal` line. An authentication never moves an envelope
+  (ADR-0025). Every move, also one to a stronger policy, unseals its new
+  envelope and compares the secret before it replaces the old one, a move
+  whose directory sync fails counts as made since the new envelope is
+  visible, and no move takes an envelope off the DA-exempt key. irlumed
+  persists the key before the template keys move, so they move in the same
+  start. A moved envelope needs this release, as one sealed under the new
+  key does.
+
 - New seals go under irlume's DA-exempt storage key once irlumed has
   persisted it, and each envelope records that key's handle and TPM name
   (ADR-0034 §3.3). A load uses only the key the envelope records, so a TPM in
@@ -20,14 +34,14 @@ All notable changes to irlume are documented here. This project adheres to
   line, and a template key needs `irlume recovery restore` or a re-enrollment.
 
 - irlumed persists irlume's DA-exempt storage key at start while any
-  envelope is under the original key (ADR-0034 §3.2). It goes to the owner
+  envelope exists (ADR-0034 §3.2). It goes to the owner
   handle after the original key's, or the next free one; a copy an earlier
   start persisted is found by its TPM name, so a power loss before the
   record never leaves two. A refused persist is recorded with the boot: the
   same boot derives nothing again unless the refusal was for lack of room
   and the TPM now reports room, and `irlume doctor`'s `tpm-lockout` warns
   with the reason (no room, no free handle, an owner authorization, or a
-  refused `IRLUME_SRK_HANDLE`) (#1083). Nothing seals under the key yet.
+  refused `IRLUME_SRK_HANDLE`) (#1083).
 
 - `irlume doctor` reports, as `tpm-lockout`, the TPM's dictionary-attack
   lockout state: whether a lockout authorization is set, whether the TPM is in

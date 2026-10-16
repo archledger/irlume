@@ -1592,10 +1592,70 @@ pub fn stronger_tier_available_than(current: &SealedEnvelope) -> bool {
     )
 }
 
-/// Rank both sides against the same current prediction, after sealing and
-/// before publication. Unknown is not a weak rank: neither a candidate nor an
-/// existing envelope with an unestablished binding may authorize a move.
-pub(crate) fn policy_is_stronger(candidate: &SealedEnvelope, current: &SealedEnvelope) -> bool {
+/// True when `current` should move now: a strictly stronger policy is
+/// available ([`stronger_tier_available_than`]), or `current` is under the
+/// original storage key while irlumed recorded irlume's DA-exempt key as
+/// persisted (ADR-0034 §3.3: being under the old key counts as a reason to
+/// move, like a weaker tier). Reads the policy files and the storage-key
+/// record only. The seal checks the recorded key at its handle, and a
+/// candidate that did not land on it moves nothing (`move_gain`).
+pub fn move_available(current: &SealedEnvelope) -> bool {
+    stronger_tier_available_than(current) || on_original_key_with_da_exempt_key(current)
+}
+
+/// Whether `current` is under the original storage key while irlumed
+/// recorded its DA-exempt key, with a policy whose rank is established: an
+/// envelope bound to an unrelated or unreadable prediction is kept until a
+/// verified reseal, as [`stronger_tier_available_than`] keeps it.
+fn on_original_key_with_da_exempt_key(current: &SealedEnvelope) -> bool {
+    if current.parent.is_some() || storage_key::recorded_key().is_none() {
+        return false;
+    }
+    let binding = if matches!(current.policy, PolicyKind::PcrlockNv { .. }) {
+        read_pcrlock_json().ok().and_then(|p| p.binding())
+    } else {
+        None
+    };
+    current_strength_rank(current, binding.as_ref()).is_some()
+}
+
+/// What moving an envelope to a candidate sealed for it gains (ADR-0034
+/// §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveGain {
+    /// A strictly stronger policy, on the same kind of storage key.
+    StrongerPolicy,
+    /// irlume's DA-exempt storage key in place of the original one, under a
+    /// policy that is no weaker.
+    DaExemptKey,
+    /// Both.
+    Both,
+}
+
+impl MoveGain {
+    /// Where the envelope moved, for a log line.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::StrongerPolicy => "a stronger TPM policy",
+            Self::DaExemptKey => "irlume's DA-exempt storage key",
+            Self::Both => "a stronger TPM policy under irlume's DA-exempt storage key",
+        }
+    }
+}
+
+/// What `candidate`, sealed to replace `current`, gains: a strictly stronger
+/// policy, the DA-exempt storage key in place of the original one under a
+/// policy that is no weaker, or both. `None` when it gains neither, or when
+/// it would take `current` off the DA-exempt key, where a lockout would stop
+/// it again. Ranks both sides against the same current prediction, after
+/// sealing and before publication. Unknown is not a weak rank: neither a
+/// candidate nor an existing envelope with an unestablished binding may
+/// authorize a move.
+pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) -> Option<MoveGain> {
+    if current.parent.is_some() && candidate.parent.is_none() {
+        return None;
+    }
     let binding = if matches!(candidate.policy, PolicyKind::PcrlockNv { .. })
         || matches!(current.policy, PolicyKind::PcrlockNv { .. })
     {
@@ -1603,12 +1663,14 @@ pub(crate) fn policy_is_stronger(candidate: &SealedEnvelope, current: &SealedEnv
     } else {
         None
     };
-    match (
-        current_strength_rank(candidate, binding.as_ref()),
-        current_strength_rank(current, binding.as_ref()),
-    ) {
-        (Some(candidate), Some(current)) => candidate > current,
-        _ => false,
+    let candidate_rank = current_strength_rank(candidate, binding.as_ref())?;
+    let current_rank = current_strength_rank(current, binding.as_ref())?;
+    let to_da_exempt_key = current.parent.is_none() && candidate.parent.is_some();
+    match (candidate_rank.cmp(&current_rank), to_da_exempt_key) {
+        (std::cmp::Ordering::Greater, false) => Some(MoveGain::StrongerPolicy),
+        (std::cmp::Ordering::Greater, true) => Some(MoveGain::Both),
+        (std::cmp::Ordering::Equal, true) => Some(MoveGain::DaExemptKey),
+        _ => None,
     }
 }
 
@@ -4568,9 +4630,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         dirs.store("alice", &old);
         let persisted = crate::storage_key::ensure_at_start();
         let new = seal_with_pcrs(b"sealed after", &[]).expect("seal");
-        let new_open = unseal(&new).map(|s| s.to_vec());
-        let new_read_only = unseal_read_only(&new).map(|s| s.to_vec());
-        let old_open = unseal(&old).map(|s| s.to_vec());
+        let new_open = unseal(&new);
+        let new_read_only = unseal_read_only(&new);
+        let old_open = unseal(&old);
         let spared_mixed = lockout_state().map(|l| l.storage_key_no_da);
         dirs.store("alice", &new);
         let spared_all = lockout_state().map(|l| l.storage_key_no_da);
@@ -4578,7 +4640,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let removed = evict_da_exempt_srks();
         persist_child_at(da_exempt_srk_template().expect("template"), PREFERRED);
         let moved = crate::storage_key::ensure_at_start();
-        let through_record = unseal(&new).map(|s| s.to_vec());
+        let through_record = unseal(&new);
         let removed_again = evict_da_exempt_srks();
         let gone = unseal(&new);
         let fallback = seal_with_pcrs(b"sealed without it", &[]);
@@ -4596,10 +4658,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
         let parent = new.parent.clone().expect("a new seal records its parent");
         assert_eq!(parent.handle, PREFERRED);
-        assert_eq!(new_open.expect("unseal under the new key"), b"sealed after");
-        assert_eq!(new_read_only.expect("read-only unseal"), b"sealed after");
         assert_eq!(
-            old_open.expect("the original key still opens"),
+            new_open.expect("unseal under the new key").as_slice(),
+            b"sealed after"
+        );
+        assert_eq!(
+            new_read_only.expect("read-only unseal").as_slice(),
+            b"sealed after"
+        );
+        assert_eq!(
+            old_open.expect("the original key still opens").as_slice(),
             b"sealed before"
         );
         assert!(
@@ -4618,7 +4686,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             })
         );
         assert_eq!(
-            through_record.expect("the recorded key opens it at its new handle"),
+            through_record
+                .expect("the recorded key opens it at its new handle")
+                .as_slice(),
             b"sealed after"
         );
         assert_eq!(removed_again.expect("evict"), vec![PREFERRED + 1]);
@@ -4630,6 +4700,127 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             fallback.expect("seal").parent.is_none(),
             "without the key a seal uses the original key"
         );
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// ADR-0034 §3.3 on swtpm: a template key, a login password and a GNOME
+    /// keyring token sealed before irlumed persisted the DA-exempt key move
+    /// onto it at their move points (irlumed's start for the template key, a
+    /// login's reseal for the keyring), keeping kind, wrap and uid, and still
+    /// unseal; a second pass finds nothing to move, and a lockout then spares
+    /// irlume. The ladder is pinned to the literal PCR 7 seal, so only the
+    /// storage key changes.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_envelopes_on_the_original_key_move_onto_the_da_exempt_key() {
+        use crate::envelope::SecretKind;
+        use crate::keyring::{envelope_path, reseal_password, unseal_password, Reseal};
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("move-onto-da-exempt");
+        // IRLUME_PCRS=7 and no prediction file: the literal PCR 7 seal.
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED),
+            "the handle this test uses is taken: {before:x?}"
+        );
+        let _alice = crate::account::remember("alice", 4150);
+        let _bob = crate::account::remember("bob", 4151);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        crate::keyring::seal_password("alice", b"alice-password").expect("arm the password");
+        let token = b"bob-gnome-keyring-token-for-tests";
+        let mut armed = seal_with_pcrs(token, &[7]).expect("seal the token");
+        armed.secret = SecretKind::GnomeKeyringToken;
+        armed.password_wrap = Some(crate::recovery::wrap(b"bob-password", token).expect("wrap"));
+        armed.uid = Some(4151);
+        armed.save(&envelope_path("bob")).expect("arm the token");
+        let paths = [
+            crate::template_key::key_path("alice"),
+            envelope_path("alice"),
+            envelope_path("bob"),
+        ];
+        // Read without panicking: the key is evicted before anything is
+        // asserted, so a failure leaves the shared swtpm as it was.
+        let parents = || {
+            paths
+                .iter()
+                .map(|path| SealedEnvelope::load(path).map(|env| env.parent).ok())
+                .collect::<Vec<_>>()
+        };
+        let sealed_before = parents();
+
+        let persisted = crate::storage_key::ensure_at_start();
+        let template_move = crate::template_key::move_to_stronger_policy("alice");
+        let template_again = crate::template_key::move_to_stronger_policy("alice");
+        let template_key = crate::template_key::load_key("alice");
+        let password_move = reseal_password("alice", b"alice-password", None);
+        let password_again = reseal_password("alice", b"alice-password", None);
+        let password = unseal_password("alice");
+        let token_move = reseal_password("bob", b"bob-password", None);
+        let token_again = reseal_password("bob", b"bob-password", None);
+        let token_open = unseal_password("bob");
+        let token_env = SealedEnvelope::load(&envelope_path("bob"));
+        let moved = parents();
+        let spared = lockout_state().map(|l| l.storage_key_no_da);
+        let removed = evict_da_exempt_srks();
+        let after = handles();
+        drop(dirs);
+
+        assert!(
+            sealed_before
+                .iter()
+                .all(|parent| matches!(parent, Some(None))),
+            "sealed under the original key: {sealed_before:?}"
+        );
+        assert_eq!(
+            persisted.expect("the step"),
+            Some(crate::storage_key::Outcome::Persisted { handle: PREFERRED })
+        );
+        assert_eq!(
+            template_move.expect("the startup move"),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(template_again.expect("a second start"), None);
+        assert_eq!(template_key.expect("load").as_slice(), key.as_slice());
+        assert_eq!(
+            password_move.expect("the reseal"),
+            Reseal::MovedToDaExemptKey
+        );
+        assert_eq!(password_again.expect("a second login"), Reseal::Unchanged);
+        assert_eq!(password.expect("unseal").as_slice(), b"alice-password");
+        assert_eq!(token_move.expect("the reseal"), Reseal::MovedToDaExemptKey);
+        assert_eq!(token_again.expect("a second login"), Reseal::Unchanged);
+        assert_eq!(token_open.expect("unseal").as_slice(), token);
+        let token_env = token_env.expect("the token envelope");
+        assert_eq!(token_env.secret, SecretKind::GnomeKeyringToken);
+        assert_eq!(token_env.uid, Some(4151));
+        let wrap = token_env.password_wrap.as_ref().expect("the wrap");
+        assert_eq!(
+            &*crate::recovery::unwrap(b"bob-password", wrap).expect("the wrap opens"),
+            token
+        );
+        assert!(
+            moved.iter().all(|parent| matches!(
+                parent,
+                Some(Some(parent)) if parent.handle == PREFERRED
+            )),
+            "every envelope on the DA-exempt key: {moved:?}"
+        );
+        assert!(spared.expect("lockout state"), "a lockout spares irlume");
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"
@@ -4694,7 +4885,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// ADR-0034 acceptance, in a swtpm of its own (the lockout lasts 1000 s
     /// on a fresh swtpm, so the shared lane never runs it): with the TPM in
     /// dictionary-attack lockout, a seal and an unseal under the DA-exempt key
-    /// succeed, and an envelope under the original key does not load.
+    /// succeed, and an envelope under the original key does not load. A
+    /// template key and a keyring secret moved at their move points onto the
+    /// DA-exempt key unseal in lockout, and a template key still on the
+    /// original key cannot move while it lasts. The moves run before the
+    /// lockout: irlume never ends one (ADR-0034 §2, the source scan in
+    /// `tests/no_dictionary_attack_commands.rs`) and a fresh swtpm's lasts
+    /// 1000 s, and nothing in a move depends on an earlier lockout.
     #[test]
     #[ignore = "needs a swtpm of its own (IRLUME_TEST_OWN_SWTPM=1 with \
                 scripts/with-swtpm.sh); CI runs it so"]
@@ -4709,10 +4906,23 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dirs = StateDirs::new("lockout");
-        let old = seal_with_pcrs(b"on the original key", &[]).expect("seal");
+        // IRLUME_PCRS=7 and no prediction file: the literal PCR 7 seal, so a
+        // move changes only the storage key.
+        let _prediction = PredictionFixture::new();
+        let _alice = crate::account::remember("alice", 4160);
+        let _carol = crate::account::remember("carol", 4161);
+        let _dave = crate::account::remember("dave", 4162);
+        let old = seal_with_pcrs(b"on the original key", &[7]).expect("seal");
         dirs.store("alice", &old);
+        let template_key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("carol", &template_key).expect("seal a template key");
+        crate::template_key::reseal_key("dave", &crate::crypto::generate_key())
+            .expect("seal a template key");
+        let dave = crate::template_key::key_path("dave");
         let persisted = crate::storage_key::ensure_at_start().expect("the step");
         let new = seal_with_pcrs(b"on the DA-exempt key", &[]).expect("seal");
+        let template_move = crate::template_key::move_to_stronger_policy("carol");
+        let keyring_move = crate::keyring::reseal_password("alice", b"on the original key", None);
         let (handle, name) = crate::storage_key::recorded_key().expect("recorded");
         let mut ctx = open_context().expect("context");
         let key = da_exempt_key_at(&mut ctx, handle, &name, true)
@@ -4722,13 +4932,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         drop(ctx);
 
         let state = lockout_state().expect("lockout state");
-        let opened = unseal(&new).map(|s| s.to_vec());
+        let opened = unseal(&new);
         let during = seal_with_pcrs(b"sealed in lockout", &[]);
-        let during_opened = during
-            .as_ref()
-            .ok()
-            .map(|env| unseal(env).map(|s| s.to_vec()));
+        let during_opened = during.as_ref().ok().map(unseal);
         let blocked = unseal(&old);
+        let template_opened = crate::template_key::load_key("carol");
+        let keyring_opened = crate::keyring::unseal_password("alice");
+        let dave_before = std::fs::read(&dave).expect("the template key");
+        let stuck = crate::template_key::move_to_stronger_policy("dave");
+        let stuck_unchanged = std::fs::read(&dave).expect("the template key") == dave_before;
         drop(dirs);
 
         assert!(matches!(
@@ -4737,15 +4949,42 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         ));
         assert!(state.in_lockout, "the TPM is in lockout");
         assert_eq!(
-            opened.expect("unseal under the new key"),
+            opened.expect("unseal under the new key").as_slice(),
             b"on the DA-exempt key"
         );
         assert!(during.expect("seal in lockout").parent.is_some());
         assert_eq!(
-            during_opened.expect("sealed").expect("unseal in lockout"),
+            during_opened
+                .expect("sealed")
+                .expect("unseal in lockout")
+                .as_slice(),
             b"sealed in lockout"
         );
         assert!(blocked.is_err(), "the original key is blocked in lockout");
+        assert_eq!(
+            template_move.expect("the startup move"),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(
+            keyring_move.expect("the reseal"),
+            crate::keyring::Reseal::MovedToDaExemptKey
+        );
+        assert_eq!(
+            template_opened
+                .expect("the moved template key in lockout")
+                .as_slice(),
+            template_key.as_slice()
+        );
+        assert_eq!(
+            keyring_opened
+                .expect("the moved keyring secret in lockout")
+                .as_slice(),
+            b"on the original key"
+        );
+        assert!(
+            stuck.is_err() && stuck_unchanged,
+            "a key on the original key cannot move in lockout"
+        );
     }
 
     /// Our SRK template with a non-empty authPolicy, as another stack's
@@ -4963,10 +5202,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             let firmware = pcrs.contains(&7);
             for old in [&firmware_record, &os_record] {
                 assert_eq!(stronger_tier_available_than(old), !firmware);
-                assert_eq!(policy_is_stronger(&literal, old), !firmware);
-                assert_eq!(policy_is_stronger(old, &literal), firmware);
-                assert!(!policy_is_stronger(&firmware_record, old));
-                assert!(!policy_is_stronger(&os_record, old));
+                assert_eq!(move_gain(&literal, old).is_some(), !firmware);
+                assert_eq!(move_gain(old, &literal).is_some(), firmware);
+                assert!(move_gain(&firmware_record, old).is_none());
+                assert!(move_gain(&os_record, old).is_none());
             }
             assert_eq!(pcrlock_for_sealing().is_some(), firmware);
         }
@@ -4975,7 +5214,115 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         std::env::set_var("IRLUME_PCRS", "11,15");
         literal.pcrs = vec![11, 15];
         assert!(!stronger_tier_available_than(&firmware_record));
-        assert!(!policy_is_stronger(&literal, &firmware_record));
+        assert!(move_gain(&literal, &firmware_record).is_none());
+    }
+
+    /// ADR-0034 §3.3: a move gains a stronger policy, irlume's DA-exempt
+    /// storage key under a policy no weaker, or both, and never takes an
+    /// envelope off that key, even for a stronger policy.
+    #[test]
+    fn a_move_gains_the_da_exempt_key_and_never_gives_it_up() {
+        let envelope = |pcrs: &[u32], on_key: bool| {
+            let mut env: SealedEnvelope = serde_json::from_value(serde_json::json!({
+                "version": 1, "pcrs": pcrs, "public": "", "private": ""
+            }))
+            .unwrap();
+            env.parent = on_key.then(|| ParentKey {
+                handle: 0x8101_0003,
+                name: "000b00".into(),
+            });
+            env
+        };
+        // Literal seals: PCR 7 binds the firmware state, no PCR binds nothing.
+        let firmware = |on_key| envelope(&[7], on_key);
+        let unbound = |on_key| envelope(&[], on_key);
+        assert_eq!(
+            move_gain(&firmware(true), &firmware(false)),
+            Some(MoveGain::DaExemptKey)
+        );
+        assert_eq!(
+            move_gain(&firmware(true), &unbound(false)),
+            Some(MoveGain::Both)
+        );
+        assert_eq!(
+            move_gain(&firmware(true), &unbound(true)),
+            Some(MoveGain::StrongerPolicy)
+        );
+        assert_eq!(
+            move_gain(&firmware(false), &unbound(false)),
+            Some(MoveGain::StrongerPolicy)
+        );
+        assert_eq!(move_gain(&firmware(true), &firmware(true)), None);
+        assert_eq!(move_gain(&firmware(false), &firmware(false)), None);
+        assert_eq!(
+            move_gain(&unbound(true), &firmware(false)),
+            None,
+            "a weaker policy is no move, even onto the DA-exempt key"
+        );
+        assert_eq!(
+            move_gain(&firmware(false), &unbound(true)),
+            None,
+            "never off the DA-exempt key, even for a stronger policy"
+        );
+    }
+
+    /// Being under the original storage key is a reason to move once
+    /// irlumed recorded the DA-exempt key as persisted (ADR-0034 §3.3), read
+    /// from the files alone; not for an envelope already on a key, nor for
+    /// one whose binding is unknown, nor with a record that names no key.
+    #[test]
+    fn an_envelope_on_the_original_key_moves_once_the_da_exempt_key_is_recorded() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        // IRLUME_PCRS=7 and no prediction file: nothing stronger than a
+        // literal PCR 7 seal is available.
+        let prediction = PredictionFixture::new();
+        let state = crate::test_tmp_dir("move-available");
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let previous = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &state);
+        let record = |name: &str| {
+            let json = serde_json::json!({
+                "version": 1, "persisted": {"handle": 0x8101_0003_u32, "name": name}
+            });
+            std::fs::write(format!("{state}/tpm-storage-key"), json.to_string()).unwrap();
+        };
+        let mut original = PredictionFixture::envelope(&[7]);
+        original.policy = PolicyKind::PcrLiteral;
+        let mut on_key = PredictionFixture::envelope(&[7]);
+        on_key.policy = PolicyKind::PcrLiteral;
+        on_key.parent = Some(ParentKey {
+            handle: 0x8101_0003,
+            name: "000b00".into(),
+        });
+        // Bound to a prediction this host does not have: an unknown rank.
+        let unknown = PredictionFixture::envelope(&[7]);
+        let available = || {
+            [
+                move_available(&original),
+                move_available(&on_key),
+                move_available(&unknown),
+            ]
+        };
+
+        let without = available();
+        record("000b00");
+        let with = available();
+        record("not hex");
+        let not_hex = available();
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&state);
+        drop(prediction);
+
+        assert_eq!(without, [false; 3], "no record, nothing stronger");
+        assert_eq!(with, [true, false, false]);
+        assert_eq!(not_hex, [false; 3], "a record naming no key is none");
     }
 
     #[test]
@@ -4991,8 +5338,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             for recorded in [&[7][..], &[11, 15]] {
                 let old = PredictionFixture::envelope(recorded);
                 assert!(!stronger_tier_available_than(&old));
-                assert!(!policy_is_stronger(&literal, &old));
-                assert!(!policy_is_stronger(&old, &literal));
+                assert!(move_gain(&literal, &old).is_none());
+                assert!(move_gain(&old, &literal).is_none());
             }
         };
         prediction.write(&[11, 15]);
@@ -5293,7 +5640,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(stronger_tier_available_than(&env));
         let replacement = seal(secret).unwrap();
         assert_eq!(replacement.policy, PolicyKind::PcrLiteral);
-        assert!(policy_is_stronger(&replacement, &env));
+        assert!(move_gain(&replacement, &env).is_some());
         assert_eq!(&*unseal(&replacement).unwrap(), secret);
 
         // Drift: rewrite the NV policy to one the live PCRs cannot satisfy

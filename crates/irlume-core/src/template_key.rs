@@ -374,7 +374,8 @@ pub(crate) type KeyIsAnotherAccounts<'f> =
 /// and the replaced enrollment's added-camera store. `account` is the enrollment write's view of the account, so the key is
 /// chosen against the uid the enrollment is written for. The key is checked
 /// on a load that writes nothing, and only a key the write keeps moves to a
-/// stronger TPM policy ([`move_kept_key`]).
+/// stronger TPM policy or onto irlume's DA-exempt storage key
+/// ([`move_kept_key`]).
 pub(crate) fn ensure_enrollment_key_unlocked(
     user: &str,
     account: &mut Account<'_>,
@@ -399,9 +400,10 @@ pub(crate) fn ensure_enrollment_key_unlocked(
 /// nothing written; `irlume enroll` then gives the account a key of its own
 /// and removes the replaced enrollment's store. A key sealed for another uid
 /// is refused by the unseal, as in [`ensure_key`]. The key is checked on a
-/// load that writes nothing, and moves to a stronger TPM policy
-/// ([`move_kept_key`]) only once the check found it is the account's, so a
-/// refused write leaves the key file as it was.
+/// load that writes nothing, and moves to a stronger TPM policy or onto
+/// irlume's DA-exempt storage key ([`move_kept_key`]) only once the check
+/// found it is the account's, so a refused write leaves the key file as it
+/// was.
 ///
 /// # Errors
 ///
@@ -794,7 +796,7 @@ pub(crate) fn load_key_as(user: &str, account: &mut Account<'_>) -> Result<Zeroi
         account,
         KeyLoadPolicy::Upgrade,
         tpm::unseal,
-        tpm::stronger_tier_available_than,
+        tpm::move_available,
         tpm::seal,
     )
 }
@@ -823,96 +825,129 @@ pub(crate) fn load_key_unmoved_as(
         account,
         KeyLoadPolicy::Keep,
         tpm::unseal,
-        tpm::stronger_tier_available_than,
+        tpm::move_available,
         tpm::seal,
     )
 }
 
 /// Move `user`'s template key, unsealed as `key` by [`load_key_unmoved_as`]
-/// and kept by the write that loaded it, to a strictly stronger TPM policy
-/// when one is available, as a load through [`load_key_as`] does: best
+/// and kept by the write that loaded it, as a load through [`load_key_as`]
+/// does: to a strictly stronger TPM policy, or onto irlume's DA-exempt
+/// storage key, when one is available ([`move_to_stronger_policy`]). Best
 /// effort, keeping the uid the key records, and never failing the write.
 /// The caller holds the user state lock it loaded the key under, so the
 /// envelope read here is the one `key` was unsealed from.
 pub(crate) fn move_kept_key(user: &str, key: &[u8]) {
-    move_kept_key_with(user, key, tpm::stronger_tier_available_than, tpm::seal);
+    move_kept_key_with(user, key, tpm::move_available, tpm::unseal, tpm::seal);
 }
 
 /// [`move_kept_key`] with the TPM calls passed in.
 pub(crate) fn move_kept_key_with(
     user: &str,
     key: &[u8],
-    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    move_available: impl FnOnce(&SealedEnvelope) -> bool,
+    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
     seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
 ) {
     let path = key_path(user);
     if let Ok(env) = SealedEnvelope::load(&path) {
-        move_best_effort(&path, &env, key, stronger_tier_available, seal);
+        move_best_effort(user, &path, &env, key, move_available, unseal, seal);
     }
 }
 
-/// Move `user`'s template key to a strictly stronger TPM policy when one is
-/// available: a signed Tier 1 envelope an earlier release wrote, or a literal
-/// one after a pcrlock policy covering a firmware-measured PCR was
-/// provisioned. irlumed calls this at startup, off every authentication
-/// request. With nothing stronger available it reads only the envelope and
-/// the policy files; otherwise it unseals the key once, seals it under the
-/// ladder's policy (round-trip verified) and keeps the new envelope only if
-/// it ranks higher. `Ok(true)` when the envelope moved.
+/// Move `user`'s template key to a better envelope when one is available
+/// (ADR-0034 §3.3): a strictly stronger TPM policy (a signed Tier 1
+/// envelope an earlier release wrote, or a literal one after a pcrlock
+/// policy covering a firmware-measured PCR was provisioned), or irlume's
+/// DA-exempt storage key in place of the original one once irlumed has
+/// persisted it, so that a TPM lockout no longer stops the key. irlumed
+/// calls this at startup, after the step that persists that key, off every
+/// authentication request. With no move available it reads only the
+/// envelope, the policy files and the storage-key record; otherwise it
+/// unseals the key once, seals it through the ladder, keeps the new
+/// envelope only if it gains a stronger policy or the DA-exempt key and
+/// loses neither, and unseals it to the same key before it replaces the old
+/// one. `Some` with what the move gained.
 ///
 /// # Errors
-/// Returns the lock, envelope, unseal, seal or save error; the envelope is
-/// then left as it was.
-pub fn move_to_stronger_policy(user: &str) -> Result<bool> {
+/// Returns the lock, envelope, unseal, seal, round-trip or save error; the
+/// envelope is then left as it was.
+pub fn move_to_stronger_policy(user: &str) -> Result<Option<tpm::MoveGain>> {
     if !has_key(user) {
-        return Ok(false);
+        return Ok(None);
     }
     let _state = UserStateLock::acquire(user)?;
-    move_with(
-        user,
-        tpm::unseal,
-        tpm::stronger_tier_available_than,
-        tpm::seal,
-    )
+    move_with(user, tpm::unseal, tpm::move_available, tpm::seal)
 }
 
 /// [`move_to_stronger_policy`] with the TPM calls passed in. Unlike the
-/// best-effort move in [`load_key_with`], a failed seal or save is an error,
-/// so irlumed can say the key stayed where it was.
+/// best-effort move in [`load_key_with`], a failed seal, round trip or save
+/// is an error, so irlumed can say the key stayed where it was.
 fn move_with(
     user: &str,
-    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
-    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    mut unseal: impl FnMut(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
+    move_available: impl FnOnce(&SealedEnvelope) -> bool,
     seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
-) -> Result<bool> {
+) -> Result<Option<tpm::MoveGain>> {
     let path = key_path(user);
     let env = SealedEnvelope::load(&path)?;
-    if !stronger_tier_available(&env) {
-        return Ok(false);
+    if !move_available(&env) {
+        return Ok(None);
     }
     // A key sealed for another uid is not unsealed, and not moved. A move
-    // changes the policy only: a key an earlier release sealed without a uid
-    // keeps none, since the name may no longer resolve to the account whose
-    // enrollment the key opens; that enrollment's next write records it.
+    // changes the policy and the storage key only: a key an earlier release
+    // sealed without a uid keeps none, since the name may no longer resolve
+    // to the account whose enrollment the key opens; that enrollment's next
+    // write records it.
     Account::new(user).require(Record::TemplateKey, env.uid)?;
     let key = unseal(&env)?;
     let mut candidate = seal(&key)?;
     candidate.uid = env.uid;
-    if !tpm::policy_is_stronger(&candidate, &env) {
-        return Ok(false);
+    let Some(gain) = tpm::move_gain(&candidate, &env) else {
+        return Ok(None);
+    };
+    check_round_trip(&candidate, &key, unseal)?;
+    publish_move(user, &path, &candidate, gain)?;
+    Ok(Some(gain))
+}
+
+/// Unseal `candidate`, the envelope a move sealed `key` into, and compare.
+/// `tpm::seal` unseals only a pcrlock candidate before it returns it, never
+/// the literal PCR seal, and a candidate that does not give `key` back must
+/// not replace an envelope that does (ADR-0034 §3.3).
+fn check_round_trip(
+    candidate: &SealedEnvelope,
+    key: &[u8],
+    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<()> {
+    if unseal(candidate)?.as_slice() != key {
+        return Err(Error::Tpm(
+            "the new envelope does not unseal to the same template key".into(),
+        ));
     }
-    // Once the new envelope is visible the move happened, even when syncing
-    // the directory failed: an error here must mean the old one is still in
-    // place. A power loss may bring the old envelope back, which unseals too.
-    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = candidate.save_reporting(&path)? {
+    Ok(())
+}
+
+/// Write `candidate`, `user`'s moved template key envelope, at `path`. Once
+/// the new envelope is visible the move happened, even when syncing the
+/// directory failed: an error here must mean the old one is still in place.
+/// A power loss may bring the old envelope back, which unseals too.
+fn publish_move(
+    user: &str,
+    path: &Path,
+    candidate: &SealedEnvelope,
+    gain: tpm::MoveGain,
+) -> Result<()> {
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) = candidate.save_reporting(path)? {
         eprintln!(
-            "irlume: moved the template key of '{user}' to a stronger TPM policy, but syncing \
-             its directory failed ({e}); after a power loss the previous envelope, which still \
-             unseals, may come back"
+            "irlume: moved the template key of '{user}' to {}, but syncing its directory \
+             failed ({e}); after a power loss the previous envelope, which still unseals, may \
+             come back",
+            gain.describe()
         );
     }
-    set_0600(&path);
-    Ok(true)
+    set_0600(path);
+    Ok(())
 }
 
 /// Caller holds the existing user state lock. Never upgrades the envelope or
@@ -931,7 +966,7 @@ pub(crate) fn load_key_read_only_as(
         account,
         KeyLoadPolicy::ReadOnly,
         tpm::unseal_read_only,
-        tpm::stronger_tier_available_than,
+        tpm::move_available,
         tpm::seal,
     )
 }
@@ -940,8 +975,8 @@ pub(crate) fn load_key_with(
     user: &str,
     account: &mut Account<'_>,
     policy: KeyLoadPolicy,
-    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
-    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    mut unseal: impl FnMut(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
+    move_available: impl FnOnce(&SealedEnvelope) -> bool,
     seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let path = key_path(user);
@@ -955,40 +990,48 @@ pub(crate) fn load_key_with(
     // enrollment then reads as absent; see `storage`).
     account.require(Record::TemplateKey, env.uid)?;
     let key = unseal(&env)?;
-    // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
-    // strictly stronger policy is available than the one this key was sealed
-    // under (pcrlock provisioned since, or a signed Tier 1 envelope from an
-    // earlier release), re-seal the key to it with no re-enroll. Not on a
-    // `Keep` load: an authentication request's, since the ladder's round trip
-    // unseals again, or a write's, which moves the key only once it has found
-    // the key is the account's (`move_kept_key`). The check short-circuits to
-    // a no-op once the envelope is already at the best policy. Never fail the
-    // load on it: the key unsealed fine and the weaker envelope stays usable.
-    // The move keeps the uid the key records, or none (see `move_with`).
+    // Best-effort move (mirrors keyring::reseal_password): if a strictly
+    // stronger policy is available than the one this key was sealed under
+    // (pcrlock provisioned since, or a signed Tier 1 envelope from an earlier
+    // release), or the key is under the original storage key while irlume's
+    // DA-exempt key is persisted (ADR-0034 §3.3), re-seal the key with no
+    // re-enroll. Not on a `Keep` load: an authentication request's, since the
+    // move's round trip unseals again, or a write's, which moves the key only
+    // once it has found the key is the account's (`move_kept_key`). The check
+    // short-circuits to a no-op once the envelope has nothing to gain. Never
+    // fail the load on it: the key unsealed fine and the old envelope stays
+    // usable. The move keeps the uid the key records, or none (see
+    // `move_with`).
     if policy == KeyLoadPolicy::Upgrade {
-        move_best_effort(&path, &env, &key, stronger_tier_available, seal);
+        move_best_effort(user, &path, &env, &key, move_available, unseal, seal);
     }
     Ok(key)
 }
 
-/// Re-seal `key`, unsealed from `env` at `path`, under a strictly stronger
-/// policy when one is available, keeping the uid `env` records. Best effort:
-/// a failed seal or save, or a candidate that does not rank higher, leaves
-/// `env` in place.
+/// Move `key`, `user`'s template key unsealed from `env` at `path`, to a
+/// better envelope when one is available, keeping the uid `env` records:
+/// the steps of [`move_with`]. Best effort: a failed seal, round trip or
+/// save, or a candidate that gains nothing, leaves `env` in place.
 fn move_best_effort(
+    user: &str,
     path: &Path,
     env: &SealedEnvelope,
     key: &[u8],
-    stronger_tier_available: impl FnOnce(&SealedEnvelope) -> bool,
+    move_available: impl FnOnce(&SealedEnvelope) -> bool,
+    unseal: impl FnOnce(&SealedEnvelope) -> Result<Zeroizing<Vec<u8>>>,
     seal: impl FnOnce(&[u8]) -> Result<SealedEnvelope>,
 ) {
-    if !stronger_tier_available(env) {
+    if !move_available(env) {
         return;
     }
-    if let Ok(mut candidate) = seal(key) {
-        candidate.uid = env.uid;
-        if tpm::policy_is_stronger(&candidate, env) && candidate.save(path).is_ok() {
-            set_0600(path);
+    let Ok(mut candidate) = seal(key) else {
+        return;
+    };
+    candidate.uid = env.uid;
+    if let Some(gain) = tpm::move_gain(&candidate, env) {
+        if check_round_trip(&candidate, key, unseal).is_ok() {
+            // A failed write leaves `env` in place, which still unseals.
+            let _ = publish_move(user, path, &candidate, gain);
         }
     }
 }
@@ -1552,7 +1595,8 @@ mod tests {
             |_| true,
             |_| stronger()
         )
-        .unwrap());
+        .unwrap()
+        .is_some());
         assert_eq!(SealedEnvelope::load(&key_path(user)).unwrap().uid, None);
         let mut bound: SealedEnvelope = serde_json::from_str(legacy).unwrap();
         bound.uid = Some(4111);
@@ -1563,7 +1607,8 @@ mod tests {
             |_| true,
             |_| stronger()
         )
-        .unwrap());
+        .unwrap()
+        .is_some());
         assert_eq!(
             SealedEnvelope::load(&key_path(user)).unwrap().uid,
             Some(4111)
@@ -1606,13 +1651,14 @@ mod tests {
             Ok(env)
         };
         prediction.write(&[7]);
-        assert!(!move_with(
+        assert!(move_with(
             user,
             |_| panic!("healthy current policy must not unseal"),
             tpm::stronger_tier_available_than,
             |_| panic!("healthy current policy must not seal"),
         )
-        .unwrap());
+        .unwrap()
+        .is_none());
 
         prediction.write(&[11, 15]);
         let mut unseals = 0;
@@ -1637,7 +1683,7 @@ mod tests {
         // cannot be treated as permission to downgrade this working envelope.
         for missing in [false, true] {
             prediction.write(&[11, 15]);
-            assert!(!move_with(
+            assert!(move_with(
                 user,
                 |_| Ok(Zeroizing::new(vec![42; 32])),
                 tpm::stronger_tier_available_than,
@@ -1650,7 +1696,8 @@ mod tests {
                     literal(key)
                 },
             )
-            .unwrap());
+            .unwrap()
+            .is_none());
             assert_eq!(std::fs::read(key_path(user)).unwrap(), before);
         }
         prediction.write(&[11, 15]);
@@ -1660,7 +1707,8 @@ mod tests {
             tpm::stronger_tier_available_than,
             literal,
         )
-        .unwrap());
+        .unwrap()
+        .is_some());
         let moved = SealedEnvelope::load(&key_path(user)).unwrap();
         assert_eq!(moved.policy, crate::envelope::PolicyKind::PcrLiteral);
         assert_eq!(moved.uid, Some(4138));
@@ -1689,10 +1737,12 @@ mod tests {
             Ok(env)
         };
         move_best_effort(
+            "alice",
             &path,
             &old,
             &[42; 32],
             |env| force_gate || tpm::stronger_tier_available_than(env),
+            |_| Ok(Zeroizing::new(vec![42; 32])),
             |key| {
                 assert_eq!(key, &[42; 32]);
                 literal()
@@ -2035,15 +2085,18 @@ mod tests {
             Ok(env)
         };
 
-        assert!(!move_with(
+        assert!(move_with(
             "alice",
             |_| panic!("nothing stronger: no unseal"),
             |_| false,
             |_| panic!("nothing stronger: no seal"),
         )
-        .unwrap());
+        .unwrap()
+        .is_none());
         let same = |_: &[u8]| Ok(serde_json::from_slice::<SealedEnvelope>(&before).unwrap());
-        assert!(!move_with("alice", unseal, |_| true, same).unwrap());
+        assert!(move_with("alice", unseal, |_| true, same)
+            .unwrap()
+            .is_none());
         assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
         assert!(move_with(
             "alice",
@@ -2053,13 +2106,114 @@ mod tests {
         )
         .is_err());
         assert_eq!(std::fs::read(key_path("alice")).unwrap(), before);
-        assert!(move_with("alice", unseal, |_| true, stronger).unwrap());
+        assert!(move_with("alice", unseal, |_| true, stronger)
+            .unwrap()
+            .is_some());
         assert!(matches!(
             SealedEnvelope::load(&key_path("alice")).unwrap().policy,
             crate::envelope::PolicyKind::PcrlockNv { .. }
         ));
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ADR-0034 §3.3 with the TPM calls faked: a template key under the
+    /// original storage key moves onto irlume's DA-exempt key, keeping its
+    /// uid, only once the new envelope unseals to the same key. A candidate
+    /// that unseals to another key or not at all is an error at startup and
+    /// changes nothing on a best-effort load; one the seal put on the original
+    /// key again is no move; and a key already moved never goes back.
+    #[test]
+    fn a_key_moves_onto_the_da_exempt_key_only_after_its_round_trip() {
+        use crate::envelope::ParentKey;
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        // IRLUME_PCRS=7 and no prediction: the policy stays the literal
+        // PCR 7 seal, so only the storage key can change.
+        let _prediction = tpm::tests::PredictionFixture::new();
+        let dir = PathBuf::from(crate::test_tmp_dir("move-da-exempt"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let user = "move-da-exempt";
+        let _owner = crate::account::remember(user, 4140);
+        const KEY: [u8; 32] = [9; 32];
+        // A fake envelope's private blob is the key it unseals to.
+        let envelope = |on_key: bool, blob: &[u8]| {
+            let mut env: SealedEnvelope =
+                serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)
+                    .unwrap();
+            env.private = blob.to_vec();
+            env.parent = on_key.then(|| ParentKey {
+                handle: 0x8101_0003,
+                name: "000b00".into(),
+            });
+            env
+        };
+        let unseals = std::cell::Cell::new(0);
+        let unseal = |env: &SealedEnvelope| {
+            unseals.set(unseals.get() + 1);
+            Ok(Zeroizing::new(env.private.clone()))
+        };
+        let mut original = envelope(false, &KEY);
+        original.uid = Some(4140);
+        original.save(&key_path(user)).unwrap();
+        let before = std::fs::read(key_path(user)).unwrap();
+        let unchanged = || std::fs::read(key_path(user)).unwrap() == before;
+
+        let back_on_original = move_with(user, unseal, |_| true, |_| Ok(envelope(false, &KEY)));
+        let original_unseals = unseals.replace(0);
+        let wrong_key = move_with(user, unseal, |_| true, |_| Ok(envelope(true, &[8; 32])));
+        let wrong_key_unchanged = unchanged();
+        let unopened = move_with(
+            user,
+            |env: &SealedEnvelope| match env.parent {
+                Some(_) => Err(Error::Tpm("the new envelope does not unseal".into())),
+                None => Ok(Zeroizing::new(env.private.clone())),
+            },
+            |_| true,
+            |_| Ok(envelope(true, &KEY)),
+        );
+        let unopened_unchanged = unchanged();
+        move_kept_key_with(
+            user,
+            &KEY,
+            |_| true,
+            unseal,
+            |_| Ok(envelope(true, &[8; 32])),
+        );
+        let best_effort_unchanged = unchanged();
+        unseals.set(0);
+        let moved = move_with(user, unseal, |_| true, |_| Ok(envelope(true, &KEY)));
+        let moved_unseals = unseals.get();
+        let after = SealedEnvelope::load(&key_path(user)).unwrap();
+        let moved_bytes = std::fs::read(key_path(user)).unwrap();
+        let off_key = move_with(user, unseal, |_| true, |_| Ok(envelope(false, &KEY)));
+        let stays = std::fs::read(key_path(user)).unwrap() == moved_bytes;
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(back_on_original.unwrap().is_none());
+        assert_eq!(
+            original_unseals, 1,
+            "no round trip for a candidate kept out"
+        );
+        assert!(wrong_key.is_err() && wrong_key_unchanged);
+        assert!(unopened.is_err() && unopened_unchanged);
+        assert!(
+            best_effort_unchanged,
+            "a best-effort move checks the round trip too"
+        );
+        assert_eq!(moved.unwrap(), Some(tpm::MoveGain::DaExemptKey));
+        assert_eq!(moved_unseals, 2, "the key, then the new envelope");
+        assert!(after.parent.is_some());
+        assert_eq!(after.uid, Some(4140), "the move keeps the uid");
+        assert!(
+            off_key.unwrap().is_none() && stays,
+            "never back to the original key"
+        );
     }
 
     /// Pin the production wrappers exercised by the kept-key move seam: a
@@ -2301,18 +2455,21 @@ mod tests {
         }
         assert_eq!(policy(), PolicyKind::PcrLiteral, "authentication moved it");
 
-        assert!(move_to_stronger_policy("mv").unwrap(), "the startup move");
+        assert!(
+            move_to_stronger_policy("mv").unwrap().is_some(),
+            "the startup move"
+        );
         assert!(
             matches!(policy(), PolicyKind::PcrlockNv { .. }),
             "got {:?}",
             policy()
         );
         assert!(
-            !move_to_stronger_policy("mv").unwrap(),
+            move_to_stronger_policy("mv").unwrap().is_none(),
             "nothing stronger left"
         );
         assert!(
-            !move_to_stronger_policy("nobody").unwrap(),
+            move_to_stronger_policy("nobody").unwrap().is_none(),
             "no key, no move"
         );
         assert_eq!(&*load_key("mv").unwrap(), &*key, "still unseals");

@@ -453,7 +453,9 @@ fn original_key_state(
         wait,
     };
     if original_handle != Some(handle) {
-        return Ok(waiting(RetirementWait::Unchecked));
+        return Ok(waiting(RetirementWait::HandleChanged {
+            configured: original_handle,
+        }));
     }
     let Some(at_handle) = tpm.name_at(handle)? else {
         return Ok(OriginalKey::Retired { handle });
@@ -462,7 +464,7 @@ fn original_key_state(
         return Ok(waiting(RetirementWait::Unchecked));
     }
     if !original.matched {
-        return Ok(waiting(RetirementWait::NotReproduced));
+        return Ok(waiting(RetirementWait::NotReproduced { in_use }));
     }
     if in_use {
         return Ok(waiting(RetirementWait::Envelopes));
@@ -498,6 +500,8 @@ fn original_key_state(
         })
         .collect();
     if !unsettled.is_empty() {
+        // Every entry counts in the total, named or not.
+        let total = u32::try_from(unsettled.len()).unwrap_or(u32::MAX);
         let mut envelopes: Vec<OriginalKeyEnvelope> = unsettled
             .into_iter()
             .filter(|entry| is_account_name(&entry.user))
@@ -508,7 +512,7 @@ fn original_key_state(
             .collect();
         envelopes.sort();
         envelopes.truncate(MAX_NAMED_ENVELOPES);
-        return Ok(waiting(RetirementWait::UnsettledMoves { envelopes }));
+        return Ok(waiting(RetirementWait::UnsettledMoves { envelopes, total }));
     }
     Ok(waiting(match (record.unused_since.as_deref(), boot) {
         (None, _) => RetirementWait::Count,
@@ -3391,8 +3395,8 @@ mod tests {
     #[test]
     fn the_original_keys_retirement_is_reported_with_what_it_waits_for() {
         use RetirementWait::{
-            Count, DaExemptKey, Envelopes, Failed, LaterBoot, NextStart, NotReproduced, Unchecked,
-            UnsettledMoves,
+            Count, DaExemptKey, Envelopes, Failed, HandleChanged, LaterBoot, NextStart,
+            NotReproduced, Unchecked, UnsettledMoves,
         };
         let now = Some(LATER_BOOT);
         let state = |tpm: &mut FakeTpm, record: &Record, in_use: bool| {
@@ -3426,8 +3430,15 @@ mod tests {
         assert_eq!(
             original_key_state(&mut retiring_tpm(), &record, false, Some(0x8101_0010), now)
                 .expect("read"),
-            waiting(Unchecked),
+            waiting(HandleChanged {
+                configured: Some(0x8101_0010)
+            }),
             "the original key's handle changed"
+        );
+        assert_eq!(
+            original_key_state(&mut retiring_tpm(), &record, false, None, now).expect("read"),
+            waiting(HandleChanged { configured: None }),
+            "IRLUME_SRK_HANDLE is refused"
         );
         let unmatched = with(&|r| {
             if let Some(original) = r.original.as_mut() {
@@ -3436,7 +3447,13 @@ mod tests {
         });
         assert_eq!(
             state(&mut retiring_tpm(), &unmatched, false),
-            waiting(NotReproduced)
+            waiting(NotReproduced { in_use: false })
+        );
+        // The census counts an envelope it cannot read, which doctor's list
+        // of envelopes does not name.
+        assert_eq!(
+            state(&mut retiring_tpm(), &unmatched, true),
+            waiting(NotReproduced { in_use: true })
         );
         assert_eq!(
             state(&mut retiring_tpm(), &record, true),
@@ -3496,7 +3513,8 @@ mod tests {
                 envelopes: vec![OriginalKeyEnvelope {
                     user: "bob".into(),
                     kind: EnvelopeKind::KeyringSecret
-                }]
+                }],
+                total: 2
             })
         );
         let settled = with(&|r| {

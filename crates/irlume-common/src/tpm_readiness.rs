@@ -291,10 +291,13 @@ pub enum RetirementWait {
     /// Envelopes are still under it ([`DaExemptKey::on_original_key`]).
     Envelopes,
     /// A move off it in this boot is not yet shown durable, for these
-    /// envelopes; irlumed's first start in a later boot counts again.
+    /// envelopes (at most [`MAX_NAMED_ENVELOPES`]) and `total` in all;
+    /// irlumed's first start in a later boot counts again.
     UnsettledMoves {
         #[serde(default)]
         envelopes: Vec<OriginalKeyEnvelope>,
+        #[serde(default)]
+        total: u32,
     },
     /// No envelope is under it, but no start has counted since the last one
     /// moved off it; irlumed's next start counts.
@@ -319,14 +322,28 @@ pub enum RetirementWait {
     },
     /// Today's derivation of irlume's template does not give the key at the
     /// handle, so irlume never evicts it: the manual path, once no envelope
-    /// is under it (#1079).
-    NotReproduced,
-    /// Another key is at the handle now, or the original key's handle was
-    /// changed; irlumed's next start that derives nothing else checks it.
+    /// is under it (#1079). `in_use` is irlumed's census, in which an
+    /// envelope it cannot read counts; a reply without it reads as in use.
+    NotReproduced {
+        #[serde(default = "in_use_unless_told")]
+        in_use: bool,
+    },
+    /// Another key is at the handle now; irlumed's next start that derives
+    /// nothing else checks it.
     Unchecked,
+    /// `IRLUME_SRK_HANDLE` now names another handle (`configured`, or none
+    /// for a value irlumed refuses) than the one the key was recorded at;
+    /// irlumed retires the original key only at the handle it names.
+    HandleChanged { configured: Option<u32> },
     /// A wait this build does not know (a newer daemon).
     #[serde(other)]
     Unknown,
+}
+
+/// A missing census reads as in use, so a client never offers to evict a key
+/// an envelope may still need.
+fn in_use_unless_told() -> bool {
+    true
 }
 
 /// The envelopes still under irlume's original storage key: the first ones
@@ -449,6 +466,12 @@ mod tests {
         let newer: DaExemptKey =
             serde_json::from_str(r#"{"original_key": {"state": "melted"}}"#).unwrap();
         assert_eq!(newer.original_key, Some(OriginalKey::Unknown));
+        let untold: RetirementWait = serde_json::from_str(r#"{"for": "not_reproduced"}"#).unwrap();
+        assert_eq!(
+            untold,
+            RetirementWait::NotReproduced { in_use: true },
+            "a missing census never reads as no envelope"
+        );
         let newer_wait: DaExemptKey = serde_json::from_str(
             r#"{"original_key": {"state": "waiting", "handle": 1, "name": "aa", "wait": {"for": "the moon"}}}"#,
         )

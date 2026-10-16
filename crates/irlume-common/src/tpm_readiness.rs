@@ -226,6 +226,86 @@ impl TpmLockout {
     }
 }
 
+/// The `da_exempt_key` part of a `TpmReadiness` reply from an irlumed that
+/// predates it, as this client reads one.
+pub const DA_EXEMPT_KEY_NOT_REPORTED: &str =
+    "this irlumed predates the DA-exempt storage key report";
+
+/// irlume's DA-exempt storage key (ADR-0034 §3.2) as irlumed last recorded
+/// it: persisted at a handle, refused, or neither because no envelope needed
+/// it yet. Optional fields, so a newer daemon's additions never stop an older
+/// client from reading the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaExemptKey {
+    /// The owner persistent handle the key is persisted at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<u32>,
+    /// Why the last attempt to persist it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<KeyRefusal>,
+}
+
+/// A refused persist of the DA-exempt storage key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRefusal {
+    pub reason: RefusalReason,
+    /// The TPM's or the transport's own words.
+    pub detail: String,
+}
+
+/// Why the DA-exempt storage key could not be persisted (#1083).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// `TPM_RC_NV_SPACE`: no room for another persistent object.
+    NoSpace,
+    /// Every owner persistent handle is taken.
+    NoFreeHandle,
+    /// An owner authorization is set. irlume derives and persists its keys
+    /// with an empty one, so it can do neither.
+    OwnerAuthorization,
+    /// `IRLUME_SRK_HANDLE` does not parse, or names a handle outside the
+    /// owner persistent range.
+    HandleOverride,
+    /// Any other refusal.
+    Other,
+    /// A reason this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
+}
+
+impl RefusalReason {
+    /// Whether the refusal was for lack of room. Only then may irlumed try
+    /// again in the same boot, once `TPM_PT_HR_PERSISTENT_AVAIL` reads at
+    /// least 1 (#1083).
+    pub fn is_capacity(self) -> bool {
+        matches!(self, Self::NoSpace | Self::NoFreeHandle)
+    }
+
+    /// When irlumed tries again, which is only ever at one of its starts: a
+    /// refused override at the next start after it is corrected, a lack of
+    /// room at the next start after the TPM reports room, a refusal this
+    /// release names otherwise at the first start in a later boot (#1083). A
+    /// reason this release does not know promises no schedule.
+    pub fn when_retried(self) -> &'static str {
+        match self {
+            Self::HandleOverride => {
+                "at its next start once IRLUME_SRK_HANDLE is unset or names a handle from \
+                 0x81000000 to 0x817fffff"
+            }
+            Self::NoSpace | Self::NoFreeHandle => {
+                "at its next start once the TPM reports room for another persistent object, \
+                 or at its first start in a later boot"
+            }
+            Self::OwnerAuthorization | Self::Other => "at its first start in a later boot",
+            Self::Unknown => {
+                "at a later start, when that newer irlumed's rule for this reason allows; \
+                 this release does not know the reason"
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

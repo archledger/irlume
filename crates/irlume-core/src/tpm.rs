@@ -28,6 +28,7 @@
 //! bricks the daemon after a few operations.
 
 use crate::envelope::{PcrValue, PolicyKind, SealedEnvelope};
+use crate::storage_key;
 use irlume_common::{Error, Result};
 use sha2::{Digest as _, Sha256};
 use std::convert::TryFrom;
@@ -93,7 +94,7 @@ const PERSISTENT_SRK_HANDLE: u32 = 0x8101_0002;
 
 /// The persistent handles Owner Authorization may assign (Part 1 34.3);
 /// 0x81800000 to 0x81FFFFFF need Platform Authorization.
-const OWNER_PERSISTENT: std::ops::RangeInclusive<u32> = 0x8100_0000..=0x817F_FFFF;
+pub(crate) const OWNER_PERSISTENT: std::ops::RangeInclusive<u32> = 0x8100_0000..=0x817F_FFFF;
 
 /// The start of the `unique` of irlume's DA-exempt storage key template
 /// ([`da_exempt_srk_template`]), zero-padded to [`RSA_2048_MODULUS_BYTES`].
@@ -929,6 +930,201 @@ fn persistent_srk_raw() -> u32 {
 
 fn persistent_srk_handle() -> Result<PersistentTpmHandle> {
     PersistentTpmHandle::new(persistent_srk_raw()).map_err(tpm_err)
+}
+
+/// Where irlume's DA-exempt storage key goes (ADR-0034 §3.2), from
+/// `IRLUME_SRK_HANDLE`.
+pub(crate) fn da_exempt_key_plan() -> std::result::Result<storage_key::Plan, String> {
+    da_exempt_key_plan_for(std::env::var("IRLUME_SRK_HANDLE").ok().as_deref())
+}
+
+/// [`da_exempt_key_plan`] for an override value. The preferred handle is the
+/// one after the original key's, or the one before for 0x817FFFFF, the top of
+/// the owner range. The value is read as [`persistent_srk_raw`] reads it, so
+/// both keys agree on the original handle; one that does not parse, which the
+/// original key replaces with [`PERSISTENT_SRK_HANDLE`], or one outside the
+/// owner persistent range is refused, and no new key is persisted.
+pub(crate) fn da_exempt_key_plan_for(
+    value: Option<&str>,
+) -> std::result::Result<storage_key::Plan, String> {
+    let original = match value {
+        None => PERSISTENT_SRK_HANDLE,
+        Some(text) => u32::from_str_radix(text.trim().trim_start_matches("0x"), 16)
+            .map_err(|_| format!("IRLUME_SRK_HANDLE={text:?} does not parse as a hex handle"))?,
+    };
+    if !OWNER_PERSISTENT.contains(&original) {
+        return Err(format!(
+            "IRLUME_SRK_HANDLE={original:#010x} is outside the owner persistent range \
+             0x81000000 to 0x817fffff"
+        ));
+    }
+    let preferred = if original == *OWNER_PERSISTENT.end() {
+        original - 1
+    } else {
+        original + 1
+    };
+    Ok(storage_key::Plan {
+        preferred,
+        original,
+    })
+}
+
+/// [`storage_key::KeyTpm`] over one TPM context. Dropping it flushes the
+/// derived key, which persists only as the copy `persist` made.
+pub(crate) struct DaExemptKeyTpm {
+    ctx: TpmContext,
+    derived: Option<KeyHandle>,
+}
+
+impl DaExemptKeyTpm {
+    pub(crate) fn open() -> Result<Self> {
+        Ok(Self {
+            ctx: open_context()?,
+            derived: None,
+        })
+    }
+}
+
+impl Drop for DaExemptKeyTpm {
+    fn drop(&mut self) {
+        if let Some(derived) = self.derived.take() {
+            let _ = self.ctx.flush_context(derived.into());
+        }
+    }
+}
+
+impl storage_key::KeyTpm for DaExemptKeyTpm {
+    fn name_at(&mut self, handle: u32) -> Result<Option<Vec<u8>>> {
+        // Probed first, so that a free handle logs no esys error (#601).
+        if !persistent_handle_present(&mut self.ctx, handle)? {
+            return Ok(None);
+        }
+        let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+        let object = self
+            .ctx
+            .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+            .map_err(tpm_err)?;
+        let (_, name, _) = self
+            .ctx
+            .read_public(KeyHandle::from(ESYS_TR::from(object)))
+            .map_err(tpm_err)?;
+        Ok(Some(name.value().to_vec()))
+    }
+
+    fn persistent_avail(&mut self) -> Result<u32> {
+        let tag = PropertyTag::HrPersistentAvail;
+        let (data, _more) = self
+            .ctx
+            .get_capability(CapabilityType::TpmProperties, u32::from(tag), 1)
+            .map_err(tpm_err)?;
+        let CapabilityData::TpmProperties(list) = data else {
+            return Err(Error::Tpm(
+                "TPM returned a non-property capability for a property query".into(),
+            ));
+        };
+        list.find(tag)
+            .map(|property| property.value())
+            .ok_or_else(|| Error::Tpm("the TPM did not report TPM_PT_HR_PERSISTENT_AVAIL".into()))
+    }
+
+    fn derive(&mut self) -> std::result::Result<Vec<u8>, storage_key::Failure> {
+        let template = da_exempt_srk_template().map_err(other_failure)?;
+        let primary = self
+            .ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.create_primary(Hierarchy::Owner, template, None, None, None, None)
+            })
+            .map_err(classify_failure)?;
+        if let Some(earlier) = self.derived.replace(primary.key_handle) {
+            let _ = self.ctx.flush_context(earlier.into());
+        }
+        let (_, name, _) = self
+            .ctx
+            .read_public(primary.key_handle)
+            .map_err(classify_failure)?;
+        Ok(name.value().to_vec())
+    }
+
+    fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
+        let mut names = Vec::new();
+        for handle in persistent_handles(&mut self.ctx)? {
+            if !OWNER_PERSISTENT.contains(&handle) {
+                continue;
+            }
+            if let Some(name) = self.name_at(handle)? {
+                names.push((handle, name));
+            }
+        }
+        Ok(names)
+    }
+
+    fn persist(&mut self, handle: u32) -> std::result::Result<(), storage_key::Failure> {
+        let Some(derived) = self.derived else {
+            return Err(other_failure("no derived key to persist"));
+        };
+        let persistent = PersistentTpmHandle::new(handle).map_err(other_failure)?;
+        self.ctx
+            .execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    derived.into(),
+                    Persistent::Persistent(persistent),
+                )
+            })
+            .map_err(classify_failure)?;
+        Ok(())
+    }
+}
+
+/// Classify a refused command for the record (#1083). `Tss2ResponseCode::kind`
+/// does not look at the TSS layer, but no other layer's code can read as one
+/// of these: the TSS base codes run to 54 (`tss2_common.h`), so as format-zero
+/// codes they never reach `TPM_RC_NV_SPACE` (0x14B) or `TPM_RC_NV_DEFINED`
+/// (0x14C), and they never set the format-one bit (0x80) of `TPM_RC_BAD_AUTH`
+/// and `TPM_RC_AUTH_FAIL`. The owner hierarchy is DA-exempt (Part 1 16.8;
+/// `IsDAExempted` in the reference code), so its wrong authorization is
+/// `TPM_RC_BAD_AUTH` and counts toward no lockout.
+fn classify_failure(error: tss_esapi::Error) -> storage_key::Failure {
+    use storage_key::FailureClass;
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind as Kind;
+    let class = match error {
+        tss_esapi::Error::Tss2Error(code) => match code.kind() {
+            Some(Kind::NvSpace) => FailureClass::NoSpace,
+            Some(Kind::NvDefined) => FailureClass::Taken,
+            Some(Kind::BadAuth | Kind::AuthFail) => FailureClass::OwnerAuthorization,
+            _ => FailureClass::Other,
+        },
+        tss_esapi::Error::WrapperError(_) => FailureClass::Other,
+    };
+    storage_key::Failure {
+        class,
+        detail: error.to_string(),
+    }
+}
+
+fn other_failure(detail: impl std::fmt::Display) -> storage_key::Failure {
+    storage_key::Failure {
+        class: storage_key::FailureClass::Other,
+        detail: detail.to_string(),
+    }
+}
+
+/// Whether a persistent object is at `handle`. GetCapability lists handles
+/// from the one asked for, so a one-handle query from `handle` answers it
+/// without paging.
+fn persistent_handle_present(ctx: &mut Context, handle: u32) -> Result<bool> {
+    let (data, _more) = ctx
+        .get_capability(CapabilityType::Handles, handle, 1)
+        .map_err(tpm_err)?;
+    let CapabilityData::Handles(list) = data else {
+        return Err(Error::Tpm(
+            "TPM returned a non-handle capability for a handle query".into(),
+        ));
+    };
+    Ok(list
+        .into_inner()
+        .into_iter()
+        .any(|listed| u32::from(listed) == handle))
 }
 
 /// Outcome of an uninstall-time attempt to evict the persisted SRK.
@@ -3320,6 +3516,32 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// ADR-0034 §3.2 acceptance: the new key's handle is 0x81010003 by
+    /// default, the one after an `IRLUME_SRK_HANDLE` override, and 0x817FFFFE
+    /// for an override of 0x817FFFFF; never outside the owner range. An
+    /// override in the platform range, outside the persistent range, or that
+    /// does not parse as the original key's lookup reads it (a capital `0X`
+    /// included, which that lookup also rejects) is refused.
+    #[test]
+    fn the_da_exempt_key_goes_next_to_the_original_key_in_the_owner_range() {
+        let plan =
+            |value| da_exempt_key_plan_for(value).map(|plan| (plan.preferred, plan.original));
+        assert_eq!(plan(None), Ok((0x8101_0003, 0x8101_0002)));
+        assert_eq!(plan(Some("0x81020000")), Ok((0x8102_0001, 0x8102_0000)));
+        assert_eq!(plan(Some(" 81000010\n")), Ok((0x8100_0011, 0x8100_0010)));
+        assert_eq!(plan(Some("0x817FFFFF")), Ok((0x817F_FFFE, 0x817F_FFFF)));
+        for refused in [
+            "0x81800000",
+            "0x81ffffff",
+            "0x01000000",
+            "zz",
+            "",
+            "0X81010002",
+        ] {
+            assert!(plan(Some(refused)).is_err(), "{refused:?}");
+        }
+    }
+
     /// A handle scan asks again after the last handle of a page while the TPM
     /// says more remain, and stops when it does not; a page that claims more
     /// without moving on is an error, not an endless loop.
@@ -4005,6 +4227,153 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert!(left.contains(&SHARED), "another stack's key stays");
         assert!(left.contains(&PLANTED), "a key with another modulus stays");
         assert!(!left.contains(&OURS));
+    }
+
+    /// Persists a child key of `template`, with a random modulus, at `handle`.
+    fn persist_child_at(template: Public, handle: u32) {
+        let mut ctx = open_context().expect("context");
+        let parent = create_srk(&mut ctx).expect("transient parent");
+        let child = ctx
+            .execute_with_nullauth_session(|ctx| {
+                let created = ctx.create(parent, template, None, None, None, None)?;
+                ctx.load(parent, created.out_private, created.out_public)
+            })
+            .expect("child key");
+        let _ = ctx.flush_context(parent.into());
+        persist_at(&mut ctx, child, handle);
+    }
+
+    /// Persists copies of one key from 0x81000100 upward until the TPM
+    /// answers `TPM_RC_NV_SPACE`, and returns their handles (swtpm holds 64).
+    fn fill_persistent_capacity() -> Vec<u32> {
+        let mut ctx = open_context().expect("context");
+        let key = create_srk(&mut ctx).expect("transient key");
+        let mut filled = Vec::new();
+        for handle in 0x8100_0100..0x8100_0200 {
+            let persistent = PersistentTpmHandle::new(handle).expect("handle");
+            let result = ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    key.into(),
+                    Persistent::Persistent(persistent),
+                )
+            });
+            match result {
+                Ok(_) => filled.push(handle),
+                Err(error)
+                    if classify_failure(error).class == storage_key::FailureClass::NoSpace =>
+                {
+                    break
+                }
+                Err(error) => panic!("filling the TPM: {error}"),
+            }
+        }
+        let _ = ctx.flush_context(key.into());
+        filled
+    }
+
+    /// Sets, or with `current` clears, the owner hierarchy's authorization.
+    fn set_owner_auth(current: &[u8], new: &[u8]) {
+        use tss_esapi::handles::AuthHandle;
+        let mut ctx = open_context().expect("context");
+        ctx.tr_set_auth(
+            ObjectHandle::Owner,
+            Auth::try_from(current.to_vec()).expect("auth"),
+        )
+        .expect("current owner auth");
+        ctx.execute_with_nullauth_session(|ctx| {
+            ctx.hierarchy_change_auth(
+                AuthHandle::Owner,
+                Auth::try_from(new.to_vec()).expect("auth"),
+            )
+        })
+        .expect("change the owner auth");
+    }
+
+    /// ADR-0034 §3.2 and #1083 on swtpm, through the real TPM operations: the
+    /// key is persisted at the preferred handle, found there again with
+    /// nothing derived, adopted by its name when the record is lost, moved on
+    /// when another key holds the preferred handle, and refused with
+    /// `TPM_RC_NV_SPACE` when the TPM is full and `TPM_RC_BAD_AUTH` when an
+    /// owner authorization is set (`tpm2_changeauth -c o`). swtpm only: it
+    /// persists keys at fixed handles, fills the TPM and sets an owner
+    /// authorization, and it refuses any transport but swtpm.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_the_da_exempt_key_is_persisted_found_and_refused() {
+        use crate::storage_key::{ensure_with, Outcome, Plan, Record};
+        use irlume_common::tpm_readiness::RefusalReason;
+        const BOOT: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        const PREFERRED: u32 = 0x8101_0003;
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this test writes persistent handles: run it on swtpm, never on a real TPM"
+        );
+        let plan = Ok(Plan {
+            preferred: PREFERRED,
+            original: 0x8101_0002,
+        });
+        let step = |record: &Record| {
+            let mut tpm = DaExemptKeyTpm::open().expect("context");
+            ensure_with(&mut tpm, record, Some(BOOT), &plan).expect("the step runs")
+        };
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let before = handles();
+        assert!(
+            !before.contains(&PREFERRED) && !before.contains(&(PREFERRED + 1)),
+            "the handles this test uses are taken: {before:x?}"
+        );
+
+        let (record, first) = step(&Record::default());
+        let (_, again) = step(&record);
+        let (_, adopted) = step(&Record::default());
+        let with_key = handles();
+        let removed = evict_da_exempt_srks();
+
+        persist_child_at(da_exempt_srk_template().expect("template"), PREFERRED);
+        let (_, moved) = step(&Record::default());
+        let moved_removed = evict_da_exempt_srks();
+        evict_fixture_at(PREFERRED);
+
+        let filled = fill_persistent_capacity();
+        let (_, full) = step(&Record::default());
+        for handle in &filled {
+            evict_fixture_at(*handle);
+        }
+
+        set_owner_auth(b"", b"irlume-test-owner");
+        let (_, owner) = step(&Record::default());
+        set_owner_auth(b"irlume-test-owner", b"");
+        let after = handles();
+
+        assert_eq!(first, Outcome::Persisted { handle: PREFERRED });
+        assert_eq!(again, Outcome::Present { handle: PREFERRED });
+        assert_eq!(adopted, Outcome::Adopted { handle: PREFERRED });
+        assert_eq!(
+            with_key.len(),
+            before.len() + 1,
+            "an adoption persists no second copy"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert_eq!(
+            moved,
+            Outcome::Persisted {
+                handle: PREFERRED + 1
+            }
+        );
+        assert_eq!(moved_removed.expect("evict"), vec![PREFERRED + 1]);
+        assert!(!filled.is_empty(), "the TPM had room before it was filled");
+        let reason = |outcome: &Outcome| match outcome {
+            Outcome::Refused(refusal) => refusal.reason,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(reason(&full), RefusalReason::NoSpace);
+        assert_eq!(reason(&owner), RefusalReason::OwnerAuthorization);
+        assert_eq!(after, before, "the test leaves the TPM as it found it");
     }
 
     /// Our SRK template with a non-empty authPolicy, as another stack's

@@ -569,6 +569,7 @@ APPARMOR_RUNTIME_RULES=(
   "/var/lib/irlume/capture-qualifications/*.lock rwk,"
   "/var/lib/irlume/retry/ rwk,"
   "/var/lib/irlume/retry/*.operation rwk,"
+  "/var/lib/irlume/.tpm-storage-key.lock rwk,"
   # ADR-0026: the raw TPM device is the primary transport (the manager is the
   # fallback), and the crash-recovery marker lives in the tmpfs lock dir. A
   # profile missing the device rule silently costs ~1.4 s per unseal on AMD

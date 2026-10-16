@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- irlumed persists irlume's DA-exempt storage key at start while any
+  envelope is under the original key (ADR-0034 §3.2). It goes to the owner
+  handle after the original key's, or the next free one; a copy an earlier
+  start persisted is found by its TPM name, so a power loss before the
+  record never leaves two. A refused persist is recorded with the boot: the
+  same boot derives nothing again unless the refusal was for lack of room
+  and the TPM now reports room, and `irlume doctor`'s `tpm-lockout` warns
+  with the reason (no room, no free handle, an owner authorization, or a
+  refused `IRLUME_SRK_HANDLE`) (#1083). Nothing seals under the key yet.
+
 - `irlume doctor` reports, as `tpm-lockout`, the TPM's dictionary-attack
   lockout state: whether a lockout authorization is set, whether the TPM is in
   lockout, and its failure counter, maximum and recovery interval, read by

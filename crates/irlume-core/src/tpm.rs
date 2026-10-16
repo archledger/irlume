@@ -4620,13 +4620,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             let mut ctx = open_context().expect("context");
             persistent_handles(&mut ctx).expect("handle scan")
         };
+        // The first seal persists the original key when no earlier test did,
+        // so the handles are taken after it: what this test must leave as it
+        // found is the DA-exempt key's.
+        let old = seal_with_pcrs(b"sealed before", &[]).expect("seal");
         let before = handles();
         assert!(
             !before.contains(&PREFERRED) && !before.contains(&(PREFERRED + 1)),
             "the handles this test uses are taken: {before:x?}"
         );
-
-        let old = seal_with_pcrs(b"sealed before", &[]).expect("seal");
         dirs.store("alice", &old);
         let persisted = crate::storage_key::ensure_at_start();
         let new = seal_with_pcrs(b"sealed after", &[]).expect("seal");
@@ -4711,7 +4713,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// onto it at their move points (irlumed's start for the template key, a
     /// login's reseal for the keyring), keeping kind, wrap and uid, and still
     /// unseal; a second pass finds nothing to move, and a lockout then spares
-    /// irlume. The ladder is pinned to the literal PCR 7 seal, so only the
+    /// irlume. doctor's report names all three before the moves and none
+    /// after (§4). The ladder is pinned to the literal PCR 7 seal, so only the
     /// storage key changes.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
@@ -4719,6 +4722,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     fn tpm_envelopes_on_the_original_key_move_onto_the_da_exempt_key() {
         use crate::envelope::SecretKind;
         use crate::keyring::{envelope_path, reseal_password, unseal_password, Reseal};
+        use irlume_common::tpm_readiness::{EnvelopeKind, OriginalKeyEnvelope};
         const PREFERRED: u32 = 0x8101_0003;
         require_swtpm();
         let _env = crate::testenv::ENV_LOCK
@@ -4731,15 +4735,18 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             let mut ctx = open_context().expect("context");
             persistent_handles(&mut ctx).expect("handle scan")
         };
+        let _alice = crate::account::remember("alice", 4150);
+        let _bob = crate::account::remember("bob", 4151);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did,
+        // so the handles are taken after it: what this test must leave as it
+        // found is the DA-exempt key's.
         let before = handles();
         assert!(
             !before.contains(&PREFERRED),
             "the handle this test uses is taken: {before:x?}"
         );
-        let _alice = crate::account::remember("alice", 4150);
-        let _bob = crate::account::remember("bob", 4151);
-        let key = crate::crypto::generate_key();
-        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
         crate::keyring::seal_password("alice", b"alice-password").expect("arm the password");
         let token = b"bob-gnome-keyring-token-for-tests";
         let mut armed = seal_with_pcrs(token, &[7]).expect("seal the token");
@@ -4763,6 +4770,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let sealed_before = parents();
 
         let persisted = crate::storage_key::ensure_at_start();
+        let reported_before = crate::storage_key::report();
         let template_move = crate::template_key::move_to_stronger_policy("alice");
         let template_again = crate::template_key::move_to_stronger_policy("alice");
         let template_key = crate::template_key::load_key("alice");
@@ -4774,6 +4782,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let token_open = unseal_password("bob");
         let token_env = SealedEnvelope::load(&envelope_path("bob"));
         let moved = parents();
+        let reported_after = crate::storage_key::report();
         let spared = lockout_state().map(|l| l.storage_key_no_da);
         let removed = evict_da_exempt_srks();
         let after = handles();
@@ -4820,6 +4829,29 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             "every envelope on the DA-exempt key: {moved:?}"
         );
         assert!(spared.expect("lockout state"), "a lockout spares irlume");
+        // What doctor names (ADR-0034 §4): every envelope before the moves,
+        // none after.
+        let on_original = |report: Result<irlume_common::tpm_readiness::DaExemptKey>| {
+            let report = report.expect("the report");
+            assert_eq!(report.handle, Some(PREFERRED));
+            report.on_original_key.expect("the list")
+        };
+        let before_moves = on_original(reported_before);
+        let named = |user: &str, kind| OriginalKeyEnvelope {
+            user: user.into(),
+            kind,
+        };
+        assert_eq!(
+            before_moves.named,
+            [
+                named("alice", EnvelopeKind::TemplateKey),
+                named("alice", EnvelopeKind::KeyringSecret),
+                named("bob", EnvelopeKind::KeyringSecret),
+            ]
+        );
+        assert_eq!(before_moves.total, 3);
+        let after_moves = on_original(reported_after);
+        assert_eq!((after_moves.named.len(), after_moves.total), (0, 0));
         assert_eq!(removed.expect("evict"), vec![PREFERRED]);
         assert_eq!(
             after, before,

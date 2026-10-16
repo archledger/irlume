@@ -4206,7 +4206,10 @@ fn tpm_lockout_check(
         (Err(e), Some(refused)) => {
             return (
                 State::Warn,
-                format!("lockout state not read ({e}), {}", refusal_warning(refused)),
+                format!(
+                    "lockout state not read ({e}), {}",
+                    refusal_warning(refused, da_exempt_key)
+                ),
             )
         }
         (Err(e), None) => return (State::Unknown, format!("lockout state not read: {e}")),
@@ -4219,11 +4222,20 @@ fn tpm_lockout_check(
         let effect = if lockout.storage_key_no_da {
             "irlume's storage key is DA-exempt, so irlume is not affected, but disk \
              unlock PINs and other TPM PIN users on this machine are"
+                .to_owned()
+        } else if let Some(named) = original_key_envelopes(da_exempt_key, true) {
+            format!(
+                "these irlume envelopes are still on its original storage key, which the \
+                 lockout blocks (ADR-0034 §3), so what each protects uses the password until \
+                 it ends: {named}. Envelopes on irlume's DA-exempt storage key are not \
+                 affected"
+            )
         } else {
             "not every irlume envelope is on its DA-exempt storage key yet (ADR-0034 §3), \
              so face login with an encrypted enrollment (one a TPM-sealed template key \
              protects) and the release of sealed keyring secrets whose envelopes are still \
              on the original key use the password until it ends"
+                .to_owned()
         };
         // The TPM keeps no "time left" value: a lockout ends one recovery
         // interval of powered-on time after the last failure, and a power
@@ -4275,7 +4287,10 @@ fn tpm_lockout_check(
     if let Some(refused) = refused {
         return (
             State::Warn,
-            format!("not in lockout ({counts}), {}", refusal_warning(refused)),
+            format!(
+                "not in lockout ({counts}), {}",
+                refusal_warning(refused, da_exempt_key)
+            ),
         );
     }
     // A current irlumed that could not report the key's state (an envelope
@@ -4310,15 +4325,83 @@ fn tpm_lockout_check(
     )
 }
 
-/// The warning for a refused persist of irlume's DA-exempt storage key.
-fn refusal_warning(refused: &irlume_common::tpm_readiness::KeyRefusal) -> String {
+/// The warning for a refused persist of irlume's DA-exempt storage key,
+/// naming the envelopes that stay on the original key when irlumed listed
+/// them.
+fn refusal_warning(
+    refused: &irlume_common::tpm_readiness::KeyRefusal,
+    da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+) -> String {
+    let staying = match original_key_envelopes(da_exempt_key, false) {
+        Some(named) => format!(
+            "These envelopes stay on irlume's original key, which the next TPM lockout \
+             would block: {named}"
+        ),
+        None => "irlume's envelopes stay on its original key, which the next TPM lockout \
+                 would block"
+            .to_owned(),
+    };
     format!(
         "but irlumed could not persist irlume's DA-exempt storage key (ADR-0034 §3): {}. \
-         irlume's envelopes stay on its original key, which the next TPM lockout would \
-         block. irlumed tries again {}",
+         {staying}. irlumed tries again {}",
         refusal_text(refused),
         refused.reason.when_retried()
     )
+}
+
+/// At most this many envelopes are named in a doctor line; irlumed sends at
+/// most `tpm_readiness::MAX_NAMED_ENVELOPES`, and an older or altered one
+/// may send more.
+const MAX_ENVELOPES_SHOWN: usize = 12;
+
+/// The envelopes irlumed listed as still under irlume's original storage key
+/// (ADR-0034 §4), by account and kind, with what a TPM lockout blocks for each
+/// when `with_effect`, and how many more there are. `None` when irlumed sent
+/// no list (it predates it, or could not report) or the list is empty. Account
+/// names come from irlumed's state directory: they are cleaned again here, as
+/// for a refusal's detail.
+fn original_key_envelopes(
+    da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+    with_effect: bool,
+) -> Option<String> {
+    use irlume_common::tpm_readiness::EnvelopeKind;
+    let list = da_exempt_key.as_ref().ok()?.on_original_key.as_ref()?;
+    let total = usize::try_from(list.total)
+        .unwrap_or(usize::MAX)
+        .max(list.named.len());
+    if total == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = list
+        .named
+        .iter()
+        .take(MAX_ENVELOPES_SHOWN)
+        .map(|envelope| {
+            let user = irlume_common::single_line(&envelope.user, 64);
+            let (what, effect) = match envelope.kind {
+                EnvelopeKind::TemplateKey => ("template key", Some("face login")),
+                EnvelopeKind::KeyringSecret => (
+                    "keyring secret",
+                    Some("credential release after a face or fingerprint login"),
+                ),
+                EnvelopeKind::Unknown => ("envelope", None),
+            };
+            match effect.filter(|_| with_effect) {
+                Some(effect) => format!("{user}'s {what} ({effect})"),
+                None => format!("{user}'s {what}"),
+            }
+        })
+        .collect();
+    let rest = total - parts.len();
+    if parts.is_empty() {
+        parts.push(format!(
+            "{rest} envelope{} under names irlumed does not show",
+            if rest == 1 { "" } else { "s" }
+        ));
+    } else if rest > 0 {
+        parts.push(format!("and {rest} more"));
+    }
+    Some(parts.join("; "))
 }
 
 /// Why irlume's DA-exempt storage key could not be persisted, in words, with
@@ -6714,7 +6797,7 @@ mod tests {
                 lockout: Ok(lockout),
                 da_exempt_key: Ok(irlume_common::tpm_readiness::DaExemptKey {
                     handle: Some(0x8101_0003),
-                    refused: None,
+                    ..Default::default()
                 }),
             })
         });
@@ -6792,11 +6875,11 @@ mod tests {
         use irlume_core::tpm::TpmLockout;
         let refused = |reason| {
             Ok(DaExemptKey {
-                handle: None,
                 refused: Some(KeyRefusal {
                     reason,
                     detail: "the TPM's words".into(),
                 }),
+                ..Default::default()
             })
         };
         let calm = Ok(TpmLockout::from_properties(0x4, 0, 32, 7200, 86400, false));
@@ -6849,14 +6932,112 @@ mod tests {
         let (reading, _) = tpm_lockout_check(&unread, &Ok(DaExemptKey::default()));
         assert_eq!(reading, State::Unknown);
         let hostile = Ok(DaExemptKey {
-            handle: None,
             refused: Some(KeyRefusal {
                 reason: RefusalReason::Other,
                 detail: "\u{1b}]0;title\u{7}\nnext line".into(),
             }),
+            ..Default::default()
         });
         let (_, detail) = tpm_lockout_check(&calm, &hostile);
         assert!(!detail.chars().any(char::is_control), "{detail:?}");
+    }
+
+    /// ADR-0034 §4: in lockout, doctor names each account and envelope kind
+    /// still on the original key and what the lockout blocks for it, and the
+    /// refused-persist warning names what stays there. Names are cleaned,
+    /// capped and counted; an empty or missing list keeps the general
+    /// wording.
+    #[test]
+    fn tpm_lockout_names_the_envelopes_still_on_the_original_key() {
+        use crate::doctor_report::State;
+        use irlume_common::tpm_readiness::{
+            DaExemptKey, EnvelopeKind, KeyRefusal, OriginalKeyEnvelope, OriginalKeyEnvelopes,
+            RefusalReason,
+        };
+        use irlume_core::tpm::TpmLockout;
+        let envelope = |user: &str, kind| OriginalKeyEnvelope {
+            user: user.into(),
+            kind,
+        };
+        let listed = |named: Vec<OriginalKeyEnvelope>, total, refused| {
+            Ok(DaExemptKey {
+                refused,
+                on_original_key: Some(OriginalKeyEnvelopes { named, total }),
+                ..Default::default()
+            })
+        };
+        let locked = Ok(TpmLockout::from_properties(
+            0x204, 32, 32, 7200, 86400, false,
+        ));
+        let two = listed(
+            vec![
+                envelope("alice", EnvelopeKind::TemplateKey),
+                envelope("bob", EnvelopeKind::KeyringSecret),
+            ],
+            2,
+            None,
+        );
+        let (reading, detail) = tpm_lockout_check(&locked, &two);
+        assert_eq!(reading, State::Warn);
+        assert!(
+            detail.contains(
+                "alice's template key (face login); bob's keyring secret (credential release \
+                 after a face or fingerprint login)"
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("DA-exempt storage key are not affected"),
+            "{detail}"
+        );
+        assert!(!detail.contains("not every irlume envelope"), "{detail}");
+
+        let hostile = listed(
+            vec![envelope("eve\u{1b}[2J\nx", EnvelopeKind::Unknown)],
+            40,
+            None,
+        );
+        let (_, detail) = tpm_lockout_check(&locked, &hostile);
+        assert!(!detail.chars().any(char::is_control), "{detail:?}");
+        assert!(detail.contains("'s envelope; and 39 more"), "{detail}");
+        let unnamed = listed(Vec::new(), 3, None);
+        let (_, detail) = tpm_lockout_check(&locked, &unnamed);
+        assert!(
+            detail.contains("3 envelopes under names irlumed does not show"),
+            "{detail}"
+        );
+        let many = listed(
+            (0..20)
+                .map(|n| envelope(&format!("user{n:02}"), EnvelopeKind::TemplateKey))
+                .collect(),
+            20,
+            None,
+        );
+        let (_, detail) = tpm_lockout_check(&locked, &many);
+        assert!(detail.contains("user11's template key"), "{detail}");
+        assert!(!detail.contains("user12"), "{detail}");
+        assert!(detail.contains("and 8 more"), "{detail}");
+        for general in [listed(Vec::new(), 0, None), Ok(DaExemptKey::default())] {
+            let (_, detail) = tpm_lockout_check(&locked, &general);
+            assert!(detail.contains("not every irlume envelope"), "{detail}");
+        }
+
+        let calm = Ok(TpmLockout::from_properties(0x4, 0, 32, 7200, 86400, false));
+        let refused = listed(
+            vec![envelope("alice", EnvelopeKind::TemplateKey)],
+            1,
+            Some(KeyRefusal {
+                reason: RefusalReason::NoSpace,
+                detail: "the TPM's words".into(),
+            }),
+        );
+        let (reading, detail) = tpm_lockout_check(&calm, &refused);
+        assert_eq!(reading, State::Warn);
+        assert!(
+            detail.contains("next TPM lockout would block: alice's template key."),
+            "{detail}"
+        );
+        assert!(!detail.contains("(face login)"), "{detail}");
     }
 
     #[test]

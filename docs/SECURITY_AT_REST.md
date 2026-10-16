@@ -257,7 +257,8 @@ each record it does not use, with the uids and the next step.
   when the session opens, even when neither the secret nor its TPM policy
   changes: only the uid field is written. Such a write for a name that has
   no account records no uid. Moving a template key to a stronger policy
-  (at irlumed's start, or on a load) keeps the uid it records, or none: the
+  or onto irlume's DA-exempt storage key (at irlumed's start, or on a
+  load; ADR-0034 §3.3) keeps the uid it records, or none: the
   name may by then resolve to another account than the one whose enrollment
   the key opens. An enrollment write for the account does not reuse such a
   key when the enrollment under it records another uid (the write reads the
@@ -274,8 +275,8 @@ each record it does not use, with the uids and the next step.
   not the target); for anything else there, such as a directory, the
   refusal says to move the path away instead. An enrollment write, an
   added-camera store write and `irlume recovery setup` check the key on a
-  load that writes nothing, and move it to a stronger policy only once
-  they keep it as the account's: a write refused over the key leaves the
+  load that writes nothing, and move it to a stronger policy or onto the
+  DA-exempt storage key only once they keep it as the account's: a write refused over the key leaves the
   key file as it was, and a key an enrollment write replaces is set aside
   unmoved, so a failed write puts it back as it was.
 - An enrollment write that replaces another uid's enrollment first records,

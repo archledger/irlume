@@ -465,10 +465,27 @@ pub enum Reseal {
     Resealed,
     /// The password and PCR policy were unchanged, but a stronger policy is
     /// available (pcrlock was provisioned, or the envelope is a signed Tier 1
-    /// one from an earlier release), so the envelope was re-sealed to it. Lets
-    /// an existing arm move on the next login with no `keyring arm` from the
-    /// user.
+    /// one from an earlier release), so the envelope was re-sealed to it,
+    /// under irlume's DA-exempt storage key when irlumed has persisted it.
+    /// Lets an existing arm move on the next login with no `keyring arm` from
+    /// the user.
     Upgraded,
+    /// The password and PCR policy were unchanged and no stronger policy is
+    /// available, but the envelope was under the original storage key while
+    /// irlume's DA-exempt key is persisted, so it was re-sealed under that
+    /// key with a policy no weaker (ADR-0034 §3.3): a TPM lockout no longer
+    /// stops the keyring release.
+    MovedToDaExemptKey,
+}
+
+impl Reseal {
+    /// The outcome for a move that gained `gain`.
+    fn moved(gain: tpm::MoveGain) -> Self {
+        match gain {
+            tpm::MoveGain::DaExemptKey => Self::MovedToDaExemptKey,
+            tpm::MoveGain::StrongerPolicy | tpm::MoveGain::Both => Self::Upgraded,
+        }
+    }
 }
 
 /// Self-heal: re-seal `user`'s login password against the *current* PCR policy,
@@ -544,15 +561,16 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
         if current.as_slice() == password {
             // One exception: if a strictly stronger policy is available than
             // the one this envelope was written under (pcrlock provisioned
-            // since, or a signed Tier 1 envelope from an earlier release),
-            // move to it without the user re-arming. Only fires when an
-            // upgrade is actually possible, and only adopts the new envelope
-            // if the ladder genuinely produced a stronger policy (it
-            // round-trip-verifies internally), so a machine already at its
-            // best policy writes nothing.
+            // since, or a signed Tier 1 envelope from an earlier release), or
+            // the envelope is under the original storage key while irlume's
+            // DA-exempt key is persisted (ADR-0034 §3.3), move without the
+            // user re-arming. Only fires when a move is actually possible,
+            // and only adopts the new envelope if it gains a stronger policy
+            // or the DA-exempt key and unseals to the same secret, so a
+            // machine with nothing to gain writes nothing.
             if let Ok(env) = SealedEnvelope::load(&envelope_path(user)) {
                 // Without a uid to record, the move waits for a later login.
-                let upgrade = tpm::stronger_tier_available_than(&env)
+                let upgrade = tpm::move_available(&env)
                     .then(|| account.uid_to_record(record_for(kind), env.uid).ok())
                     .flatten();
                 if let Some(uid) = upgrade {
@@ -563,9 +581,10 @@ pub fn reseal_password(user: &str, password: &[u8], wallet_salt: Option<&[u8]>) 
                     // hand 56 bytes of key to pam_gnome_keyring as an AUTHTOK.
                     candidate.secret = kind;
                     candidate.uid = uid;
-                    if tpm::policy_is_stronger(&candidate, &env) {
-                        candidate.save(&envelope_path(user))?;
-                        return Ok(Reseal::Upgraded);
+                    if let Some(gain) = tpm::move_gain(&candidate, &env) {
+                        check_round_trip(&candidate, password)?;
+                        publish_move(user, &candidate, gain)?;
+                        return Ok(Reseal::moved(gain));
                     }
                 }
                 record_uid_on_unbound(user, env, &mut account)?;
@@ -604,16 +623,48 @@ fn record_uid_on_unbound(
     env.save(&envelope_path(user))
 }
 
-/// `env`'s token sealed under a strictly stronger policy, with its kind and
-/// recovery wrap carried over, or `None` when no stronger policy is available,
-/// the ladder did not reach one, or there is no uid to record (the climb then
-/// waits for a later login).
+/// Unseal `candidate`, the envelope a move sealed `secret` into, and compare.
+/// `tpm::seal` unseals only a pcrlock candidate before it returns it, never
+/// the literal PCR seal, and a candidate that does not give `secret` back
+/// must not replace an envelope that does (ADR-0034 §3.3).
+fn check_round_trip(candidate: &SealedEnvelope, secret: &[u8]) -> Result<()> {
+    if tpm::unseal(candidate)?.as_slice() != secret {
+        return Err(Error::Tpm(
+            "the new envelope does not unseal to the same keyring secret".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Write `candidate`, `user`'s moved keyring envelope. Once the new envelope
+/// is visible the move happened, even when syncing the directory failed: an
+/// error here must mean the old one is still in place. A power loss may
+/// bring the old envelope back, which unseals too.
+fn publish_move(user: &str, candidate: &SealedEnvelope, gain: tpm::MoveGain) -> Result<()> {
+    if let irlume_common::AtomicWrite::VisibleNotDurable(e) =
+        candidate.save_reporting(&envelope_path(user))?
+    {
+        eprintln!(
+            "irlume: moved the keyring secret of '{user}' to {}, but syncing its directory \
+             failed ({e}); after a power loss the previous envelope, which still unseals, may \
+             come back",
+            gain.describe()
+        );
+    }
+    Ok(())
+}
+
+/// `env`'s token sealed under a strictly stronger policy or under irlume's
+/// DA-exempt storage key ([`tpm::move_available`]), with its kind and
+/// recovery wrap carried over and its round trip checked, and what the move
+/// gains; `None` when no move is available, the seal gained nothing, or
+/// there is no uid to record (the move then waits for a later login).
 fn climbed_token(
     env: &SealedEnvelope,
     token: &[u8],
     account: &mut Account<'_>,
-) -> Result<Option<SealedEnvelope>> {
-    if !tpm::stronger_tier_available_than(env) {
+) -> Result<Option<(SealedEnvelope, tpm::MoveGain)>> {
+    if !tpm::move_available(env) {
         return Ok(None);
     }
     let Ok(uid) = account.uid_to_record(Record::KeyringToken, env.uid) else {
@@ -627,7 +678,11 @@ fn climbed_token(
     // change.
     candidate.secret = SecretKind::GnomeKeyringToken;
     candidate.password_wrap = env.password_wrap.clone();
-    Ok(tpm::policy_is_stronger(&candidate, env).then_some(candidate))
+    let Some(gain) = tpm::move_gain(&candidate, env) else {
+        return Ok(None);
+    };
+    check_round_trip(&candidate, token)?;
+    Ok(Some((candidate, gain)))
 }
 
 /// The token half of [`reseal_password`]. A token cannot be re-derived, so the
@@ -665,16 +720,16 @@ fn reseal_token(
                 let mut env = env;
                 env.password_wrap = Some(crate::recovery::wrap(password, &token)?);
                 env.uid = account.uid_to_record(Record::KeyringToken, env.uid)?;
-                if let Ok(Some(stronger)) = climbed_token(&env, &token, account) {
-                    env = stronger;
+                match climbed_token(&env, &token, account) {
+                    Ok(Some((stronger, gain))) => publish_move(user, &stronger, gain)?,
+                    _ => env.save(&envelope_path(user))?,
                 }
-                env.save(&envelope_path(user))?;
                 return Ok(Reseal::Resealed);
             }
             match climbed_token(&env, &token, account)? {
-                Some(stronger) => {
-                    stronger.save(&envelope_path(user))?;
-                    Ok(Reseal::Upgraded)
+                Some((stronger, gain)) => {
+                    publish_move(user, &stronger, gain)?;
+                    Ok(Reseal::moved(gain))
                 }
                 None => {
                     record_uid_on_unbound(user, env, account)?;

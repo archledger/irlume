@@ -1506,35 +1506,15 @@ fn main() {
                 }
             }
 
-            // Move each account's template key to a stronger TPM policy when one
-            // is available (a signed Tier 1 seal an earlier release wrote, or a
-            // literal one after pcrlock was provisioned). Here at startup, not
-            // in an authentication request, which unseals the key at most once
-            // (ADR-0025) while the move round-trip unseals the new envelope. With
-            // nothing stronger available only the envelope and the policy files
-            // are read, so an ordinary start does no TPM work here.
-            if irlume_core::template_key::tpm_available() {
-                for user in irlume_core::storage::list_users() {
-                    match irlume_core::template_key::move_to_stronger_policy(&user) {
-                        Ok(true) => jout_notice!(
-                            "irlumed: moved the template key of '{user}' to a stronger TPM policy"
-                        ),
-                        Ok(false) => {}
-                        Err(e) => jout_warn!(
-                            "irlumed: could not move the template key of '{user}' to a stronger \
-                             TPM policy ({e}); its envelope was not changed"
-                        ),
-                    }
-                }
-            }
-
             // irlume's DA-exempt storage key (ADR-0034 §3.2): found, or
             // derived and persisted, here at startup, so no login pays for the
-            // derivation. It runs only while an envelope is under the original
-            // key, and after a refusal it derives nothing again in the same
-            // boot unless the TPM now has room (#1083). Nothing seals under
-            // the key yet. An explicit transport counts, as for the readiness
-            // report: keyring secrets seal through it with no device node.
+            // derivation. It runs while any envelope exists, and after a
+            // refusal it derives nothing again in the same boot unless the
+            // TPM now has room (#1083). New seals go under the key once it is
+            // persisted, and this runs before the template key moves below,
+            // so their envelopes can move onto it in this start. An explicit
+            // transport counts, as for the readiness report: keyring secrets
+            // seal through it with no device node.
             if std::env::var_os("IRLUME_TCTI").is_some()
                 || irlume_core::template_key::tpm_available()
             {
@@ -1558,6 +1538,33 @@ fn main() {
                         "irlumed: could not check irlume's DA-exempt storage key ({e}); \
                          envelopes stay on the original key"
                     ),
+                }
+            }
+
+            // Move each account's template key to a better envelope when one is
+            // available (ADR-0034 §3.3): a stronger TPM policy (a signed Tier 1
+            // seal an earlier release wrote, or a literal one after pcrlock
+            // was provisioned), or irlume's DA-exempt storage key, persisted
+            // by the step above, in place of the original key. Here at
+            // startup, not in an authentication request, which unseals the key
+            // at most once (ADR-0025) while the move's round trip unseals the
+            // new envelope. With no move available only the envelope, the
+            // policy files and the storage-key record are read, so an ordinary
+            // start does no TPM work here.
+            if irlume_core::template_key::tpm_available() {
+                for user in irlume_core::storage::list_users() {
+                    match irlume_core::template_key::move_to_stronger_policy(&user) {
+                        Ok(Some(gain)) => jout_notice!(
+                            "irlumed: moved the template key of '{user}' to {}",
+                            gain.describe()
+                        ),
+                        Ok(None) => {}
+                        Err(e) => jout_warn!(
+                            "irlumed: could not move the template key of '{user}' to a stronger \
+                             TPM policy or irlume's DA-exempt storage key ({e}); its envelope \
+                             was not changed"
+                        ),
+                    }
                 }
             }
 
@@ -10303,12 +10310,18 @@ fn dispatch_after_authorization(
                         jout_notice!(
                             "irlumed: ResealPassword: upgraded '{user}' keyring seal to a stronger TPM policy tier (no re-arm needed)"
                         );
+                    } else if outcome == Reseal::MovedToDaExemptKey {
+                        jout_notice!(
+                            "irlumed: ResealPassword: moved '{user}' keyring seal to irlume's DA-exempt storage key (no re-arm needed)"
+                        );
                     }
                     Response::PasswordResealed {
-                        // Both Resealed (self-heal) and Upgraded (tier climb)
-                        // changed the on-disk envelope.
+                        // Resealed (self-heal), Upgraded (tier climb) and
+                        // MovedToDaExemptKey all changed the on-disk envelope.
                         armed: outcome != Reseal::NotArmed,
-                        changed: outcome == Reseal::Resealed || outcome == Reseal::Upgraded,
+                        changed: outcome == Reseal::Resealed
+                            || outcome == Reseal::Upgraded
+                            || outcome == Reseal::MovedToDaExemptKey,
                     }
                 }
                 Err(e) => {

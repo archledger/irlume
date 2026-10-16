@@ -2504,6 +2504,7 @@ mod tests {
             user,
             key,
             |_| true,
+            |env| Ok(zeroize::Zeroizing::new(env.private.clone())),
             |key| {
                 let mut env: crate::envelope::SealedEnvelope =
                     serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#)

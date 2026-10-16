@@ -1450,36 +1450,61 @@ fn supersede(next: &mut Record, old: Persisted) {
     }
 }
 
-/// When the start-up step recorded another DA-exempt key than `record` did
-/// (the recorded key was away from its handle, and today's derivation was
-/// adopted or persisted in its place), keep the old key as superseded while
-/// it is still persisted somewhere, found by its TPM name: its envelopes
-/// then move off it, and load through it by name until they do. A key
-/// persisted nowhere is not kept; nothing can load under it.
+/// Keep the superseded keys in `next` findable by name. When the start-up
+/// step recorded another DA-exempt key than `record` did (the recorded key
+/// was away from its handle, and today's derivation was adopted or
+/// persisted in its place), the old key is kept as superseded while it is
+/// still persisted somewhere, found by its TPM name: its envelopes then move
+/// off it, and load through it by name until they do; a key persisted
+/// nowhere is not kept, since nothing can load under it. Every kept key
+/// that is no longer at its recorded handle is looked for by its name among
+/// the owner persistent handles and recorded where it is, since a keyring
+/// envelope, which no start rewrites, loads through that handle; one found
+/// nowhere keeps its entry, for the report.
 fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) -> Result<()> {
-    let (Some(old), Some(new)) = (&record.persisted, &next.persisted) else {
-        return Ok(());
-    };
-    if old.name == new.name {
-        return Ok(());
+    let mut owners = None;
+    if let (Some(old), Some(new)) = (&record.persisted, &next.persisted) {
+        if old.name != new.name {
+            if let Some(name) = unhex(&old.name) {
+                if let Some(handle) = persisted_by_name(tpm, &mut owners, &name)? {
+                    let old = Persisted {
+                        handle,
+                        name: old.name.clone(),
+                    };
+                    supersede(next, old);
+                }
+            }
+        }
     }
-    let Some(name) = unhex(&old.name) else {
-        return Ok(());
-    };
-    if let Some((handle, _)) = tpm
-        .owner_names()?
-        .into_iter()
-        .find(|(_, found)| *found == name)
-    {
-        supersede(
-            next,
-            Persisted {
-                handle,
-                name: old.name.clone(),
-            },
-        );
+    for index in 0..next.superseded.len() {
+        let Some(name) = unhex(&next.superseded[index].name) else {
+            continue;
+        };
+        if tpm.name_at(next.superseded[index].handle)?.as_deref() == Some(name.as_slice()) {
+            continue;
+        }
+        if let Some(handle) = persisted_by_name(tpm, &mut owners, &name)? {
+            next.superseded[index].handle = handle;
+        }
     }
     Ok(())
+}
+
+/// The owner persistent handle the key with TPM name `name` is at, from one
+/// scan of them per start (`owners`).
+fn persisted_by_name(
+    tpm: &mut impl KeyTpm,
+    owners: &mut Option<Vec<(u32, Vec<u8>)>>,
+    name: &[u8],
+) -> Result<Option<u32>> {
+    if owners.is_none() {
+        *owners = Some(tpm.owner_names()?);
+    }
+    Ok(owners
+        .iter()
+        .flatten()
+        .find(|(_, found)| found.as_slice() == name)
+        .map(|(handle, _)| *handle))
 }
 
 /// The DA-exempt keys the recorded one superseded, as their handles and TPM
@@ -1487,14 +1512,22 @@ fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) ->
 /// the recorded DA-exempt key ([`crate::tpm::move_available`]). One that
 /// names the recorded key itself is left out. Reads the record only.
 pub(crate) fn superseded_keys() -> Vec<(u32, String)> {
+    da_exempt_keys().1
+}
+
+/// The recorded DA-exempt key's TPM name in hex, and the keys it superseded
+/// ([`superseded_keys`]), from one read of the record, so a caller that
+/// compares them sees one state of it.
+pub(crate) fn da_exempt_keys() -> (Option<String>, Vec<(u32, String)>) {
     let record = load_record();
     let recorded = record.persisted.map(|persisted| persisted.name);
-    record
+    let superseded = record
         .superseded
         .into_iter()
         .filter(|kept| recorded.as_deref() != Some(kept.name.as_str()))
         .map(|kept| (kept.handle, kept.name))
-        .collect()
+        .collect();
+    (recorded, superseded)
 }
 
 /// Where a key [`KeyTpm::derive`] just derived, with TPM name `name`, ended
@@ -3911,6 +3944,24 @@ mod tests {
         let (again, outcome) = start(&mut same);
         assert_eq!(outcome, Outcome::Adopted { handle: ELSEWHERE });
         assert!(again.superseded.is_empty(), "the same key, adopted again");
+
+        // A kept key found at another handle since is recorded there; one
+        // found nowhere keeps its entry.
+        let mut moved = FakeTpm::new();
+        moved.objects.insert(DA_EXEMPT, b"ours".to_vec());
+        moved.objects.insert(0x8101_000a, b"weak".to_vec());
+        let kept = Record {
+            superseded: vec![relocated.clone()],
+            ..persisted_record(DA_EXEMPT, b"ours")
+        };
+        let mut refreshed = kept.clone();
+        keep_superseded(&mut moved, &kept, &mut refreshed).expect("refreshed");
+        assert_eq!(refreshed.superseded[0].handle, 0x8101_000a);
+        let mut nowhere = FakeTpm::new();
+        nowhere.objects.insert(DA_EXEMPT, b"ours".to_vec());
+        let mut stale = kept.clone();
+        keep_superseded(&mut nowhere, &kept, &mut stale).expect("kept");
+        assert_eq!(stale.superseded, kept.superseded, "kept for the report");
 
         let mut itself = persisted_record(DA_EXEMPT, b"weak");
         supersede(

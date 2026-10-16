@@ -1938,14 +1938,15 @@ pub(crate) fn move_gain(candidate: &SealedEnvelope, current: &SealedEnvelope) ->
     };
     let candidate_rank = current_strength_rank(candidate, binding.as_ref())?;
     let current_rank = current_strength_rank(current, binding.as_ref())?;
-    // Onto the DA-exempt key from the original key, or from the weak
-    // DA-exempt key a replacement superseded onto the one now recorded.
+    // Onto the DA-exempt key from the original key, or from a key the
+    // recorded one superseded onto the recorded key itself, read with the
+    // superseded keys from one state of the record: a start that superseded
+    // the candidate's key since it was sealed makes this no move.
     let off_superseded = match (&current.parent, &candidate.parent) {
-        (Some(from), Some(to)) => {
-            from.name != to.name
-                && storage_key::superseded_keys()
-                    .iter()
-                    .any(|(_, name)| *name == from.name)
+        (Some(from), Some(to)) if from.name != to.name => {
+            let (recorded, superseded) = storage_key::da_exempt_keys();
+            recorded.as_deref() == Some(to.name.as_str())
+                && superseded.iter().any(|(_, name)| *name == from.name)
         }
         _ => false,
     };
@@ -6900,7 +6901,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let json = serde_json::json!({
             "version": 1,
             "persisted": {"handle": 0x8101_0004_u32, "name": "000b11"},
-            "superseded": [{"handle": 0x8101_0003_u32, "name": "000b00"}],
+            "superseded": [
+                {"handle": 0x8101_0003_u32, "name": "000b00"},
+                {"handle": 0x8101_0006_u32, "name": "000b33"},
+            ],
         });
         std::fs::write(format!("{state}/tpm-storage-key"), json.to_string()).unwrap();
         let on = |name: &str, handle: u32| {
@@ -6919,6 +6923,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let off_weak = move_gain(&current, &weak);
         let back_onto_weak = move_gain(&weak, &current);
         let between_others = move_gain(&other, &current);
+        // A candidate sealed under a key a start superseded since: no move.
+        let onto_superseded = move_gain(&on("000b33", 0x8101_0006), &weak);
         match previous {
             Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
             None => std::env::remove_var("IRLUME_STATE_DIR"),
@@ -6930,6 +6936,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(off_weak, Some(MoveGain::DaExemptKey));
         assert_eq!(back_onto_weak, None, "never back onto the superseded key");
         assert_eq!(between_others, None);
+        assert_eq!(
+            onto_superseded, None,
+            "a move lands only on the recorded key"
+        );
     }
 
     #[test]

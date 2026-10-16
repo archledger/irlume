@@ -226,6 +226,11 @@ impl TpmLockout {
     }
 }
 
+/// The `da_exempt_key` part of a `TpmReadiness` reply from an irlumed that
+/// predates it, as this client reads one.
+pub const DA_EXEMPT_KEY_NOT_REPORTED: &str =
+    "this irlumed predates the DA-exempt storage key report";
+
 /// irlume's DA-exempt storage key (ADR-0034 §3.2) as irlumed last recorded
 /// it: persisted at a handle, refused, or neither because no envelope needed
 /// it yet. Optional fields, so a newer daemon's additions never stop an older
@@ -279,8 +284,9 @@ impl RefusalReason {
 
     /// When irlumed tries again, which is only ever at one of its starts: a
     /// refused override at the next start after it is corrected, a lack of
-    /// room at the next start after the TPM reports room, anything else at
-    /// the first start in a later boot (#1083).
+    /// room at the next start after the TPM reports room, a refusal this
+    /// release names otherwise at the first start in a later boot (#1083). A
+    /// reason this release does not know promises no schedule.
     pub fn when_retried(self) -> &'static str {
         match self {
             Self::HandleOverride => {
@@ -291,8 +297,10 @@ impl RefusalReason {
                 "at its next start once the TPM reports room for another persistent object, \
                  or at its first start in a later boot"
             }
-            Self::OwnerAuthorization | Self::Other | Self::Unknown => {
-                "at its first start in a later boot"
+            Self::OwnerAuthorization | Self::Other => "at its first start in a later boot",
+            Self::Unknown => {
+                "at a later start, when that newer irlumed's rule for this reason allows; \
+                 this release does not know the reason"
             }
         }
     }

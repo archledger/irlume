@@ -4277,6 +4277,21 @@ fn tpm_lockout_check(
             format!("not in lockout ({counts}), {}", refusal_warning(refused)),
         );
     }
+    // A current irlumed that could not report the key's state (an envelope
+    // store or a recorded handle it could not read) leaves the reading
+    // unknown. An older irlumed, which has no such report, changes nothing.
+    if let Err(e) = da_exempt_key {
+        if e != irlume_common::tpm_readiness::DA_EXEMPT_KEY_NOT_REPORTED {
+            return (
+                State::Unknown,
+                format!(
+                    "not in lockout ({counts}), but irlumed could not report irlume's DA-exempt \
+                     storage key: {}",
+                    irlume_common::single_line(e, 300)
+                ),
+            );
+        }
+    }
     if !lockout.lockout_auth_set {
         return (
             State::Info,
@@ -6810,8 +6825,21 @@ mod tests {
         let (reading, detail) = tpm_lockout_check(&locked, &refused(RefusalReason::NoSpace));
         assert_eq!(reading, State::Warn);
         assert!(detail.contains("dictionary-attack lockout"), "{detail}");
-        let (reading, _) = tpm_lockout_check(&calm, &Err("this irlumed predates it".into()));
-        assert_eq!(reading, State::Pass);
+        let older = Err(irlume_common::tpm_readiness::DA_EXEMPT_KEY_NOT_REPORTED.to_owned());
+        let (reading, _) = tpm_lockout_check(&calm, &older);
+        assert_eq!(reading, State::Pass, "an older irlumed changes nothing");
+        let failed = Err("/var/lib/irlume/keyring: permission denied".to_owned());
+        let (reading, detail) = tpm_lockout_check(&calm, &failed);
+        assert_eq!(
+            reading,
+            State::Unknown,
+            "a current irlumed's failure is surfaced"
+        );
+        assert!(detail.contains("could not report"), "{detail}");
+        assert!(detail.contains("permission denied"), "{detail}");
+        let (_, detail) = tpm_lockout_check(&calm, &refused(RefusalReason::Unknown));
+        assert!(detail.contains("does not know the reason"), "{detail}");
+        assert!(!detail.contains("later boot"), "{detail}");
         let unread: Result<TpmLockout, String> = Err("the TPM did not answer".into());
         let (reading, detail) = tpm_lockout_check(&unread, &refused(RefusalReason::NoSpace));
         assert_eq!(reading, State::Warn, "a recorded refusal stays actionable");

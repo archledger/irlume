@@ -254,6 +254,10 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # lock file the writer holds; `**` alone does not grant flock.
   /var/lib/irlume/attempts/ rwk,
   /var/lib/irlume/attempts/.lock rwk,
+  # The DA-exempt storage key record's lock (ADR-0034 §3.2): irlumed's
+  # start-up step holds it while it reads and writes the record, and `**`
+  # alone does not grant flock.
+  /var/lib/irlume/.tpm-storage-key.lock rwk,
   # The session state bound to the requesting login (ADR-0030 §5): the
   # peer's cgroup names its logind session, whose facts logind publishes.
   /proc/[0-9]*/cgroup r,

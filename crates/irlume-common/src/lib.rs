@@ -171,7 +171,7 @@ fn lockout_not_reported() -> std::result::Result<tpm_readiness::TpmLockout, Stri
 /// The `da_exempt_key` part of a `TpmReadiness` reply from a daemon that
 /// predates it.
 fn da_exempt_key_not_reported() -> std::result::Result<tpm_readiness::DaExemptKey, String> {
-    Err("this irlumed predates the DA-exempt storage key report".to_owned())
+    Err(tpm_readiness::DA_EXEMPT_KEY_NOT_REPORTED.to_owned())
 }
 
 fn default_true() -> bool {

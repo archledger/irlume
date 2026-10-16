@@ -103,6 +103,39 @@ pub(crate) trait KeyTpm {
     fn persist(&mut self, handle: u32) -> std::result::Result<(), Failure>;
 }
 
+/// The [`KeyTpm`] for a refused override, which [`ensure_with`] records
+/// before any TPM call; every call is refused, so none can reach a TPM.
+struct Unopened;
+
+impl KeyTpm for Unopened {
+    fn name_at(&mut self, _: u32) -> Result<Option<Vec<u8>>> {
+        Err(unopened())
+    }
+    fn persistent_avail(&mut self) -> Result<u32> {
+        Err(unopened())
+    }
+    fn derive(&mut self) -> std::result::Result<Vec<u8>, Failure> {
+        Err(unopened_failure())
+    }
+    fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
+        Err(unopened())
+    }
+    fn persist(&mut self, _: u32) -> std::result::Result<(), Failure> {
+        Err(unopened_failure())
+    }
+}
+
+fn unopened() -> Error {
+    Error::Tpm("no TPM is opened for a refused IRLUME_SRK_HANDLE".into())
+}
+
+fn unopened_failure() -> Failure {
+    Failure {
+        class: FailureClass::Other,
+        detail: unopened().to_string(),
+    }
+}
+
 /// What the start-up step did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -161,10 +194,16 @@ pub fn ensure_at_start() -> Result<Option<Outcome>> {
         return Ok(None);
     }
     let plan = tpm::da_exempt_key_plan();
-    let mut tpm = tpm::DaExemptKeyTpm::open()?;
     let boot = irlume_common::boot_id();
-    let (next, outcome) = ensure_with(&mut tpm, &record, boot.as_deref(), &plan)?;
-    drop(tpm);
+    // A refused override needs no TPM, so a transport that cannot be opened
+    // does not hide it: `ensure_with` records it before any TPM call.
+    let (next, outcome) = match &plan {
+        Ok(_) => {
+            let mut tpm = tpm::DaExemptKeyTpm::open()?;
+            ensure_with(&mut tpm, &record, boot.as_deref(), &plan)?
+        }
+        Err(_) => ensure_with(&mut Unopened, &record, boot.as_deref(), &plan)?,
+    };
     if next != record {
         save_record(&next)?;
     }
@@ -872,6 +911,48 @@ mod tests {
                 detail.len()
             );
         }
+    }
+
+    /// A refused `IRLUME_SRK_HANDLE` is recorded without opening the TPM, so
+    /// a transport that cannot be opened does not hide it from doctor.
+    #[test]
+    fn a_refused_override_is_recorded_when_the_tpm_cannot_be_opened() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("storage-key-override");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(format!("{dir}/keyring")).unwrap();
+        std::fs::write(format!("{dir}/keyring/alice.json"), b"{}").unwrap();
+        let vars = [
+            "IRLUME_STATE_DIR",
+            "IRLUME_TEMPLATE_KEY_DIR",
+            "IRLUME_KEYRING_DIR",
+            "IRLUME_SRK_HANDLE",
+        ];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", format!("{dir}/template-keys"));
+        std::env::set_var("IRLUME_KEYRING_DIR", format!("{dir}/keyring"));
+        std::env::set_var("IRLUME_SRK_HANDLE", "0x81800000");
+        let outcome = ensure_at_start();
+        let reported = report();
+        for (var, value) in vars.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(Outcome::Refused(refusal)) = outcome.expect("the step runs") else {
+            panic!("a refused override is recorded");
+        };
+        assert_eq!(refusal.reason, RefusalReason::HandleOverride);
+        assert_eq!(
+            reported.expect("report").refused.map(|r| r.reason),
+            Some(RefusalReason::HandleOverride)
+        );
     }
 
     /// A record edited to carry terminal control characters reaches doctor's

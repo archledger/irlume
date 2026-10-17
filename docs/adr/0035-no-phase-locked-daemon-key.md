@@ -127,8 +127,10 @@ the UAPI group's registries:
    `Documentation/admin-guide/pm/sleep-states.rst`), and a key held for the
    whole uptime is in it. On a host whose image or swap is not encrypted, a
    thief who takes the disk afterwards reads the key and opens every
-   envelope, which the seal alone protects today: the template key exists in
-   memory only during a request (ADR-0025 section 3).
+   envelope. Today that exposure is limited to an image taken during an
+   authentication request, the only time the template key is in memory
+   (ADR-0025 section 3); with a key kept for the whole uptime, every image
+   holds it.
 7. **A restart cannot reopen the window.** Without a key kept outside the
    process, every restart of irlumed would end face login until the next
    boot. systemd's file descriptor store can keep the key in a memfd: "a
@@ -159,11 +161,20 @@ the UAPI group's registries:
      into PCR 9 when its `tpm` module is loaded (GRUB manual 19.6), and that
      value changes at every kernel or initrd update, so the policy would have
      to be predicted again each time, as systemd-pcrlock does for its own;
-   - a gate index root cannot delete and recreate, which
-     `TPMA_NV_POLICY_DELETE` gives only by making deletion need
-     `TPM2_NV_UndefineSpaceSpecial` with the platform authorization, which
-     the operating system does not hold, so uninstall could never remove
-     the index.
+   - a gate index root cannot delete and recreate. `TPMA_NV_POLICY_DELETE`
+     gives that, but `TPM2_NV_DefineSpace` accepts it only "with Platform
+     Authorization" (Part 3, 31.3), which firmware withholds from the
+     operating system: the index would have to be provisioned through the
+     firmware or with physical presence before first use, and uninstall
+     could not remove it either (`TPM2_NV_UndefineSpaceSpecial` needs the
+     same). An index the owner creates instead can be deleted and recreated
+     by root, which systemd answers by measuring each NvPCR's name into
+     PCR 9 (point 4);
+   - a handoff root cannot read. PID 1's file descriptor store (point 7) and
+     a credential under `/run` are both open to root, so on the hardened
+     hosts this path is for, the key would have to stay inside a process
+     that starts in the initrd and keeps running in the host system, which
+     irlumed is not.
 
 ### What it would cost
 
@@ -180,8 +191,9 @@ the UAPI group's registries:
   be dropped before the snapshot, with a reboot to get it back, or the
   hibernation image encrypted independently, and the window re-closed from
   the resume path, which no supported init system does today. Without that,
-  a host that hibernates to an unencrypted image would lose today's
-  protection against disk theft.
+  on a host that hibernates to an unencrypted image, every image would hold
+  the key, where today only one taken during a request holds the template
+  key.
 - It would take a TPM resource irlume does not hold today: an anchored NV
   index with its own registry range, or a PCR another component uses.
 
@@ -207,11 +219,13 @@ boot-phase window.
    userspace: PCR 11 phases and initrd policies need a measured UKI, and
    irlumed starts after `multi-user.target`. irlume's own initrd step could
    (point 8), at the cost of an integration per initramfs generator, a policy
-   predicted again at every kernel or initrd update, and an NV index that
-   cannot be removed.
+   predicted again at every kernel or initrd update, a gate index the
+   firmware must provision and uninstall cannot remove, and irlumed itself
+   starting in the initrd so the key never passes through anything root can
+   read.
 3. Every resume from hibernation reopens the window for the userspace it
-   restores, and every hibernation image holds the key, so a host without an
-   encrypted image would trade protection against disk theft for it.
+   restores, and every hibernation image would hold the key, where today
+   only an image taken during a request holds the template key.
 4. A stop and start, an upgrade outside a restart job, or a crash loop that
    leaves the unit failed would turn face login off until the next boot.
    Surviving the other restarts means keeping the key in PID 1's file

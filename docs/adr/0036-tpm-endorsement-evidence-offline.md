@@ -124,10 +124,13 @@ never opens the TPM: irlumed answers a new root-only request (section 4).
 | `unknown` | The chain cannot be completed: its issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), or it is signed with an algorithm irlume does not accept, such as SHA-1; neither means the TPM is not genuine. Also: irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); the same-TPM test hit an operational error (section 2.4); or the TPM could not be read in the time allowed. |
 
 A TPM may store several EK certificates (the low-range RSA and ECC ones, say).
-irlume judges only those for storage EKs, whose template has `restricted`
-and `decrypt` SET and `sign` CLEAR, since the same-TPM test needs one: "If
-keyHandle is not a Storage Key, then the TPM shall return TPM_RC_TYPE" (Part
-3, 12.5). A certificate for a signing EK is skipped and named as such. Each
+irlume judges only certificates for storage EKs it can run the same-TPM test
+with: RSA and ECC NIST P-256, P-384 and P-521 storage EKs, whose template has
+`restricted` and `decrypt` SET and `sign` CLEAR, since "If keyHandle is not a
+Storage Key, then the TPM shall return TPM_RC_TYPE" (Part 3, 12.5). The
+certificates the Credential Profile assigns to other EKs are skipped and
+named when populated: signing EKs, firmware-limited EKs, ML-KEM storage EKs
+and the SM2 one (section 2.1); they do not change the result. Each judged
 storage EK certificate is judged on its own by the rows above, and the check reports the worst
 evidence first, so a bad certificate is never hidden by a good one and a
 genuine TPM is not refused over an optional certificate irlume cannot read:
@@ -140,10 +143,20 @@ it cannot vouch for.
 
 ### 2. What irlumed reads and checks
 
-1. The EK certificate indices in 0x01C00000 to 0x01C07FFF, except the chain
-   range 0x01C00100 to 0x01C001FF, which holds only chain material
-   (Credential Profile 2.2.2.5.2): each certificate index read as DER with
-   trailing bytes tolerated, and when it starts with the PC Client wrapper
+1. The certificate handles the Credential Profile assigns, and no other index
+   in its 0x01C00000 to 0x01C07FFF range (which also holds templates, nonces,
+   PolicyAuthorizeNV data such as 0x01C07F02 and other reserved
+   allocations). Judged: the low-range RSA 2048 and ECC P-256 certificates at
+   0x01C00002 and 0x01C0000A, and the high-range storage EK certificates H-1
+   to H-4, H-6 and H-7 at 0x01C00012, 0x01C00014, 0x01C00016, 0x01C00018,
+   0x01C0001C and 0x01C0001E. Skipped and named when populated: H-5 (SM2 at
+   0x01C0001A) and every other certificate the profile assigns from
+   0x01C00032 to 0x01C0007A, that is the signing EK certificates (H-8 to
+   H-17 and H-22 to H-25, and the ML-DSA ones at 0x01C00070 to 0x01C0007A),
+   the firmware-limited storage ones (0x01C00040 to 0x01C00046) and the
+   ML-KEM storage ones (0x01C00060 to 0x01C0006A), none of which irlume can
+   run the same-TPM test with. Each judged certificate index
+   is read as DER with trailing bytes tolerated, and when it starts with the PC Client wrapper
    (`0x10 0x01 0x00` then a two-byte big-endian length), exactly the
    `length` bytes after those five, as go-attestation's `ParseEKCertificate`
    reads them; the templates and, in the low range,
@@ -160,9 +173,10 @@ it cannot vouch for.
    populated, else the default L-1 or L-2, and the nonce at 0x01C00003 or
    0x01C0000B, when populated, goes into the template's unique field as the
    Credential Profile's EK creation procedure describes. The certificate is
-   used only when its public key equals the EK's. The firmware-limited EK
-   certificates (0x01C00040 to 0x01C00046) are skipped and named: their EKs
-   are created under `TPM_RH_FW_ENDORSEMENT`, which irlume does not use.
+   used only when its public key equals the EK's. The firmware-limited EKs
+   skipped in section 2.1 are created under `TPM_RH_FW_ENDORSEMENT`, which
+   irlume does not use; the ML-KEM and SM2 ones would need a key exchange
+   none of irlume's crates provides (section 6).
 3. The chain, in software: the EK certificate, then intermediates from the
    NV chain indices and from irlume's list (section 5), up to a pinned root.
    The leaf must be an EK certificate by the Credential Profile (3.2): a
@@ -349,8 +363,6 @@ check.
   it would not.
 - A path with a critical extension the verifier does not process reads
   `unknown`.
-- A certificate for a signing EK is skipped and named, and does not change
-  the result of a storage EK certificate beside it.
 - Several certificates: one that passes beside one signed with SHA-1 reads
   `pass`, naming the other as unverifiable; one that passes beside one that
   does not match its EK reads `warn`; one that cannot be judged beside none
@@ -362,7 +374,11 @@ check.
   the certificate; it refuses a wrapper whose length runs past the index, and
   a certificate whose public key differs from the EK's. It never takes an
   index in the chain range for an EK certificate.
-- A firmware-limited EK certificate is skipped and named.
+- Only the assigned certificate handles are read: data at 0x01C07F02 or
+  another non-certificate index in the range is never taken for a
+  certificate, and a TPM with only such indices reads `info`. A
+  firmware-limited, signing, ML-KEM or SM2 EK certificate is skipped and
+  named, and does not change the result.
 - A request whose deadline passes stops before its next TPM command and
   reads `unknown`. With five storage EK certificates, the fifth is named as
   not judged and the result is not `pass`.

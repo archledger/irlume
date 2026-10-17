@@ -593,6 +593,9 @@ fn tpm_endorsement_a_certificate_for_another_key_warns() {
     assert!(report.certificates[0]
         .detail
         .contains("not the RSA 2048 key the profile stores"));
+    // Its chain verified, so the report still says what it names.
+    assert!(report.certificates[0].tpm.is_some(), "{report:#?}");
+    assert_eq!(report.certificates[0].chain.len(), 2, "{report:#?}");
     // Also when that ECC EK is persistent: the certificate stays the wrong
     // one for the L-1 index, and is never reported as an RSA EK's.
     tpm.persist(Slot::L2.default_template().unwrap(), 0x8101_0001);
@@ -1000,6 +1003,9 @@ fn tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key() {
                 .contains("dictionary-attack lockout, and irlume's storage key is not exempt"),
             "{certificate:#?}"
         );
+        // The chain verified: what it names is reported with the unknown.
+        assert!(certificate.tpm.is_some(), "{certificate:#?}");
+        assert_eq!(certificate.chain.len(), 2, "{certificate:#?}");
     }
     assert!(lockout_state().expect("lockout state").in_lockout);
 }

@@ -745,6 +745,32 @@ impl Check<'_> {
         ));
         };
         let verdict = certificate.verify(self.chain, self.anchors, self.manufacturer);
+        // What a verified chain says goes with every result judged after it
+        // (ADR-0036, Phase 2 amendment "The report"), whatever the TPM does.
+        let (tpm, chain) = match &verdict {
+            ChainVerdict::Verified(chain) => (
+                Some(CertifiedTpm {
+                    manufacturer: chain.tpm.manufacturer,
+                    model: chain.tpm.model.clone(),
+                    version: chain.tpm.version.clone(),
+                }),
+                chain
+                    .path
+                    .iter()
+                    .skip(1)
+                    .map(|link| CertificateAuthority {
+                        name: link.name.clone(),
+                        not_after: link.not_after,
+                    })
+                    .collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+        let result = |state, detail| EndorsementCertificate {
+            tpm: tpm.clone(),
+            chain: chain.clone(),
+            ..certificate_result(index, slot, state, detail)
+        };
         // Evidence against the certificate is the result whatever the TPM
         // answers next, so no TPM failure or deadline can turn it unknown.
         if let ChainVerdict::Refused(refusal) = &verdict {
@@ -819,42 +845,36 @@ impl Check<'_> {
         let same_tpm = same_tpm?;
 
         Ok(match (verdict, same_tpm) {
-        // Returned above.
-        (ChainVerdict::Refused(refusal), _) => result(EndorsementState::Warn, refused(&refusal)),
-        (_, SameTpm::Failed(why)) => result(
-            EndorsementState::Warn,
-            format!("irlume's storage key is not in the TPM that holds this certificate's endorsement key: {why}"),
-        ),
-        (ChainVerdict::Verified(chain), SameTpm::Passed) => EndorsementCertificate {
-            index,
-            key: slot.label().to_owned(),
-            state: EndorsementState::Pass,
-            detail: format!(
-                "verifies to {}, matches the TPM's endorsement key, and irlume's storage key \
-                 is in the same TPM",
-                chain.path.last().map_or("a pinned root", |root| root.name.as_str())
+            // Returned above.
+            (ChainVerdict::Refused(refusal), _) => {
+                result(EndorsementState::Warn, refused(&refusal))
+            }
+            (_, SameTpm::Failed(why)) => result(
+                EndorsementState::Warn,
+                format!(
+                    "irlume's storage key is not in the TPM that holds this certificate's \
+                     endorsement key: {why}"
+                ),
             ),
-            tpm: Some(CertifiedTpm {
-                manufacturer: chain.tpm.manufacturer,
-                model: chain.tpm.model,
-                version: chain.tpm.version,
-            }),
-            chain: chain
-                .path
-                .iter()
-                .skip(1)
-                .map(|link| CertificateAuthority {
-                    name: link.name.clone(),
-                    not_after: link.not_after,
-                })
-                .collect(),
-        },
-        (ChainVerdict::Unverifiable(why), _) => result(EndorsementState::Unknown, unverifiable(&why)),
-        (ChainVerdict::Verified(_), SameTpm::NotRun(why)) => result(
-            EndorsementState::Unknown,
-            format!("the certificate verifies, but the same-TPM test could not run: {why}"),
-        ),
-    })
+            (ChainVerdict::Verified(verified), SameTpm::Passed) => result(
+                EndorsementState::Pass,
+                format!(
+                    "verifies to {}, matches the TPM's endorsement key, and irlume's storage \
+                     key is in the same TPM",
+                    verified
+                        .path
+                        .last()
+                        .map_or("a pinned root", |root| root.name.as_str())
+                ),
+            ),
+            (ChainVerdict::Unverifiable(why), _) => {
+                result(EndorsementState::Unknown, unverifiable(&why))
+            }
+            (ChainVerdict::Verified(_), SameTpm::NotRun(why)) => result(
+                EndorsementState::Unknown,
+                format!("the certificate verifies, but the same-TPM test could not run: {why}"),
+            ),
+        })
     }
 }
 

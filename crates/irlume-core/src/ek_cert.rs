@@ -616,6 +616,8 @@ pub enum LeafProblem {
     NoVersion,
     /// An Extended Key Usage without tcg-kp-EKCertificate.
     Purpose,
+    /// A critical Extended Key Usage, which the profile requires non-critical.
+    PurposeCritical,
 }
 
 /// Evidence against the certificate on a path to a pinned root: the doctor
@@ -729,10 +731,10 @@ impl EkCertificate {
             .filter(|der| !listed(der))
             .filter_map(|der| Parsed::new(der).ok())
             .collect();
-        // irlume's own certificates come first: the search tries candidates
-        // in pool order at every level, so certificates from the untrusted
-        // chain indices cannot use up the path or step budget before every
-        // path through listed CAs has been found.
+        // Two searches: first through irlume's own certificates alone, then
+        // with the chain-index certificates added. The chain indices are
+        // untrusted, so nothing they hold can use up the bounds of the
+        // search that may find a listed path.
         let mut pool: Vec<(&Parsed, CertificateSource)> = Vec::new();
         pool.extend(
             anchors
@@ -741,54 +743,62 @@ impl EkCertificate {
                 .map(|c| (c, CertificateSource::Listed)),
         );
         pool.extend(anchors.roots.iter().map(|c| (c, CertificateSource::Root)));
+        let listed_only = pool.len();
         pool.extend(tpm_chain.iter().map(|c| (c, CertificateSource::TpmChain)));
-
-        let mut search = PathSearch::new(&pool, &self.leaf);
-        search.extend(&mut Vec::new(), &self.leaf);
 
         let mut refusal = None;
         let mut unverifiable = None;
-        for path in &search.paths {
-            let chain: Vec<(&Parsed, CertificateSource)> =
-                std::iter::once((&self.leaf, CertificateSource::Leaf))
-                    .chain(path.iter().map(|&i| pool[i]))
-                    .collect();
-            match judge_path(&chain, Some((key, tpm_manufacturer))) {
-                PathResult::Verified(Some(tpm)) => {
-                    return ChainVerdict::Verified(VerifiedChain {
-                        tpm,
-                        path: chain
-                            .iter()
-                            .enumerate()
-                            .map(|(i, (cert, source))| ChainLink {
-                                name: cert.label(i == 0),
-                                not_before: cert.not_before(),
-                                not_after: cert.not_after(),
-                                source: *source,
-                            })
-                            .collect(),
-                    });
-                }
-                // judge_path names the TPM whenever it is given a leaf.
-                PathResult::Verified(None) => {}
-                PathResult::Refused(r) => {
-                    refusal.get_or_insert(r);
-                }
-                PathResult::Unverifiable(u) => {
-                    unverifiable.get_or_insert(u);
+        let mut missing_issuer = None;
+        let searches: &[&[(&Parsed, CertificateSource)]] = if tpm_chain.is_empty() {
+            &[&pool]
+        } else {
+            &[&pool[..listed_only], &pool]
+        };
+        for pool in searches {
+            let mut search = PathSearch::new(pool, &self.leaf);
+            search.extend(&mut Vec::new(), &self.leaf);
+            for path in &search.paths {
+                let chain: Vec<(&Parsed, CertificateSource)> =
+                    std::iter::once((&self.leaf, CertificateSource::Leaf))
+                        .chain(path.iter().map(|&i| pool[i]))
+                        .collect();
+                match judge_path(&chain, Some((key, tpm_manufacturer))) {
+                    PathResult::Verified(Some(tpm)) => {
+                        return ChainVerdict::Verified(VerifiedChain {
+                            tpm,
+                            path: chain
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (cert, source))| ChainLink {
+                                    name: cert.label(i == 0),
+                                    not_before: cert.not_before(),
+                                    not_after: cert.not_after(),
+                                    source: *source,
+                                })
+                                .collect(),
+                        });
+                    }
+                    // judge_path names the TPM whenever it is given a leaf.
+                    PathResult::Verified(None) => {}
+                    PathResult::Refused(r) => {
+                        refusal.get_or_insert(r);
+                    }
+                    PathResult::Unverifiable(u) => {
+                        unverifiable.get_or_insert(u);
+                    }
                 }
             }
+            // The last search saw every certificate: its missing issuer.
+            missing_issuer = search.missing_issuer;
         }
         if let Some(r) = refusal {
             return ChainVerdict::Refused(r);
         }
-        ChainVerdict::Unverifiable(unverifiable.unwrap_or_else(|| {
-            Unverifiable::IssuerNotListed {
-                issuer: search
-                    .missing_issuer
-                    .unwrap_or_else(|| name_text(self.leaf.issuer())),
-            }
-        }))
+        ChainVerdict::Unverifiable(
+            unverifiable.unwrap_or_else(|| Unverifiable::IssuerNotListed {
+                issuer: missing_issuer.unwrap_or_else(|| name_text(self.leaf.issuer())),
+            }),
+        )
     }
 }
 
@@ -1329,7 +1339,12 @@ fn check_leaf(
         Some((true, _)) => return Err(LeafProblem::KeyUsageWrong),
         _ => return Err(LeafProblem::KeyUsageMissing),
     }
-    if let Some((_, eku)) = cert.extension::<ExtendedKeyUsage>(oid::EXT_KEY_USAGE) {
+    // The profile makes the Extended Key Usage optional and non-critical
+    // (3.2.16).
+    if let Some((critical, eku)) = cert.extension::<ExtendedKeyUsage>(oid::EXT_KEY_USAGE) {
+        if critical {
+            return Err(LeafProblem::PurposeCritical);
+        }
         if !eku.0.contains(&oid::TCG_KP_EK_CERTIFICATE) {
             return Err(LeafProblem::Purpose);
         }

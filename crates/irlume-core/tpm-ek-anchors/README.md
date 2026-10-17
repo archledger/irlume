@@ -48,7 +48,8 @@ python3 scripts/update-tpm-ek-anchors.py --check   # offline consistency check
 
 A refresh writes nothing unless every source is HTTPS and downloads, every
 file is exactly one DER certificate, every root's self-signature verifies
-and every intermediate's signature chains to a listed root. Review it like
+and every intermediate's signature chains to a listed root (issuers found by
+OpenSSL's canonical name hash, as the verifier compares names). Review it like
 code: a changed or new root changes whom irlume trusts, so compare a new
 root's SHA-256 with a second, independent copy before merging. One refresh
 before each release is the target.

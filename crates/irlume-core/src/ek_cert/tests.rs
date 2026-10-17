@@ -1497,3 +1497,42 @@ fn forged_chain_index_certificates_neither_hide_nor_refuse_a_genuine_path() {
         ChainVerdict::Unverifiable(Unverifiable::IssuerNotListed { .. })
     ));
 }
+
+#[test]
+fn a_critical_extended_key_usage_on_the_ek_certificate_is_refused() {
+    let (root, issuing) = ecdsa_chain();
+    let leaf = ek_with(Key::p256(3), &issuing, |s| {
+        s.exts.set(EKU, true, eku(&[EK_CERTIFICATE]));
+    });
+    leaf_refused(
+        verify(&leaf, &[], &anchors(&[&root], &[&issuing])),
+        LeafProblem::PurposeCritical,
+    );
+}
+
+#[test]
+fn chain_index_paths_under_one_listed_ca_do_not_hide_a_second_listed_ca() {
+    // Two listed CAs share the EK certificate's issuer name; the EK
+    // certificate has no authority key identifier, so both are candidates,
+    // and the first is not its issuer. Forty chain-index certificates
+    // carrying the root's name reach the root by name below the first CA,
+    // more paths than the budget holds.
+    let root = root("Test ECC Root CA", Key::p384(1));
+    let wrong = intermediate("Test ECC EK CA 01", Key::p256(9), &root);
+    let right = intermediate("Test ECC EK CA 01", Key::p256(2), &root);
+    let leaf = ek_with(Key::p256(3), &right, |spec| {
+        spec.exts.remove(AKI);
+    });
+    let forged: Vec<Vec<u8>> = (0..40u8)
+        .map(|seed| {
+            let mut spec = ca_spec("Test ECC Root CA", Key::p256(150 + seed), None);
+            spec.exts.remove(SKI);
+            issue(&spec, &root.name, &Key::p384(seed + 50), None)
+        })
+        .collect();
+    let chain: Vec<&[u8]> = forged.iter().map(Vec::as_slice).collect();
+    assert!(matches!(
+        verify(&leaf, &chain, &anchors(&[&root], &[&wrong, &right])),
+        ChainVerdict::Verified(_)
+    ));
+}

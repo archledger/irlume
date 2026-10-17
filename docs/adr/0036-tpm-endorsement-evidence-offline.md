@@ -361,8 +361,11 @@ left open:
   same-named CA with another key (a re-keyed CA irlume does not list) is not
   the issuer, and the path reads `unknown`; so does a failing signature of or
   by a certificate from the chain indices, which any process that can define
-  NV indices may write. Listed CAs are searched before those certificates,
-  so they cannot use up the search's bounds ahead of a listed path.
+  NV indices may write. A first search uses irlume's own certificates
+  alone, and only a second adds those, so they cannot use up the search's
+  bounds ahead of a listed path.
+- **The EK certificate's Extended Key Usage**, when present, must also be
+  non-critical, as the profile requires (3.2.16); a critical one is refused.
 - **Roots** are trust anchors by name and key: their own extensions are not
   processed (RFC 5280 6.1.1), and a root's self-signature is never relied on.
   A CA that is not self-signed is an intermediate, also when its vendor calls

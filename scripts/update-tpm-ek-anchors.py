@@ -128,6 +128,26 @@ def describe(der):
     }
 
 
+def name_hashes(der):
+    """OpenSSL's hashes of the subject and issuer in canonical form.
+
+    X509_NAME_hash folds case, insignificant spaces and the string type
+    before hashing, the comparison RFC 5280 7.1 asks for and irlume's own
+    verifier makes: vendors do not always repeat a CA's name with the same
+    encoding. A matching hash only nominates an issuer; its signature must
+    still verify.
+    """
+    subject, issuer = openssl(
+        ["x509", "-inform", "DER", "-noout", "-subject_hash", "-issuer_hash"], der
+    ).decode().split()
+    return subject, issuer
+
+
+def role_of(der):
+    subject, issuer = name_hashes(der)
+    return "root" if subject == issuer else "intermediate"
+
+
 def signed_by(child_der, parent_der):
     """True when parent's key verifies child's signature (no time or trust checks).
 
@@ -201,9 +221,10 @@ def load_manifest():
 
 def verify_set(entries, ders):
     """Fail unless roots are self-signed and every intermediate chains to a root."""
+    hashes = {entry["sha256"]: name_hashes(ders[entry["sha256"]]) for entry in entries}
     by_subject = {}
     for entry in entries:
-        by_subject.setdefault(entry["subject"], []).append(entry)
+        by_subject.setdefault(hashes[entry["sha256"]][0], []).append(entry)
     for entry in entries:
         der = ders[entry["sha256"]]
         if entry["role"] == "root":
@@ -220,7 +241,7 @@ def verify_set(entries, ders):
             if child["sha256"] in seen:
                 continue
             seen.add(child["sha256"])
-            for parent in by_subject.get(child["issuer"], []):
+            for parent in by_subject.get(hashes[child["sha256"]][1], []):
                 if parent["sha256"] == child["sha256"]:
                     continue
                 if not signed_by(ders[child["sha256"]], ders[parent["sha256"]]):
@@ -292,7 +313,7 @@ def read_shipped(entry):
 
 def entry_for(vendor, url, der, retrieved):
     entry = {"vendor": vendor, "url": url, **describe(der), "sha256": hashlib.sha256(der).hexdigest()}
-    entry["role"] = "root" if entry["subject"] == entry["issuer"] else "intermediate"
+    entry["role"] = role_of(der)
     entry["file"] = file_name(entry)
     entry["retrieved"] = retrieved
     return entry
@@ -374,7 +395,7 @@ def check(manifest):
             fail(f"{entry['file']}: {err}")
         if describe(der) != {key: entry[key] for key in ("subject", "issuer", "not_before", "not_after")}:
             fail(f"{entry['file']}: subject, issuer or validity differs from the manifest")
-        role = "root" if entry["subject"] == entry["issuer"] else "intermediate"
+        role = role_of(der)
         if entry["role"] != role:
             fail(f"{entry['file']}: role should be {role}")
         ders[entry["sha256"]] = der

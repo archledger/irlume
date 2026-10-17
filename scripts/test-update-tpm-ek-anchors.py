@@ -42,8 +42,8 @@ class Pki:
         openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(path))
         return path
 
-    def root(self, cn):
-        key = self.key(cn)
+    def root(self, cn, key=None):
+        key = key or self.key(cn)
         return openssl(
             "req", "-x509", "-new", "-key", str(key), "-subj", f"/CN={cn}", "-days", "3650",
             "-addext", "basicConstraints=critical,CA:TRUE",
@@ -181,6 +181,16 @@ class Refresh(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.refresh()
         self.assertEqual(os.listdir(self.anchors), ["manifest.json"])
+
+    def test_an_issuer_named_with_other_case_and_spacing_is_found(self):
+        # The CA was issued under "test  root"; the listed root, with the
+        # same key, is named "Test Root".
+        lower, _ = self.pki.root("test  root", key=self.root_key)
+        self.served["https://pki.example/ca.crt"] = self.pki.intermediate("Test CA", lower, self.root_key)
+        self.refresh()
+        self.assertEqual([e["role"] for e in self.entries()], ["root", "intermediate"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ANCHORS.check(ANCHORS.load_manifest())
 
     def test_a_root_with_a_broken_self_signature_is_refused(self):
         broken = bytearray(self.root)

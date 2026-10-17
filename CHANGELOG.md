@@ -319,8 +319,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 - `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
   strictly (#1081). It now judges these cases:
-  - A separator that records a measurement error (1) is a `warn`; one that
-    is not a 4-byte 0, 1 or all ones is malformed.
+  - A separator that records a measurement error (its digest is that of
+    the value 1, whatever its event data) is a `warn`; one that is neither
+    that nor a 4-byte 0 or all ones is malformed.
   - An image or driver load measured into PCR 7, extraneous under
     Microsoft's PCR 7 guidance, is a `warn`.
   - A PCR 7 event of a type doctor does not read, such as SPDM device

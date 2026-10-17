@@ -5097,8 +5097,8 @@ fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, Stri
         Err(Untrusted::Malformed(count)) => format!(
             "{count} PCR 7 event(s) in the firmware event log do not have the form their type \
              requires (UEFI variable data for a configuration or authority event, a 4-byte \
-             0, 1 or all ones for a separator, 0 or 1 for SecureBoot), so the log does not \
-             show what PCR 7 was extended with"
+             0 or all ones for a separator that records no error, 0 or 1 for SecureBoot), so \
+             the log does not show what PCR 7 was extended with"
         ),
     };
     (State::Unknown, why)
@@ -5126,9 +5126,9 @@ fn pcr7_binding_verdict(
     if pcr7.separator_errors > 0 {
         return (
             State::Warn,
-            "the firmware recorded a measurement error in PCR 7 (a separator of 1, not 0), \
-             so what it measured there may be incomplete and PCR 7 may not show what \
-             booted"
+            "the firmware recorded a measurement error in PCR 7 (a separator measured as 1, \
+             not 0), so what it measured there may be incomplete and PCR 7 may not show \
+             what booted"
                 .to_owned(),
         );
     }

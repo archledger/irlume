@@ -318,9 +318,11 @@ pub struct Pcr7<'a> {
     /// EV_EFI_ACTION strings, such as "UEFI Debug Mode" and "DMA Protection
     /// Disabled", which the firmware measures when it runs that way.
     pub actions: Vec<String>,
-    /// How many PCR 7 separators record a measurement error (the value 1,
-    /// which systemd-pcrlock reads as "Separator: Error"), not success (0,
-    /// or all ones as older firmware writes it).
+    /// How many PCR 7 separators record a measurement error: their digest is
+    /// that of the 32-bit value 1, whatever their event data, which then
+    /// carries information about the error (TCG PC Client "Error
+    /// Conditions", as Canonical's tcglog-parser reads it; EDK2 writes the
+    /// value 1 itself). Success is 0, or all ones as older firmware writes it.
     pub separator_errors: usize,
     /// How many image or driver loads were measured into PCR 7
     /// (EV_EFI_BOOT_SERVICES_APPLICATION, EV_EFI_BOOT_SERVICES_DRIVER,
@@ -340,9 +342,9 @@ pub struct Pcr7<'a> {
     pub unverified: usize,
     /// How many PCR 7 events do not have the form their type requires: a
     /// configuration or authority event that is not UEFI_VARIABLE_DATA, a
-    /// separator that is not a 4-byte 0, 1 or all ones, or a SecureBoot
-    /// value other than 0 or 1. PCR 7 was extended with something the lists
-    /// above leave out.
+    /// separator that is neither an error nor a 4-byte 0 or all ones, or a
+    /// SecureBoot value other than 0 or 1. PCR 7 was extended with something
+    /// the lists above leave out.
     pub malformed: usize,
 }
 
@@ -359,13 +361,18 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
         if leading {
             out.leading_configuration += 1;
         }
+        // An error separator is known by its digest, which is not of its
+        // event data: it is verified by being that digest.
+        let error_separator = event.kind == EV_SEPARATOR
+            && event.sha256 == Some(&sha2::Sha256::digest(1u32.to_le_bytes())[..]);
         if matches!(
             event.kind,
             EV_EFI_VARIABLE_DRIVER_CONFIG
                 | EV_SEPARATOR
                 | EV_EFI_VARIABLE_AUTHORITY
                 | EV_EFI_ACTION
-        ) && event.sha256 != Some(&sha2::Sha256::digest(event.data)[..])
+        ) && !error_separator
+            && event.sha256 != Some(&sha2::Sha256::digest(event.data)[..])
         {
             out.unverified += 1;
         }
@@ -407,13 +414,14 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
                 out.actions
                     .push(String::from_utf8_lossy(&text[..end]).into_owned());
             }
-            // A 4-byte value, as systemd-pcrlock reads it: 0 (all ones in
-            // older firmware) for success, 1 for a measurement error.
-            EV_SEPARATOR => match event.data {
-                [0, 0, 0, 0] | [0xff, 0xff, 0xff, 0xff] => {}
-                [1, 0, 0, 0] => out.separator_errors += 1,
-                _ => out.malformed += 1,
-            },
+            // An error by its digest, whatever its data; otherwise a 4-byte
+            // 0 (all ones in older firmware) for success.
+            EV_SEPARATOR if error_separator => out.separator_errors += 1,
+            EV_SEPARATOR => {
+                if !matches!(event.data, [0, 0, 0, 0] | [0xff, 0xff, 0xff, 0xff]) {
+                    out.malformed += 1;
+                }
+            }
             EV_EFI_BOOT_SERVICES_APPLICATION
             | EV_EFI_BOOT_SERVICES_DRIVER
             | EV_EFI_RUNTIME_SERVICES_DRIVER => out.extraneous += 1,
@@ -875,7 +883,11 @@ pub(crate) mod tests {
             (pcr7.separator_errors, pcr7.malformed)
         };
         assert_eq!(separators(vec![vec![0; 4], vec![0xff; 4]]), (0, 0));
-        assert_eq!(separators(vec![vec![1, 0, 0, 0]]), (1, 0));
+        assert_eq!(
+            separators(vec![vec![1, 0, 0, 0]]),
+            (1, 0),
+            "as EDK2 writes it"
+        );
         assert_eq!(separators(vec![vec![2, 0, 0, 0]]), (0, 1));
         assert_eq!(separators(vec![vec![0; 3], vec![0; 5]]), (0, 2));
         assert_eq!(separators(vec![vec![0, 0, 0, 1]]), (0, 1), "big-endian 1");
@@ -893,6 +905,32 @@ pub(crate) mod tests {
         let bad = log(&[(7, EV_SEPARATOR, vec![7; 4])]);
         let value = replay(&events(&bad).unwrap().0, 7).unwrap();
         assert_eq!(verified_pcr7(&bad, &value), Err(Untrusted::Malformed(1)));
+
+        // An error separator is known by its digest, the hash of 1, and its
+        // event data is free-form information about the error: it is read
+        // as an error, not as a payload that does not match its digest.
+        let with_digest = |digest: &[u8], data: &[u8]| {
+            let mut out = log(&[]);
+            for field in [7, EV_SEPARATOR, 2] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            out.extend_from_slice(&0x0004u16.to_le_bytes());
+            out.extend_from_slice(&[0; 20]);
+            out.extend_from_slice(&0x000bu16.to_le_bytes());
+            out.extend_from_slice(digest);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        };
+        let error_digest = sha2::Sha256::digest(1u32.to_le_bytes());
+        let informative = with_digest(&error_digest, b"TPM self-test failed");
+        let value = replay(&events(&informative).unwrap().0, 7).unwrap();
+        let read = verified_pcr7(&informative, &value).expect("an error separator");
+        assert_eq!((read.separator_errors, read.unverified), (1, 0));
+        // Data of 1 under another digest is not an error but a mismatch.
+        let forged = with_digest(&[0x55; 32], &[1, 0, 0, 0]);
+        let value = replay(&events(&forged).unwrap().0, 7).unwrap();
+        assert_eq!(verified_pcr7(&forged, &value), Err(Untrusted::Payload(1)));
     }
 
     /// #1081 item 2: an image or driver load in PCR 7 is counted as

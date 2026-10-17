@@ -1311,7 +1311,11 @@ fn every_shipped_certificate_parses_and_matches_the_manifest() {
         };
         assert_eq!(entry["role"], role, "{file}");
         let parsed = Parsed::new(anchor.der).unwrap_or_else(|e| panic!("{file}: {e}"));
-        assert_eq!(parsed.self_issued(), role == "root", "{file}");
+        // A root is self-signed; a self-issued intermediate (a key
+        // rollover) is possible.
+        if role == "root" {
+            assert!(parsed.self_issued(), "{file}");
+        }
         assert!(
             entry["url"].as_str().unwrap().starts_with("https://"),
             "{file}"
@@ -1578,4 +1582,73 @@ fn rsa_encryption_parameters_other_than_null_make_the_key_unreadable() {
         verify(&odd, &[], &anchors),
         ChainVerdict::Unverifiable(Unverifiable::LeafKey)
     );
+}
+
+#[test]
+fn an_ek_key_outside_the_accepted_sizes_or_off_its_curve_is_unknown() {
+    let (root, issuing) = ecdsa_chain();
+    let anchors = anchors(&[&root], &[&issuing]);
+    let leaf_with_key = |spki: Vec<u8>| {
+        let spec = ek_spec(Key::p256(3), &issuing);
+        let mut fields = vec![explicit(0, &int(&[2])), int(&[1])];
+        fields.push(issuing.key.default_alg());
+        fields.push(issuing.name.clone());
+        fields.push(seq(&[utc_time(spec.not_before), utc_time(spec.not_after)]));
+        fields.push(spec.subject.clone());
+        fields.push(spki);
+        fields.push(explicit(3, &spec.exts.encode()));
+        let tbs = seq(&fields);
+        let alg = issuing.key.default_alg();
+        seq(&[
+            tbs.clone(),
+            alg.clone(),
+            bit_string(&issuing.key.sign(&alg, &tbs)),
+        ])
+    };
+    // A 1024-bit RSA modulus (odd, top bit set).
+    let mut modulus = vec![0xc3; 128];
+    modulus[127] = 0x01;
+    let rsa1024 = seq(&[
+        seq(&[oid_der("1.2.840.113549.1.1.1"), null()]),
+        bit_string(&seq(&[int(&modulus), int(&[0x01, 0x00, 0x01])])),
+    ]);
+    // A P-256 point that is not on the curve.
+    let mut point = vec![0x04];
+    point.extend_from_slice(&[0x11; 64]);
+    let off_curve = seq(&[
+        seq(&[oid_der("1.2.840.10045.2.1"), oid_der("1.2.840.10045.3.1.7")]),
+        bit_string(&point),
+    ]);
+    for spki in [rsa1024, off_curve] {
+        let leaf = leaf_with_key(spki);
+        assert_eq!(EkCertificate::from_der(&leaf).unwrap().public_key(), None);
+        assert_eq!(
+            verify(&leaf, &[], &anchors),
+            ChainVerdict::Unverifiable(Unverifiable::LeafKey)
+        );
+    }
+}
+
+#[test]
+fn a_self_issued_key_rollover_ca_chains_to_the_old_root() {
+    // The vendor rolls its root to a new key under the same name and links
+    // the new key to the old root with a self-issued certificate signed by
+    // the old key.
+    let old_root = root("Test ECC Root CA", Key::p384(1));
+    let new_key = Key::p384(30);
+    let spec = ca_spec("Test ECC Root CA", new_key.clone(), Some(&old_root.key));
+    let rollover = Ca {
+        der: issue(&spec, &old_root.name, &old_root.key, None),
+        name: spec.subject.clone(),
+        key: new_key,
+    };
+    let issuing = intermediate("Test ECC EK CA 02", Key::p256(31), &rollover);
+    let leaf = ek(Key::p256(3), &issuing);
+    let ChainVerdict::Verified(chain) =
+        verify(&leaf, &[], &anchors(&[&old_root], &[&rollover, &issuing]))
+    else {
+        panic!("the rollover certificate links the new key to the old root");
+    };
+    assert_eq!(chain.path.len(), 4);
+    assert!(Parsed::new(&rollover.der).unwrap().self_issued());
 }

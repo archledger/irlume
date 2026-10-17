@@ -144,16 +144,39 @@ def name_hashes(der):
 
 
 def role_of(der):
+    """A root is self-signed: self-issued and verified by its own key. A
+    self-issued certificate another key signed (a same-name key rollover
+    linking a new key to the old one) is an intermediate."""
     subject, issuer = name_hashes(der)
-    return "root" if subject == issuer else "intermediate"
+    return "root" if subject == issuer and self_signed(der) else "intermediate"
+
+
+def self_signed(der):
+    """True when the certificate is its own issuer and its own key verifies it.
+
+    Without -partial_chain OpenSSL accepts the certificate only as a
+    self-signed anchor, and -check_ss_sig then checks that signature; a
+    certificate that names itself but another key signed fails.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cert.pem")
+        with open(path, "wb") as f:
+            f.write(openssl(["x509", "-inform", "DER"], der))
+        proc = subprocess.run(
+            [
+                "openssl", "verify", "-auth_level", "0", "-no_check_time",
+                "-check_ss_sig", "-CAfile", path, path,
+            ],
+            capture_output=True,
+        )
+        return proc.returncode == 0
 
 
 def signed_by(child_der, parent_der):
     """True when parent's key verifies child's signature (no time or trust checks).
 
-    With child and parent the same certificate, the self-signature itself is
-    checked: OpenSSL takes a certificate in -CAfile as trusted and skips its
-    own signature unless asked with -check_ss_sig.
+    A root parent's own self-signature is checked too (-check_ss_sig); use
+    self_signed to ask whether a certificate is a root.
     """
     with tempfile.TemporaryDirectory() as tmp:
         child = os.path.join(tmp, "child.pem")
@@ -228,7 +251,7 @@ def verify_set(entries, ders):
     for entry in entries:
         der = ders[entry["sha256"]]
         if entry["role"] == "root":
-            if not signed_by(der, der):
+            if not self_signed(der):
                 fail(f"{entry['url']}: root is not self-signed")
             continue
         # Walk issuer links to a root, trying every listed CA with the

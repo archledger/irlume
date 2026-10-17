@@ -675,7 +675,8 @@ pub enum Unverifiable {
         certificate: String,
         detail: &'static str,
     },
-    /// The EK certificate's key is not RSA or NIST P-256, P-384 or P-521.
+    /// The EK certificate's key is not RSA of 2048 to 4096 bits or a point
+    /// on NIST P-256, P-384 or P-521.
     LeafKey,
 }
 
@@ -701,12 +702,16 @@ impl EkCertificate {
     /// [`CertificateError`] when the bytes are not one DER X.509 certificate.
     pub fn from_der(der: &[u8]) -> Result<Self, CertificateError> {
         let leaf = Parsed::new(der)?;
-        let key = spki_key(leaf.cert.tbs_certificate().subject_public_key_info());
+        // The same bounds as for an issuer's key: RSA of 2048 to 4096 bits
+        // (the TPM's EK templates are 2048, 3072 and 4096), or a point on
+        // its curve.
+        let key = spki_key(leaf.cert.tbs_certificate().subject_public_key_info())
+            .filter(|key| usable_key(key).is_ok());
         Ok(Self { leaf, key })
     }
 
-    /// The public key the certificate certifies, when it is RSA or NIST
-    /// P-256, P-384 or P-521.
+    /// The public key the certificate certifies, when it is RSA of 2048 to
+    /// 4096 bits or a point on NIST P-256, P-384 or P-521.
     #[must_use]
     pub fn public_key(&self) -> Option<&EkPublicKey> {
         self.key.as_ref()
@@ -1193,6 +1198,46 @@ impl Link {
     }
 }
 
+/// A key irlume accepts, ready to verify with: RSA of 2048 to 4096 bits with
+/// a usable exponent, or a point on its NIST curve. Errs with what it is not.
+fn usable_key(key: &EkPublicKey) -> Result<IssuerKey, String> {
+    match key {
+        EkPublicKey::Rsa { modulus, exponent } => {
+            let bits = modulus.first().map_or(0, |b| {
+                (modulus.len() - 1) * 8 + (8 - b.leading_zeros() as usize)
+            });
+            if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+                return Err(format!("RSA-{bits}"));
+            }
+            RsaPublicKey::new_with_max_size(
+                BoxedUint::from_be_slice_vartime(modulus),
+                BoxedUint::from(u64::from(*exponent)),
+                MAX_RSA_BITS,
+            )
+            .map(IssuerKey::Rsa)
+            .map_err(|_| format!("RSA-{bits} with an unusable modulus or exponent"))
+        }
+        EkPublicKey::Ecc { curve, x, y } => {
+            let mut point = Vec::with_capacity(1 + x.len() + y.len());
+            point.push(0x04);
+            point.extend_from_slice(x);
+            point.extend_from_slice(y);
+            let invalid = |_| "an ECC key that is not on its curve".to_owned();
+            Ok(match curve {
+                EccCurve::NistP256 => IssuerKey::P256(
+                    p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
+                ),
+                EccCurve::NistP384 => IssuerKey::P384(
+                    p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
+                ),
+                EccCurve::NistP521 => IssuerKey::P521(
+                    p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
+                ),
+            })
+        }
+    }
+}
+
 /// Check that irlume accepts how `parent` signed `child`, and prepare the
 /// key. Errs with the name of what it does not accept.
 fn link_check(child: &Parsed, parent: &Parsed) -> Result<Link, String> {
@@ -1203,39 +1248,8 @@ fn link_check(child: &Parsed, parent: &Parsed) -> Result<Link, String> {
     let scheme = scheme(child.cert.signature_algorithm())?;
     let spki = parent.cert.tbs_certificate().subject_public_key_info();
     let key = match (spki_key(spki), spki.algorithm.oid) {
-        (Some(EkPublicKey::Rsa { modulus, exponent }), oid::RSA_ENCRYPTION) => {
-            let bits = modulus.first().map_or(0, |b| {
-                (modulus.len() - 1) * 8 + (8 - b.leading_zeros() as usize)
-            });
-            if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
-                return Err(format!("RSA-{bits}"));
-            }
-            let key = RsaPublicKey::new_with_max_size(
-                BoxedUint::from_be_slice_vartime(&modulus),
-                BoxedUint::from(u64::from(exponent)),
-                MAX_RSA_BITS,
-            )
-            .map_err(|_| format!("RSA-{bits} with an unusable modulus or exponent"))?;
-            IssuerKey::Rsa(key)
-        }
-        (Some(EkPublicKey::Ecc { curve, x, y }), _) => {
-            let mut point = Vec::with_capacity(1 + x.len() + y.len());
-            point.push(0x04);
-            point.extend_from_slice(&x);
-            point.extend_from_slice(&y);
-            let invalid = |_| "an ECC key that is not on its curve".to_owned();
-            match curve {
-                EccCurve::NistP256 => IssuerKey::P256(
-                    p256::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
-                ),
-                EccCurve::NistP384 => IssuerKey::P384(
-                    p384::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
-                ),
-                EccCurve::NistP521 => IssuerKey::P521(
-                    p521::ecdsa::VerifyingKey::from_sec1_bytes(&point).map_err(invalid)?,
-                ),
-            }
-        }
+        (Some(key @ EkPublicKey::Rsa { .. }), oid::RSA_ENCRYPTION)
+        | (Some(key @ EkPublicKey::Ecc { .. }), _) => usable_key(&key)?,
         _ => return Err(format!("an issuer key of type {}", spki.algorithm.oid)),
     };
     match (&key, scheme) {

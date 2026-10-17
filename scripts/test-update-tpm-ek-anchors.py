@@ -93,10 +93,10 @@ class SelfSignature(unittest.TestCase):
     def test_a_root_whose_self_signature_is_broken_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, _ = Pki(tmp).root("Test Root")
-            self.assertTrue(ANCHORS.signed_by(root, root))
+            self.assertTrue(ANCHORS.self_signed(root))
             broken = bytearray(root)
             broken[-5] ^= 0x01
-            self.assertFalse(ANCHORS.signed_by(bytes(broken), bytes(broken)))
+            self.assertFalse(ANCHORS.self_signed(bytes(broken)))
 
 
 class Refresh(unittest.TestCase):
@@ -187,6 +187,24 @@ class Refresh(unittest.TestCase):
         # same key, is named "Test Root".
         lower, _ = self.pki.root("test  root", key=self.root_key)
         self.served["https://pki.example/ca.crt"] = self.pki.intermediate("Test CA", lower, self.root_key)
+        self.refresh()
+        self.assertEqual([e["role"] for e in self.entries()], ["root", "intermediate"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            ANCHORS.check(ANCHORS.load_manifest())
+
+    def test_a_self_issued_rollover_certificate_is_an_intermediate(self):
+        # The new key under the root's own name, signed by the old key.
+        new_key = self.pki.key("rollover")
+        csr = openssl("req", "-new", "-key", str(new_key), "-subj", "/CN=Test Root")
+        issuer = self.pki.tmp / "old-root.pem"
+        issuer.write_bytes(openssl("x509", "-inform", "DER", data=self.root))
+        ext = self.pki.tmp / "ca.cnf"
+        ext.write_text("basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n")
+        rollover = openssl(
+            "x509", "-req", "-CA", str(issuer), "-CAkey", str(self.root_key), "-CAcreateserial",
+            "-days", "3650", "-extfile", str(ext), "-outform", "DER", data=csr,
+        )
+        self.served["https://pki.example/ca.crt"] = rollover
         self.refresh()
         self.assertEqual([e["role"] for e in self.entries()], ["root", "intermediate"])
         with contextlib.redirect_stdout(io.StringIO()):

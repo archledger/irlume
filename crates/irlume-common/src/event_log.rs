@@ -23,6 +23,9 @@ pub const SECURITYFS: &str = "/sys/kernel/security";
 const EV_NO_ACTION: u32 = 0x0000_0003;
 const EV_SEPARATOR: u32 = 0x0000_0004;
 const EV_EFI_VARIABLE_DRIVER_CONFIG: u32 = 0x8000_0001;
+const EV_EFI_BOOT_SERVICES_APPLICATION: u32 = 0x8000_0003;
+const EV_EFI_BOOT_SERVICES_DRIVER: u32 = 0x8000_0004;
+const EV_EFI_RUNTIME_SERVICES_DRIVER: u32 = 0x8000_0005;
 const EV_EFI_ACTION: u32 = 0x8000_0007;
 const EV_EFI_VARIABLE_AUTHORITY: u32 = 0x8000_00e0;
 const TPM_ALG_SHA256: u16 = 0x000b;
@@ -67,8 +70,11 @@ pub const SECURE_BOOT_CONFIGURATION: [(&str, [u8; 16]); 5] = [
     ("db", EFI_IMAGE_SECURITY_DATABASE),
     ("dbx", EFI_IMAGE_SECURITY_DATABASE),
 ];
-/// More digest algorithms than a Spec ID header declares in practice.
+/// More digest algorithms than a Spec ID header declares in practice, and the
+/// width of the mask [`event2`] keeps them in.
 const MAX_ALGORITHMS: u32 = 64;
+/// How many distinct event types [`Pcr7::other_kinds`] keeps.
+const MAX_OTHER_KINDS: usize = 8;
 
 /// The signature that opens the first event of a crypto-agile log.
 const SPEC_ID_EVENT03: &[u8; 16] = b"Spec ID Event03\0";
@@ -111,10 +117,11 @@ impl<'a> Reader<'a> {
 }
 
 /// The events of a crypto-agile log, from the first event after the Spec ID
-/// header. `None` when the log does not open with a Spec ID Event03 header
-/// (a SHA-1-only log, or not an event log at all). An event that runs past
-/// the end, or uses a digest algorithm the header did not declare, ends the
-/// list there: `complete` is then false.
+/// header. `None` when the log does not open with a valid Spec ID Event03
+/// header (a SHA-1-only log, not an event log at all, or a header this
+/// format does not allow). An event that runs past the end, or does not carry
+/// exactly one digest for each algorithm the header declared, ends the list
+/// there: `complete` is then false.
 pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
     let mut r = Reader(log);
     // The header is a TCG_PCR_EVENT: PCR, type, a SHA-1 digest, then the
@@ -132,15 +139,27 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
     {
         return None;
     }
-    // platformClass, specVersionMinor/Major, specErrata, uintnSize.
-    spec.take(8)?;
-    let count = spec.u32()?;
-    if count > MAX_ALGORITHMS {
+    // platformClass, then specVersionMinor, specVersionMajor, specErrata and
+    // uintnSize. A crypto-agile log is version 2.0 or later (major 2, as EDK2
+    // writes it), with UINTN fields of 32 bits (1) or 64 bits (2), the only
+    // sizes the TCG EFI Protocol Specification defines.
+    spec.take(4)?;
+    let version = spec.take(4)?;
+    if version[1] < 2 || !matches!(version[3], 1 | 2) {
         return None;
     }
-    let mut sizes = Vec::new();
+    // At least one algorithm (PC Client profile 9.4.5.1), each once.
+    let count = spec.u32()?;
+    if count == 0 || count > MAX_ALGORITHMS {
+        return None;
+    }
+    let mut sizes: Vec<(u16, usize)> = Vec::new();
     for _ in 0..count {
-        sizes.push((spec.u16()?, usize::from(spec.u16()?)));
+        let (id, size) = (spec.u16()?, usize::from(spec.u16()?));
+        if sizes.iter().any(|(seen, _)| *seen == id) {
+            return None;
+        }
+        sizes.push((id, size));
     }
     // vendorInfoSize and vendorInfo close the header, with nothing after.
     let vendor_info = usize::from(spec.take(1)?[0]);
@@ -162,12 +181,26 @@ pub fn events(log: &[u8]) -> Option<(Vec<Event<'_>>, bool)> {
 }
 
 /// One TCG_PCR_EVENT2: PCR, type, a digest per algorithm, then the event data.
+/// Every event carries a digest for each algorithm the header declared (PC
+/// Client profile 9.1, which the kernel's parser also enforces), each once.
+/// The order is not checked: systemd-pcrlock notes logs whose events list
+/// them in another order than the header (some Hyper-V firmware).
 fn event2<'a>(r: &mut Reader<'a>, sizes: &[(u16, usize)]) -> Option<Event<'a>> {
     let (pcr, kind, count) = (r.u32()?, r.u32()?, r.u32()?);
+    if usize::try_from(count).ok()? != sizes.len() {
+        return None;
+    }
+    let mut seen = 0u64;
     let mut sha256 = None;
     for _ in 0..count {
         let algorithm = r.u16()?;
-        let size = sizes.iter().find(|(id, _)| *id == algorithm)?.1;
+        let index = sizes.iter().position(|(id, _)| *id == algorithm)?;
+        let bit = 1u64 << index;
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+        let size = sizes[index].1;
         let digest = r.take(size)?;
         if algorithm == TPM_ALG_SHA256 && size == 32 {
             sha256 = Some(digest);
@@ -269,7 +302,9 @@ pub struct Setting {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Pcr7<'a> {
     /// The SecureBoot variable (under `EFI_GLOBAL_VARIABLE`) as measured:
-    /// `Some(true)` when it was 1.
+    /// `Some(true)` when it was 1, `Some(false)` when it was 0 or measured
+    /// with no data, as EDK2 measures an absent variable. UEFI defines it as
+    /// one byte, 0 or 1 (UEFI 2.10, 3.3): any other value is malformed.
     pub secure_boot: Option<bool>,
     /// The Secure Boot configuration variables measured (SecureBoot, PK,
     /// KEK, db, dbx, and any others), in order.
@@ -283,19 +318,38 @@ pub struct Pcr7<'a> {
     /// EV_EFI_ACTION strings, such as "UEFI Debug Mode" and "DMA Protection
     /// Disabled", which the firmware measures when it runs that way.
     pub actions: Vec<String>,
+    /// How many PCR 7 separators record a measurement error: their digest is
+    /// that of the 32-bit value 1, whatever their event data, which then
+    /// carries information about the error (TCG PC Client "Error
+    /// Conditions", as Canonical's tcglog-parser reads it; EDK2 writes the
+    /// value 1 itself). Success is 0, or all ones as older firmware writes it.
+    pub separator_errors: usize,
+    /// How many image or driver loads were measured into PCR 7
+    /// (EV_EFI_BOOT_SERVICES_APPLICATION, EV_EFI_BOOT_SERVICES_DRIVER,
+    /// EV_EFI_RUNTIME_SERVICES_DRIVER): extraneous measurements under
+    /// Microsoft's PCR 7 guidance, which make PCR 7 change with the binary.
+    pub extraneous: usize,
+    /// How many PCR 7 events are of a type read nowhere above (EV_NO_ACTION
+    /// aside), such as the PC Client profile's SPDM device policy and
+    /// authority: what they bind is not known here.
+    pub other: usize,
+    /// Their distinct event types, at most eight.
+    pub other_kinds: Vec<u32>,
     /// How many of the PCR 7 events read here (configuration, separator,
     /// authority, action) have data that does not hash to their SHA-256
     /// digest, or no such digest: what PCR 7 was extended with is then not
     /// what the event says.
     pub unverified: usize,
-    /// How many PCR 7 configuration or authority events do not parse as
-    /// UEFI_VARIABLE_DATA: PCR 7 was extended with something the lists above
-    /// leave out.
+    /// How many PCR 7 events do not have the form their type requires: a
+    /// configuration or authority event that is not UEFI_VARIABLE_DATA, a
+    /// separator that is neither an error nor a 4-byte 0 or all ones, or a
+    /// SecureBoot value other than 0 or 1. PCR 7 was extended with something
+    /// the lists above leave out.
     pub malformed: usize,
 }
 
-/// The PCR 7 events of `events`, read into [`Pcr7`]. Configuration and
-/// authority events that do not parse are counted in `malformed`.
+/// The PCR 7 events of `events`, read into [`Pcr7`]. Events that do not have
+/// the form their type requires are counted in `malformed`.
 pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
     let mut out = Pcr7::default();
     let mut leading = true;
@@ -307,13 +361,18 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
         if leading {
             out.leading_configuration += 1;
         }
+        // An error separator is known by its digest, which is not of its
+        // event data: it is verified by being that digest.
+        let error_separator = event.kind == EV_SEPARATOR
+            && event.sha256 == Some(&sha2::Sha256::digest(1u32.to_le_bytes())[..]);
         if matches!(
             event.kind,
             EV_EFI_VARIABLE_DRIVER_CONFIG
                 | EV_SEPARATOR
                 | EV_EFI_VARIABLE_AUTHORITY
                 | EV_EFI_ACTION
-        ) && event.sha256 != Some(&sha2::Sha256::digest(event.data)[..])
+        ) && !error_separator
+            && event.sha256 != Some(&sha2::Sha256::digest(event.data)[..])
         {
             out.unverified += 1;
         }
@@ -321,7 +380,11 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
             EV_EFI_VARIABLE_DRIVER_CONFIG => {
                 if let Some((guid, name, data)) = variable(event.data) {
                     if name == "SecureBoot" && guid == EFI_GLOBAL_VARIABLE {
-                        out.secure_boot = data.first().map(|&v| v == 1);
+                        match data {
+                            [] | [0] => out.secure_boot = Some(false),
+                            [1] => out.secure_boot = Some(true),
+                            _ => out.malformed += 1,
+                        }
                     }
                     out.configuration.push(Setting {
                         guid,
@@ -351,7 +414,23 @@ pub fn pcr7<'a>(events: &[Event<'a>]) -> Pcr7<'a> {
                 out.actions
                     .push(String::from_utf8_lossy(&text[..end]).into_owned());
             }
-            _ => {}
+            // An error by its digest, whatever its data; otherwise a 4-byte
+            // 0 (all ones in older firmware) for success.
+            EV_SEPARATOR if error_separator => out.separator_errors += 1,
+            EV_SEPARATOR => {
+                if !matches!(event.data, [0, 0, 0, 0] | [0xff, 0xff, 0xff, 0xff]) {
+                    out.malformed += 1;
+                }
+            }
+            EV_EFI_BOOT_SERVICES_APPLICATION
+            | EV_EFI_BOOT_SERVICES_DRIVER
+            | EV_EFI_RUNTIME_SERVICES_DRIVER => out.extraneous += 1,
+            other => {
+                out.other += 1;
+                if out.other_kinds.len() < MAX_OTHER_KINDS && !out.other_kinds.contains(&other) {
+                    out.other_kinds.push(other);
+                }
+            }
         }
     }
     out
@@ -367,11 +446,13 @@ pub fn authority_certificate<'a>(authority: &Authority<'a>) -> Option<&'a [u8]> 
 /// Why the log's account of PCR 7 is not relied on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Untrusted {
-    /// The log does not open with a Spec ID Event03 header: a SHA-1-only log,
-    /// or not an event log at all.
+    /// The log does not open with a valid Spec ID Event03 header: a
+    /// SHA-1-only log, not an event log at all, or a header this format does
+    /// not allow (a version before 2.0, a UINTN size other than 32 or 64
+    /// bits, no algorithm, or one declared twice).
     NotCryptoAgile,
-    /// An event runs past the end or uses a digest algorithm the header did
-    /// not declare, so the events after it are unread.
+    /// An event runs past the end or does not carry exactly one digest for
+    /// each algorithm the header declared, so the events after it are unread.
     Incomplete,
     /// A PCR 7 event carries no SHA-256 digest.
     NoSha256,
@@ -380,16 +461,15 @@ pub enum Untrusted {
     Replay,
     /// This many PCR 7 events have data that does not hash to their digest.
     Payload(usize),
-    /// This many PCR 7 configuration or authority events do not parse as
-    /// UEFI_VARIABLE_DATA.
+    /// This many PCR 7 events do not have the form their type requires
+    /// ([`Pcr7::malformed`]).
     Malformed(usize),
 }
 
 /// What PCR 7 recorded in this boot, read from `log` only once the log is
 /// shown to account for `value`, the SHA-256 value PCR 7 holds: every event
 /// parses, the PCR 7 digests replay to `value`, each PCR 7 event read hashes
-/// to its digest, and each configuration and authority event parses as
-/// UEFI_VARIABLE_DATA.
+/// to its digest, and each has the form its type requires.
 ///
 /// # Errors
 ///
@@ -762,19 +842,211 @@ pub(crate) mod tests {
             Err(Untrusted::Malformed(1))
         );
 
-        // A PCR 7 event with only a SHA-1 digest cannot be replayed.
-        let mut sha1_only = log(&[]);
-        for field in [7, EV_SEPARATOR, 1] {
-            sha1_only.extend_from_slice(&field.to_le_bytes());
-        }
-        sha1_only.extend_from_slice(&0x0004u16.to_le_bytes());
-        sha1_only.extend_from_slice(&[0; 20]);
-        sha1_only.extend_from_slice(&4u32.to_le_bytes());
-        sha1_only.extend_from_slice(&[0; 4]);
+        // A PCR 7 event with only a SHA-1 digest: in a log that declares
+        // SHA-256 too it lacks a declared digest and does not parse; in a
+        // log that declares SHA-1 alone it cannot be replayed.
+        let sha1_event = || {
+            let mut out = Vec::new();
+            for field in [7, EV_SEPARATOR, 1] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            out.extend_from_slice(&0x0004u16.to_le_bytes());
+            out.extend_from_slice(&[0; 20]);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&[0; 4]);
+            out
+        };
+        let mut lacking = log(&[]);
+        lacking.extend_from_slice(&sha1_event());
+        assert_eq!(verified_pcr7(&lacking, &value), Err(Untrusted::Incomplete));
+        let mut spec = spec_id(1, &[(0x0004, 20)]);
+        spec.push(0);
+        let mut sha1_only = header(&spec);
+        sha1_only.extend_from_slice(&sha1_event());
         let (read, complete) = events(&sha1_only).unwrap();
         assert!(complete);
         assert_eq!(read[0].sha256, None);
         assert_eq!(verified_pcr7(&sha1_only, &value), Err(Untrusted::NoSha256));
+    }
+
+    /// #1081 item 1: a separator is a 4-byte value. 0, or all ones as older
+    /// firmware writes it, is success; 1 records a measurement error, which
+    /// is read but leaves the log trusted; any other value or size is
+    /// malformed.
+    #[test]
+    fn separator_values_are_read_as_success_error_or_malformed() {
+        let separators = |data: Vec<Vec<u8>>| {
+            let measured: Vec<(u32, u32, Vec<u8>)> =
+                data.into_iter().map(|d| (7, EV_SEPARATOR, d)).collect();
+            let log = log(&measured);
+            let pcr7 = pcr7(&events(&log).expect("a crypto-agile log").0);
+            (pcr7.separator_errors, pcr7.malformed)
+        };
+        assert_eq!(separators(vec![vec![0; 4], vec![0xff; 4]]), (0, 0));
+        assert_eq!(
+            separators(vec![vec![1, 0, 0, 0]]),
+            (1, 0),
+            "as EDK2 writes it"
+        );
+        assert_eq!(separators(vec![vec![2, 0, 0, 0]]), (0, 1));
+        assert_eq!(separators(vec![vec![0; 3], vec![0; 5]]), (0, 2));
+        assert_eq!(separators(vec![vec![0, 0, 0, 1]]), (0, 1), "big-endian 1");
+        // In another PCR a separator is not PCR 7's to judge.
+        let elsewhere = log(&[(4, EV_SEPARATOR, vec![9; 4])]);
+        assert_eq!(pcr7(&events(&elsewhere).unwrap().0).malformed, 0);
+
+        // A recorded error is reported, not refused; a malformed one is.
+        let error = log(&[(7, EV_SEPARATOR, vec![1, 0, 0, 0])]);
+        let value = replay(&events(&error).unwrap().0, 7).unwrap();
+        assert_eq!(
+            verified_pcr7(&error, &value).map(|pcr7| pcr7.separator_errors),
+            Ok(1)
+        );
+        let bad = log(&[(7, EV_SEPARATOR, vec![7; 4])]);
+        let value = replay(&events(&bad).unwrap().0, 7).unwrap();
+        assert_eq!(verified_pcr7(&bad, &value), Err(Untrusted::Malformed(1)));
+
+        // An error separator is known by its digest, the hash of 1, and its
+        // event data is free-form information about the error: it is read
+        // as an error, not as a payload that does not match its digest.
+        let with_digest = |digest: &[u8], data: &[u8]| {
+            let mut out = log(&[]);
+            for field in [7, EV_SEPARATOR, 2] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            out.extend_from_slice(&0x0004u16.to_le_bytes());
+            out.extend_from_slice(&[0; 20]);
+            out.extend_from_slice(&0x000bu16.to_le_bytes());
+            out.extend_from_slice(digest);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        };
+        let error_digest = sha2::Sha256::digest(1u32.to_le_bytes());
+        let informative = with_digest(&error_digest, b"TPM self-test failed");
+        let value = replay(&events(&informative).unwrap().0, 7).unwrap();
+        let read = verified_pcr7(&informative, &value).expect("an error separator");
+        assert_eq!((read.separator_errors, read.unverified), (1, 0));
+        // Data of 1 under another digest is not an error but a mismatch.
+        let forged = with_digest(&[0x55; 32], &[1, 0, 0, 0]);
+        let value = replay(&events(&forged).unwrap().0, 7).unwrap();
+        assert_eq!(verified_pcr7(&forged, &value), Err(Untrusted::Payload(1)));
+    }
+
+    /// #1081 item 2: an image or driver load in PCR 7 is counted as
+    /// extraneous; any other type not read here (such as SPDM device policy
+    /// and authority) is counted with its type, at most eight types kept.
+    #[test]
+    fn pcr_7_events_of_other_types_are_counted() {
+        let mut measured = vec![
+            (7, EV_EFI_BOOT_SERVICES_APPLICATION, vec![1; 8]),
+            (7, EV_EFI_BOOT_SERVICES_DRIVER, vec![2; 8]),
+            (7, EV_EFI_RUNTIME_SERVICES_DRIVER, vec![3; 8]),
+            (7, 0x8000_00e3, vec![4; 8]),
+            (7, 0x8000_00e4, vec![5; 8]),
+            (7, 0x8000_00e3, vec![6; 8]),
+            (4, EV_EFI_BOOT_SERVICES_APPLICATION, vec![7; 8]),
+            (7, EV_NO_ACTION, vec![8; 8]),
+        ];
+        let data = log(&measured);
+        let read = pcr7(&events(&data).unwrap().0);
+        assert_eq!(read.extraneous, 3);
+        assert_eq!(read.other, 3);
+        assert_eq!(read.other_kinds, [0x8000_00e3, 0x8000_00e4]);
+        assert_eq!(read.malformed, 0);
+        for kind in 0x0000_0100..0x0000_010a {
+            measured.push((7, kind, vec![0]));
+        }
+        let data = log(&measured);
+        let read = pcr7(&events(&data).unwrap().0);
+        assert_eq!(read.other, 13);
+        assert_eq!(read.other_kinds.len(), MAX_OTHER_KINDS);
+    }
+
+    /// #1081 item 3: the Spec ID header is version 2.0 or later with UINTN
+    /// fields of 32 or 64 bits, and declares at least one algorithm, each
+    /// once.
+    #[test]
+    fn a_spec_id_header_must_have_a_known_version_and_uintn_size() {
+        let algorithms = [(0x0004, 20), (0x000b, 32)];
+        // platformClass is bytes 16 to 19; then minor, major, errata, uintnSize.
+        let with = |at: usize, value: u8| {
+            let mut spec = spec_id(2, &algorithms);
+            spec[at] = value;
+            spec.push(0);
+            events(&header(&spec)).map(|(read, complete)| (read.len(), complete))
+        };
+        assert_eq!(with(21, 2), Some((0, true)));
+        assert_eq!(with(21, 3), Some((0, true)), "a later version");
+        assert_eq!(with(21, 1), None, "version 1");
+        assert_eq!(with(21, 0), None, "version 0");
+        assert_eq!(with(23, 1), Some((0, true)), "32-bit UINTN");
+        assert_eq!(with(23, 0), None, "no UINTN size");
+        assert_eq!(with(23, 3), None, "an undefined UINTN size");
+        let mut none = spec_id(0, &[]);
+        none.push(0);
+        assert_eq!(events(&header(&none)), None, "no algorithm");
+        let mut twice = spec_id(2, &[(0x000b, 32), (0x000b, 32)]);
+        twice.push(0);
+        assert_eq!(events(&header(&twice)), None, "an algorithm declared twice");
+    }
+
+    /// #1081 item 4: SecureBoot is one byte, 0 or 1 (UEFI 2.10, 3.3); EDK2
+    /// measures an absent variable with no data, which reads as off. Any
+    /// other value is malformed and says nothing about Secure Boot.
+    #[test]
+    fn secure_boot_is_one_byte_zero_or_one() {
+        let read = |data: &[u8]| {
+            let log = log(&[(7, EV_EFI_VARIABLE_DRIVER_CONFIG, var("SecureBoot", data))]);
+            let pcr7 = pcr7(&events(&log).unwrap().0);
+            (pcr7.secure_boot, pcr7.malformed)
+        };
+        assert_eq!(read(&[1]), (Some(true), 0));
+        assert_eq!(read(&[0]), (Some(false), 0));
+        assert_eq!(read(&[]), (Some(false), 0), "an absent variable");
+        assert_eq!(read(&[2]), (None, 1));
+        assert_eq!(read(&[1, 0]), (None, 1), "more than one byte");
+        assert_eq!(read(&[0xff]), (None, 1));
+    }
+
+    /// #1081 item 5: every event carries one digest for each algorithm the
+    /// header declared, each once, in any order (systemd-pcrlock notes
+    /// firmware that reorders them). One missing or repeated ends the list.
+    #[test]
+    fn every_event_carries_each_declared_digest_once() {
+        let event = |digests: &[(u16, &[u8])], data: &[u8]| {
+            let mut out = log(&[]);
+            out.extend_from_slice(&7u32.to_le_bytes());
+            out.extend_from_slice(&EV_SEPARATOR.to_le_bytes());
+            out.extend_from_slice(&(digests.len() as u32).to_le_bytes());
+            for (id, digest) in digests {
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(digest);
+            }
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        };
+        let separator = [0u8; 4];
+        let sha256 = sha2::Sha256::digest(separator);
+        let sha1 = [0u8; 20];
+        let ordered = event(&[(0x0004, &sha1), (0x000b, &sha256)], &separator);
+        let (read, complete) = events(&ordered).unwrap();
+        assert!(complete);
+        assert_eq!(read[0].sha256, Some(&sha256[..]));
+        let reordered = event(&[(0x000b, &sha256), (0x0004, &sha1)], &separator);
+        let (read, complete) = events(&reordered).unwrap();
+        assert!(complete, "another order is read");
+        assert_eq!(read[0].sha256, Some(&sha256[..]));
+        let missing = event(&[(0x000b, &sha256)], &separator);
+        assert_eq!(events(&missing), Some((vec![], false)), "SHA-1 missing");
+        let repeated = event(&[(0x000b, &sha256), (0x000b, &sha256)], &separator);
+        assert_eq!(events(&repeated), Some((vec![], false)), "SHA-256 twice");
+        let extra = event(
+            &[(0x0004, &sha1), (0x000b, &sha256), (0x000b, &sha256)],
+            &separator,
+        );
+        assert_eq!(events(&extra), Some((vec![], false)), "more than declared");
     }
 
     #[test]

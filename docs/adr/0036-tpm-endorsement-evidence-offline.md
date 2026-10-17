@@ -529,6 +529,29 @@ irlumed's `TpmEndorsement` request (section 4) is wired as follows:
   include/linux/tpm_command.h). A worker still in the check after that
   reads as wedged.
 
+## Amendment 2026-10-17: Phase 3 doctor check
+
+- **Asking.** doctor sends `TpmEndorsement` after `TpmReadiness`, with the
+  request's 60-second budget, so a root run on a slow TPM can take up to
+  that much longer. An older irlumed reads as "irlumed predates the
+  endorsement check", an absent one as not running, a non-root caller as
+  irlumed's "requires root" refusal, and no answer in time as such; each is
+  `unknown`.
+- **Detail.** One line: each judged certificate as its EK algorithm, index,
+  result and irlumed's reason, with, when its chain verified, the TPM it
+  names ("TPM STM ST33HTPHAHE4, firmware id:00090108 when certified") and
+  any CA whose validity ended, with the UTC date (reported, not enforced);
+  then the indices not judged and those skipped, with the kind of EK. Every
+  string from irlumed passes through the same visible-ASCII rule as
+  `firmware_text`: other characters show as `?`, a certificate field keeps
+  at most 64 characters and a reason at most 320, then `...`.
+- **TUI.** Full Diagnostics runs doctor as the user who started the TUI, so
+  every root-only TPM check reads `unknown` there. For CLI and TUI parity
+  with `sudo irlume doctor`, the Diagnostics page gains Full Diagnostics as
+  Administrator: it asks first, then runs `sudo irlume doctor --user
+  <account>` in the cooked terminal, as the Logs view runs `sudo irlume
+  logs`.
+
 ## Acceptance tests
 
 - The verifier accepts a generated chain (root, intermediate, EK certificate)

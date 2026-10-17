@@ -18,7 +18,7 @@ pub(super) const UNDATED: &str = "date not recorded";
 /// seconds east of UTC: (year, month 1-12, day 1-31). The proleptic
 /// Gregorian conversion from days since the epoch (H. Hinnant's
 /// `civil_from_days`).
-pub(super) fn civil_date(at: u64, utc_offset: i64) -> (i64, usize, i64) {
+pub(crate) fn civil_date(at: u64, utc_offset: i64) -> (i64, usize, i64) {
     let local = i64::try_from(at)
         .unwrap_or(i64::MAX)
         .saturating_add(utc_offset);

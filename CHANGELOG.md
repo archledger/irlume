@@ -258,6 +258,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `deny.toml` suppresses RUSTSEC-2026-0367, 0368 and 0369, three
+  extraction flaws in `zip` 8.6.0 (#1103). `zip` is only a build
+  dependency of `edgefirst-tflite-sys` 0.10.3, whose build script extracts
+  an archive only for its `vendored` feature, which irlume does not enable,
+  so the vulnerable code is never reached. No release of that crate builds
+  with the fixed zip 9 yet. A release's VEX document states the three as
+  `not_affected` (`vulnerable_code_not_in_execute_path`); the entries go
+  once the pinned crate moves to zip 9.
+
 - Once irlumed has persisted irlume's DA-exempt storage key, nothing but
   irlumed's start derives the original storage key (ADR-0034, Phase 3
   amendment). An unseal under the original key that finds it away from its

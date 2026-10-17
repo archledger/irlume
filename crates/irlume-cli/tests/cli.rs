@@ -5670,6 +5670,12 @@ esac"#,
                 out.contains("copr disable archledger/irlume-nightly"),
                 "{out}"
             );
+            assert!(
+                out.contains(
+                    "sudo dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm"
+                ),
+                "{out}"
+            );
             let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update"]));
             assert_eq!(code, 0);
             assert!(out.contains("[update] done."), "{out}");
@@ -5703,6 +5709,10 @@ esac"#,
             );
             assert!(
                 out.contains("--remove ppa:archledger/irlume-nightly"),
+                "{out}"
+            );
+            assert!(
+                out.contains("add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed"),
                 "{out}"
             );
         }

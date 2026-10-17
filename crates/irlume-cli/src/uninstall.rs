@@ -369,21 +369,26 @@ fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
 
 /// The names irlume's pacman packages are installed under: the KCM first,
 /// when installed, then irlume itself, each found through what it provides
-/// (`pacman -Qq` prints the providing package's name). Falls back to
-/// `irlume` when pacman answers nothing.
+/// (`pacman -Qq` prints the providing package's name), so whichever KCM is
+/// installed goes with whichever main package (the release `irlume-kcm`
+/// beside the AUR's `irlume-git`, ADR-0037 §4). Falls back to `irlume` when
+/// pacman answers nothing.
 fn arch_installed_packages() -> Vec<String> {
-    let installed = |provided: &str| -> Option<String> {
+    arch_installed_packages_via(|provided| {
         let out = Command::new("pacman")
             .args(["-Qq", provided])
             .output()
             .ok()?;
-        out.status.success().then(|| {
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .next()
-                .unwrap_or(provided)
-                .to_owned()
-        })
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })
+}
+
+/// [`arch_installed_packages`] with `pacman -Qq <provided>` injected.
+fn arch_installed_packages_via(query: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let installed = |provided: &str| -> Option<String> {
+        query(provided).map(|out| out.split_whitespace().next().unwrap_or(provided).to_owned())
     };
     let mut names: Vec<String> = installed("irlume-kcm").into_iter().collect();
     names.push(installed("irlume").unwrap_or_else(|| "irlume".to_owned()));
@@ -4379,6 +4384,26 @@ mod tests {
             removal_hint(&InstallOrigin::ArchGit),
             "sudo pacman -Rns irlume-git"
         );
+        // Whichever KCM provides irlume-kcm goes with whichever main
+        // package: the release KCM beside irlume-git too.
+        let names = |pairs: &'static [(&'static str, &'static str)]| {
+            arch_installed_packages_via(move |provided| {
+                pairs
+                    .iter()
+                    .find(|(p, _)| *p == provided)
+                    .map(|(_, name)| format!("{name}\n"))
+            })
+        };
+        assert_eq!(
+            names(&[("irlume", "irlume-git"), ("irlume-kcm", "irlume-kcm")]),
+            ["irlume-kcm", "irlume-git"]
+        );
+        assert_eq!(
+            names(&[("irlume", "irlume-git"), ("irlume-kcm", "irlume-kcm-git")]),
+            ["irlume-kcm-git", "irlume-git"]
+        );
+        assert_eq!(names(&[("irlume", "irlume")]), ["irlume"]);
+        assert_eq!(names(&[]), ["irlume"]);
     }
 
     #[test]

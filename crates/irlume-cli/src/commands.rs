@@ -180,8 +180,12 @@ fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
                 return run_pkg_steps(&[&["dnf", "upgrade", "--refresh", "irlume"]]);
             }
             println!("  Back to releases: sudo dnf copr disable archledger/irlume-nightly");
+            println!("    && sudo dnf copr enable archledger/irlume");
+            // Each subpackage requires the exact irlume version and dnf
+            // downgrades only the packages named, so they move together;
+            // --skip-unavailable lets it name one that is not installed.
             println!(
-                "    && sudo dnf copr enable archledger/irlume && sudo dnf distro-sync irlume"
+                "    && sudo dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm"
             );
         }
         InstallOrigin::PpaNightly => {

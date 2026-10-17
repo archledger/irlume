@@ -246,7 +246,12 @@ says so, and that:
   archledger/irlume-nightly`, `dnf copr enable archledger/irlume` (a machine
   installed from the nightly Copr alone has no release repository enabled,
   and `distro-sync` picks from enabled repositories only), then
-  `dnf distro-sync irlume`; removing the
+  `dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm`:
+  each subpackage requires the exact `irlume` version, and dnf downgrades
+  only the packages a `distro-sync` names, so the installed ones (the
+  default install has `irlume-selinux`, a Recommends) move in the same
+  transaction, and `--skip-unavailable` lets the command name one that is
+  not installed; removing the
   nightly PPA, adding the release PPA (a machine installed from the nightly
   PPA alone has none), then installing the release PPA's version with
   `--allow-downgrades`, with `irlume-kcm` in the same command when it is
@@ -310,7 +315,10 @@ These need the maintainer's accounts, and are done once:
   machine that had only the nightly PPA returns to the release, and names
   `irlume-kcm` in the downgrade command beside `irlume`.
 - Leaving the nightly Copr enables the release Copr before `distro-sync`, so
-  a machine that had only the nightly Copr returns to the release.
+  a machine that had only the nightly Copr returns to the release, and
+  names `irlume-selinux` and `irlume-kcm` beside `irlume`, so the default
+  install (with `irlume-selinux`) and one with `irlume-kcm` both downgrade
+  in one transaction, and one without them still runs.
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
   names the AUR nightly package and uninstall removes `irlume-git` and, when
   installed, `irlume-kcm-git`, or the release `irlume-kcm` beside it.

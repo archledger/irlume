@@ -201,6 +201,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb-mode"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac64b0984be8510caae81455ea2c8c23e5af6be61c36129df62f3380d5d64e1f"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -427,6 +436,7 @@ dependencies = [
  "digest",
  "ff",
  "group",
+ "hkdf",
  "hybrid-array",
  "rand_core",
  "sec1",
@@ -591,6 +601,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
 name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -701,10 +720,13 @@ dependencies = [
 name = "irlume-core"
 version = "0.15.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "argon2",
  "base64",
+ "cfb-mode",
  "der",
+ "hmac",
  "irlume-common",
  "irlume-vision",
  "libc",

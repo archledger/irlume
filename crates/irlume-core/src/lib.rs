@@ -35,6 +35,7 @@ pub mod storage;
 pub mod storage_key;
 pub mod template_key;
 pub mod tpm;
+pub mod tpm_credential;
 pub mod tpm_pcrlock;
 
 /// A per-process-unique `/tmp` path for a test that writes to a state dir. A

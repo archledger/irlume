@@ -81,9 +81,14 @@ spki       = { version = "0.8", features = ["alloc", "pem"] }  # SubjectPublicKe
 # 0.10, rand_core 0.6) and would duplicate that stack.
 x509-cert  = { version = "0.3", default-features = false }
 rsa        = { version = "=0.10.0-rc.19", default-features = false }
-p256       = { version = "0.14", default-features = false, features = ["ecdsa"] }
-p384       = { version = "0.14", default-features = false, features = ["ecdsa"] }
-p521       = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p256       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
+p384       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
+p521       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
+# Software TPM2_MakeCredential (ADR-0036 section 2.4): AES-CFB over the
+# credential, HMAC-based KDFa. aes and hmac are already in the tree.
+aes        = "0.9"
+cfb-mode   = "0.9"
+hmac       = "0.13"
 aes-gcm    = "0.11"     # AES-256-GCM for template-at-rest encryption
 argon2     = "0.6"      # Argon2id KDF for the recovery passphrase
 pbkdf2     = { version = "0.13", default-features = false, features = ["hmac"] }  # PBKDF2-HMAC-SHA512: the KDE wallet key ksecretd expects

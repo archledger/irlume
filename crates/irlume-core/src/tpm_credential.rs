@@ -143,6 +143,9 @@ pub(crate) fn kdfa(
         );
         counter += 1;
     }
+    // Wipe the last block's unused tail before shortening (Zeroizing would
+    // reach it too, as spare capacity, but only when the vector drops).
+    out[wanted..].zeroize();
     out.truncate(wanted);
     out
 }
@@ -169,6 +172,9 @@ pub(crate) fn kdfe(
         );
         counter += 1;
     }
+    // Wipe the last block's unused tail before shortening (Zeroizing would
+    // reach it too, as spare capacity, but only when the vector drops).
+    out[wanted..].zeroize();
     out.truncate(wanted);
     out
 }
@@ -288,11 +294,14 @@ fn protect(ek: &EkTarget<'_>, seed: &[u8], object_name: &[u8], credential: &[u8]
         &[],
         ek.symmetric.key_bits(),
     );
-    // The whole TPM2B_DIGEST is encrypted, its size included (Part 1 21.4).
-    let mut enc_identity = u16::try_from(credential.len())
-        .expect("check_protection bounds the credential")
-        .to_be_bytes()
-        .to_vec();
+    // The whole TPM2B_DIGEST is encrypted, its size included (Part 1 21.4),
+    // staged where an unwind before the encryption still wipes it.
+    let mut enc_identity = Zeroizing::new(Vec::with_capacity(2 + credential.len()));
+    enc_identity.extend_from_slice(
+        &u16::try_from(credential.len())
+            .expect("check_protection bounds the credential")
+            .to_be_bytes(),
+    );
     enc_identity.extend_from_slice(credential);
     let iv = [0u8; 16];
     match ek.symmetric {
@@ -310,7 +319,7 @@ fn protect(ek: &EkTarget<'_>, seed: &[u8], object_name: &[u8], credential: &[u8]
         .to_be_bytes()
         .to_vec();
     alg.hmac_into(&hmac_key, &[&enc_identity, object_name], &mut id_object);
-    id_object.extend(enc_identity);
+    id_object.extend_from_slice(&enc_identity);
     id_object
 }
 

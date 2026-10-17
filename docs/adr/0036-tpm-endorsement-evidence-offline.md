@@ -226,7 +226,10 @@ binds irlumed too, not only the client: the handler takes the request's
 deadline, checks it before each TPM command, and stops with `unknown` ("ran
 out of time") once it has passed, so an abandoned request releases the TPM
 within one command after its deadline. It judges at most four storage EK
-certificates, the low-range RSA and ECC ones first. The request
+certificates, the low-range RSA and ECC ones first. Any beyond those are named
+as not judged, and their presence keeps the result from `pass`: it reads
+`unknown` unless a judged certificate is in a `warn` case, so the worst-first
+rule of section 1 never hides a certificate it did not look at. The request
 is additive on the wire, gets explicit posture table arms, and an older
 irlumed's refusal reads as "irlumed predates the endorsement check"
 (`unknown`).
@@ -281,6 +284,12 @@ RSA encryption.
   public key, its hash, the certificate serial or a fingerprint of the EK
   certificate. They carry the manufacturer, model and firmware version, the
   names of the CAs in the chain, and the result.
+- Every string taken from a certificate (the manufacturer, model and
+  firmware version in its subject alternative name, a CA's name) is
+  untrusted: irlumed bounds it, and doctor prints it as visible ASCII on one
+  line, as `firmware_text` already does for firmware-written text in the
+  `pcr7-binding` check, before it reaches the terminal, `--json` or a support
+  report.
 
 ### 8. When to revisit
 
@@ -349,7 +358,11 @@ check.
   index in the chain range for an EK certificate.
 - A firmware-limited EK certificate is skipped and named.
 - A request whose deadline passes stops before its next TPM command and
-  reads `unknown`.
+  reads `unknown`. With five storage EK certificates, the fifth is named as
+  not judged and the result is not `pass`.
+- A certificate whose subject alternative name or CA name carries control
+  characters or terminal sequences reaches doctor's output as visible ASCII
+  on one bounded line.
 - On swtpm, with an EK certificate from `swtpm_setup --create-ek-cert`: the
   check reads `unknown` (issuer not in irlume's list) with the shipped
   anchors; with the test CA added as an anchor in the test only, it reads

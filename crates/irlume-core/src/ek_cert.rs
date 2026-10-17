@@ -1443,4 +1443,6 @@ fn check_leaf(
 }
 
 #[cfg(test)]
+pub(crate) mod test_pki;
+#[cfg(test)]
 mod tests;

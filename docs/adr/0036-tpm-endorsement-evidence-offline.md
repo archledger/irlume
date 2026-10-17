@@ -405,6 +405,71 @@ left open:
   duplicate the previous generation. The RUSTSEC-2023-0071 ignore is tracked
   in #1112.
 
+## Amendment 2026-10-17: Phase 2 TPM details
+
+Phase 2's TPM side (`crates/irlume-core/src/tpm/endorsement.rs`, the
+credential made in software in `crates/irlume-core/src/tpm_credential.rs`,
+the report in `crates/irlume-common/src/tpm_endorsement.rs`) settles points
+sections 2 to 4 left open:
+
+- **The EK's policy.** The low-range templates' authPolicy is PolicyA,
+  `TPM2_PolicySecret(TPM_RH_ENDORSEMENT)`; the high-range ones' is PolicyB,
+  `TPM2_PolicyOR(PolicyA, PolicyC)`, PolicyC being the
+  `TPM2_PolicyAuthorizeNV` branch (Credential Profile A.2). irlumed
+  satisfies PolicyB through PolicyA: PolicySecret on the endorsement
+  hierarchy, then PolicyOR over both branch digests, in a policy session
+  whose hash is the EK's nameAlg. A password session would also do in the
+  high range, where userWithAuth is set, but the EK is not exempt from
+  dictionary-attack protection, so it fails during a lockout; a policy
+  without PolicyAuthValue or PolicyPassword does not. An EK whose authPolicy
+  is neither digest for its nameAlg, whose nameAlg is not SHA-256, SHA-384 or
+  SHA-512, or whose symmetric algorithm is not AES-128 or AES-256 in CFB
+  mode is not tried: `unknown`.
+- **The storage key** is TPM2_ActivateCredential's activateHandle, which
+  needs the ADMIN role: irlume's storage keys have adminWithPolicy clear and
+  an empty authValue, so a password session gives it. It is found without
+  persisting or writing anything: ADR-0034's recorded DA-exempt key when it
+  is at its handle with its recorded Name, else the original key at its
+  handle or derived for the request and flushed. During a lockout
+  (`inLockout` in `TPM_PT_PERMANENT`) the test runs under the DA-exempt key
+  and not under the original one, which reads `unknown`.
+- **The EK.** Any persistent endorsement primary (0x81010000 to 0x8101FFFF,
+  not only 0x81010001) is used when its public key is the certificate's;
+  otherwise the EK is derived under the endorsement hierarchy's empty
+  authorization and flushed after the test. A template index is used only
+  when it holds exactly one TPMT_PUBLIC, with no bytes after it.
+- **Evidence.** `warn` comes from TPM2_ActivateCredential returning
+  `TPM_RC_INTEGRITY`, or `TPM_RC_VALUE` on its second parameter (the
+  encrypted seed), or releasing a credential other than the one made. Any
+  other response code is `unknown`.
+- **NV reads.** An index is read with its own empty authorization when
+  `TPMA_NV_AUTHREAD` is set, else with the owner's (a set owner
+  authorization makes it unreadable, and its certificate `unknown`), in
+  pieces of at most `TPM_PT_NV_BUFFER_MAX` octets; an index larger than
+  16 KiB is not read. The chain indices are read from 0x01C00100 up to the
+  first one that is absent or cannot be read.
+- **The deadline.** The check takes a hook it asks before each TPM command,
+  or before each ESYS helper that sends a few. When the hook answers no, the
+  check stops: `unknown`, "ran out of time", unless a certificate already
+  judged is in a `warn` case. What the check loaded is still flushed. Phase
+  2b's handler supplies the hook from the request's deadline.
+- **The report** names a reason when the check stopped early and, for each
+  judged certificate, its index, its EK's algorithm, its state, a one-line
+  detail and, when its chain verified, the TPM it names and its CAs with
+  their end dates; then the skipped and not-judged indices. A state or
+  skipped kind this build does not know reads `unknown`, so a newer irlumed
+  never reads as a stronger result.
+- **The swtpm tests** write their EK certificates themselves instead of
+  using `swtpm_setup --create-ek-cert`: with the platform authorization,
+  empty on a fresh swtpm, they define the profile's indices as
+  platform-created and write certificates a test CA issues for the keys the
+  TPM derives. The same harness then covers a certificate for another key,
+  the chain indices, a fifth storage certificate, non-certificate indices in
+  the range, a low-range template with a nonce, a persistent EK that only
+  its key identifies, and the high range (H-3, ECDH on P-384 under SHA-384
+  and AES-256). They run on a swtpm of their own, and the lockout test on
+  another, since its lockout outlasts the run.
+
 ## Acceptance tests
 
 - The verifier accepts a generated chain (root, intermediate, EK certificate)
@@ -459,6 +524,10 @@ left open:
   (`warn`) on both; with the endorsement authorization set, nothing is tried and the
   check reads `unknown`; after the authorization is cleared in the same boot,
   the next request runs the test.
+- On swtpm in dictionary-attack lockout, a low-range and a high-range EK
+  certificate both read `pass` under ADR-0034's DA-exempt key, and
+  `unknown` (the original key is not exempt) when only the original key is
+  known.
 - No doctor text, `--json` field or support report contains the EK public
   key, its hash, the certificate serial or its fingerprint.
 - irlume makes no network request in any of these paths.

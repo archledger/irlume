@@ -225,6 +225,7 @@ mod tests {
             srk_eviction: SrkOutcome::Kept,
             da_exempt_srk: DaExemptSrkOutcome::Kept,
             tpm_target: None,
+            kept_keys: super::super::KeptKeys::NotChecked,
             retention: super::super::RetentionState::Retained,
         };
         assert_eq!(

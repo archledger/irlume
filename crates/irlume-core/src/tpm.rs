@@ -3208,6 +3208,78 @@ pub fn pcrlock_for_sealing() -> Option<u32> {
     (binding.rank > 0).then_some(binding.nv_index)
 }
 
+/// Whether [`seal`] takes the pcrlock rung on this boot, checked without
+/// sealing anything (#1077). The checks are what the seal's round trip
+/// unseals through:
+/// - a provisioned policy that binds firmware state ([`pcrlock_for_sealing`]);
+/// - its NV index defined;
+/// - a policy session that replays the predicted super-PCR policy against
+///   the live PCRs and passes `PolicyAuthorizeNV`, which accepts the session
+///   only when its digest is the policy the index holds.
+///
+/// `false` (no such policy, no index, a stale index, PCRs no branch predicts,
+/// or an owner authorization the empty one does not satisfy) is where the
+/// seal falls back to the literal PCR policy. Nothing is loaded, sealed or
+/// unsealed.
+///
+/// # Errors
+///
+/// When the prediction cannot be read again, the TPM cannot be opened, its
+/// handles cannot be listed, a session cannot be started, or a PCR changed
+/// during the replay (a race the seal itself retries).
+pub fn pcrlock_seals_here() -> Result<bool> {
+    let Some(nv_index) = pcrlock_for_sealing() else {
+        return Ok(false);
+    };
+    let super_pcr = build_super_pcr(&read_pcrlock_json()?)?;
+    let singles = if super_pcr.singles.is_empty() {
+        None
+    } else {
+        Some(pcr_selection(&super_pcr.singles)?)
+    };
+    let multis = super_pcr
+        .multis
+        .iter()
+        .map(|(pcr, branches)| Ok((pcr_selection(&[*pcr])?, digest_list(branches)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut ctx = open_context()?;
+    let wanted = TpmHandle::NvIndex(NvIndexTpmHandle::new(nv_index).map_err(tpm_err)?);
+    if !tpm_handle_exists(&mut ctx, TPM2_HR_NV_INDEX, wanted)? {
+        return Ok(false);
+    }
+    let nv = nv_index_handle(&mut ctx, nv_index)?;
+    with_session(&mut ctx, None, SessionType::Policy, |ctx, session| {
+        let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+        let replayed = (|| -> std::result::Result<(), tss_esapi::Error> {
+            if let Some(singles) = singles {
+                ctx.policy_pcr(policy, Digest::default(), singles)?;
+            }
+            for (selection, branches) in multis {
+                ctx.policy_pcr(policy, Digest::default(), selection)?;
+                ctx.policy_or(policy, branches)?;
+            }
+            ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+                ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
+            })
+        })();
+        match replayed.map_err(retryable_tpm_err) {
+            Ok(()) => Ok(true),
+            Err(e) if is_pcr_changed_race(&e) => Err(e),
+            Err(_) => Ok(false),
+        }
+    })
+}
+
+/// The policy PCRs ([`policy_pcrs`]) a literal seal cannot bind: `IRLUME_PCRS`
+/// naming PCRs 17 to 22, or one past 23, which the seal refuses as
+/// unsupported. A configuration error, unlike a bank that cannot be read now.
+pub fn unsupported_policy_pcrs() -> Vec<u32> {
+    policy_pcrs()
+        .into_iter()
+        .filter(|&pcr| pcr_slot(pcr).is_err())
+        .collect()
+}
+
 /// Marker `policy_aware_err` embeds when it diagnoses PCR drift;
 /// [`is_pcr_mismatch`] keys on it, so the two stay in sync here.
 const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
@@ -7467,6 +7539,34 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // honest, since a fixture only this test's twin exercised would drift.
         let fixture = PcrlockFixture::provision(NV_INDEX);
 
+        // #1077: the enrollment preflight's check that the pcrlock rung seals
+        // on this boot, without sealing. True for the provisioned policy;
+        // false for one naming an index that is not defined (and, below, for
+        // a stale one).
+        let json = fixture.dir.join("pcrlock.json");
+        let firmware = std::fs::read_to_string(&json).unwrap();
+        let with_json = |text: &str, name: &str| {
+            let path = fixture.dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &path);
+            let answer = pcrlock_seals_here();
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+            answer
+        };
+        assert!(
+            pcrlock_seals_here().expect("the pcrlock check"),
+            "a working policy"
+        );
+        let undefined = firmware.replace(
+            &format!("\"nvIndex\":{NV_INDEX}"),
+            &format!("\"nvIndex\":{}", NV_INDEX + 1),
+        );
+        assert_ne!(undefined, firmware);
+        assert!(
+            !with_json(&undefined, "undefined.json").expect("the pcrlock check"),
+            "an index that is not defined"
+        );
+
         // Round trip through the public Tier-2 entry points.
         let env = seal_with_pcrlock(secret, NV_INDEX).expect("pcrlock seal");
         assert!(matches!(env.policy, PolicyKind::PcrlockNv { .. }));
@@ -7501,6 +7601,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         .unwrap();
         drop(ctx);
         assert!(unseal(&env).is_err(), "stale policy must not unseal");
+        assert!(
+            !with_json(&firmware, "stale.json").expect("the pcrlock check"),
+            "a stale index: the seal would fall back to the literal policy"
+        );
 
         // Cleanup is the fixture's Drop, which also runs if an assertion above
         // fails; the hand-rolled version here did not.

@@ -1,0 +1,240 @@
+# ADR-0037: A nightly channel built from main
+
+## Status
+
+Proposed 2026-10-17. Adds a release channel; changes no existing channel. The
+maintainer chose the name "nightly" and, for the Ubuntu lane, nightly uploads
+from minihost signed with the key Launchpad already has (2026-10-17). Depends
+on [docs/RELEASING.md](../RELEASING.md), which keeps governing releases.
+
+## Context
+
+Every install lane today moves only with a signed release tag, after the
+candidate checks in RELEASING.md:
+
+| Lane | Built from |
+|---|---|
+| Copr `archledger/irlume` | Packit, `trigger: release` (`.packit.yaml`) |
+| AUR `irlume` | `packaging/arch/PKGBUILD`, the signed tag (`#tag=v${pkgver}?signed`) |
+| PPA `ppa:archledger/irlume` | `scripts/build-ppa-source.sh` on the tag tree |
+| `.deb` and Arch package | GitHub release assets |
+| Nix | the flake, which already follows `main` when unpinned |
+
+The maintainer wants a channel that follows the latest commit on `main`, so
+that a fix can be tried before the next release. `main` moves only through
+squash-merged pull requests whose required checks passed, and SECURITY.md
+already lists `main` as supported. What `main` does not have is the release work: the
+install matrix, the upgrade and rollback transactions, hardware
+qualification, SBOM, VEX and SLSA provenance.
+
+The first name proposed, "edge", returns Microsoft Edge in searches, so the
+maintainer chose "nightly".
+
+### What irlume's tools assume today
+
+The CLI knows one channel per distribution family, and a second one would be
+misread (`crates/irlume-cli/src/commands.rs`, `uninstall.rs`,
+`support_report.rs`):
+
+- `is_copr_repo` accepts only `copr:...:archledger:irlume`, so a package from
+  `archledger/irlume-nightly` reads as a local RPM, and `irlume update` then
+  tells the user to enable the release Copr.
+- The PPA test is a substring match on `ppa.launchpadcontent.net/archledger/
+  irlume`, which `.../archledger/irlume-nightly` also matches: the nightly
+  PPA reads as the release PPA, and uninstall removes the release PPA.
+- `pacman -Qq irlume` succeeds for a package that provides `irlume`, but its
+  output, the actual package name, is discarded; uninstall's
+  `pacman -Rns irlume` then fails, since `-R` does not resolve provides.
+- `version_gt` keeps the leading all-digit fields of each dot-separated part,
+  so `0.15.0^...` and `0.15.0+git...` parse as `0.15`, and `version_base`
+  keeps a caret version whole.
+- `irlume update` gates on the latest GitHub release, which a nightly build is
+  always at or past, so it would never update a nightly install.
+
+### What Launchpad allows
+
+The release PPA's 0.15.0 upload is a 649 MB orig tarball (vendored crates,
+ONNX Runtime, the models; Launchpad builders have no network) and builds a
+582 MB package, about 1.23 GB per upload. A PPA has 8 GiB by default.
+Launchpad removes a file once every publication that references it is
+scheduled for deletion, and its cleanup runs every six hours (Launchpad
+manual, "Delete packages from PPAs"). On the release PPA, each superseded
+upload from 0.11.1 to 0.14.0 was removed from disk 1 to 1.5 days after the
+next one was published (`getPublishedSources`, `date_superseded` and
+`date_removed`). Launchpad also refuses an upload whose version is not higher
+than the published one.
+
+## Decision
+
+### 1. One channel, named nightly, on three lanes
+
+| Lane | Channel | Built | Version |
+|---|---|---|---|
+| Fedora | Copr `archledger/irlume-nightly` | by Packit on every push to `main` | the spec's `Version`, Packit's default Release suffix |
+| Arch | AUR `irlume-git` and `irlume-kcm-git` | by the user's AUR helper from `main` at install time | `<tag>.r<commits>.g<hash>` |
+| Ubuntu | PPA `ppa:archledger/irlume-nightly` | on minihost, at most once a day, when `main` moved | `<tag>+git<commits>.g<hash>-0ppa1~<series>1` |
+
+The `.deb` and Arch packages on GitHub stay release-only, and Nix needs
+nothing new. The AUR names follow the AUR's own rule for packages built from
+a version control repository (the `-git` suffix), not the channel name.
+
+### 2. Versions sort after the release they follow
+
+Each nightly version sorts above the release of the same version and below
+the next one, so a user who also has the release lane enabled keeps the
+newer build:
+
+- **Copr.** Packit's commit builds keep the spec's `Version` and append its
+  default suffix to the Release, `{original_release_number}.{current_time}.
+  {sanitized_current_branch}{git_desc_suffix}` (Packit, "release_suffix"):
+  `0.15.0-1.<time>.main.<n>.g<hash>` sorts above `0.15.0-1`, and the time
+  keeps successive builds increasing. From the release-preparation commit,
+  which bumps `Version` before the tag (RELEASING.md step 1), a nightly
+  carries the next release's `Version` and sorts above that release too; it
+  is the same code, so a nightly user simply stays on nightly.
+- **AUR.** `pkgver()` is `git describe --long --tags --match 'v[0-9]*'`
+  reformatted, as the Packit config matches release tags: `0.15.0.r139.
+  g3c162b83`. `vercmp` puts it above `0.15.0-1` and below `0.15.1-1`, and the
+  commit count keeps it increasing.
+- **PPA.** The same `describe` gives `0.15.0+git139.g3c162b83-0ppa1~resolute1`:
+  `+git` sorts above the release's `0.15.0-0ppa1~resolute1`, and the commit
+  count keeps each upload higher than the last, which Launchpad requires.
+
+The AUR and PPA versions start from the last tag, not from `Cargo.toml`, so
+the release-preparation bump does not move a nightly above the release it
+precedes. `irlume version` keeps printing the crate version; the channel and
+the package version are reported by `irlume doctor` (section 4).
+
+### 3. Each lane's build
+
+- **Copr.** `.packit.yaml` gains a `copr_build` job with `trigger: commit`,
+  `branch: main`, `owner: archledger`, `project: irlume-nightly`,
+  `identifier: nightly`, `enable_net: true` and the release job's targets.
+  The spec is unchanged: Packit builds the SRPM from the checked-out commit,
+  as the pull request job already does, and the other sources are pinned by
+  SHA-256 as for a release.
+- **AUR.** `packaging/arch-git/PKGBUILD` keeps `packaging/arch/PKGBUILD`'s
+  dependencies, sources, checksums and package functions, with `pkgbase=
+  irlume-git`, `pkgname=(irlume-git irlume-kcm-git)`, `provides` and
+  `conflicts` for `irlume` and `irlume-kcm`, `git` in `makedepends`, and
+  `git+https://github.com/archledger/irlume.git#branch=main` as its source.
+  It does not add `?signed`: commits on `main` are GitHub's squash merges,
+  signed by GitHub's web-flow key rather than the release key in
+  `validpgpkeys`, so the source is fetched over HTTPS without a signature
+  check. The parity script checks it beside the release recipe.
+- **PPA.** `scripts/ppa-nightly.sh` runs from a user timer on minihost, which
+  already runs user timers with lingering enabled. It updates a dedicated
+  clone, does nothing when `main` has not moved since its last successful
+  upload, builds the source package from `main`'s commit in the same Ubuntu
+  container as a release (`packaging/ppa/build-ppa-container.sh`, given the
+  commit and the nightly version), signs it with the key Launchpad has
+  (fingerprint F350 5339 8E3C 80FE 2089 1B82 C10B 8492 BD7F 30C6) through
+  gpg-agent, uploads it with dput, and records the commit only once
+  `scripts/verify-ppa-publish.py` (with `PPA_NAME=irlume-nightly`) sees the
+  binary published. A failure at any step leaves the last recorded commit, so
+  the next night tries again, and is logged to the user journal.
+  At most one upload a day keeps two or three uploads, 2.5 to 3.7 GB, on disk
+  at once, inside the 8 GiB quota (Context).
+
+### 4. irlume's tools know the channel
+
+- `install-origin` (doctor, the TUI, support reports) names the nightly lanes
+  apart from the release lanes: "Fedora Copr nightly (archledger/
+  irlume-nightly)", "Launchpad PPA nightly (ppa:archledger/irlume-nightly)",
+  "AUR irlume-git (nightly)", with the installed package version. The Copr
+  lane is told by the package's `from_repo`; the PPA lane by the origin
+  `apt-cache policy` lists for the installed version, matched as a whole path
+  segment, so neither PPA is mistaken for the other; the AUR lane by the name
+  `pacman -Qq irlume` prints. The support report gains the channel values
+  `fedora_copr_nightly`, `ubuntu_ppa_nightly` and `arch_git`.
+- `irlume update` on a nightly lane upgrades through that lane every time,
+  since GitHub releases are not its gate: `dnf upgrade --refresh irlume` from
+  the nightly Copr, `apt-get install --only-upgrade irlume` after an update
+  from the nightly PPA, and, as for the AUR release package, the commands to
+  run (an AUR helper does not run as root): `yay -Syu --devel` or rebuilding
+  `irlume-git`.
+- Version comparisons read the snapshot forms: the caret, `+git` and
+  `.r<n>.g<hash>` suffixes end the numeric part, so `0.15.0^...`,
+  `0.15.0+git...` and `0.15.0.r139.g...` compare as `0.15.0` against a
+  release tag.
+- `irlume uninstall` removes the packages that are installed under their own
+  names (`irlume-git`, `irlume-kcm-git`) and the channel they came from: the
+  nightly Copr repository or the nightly PPA, never the release one in their
+  place.
+
+### 5. What the channel promises
+
+Nothing beyond `main`: each build is a commit that passed the required checks,
+and none has had the release candidate checks. The channel's documentation
+says so, and that:
+
+- a nightly build can break face login or its PAM wiring on a given machine;
+  the password always works, as it does with any irlume build;
+- Copr and Launchpad sign their repositories with their own keys, the AUR
+  build fetches `main` over HTTPS without a signature check, and nightly
+  builds carry no SBOM, VEX or SLSA provenance ([VERIFY.md](../VERIFY.md)
+  covers release assets only);
+- leaving the channel returns to the release: `dnf copr disable
+  archledger/irlume-nightly` then `dnf distro-sync irlume`; removing the
+  nightly PPA then installing the release PPA's version with
+  `--allow-downgrades`; installing `irlume` from the AUR, which replaces
+  `irlume-git`.
+
+### 6. Owner setup, once
+
+These need the maintainer's accounts, and are done once:
+
+1. Copr: create `archledger/irlume-nightly` with the same chroots as
+   `archledger/irlume`, network enabled for builds, and
+   `github.com/archledger/irlume` under "Packit allowed forge projects"; then
+   approve Packit's builder request at its first build (or run
+   `copr-cli edit-permissions --builder packit irlume-nightly`).
+2. Launchpad: create the PPA `irlume-nightly` under `~archledger`.
+3. AUR: publish `irlume-git` from `packaging/arch-git/` with the maintainer's
+   AUR key (`irlume-kcm-git` is its split package).
+4. minihost: enable the user timer (`systemctl --user enable --now
+   irlume-ppa-nightly.timer`).
+
+## Consequences
+
+- Fedora users get a build of every merge, once Copr has built it; Arch users
+  get `main` whenever they rebuild `irlume-git`; Ubuntu users get `main` at
+  most a day late, once Launchpad has built it.
+- On a night `main` moved, minihost builds the source package in a container
+  and uploads about 650 MB; Launchpad builds the 582 MB package. The timer
+  depends on gpg-agent being able to sign without a prompt; when it cannot,
+  the upload is skipped and the failure logged.
+- The CLI gains three install origins and their update and uninstall paths;
+  the support report gains three channel values.
+- RELEASING.md is unchanged: releases still come only from signed tags, and
+  the nightly lanes never replace a release lane's packages.
+
+## Phasing
+
+1. This ADR.
+2. The CLI's channel awareness (section 4), before any nightly package
+   exists, so the first nightly install is read correctly.
+3. The Packit job, the `irlume-git` recipe, the PPA nightly script and its
+   timer, and the documentation (sections 1, 3 and 5).
+4. The owner setup (section 6), then a first build on each lane.
+
+## Acceptance tests
+
+- With a fake `dnf repoquery` answering `copr:copr.fedorainfracloud.org:
+  archledger:irlume-nightly`, `install-origin` names the nightly Copr and
+  `irlume update` runs `dnf upgrade --refresh irlume`; with `...:irlume`, the
+  release Copr as before.
+- With a fake `apt-cache policy` listing only the nightly PPA for the
+  installed version, `install-origin` names the nightly PPA; with only the
+  release PPA, the release PPA; uninstall removes only the PPA named.
+- With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
+  names the AUR nightly package and uninstall removes `irlume-git` and, when
+  installed, `irlume-kcm-git`.
+- `version_gt` and `version_base` read `0.15.0^20261017git3c162b8`,
+  `0.15.0+git139.g3c162b83-0ppa1~resolute1` and `0.15.0.r139.g3c162b83-1` as
+  `0.15.0`: not newer than the v0.15.0 tag, and older than v0.15.1.
+- The `irlume-git` recipe builds in a clean Arch container, its package
+  provides `irlume`, and the parity script checks it.
+- `scripts/ppa-nightly.sh` uploads nothing when `main` has not moved, builds
+  the version above from a given commit, and keeps its last recorded commit
+  when signing, upload or publication fails.

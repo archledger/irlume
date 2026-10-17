@@ -64,9 +64,11 @@ template envelopes from a root process that also cannot read irlumed's
 memory. That needs a host that blocks both ways root reads another process:
 Yama's ptrace scope 3, where "no processes may use ptrace with PTRACE_ATTACH
 nor via PTRACE_TRACEME" (kernel `Documentation/admin-guide/LSM/Yama.rst`;
-modes 0 to 2 leave root able to attach), and kernel lockdown, which
-restricts direct access to the running kernel image (`/dev/mem`, `/dev/kmem`,
-`/dev/kcore`, BPF and kprobes among others, `kernel_lockdown(7)`). That is the benefit this ADR weighs: the privacy of
+modes 0 to 2 leave root able to attach), and kernel lockdown in
+confidentiality mode (`lockdown=confidentiality`, `kernel_lockdown(7)`):
+`/proc/kcore`, kprobes, BPF reads of kernel memory, perf and tracefs are
+restricted only in that mode, since `include/linux/security.h` places them
+after `LOCKDOWN_INTEGRITY_MAX`. That is the benefit this ADR weighs: the privacy of
 the templates against a live root process, on hosts hardened that far.
 
 ### What the mechanisms give on the machines irlume runs on
@@ -137,7 +139,31 @@ the UAPI group's registries:
    jobs, so the key would survive them. It would not survive a `systemctl stop`
    followed by a `start`, or a crash loop that exhausts the restart attempts
    and leaves the unit failed, unless `FileDescriptorStorePreserve=` keeps the
-   store. The key would then live in PID 1 as well as in irlumed.
+   store. The key would then live in PID 1 as well as in irlumed, and there
+   root can still read it: `/proc/1/fd` opens PID 1's descriptors with the
+   `PTRACE_MODE_READ` check (`fs/proc/fd.c`), which Yama's scope 3 does not
+   restrict, since it acts on `PTRACE_MODE_ATTACH` only
+   (`security/yama/yama_lsm.c`). On the hardened hosts where the lock would
+   protect the templates, surviving restarts through the store would give
+   that protection away; keeping it means face login ends at every restart
+   until the next boot.
+8. **irlume's own initrd step is possible, at a cost.** On any boot, an
+   irlume hook in the initrd could unseal the key, read-lock an NV gate and
+   hand the key over before switch-root, without systemd's phase policies.
+   It would need:
+   - an integration for each initramfs generator irlume's packages meet
+     (dracut, mkinitcpio, initramfs-tools, NixOS's stage 1);
+   - a policy bound to the initrd's own measurement, since on a GRUB boot
+     the initrd is a file on `/boot` that root can rewrite to run its own
+     code before the lock at the next boot. GRUB measures every file it reads
+     into PCR 9 when its `tpm` module is loaded (GRUB manual 19.6), and that
+     value changes at every kernel or initrd update, so the policy would have
+     to be predicted again each time, as systemd-pcrlock does for its own;
+   - a gate index root cannot delete and recreate, which
+     `TPMA_NV_POLICY_DELETE` gives only by making deletion need
+     `TPM2_NV_UndefineSpaceSpecial` with the platform authorization, which
+     the operating system does not hold, so uninstall could never remove
+     the index.
 
 ### What it would cost
 
@@ -173,19 +199,23 @@ boot-phase window.
 1. The lock would not protect the keyring secret, which root can ask irlumed
    for (`UnsealKeyring`). It would protect the template envelopes only from a
    root process that cannot read irlumed's memory, on hosts with Yama's
-   ptrace scope 3 and kernel lockdown, and on every other host it would make
-   reading memory more rewarding, since the key would sit there for the
-   whole uptime.
-2. On most installs the window cannot close before host userspace: PCR 11
-   phases need a measured UKI, initrd-only policies need the UKI builder's
-   signing key, and irlumed starts after `multi-user.target`.
+   ptrace scope 3 and kernel lockdown in confidentiality mode, and only while
+   the key is not also kept in PID 1's file descriptor store. On every other
+   host it would make reading memory more rewarding, since the key would sit
+   there for the whole uptime.
+2. On most installs systemd's facilities cannot close the window before host
+   userspace: PCR 11 phases and initrd policies need a measured UKI, and
+   irlumed starts after `multi-user.target`. irlume's own initrd step could
+   (point 8), at the cost of an integration per initramfs generator, a policy
+   predicted again at every kernel or initrd update, and an NV index that
+   cannot be removed.
 3. Every resume from hibernation reopens the window for the userspace it
    restores, and every hibernation image holds the key, so a host without an
    encrypted image would trade protection against disk theft for it.
 4. A stop and start, an upgrade outside a restart job, or a crash loop that
    leaves the unit failed would turn face login off until the next boot.
    Surviving the other restarts means keeping the key in PID 1's file
-   descriptor store as well.
+   descriptor store as well, where root can read it (point 7).
 
 ### 3. What stays as it is
 
@@ -211,8 +241,9 @@ Revisit when all of these hold:
 
 The template-envelope benefit (Context, "What it would protect against, as
 irlume runs today") can also be raised on its own, for hosts hardened with
-Yama's ptrace scope 3 and kernel lockdown, if the maintainer judges it worth
-the costs above for them.
+Yama's ptrace scope 3 and kernel lockdown in confidentiality mode, if the
+maintainer judges it worth the costs above for them, including face login
+ending at every restart.
 
 ## Consequences
 

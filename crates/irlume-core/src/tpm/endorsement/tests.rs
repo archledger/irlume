@@ -24,6 +24,47 @@ fn digest(alg: NameAlg, parts: &[&[u8]]) -> Vec<u8> {
 // --- the profile's policies and templates ------------------------------------
 
 #[test]
+fn each_slot_holds_only_its_ek_s_algorithm_and_size() {
+    let rsa = |bits: usize| EkPublicKey::Rsa {
+        modulus: [vec![0x80], vec![0; bits / 8 - 1]].concat(),
+        exponent: 65_537,
+    };
+    let ecc = |curve| EkPublicKey::Ecc {
+        curve,
+        x: vec![1],
+        y: vec![1],
+    };
+    let keys = [
+        rsa(2048),
+        rsa(3072),
+        rsa(4096),
+        ecc(ek_cert::EccCurve::NistP256),
+        ecc(ek_cert::EccCurve::NistP384),
+        ecc(ek_cert::EccCurve::NistP521),
+    ];
+    for (slot, held) in [
+        (Slot::L1, 0),
+        (Slot::H1, 0),
+        (Slot::H6, 1),
+        (Slot::H7, 2),
+        (Slot::L2, 3),
+        (Slot::H2, 3),
+        (Slot::H3, 4),
+        (Slot::H4, 5),
+    ] {
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(slot.holds(key), i == held, "{slot:?} {i}");
+        }
+    }
+    // A 2047-bit modulus is not RSA 2048.
+    let short = EkPublicKey::Rsa {
+        modulus: [vec![0x7F], vec![0; 255]].concat(),
+        exponent: 65_537,
+    };
+    assert!(!Slot::L1.holds(&short));
+}
+
+#[test]
 fn the_ek_policy_digests_are_the_profiles() {
     // Credential Profile A.2: PolicyA = PolicySecret(TPM_RH_ENDORSEMENT)
     // with an empty policyRef; PolicyC = PolicyAuthorizeNV over the policy
@@ -546,11 +587,17 @@ fn tpm_endorsement_a_certificate_for_another_key_warns() {
         0x01C0_0002,
         &test_pki::ek_certificate_for(&other, &issuing, manufacturer),
     );
-    let report = run_check(&anchors_of(&[&root], &[&issuing]));
+    let anchors = anchors_of(&[&root], &[&issuing]);
+    let report = run_check(&anchors);
     assert_eq!(report.state, EndorsementState::Warn, "{report:#?}");
     assert!(report.certificates[0]
         .detail
-        .contains("not for this TPM's endorsement key"));
+        .contains("not the RSA 2048 key the profile stores"));
+    // Also when that ECC EK is persistent: the certificate stays the wrong
+    // one for the L-1 index, and is never reported as an RSA EK's.
+    tpm.persist(Slot::L2.default_template().unwrap(), 0x8101_0001);
+    let report = run_check(&anchors);
+    assert_eq!(report.state, EndorsementState::Warn, "{report:#?}");
 }
 
 #[test]
@@ -594,7 +641,9 @@ fn tpm_endorsement_a_credential_bound_to_another_key_is_refused_by_the_tpm() {
             ctx: &mut ctx,
             before_command: &mut always,
         };
-        let found = find_storage_key(&mut run).unwrap_or_else(|_| panic!("the storage key"));
+        let found = find_storage_key(&mut run, false)
+            .unwrap_or_else(|_| panic!("the storage key"))
+            .expect("not in lockout");
         let storage = found.handle;
         // Bound to a Name the storage key does not have.
         let mut wrong_name = run.ctx.read_public(storage).unwrap().1.value().to_vec();
@@ -929,12 +978,17 @@ fn tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key() {
     assert_eq!(report.state, EndorsementState::Pass, "{report:#?}");
     assert_eq!(report.certificates.len(), 2);
 
-    // Without the record, only the original key is known.
+    // Without the record, only the original key is known, and it is not
+    // persisted either: the check derives nothing it could not use.
+    crate::tpm::evict_persistent_srk().expect("evict the original key");
     let empty = crate::test_tmp_dir("endorsement-lockout-unrecorded");
     let _ = std::fs::remove_dir_all(&empty);
     std::fs::create_dir_all(&empty).unwrap();
     std::env::set_var("IRLUME_STATE_DIR", &empty);
+    let derived = || super::super::ORIGINAL_DERIVATIONS.with(std::cell::Cell::get);
+    let before = derived();
     let report = run_check(&anchors);
+    assert_eq!(derived(), before, "no derivation during the lockout");
     let _ = std::fs::remove_dir_all(&empty);
     assert_eq!(report.state, EndorsementState::Unknown, "{report:#?}");
     assert_eq!(report.certificates.len(), 2);

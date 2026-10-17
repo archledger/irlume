@@ -430,14 +430,20 @@ sections 2 to 4 left open:
   an empty authValue, so a password session gives it. It is found without
   persisting or writing anything: ADR-0034's recorded DA-exempt key when it
   is at its handle with its recorded Name, else the original key at its
-  handle or derived for the request and flushed. During a lockout
-  (`inLockout` in `TPM_PT_PERMANENT`) the test runs under the DA-exempt key
-  and not under the original one, which reads `unknown`.
+  handle or derived for the request and flushed. An error reading the
+  recorded DA-exempt key is `unknown`, as it is for sealing; an original
+  key that cannot be read is replaced by a derivation, as for sealing.
+  During a lockout (`inLockout` in `TPM_PT_PERMANENT`) the test runs under
+  the DA-exempt key; without it the original key is neither looked for nor
+  derived, and the test reads `unknown`.
 - **The EK.** Any persistent endorsement primary (0x81010000 to 0x8101FFFF,
   not only 0x81010001) is used when its public key is the certificate's;
   otherwise the EK is derived under the endorsement hierarchy's empty
   authorization and flushed after the test. A template index is used only
-  when it holds exactly one TPMT_PUBLIC, with no bytes after it.
+  when it holds exactly one TPMT_PUBLIC, with no bytes after it. When a
+  listed persistent primary cannot be read, a derived key that differs from
+  the certificate's is `unknown`, not `warn`: the unread one may be the
+  certificate's.
 - **Evidence.** `warn` comes from TPM2_ActivateCredential returning
   `TPM_RC_INTEGRITY`, or `TPM_RC_VALUE` on its second parameter (the
   encrypted seed), or releasing a credential other than the one made. Any
@@ -456,7 +462,10 @@ sections 2 to 4 left open:
   supplies the hook from the request's deadline.
 - **Order of work per certificate.** A chain refused in software is `warn`
   before any TPM command for that certificate, so no later TPM failure or
-  deadline turns it `unknown`. A persistent EK with the certificate's key is
+  deadline turns it `unknown`. So is a certificate whose key is not of the
+  algorithm and size of the EK the profile stores its index's certificate
+  for (an ECC certificate at the RSA 2048 index), whichever of the TPM's
+  EKs it names. A persistent EK with the certificate's key is
   looked for before the template and nonce indices, which only a derivation
   needs. The storage key is found once per request, by the first same-TPM
   test, and released after the last.

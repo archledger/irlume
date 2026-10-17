@@ -410,8 +410,10 @@ Closing that gap would need a TEE/enclave path (out of scope today; noted).
   the original machine can reach them. This is the Hello-vs-irlume delta above.
 - irlume does not lock its envelopes out of the TPM after early boot, as
   BitLocker does by extending PCR 11: a live root process could still ask
-  the daemon or read its memory, on most installs the window could not close
-  before host userspace, and a resume from hibernation would reopen it
+  the daemon for the keyring secret, and read its memory unless the host sets
+  Yama's ptrace scope 3 and kernel lockdown; on most installs the window
+  could not close before host userspace; and hibernation would reopen it and
+  write the key held for it into the image
   ([ADR-0035](adr/0035-no-phase-locked-daemon-key.md)).
 - No-TPM hosts store plaintext-at-rest embeddings (root-only). A software
   passphrase-encrypted mode (Argon2id, like the recovery envelope) could

@@ -47,18 +47,27 @@ boundary. docs/SECURITY_AT_REST.md's attacker table, row "Root on the live
 original machine": "Game over: root can ask the daemon to unseal". Two paths
 stay open to such a root process whatever the TPM refuses:
 
-- **Asking irlumed.** `UnsealKeyring` releases the sealed login password,
-  KDE wallet key or GNOME keyring token to a root peer on a login or unlock
-  service with no face match, for the fingerprint path; its wire
-  documentation says "a live root attacker in a login context can obtain it"
-  (`Request::UnsealKeyring`, ADR-0003).
-- **Reading irlumed's memory.** irlume is not enclave-isolated, and root can
-  read the daemon's memory (SECURITY_AT_REST.md, "Residual gaps"). Under the
-  proposal that memory would hold the daemon key for the whole uptime.
+- **Asking irlumed, for the keyring secret.** `UnsealKeyring` releases the
+  sealed login password, KDE wallet key or GNOME keyring token to a root peer
+  on a login or unlock service with no face match, for the fingerprint path;
+  its wire documentation says "a live root attacker in a login context can
+  obtain it" (`Request::UnsealKeyring`, ADR-0003). A phase lock would not
+  change that.
+- **Reading irlumed's memory, for everything.** irlume is not
+  enclave-isolated, and root can read the daemon's memory
+  (SECURITY_AT_REST.md, "Residual gaps"). Under the proposal that memory
+  would hold the daemon key for the whole uptime.
 
-So a phase lock helps only against a root process that can neither send
-irlumed a privileged request nor read its memory. irlume does not have that
-posture today.
+The template key and the templates are different: irlumed never sends them
+to a peer, so asking irlumed does not reach them. A phase lock would keep the
+template envelopes from a root process that also cannot read irlumed's
+memory. That needs a host that blocks both ways root reads another process:
+Yama's ptrace scope 3, where "no processes may use ptrace with PTRACE_ATTACH
+nor via PTRACE_TRACEME" (kernel `Documentation/admin-guide/LSM/Yama.rst`;
+modes 0 to 2 leave root able to attach), and kernel lockdown, which
+restricts direct access to the running kernel image (`/dev/mem`, `/dev/kmem`,
+`/dev/kcore`, BPF and kprobes among others, `kernel_lockdown(7)`). That is the benefit this ADR weighs: the privacy of
+the templates against a live root process, on hosts hardened that far.
 
 ### What the mechanisms give on the machines irlume runs on
 
@@ -74,11 +83,17 @@ the UAPI group's registries:
    `systemd.tpm2_measured_os=` says so. On a GRUB boot of a plain kernel the
    units do not run, PCR 11 stays zero for the whole boot, and any process
    that can extend PCRs can give it any "phase" value.
-2. **Policies limited to the initrd need the UKI builder's key.**
+2. **Policies limited to the initrd need a measured UKI.** In v262,
    `systemd-measure --policyref`, `systemd-cryptenroll
-   --tpm2-public-key-policyref=initrd` and `ukify --sign-initrd-pcrs` arrived
-   in v262, and they sign with the key whoever builds the UKI holds: a
-   distribution or the machine's owner, not irlume.
+   --tpm2-public-key-policyref=initrd` and `ukify --sign-initrd-pcrs` sign
+   with the key whoever builds the UKI holds: a distribution or the machine's
+   owner, not irlume. systemd main (commit `46bdee6`, 2026-10-14, after v262)
+   falls back, for NvPCRs, to a write policy bound to the current value of
+   PCR 11 when the UKI carries no signed initrd policy. Its NEWS notes that
+   such a policy changes "whenever the UKI changes, so this is mostly useful
+   where the value of PCR 11 in the initrd is predictable". A gate built that
+   way needs no builder key, but still a measured UKI, and its policy must be
+   remade at each UKI update.
 3. **irlumed starts late.** Its unit is ordered `After=multi-user.target`
    (`packaging/systemd/irlumed.service`). A window that irlumed itself closes
    is open to every root service that starts before it. Closing it before
@@ -99,13 +114,19 @@ the UAPI group's registries:
    so they cannot hold a lock. UAPI.7 lists a Linux user for every one of
    PCR 8 to 15; an extra extend of PCR 11, for example, breaks systemd
    secrets bound to its phase paths.
-6. **Hibernation reopens every lock.** A resume from S4 is a TPM Restart
-   (`Startup(CLEAR)` after `Shutdown(STATE)`): every PCR returns to its
-   initial value and every STCLEAR lock clears (Part 1, 9.2.3.2; Part 3,
-   9.3.1), while the restored userspace, including any root process that was
-   running, comes back with the window open. systemd has the same open
-   problem for its own phases (systemd issue #34488). S3 and s2idle keep the
-   locks.
+6. **Hibernation reopens every lock, and writes the key to disk.** A resume
+   from S4 is a TPM Restart (`Startup(CLEAR)` after `Shutdown(STATE)`): every
+   PCR returns to its initial value and every STCLEAR lock clears (Part 1,
+   9.2.3.2; Part 3, 9.3.1), while the restored userspace, including any root
+   process that was running, comes back with the window open. systemd has the
+   same open problem for its own phases (systemd issue #34488). S3 and s2idle
+   keep the locks. Before that, hibernation "creates a snapshot image of
+   memory to be written into persistent storage" (kernel
+   `Documentation/admin-guide/pm/sleep-states.rst`), and a key held for the
+   whole uptime is in it. On a host whose image or swap is not encrypted, a
+   thief who takes the disk afterwards reads the key and opens every
+   envelope, which the seal alone protects today: the template key exists in
+   memory only during a request (ADR-0025 section 3).
 7. **A restart cannot reopen the window.** Without a key kept outside the
    process, every restart of irlumed would end face login until the next
    boot. systemd's file descriptor store can keep the key in a memfd: "a
@@ -129,9 +150,12 @@ the UAPI group's registries:
 - Face login would depend on how irlumed stops: a stop and start, or a crash
   loop that leaves the unit failed, would end it until the next boot (points
   3 and 7 above).
-- Hibernation would need its own handling (point 6): inhibit it, drop the
-  key before it and require a reboot, or re-close the window from the resume
-  path, which no supported init system does today.
+- Hibernation would need its own handling (point 6): the key would have to
+  be dropped before the snapshot, with a reboot to get it back, or the
+  hibernation image encrypted independently, and the window re-closed from
+  the resume path, which no supported init system does today. Without that,
+  a host that hibernates to an unencrypted image would lose today's
+  protection against disk theft.
 - It would take a TPM resource irlume does not hold today: an anchored NV
   index with its own registry range, or a PCR another component uses.
 
@@ -146,15 +170,18 @@ boot-phase window.
 
 ### 2. Why
 
-1. Under irlume's stated trust boundary the lock closes neither path a live
-   root process already has: it can ask irlumed (`UnsealKeyring`) and read
-   irlumed's memory. The proposal would make the second path easier, since
-   the key would sit in memory for the whole uptime.
+1. The lock would not protect the keyring secret, which root can ask irlumed
+   for (`UnsealKeyring`). It would protect the template envelopes only from a
+   root process that cannot read irlumed's memory, on hosts with Yama's
+   ptrace scope 3 and kernel lockdown, and on every other host it would make
+   reading memory more rewarding, since the key would sit there for the
+   whole uptime.
 2. On most installs the window cannot close before host userspace: PCR 11
    phases need a measured UKI, initrd-only policies need the UKI builder's
    signing key, and irlumed starts after `multi-user.target`.
 3. Every resume from hibernation reopens the window for the userspace it
-   restores.
+   restores, and every hibernation image holds the key, so a host without an
+   encrypted image would trade protection against disk theft for it.
 4. A stop and start, an upgrade outside a restart job, or a crash loop that
    leaves the unit failed would turn face login off until the next boot.
    Surviving the other restarts means keeping the key in PID 1's file
@@ -174,11 +201,18 @@ Revisit when all of these hold:
 
 - irlume no longer releases a sealed secret to root without a check that
   root alone cannot satisfy, so a TPM lock would close the last path;
-- the supported distributions boot measured UKIs with signed initrd-phase
-  policies by default, so a key can be unsealed in the initrd and the window
-  closed before host userspace;
+- the supported distributions boot measured UKIs by default, with signed
+  initrd-phase policies or a predictable PCR 11 for systemd's fallback, so a
+  key can be unsealed in the initrd and the window closed before host
+  userspace;
 - a resume from hibernation re-closes such windows before the restored
-  userspace runs (systemd issue #34488, or an equivalent).
+  userspace runs (systemd issue #34488, or an equivalent), and the key can be
+  kept out of the hibernation image.
+
+The template-envelope benefit (Context, "What it would protect against, as
+irlume runs today") can also be raised on its own, for hosts hardened with
+Yama's ptrace scope 3 and kernel lockdown, if the maintainer judges it worth
+the costs above for them.
 
 ## Consequences
 

@@ -42,9 +42,12 @@ misread (`crates/irlume-cli/src/commands.rs`, `uninstall.rs`,
 - The PPA test is a substring match on `ppa.launchpadcontent.net/archledger/
   irlume`, which `.../archledger/irlume-nightly` also matches: the nightly
   PPA reads as the release PPA, and uninstall removes the release PPA.
-- `pacman -Qq irlume` succeeds for a package that provides `irlume`, but its
-  output, the actual package name, is discarded; uninstall's
-  `pacman -Rns irlume` then fails, since `-R` does not resolve provides.
+- `pacman -Qq irlume` succeeds for a package that provides `irlume` (pacman's
+  `-Q` falls back to `alpm_find_satisfier` when no installed package has the
+  name, `src/pacman/query.c`; on minihost's pacman 7.1.0 `pacman -Qq sh`
+  prints `bash`), but its output, the actual package name, is discarded;
+  uninstall's `pacman -Rns irlume` then fails, since `-R` does not resolve
+  provides.
 - `version_gt` keeps the leading all-digit fields of each dot-separated part,
   so `0.15.0^...` and `0.15.0+git...` parse as `0.15`, and `version_base`
   keeps a caret version whole.
@@ -124,17 +127,26 @@ the package version are reported by `irlume doctor` (section 4).
   check. The parity script checks it beside the release recipe.
 - **PPA.** `scripts/ppa-nightly.sh` runs from a user timer on minihost, which
   already runs user timers with lingering enabled. It updates a dedicated
-  clone, does nothing when `main` has not moved since its last successful
-  upload, builds the source package from `main`'s commit in the same Ubuntu
-  container as a release (`packaging/ppa/build-ppa-container.sh`, given the
-  commit and the nightly version), signs it with the key Launchpad has
-  (fingerprint F350 5339 8E3C 80FE 2089 1B82 C10B 8492 BD7F 30C6) through
-  gpg-agent, uploads it with dput, and records the commit only once
-  `scripts/verify-ppa-publish.py` (with `PPA_NAME=irlume-nightly`) sees the
-  binary published. A failure at any step leaves the last recorded commit, so
-  the next night tries again, and is logged to the user journal.
-  At most one upload a day keeps two or three uploads, 2.5 to 3.7 GB, on disk
-  at once, inside the 8 GiB quota (Context).
+  clone and derives the nightly version from `main` (section 2), so a release
+  tag on an already uploaded commit is a new input too. It builds the source
+  package from that commit in the same Ubuntu container as a release
+  (`packaging/ppa/build-ppa-container.sh`, given the commit and the version),
+  signs it with the key Launchpad has (fingerprint F350 5339 8E3C 80FE 2089
+  1B82 C10B 8492 BD7F 30C6) through gpg-agent, uploads it with dput, and then
+  waits for `scripts/verify-ppa-publish.py` (with `PPA_NAME=irlume-nightly`)
+  to see the binary published. Launchpad never accepts a version twice in a
+  PPA, also after a deletion, so the script records each step's state:
+  - the version it last saw published: when the derived version equals it,
+    there is nothing to do;
+  - a version it uploaded and has not yet seen published: the next run only
+    verifies it again, never uploads it again;
+  - a version whose build failed: the next run uploads the same commit with
+    the next PPA revision (`-0ppa2`, then `-0ppa3`), as a release's failed
+    build does (`verify-ppa-publish.py`'s own advice).
+  A failure before the upload (the build, the signature, dput) records
+  nothing, so the next night starts over; every failure is logged to the user
+  journal. At most one upload a day keeps two or three uploads, 2.5 to
+  3.7 GB, on disk at once, inside the 8 GiB quota (Context).
 
 ### 4. irlume's tools know the channel
 
@@ -178,7 +190,9 @@ says so, and that:
   archledger/irlume-nightly` then `dnf distro-sync irlume`; removing the
   nightly PPA then installing the release PPA's version with
   `--allow-downgrades`; installing `irlume` from the AUR, which replaces
-  `irlume-git`.
+  `irlume-git`, in the same transaction as `irlume-kcm` when
+  `irlume-kcm-git` is installed (`yay -S irlume irlume-kcm`), since each
+  release package replaces only its own nightly counterpart.
 
 ### 6. Owner setup, once
 
@@ -232,9 +246,19 @@ These need the maintainer's accounts, and are done once:
   installed, `irlume-kcm-git`.
 - `version_gt` and `version_base` read `0.15.0^20261017git3c162b8`,
   `0.15.0+git139.g3c162b83-0ppa1~resolute1` and `0.15.0.r139.g3c162b83-1` as
-  `0.15.0`: not newer than the v0.15.0 tag, and older than v0.15.1.
+  `0.15.0`: not newer than the v0.15.0 tag, and older than v0.15.1. With a
+  nonzero patch field, `0.15.1+git3.g...`, `0.15.1^...` and `0.15.1.r3.g...`
+  read as `0.15.1`: not older than the v0.15.1 tag, newer than v0.15.0, older
+  than v0.15.2.
 - The `irlume-git` recipe builds in a clean Arch container, its package
   provides `irlume`, and the parity script checks it.
-- `scripts/ppa-nightly.sh` uploads nothing when `main` has not moved, builds
-  the version above from a given commit, and keeps its last recorded commit
-  when signing, upload or publication fails.
+- `scripts/ppa-nightly.sh`, with Launchpad, dput and the container build
+  faked:
+  - uploads nothing when the derived version is the one last published;
+  - uploads when a release tag lands on the already published commit
+    (`0.15.0+git139...` becomes `0.16.0+git0...`);
+  - after an accepted upload whose publication it has not seen, verifies
+    again and does not upload;
+  - after a failed build, uploads the same commit with the next PPA
+    revision;
+  - records nothing when the build, the signature or dput fails.

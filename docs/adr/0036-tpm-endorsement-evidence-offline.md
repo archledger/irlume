@@ -123,6 +123,14 @@ never opens the TPM: irlumed answers a new root-only request (section 4).
 | `warn` | A stored certificate does not match the TPM's EK; on a chain that reaches a pinned root, a signature, a CA constraint or the leaf's EK profile (section 2.3) fails; or the same-TPM test fails with the result section 2.4 names, so irlume's storage key is not in the TPM the certificate names. Each points at a swapped device, an emulator or a wrong `IRLUME_TCTI`. |
 | `unknown` | The chain cannot be completed: its issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), or it is signed with an algorithm irlume does not accept, such as SHA-1; neither means the TPM is not genuine. Also: irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); the same-TPM test hit an operational error (section 2.4); or the TPM could not be read in the time allowed. |
 
+A TPM may store several EK certificates (the low-range RSA and ECC ones, say).
+Each is judged on its own by the rows above, and the check reports the worst
+evidence first, so a bad certificate is never hidden by a good one and a
+genuine TPM is not refused over an optional certificate irlume cannot read:
+`warn` when any certificate is in a `warn` case; otherwise `pass` when any
+passes; otherwise `unknown` when any cannot be judged; otherwise `info`. The
+detail names each certificate's result by its index and algorithm.
+
 The check never reports `fail`: it judges evidence, and irlume works on a TPM
 it cannot vouch for.
 
@@ -177,11 +185,13 @@ it cannot vouch for.
    run during a lockout and reads `unknown`.
 
 Each request reads the endorsement hierarchy's state (section 3) and the
-certificate indices again. irlumed keeps the EK derivation, the chain result
-and the same-TPM result in memory for the rest of the boot, and reuses them
-only while the certificate bytes and the storage key's Name are unchanged and
-the hierarchy still allows the test, since `TPM2_HierarchyControl` and
-`TPM2_HierarchyChangeAuth` can change that state within a boot.
+certificate indices again, and matches the EK and runs the same-TPM test
+again, since `TPM2_HierarchyControl`, `TPM2_HierarchyChangeAuth` and
+`TPM2_ChangeEPS` can change what they answer within a boot without changing
+a certificate. irlumed keeps only the software chain result in memory, keyed
+by the certificate's bytes: a request that changes nothing in the TPM costs
+the reads, at most one EK derivation per certificate and one
+ActivateCredential.
 
 ### 3. The endorsement hierarchy
 
@@ -294,6 +304,10 @@ check.
 - A low-range certificate whose EK uses the template at 0x01C00004 with the
   nonce at 0x01C00003 matches its EK; derived from the default template alone
   it would not.
+- Several certificates: one that passes beside one signed with SHA-1 reads
+  `pass`, naming the other as unverifiable; one that passes beside one that
+  does not match its EK reads `warn`; one that cannot be judged beside none
+  that passes reads `unknown`.
 - Every shipped intermediate chains to a shipped root, and every file's
   SHA-256 matches the manifest.
 - The NV reader tolerates trailing bytes and the `0x10 0x01 0x00` header, and

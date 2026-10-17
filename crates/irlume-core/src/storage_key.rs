@@ -2034,8 +2034,11 @@ fn has_envelope(dir: &Path) -> Result<bool> {
     Ok(!envelope_paths(dir)?.is_empty())
 }
 
+/// The record's file name in the state directory.
+const RECORD_FILE: &str = "tpm-storage-key";
+
 fn record_path() -> PathBuf {
-    irlume_common::state_dir().join("tpm-storage-key")
+    irlume_common::state_dir().join(RECORD_FILE)
 }
 
 /// An exclusive `flock` on `state_dir()/.tpm-storage-key.lock` for each
@@ -2101,6 +2104,120 @@ impl Drop for RecordLock {
             }
         }
     }
+}
+
+/// A storage key irlumed's record keeps, for uninstall's report of the keys
+/// it leaves persisted (ADR-0034, Phase 3 amendment, "Uninstall").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptKey {
+    pub role: KeptKeyRole,
+    pub handle: u32,
+    /// The key's TPM name in hex, at most `MAX_NAME_HEX` characters.
+    pub name: String,
+}
+
+/// What irlumed's record keeps a [`KeptKey`] as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptKeyRole {
+    /// The original storage key, recorded by a start whose derivation of
+    /// the original template gave it.
+    Original,
+    /// The DA-exempt key irlumed records.
+    DaExempt,
+    /// A DA-exempt key the recorded one superseded.
+    Superseded,
+}
+
+/// The storage keys the record under `state_dir` keeps: the original key's
+/// entry when a derivation matched it, the recorded DA-exempt key, and each
+/// key it superseded. Uninstall reads them before its wipe removes the
+/// record, and after its evictions reports each one still persisted
+/// ([`still_persisted_through`]). The record is untrusted where it is
+/// writable offline (§5): it chooses what is reported, never what is
+/// evicted, and only owner persistent handles with a bounded hex name come
+/// out of it. No record is none.
+///
+/// # Errors
+///
+/// When a record is there and cannot be read (a symbolic link, not a
+/// regular file, or larger than `MAX_RECORD_BYTES`), is malformed, or is
+/// from a newer release, so that it never reads as keeping nothing.
+pub fn kept_keys_in(state_dir: &Path) -> Result<Vec<KeptKey>> {
+    let path = state_dir.join(RECORD_FILE);
+    let bytes = match crate::envelope::read_bounded(&path, MAX_RECORD_BYTES) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(format!("{}: {e}", path.display()))),
+    };
+    // serde's message can quote the record, which is untrusted: one bounded
+    // line with no control characters.
+    let record: Record = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::Protocol(format!(
+            "{}: {}",
+            path.display(),
+            irlume_common::single_line(&e.to_string(), MAX_DETAIL_CHARS)
+        ))
+    })?;
+    if record.version > RECORD_VERSION {
+        return Err(Error::Protocol(format!(
+            "{}: written by a newer irlume (version {})",
+            path.display(),
+            record.version
+        )));
+    }
+    let mut superseded = record.superseded;
+    bound_superseded(&mut superseded);
+    let original = record
+        .original
+        .filter(|original| original.matched)
+        .map(|original| (KeptKeyRole::Original, original.handle, original.name));
+    let recorded = record
+        .persisted
+        .map(|persisted| (KeptKeyRole::DaExempt, persisted.handle, persisted.name));
+    let superseded = superseded
+        .into_iter()
+        .map(|kept| (KeptKeyRole::Superseded, kept.handle, kept.name));
+    let mut kept: Vec<KeptKey> = Vec::new();
+    for (role, handle, name) in original.into_iter().chain(recorded).chain(superseded) {
+        let valid = tpm::OWNER_PERSISTENT.contains(&handle)
+            && name.len() <= MAX_NAME_HEX
+            && unhex(&name).is_some();
+        if valid
+            && !kept
+                .iter()
+                .any(|key| key.handle == handle && key.name == name)
+        {
+            kept.push(KeptKey { role, handle, name });
+        }
+    }
+    Ok(kept)
+}
+
+/// The keys of `kept` still persisted at their handle with their TPM name,
+/// on the TPM `tcti` selects, as uninstall's evictions take it (#1088). It
+/// reads, never evicts; with nothing kept, no TPM is opened.
+///
+/// # Errors
+///
+/// When the TPM cannot be opened or a handle cannot be read.
+pub fn still_persisted_through(tcti: Option<&str>, kept: &[KeptKey]) -> Result<Vec<KeptKey>> {
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    still_persisted(&mut tpm::DaExemptKeyTpm::open_through(tcti)?, kept)
+}
+
+fn still_persisted(tpm: &mut impl KeyTpm, kept: &[KeptKey]) -> Result<Vec<KeptKey>> {
+    let mut left = Vec::new();
+    for key in kept {
+        let Some(name) = unhex(&key.name) else {
+            continue;
+        };
+        if tpm.name_at(key.handle)?.as_deref() == Some(name.as_slice()) {
+            left.push(key.clone());
+        }
+    }
+    Ok(left)
 }
 
 /// The record, or an empty one when there is none. A record that is
@@ -3110,6 +3227,118 @@ mod tests {
     /// `storage::list_users` would read as an account, and it round-trips.
     /// The state, template-key and keyring directories in a fresh temporary
     /// tree until dropped. Hold `testenv::ENV_LOCK` first.
+    /// Uninstall's read of the keys the record keeps (ADR-0034, Phase 3
+    /// amendment, "Uninstall"): the original key only when a derivation
+    /// matched it, the recorded DA-exempt key and each superseded one, once
+    /// each, and nothing outside the owner persistent handles or without a
+    /// hex name. No record is none; one that cannot be read, is malformed or
+    /// is from a newer release is an error, never none.
+    #[test]
+    fn uninstall_reads_the_keys_the_record_keeps() {
+        let dir = crate::test_tmp_dir("storage-key-kept-keys");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Path::new(&dir);
+        let none = kept_keys_in(dir);
+        let at = |handle, name: &[u8]| Persisted {
+            handle,
+            name: hex(name),
+        };
+        let write = |record: &Record| {
+            std::fs::write(dir.join(RECORD_FILE), serde_json::to_vec(record).unwrap()).unwrap();
+            kept_keys_in(dir)
+        };
+        let record = Record {
+            original: Some(Original {
+                handle: 0x8100_0001,
+                name: hex(b"original"),
+                matched: true,
+            }),
+            superseded: vec![
+                at(0x8101_0002, b"weak"),
+                at(0x8101_0002, b"weak"),
+                at(0x8180_0000, b"platform"),
+                Persisted {
+                    handle: 0x8101_0004,
+                    name: "not hex".into(),
+                },
+                at(0x8101_0005, b"ours"),
+            ],
+            ..persisted_record(0x8101_0005, b"ours")
+        };
+        let kept = write(&record);
+        let unmatched = write(&Record {
+            original: Some(Original {
+                handle: 0x8100_0001,
+                name: hex(b"original"),
+                matched: false,
+            }),
+            ..Record::default()
+        });
+        let newer = write(&Record {
+            version: RECORD_VERSION + 1,
+            ..record.clone()
+        });
+        std::fs::write(
+            dir.join(RECORD_FILE),
+            r#"{"version":1,"persisted":"\u001b]0;x\u0007"}"#,
+        )
+        .unwrap();
+        let malformed = kept_keys_in(dir);
+        std::fs::remove_file(dir.join(RECORD_FILE)).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.join(RECORD_FILE)).unwrap();
+        let linked = kept_keys_in(dir);
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(none.expect("no record"), Vec::new());
+        let key = |role, handle, name: &[u8]| KeptKey {
+            role,
+            handle,
+            name: hex(name),
+        };
+        assert_eq!(
+            kept.expect("the kept keys"),
+            vec![
+                key(KeptKeyRole::Original, 0x8100_0001, b"original"),
+                key(KeptKeyRole::DaExempt, 0x8101_0005, b"ours"),
+                key(KeptKeyRole::Superseded, 0x8101_0002, b"weak"),
+            ]
+        );
+        assert_eq!(unmatched.expect("the kept keys"), Vec::new());
+        assert!(newer.is_err(), "{newer:?}");
+        let malformed = malformed.expect_err("a malformed record").to_string();
+        assert!(!malformed.chars().any(char::is_control), "{malformed:?}");
+        assert!(linked.is_err(), "{linked:?}");
+    }
+
+    /// After uninstall's evictions, a kept key is reported only while its
+    /// handle still holds its name: not once it is gone or another key took
+    /// the handle.
+    #[test]
+    fn a_kept_key_is_left_only_while_its_handle_holds_its_name() {
+        let mut tpm = FakeTpm::new();
+        tpm.objects.insert(0x8101_0002, b"weak".to_vec());
+        tpm.objects.insert(0x8101_0003, b"other".to_vec());
+        let key = |handle, name: &[u8]| KeptKey {
+            role: KeptKeyRole::Superseded,
+            handle,
+            name: hex(name),
+        };
+        let kept = [
+            key(0x8101_0002, b"weak"),
+            key(0x8101_0003, b"ours"),
+            key(0x8101_0004, b"gone"),
+        ];
+        assert_eq!(
+            still_persisted(&mut tpm, &kept).expect("the check"),
+            vec![key(0x8101_0002, b"weak")]
+        );
+        assert_eq!(
+            still_persisted_through(Some("not a transport"), &[]).expect("nothing kept"),
+            Vec::new()
+        );
+    }
+
     struct Sandbox {
         dir: String,
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,

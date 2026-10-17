@@ -7,6 +7,24 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume uninstall` reports the storage keys irlumed's record keeps that
+  are still persisted after its evictions (ADR-0034, Phase 3 amendment,
+  "Uninstall"): the original key when a start's derivation matched it, the
+  recorded DA-exempt key, and each key it superseded, such as a weak
+  DA-exempt key a replacement left. It reads the record before the wipe
+  removes it, from every state root irlumed may use (the unit's first,
+  even under an account's home), and after the evictions checks each key
+  by handle and TPM name on the TPM they went through. A key still there
+  gets one `TPM storage key left` line with its handle, its TPM name and
+  the manual `tpm2_evictcontrol` command, with the check to run first and
+  the warning not to clear the whole TPM; the commands pass the transport
+  irlumed's unit sets with `-T`, quoted, since tpm2-tools does not read
+  `IRLUME_TCTI`. The
+  record is advisory: it chooses what is reported, never what is evicted,
+  and a key no derivation gives is never evicted. A record or a TPM that
+  cannot be read is named with the way to list the handles by hand. The
+  TUI's uninstall runs the same command.
+
 - `irlume doctor`'s `tpm-firmware` check reads every storage key irlume
   knows of for the ROCA fingerprint (ADR-0034, Phase 3 amendment; #1073
   item 2). irlumed's root-only `TpmReadiness` reply gains a per-key list

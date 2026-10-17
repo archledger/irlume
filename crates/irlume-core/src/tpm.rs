@@ -1062,6 +1062,15 @@ impl DaExemptKeyTpm {
             derived: None,
         })
     }
+
+    /// [`Self::open`] through `tcti`, as [`evict_persistent_srk_through`]
+    /// takes it.
+    pub(crate) fn open_through(tcti: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            ctx: open_context_through(tcti)?,
+            derived: None,
+        })
+    }
 }
 
 impl Drop for DaExemptKeyTpm {
@@ -4762,12 +4771,17 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// nowhere (so nothing can reach another TPM by accident) and no
     /// `IRLUME_SRK_HANDLE`, the explicit transport and a handle other than the
     /// default reach both keys, and a second pass finds the handle clean.
+    /// Through the same transport, of the keys a record keeps (ADR-0034,
+    /// Phase 3 amendment, "Uninstall") only the one no derivation gives, a
+    /// key with the DA-exempt template's shape and a random modulus as a
+    /// superseded weak key is, is still persisted afterwards.
     #[test]
     #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
     fn tpm_uninstall_evicts_both_keys_through_the_transport_irlumed_names() {
         const ORIGINAL: u32 = 0x8101_0010;
         const DA_EXEMPT: u32 = 0x8101_0011;
+        const SUPERSEDED: u32 = 0x8101_0012;
         require_swtpm();
         let _env = crate::testenv::ENV_LOCK
             .lock()
@@ -4778,7 +4792,9 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         };
         let before = handles();
         assert!(
-            !before.contains(&ORIGINAL) && !before.contains(&DA_EXEMPT),
+            [ORIGINAL, DA_EXEMPT, SUPERSEDED]
+                .iter()
+                .all(|handle| !before.contains(handle)),
             "the handles this test uses are taken: {before:x?}"
         );
         {
@@ -4789,16 +4805,31 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             let da_exempt = create_storage_key(&mut ctx, template).expect("the DA-exempt key");
             persist_at(&mut ctx, da_exempt, DA_EXEMPT);
         }
+        persist_child_at(da_exempt_srk_template().expect("template"), SUPERSEDED);
+        let kept: Vec<storage_key::KeptKey> = [
+            (storage_key::KeptKeyRole::Original, ORIGINAL),
+            (storage_key::KeptKeyRole::DaExempt, DA_EXEMPT),
+            (storage_key::KeptKeyRole::Superseded, SUPERSEDED),
+        ]
+        .into_iter()
+        .map(|(role, handle)| storage_key::KeptKey {
+            role,
+            handle,
+            name: storage_key::hex(&name_at_handle(handle).expect("a persisted key")),
+        })
+        .collect();
         let tcti = std::env::var("IRLUME_TCTI").expect("the swtpm transport");
         let handle_override = std::env::var_os("IRLUME_SRK_HANDLE");
         std::env::remove_var("IRLUME_SRK_HANDLE");
-        let (da_exempt, original, again) = {
+        let (kept_before, da_exempt, original, again, left) = {
             let _nowhere = crate::testenv::NoTpm::set();
             let handle = srk_handle_for(Some("0x81010010"));
             (
+                storage_key::still_persisted_through(Some(&tcti), &kept),
                 evict_da_exempt_srks_through(Some(&tcti)),
                 evict_persistent_srk_through(Some(&tcti), handle),
                 evict_persistent_srk_through(Some(&tcti), srk_handle_for(Some("81010010"))),
+                storage_key::still_persisted_through(Some(&tcti), &kept),
             )
         };
         if let Some(value) = handle_override {
@@ -4806,11 +4837,18 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         }
         evict_fixture_at(ORIGINAL);
         evict_fixture_at(DA_EXEMPT);
+        evict_fixture_at(SUPERSEDED);
         let after = handles();
 
+        assert_eq!(kept_before.expect("the kept keys"), kept);
         assert_eq!(da_exempt.expect("the DA-exempt scan"), vec![DA_EXEMPT]);
         assert_eq!(original.expect("the original key"), SrkEviction::Evicted);
         assert_eq!(again.expect("a second pass"), SrkEviction::Absent);
+        assert_eq!(
+            left.expect("the kept keys"),
+            vec![kept[2].clone()],
+            "only the key no derivation gives is left"
+        );
         assert_eq!(
             after, before,
             "the test leaves the TPM's handles as it found them"

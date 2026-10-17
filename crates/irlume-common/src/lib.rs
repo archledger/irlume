@@ -36,6 +36,7 @@ pub mod split_wire;
 #[cfg(test)]
 mod guarded_split_wire_tests;
 pub mod storage_encryption;
+pub mod tpm_endorsement;
 pub mod tpm_readiness;
 
 pub use storage_encryption::StorageDirectory;

@@ -370,6 +370,9 @@ pub use irlume_common::tpm_readiness::{
     TpmLockout,
 };
 
+mod endorsement;
+pub use endorsement::endorsement_report;
+
 /// The ASCII text of TPM property words: printable characters only, runs of
 /// padding spaces read as one.
 fn property_text(words: &[u32]) -> String {
@@ -5142,13 +5145,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
     /// The state, template-key and keyring directories pointed at a fresh
     /// temporary tree until dropped. Hold `testenv::ENV_LOCK` first.
-    struct StateDirs {
+    pub(crate) struct StateDirs {
         dir: String,
         previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
 
     impl StateDirs {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let dir = crate::test_tmp_dir(name);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(format!("{dir}/keyring")).expect("keyring dir");
@@ -5169,7 +5172,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         }
 
         /// Writes `env` as `user`'s keyring envelope.
-        fn store(&self, user: &str, env: &SealedEnvelope) {
+        pub(crate) fn store(&self, user: &str, env: &SealedEnvelope) {
             let bytes = serde_json::to_vec(env).expect("envelope json");
             std::fs::write(format!("{}/keyring/{user}.json", self.dir), bytes)
                 .expect("write the envelope");
@@ -6710,7 +6713,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// Fails the authorization of a DA-protected object (no noDA, an
     /// authValue) under `parent` until the TPM answers `TPM_RC_LOCKOUT`.
     /// swtpm starts with maxTries 3 (ADR-0034's swtpm experiments).
-    fn fail_until_lockout(ctx: &mut Context, parent: KeyHandle) {
+    pub(crate) fn fail_until_lockout(ctx: &mut Context, parent: KeyHandle) {
         use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
         let attrs = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)

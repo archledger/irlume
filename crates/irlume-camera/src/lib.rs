@@ -200,6 +200,7 @@ pub fn with_selected_split_camera_publication<R>(
 pub mod measurement;
 mod media_graph;
 mod mmap_capture;
+pub mod node_access;
 mod paired_processing;
 pub mod profiles;
 pub use paired_processing::process_pair_while_draining;
@@ -7615,16 +7616,19 @@ impl IrSession<'_> {
         // An alternation the emitter did not make, before, during or after the
         // burst, is not the emitter's (Amendment 2026-10-14).
         let emitter_active = emitter_before && self._mode.still_active();
-        // Only a split pair under the owner's experimental opt-in judges a
-        // YUYV burst at all: the sequential and IR-only routes do not require
-        // active-IR provenance, so a ceiling there would bypass the opt-in
-        // that confines this evidence (Amendment 2026-10-14). Elsewhere every
-        // YUYV burst stays without a ceiling, as before.
-        let optical_admitted = optical_provenance_admitted(&lease);
+        // Only a split pair under the owner's experimental opt-in, or one
+        // whose IR node is closed to every non-root program, judges a YUYV
+        // burst at
+        // all: the sequential and IR-only routes do not require active-IR
+        // provenance, so a ceiling there would bypass the confinement this
+        // evidence needs (Amendment 2026-10-14; the hardened-node alternative
+        // is Amendment 2026-10-17). Elsewhere every YUYV burst stays without
+        // a ceiling, as before.
+        let optical_admitted = optical_provenance_admitted(&lease, device);
         let qualified = match (format_white_level, content.as_ref(), judged_before) {
             (None, Some(_), Some(_)) if dec.pix == IrPixel::YuyvLuma && !optical_admitted => {
                 irlume_common::dlog!(
-                    "[ir] {}: no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on a split pair under the experimental opt-in",
+                    "[ir] {}: no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on a split pair under the experimental opt-in or on an access-hardened IR node",
                     camera_text(device)
                 );
                 None
@@ -8554,12 +8558,16 @@ fn ir_frame_disposition(mean: f64) -> IrFrameDisposition {
 /// Whether a qualified burst's alternation may stand in for missing
 /// illumination records (ADR-0031 §4, Amendment 2026-10-14): only on a
 /// split pair while the machine owner's experimental split opt-in is latched
-/// (ADR-0032, amendment 2026-10-13). Reads of the emitter control around a
-/// burst cannot exclude a change made and undone within it by another
-/// program with access to the camera, so this evidence stays inside that
-/// opt-in.
-fn optical_provenance_admitted(lease: &lease::CameraLease) -> bool {
-    lease.is_split_pair() && lease::experimental_split_trust()
+/// (ADR-0032, amendment 2026-10-13) or the IR node is closed to every
+/// non-root program (ADR-0031, amendment 2026-10-17). Reads of the emitter control around a
+/// burst cannot exclude a change made and undone within it by another program
+/// with access to the camera, so this evidence needs one of the two: the
+/// opt-in that accepts the residual, or a node no unprivileged program can
+/// open (measured fresh on the node itself, never assumed).
+fn optical_provenance_admitted(lease: &lease::CameraLease, ir_node: &str) -> bool {
+    lease.is_split_pair()
+        && (lease::experimental_split_trust()
+            || node_access::hardened(std::path::Path::new(ir_node)))
 }
 
 /// The per-frame illumination a burst's contributors carry as provenance:
@@ -13406,14 +13414,17 @@ mod tests {
             from += at + step.len();
         }
         // Amendment 2026-10-14: frame provenance reads the derived flags, only
-        // under the split opt-in; the camera's own `flags` keep driving the
-        // selection and the statistics.
-        assert!(capture.contains("let optical_admitted = optical_provenance_admitted(&lease);"));
+        // under the split opt-in or on an access-hardened IR node (Amendment
+        // 2026-10-17); the camera's own `flags` keep driving the selection and
+        // the statistics.
+        assert!(
+            capture.contains("let optical_admitted = optical_provenance_admitted(&lease, device);")
+        );
         assert!(capture.contains(
             "(None, Some(_), Some(_)) if dec.pix == IrPixel::YuyvLuma && !optical_admitted => {"
         ));
         assert!(lib.contains(
-            "fn optical_provenance_admitted(lease: &lease::CameraLease) -> bool {\n    lease.is_split_pair() && lease::experimental_split_trust()\n}"
+            "fn optical_provenance_admitted(lease: &lease::CameraLease, ir_node: &str) -> bool {\n    lease.is_split_pair()\n        && (lease::experimental_split_trust()\n            || node_access::hardened(std::path::Path::new(ir_node)))\n}"
         ));
         assert_eq!(
             after

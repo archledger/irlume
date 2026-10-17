@@ -144,6 +144,10 @@ const JUDGED: [(u32, Slot); 8] = [
 
 /// What a populated certificate index outside [`JUDGED`] is, when the
 /// profile assigns it to an EK irlume cannot test (ADR-0036 section 2.1).
+/// The profile (2.6, "EK certificates for Signing EKs") lists the
+/// firmware-limited signing EKs H-22 to H-25 (0x01C00056 to 0x01C0005C)
+/// among the signing EKs; being signing keys is why the test cannot use
+/// them. The firmware-limited storage EKs are H-18 to H-21.
 fn skipped_kind(index: u32) -> Option<SkippedKind> {
     if index % 2 != 0 {
         return None;
@@ -373,6 +377,27 @@ enum Stop {
     Tpm(String),
 }
 
+/// Where the next page of a handle scan from `from` up to `last` starts, or
+/// `None` when the TPM returned the last of them. A page that claims more
+/// but does not move past `from` is an error, not a partial list, as in
+/// `next_handle_page`.
+fn next_page(
+    more: bool,
+    from: u32,
+    last: u32,
+    page: &[u32],
+) -> std::result::Result<Option<u32>, String> {
+    if !more {
+        return Ok(None);
+    }
+    match page.last() {
+        Some(&next) if next >= from => Ok((next < last).then(|| next + 1)),
+        _ => Err(format!(
+            "the TPM reported more handles after {from:#010x} but returned none past it"
+        )),
+    }
+}
+
 /// A TPM conversation under the caller's deadline.
 struct Run<'a, 'f> {
     ctx: &'a mut Context,
@@ -452,9 +477,9 @@ impl Run<'_, '_> {
             };
             let page: Vec<u32> = list.into_inner().into_iter().map(u32::from).collect();
             found.extend(page.iter().copied().filter(|h| (first..=last).contains(h)));
-            match page.last() {
-                Some(&next) if more && next >= from && next < last => from = next + 1,
-                _ => return Ok(found),
+            match next_page(more, from, last, &page).map_err(Stop::Tpm)? {
+                Some(next) => from = next,
+                None => return Ok(found),
             }
         }
     }
@@ -1196,9 +1221,10 @@ fn find_storage_key(
             && run.tpm(|ctx| persistent_handle_present(ctx, handle))?
         {
             let template = da_exempt_srk_template().map_err(|e| Stop::Tpm(e.to_string()))?;
-            if let Some(handle) = persistent_key(run, handle, |public, found| {
+            if let Some((object, handle)) = persistent_key(run, handle, |public, found| {
                 found == name.as_slice() && has_template_shape(public, &template)
             })? {
+                with_empty_auth(run, object)?;
                 return Ok(Some(StorageKey {
                     handle,
                     transient: false,
@@ -1215,15 +1241,17 @@ fn find_storage_key(
     {
         let srk = srk_template().map_err(|e| Stop::Tpm(e.to_string()))?;
         // An original key that cannot be read is replaced by a derivation,
-        // as `load_or_create_srk` does.
+        // as `load_or_create_srk` does; failing to give ESYS its empty
+        // authValue is an error there too.
         match persistent_key(run, u32::from(persistent), |public, _| {
             has_template_shape(public, &srk)
         }) {
-            Ok(Some(handle)) => {
+            Ok(Some((object, handle))) => {
+                with_empty_auth(run, object)?;
                 return Ok(Some(StorageKey {
                     handle,
                     transient: false,
-                }))
+                }));
             }
             Ok(None) | Err(Stop::Tpm(_)) => {}
             Err(Stop::Time) => return Err(Stop::Time),
@@ -1236,24 +1264,26 @@ fn find_storage_key(
 }
 
 /// The persistent key at `handle` when `wanted` accepts its public area and
-/// Name, with its empty authValue set; `None` when `wanted` does not. A key
-/// that cannot be read is an error. Either way the object stays resolved
-/// until the check ends ([`Run::persistent`]).
+/// Name; `None` when `wanted` does not. A key that cannot be read is an
+/// error. Either way the object stays resolved until the check ends
+/// ([`Run::persistent`]).
 fn persistent_key(
     run: &mut Run<'_, '_>,
     handle: u32,
     wanted: impl FnOnce(&Public, &[u8]) -> bool,
-) -> std::result::Result<Option<KeyHandle>, Stop> {
+) -> std::result::Result<Option<(ObjectHandle, KeyHandle)>, Stop> {
     let object = run.persistent(handle)?;
     let key = KeyHandle::from(ESYS_TR::from(object));
     let (public, name, _) = run.tpm(|ctx| ctx.read_public(key))?;
-    if !wanted(&public, name.value()) {
-        return Ok(None);
-    }
+    Ok(wanted(&public, name.value()).then_some((object, key)))
+}
+
+/// Tell ESYS that a storage key's authValue is empty, as `load_or_create_srk`
+/// and `da_exempt_key_at` do; a failure is an error for both keys.
+fn with_empty_auth(run: &mut Run<'_, '_>, object: ObjectHandle) -> std::result::Result<(), Stop> {
     run.ctx
         .tr_set_auth(object, Auth::default())
-        .map_err(|e| Stop::Tpm(e.to_string()))?;
-    Ok(Some(key))
+        .map_err(|e| Stop::Tpm(e.to_string()))
 }
 
 fn hashing(alg: NameAlg) -> HashingAlgorithm {

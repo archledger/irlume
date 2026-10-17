@@ -107,9 +107,12 @@ pub struct SkippedCertificate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkippedKind {
-    /// For a signing EK, which TPM2_ActivateCredential cannot use.
+    /// For a signing EK, which TPM2_ActivateCredential cannot use: H-8 to
+    /// H-17, the firmware-limited signing EKs H-22 to H-25 and the ML-DSA
+    /// ones.
     Signing,
-    /// For a firmware-limited EK, under a hierarchy irlume does not use.
+    /// For a firmware-limited storage EK (H-18 to H-21), under a hierarchy
+    /// irlume does not use.
     FirmwareLimited,
     /// For an ML-KEM storage EK.
     MlKem,

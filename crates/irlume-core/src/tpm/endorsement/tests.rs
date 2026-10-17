@@ -229,6 +229,22 @@ fn a_low_range_nonce_fills_the_unique_field_as_the_profile_says() {
     assert!(with_nonce(Slot::L2.default_template().unwrap(), &[0; 33]).is_err());
 }
 
+/// A handle scan follows the TPM's pages and stops past its range; a page
+/// that claims more but does not move on is an error, never a partial list
+/// a missing certificate or EK could hide in.
+#[test]
+fn a_handle_scan_that_does_not_advance_is_an_error() {
+    let (first, last) = EK_RANGE;
+    assert_eq!(next_page(false, first, last, &[first]), Ok(None));
+    assert_eq!(
+        next_page(true, first, last, &[first, first + 2]),
+        Ok(Some(first + 3))
+    );
+    assert_eq!(next_page(true, first, last, &[last + 5]), Ok(None));
+    assert!(next_page(true, first + 4, last, &[]).is_err());
+    assert!(next_page(true, first + 4, last, &[first + 2]).is_err());
+}
+
 #[test]
 fn a_template_with_bytes_after_it_is_refused() {
     let bytes = Slot::L2.default_template().unwrap().marshall().unwrap();

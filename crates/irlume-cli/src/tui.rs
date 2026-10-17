@@ -9861,7 +9861,12 @@ impl App {
         push_page_actions(
             &mut lines,
             &mut page_actions,
-            &[("r", "re-check"), ("d", "doctor"), ("w", "watch logs")],
+            &[
+                ("r", "re-check"),
+                ("d", "doctor"),
+                ("D", "doctor as administrator"),
+                ("w", "watch logs"),
+            ],
         );
         targets.extend(
             page_actions
@@ -13108,8 +13113,13 @@ mod tests {
     /// is on.
     #[test]
     fn full_diagnostics_as_administrator_asks_first_then_runs_doctor_as_root() {
+        let _guard = dead_socket();
         let mut app = app_with_user("carol");
         app.screen = SC_REPAIR;
+        assert!(
+            draw_text(&app).contains("doctor as administrator"),
+            "the page's action rows offer it too"
+        );
         app.on_key(KeyCode::Char('D'));
         assert!(
             app.suspend.is_none(),

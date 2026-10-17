@@ -106,7 +106,11 @@ newer build:
 The AUR and PPA versions start from the last tag, not from `Cargo.toml`, so
 the release-preparation bump does not move a nightly above the release it
 precedes. `irlume version` keeps printing the crate version; the channel and
-the package version are reported by `irlume doctor` (section 4).
+the package version are reported by `irlume doctor` (section 4). Between the
+release-preparation bump and its tag, the crate version is ahead of the AUR
+and PPA package versions by design, so the "the running binary is not the
+packaged one" note `irlume update` prints for an overlaid build compares
+nothing on a nightly lane.
 
 ### 3. Each lane's build
 
@@ -124,7 +128,15 @@ the package version are reported by `irlume doctor` (section 4).
   It does not add `?signed`: commits on `main` are GitHub's squash merges,
   signed by GitHub's web-flow key rather than the release key in
   `validpgpkeys`, so the source is fetched over HTTPS without a signature
-  check. The parity script checks it beside the release recipe.
+  check. `scripts/arch-git-pkgbuild.py` generates it from the release
+  recipe, and CI fails when the committed copy is stale.
+  An AUR helper builds from the AUR's own copy of the recipe, which only the
+  maintainer's AUR key can update, so a change to `packaging/arch-git/`
+  reaches users once the maintainer pushes it, as each release's AUR update
+  does today. A scheduled workflow compares the AUR's `PKGBUILD` with
+  `main`'s and fails when they differ, which `ci-alert.yml` turns into a
+  `ci-alert` issue as for any failing scheduled workflow, so a recipe change
+  on `main` is not left unpublished unseen.
 - **PPA.** `scripts/ppa-nightly.sh` runs from a user timer on minihost, which
   already runs user timers with lingering enabled. It updates a dedicated
   clone and derives the nightly version from `main` (section 2), so a release
@@ -134,19 +146,31 @@ the package version are reported by `irlume doctor` (section 4).
   signs it with the key Launchpad has (fingerprint F350 5339 8E3C 80FE 2089
   1B82 C10B 8492 BD7F 30C6) through gpg-agent, uploads it with dput, and then
   waits for `scripts/verify-ppa-publish.py` (with `PPA_NAME=irlume-nightly`)
-  to see the binary published. Launchpad never accepts a version twice in a
-  PPA, also after a deletion, so the script records each step's state:
+  to see the binary published. dput's success means only that the files
+  reached Launchpad, which accepts or rejects the upload afterwards
+  (Launchpad manual, "Package upload errors"), and Launchpad never accepts a
+  version twice in a PPA, also after a deletion. So the script records each
+  step's state, read from Launchpad's API:
   - the version it last saw published: when the derived version equals it,
     there is nothing to do;
-  - a version it uploaded and has not yet seen published: the next run only
-    verifies it again, never uploads it again;
-  - a version whose build failed: the next run uploads the same commit with
+  - a version it uploaded: accepted once its source publication appears in
+    the PPA (pending or published), and from then on only verified again,
+    never uploaded again; an upload whose source publication has not
+    appeared a day later was rejected;
+  - a version whose build failed, or whose upload was rejected: while the
+    derived version is unchanged, the next run uploads the same commit with
     the next PPA revision (`-0ppa2`, then `-0ppa3`), as a release's failed
-    build does (`verify-ppa-publish.py`'s own advice).
+    build does (`verify-ppa-publish.py`'s own advice); once `main` moves, the
+    failed state is dropped and the new version is uploaded, so a fix on
+    `main` is never held up by retries of the commit it fixed.
   A failure before the upload (the build, the signature, dput) records
   nothing, so the next night starts over; every failure is logged to the user
   journal. At most one upload a day keeps two or three uploads, 2.5 to
   3.7 GB, on disk at once, inside the 8 GiB quota (Context).
+  The key is stored on minihost without a passphrase (gpg-agent's `keyinfo`
+  reports it unprotected), as it already signs that host's commits
+  unattended, so the timer needs no cached passphrase; if the key gains one,
+  signing fails and the night's upload is skipped and logged.
 
 ### 4. irlume's tools know the channel
 
@@ -215,9 +239,9 @@ These need the maintainer's accounts, and are done once:
   get `main` whenever they rebuild `irlume-git`; Ubuntu users get `main` at
   most a day late, once Launchpad has built it.
 - On a night `main` moved, minihost builds the source package in a container
-  and uploads about 650 MB; Launchpad builds the 582 MB package. The timer
-  depends on gpg-agent being able to sign without a prompt; when it cannot,
-  the upload is skipped and the failure logged.
+  and uploads about 650 MB; Launchpad builds the 582 MB package.
+- The AUR copy of the `irlume-git` recipe is updated by hand, with an alert
+  when it falls behind `main`'s.
 - The CLI gains three install origins and their update and uninstall paths;
   the support report gains three channel values.
 - RELEASING.md is unchanged: releases still come only from signed tags, and
@@ -244,6 +268,9 @@ These need the maintainer's accounts, and are done once:
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
   names the AUR nightly package and uninstall removes `irlume-git` and, when
   installed, `irlume-kcm-git`.
+- On a nightly lane `irlume update` prints no "running binary" note, also
+  when the crate version is `0.16.0` and the package version
+  `0.15.0+git150.g...` (the release-preparation commit before its tag).
 - `version_gt` and `version_base` read `0.15.0^20261017git3c162b8`,
   `0.15.0+git139.g3c162b83-0ppa1~resolute1` and `0.15.0.r139.g3c162b83-1` as
   `0.15.0`: not newer than the v0.15.0 tag, and older than v0.15.1. With a
@@ -259,6 +286,11 @@ These need the maintainer's accounts, and are done once:
     (`0.15.0+git139...` becomes `0.16.0+git0...`);
   - after an accepted upload whose publication it has not seen, verifies
     again and does not upload;
-  - after a failed build, uploads the same commit with the next PPA
+  - after an upload whose source publication never appears (rejected), and
+    after a failed build, uploads the same commit with the next PPA
     revision;
+  - after a failed build followed by a move of `main`, uploads the new
+    version and drops the failed one;
   - records nothing when the build, the signature or dput fails.
+- The scheduled AUR drift check reports a `PKGBUILD` that differs from
+  `main`'s `packaging/arch-git/PKGBUILD`, and passes when they match.

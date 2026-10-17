@@ -255,6 +255,68 @@ pub struct DaExemptKey {
     /// the report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_key: Option<OriginalKey>,
+    /// The recorded DA-exempt key carries the ROCA fingerprint and so did
+    /// today's derivation of its template, on the firmware version the TPM
+    /// reported then: nothing replaces it until a firmware update fixes key
+    /// generation (#1073 item 2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub derivation_weak: bool,
+    /// Why the replacement of a weak DA-exempt key could not be persisted;
+    /// irlumed tries again by the rules for the key itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_refused: Option<KeyRefusal>,
+    /// Whether any envelope is stored (a template key or a keyring secret,
+    /// readable or not): irlumed's start checks and replaces the DA-exempt
+    /// key only while one is, so until then new seals go under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_envelope: bool,
+}
+
+/// The `storage_keys` part of a `TpmReadiness` reply from an irlumed that
+/// predates it, as this client reads one.
+pub const STORAGE_KEYS_NOT_REPORTED: &str = "this irlumed predates the per-key storage key report";
+
+/// A storage key irlume knows of, checked for the ROCA fingerprint
+/// (ADR-0034, Phase 3 amendment, #1073 item 2): the original key, the
+/// DA-exempt key, and each DA-exempt key a replacement superseded, since
+/// during a migration or a replacement each can hold envelopes. The name and
+/// the account names come from irlumed's record and state directory, which
+/// are untrusted where writable offline (§5): irlumed sends only bounded hex
+/// and accepted account names, and a client cleans them again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageKeyEntry {
+    pub role: StorageKeyRole,
+    /// The owner persistent handle it was read at.
+    pub handle: u32,
+    /// Its TPM name in hex; empty when nothing is at the handle.
+    #[serde(default)]
+    pub name: String,
+    pub check: StorageKeyCheck,
+    /// The envelopes that record this key as their parent: `None` for the
+    /// original key, whose envelopes record none
+    /// ([`DaExemptKey::on_original_key`] names those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelopes: Option<OriginalKeyEnvelopes>,
+    /// For a superseded key: no envelope has named it since a start in an
+    /// earlier boot, so a power loss cannot bring one back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unused_across_boots: bool,
+}
+
+/// Which storage key a [`StorageKeyEntry`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageKeyRole {
+    /// The original storage key, at irlumed's `IRLUME_SRK_HANDLE`.
+    Original,
+    /// The DA-exempt key irlumed records, under which new seals go.
+    DaExempt,
+    /// A DA-exempt key the recorded one superseded: irlume never evicts it,
+    /// and its envelopes move off it at their move points.
+    Superseded,
+    /// A role this build does not know (a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 /// irlume's original storage key as irlumed's record and the TPM show it,
@@ -497,6 +559,25 @@ mod tests {
         };
         let json = serde_json::to_string(&failed).unwrap();
         assert_eq!(serde_json::from_str::<DaExemptKey>(&json).unwrap(), failed);
+        // The replacement state round-trips, and an older irlumed's reply
+        // without it reads as no weak derivation, no refusal and no envelope.
+        let replacing = DaExemptKey {
+            derivation_weak: true,
+            replacement_refused: Some(KeyRefusal {
+                reason: RefusalReason::NoSpace,
+                detail: "no room".into(),
+            }),
+            any_envelope: true,
+            ..DaExemptKey::default()
+        };
+        let json = serde_json::to_string(&replacing).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DaExemptKey>(&json).unwrap(),
+            replacing
+        );
+        let older: DaExemptKey = serde_json::from_str("{}").unwrap();
+        assert!(!older.derivation_weak && !older.any_envelope);
+        assert_eq!(older.replacement_refused, None);
     }
 
     #[test]

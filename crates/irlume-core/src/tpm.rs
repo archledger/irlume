@@ -565,6 +565,37 @@ pub fn storage_key_check() -> Result<StorageKeyCheck> {
     roca_verdict(roca, handle, || derived_srk(&mut ctx, &public))
 }
 
+/// The ROCA check of a DA-exempt key at `handle` whose TPM name the record
+/// keeps as `name` (ADR-0034, Phase 3 amendment, #1073 item 2): the recorded
+/// key, or one it superseded. [`StorageKeyCheck::Absent`] when the handle is
+/// free or holds another key. Nothing is derived, so doctor's request stays
+/// within its client's budget on a slow TPM: whether today's derivation is
+/// weak too is irlumed's start's to find, and its record says so. A weak key
+/// reports no comparison (`derived: None`).
+pub(crate) fn da_exempt_key_check(handle: u32, name: &[u8]) -> Result<StorageKeyCheck> {
+    let mut ctx = open_context()?;
+    if !OWNER_PERSISTENT.contains(&handle) || !persistent_handle_present(&mut ctx, handle)? {
+        return Ok(StorageKeyCheck::Absent);
+    }
+    let persistent = PersistentTpmHandle::new(handle).map_err(tpm_err)?;
+    let object = ctx
+        .tr_from_tpm_public(TpmHandle::Persistent(persistent))
+        .map_err(tpm_err)?;
+    let (public, found, _) = ctx
+        .read_public(KeyHandle::from(ESYS_TR::from(object)))
+        .map_err(tpm_err)?;
+    if found.value() != name {
+        return Ok(StorageKeyCheck::Absent);
+    }
+    if !weak_key(&public, name) {
+        return Ok(StorageKeyCheck::Clean);
+    }
+    Ok(StorageKeyCheck::RocaFingerprint {
+        handle,
+        derived: None,
+    })
+}
+
 /// The storage-key verdict. Only a key with the ROCA fingerprint, which doctor
 /// then advises evicting, is compared with the key irlume's template derives,
 /// since deriving it takes seconds on slow TPMs. A comparison that fails (an
@@ -962,7 +993,7 @@ fn create_storage_key(ctx: &mut Context, template: Public) -> Result<KeyHandle> 
 
 /// irlume's persistent SRK handle: `IRLUME_SRK_HANDLE` (hex) or
 /// [`PERSISTENT_SRK_HANDLE`].
-fn persistent_srk_raw() -> u32 {
+pub(crate) fn persistent_srk_raw() -> u32 {
     srk_handle_for(std::env::var("IRLUME_SRK_HANDLE").ok().as_deref())
 }
 
@@ -6003,8 +6034,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// weak key whose recorded handle another stack took is released through
     /// the superseded key, found by name, and moves at the next login's
     /// reseal; new seals go under the new key; the weak key stays persisted,
-    /// never evicted, and a lockout spares irlume through both. A second
-    /// start replaces nothing. With the TPM
+    /// never evicted, and a lockout spares irlume through both. doctor's
+    /// per-key report lists the weak key with the envelopes still naming it,
+    /// and as unused across boots once they moved and a start in an earlier
+    /// boot found none. A second start replaces nothing. With the TPM
     /// full, the replacement is refused and recorded, and the weak key stays
     /// the parent of new seals.
     #[test]
@@ -6069,6 +6102,8 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
 
         let replaced = ensure_at_start_reporting();
         let after_replacement = record();
+        // doctor's per-key report before the envelopes move.
+        let keys_before = crate::storage_key::storage_keys(storage_key_check().ok());
         let moved = crate::template_key::move_to_stronger_policy("alice");
         let moved_under = parent(&alice);
         // Credential release before the login's reseal, through the
@@ -6111,6 +6146,18 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         std::fs::write(&keyring, serde_json::to_vec(&shadowed).unwrap()).expect("shadowed");
         let through_record = crate::keyring::unseal_password("alice");
         evict_fixture_at(COPY);
+        // A start in an earlier (fake) boot finds no envelope naming the weak
+        // key: the report then offers it for the manual path.
+        const EARLIER_BOOT: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        let settled = crate::storage_key::settle_at_start_in(Some(EARLIER_BOOT), false);
+        let keys_after = crate::storage_key::storage_keys(storage_key_check().ok());
+        // An envelope that cannot be read may name the weak key: not unused.
+        std::fs::write(crate::keyring::envelope_path("mallory"), b"not an envelope")
+            .expect("an unreadable envelope");
+        let keys_unreadable = crate::storage_key::storage_keys(storage_key_check().ok());
+        // It would also keep doctor's lockout warning, which is checked next.
+        std::fs::remove_file(crate::keyring::envelope_path("mallory"))
+            .expect("the unreadable envelope is removed");
         let template_key = crate::template_key::load_key("alice");
         let new_seal = seal_with_pcrs(b"a seal after the replacement", &[7]).map(|env| env.parent);
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -6164,6 +6211,58 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             .to_owned();
         assert_eq!(moved.expect("the move"), Some(MoveGain::DaExemptKey));
         assert_eq!(moved_under.as_deref(), Some(new_hex.as_str()));
+        {
+            use irlume_common::tpm_readiness::{StorageKeyCheck, StorageKeyRole};
+            let keys_before = keys_before.expect("the per-key report");
+            let role = |keys: &[irlume_common::tpm_readiness::StorageKeyEntry], role| {
+                keys.iter().find(|entry| entry.role == role).cloned()
+            };
+            assert!(role(&keys_before, StorageKeyRole::Original).is_some());
+            let current = role(&keys_before, StorageKeyRole::DaExempt).expect("the new key");
+            assert_eq!(
+                (current.handle, current.check),
+                (PREFERRED + 1, StorageKeyCheck::Clean)
+            );
+            let weak_before = role(&keys_before, StorageKeyRole::Superseded).expect("the weak key");
+            assert_eq!(weak_before.handle, PREFERRED);
+            assert!(matches!(
+                weak_before.check,
+                StorageKeyCheck::RocaFingerprint {
+                    handle: PREFERRED,
+                    ..
+                }
+            ));
+            assert_eq!(
+                weak_before
+                    .envelopes
+                    .as_ref()
+                    .map(|envelopes| envelopes.total),
+                Some(2),
+                "the template key and the keyring password still name it"
+            );
+            assert!(!weak_before.unused_across_boots);
+            assert!(settled.is_ok());
+            let keys_after = keys_after.expect("the per-key report");
+            let weak_after = role(&keys_after, StorageKeyRole::Superseded).expect("the weak key");
+            assert_eq!(
+                weak_after
+                    .envelopes
+                    .as_ref()
+                    .map(|envelopes| envelopes.total),
+                Some(0)
+            );
+            assert!(
+                weak_after.unused_across_boots,
+                "unused since a start in an earlier boot"
+            );
+            let keys_unreadable = keys_unreadable.expect("the per-key report");
+            let weak_unreadable =
+                role(&keys_unreadable, StorageKeyRole::Superseded).expect("the weak key");
+            assert!(
+                !weak_unreadable.unused_across_boots,
+                "an unreadable envelope may still name it"
+            );
+        }
         assert_eq!(
             before_replacement.expect("unseal by name").as_slice(),
             b"alice-password"

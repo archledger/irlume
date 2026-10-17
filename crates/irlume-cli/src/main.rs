@@ -4001,6 +4001,7 @@ struct TpmReport {
     storage_key: Result<irlume_common::tpm_readiness::StorageKeyCheck, String>,
     lockout: Result<irlume_common::tpm_readiness::TpmLockout, String>,
     da_exempt_key: Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+    storage_keys: Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>, String>,
 }
 
 /// Ask irlumed for its TPM readiness. Every way of getting no report (an
@@ -4017,6 +4018,7 @@ fn tpm_readiness(
             storage_key,
             lockout,
             da_exempt_key,
+            storage_keys,
         }) => {
             return TpmReport {
                 identity,
@@ -4024,6 +4026,7 @@ fn tpm_readiness(
                 storage_key,
                 lockout,
                 da_exempt_key,
+                storage_keys,
             }
         }
         Ok(Response::Error(error)) if error == "bad request" => {
@@ -4041,7 +4044,8 @@ fn tpm_readiness(
         pcr_bank: Err(reason.clone()),
         storage_key: Err(reason.clone()),
         lockout: Err(reason.clone()),
-        da_exempt_key: Err(reason),
+        da_exempt_key: Err(reason.clone()),
+        storage_keys: Err(reason),
     }
 }
 
@@ -4647,6 +4651,243 @@ fn envelope_names(
         parts.push(format!("and {rest} more"));
     }
     parts.join("; ")
+}
+
+/// The `tpm-firmware` check over every storage key irlume knows of
+/// (ADR-0034, Phase 3 amendment, #1073 item 2): [`tpm_firmware_check`] for
+/// the TPM and the original key, which an older irlumed's reply also carries,
+/// then what irlumed's per-key report says of the DA-exempt key and the keys
+/// it superseded ([`storage_key_notes`]), the worst state of them all.
+fn tpm_firmware_report(
+    identity: &Result<irlume_core::tpm::TpmIdentity, String>,
+    storage_key: &Result<irlume_core::tpm::StorageKeyCheck, String>,
+    storage_keys: &Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>, String>,
+    da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+) -> (crate::doctor_report::State, String) {
+    let (state, detail) = tpm_firmware_check(identity, storage_key);
+    let notes = storage_key_notes(storage_key, storage_keys, da_exempt_key);
+    if notes.is_empty() {
+        return (state, detail);
+    }
+    let worst = notes
+        .iter()
+        .fold(state, |worst, (state, _)| worse_state(worst, *state));
+    let mut text = detail.trim_end_matches('.').to_owned();
+    for (_, note) in notes {
+        text.push_str(". ");
+        text.push_str(note.trim_end_matches('.'));
+    }
+    (worst, text)
+}
+
+/// The more serious of two doctor states: fail, warn, unknown, info, pass.
+fn worse_state(
+    a: crate::doctor_report::State,
+    b: crate::doctor_report::State,
+) -> crate::doctor_report::State {
+    use crate::doctor_report::State;
+    let rank = |state: State| match state {
+        State::Fail => 4,
+        State::Warn => 3,
+        State::Unknown => 2,
+        State::Info => 1,
+        State::Pass => 0,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// What irlumed's per-key report says of irlume's DA-exempt storage key and
+/// the keys it superseded: a weak DA-exempt key with why it is not replaced
+/// yet (the firmware still generates affected keys, or the replacement was
+/// refused) or that irlumed's next start replaces it; and each superseded
+/// key still persisted, with the envelopes that still name it, or, once none
+/// has named it since a start in an earlier boot, the manual command with
+/// its warning, since irlume never evicts a key no derivation gives; a weak
+/// original key the record names at a handle `IRLUME_SRK_HANDLE` no longer
+/// names; a weak key in a role a newer irlumed added, with no command; and
+/// `unknown` when a current irlumed could not make the report. Nothing from an irlumed that
+/// predates the report. What irlumed sent is cleaned again.
+fn storage_key_notes(
+    storage_key: &Result<irlume_core::tpm::StorageKeyCheck, String>,
+    storage_keys: &Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>, String>,
+    da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
+) -> Vec<(crate::doctor_report::State, String)> {
+    use crate::doctor_report::State;
+    use irlume_common::tpm_readiness::{
+        DerivedKey, StorageKeyCheck, StorageKeyRole, STORAGE_KEYS_NOT_REPORTED,
+    };
+    let entries = match storage_keys {
+        Ok(entries) => entries,
+        // An older irlumed reports the original key alone, as before.
+        Err(e) if e == STORAGE_KEYS_NOT_REPORTED => return Vec::new(),
+        // A current one that could not check the others must not read as
+        // clean for them.
+        Err(e) => {
+            return vec![(
+                State::Unknown,
+                format!(
+                    "irlumed could not check irlume's DA-exempt and superseded storage keys: {}",
+                    irlume_common::single_line(e, 300)
+                ),
+            )]
+        }
+    };
+    let key = da_exempt_key.as_ref().ok();
+    const ON_IRLUMES_TPM: &str =
+        "on the TPM irlumed uses (pass its IRLUME_TCTI with `-T` if it sets one)";
+    let mut notes = Vec::new();
+    for entry in entries {
+        let handle = entry.handle;
+        let name: String = entry
+            .name
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .take(160)
+            .collect();
+        let named = |entry: &irlume_common::tpm_readiness::StorageKeyEntry| {
+            entry
+                .envelopes
+                .as_ref()
+                .filter(|envelopes| envelopes.total > 0)
+                .map(|envelopes| envelope_names(&envelopes.named, envelopes.total))
+        };
+        let weak = matches!(entry.check, StorageKeyCheck::RocaFingerprint { .. });
+        match entry.role {
+            StorageKeyRole::DaExempt if weak => {
+                let derived = match entry.check {
+                    StorageKeyCheck::RocaFingerprint { derived, .. } => derived,
+                    _ => None,
+                };
+                let what = format!(
+                    "irlume's DA-exempt storage key at {handle:#010x} carries the ROCA \
+                     fingerprint (CVE-2017-15361)"
+                );
+                let refused = key.and_then(|key| key.replacement_refused.as_ref());
+                let firmware_weak =
+                    key.is_some_and(|key| key.derivation_weak) || derived == Some(DerivedKey::Same);
+                let note = if let Some(refused) = refused {
+                    format!(
+                        "{what}, and irlumed could not persist its replacement: {}. The weak \
+                         key stays in use, and irlumed tries again {}",
+                        refusal_text(refused),
+                        refused.reason.when_retried()
+                    )
+                } else if let Err(e) = da_exempt_key {
+                    format!(
+                        "{what}; whether irlumed's start replaces it is unknown, since irlumed \
+                         could not report its replacement state ({})",
+                        irlume_common::single_line(e, 300)
+                    )
+                } else if key.is_some_and(|key| !key.any_envelope) {
+                    // irlumed's start checks the key only while an envelope
+                    // is stored, so it promises nothing before one is.
+                    let then = if firmware_weak {
+                        "once the TPM firmware is updated with the machine vendor's tool, since \
+                         today's derivation of its template is weak too"
+                    } else {
+                        "onto a clean key when today's derivation of its template gives one"
+                    };
+                    format!(
+                        "{what}. No envelope is stored yet, so irlumed's start leaves it and new \
+                         seals go under it; the first start after one is made (`sudo systemctl \
+                         restart irlumed` after enrolling) replaces it by moving its envelopes, \
+                         {then}"
+                    )
+                } else if firmware_weak {
+                    format!(
+                        "{what}, and so does the key today's derivation of its template gives: \
+                         update the TPM firmware with the machine vendor's tool. irlumed then \
+                         replaces the key at its next start by moving its envelopes onto a \
+                         clean one, with no recovery or re-enrollment"
+                    )
+                } else if derived == Some(DerivedKey::Unaffected) {
+                    format!(
+                        "{what}, but today's derivation of its template gives a clean key, \
+                         so irlumed replaces it at its next start by moving its envelopes"
+                    )
+                } else {
+                    format!(
+                        "{what}. irlumed's next start derives its template again and replaces \
+                         it by moving its envelopes when that gives a clean key; when it is \
+                         weak too, update the TPM firmware with the machine vendor's tool"
+                    )
+                };
+                notes.push((State::Warn, note));
+            }
+            StorageKeyRole::Superseded if entry.check != StorageKeyCheck::Absent => {
+                let what = if weak {
+                    format!(
+                        "the weak key at {handle:#010x} (TPM name {name}), which irlume's \
+                         DA-exempt storage key replaced, carries the ROCA fingerprint \
+                         (CVE-2017-15361)"
+                    )
+                } else {
+                    format!(
+                        "the key at {handle:#010x} (TPM name {name}), which irlume's \
+                         DA-exempt storage key superseded, is still persisted"
+                    )
+                };
+                let state = if weak { State::Warn } else { State::Info };
+                let note = match named(entry) {
+                    Some(named) => format!(
+                        "{what}; envelopes still name it ({named}) and move onto the DA-exempt \
+                         key at their move points (a template key at irlumed's next start, a \
+                         keyring secret at the next password login)"
+                    ),
+                    None if entry.unused_across_boots => format!(
+                        "{what}; no envelope has named it since a start in an earlier boot, \
+                         and irlume never evicts a key no derivation gives. Find what else \
+                         uses it first (`tpm2_readpublic -c {handle:#010x}`, {ON_IRLUMES_TPM}); \
+                         if nothing does, evict it by hand with `sudo tpm2_evictcontrol -C o \
+                         -c {handle:#010x}` {ON_IRLUMES_TPM}. Do not clear the whole TPM for \
+                         this: that also drops every other key sealed in it, such as a disk's"
+                    ),
+                    None => format!(
+                        "{what}; no envelope names it now, and once a start in a later boot \
+                         finds the same, doctor names the manual command"
+                    ),
+                };
+                notes.push((state, note));
+            }
+            // The original key at a handle IRLUME_SRK_HANDLE no longer names;
+            // the one at the configured handle is the original-key reading.
+            StorageKeyRole::Original
+                if weak
+                    && !matches!(
+                        storage_key,
+                        Ok(StorageKeyCheck::RocaFingerprint { handle: checked, .. })
+                            if *checked == handle
+                    ) =>
+            {
+                notes.push((
+                    State::Warn,
+                    format!(
+                        "irlume's original storage key recorded at {handle:#010x} (TPM name \
+                         {name}), a handle irlumed's IRLUME_SRK_HANDLE no longer names, carries \
+                         the ROCA fingerprint (CVE-2017-15361). irlumed uses the original key \
+                         only at the handle IRLUME_SRK_HANDLE names: the `tpm-storage-keys` \
+                         check says what setting it back involves"
+                    ),
+                ));
+            }
+            // A role a newer irlumed added: what to do about it is that
+            // release's to say, but a weak key must not read as clean.
+            StorageKeyRole::Unknown if weak => notes.push((
+                State::Warn,
+                format!(
+                    "irlumed reports a storage key at {handle:#010x} (TPM name {name}), in a \
+                     role this irlume does not know, that carries the ROCA fingerprint \
+                     (CVE-2017-15361); update irlume to see what irlumed does about it"
+                ),
+            )),
+            _ => {}
+        }
+    }
+    notes
 }
 
 /// Why irlume's DA-exempt storage key could not be persisted, in words, with
@@ -5680,7 +5921,12 @@ fn doctor_run(
     for (id, (state, detail)) in [
         (
             "tpm-firmware",
-            tpm_firmware_check(&tpm.identity, &tpm.storage_key),
+            tpm_firmware_report(
+                &tpm.identity,
+                &tpm.storage_key,
+                &tpm.storage_keys,
+                &tpm.da_exempt_key,
+            ),
         ),
         ("tpm-pcr-bank", pcr_bank_check(&tpm.pcr_bank)),
         (
@@ -7048,6 +7294,7 @@ mod tests {
                     handle: Some(0x8101_0003),
                     ..Default::default()
                 }),
+                storage_keys: Ok(Vec::new()),
             })
         });
         assert_eq!(report.pcr_bank, Ok(PcrBankReadiness::Ready(vec![7])));
@@ -7189,6 +7436,267 @@ mod tests {
         });
         let (_, detail) = tpm_lockout_check(&calm, &hostile);
         assert!(!detail.chars().any(char::is_control), "{detail:?}");
+    }
+
+    /// ADR-0034, Phase 3 amendment (#1073 item 2): doctor's `tpm-firmware`
+    /// reads irlumed's per-key report. A weak DA-exempt key says why it is
+    /// not replaced yet (the firmware, a refused replacement) or that the
+    /// next start replaces it; a superseded key still persisted names the
+    /// envelopes still under it, and only once none has named it since a
+    /// start in an earlier boot is the manual command offered. A reply
+    /// without the list reads as before, and the original key's part stands.
+    #[test]
+    fn tpm_firmware_reports_every_weak_storage_key_by_role() {
+        use crate::doctor_report::State;
+        use irlume_common::tpm_readiness::{
+            DaExemptKey, DerivedKey, EnvelopeKind, KeyRefusal, OriginalKeyEnvelope,
+            OriginalKeyEnvelopes, RefusalReason, StorageKeyCheck, StorageKeyEntry, StorageKeyRole,
+            STORAGE_KEYS_NOT_REPORTED,
+        };
+        let id = |manufacturer: &str, firmware: (u16, u16)| {
+            Ok(irlume_core::tpm::TpmIdentity {
+                manufacturer: manufacturer.into(),
+                vendor: String::new(),
+                firmware,
+            })
+        };
+        let identity = id("INTC", (700, 20));
+        let clean = Ok(StorageKeyCheck::Clean);
+        let weak = |handle, derived| StorageKeyCheck::RocaFingerprint { handle, derived };
+        let entry = |role, handle: u32, check, total: u32, unused_across_boots| StorageKeyEntry {
+            role,
+            handle,
+            name: "000b11".into(),
+            check,
+            envelopes: Some(OriginalKeyEnvelopes {
+                named: (0..total.min(1))
+                    .map(|_| OriginalKeyEnvelope {
+                        user: "alice".into(),
+                        kind: EnvelopeKind::TemplateKey,
+                    })
+                    .collect(),
+                total,
+            }),
+            unused_across_boots,
+        };
+        let key = |derivation_weak, replacement_refused| {
+            Ok(DaExemptKey {
+                handle: Some(0x8101_0003),
+                derivation_weak,
+                replacement_refused,
+                any_envelope: true,
+                ..Default::default()
+            })
+        };
+        let report = |entries: Vec<StorageKeyEntry>, da_exempt_key| {
+            tpm_firmware_report(&identity, &clean, &Ok(entries), &da_exempt_key)
+        };
+
+        // Nothing weak: the original key's reading stands as it was.
+        let (state, detail) = report(
+            vec![entry(
+                StorageKeyRole::DaExempt,
+                0x8101_0003,
+                StorageKeyCheck::Clean,
+                0,
+                false,
+            )],
+            key(false, None),
+        );
+        assert_eq!(
+            (state, detail.clone()),
+            tpm_firmware_check(&identity, &clean)
+        );
+        let older = tpm_firmware_report(
+            &identity,
+            &clean,
+            &Err(STORAGE_KEYS_NOT_REPORTED.into()),
+            &key(false, None),
+        );
+        assert_eq!(older, tpm_firmware_check(&identity, &clean));
+        // A current irlumed that could not check them does not read as clean.
+        let (state, detail) = tpm_firmware_report(
+            &identity,
+            &clean,
+            &Err("the keyring store could not be read\nforged".into()),
+            &key(false, None),
+        );
+        assert_eq!(state, State::Unknown);
+        assert!(
+            detail.contains("could not check") && !detail.contains('\n'),
+            "{detail}"
+        );
+
+        let da_exempt = |derived| {
+            entry(
+                StorageKeyRole::DaExempt,
+                0x8101_0003,
+                weak(0x8101_0003, derived),
+                1,
+                false,
+            )
+        };
+        let (state, detail) = report(vec![da_exempt(Some(DerivedKey::Same))], key(true, None));
+        assert_eq!(state, State::Warn);
+        assert!(detail.contains("update the TPM firmware"), "{detail}");
+        let (_, detail) = report(
+            vec![da_exempt(Some(DerivedKey::Unaffected))],
+            key(false, None),
+        );
+        assert!(detail.contains("replaces it at its next start"), "{detail}");
+        let (state, detail) = report(vec![da_exempt(None)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("next start derives its template again"),
+            "{detail}"
+        );
+        // Without the DA-exempt part of the reply, nothing says whether a
+        // start replaces it: no promise either way.
+        let (state, detail) = report(vec![da_exempt(None)], Err("the record lock".into()));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("is unknown")
+                && detail.contains("the record lock")
+                && !detail.contains("next start"),
+            "{detail}"
+        );
+        // A weak original key the record names at another handle is
+        // reported; the one at the configured handle is the original-key
+        // reading, not repeated.
+        let original_at = |handle| {
+            entry(
+                StorageKeyRole::Original,
+                handle,
+                weak(handle, None),
+                0,
+                false,
+            )
+        };
+        let (state, detail) = report(vec![original_at(0x8101_0002)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("0x81010002") && detail.contains("no longer names"),
+            "{detail}"
+        );
+        let weak_here = Ok(StorageKeyCheck::RocaFingerprint {
+            handle: 0x8101_0002,
+            derived: None,
+        });
+        let (_, detail) = tpm_firmware_report(
+            &identity,
+            &weak_here,
+            &Ok(vec![original_at(0x8101_0002)]),
+            &key(false, None),
+        );
+        assert!(!detail.contains("no longer names"), "{detail}");
+        // With no envelope stored, irlumed's start leaves the key: no
+        // promise of a replacement at the next start.
+        let empty = |derivation_weak| {
+            Ok(DaExemptKey {
+                handle: Some(0x8101_0003),
+                derivation_weak,
+                ..Default::default()
+            })
+        };
+        for derivation_weak in [false, true] {
+            let (state, detail) = report(vec![da_exempt(None)], empty(derivation_weak));
+            assert_eq!(state, State::Warn);
+            assert!(
+                detail.contains("No envelope is stored yet")
+                    && !detail.contains("replaces it at its next start")
+                    && detail.contains("update") == derivation_weak,
+                "{detail}"
+            );
+        }
+        let refused = KeyRefusal {
+            reason: RefusalReason::NoSpace,
+            detail: "insufficient space\nforged".into(),
+        };
+        let (state, detail) = report(
+            vec![da_exempt(Some(DerivedKey::Unaffected))],
+            key(false, Some(refused)),
+        );
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("could not persist its replacement"),
+            "{detail}"
+        );
+        assert!(!detail.contains('\n'), "{detail}");
+
+        let superseded = |total, across| {
+            entry(
+                StorageKeyRole::Superseded,
+                0x8101_0004,
+                weak(0x8101_0004, None),
+                total,
+                across,
+            )
+        };
+        // A role a newer irlumed added: a weak key warns, with no command.
+        let unknown = |check| entry(StorageKeyRole::Unknown, 0x8101_0006, check, 0, true);
+        let (state, detail) = report(vec![unknown(weak(0x8101_0006, None))], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("role this irlume does not know") && !detail.contains("evictcontrol"),
+            "{detail}"
+        );
+        let (state, detail) = report(vec![unknown(StorageKeyCheck::Clean)], key(false, None));
+        assert_eq!(
+            (state, detail),
+            tpm_firmware_check(&identity, &clean),
+            "a clean key in an unknown role adds nothing"
+        );
+        const EVICT: &str = "sudo tpm2_evictcontrol -C o -c 0x81010004";
+        let (state, detail) = report(vec![superseded(1, false)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("alice's template key") && !detail.contains(EVICT),
+            "{detail}"
+        );
+        let (_, detail) = report(vec![superseded(0, false)], key(false, None));
+        assert!(detail.contains("once a start in a later boot") && !detail.contains(EVICT));
+        let (state, detail) = report(vec![superseded(0, true)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains(EVICT) && detail.contains("tpm2_readpublic -c 0x81010004"),
+            "{detail}"
+        );
+        // A superseded key that is gone, and a clean one still persisted.
+        let (_, detail) = report(
+            vec![entry(
+                StorageKeyRole::Superseded,
+                0x8101_0004,
+                StorageKeyCheck::Absent,
+                0,
+                true,
+            )],
+            key(false, None),
+        );
+        assert_eq!(detail, tpm_firmware_check(&identity, &clean).1);
+        let (state, _) = report(
+            vec![entry(
+                StorageKeyRole::Superseded,
+                0x8101_0004,
+                StorageKeyCheck::Clean,
+                1,
+                false,
+            )],
+            key(false, None),
+        );
+        assert_eq!(state, State::Info);
+        // A weak original key keeps its warning, with the others after it.
+        let roca = Ok(weak(0x8101_0002, Some(DerivedKey::Same)));
+        let (state, detail) = tpm_firmware_report(
+            &identity,
+            &roca,
+            &Ok(vec![superseded(1, false)]),
+            &key(false, None),
+        );
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("0x81010002") && detail.contains("0x81010004"),
+            "{detail}"
+        );
     }
 
     /// ADR-0034, Phase 3 amendment: doctor's `tpm-storage-keys` names a key

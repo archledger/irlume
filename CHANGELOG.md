@@ -7,6 +7,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor`'s `tpm-firmware` check reads every storage key irlume
+  knows of for the ROCA fingerprint (ADR-0034, Phase 3 amendment; #1073
+  item 2). irlumed's root-only `TpmReadiness` reply gains a per-key list
+  (role, handle, TPM name, check, and the envelopes that name each key) and
+  the replacement state, as optional fields an older client ignores. doctor
+  reports two more cases:
+  - a weak DA-exempt key, with why it is not replaced yet (update the TPM
+    firmware first, or the replacement was refused and when irlumed tries
+    again) or that irlumed's next start replaces it (while no envelope is
+    stored, the first start after one is);
+  - a weak key that DA-exempt key superseded, with the envelopes still
+    under it.
+
+  Once no envelope has named a superseded key since a start in an earlier
+  boot (each start now counts them), doctor names the manual
+  `tpm2_evictcontrol` command, with its warning, since irlume never evicts
+  a key no derivation gives. When irlumed could not check those keys, the
+  check reads `unknown` rather than clean for them. The TUI's doctor
+  readout runs the same check.
+
 - irlumed replaces a weak DA-exempt storage key by moving its envelopes
   first (ADR-0034, Phase 3 amendment; #1073 item 2). When the key at its
   recorded handle carries the ROCA fingerprint (CVE-2017-15361) and

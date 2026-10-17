@@ -268,7 +268,7 @@ reused for a different meaning. The registry as of this contract:
 | Check id | Reports on |
 |---|---|
 | `platform` | the distribution family irlume detected |
-| `install-origin` | where this build came from: a distro package, the Copr, or a source install |
+| `install-origin` | where this build came from: a distro package, the Copr, or a source install; a nightly lane ([ADR-0037](adr/0037-nightly-channel.md): the nightly Copr, the nightly PPA, or the AUR's `irlume-git`) is named as such, with its package version |
 | `tpm` | a usable TPM 2.0 resource-manager device |
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `secure-boot-certificates` | where the Secure Boot `KEK` and `db` stand in Microsoft's 2026 certificate rollover, read from efivarfs. Microsoft's certificates are recognized by SHA-256 hash, of the certificate or, for an entry held as a bare RSA-2048 key, of its modulus, never by subject. `pass` when every Microsoft 2011 certificate enrolled has its 2023 replacement; `warn` naming the 2023 certificates still to be enrolled, since enrolling them changes PCR 7 and a seal bound to PCR 7 then stops opening; `info` for a machine with its own keys, no keys enrolled (setup mode) or no UEFI boot; `unknown` when a database exists but cannot be read, or both are absent outside setup mode (efivarfs unmounted, empty databases in user mode) |
@@ -578,6 +578,39 @@ camera's own illumination metadata classified; `frames_lit` the subset it
 flagged lit; `ambient_observed` is true only when the camera flagged both a
 lit and a dark frame, meaning the counts reflect a real emitter-off
 observation rather than absent records.
+
+### `irlume support-report --json [--since N]`
+
+Capability: `support-report-json`.
+
+The support report as one document: the same privacy-bounded facts as the
+text report `irlume support-report` writes, without writing a file or opening
+a camera (`--probe` is not available with `--json`). `--since` bounds the
+daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
+
+```json
+{
+  "report_schema": 1,
+  "engine_version": "0.15.0",
+  "created_utc": "2026-10-17T23:24:22Z",
+  "effective_privilege": "user",
+  "platform": "Arch-family",
+  "kernel_release": "6.12.1-arch1-1",
+  "install_channel": "arch_package",
+  "checks": [{ "id": "daemon_reachable", "state": "unknown" }],
+  "unavailable": [{ "section": "daemon", "reason": "daemon_unavailable" }]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `report_schema` | The report layout's own version, `1` |
+| `effective_privilege` | `root` or `user`; some daemon sections need root |
+| `platform` | `Debian-family`, `Fedora-family`, `Arch-family`, or `other/unknown` |
+| `install_channel` | How irlume was installed, as doctor's `install-origin` reads it: `fedora_copr`, `local_rpm`, `ubuntu_ppa`, `local_deb`, `arch_package`, `source`, or a [nightly channel](adr/0037-nightly-channel.md) lane, `fedora_copr_nightly`, `ubuntu_ppa_nightly` or `arch_git` (added after 0.15.0) |
+| `checks` | `id` (`platform_supported`, `install_channel`, `daemon_reachable`, `tpm_present`, `secure_boot`) and `state`, as doctor's states |
+| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer |
+| `unavailable` | Each section the report could not fill (`daemon`, `camera_context`, `capture_schedule`, `recent_events`, `support_probe`) and why (`daemon_unavailable`, `daemon_restarted`, `no_camera`, `no_ir_pair`, `not_authorized`, `collection_failed`) |
 
 ### Error codes
 

@@ -284,6 +284,29 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "command": {
+            "const": "support-report"
+          }
+        },
+        "required": [
+          "ok",
+          "command"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/supportReportData"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -1466,6 +1489,145 @@
         "kept": {
           "type": "boolean",
           "description": "True for a surface irlume left as it was rather than update it (the plan's kept); it fails the apply without anything written there. Added in 0.15.0; absent from older builds."
+        }
+      }
+    },
+    "supportReportData": {
+      "description": "The support report (`irlume support-report --json`): the privacy-bounded facts the text report carries, without creating a file or opening a camera.",
+      "type": "object",
+      "required": [
+        "report_schema",
+        "engine_version",
+        "created_utc",
+        "effective_privilege",
+        "platform",
+        "kernel_release",
+        "install_channel",
+        "checks",
+        "unavailable"
+      ],
+      "properties": {
+        "report_schema": {
+          "description": "The report layout's own version, 1.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "engine_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_utc": {
+          "description": "When the report was made, `YYYY-MM-DDTHH:MM:SSZ`, or `unknown` when the clock could not be read.",
+          "type": "string",
+          "minLength": 1
+        },
+        "effective_privilege": {
+          "description": "Whether the report ran as root; some daemon sections need it.",
+          "enum": [
+            "root",
+            "user"
+          ]
+        },
+        "platform": {
+          "description": "The distro family, from `/etc/os-release` `ID` and `ID_LIKE`.",
+          "enum": [
+            "Debian-family",
+            "Fedora-family",
+            "Arch-family",
+            "other/unknown"
+          ]
+        },
+        "kernel_release": {
+          "description": "`uname -r`, or `unknown`.",
+          "type": "string",
+          "minLength": 1
+        },
+        "install_channel": {
+          "description": "How irlume was installed, as doctor's `install-origin` reads it. `fedora_copr_nightly`, `ubuntu_ppa_nightly` and `arch_git` are the nightly channel's lanes (ADR-0037), added after 0.15.0.",
+          "enum": [
+            "fedora_copr",
+            "fedora_copr_nightly",
+            "local_rpm",
+            "ubuntu_ppa",
+            "ubuntu_ppa_nightly",
+            "local_deb",
+            "arch_package",
+            "arch_git",
+            "source"
+          ]
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/supportCheck"
+          }
+        },
+        "daemon": {
+          "description": "The daemon's share-safe snapshot (uptime, retained history, capture schedule, sanitized camera context, recent share-safe events). Absent when the daemon did not answer; `unavailable` then names why.",
+          "type": "object"
+        },
+        "unavailable": {
+          "description": "Each section the report could not fill, and why. Empty when every section was filled.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/supportUnavailable"
+          }
+        }
+      }
+    },
+    "supportCheck": {
+      "type": "object",
+      "required": [
+        "id",
+        "state"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "platform_supported",
+            "install_channel",
+            "daemon_reachable",
+            "tpm_present",
+            "secure_boot"
+          ]
+        },
+        "state": {
+          "description": "As doctor's: `unknown` means the check could not be carried out; `info` is neither good nor bad.",
+          "enum": [
+            "pass",
+            "warn",
+            "fail",
+            "unknown",
+            "info"
+          ]
+        }
+      }
+    },
+    "supportUnavailable": {
+      "type": "object",
+      "required": [
+        "section",
+        "reason"
+      ],
+      "properties": {
+        "section": {
+          "enum": [
+            "daemon",
+            "camera_context",
+            "capture_schedule",
+            "recent_events",
+            "support_probe"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "daemon_unavailable",
+            "daemon_restarted",
+            "no_camera",
+            "no_ir_pair",
+            "not_authorized",
+            "collection_failed"
+          ]
         }
       }
     }

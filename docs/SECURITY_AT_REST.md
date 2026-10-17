@@ -408,6 +408,11 @@ Closing that gap would need a TEE/enclave path (out of scope today; noted).
 - Embeddings live in daemon RAM during matching (unavoidable without a TEE);
   they are `zeroize`d where feasible but a root-level live-memory attacker on
   the original machine can reach them. This is the Hello-vs-irlume delta above.
+- irlume does not lock its envelopes out of the TPM after early boot, as
+  BitLocker does by extending PCR 11: a live root process could still ask
+  the daemon or read its memory, on most installs the window could not close
+  before host userspace, and a resume from hibernation would reopen it
+  ([ADR-0035](adr/0035-no-phase-locked-daemon-key.md)).
 - No-TPM hosts store plaintext-at-rest embeddings (root-only). A software
   passphrase-encrypted mode (Argon2id, like the recovery envelope) could
   encrypt at rest even without a TPM; candidate hardening.

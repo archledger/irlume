@@ -124,7 +124,11 @@ never opens the TPM: irlumed answers a new root-only request (section 4).
 | `unknown` | The chain cannot be completed: its issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), or it is signed with an algorithm irlume does not accept, such as SHA-1; neither means the TPM is not genuine. Also: irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); the same-TPM test hit an operational error (section 2.4); or the TPM could not be read in the time allowed. |
 
 A TPM may store several EK certificates (the low-range RSA and ECC ones, say).
-Each is judged on its own by the rows above, and the check reports the worst
+irlume judges only those for storage EKs, whose template has `restricted`
+and `decrypt` SET and `sign` CLEAR, since the same-TPM test needs one: "If
+keyHandle is not a Storage Key, then the TPM shall return TPM_RC_TYPE" (Part
+3, 12.5). A certificate for a signing EK is skipped and named as such. Each
+storage EK certificate is judged on its own by the rows above, and the check reports the worst
 evidence first, so a bad certificate is never hidden by a good one and a
 genuine TPM is not refused over an optional certificate irlume cannot read:
 `warn` when any certificate is in a `warn` case; otherwise `pass` when any
@@ -162,7 +166,10 @@ it cannot vouch for.
    value equals `TPM_PT_MANUFACTURER`, and, when an Extended Key Usage is
    present, `tcg-kp-EKCertificate` (2.23.133.8.1) in it. Each signature
    verifies, and each CA has `CA:TRUE` with its path length and
-   `keyCertSign`. Validity periods are reported, not enforced: EK and
+   `keyCertSign`. Every critical extension on the path must be one the
+   verifier processes, as RFC 5280 (4.2) requires; a path with any other
+   critical extension, such as name or policy constraints it does not
+   implement, cannot be judged and reads `unknown`. Validity periods are reported, not enforced: EK and
    intermediate certificates of genuine TPMs expire while the TPM stays in
    use (a typical PC Client validity is 5 to 10 years, Credential Profile
    2.2.3, and one Infineon intermediate expired on 2025-10-20), so a `pass`
@@ -184,14 +191,13 @@ it cannot vouch for.
    not exempt from dictionary-attack protection (ADR-0034), the test is not
    run during a lockout and reads `unknown`.
 
-Each request reads the endorsement hierarchy's state (section 3) and the
-certificate indices again, and matches the EK and runs the same-TPM test
-again, since `TPM2_HierarchyControl`, `TPM2_HierarchyChangeAuth` and
-`TPM2_ChangeEPS` can change what they answer within a boot without changing
-a certificate. irlumed keeps only the software chain result in memory, keyed
-by the certificate's bytes: a request that changes nothing in the TPM costs
-the reads, at most one EK derivation per certificate and one
-ActivateCredential.
+irlumed keeps nothing between requests. Each one reads the endorsement
+hierarchy's state (section 3) and the certificate and chain indices again,
+verifies the chain again in software, matches the EK and runs the same-TPM
+test again, since `TPM2_HierarchyControl`, `TPM2_HierarchyChangeAuth`,
+`TPM2_ChangeEPS` and NV writes can change any of these answers within a boot.
+A request costs the NV reads, at most one EK derivation and one
+ActivateCredential per storage EK certificate, and the software checks.
 
 ### 3. The endorsement hierarchy
 
@@ -304,6 +310,10 @@ check.
 - A low-range certificate whose EK uses the template at 0x01C00004 with the
   nonce at 0x01C00003 matches its EK; derived from the default template alone
   it would not.
+- A path with a critical extension the verifier does not process reads
+  `unknown`.
+- A certificate for a signing EK is skipped and named, and does not change
+  the result of a storage EK certificate beside it.
 - Several certificates: one that passes beside one signed with SHA-1 reads
   `pass`, naming the other as unverifiable; one that passes beside one that
   does not match its EK reads `warn`; one that cannot be judged beside none

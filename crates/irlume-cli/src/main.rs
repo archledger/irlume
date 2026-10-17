@@ -4665,7 +4665,7 @@ fn tpm_firmware_report(
     da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
 ) -> (crate::doctor_report::State, String) {
     let (state, detail) = tpm_firmware_check(identity, storage_key);
-    let notes = storage_key_notes(storage_keys, da_exempt_key);
+    let notes = storage_key_notes(storage_key, storage_keys, da_exempt_key);
     if notes.is_empty() {
         return (state, detail);
     }
@@ -4707,10 +4707,12 @@ fn worse_state(
 /// key still persisted, with the envelopes that still name it, or, once none
 /// has named it since a start in an earlier boot, the manual command with
 /// its warning, since irlume never evicts a key no derivation gives; a weak
-/// key in a role a newer irlumed added, with no command; and `unknown` when
-/// a current irlumed could not make the report. Nothing from an irlumed that
+/// original key the record names at a handle `IRLUME_SRK_HANDLE` no longer
+/// names; a weak key in a role a newer irlumed added, with no command; and
+/// `unknown` when a current irlumed could not make the report. Nothing from an irlumed that
 /// predates the report. What irlumed sent is cleaned again.
 fn storage_key_notes(
+    storage_key: &Result<irlume_core::tpm::StorageKeyCheck, String>,
     storage_keys: &Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>, String>,
     da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
 ) -> Vec<(crate::doctor_report::State, String)> {
@@ -4773,6 +4775,12 @@ fn storage_key_notes(
                          key stays in use, and irlumed tries again {}",
                         refusal_text(refused),
                         refused.reason.when_retried()
+                    )
+                } else if let Err(e) = da_exempt_key {
+                    format!(
+                        "{what}; whether irlumed's start replaces it is unknown, since irlumed \
+                         could not report its replacement state ({})",
+                        irlume_common::single_line(e, 300)
                     )
                 } else if key.is_some_and(|key| !key.any_envelope) {
                     // irlumed's start checks the key only while an envelope
@@ -4844,6 +4852,27 @@ fn storage_key_notes(
                     ),
                 };
                 notes.push((state, note));
+            }
+            // The original key at a handle IRLUME_SRK_HANDLE no longer names;
+            // the one at the configured handle is the original-key reading.
+            StorageKeyRole::Original
+                if weak
+                    && !matches!(
+                        storage_key,
+                        Ok(StorageKeyCheck::RocaFingerprint { handle: checked, .. })
+                            if *checked == handle
+                    ) =>
+            {
+                notes.push((
+                    State::Warn,
+                    format!(
+                        "irlume's original storage key recorded at {handle:#010x} (TPM name \
+                         {name}), a handle irlumed's IRLUME_SRK_HANDLE no longer names, carries \
+                         the ROCA fingerprint (CVE-2017-15361). irlumed uses the original key \
+                         only at the handle IRLUME_SRK_HANDLE names: the `tpm-storage-keys` \
+                         check says what setting it back involves"
+                    ),
+                ));
             }
             // A role a newer irlumed added: what to do about it is that
             // release's to say, but a weak key must not read as clean.
@@ -7521,6 +7550,45 @@ mod tests {
             detail.contains("next start derives its template again"),
             "{detail}"
         );
+        // Without the DA-exempt part of the reply, nothing says whether a
+        // start replaces it: no promise either way.
+        let (state, detail) = report(vec![da_exempt(None)], Err("the record lock".into()));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("is unknown")
+                && detail.contains("the record lock")
+                && !detail.contains("next start"),
+            "{detail}"
+        );
+        // A weak original key the record names at another handle is
+        // reported; the one at the configured handle is the original-key
+        // reading, not repeated.
+        let original_at = |handle| {
+            entry(
+                StorageKeyRole::Original,
+                handle,
+                weak(handle, None),
+                0,
+                false,
+            )
+        };
+        let (state, detail) = report(vec![original_at(0x8101_0002)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("0x81010002") && detail.contains("no longer names"),
+            "{detail}"
+        );
+        let weak_here = Ok(StorageKeyCheck::RocaFingerprint {
+            handle: 0x8101_0002,
+            derived: None,
+        });
+        let (_, detail) = tpm_firmware_report(
+            &identity,
+            &weak_here,
+            &Ok(vec![original_at(0x8101_0002)]),
+            &key(false, None),
+        );
+        assert!(!detail.contains("no longer names"), "{detail}");
         // With no envelope stored, irlumed's start leaves the key: no
         // promise of a replacement at the next start.
         let empty = |derivation_weak| {

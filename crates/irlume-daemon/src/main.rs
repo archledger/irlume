@@ -6291,13 +6291,13 @@ fn enrollment_capture_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str>
 
 /// The account an enrollment capture's seal is checked for before any camera
 /// opens ([`enrollment_capture_user`]), unless the request adds to an
-/// enrollment the account does not have ([`adds_to_enrollment`] with no
-/// profile file): that reaches no save, and its handler answers that the
-/// account is not enrolled (#1077).
+/// enrollment the account does not have ([`adds_to_enrollment`], and
+/// `irlume_core::storage::has_enrollment_for` is false: no profile, or one or
+/// its key recorded for another uid): that reaches no save, and its handler
+/// answers that the account is not enrolled (#1077).
 fn seal_preflight_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str> {
-    enrollment_capture_user(req, peer).filter(|user| {
-        !adds_to_enrollment(req) || irlume_core::storage::profile_path(user).exists()
-    })
+    enrollment_capture_user(req, peer)
+        .filter(|user| !adds_to_enrollment(req) || irlume_core::storage::has_enrollment_for(user))
 }
 
 /// The refusal for an enrollment capture whose new template key could not be

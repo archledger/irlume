@@ -752,6 +752,22 @@ pub(crate) fn key_is_another_accounts(
     }
 }
 
+/// Whether `user` has an enrollment a load would return, as far as can be told
+/// without unsealing a key: a profile is stored, and neither the enrollment
+/// (when plaintext) nor its template key records another account's uid, which
+/// a load reads as absent (`load_snapshot_with`). For the enrollment seal
+/// preflight (#1077): a request that adds to an enrollment the account does
+/// not have gets its handler's "not enrolled". An encrypted enrollment whose
+/// key records no uid cannot be told apart here and counts as present.
+pub fn has_enrollment_for(user: &str) -> bool {
+    if !profile_path(user).exists() {
+        return false;
+    }
+    let mut account = Account::new(user);
+    !stored_enrollment_is_another_accounts(user, None, &mut account)
+        && !template_key::key_is_for_another_account(user, &mut account)
+}
+
 /// Whether the enrollment stored for `user`, read with `key` (`None`: only a
 /// plaintext one reads), records a uid that `account` resolves as another
 /// account's. `false` when no enrollment is stored or `key` does not read it.
@@ -2368,6 +2384,39 @@ mod tests {
         }
         let _then = crate::account::remember(user, 4601);
         assert_eq!(load(user).unwrap().unwrap().uid, Some(4601));
+        leave_uid_sandbox(&dir);
+    }
+
+    /// #1077: the enrollment preflight's presence check, read without
+    /// unsealing, reads an enrollment as a load does: no profile, a plaintext
+    /// one recorded for another uid, or a template key recorded for another
+    /// uid is absent; the account's own or a legacy enrollment is present.
+    #[test]
+    fn has_enrollment_for_reads_another_accounts_enrollment_or_key_as_absent() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = uid_sandbox("has-enrollment-for");
+        let user = "has-enrollment-owner";
+        let _now = crate::account::remember(user, 4802);
+        assert!(!has_enrollment_for(user), "no profile");
+        plant_plaintext(&dir, user, Some(4801));
+        assert!(!has_enrollment_for(user), "another uid's enrollment");
+        plant_plaintext(&dir, user, Some(4802));
+        assert!(has_enrollment_for(user));
+        plant_plaintext(&dir, user, None);
+        assert!(has_enrollment_for(user), "a legacy enrollment");
+        let key = template_key::key_path(user);
+        fs::create_dir_all(key.parent().unwrap()).unwrap();
+        let mut envelope: crate::envelope::SealedEnvelope =
+            serde_json::from_str(r#"{"version":1,"pcrs":[7],"public":"","private":""}"#).unwrap();
+        envelope.uid = Some(4801);
+        envelope.save(&key).unwrap();
+        assert!(
+            !has_enrollment_for(user),
+            "a template key recorded for another uid"
+        );
         leave_uid_sandbox(&dir);
     }
 

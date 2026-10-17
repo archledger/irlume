@@ -3217,31 +3217,42 @@ pub fn pcrlock_for_sealing() -> Option<u32> {
 ///   the live PCRs and passes `PolicyAuthorizeNV`, which accepts the session
 ///   only when its digest is the policy the index holds.
 ///
-/// `false` (no such policy, no index, a stale index, PCRs no branch predicts,
-/// or an owner authorization the empty one does not satisfy) is where the
-/// seal falls back to the literal PCR policy. Nothing is loaded, sealed or
-/// unsealed.
+/// `false` is where the seal falls back to the literal PCR policy: no such
+/// policy, a prediction no policy session can replay (a PCR no selection
+/// carries, such as 17 to 22, or more branches than one PolicyOR takes), no
+/// index, or a replay the TPM refuses as a mismatch (a stale index, PCRs no
+/// branch predicts, an owner authorization the empty one does not satisfy).
+/// Nothing is loaded, sealed or unsealed.
 ///
 /// # Errors
 ///
-/// When the prediction cannot be read again, the TPM cannot be opened, its
-/// handles cannot be listed, a session cannot be started, or a PCR changed
-/// during the replay (a race the seal itself retries).
+/// When the TPM cannot be opened, its handles cannot be listed, a session
+/// cannot be started, or a policy command fails for another reason than a
+/// mismatch: a transport error, or a PCR that changed during the replay (a
+/// race the seal itself retries). The check then says nothing either way.
 pub fn pcrlock_seals_here() -> Result<bool> {
     let Some(nv_index) = pcrlock_for_sealing() else {
         return Ok(false);
     };
-    let super_pcr = build_super_pcr(&read_pcrlock_json()?)?;
-    let singles = if super_pcr.singles.is_empty() {
-        None
-    } else {
-        Some(pcr_selection(&super_pcr.singles)?)
+    // The seal reads the prediction and builds the same selections; one it
+    // cannot build fails there too, and the seal falls back.
+    let replayable = (|| -> Result<_> {
+        let super_pcr = build_super_pcr(&read_pcrlock_json()?)?;
+        let singles = if super_pcr.singles.is_empty() {
+            None
+        } else {
+            Some(pcr_selection(&super_pcr.singles)?)
+        };
+        let multis = super_pcr
+            .multis
+            .iter()
+            .map(|(pcr, branches)| Ok((pcr_selection(&[*pcr])?, digest_list(branches)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((singles, multis))
+    })();
+    let Ok((singles, multis)) = replayable else {
+        return Ok(false);
     };
-    let multis = super_pcr
-        .multis
-        .iter()
-        .map(|(pcr, branches)| Ok((pcr_selection(&[*pcr])?, digest_list(branches)?)))
-        .collect::<Result<Vec<_>>>()?;
     let mut ctx = open_context()?;
     let wanted = TpmHandle::NvIndex(NvIndexTpmHandle::new(nv_index).map_err(tpm_err)?);
     if !tpm_handle_exists(&mut ctx, TPM2_HR_NV_INDEX, wanted)? {
@@ -3262,12 +3273,40 @@ pub fn pcrlock_seals_here() -> Result<bool> {
                 ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
             })
         })();
-        match replayed.map_err(retryable_tpm_err) {
+        match replayed {
             Ok(()) => Ok(true),
-            Err(e) if is_pcr_changed_race(&e) => Err(e),
-            Err(_) => Ok(false),
+            Err(e) if policy_refused(&e) => Ok(false),
+            Err(e) => Err(retryable_tpm_err(e)),
         }
     })
+}
+
+/// Whether a policy command failed because the policy is not satisfied, not
+/// because the TPM could not run it: PolicyOR with no matching branch, and
+/// PolicyAuthorizeNV over an index that does not hold the session's policy
+/// (TPM 2.0 Library Part 3, 23.6 and 23.22: `TPM_RC_VALUE`,
+/// `TPM_RC_NV_UNINITIALIZED`, `TPM_RC_NV_LOCKED`, `TPM_RC_INSUFFICIENT`,
+/// `TPM_RC_HASH`), or an owner authorization or NV access the empty one does
+/// not satisfy.
+fn policy_refused(e: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind as Kind;
+    matches!(
+        e,
+        tss_esapi::Error::Tss2Error(rc) if matches!(
+            rc.kind(),
+            Some(
+                Kind::Value
+                    | Kind::PolicyFail
+                    | Kind::NvUninitialized
+                    | Kind::NvLocked
+                    | Kind::NvAuthorization
+                    | Kind::Insufficient
+                    | Kind::Hash
+                    | Kind::AuthFail
+                    | Kind::BadAuth
+            )
+        )
+    )
 }
 
 /// The policy PCRs ([`policy_pcrs`]) a literal seal cannot bind: `IRLUME_PCRS`
@@ -3634,6 +3673,24 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 .nv_index,
             None
         );
+    }
+
+    /// #1077: only a policy the TPM refuses as unsatisfied reads as "the
+    /// pcrlock rung does not seal" (`TPM_RC_VALUE`, with or without a
+    /// parameter number, `POLICY_FAIL`, `NV_UNINITIALIZED`, `NV_LOCKED`,
+    /// `NV_AUTHORIZATION`, `INSUFFICIENT`, `HASH`, `AUTH_FAIL`, `BAD_AUTH`);
+    /// a PCR race, a retry, a TPM failure or a transport error says nothing.
+    #[test]
+    fn only_a_refused_policy_reads_as_not_sealing() {
+        let code = |rc: u32| tss_esapi::Error::Tss2Error(rc.into());
+        for refused in [
+            0x084, 0x1c4, 0x09d, 0x14a, 0x148, 0x149, 0x09a, 0x083, 0x08e, 0x0a2,
+        ] {
+            assert!(policy_refused(&code(refused)), "{refused:#x}");
+        }
+        for operational in [0x128, 0x922, 0x101, 0x000a_000a] {
+            assert!(!policy_refused(&code(operational)), "{operational:#x}");
+        }
     }
 
     /// The retry decision, as a value.
@@ -6893,6 +6950,41 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             "the ladder must bind PCR 7 or pcrlock, not PCR 11 alone"
         );
         assert_eq!(&*unseal(&ladder).expect("unseal the ladder seal"), secret);
+    }
+
+    /// #1077: a prediction no policy session can replay (here PCR 18, which
+    /// no selection carries, beside a firmware PCR) cannot seal, so the
+    /// preflight must not exempt it. That is decided from the file, before
+    /// any TPM is opened.
+    #[test]
+    fn a_pcrlock_prediction_no_session_can_replay_does_not_seal() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("pcrlock-unreplayable"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("pcrlock.json");
+        let value = "ab".repeat(32);
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"pcrBank":"sha256","pcrValues":[{{"pcr":7,"values":["{value}"]}},{{"pcr":18,"values":["{value}"]}}],"nvIndex":27981881}}"#
+            ),
+        )
+        .unwrap();
+        let previous = std::env::var_os("IRLUME_PCRLOCK_JSON");
+        std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+        let usable = pcrlock_for_sealing();
+        let seals = pcrlock_seals_here();
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_PCRLOCK_JSON", value),
+            None => std::env::remove_var("IRLUME_PCRLOCK_JSON"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(usable.is_some(), "the file reads as a firmware policy");
+        assert!(!seals.expect("decided without a TPM"));
     }
 
     /// Only a pcrlock policy covering a firmware-measured PCR is sealed under

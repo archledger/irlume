@@ -60,7 +60,34 @@ grants remain unqualified. See [the desktop flow](DESKTOP-AUTH.md).
 | anything else | from source | see [DEVELOPMENT.md](DEVELOPMENT.md); Rust 1.88+, onnxruntime 1.24+ |
 
 Every lane is x86_64 only today (Copr chroots, PPA, `.deb`, and the AUR
-`arch=` line all say so). No aarch64 build exists yet; the blocker is an
+`arch=` line all say so).
+
+## Nightly channel
+
+Builds of `main`, for trying a fix before the next release
+([ADR-0037](adr/0037-nightly-channel.md)). Each build is a commit that passed
+the required checks; none has had the release checks (the install matrix, the
+upgrade and rollback transactions, hardware qualification), and none carries
+an SBOM, VEX or SLSA provenance ([VERIFY.md](VERIFY.md) covers release assets
+only). A nightly build can break face login or its PAM wiring on a given
+machine; the password always works, as with any irlume build.
+
+| Distro | Lane | Updates | Back to releases |
+|---|---|---|---|
+| Fedora | Copr `archledger/irlume-nightly`: `sudo dnf copr enable archledger/irlume-nightly && sudo dnf install irlume` | every merge to `main`, once Copr has built it: `sudo dnf upgrade --refresh irlume` | `sudo dnf copr disable archledger/irlume-nightly && sudo dnf copr enable archledger/irlume && sudo dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm` (each subpackage requires the exact `irlume` version, so the installed ones move with it) |
+| Arch | AUR [`irlume-git`](https://aur.archlinux.org/packages/irlume-git) (and `irlume-kcm-git`): `yay -S irlume-git` | `yay -Syu --devel` (or `paru -Syu --devel`) rebuilds from `main` | `yay -S irlume`, with `irlume-kcm` in the same command when `irlume-kcm-git` is installed |
+
+Enable the nightly lane alone: it carries a build at least as new as the
+latest release within a day of it, when the nightly of the release's tag
+builds. A nightly version sorts after the release
+it follows and before the next one, so with both lanes enabled the package
+manager installs the newer build, which right after a release can be the
+release itself until the nightly of its tag arrives. The Copr build keeps the release's `Version` with a
+`Release` naming the build time and commit; `irlume-git` reads as
+`0.15.0.r139.g3c162b83` (139 commits after v0.15.0). `irlume doctor`'s
+`install-origin` names the nightly lane and its package version, and
+`irlume update` on a nightly lane upgrades through it whatever the latest
+release. No aarch64 build exists yet; the blocker is an
 arm64 onnxruntime + rebuild validation, not anything in the code.
 
 ## Release upgrade validation

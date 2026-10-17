@@ -81,7 +81,9 @@ sudo apt install ./irlume_*.deb                                     # Debian 12+
 On NixOS use `nixosModules.irlume` from this flake ([docs/NIXOS.md](docs/NIXOS.md)).
 Signed packages for every distro are attached to each
 [release](https://github.com/archledger/irlume/releases) as a fallback.
-Which lane suits which distro version: [docs/SETUP.md](docs/SETUP.md).
+Which lane suits which distro version: [docs/PLATFORMS.md](docs/PLATFORMS.md#install-lane-per-distro).
+To try a fix before the next release, the [nightly channel](docs/PLATFORMS.md#nightly-channel)
+builds `main` (unreleased: no release checks, and it can break face login; the password always works).
 
 </details>
 

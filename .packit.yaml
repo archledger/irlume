@@ -50,3 +50,22 @@ jobs:
     enable_net: true
     targets:
       - fedora-stable
+
+  # The nightly channel (docs/adr/0037-nightly-channel.md): every push to
+  # main builds into its own Copr project, never the release one. Packit's
+  # default Release suffix (build time, branch, commit) sorts each build above
+  # the release of the same Version and above the build before it. The
+  # project, its chroots, network and Packit's builder permission are set up
+  # once in Copr (the ADR's owner setup). The identifier keeps its check runs
+  # apart from the other copr_build jobs'.
+  - job: copr_build
+    trigger: commit
+    branch: main
+    identifier: nightly
+    owner: archledger
+    project: irlume-nightly
+    enable_net: true
+    targets:
+      - fedora-stable
+      - fedora-development
+      - fedora-rawhide

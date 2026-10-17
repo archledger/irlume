@@ -7,6 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A nightly channel builds `main` for trying a fix before the next release
+  (ADR-0037; docs/PLATFORMS.md "Nightly channel"): on Fedora the Copr
+  project `archledger/irlume-nightly`, built by Packit on every push to
+  `main`, and on Arch the AUR's `irlume-git` with `irlume-kcm-git`, whose
+  recipe is generated from the release recipe and checked by CI. Nightly
+  versions sort after the release they follow and before the next. Builds
+  are unreleased: no release checks, SBOM, VEX or provenance, and a build
+  can break face login on a given machine; the password always works.
+  Release lanes are unchanged. A daily workflow raises an alert when the
+  AUR's copy of the recipe falls behind `main`'s.
+
 - `irlume doctor` gains a `tpm-endorsement` check (ADR-0036): whether the TPM
   is the one its endorsement key (EK) certificate names. irlumed's new
   root-only `TpmEndorsement` request reads the EK certificates the TCG EK

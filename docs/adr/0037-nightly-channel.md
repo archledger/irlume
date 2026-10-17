@@ -169,9 +169,12 @@ nothing on a nightly lane.
     build does (`verify-ppa-publish.py`'s own advice); once `main` moves, the
     failed state is dropped and the new version is uploaded, so a fix on
     `main` is never held up by retries of the commit it fixed.
-  A failure before the upload (the build, the signature, dput) records
-  nothing, so the next night starts over; every failure is logged to the user
-  journal. At most one upload a day keeps two or three uploads, 2.5 to
+  A failure before the upload (the build, the signature) records nothing,
+  so the next night starts over. Once dput has run, its version is recorded
+  as uploaded whether dput succeeded or not, since a connection lost after
+  the last byte leaves dput failing while Launchpad accepts the upload; the
+  source publication then decides, as for any upload. Every failure is
+  logged to the user journal. At most one upload a day keeps two or three uploads, 2.5 to
   3.7 GB, on disk at once, inside the 8 GiB quota (Context).
   The key is stored on minihost without a passphrase (gpg-agent's `keyinfo`
   reports it unprotected), as it already signs that host's commits
@@ -231,7 +234,8 @@ says so, and that:
   installed from the nightly Copr alone has no release repository enabled,
   and `distro-sync` picks from enabled repositories only), then
   `dnf distro-sync irlume`; removing the
-  nightly PPA then installing the release PPA's version with
+  nightly PPA, adding the release PPA (a machine installed from the nightly
+  PPA alone has none), then installing the release PPA's version with
   `--allow-downgrades`, with `irlume-kcm` in the same command when it is
   installed, since it depends on the exact `irlume` version; installing
   `irlume` from the AUR, which replaces
@@ -289,8 +293,9 @@ These need the maintainer's accounts, and are done once:
   nightly version listed only at `/var/lib/dpkg/status`, beside a newer
   candidate from the nightly PPA and the release PPA's version, still reads
   as the nightly PPA.
-- Leaving the nightly PPA names `irlume-kcm` in the downgrade command beside
-  `irlume`.
+- Leaving the nightly PPA adds the release PPA before the downgrade, so a
+  machine that had only the nightly PPA returns to the release, and names
+  `irlume-kcm` in the downgrade command beside `irlume`.
 - Leaving the nightly Copr enables the release Copr before `distro-sync`, so
   a machine that had only the nightly Copr returns to the release.
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
@@ -319,7 +324,9 @@ These need the maintainer's accounts, and are done once:
     revision;
   - after a failed build followed by a move of `main`, uploads the new
     version and drops the failed one;
-  - records nothing when the build, the signature or dput fails.
+  - records nothing when the build or the signature fails;
+  - after a dput failure whose upload Launchpad accepted, verifies it
+    instead of uploading it again.
 - The scheduled AUR drift check reports a `PKGBUILD`, `.SRCINFO` or
   `irlume.install` that differs from `main`'s `packaging/arch-git/`, also a
   stale `.SRCINFO` beside a current `PKGBUILD`, and passes when all match.

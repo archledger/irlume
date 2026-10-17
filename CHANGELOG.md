@@ -632,7 +632,10 @@ All notable changes to irlume are documented here. This project adheres to
   `install-origin` and `irlume update` name the three nightly lanes, and
   `update` on one upgrades through it whatever the latest release; version
   comparisons read the nightly snapshot versions as the release they
-  follow.
+  follow. The machine API schema and MACHINE-API.md now describe
+  `irlume support-report --json`'s document, including its `install_channel`
+  values `fedora_copr_nightly`, `ubuntu_ppa_nightly` and `arch_git`, and the
+  conformance script checks it.
 
 - `irlume uninstall` evicts irlume's storage keys through the TPM irlumed
   uses: the `IRLUME_TCTI` and `IRLUME_SRK_HANDLE` that irlumed's unit sets,

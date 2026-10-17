@@ -168,17 +168,19 @@ pub fn update(args: &[String]) -> ExitCode {
 
 /// `irlume update` on a nightly lane (ADR-0037 §4): the lane's own upgrade
 /// runs every time, since a nightly build is always at or past the latest
-/// release. `--check` only says what it would run.
+/// release. `--check` only says what it would run. Either way it then says
+/// how to return to releases, and the upgrade's exit status is kept.
 fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
     println!("[update] nightly channel: builds of main, not releases (ADR-0037)");
     match origin {
         InstallOrigin::CoprNightly => {
-            if check_only {
+            let status = if check_only {
                 println!("  would run: sudo dnf upgrade --refresh irlume");
+                ExitCode::SUCCESS
             } else {
                 println!("[update] updating from the nightly Copr (the channel this was installed from):");
-                return run_pkg_steps(&[&["dnf", "upgrade", "--refresh", "irlume"]]);
-            }
+                run_pkg_steps(&[&["dnf", "upgrade", "--refresh", "irlume"]])
+            };
             println!("  Back to releases: sudo dnf copr disable archledger/irlume-nightly");
             println!("    && sudo dnf copr enable archledger/irlume");
             // Each subpackage requires the exact irlume version and dnf
@@ -187,24 +189,27 @@ fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
             println!(
                 "    && sudo dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm"
             );
+            status
         }
         InstallOrigin::PpaNightly => {
-            if check_only {
+            let status = if check_only {
                 println!("  would run: sudo apt update && sudo apt install --only-upgrade irlume");
+                ExitCode::SUCCESS
             } else {
                 println!(
                     "[update] updating from the nightly PPA (the channel this was installed from):"
                 );
-                return run_pkg_steps(&[
+                run_pkg_steps(&[
                     &["apt", "update"],
                     &["apt", "install", "--only-upgrade", "irlume"],
-                ]);
-            }
+                ])
+            };
             println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
             println!("    && sudo add-apt-repository ppa:archledger/irlume");
             // irlume-kcm depends on the exact irlume version, so it moves too.
             println!("    && sudo apt install --allow-downgrades irlume/<your Ubuntu codename>");
             println!("       (add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed)");
+            status
         }
         InstallOrigin::ArchGit => {
             // An AUR helper does not run as root, so, as for the AUR release
@@ -218,10 +223,10 @@ fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
             // Each release package replaces only its own nightly counterpart.
             println!("  Back to releases: yay -S irlume  (replaces irlume-git; add irlume-kcm");
             println!("    in the same command when irlume-kcm-git is installed)");
+            ExitCode::SUCCESS
         }
         _ => unreachable!("only the nightly lanes update here"),
     }
-    ExitCode::SUCCESS
 }
 
 /// How this irlume install got onto the system; decides the update channel.

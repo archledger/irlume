@@ -5676,9 +5676,16 @@ esac"#,
                 ),
                 "{out}"
             );
+            // The upgrade itself is followed by the way back, too.
             let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update"]));
             assert_eq!(code, 0);
             assert!(out.contains("[update] done."), "{out}");
+            assert!(
+                out.contains(
+                    "sudo dnf distro-sync --skip-unavailable irlume irlume-selinux irlume-kcm"
+                ),
+                "{out}"
+            );
         }
         "debian" => {
             sb.fake_tool(
@@ -5713,6 +5720,16 @@ esac"#,
             );
             assert!(
                 out.contains("add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed"),
+                "{out}"
+            );
+            // The upgrade itself is followed by the way back, too.
+            sb.fake_tool("sudo", r#"exec "$@""#);
+            sb.fake_tool("apt", "exit 0");
+            let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update"]));
+            assert_eq!(code, 0);
+            assert!(out.contains("[update] done."), "{out}");
+            assert!(
+                out.contains("--remove ppa:archledger/irlume-nightly"),
                 "{out}"
             );
         }

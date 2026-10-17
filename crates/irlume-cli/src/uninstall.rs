@@ -264,7 +264,9 @@ pub fn run(args: &[String]) -> ExitCode {
     // this process exits).
     println!();
     let origin = install_origin();
-    let removed = remove_irlume(&origin);
+    // Read once, so the removal and its manual fallback name the same packages.
+    let arch_packages = arch_packages_for(&origin);
+    let removed = remove_irlume(&origin, &arch_packages);
     // Clean the leftovers a package `remove` doesn't (drop-in, empty dirs, repo)
     // regardless of whether the package removal itself succeeded.
     clean_residuals(&origin);
@@ -294,7 +296,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Err(e) => {
             println!("[uninstall] could not finish removal automatically: {e}");
             println!("[uninstall] the teardown above is done; remove the package by hand:");
-            println!("  {}", removal_hint(&origin));
+            println!("  {}", removal_hint(&origin, &arch_packages));
             println!("[uninstall] {}", retention_notice(report.retention));
         }
     }
@@ -344,7 +346,7 @@ fn removal_refusal(report: &TeardownReport) -> Option<String> {
 /// Remove irlume itself. Package installs go through the package manager (so the
 /// package database stays consistent); a source install has its hand-placed
 /// files deleted directly. `--yes`/confirmation already happened in `run`.
-fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
+fn remove_irlume(origin: &InstallOrigin, arch_packages: &[String]) -> Result<String, String> {
     match origin {
         InstallOrigin::Copr | InstallOrigin::CoprNightly | InstallOrigin::LocalRpm(_) => {
             run_pkg("dnf", &["remove", "-y", "irlume"])
@@ -359,11 +361,21 @@ fn remove_irlume(origin: &InstallOrigin) -> Result<String, String> {
         // packages are installed under (`irlume-git` on the nightly lane,
         // ADR-0037), with the KCM, which depends on irlume, in the same call.
         InstallOrigin::ArchPkg | InstallOrigin::ArchGit => {
-            let args = arch_remove_args(&arch_installed_packages());
+            let args = arch_remove_args(arch_packages);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             run_pkg("pacman", &args)
         }
         InstallOrigin::Source => remove_source_files(),
+    }
+}
+
+/// The pacman packages an Arch origin removes, from
+/// [`arch_installed_packages`]; empty for every other origin, which never
+/// runs pacman.
+fn arch_packages_for(origin: &InstallOrigin) -> Vec<String> {
+    match origin {
+        InstallOrigin::ArchPkg | InstallOrigin::ArchGit => arch_installed_packages(),
+        _ => Vec::new(),
     }
 }
 
@@ -2550,7 +2562,10 @@ fn wipe_data_trees(dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 /// The package-removal command for how irlume was installed. Pure so it is unit
 /// tested; the teardown above is what actually touches the system.
-pub fn removal_hint(origin: &InstallOrigin) -> String {
+/// `arch_packages` is what an Arch origin's removal named (the KCM with
+/// irlume: pacman refuses to remove irlume alone while a KCM depends on it);
+/// dnf and apt remove what depends on irlume themselves.
+pub fn removal_hint(origin: &InstallOrigin, arch_packages: &[String]) -> String {
     match origin {
         InstallOrigin::Copr | InstallOrigin::CoprNightly | InstallOrigin::LocalRpm(_) => {
             "sudo dnf remove irlume".into()
@@ -2558,8 +2573,14 @@ pub fn removal_hint(origin: &InstallOrigin) -> String {
         InstallOrigin::Ppa | InstallOrigin::PpaNightly | InstallOrigin::LocalDeb => {
             "sudo apt remove irlume".into()
         }
-        InstallOrigin::ArchPkg => "sudo pacman -Rns irlume".into(),
-        InstallOrigin::ArchGit => "sudo pacman -Rns irlume-git".into(),
+        InstallOrigin::ArchPkg | InstallOrigin::ArchGit => {
+            let names = match (arch_packages.is_empty(), origin) {
+                (false, _) => arch_packages.join(" "),
+                (true, InstallOrigin::ArchGit) => "irlume-git".to_owned(),
+                (true, _) => "irlume".to_owned(),
+            };
+            format!("sudo pacman -Rns {names}")
+        }
         InstallOrigin::Source => {
             "source install: remove the binaries you placed (e.g. /usr/local/bin/irlume, \
              /usr/local/bin/irlumed) and the systemd unit"
@@ -3215,21 +3236,35 @@ mod tests {
 
     #[test]
     fn removal_hint_maps_each_origin_to_its_package_manager() {
-        assert_eq!(removal_hint(&InstallOrigin::Copr), "sudo dnf remove irlume");
         assert_eq!(
-            removal_hint(&InstallOrigin::LocalRpm(String::new())),
+            removal_hint(&InstallOrigin::Copr, &[]),
             "sudo dnf remove irlume"
         );
-        assert_eq!(removal_hint(&InstallOrigin::Ppa), "sudo apt remove irlume");
         assert_eq!(
-            removal_hint(&InstallOrigin::LocalDeb),
+            removal_hint(&InstallOrigin::LocalRpm(String::new()), &[]),
+            "sudo dnf remove irlume"
+        );
+        assert_eq!(
+            removal_hint(&InstallOrigin::Ppa, &[]),
             "sudo apt remove irlume"
         );
         assert_eq!(
-            removal_hint(&InstallOrigin::ArchPkg),
+            removal_hint(&InstallOrigin::LocalDeb, &[]),
+            "sudo apt remove irlume"
+        );
+        assert_eq!(
+            removal_hint(&InstallOrigin::ArchPkg, &[]),
             "sudo pacman -Rns irlume"
         );
-        assert!(removal_hint(&InstallOrigin::Source).contains("source install"));
+        assert_eq!(
+            removal_hint(&InstallOrigin::ArchGit, &[]),
+            "sudo pacman -Rns irlume-git"
+        );
+        assert!(removal_hint(&InstallOrigin::Source, &[]).contains("source install"));
+        // Other origins never ask pacman.
+        assert!(arch_packages_for(&InstallOrigin::Copr).is_empty());
+        assert!(arch_packages_for(&InstallOrigin::Ppa).is_empty());
+        assert!(arch_packages_for(&InstallOrigin::Source).is_empty());
     }
 
     // Repository/key directories are shared ownership domains. A filename is
@@ -4364,26 +4399,35 @@ mod tests {
     fn arch_removal_matches_the_manual_hint() {
         // The automatic path and the printed hint must agree; without -n,
         // pacman leaves a .pacsave of the backup-marked retry-reset file.
-        let release = arch_remove_args(&["irlume".to_owned()]);
+        // The hint names the same packages as the removal, so with a KCM
+        // installed it names the KCM too: pacman refuses irlume alone.
+        let hint_matches = |origin: &InstallOrigin, packages: &[&str]| {
+            let packages: Vec<String> = packages.iter().map(|p| (*p).to_owned()).collect();
+            let args = arch_remove_args(&packages);
+            assert_eq!(
+                removal_hint(origin, &packages),
+                format!("sudo pacman {}", args.join(" ").replace(" --noconfirm", ""))
+            );
+            args
+        };
+        let release = hint_matches(&InstallOrigin::ArchPkg, &["irlume"]);
         assert_eq!(release, ["-Rns", "--noconfirm", "irlume"]);
-        assert_eq!(
-            removal_hint(&InstallOrigin::ArchPkg),
-            format!(
-                "sudo pacman {}",
-                release.join(" ").replace(" --noconfirm", "")
-            )
-        );
+        hint_matches(&InstallOrigin::ArchPkg, &["irlume-kcm", "irlume"]);
         // The nightly lane removes its packages under their own names, the
         // KCM with them, since -R does not resolve provides (ADR-0037 §4).
-        let nightly = arch_remove_args(&["irlume-kcm-git".to_owned(), "irlume-git".to_owned()]);
+        let nightly = hint_matches(&InstallOrigin::ArchGit, &["irlume-kcm-git", "irlume-git"]);
         assert_eq!(
             nightly,
             ["-Rns", "--noconfirm", "irlume-kcm-git", "irlume-git"]
         );
         assert_eq!(
-            removal_hint(&InstallOrigin::ArchGit),
-            "sudo pacman -Rns irlume-git"
+            removal_hint(
+                &InstallOrigin::ArchGit,
+                &["irlume-kcm-git".to_owned(), "irlume-git".to_owned()]
+            ),
+            "sudo pacman -Rns irlume-kcm-git irlume-git"
         );
+        hint_matches(&InstallOrigin::ArchGit, &["irlume-kcm", "irlume-git"]);
         // Whichever KCM provides irlume-kcm goes with whichever main
         // package: the release KCM beside irlume-git too.
         let names = |pairs: &'static [(&'static str, &'static str)]| {

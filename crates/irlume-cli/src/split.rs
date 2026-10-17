@@ -85,7 +85,9 @@ camera and an IR camera on two USB devices) are not qualified for authentication
 assurance. Their evidence is sequential and grants only on an IR identity match. An \
 attested YUYV-only IR camera without per-frame illumination records, such as the \
 ThinkPad T480's, is judged per burst, and its lit frames are inferred from each burst's \
-own alternation, which other programs with access to the camera can disturb. Split pairs \
+own alternation, which other programs with access to the camera can disturb (the \
+packaged udev rule closes that window for these cameras once the node is replugged; \
+`irlume doctor` reports the node's state). Split pairs \
 use built-in cameras unless allow_external_split_cameras=1. The password always remains \
 available.";
 

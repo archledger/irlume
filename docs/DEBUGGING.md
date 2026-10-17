@@ -364,9 +364,14 @@ clipping ceiling for this burst:` and the reason, and a latched frame
 violation once per session. A qualified burst from a camera with no
 illumination records also logs `no illumination records; this burst's proven
 alternation marks its bright frames active IR` (amendment 2026-10-14).
-Outside a split pair under the experimental opt-in, every YUYV burst logs
+Outside a split pair under the experimental opt-in and outside an IR node
+closed to the seat user, every YUYV burst logs
 `no YUYV clipping ceiling for this burst: YUYV IR bursts are judged only on
-a split pair under the experimental opt-in`. When
+a split pair under the experimental opt-in or on an access-hardened IR node`.
+For a camera with no illumination records the packaged
+`72-irlume-ir-nodes.rules` closes its node to the seat user at the next plug
+or boot, and `irlume doctor`'s `ir-node-access` row reports the node's
+current state (amendment 2026-10-17, #1069). When
 no emitter control is configured, such a session logs `face authentication
 holds its device-default D1 value (read only)` at open if the camera's own
 control reports its alternating mode, which counts as an active emitter for

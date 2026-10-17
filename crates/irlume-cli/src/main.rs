@@ -5646,6 +5646,131 @@ fn doctor(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// Whether an unreadable scan entry is a deliberately hardened no-records
+/// YUYV IR node: the open was refused on permissions, the USB identity is in
+/// the table the packaged rule ships, and the node's own state reads
+/// hardened. Pure over the gathered facts so the rule is testable without a
+/// camera (Codex #1109 round 5).
+fn hardened_ir_node_present(
+    errno: Option<i32>,
+    usb: Option<(u16, u16)>,
+    access: irlume_camera::node_access::NodeAccess,
+) -> bool {
+    matches!(errno, Some(libc::EACCES) | Some(libc::EPERM))
+        && usb.is_some_and(|id| irlume_camera::uvc_descriptor::NO_RECORDS_YUYV_IR.contains(&id))
+        && access == irlume_camera::node_access::NodeAccess::Hardened
+}
+
+/// The `camera-nodes` verdict: a classified IR node passes, as does a
+/// deliberately hardened one (the daemon opens it as root); nothing readable
+/// at all fails; some cameras but no IR warns.
+fn camera_nodes_state(
+    has_ir: bool,
+    nothing_classified: bool,
+    hardened_ir_present: bool,
+) -> crate::doctor_report::State {
+    use crate::doctor_report::State;
+    if has_ir || hardened_ir_present {
+        State::Pass
+    } else if nothing_classified {
+        State::Fail
+    } else {
+        State::Warn
+    }
+}
+
+/// One scanned node's facts for `ir_node_access_rows`: its role where the
+/// scan classified it (`None` for the unreadable bucket), its USB identity
+/// where sysfs answered, its measured access state and its path.
+type NodeAccessFact = (
+    Option<irlume_camera::Role>,
+    Option<(u16, u16)>,
+    irlume_camera::node_access::NodeAccess,
+    String,
+);
+
+/// The `ir-node-access` rows: one per in-class device, over its candidate
+/// nodes' measured states (#1069). Candidates are the scan's classified IR
+/// nodes (`Some(Role::Ir)`) and its unreadable nodes (`None`), with their USB
+/// identities where sysfs answered; anything else never reaches a row. A
+/// device with several candidate nodes (its capture and metadata nodes share
+/// the rule) gets one row over their worst state. Pure so the wording is
+/// testable without a camera.
+fn ir_node_access_rows(entries: Vec<NodeAccessFact>) -> Vec<(crate::doctor_report::State, String)> {
+    use crate::doctor_report::State;
+    use irlume_camera::node_access::NodeAccess;
+    let mut devices: std::collections::BTreeMap<(u16, u16), Vec<(String, NodeAccess)>> =
+        std::collections::BTreeMap::new();
+    for (role, usb, access, path) in entries {
+        if !matches!(role, None | Some(irlume_camera::Role::Ir)) {
+            continue;
+        }
+        let Some(id) = usb else { continue };
+        if !irlume_camera::uvc_descriptor::NO_RECORDS_YUYV_IR.contains(&id) {
+            continue;
+        }
+        devices.entry(id).or_default().push((path, access));
+    }
+    let mut rows = Vec::new();
+    for (id, nodes) in devices {
+        let paths = nodes
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let worst = nodes
+            .iter()
+            .map(|(_, access)| access)
+            .max_by_key(|access| match access {
+                NodeAccess::Hardened => 0,
+                NodeAccess::Unreadable => 1,
+                NodeAccess::Shared(_) => 2,
+            })
+            .expect("a device row has at least one node");
+        let id_text = format!("{:04x}:{:04x}", id.0, id.1);
+        let (state, detail) = match worst {
+            NodeAccess::Hardened => (
+                State::Pass,
+                format!(
+                    "{id_text} ({paths}): closed to everyone but root; the burst proof \
+                     stands without the experimental opt-in"
+                ),
+            ),
+            NodeAccess::Shared(why) => (
+                State::Warn,
+                format!(
+                    "{id_text} ({paths}): {why}, so a non-root program can reach the \
+                     emitter control within a burst; the burst proof stays inside the \
+                     experimental split opt-in until the packaged udev rule applies (it \
+                     closes the node at the camera's next plug or boot) or an \
+                     administrator closes it"
+                ),
+            ),
+            NodeAccess::Unreadable => (
+                State::Unknown,
+                format!("{id_text} ({paths}): the node's access state could not be read"),
+            ),
+        };
+        rows.push((state, detail));
+    }
+    rows
+}
+
+/// The worst of the per-device row states: a shared device outranks an
+/// unreadable one, which outranks a hardened one.
+fn ir_node_access_worst(
+    rows: &[(crate::doctor_report::State, String)],
+) -> crate::doctor_report::State {
+    use crate::doctor_report::State;
+    if rows.iter().any(|(state, _)| *state == State::Warn) {
+        State::Warn
+    } else if rows.iter().any(|(state, _)| *state == State::Unknown) {
+        State::Unknown
+    } else {
+        State::Pass
+    }
+}
+
 /// The negotiated streams against the Windows Hello minimums (#223).
 ///
 /// A line, not a gate: an under-spec stream still authenticates, but a smaller
@@ -6157,15 +6282,26 @@ fn doctor_run(
     // The verdict is unchanged by #227: a node irlume cannot read is still a
     // node it cannot use, so "nodes present, none readable" fails exactly as
     // "no nodes" does. What changed is that the lines below now say which.
+    // One deliberate exception (#1069, Codex round 5): a no-records YUYV IR
+    // node hardened by the packaged udev rule is unreadable to this seat-user
+    // scan BECAUSE hardening succeeded; the daemon opens it as root, so it
+    // counts as the machine's IR capability when its own state proves the
+    // hardening (refused on permissions, in the USB identity table, and
+    // reading hardened).
+    let hardened_ir_present = scan.unreadable.iter().any(|u| {
+        hardened_ir_node_present(
+            u.errno,
+            irlume_camera::uvc_descriptor::usb_ids(&u.path).ok(),
+            irlume_camera::node_access::node_access(std::path::Path::new(&u.path)),
+        )
+    });
     report.check(
         "camera-nodes",
-        if nodes.iter().any(|(_, r)| *r == irlume_camera::Role::Ir) {
-            State::Pass
-        } else if nodes.is_empty() {
-            State::Fail
-        } else {
-            State::Warn
-        },
+        camera_nodes_state(
+            nodes.iter().any(|(_, r)| *r == irlume_camera::Role::Ir),
+            nodes.is_empty(),
+            hardened_ir_present,
+        ),
     );
     // "Could not look" is not "nothing there". Reporting a /dev that would not
     // list as a machine with no cameras is the same mistake at one level up.
@@ -6198,6 +6334,58 @@ fn doctor_run(
         "[doctor] experimental split pairs: {}",
         split::experimental_status_line()
     );
+
+    // --- IR node access for the no-records YUYV class (#1069) --------------
+    // A descriptor-attested YUYV IR camera without per-frame illumination
+    // records proves active IR from the burst's own alternation, and that
+    // proof is complete only while no non-root program can open the node
+    // (ADR-0031, amendment 2026-10-17). Report the device's real access
+    // state: a node still carrying the seat ACL keeps the proof inside the
+    // experimental opt-in. A successfully hardened node is one this scan
+    // cannot open as the seat user, so it lands in `unreadable`, not
+    // `classified`: both buckets are searched (Codex #1109 round 1). The
+    // class membership is keyed on the USB identity table the packaged udev
+    // rule ships, so this row names exactly the cameras it covers.
+    {
+        let mut entries: Vec<NodeAccessFact> = Vec::new();
+        for (path, role) in &scan.classified {
+            entries.push((
+                Some(*role),
+                irlume_camera::uvc_descriptor::usb_ids(path).ok(),
+                irlume_camera::node_access::node_access(std::path::Path::new(path)),
+                path.clone(),
+            ));
+        }
+        for unreadable in &scan.unreadable {
+            entries.push((
+                None,
+                irlume_camera::uvc_descriptor::usb_ids(&unreadable.path).ok(),
+                irlume_camera::node_access::node_access(std::path::Path::new(&unreadable.path)),
+                unreadable.path.clone(),
+            ));
+        }
+        let rows = ir_node_access_rows(entries);
+        for (_, detail) in &rows {
+            dout!(report, "[doctor] IR node access: {detail}");
+        }
+        let (state, detail) = if rows.is_empty() {
+            (
+                State::Info,
+                "no descriptor-attested YUYV IR camera without per-frame illumination \
+                 records on this machine"
+                    .to_string(),
+            )
+        } else {
+            (
+                ir_node_access_worst(&rows),
+                rows.iter()
+                    .map(|(_, detail)| detail.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        };
+        report.check_detail("ir-node-access", state, detail);
+    }
 
     // --- stream vs the Windows Hello minimums (#223) -----------------------
     {
@@ -7149,6 +7337,151 @@ fn selftest_align(args: &[String]) -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1069: the rows name exactly the cameras the packaged udev rule
+    /// covers; a hardened node the seat user's scan cannot open arrives as an
+    /// unreadable entry and must still get its row (Codex #1109 round 1).
+    #[test]
+    fn ir_node_access_rows_cover_classified_and_unreadable_nodes() {
+        use crate::doctor_report::State;
+        use irlume_camera::node_access::NodeAccess;
+        let t480 = Some((0x5986, 0x1141));
+        // One device, both its nodes unreadable to the seat user: one row,
+        // pass, naming both nodes.
+        let rows = ir_node_access_rows(vec![
+            (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
+            (None, t480, NodeAccess::Hardened, "/dev/video1".into()),
+        ]);
+        let [(state, detail)] = rows.as_slice() else {
+            panic!("one device gets one row, got {rows:?}")
+        };
+        assert_eq!(*state, State::Pass);
+        assert!(
+            detail.contains("5986:1141")
+                && detail.contains("/dev/video0")
+                && detail.contains("/dev/video1"),
+            "{detail}"
+        );
+        // An RGB node of even an in-class device, a records-capable IR camera
+        // (the ASUS) and a node whose USB identity was not read never row.
+        assert!(ir_node_access_rows(vec![
+            (
+                Some(irlume_camera::Role::Rgb),
+                t480,
+                NodeAccess::Hardened,
+                "/dev/video0".into()
+            ),
+            (
+                Some(irlume_camera::Role::Ir),
+                Some((0x3277, 0x0059)),
+                NodeAccess::Shared("the seat tag is set".into()),
+                "/dev/video2".into()
+            ),
+            (
+                Some(irlume_camera::Role::Ir),
+                None,
+                NodeAccess::Shared("the seat tag is set".into()),
+                "/dev/video3".into()
+            ),
+        ])
+        .is_empty());
+        // One shared node of the pair makes the device warn with the remedy.
+        let rows = ir_node_access_rows(vec![
+            (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
+            (
+                None,
+                t480,
+                NodeAccess::Shared("owned by uid 1000".into()),
+                "/dev/video1".into(),
+            ),
+        ]);
+        assert_eq!(rows[0].0, State::Warn);
+        assert!(
+            rows[0].1.contains("owned by uid 1000")
+                && rows[0].1.contains("experimental split opt-in")
+                && !rows[0].1.contains('\n'),
+            "{}",
+            rows[0].1
+        );
+        // Unreadable outranks hardened but never shared.
+        let rows = ir_node_access_rows(vec![(
+            None,
+            t480,
+            NodeAccess::Unreadable,
+            "/dev/video0".into(),
+        )]);
+        assert_eq!(rows[0].0, State::Unknown);
+        assert!(rows[0].1.contains("/dev/video0"), "{}", rows[0].1);
+    }
+
+    /// #1069: a shared node outranks an unreadable one, which outranks a
+    /// hardened one, so the one machine-level check reads the worst node.
+    #[test]
+    fn ir_node_access_worst_orders_warn_unknown_pass() {
+        use crate::doctor_report::State;
+        let row = |state| (state, String::new());
+        assert_eq!(ir_node_access_worst(&[row(State::Pass)]), State::Pass);
+        assert_eq!(
+            ir_node_access_worst(&[row(State::Pass), row(State::Unknown)]),
+            State::Unknown
+        );
+        assert_eq!(
+            ir_node_access_worst(&[row(State::Unknown), row(State::Warn)]),
+            State::Warn
+        );
+        assert_eq!(
+            ir_node_access_worst(&[row(State::Warn), row(State::Pass)]),
+            State::Warn
+        );
+    }
+
+    /// Codex #1109 round 5: on a host where the packaged rule hardened the
+    /// no-records YUYV IR node, the seat user's scan cannot open it, and that
+    /// success must not fail the camera-nodes capability check.
+    #[test]
+    fn camera_nodes_count_a_deliberately_hardened_ir_node() {
+        use crate::doctor_report::State;
+        use irlume_camera::node_access::NodeAccess;
+        // The hardened in-class unreadable node counts as IR capability.
+        assert!(hardened_ir_node_present(
+            Some(libc::EACCES),
+            Some((0x5986, 0x1141)),
+            NodeAccess::Hardened
+        ));
+        assert!(hardened_ir_node_present(
+            Some(libc::EPERM),
+            Some((0x5986, 0x1141)),
+            NodeAccess::Hardened
+        ));
+        // A busy node is not hardening evidence, and neither are an off-table
+        // identity, an identity sysfs could not read, or a node still shared.
+        assert!(!hardened_ir_node_present(
+            Some(libc::EBUSY),
+            Some((0x5986, 0x1141)),
+            NodeAccess::Hardened
+        ));
+        assert!(!hardened_ir_node_present(
+            Some(libc::EACCES),
+            Some((0x3277, 0x0059)),
+            NodeAccess::Hardened
+        ));
+        assert!(!hardened_ir_node_present(
+            Some(libc::EACCES),
+            Some((0x5986, 0x1141)),
+            NodeAccess::Shared("the seat tag is set".into())
+        ));
+        assert!(!hardened_ir_node_present(
+            Some(libc::EACCES),
+            None,
+            NodeAccess::Hardened
+        ));
+        // The verdict mapping, including a hardened-only host passing.
+        assert_eq!(camera_nodes_state(true, false, false), State::Pass);
+        assert_eq!(camera_nodes_state(false, true, true), State::Pass);
+        assert_eq!(camera_nodes_state(false, false, true), State::Pass);
+        assert_eq!(camera_nodes_state(false, true, false), State::Fail);
+        assert_eq!(camera_nodes_state(false, false, false), State::Warn);
+    }
 
     #[test]
     fn faillock_record_counting_matches_the_tally_format() {

@@ -7,6 +7,30 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume doctor` gains a `tpm-endorsement` check (ADR-0036): whether the TPM
+  is the one its endorsement key (EK) certificate names. irlumed's new
+  root-only `TpmEndorsement` request reads the EK certificates the TCG EK
+  Credential Profile assigns, and the certificate chain indices, verifies each
+  chain offline against the vendor root and intermediate CAs irlume now ships
+  (Infineon, STMicroelectronics with GlobalSign, Nuvoton, Intel and AMD, each
+  pinned by SHA-256 and refreshed by `scripts/update-tpm-ek-anchors.py`), and
+  asks the TPM to release a credential irlume made for its storage key
+  through the certified EK (TPM2_ActivateCredential), which only the TPM
+  holding both keys can do. `pass` names the TPM's manufacturer, model and
+  firmware version as the certificate states them; `warn` a certificate that
+  is not for this TPM's EK, a failing signature, CA constraint or EK profile
+  on a path to a pinned CA, or a credential the TPM refuses, each pointing at
+  a swapped device, an emulator or the wrong `IRLUME_TCTI`; `info` a TPM
+  that stores no EK certificate irlume can test (common on firmware TPMs),
+  since irlume does not fetch one; `unknown` a chain irlume cannot complete, which never means
+  the TPM is not genuine, and a check that could not run. Nothing is fetched,
+  written or kept, and no EK public key, serial or fingerprint is shown;
+  certificate text is shown as visible ASCII. A client waits up to 60
+  seconds, and irlumed sends no TPM command later than 45 seconds after the
+  request reached it. The TUI's doctor readout runs the same check, and its
+  Diagnostics page gains Full Diagnostics as Administrator, the TUI's route to
+  `sudo irlume doctor`, since the TPM checks need root.
+
 - `irlume uninstall` reports the storage keys irlumed's record keeps that
   are still persisted after its evictions (ADR-0034, Phase 3 amendment,
   "Uninstall"): the original key when a start's derivation matched it, the

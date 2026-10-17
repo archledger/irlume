@@ -348,7 +348,14 @@ Doctor reports a missing template key as a failed check.
 
 Physical actions such as opening a privacy shutter or changing firmware settings
 remain instructions. Recheck, Full Diagnostics, logs, support reports and explicit
-camera tests remain available. The default support report does not capture
+camera tests remain available.
+
+**Full Diagnostics** runs `irlume doctor` for the selected account, as the user
+who started the TUI. The TPM checks (firmware, PCR bank, lockout, storage keys
+and endorsement) come from irlumed's root-only requests, so they read
+`unknown` there. **Full Diagnostics as Administrator** asks first, then runs
+`sudo irlume doctor --user <account>`, the CLI's root readout; it changes
+nothing. The default support report does not capture
 camera data; an IR test or camera probe still requires an explicit action.
 
 ## Faces
@@ -507,7 +514,7 @@ scan lists. Rename and Delete confirmations name their exact target.
 | CLI task | TUI route |
 |---|---|
 | `setup`, `status`, `detect` | Overview, guided setup and Diagnostics |
-| `doctor`, `diag` | Diagnostics: Full Diagnostics and TPM Diagnostics |
+| `doctor`, `sudo irlume doctor`, `diag` | Diagnostics: Full Diagnostics, Full Diagnostics as Administrator and TPM Diagnostics |
 | `deps`, `version` | F2: runtime dependencies and version |
 | `enroll` | Faces: Enroll Face (`e`); matching faces offer improvement |
 | `enroll --scans`, `enroll --reset` | F2: chosen scan count or Replace face enrollment |

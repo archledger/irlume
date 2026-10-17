@@ -22,6 +22,7 @@ mod bitwarden;
 mod commands;
 mod consent;
 mod doctor_report;
+mod endorsement_check;
 mod fingerprint;
 mod gkr_session;
 mod logintx;
@@ -5977,6 +5978,17 @@ fn doctor_run(
         (
             "tpm-storage-keys",
             tpm_storage_keys_check(&tpm.da_exempt_key),
+        ),
+        // ADR-0036: irlumed's root-only TpmEndorsement request, with a
+        // budget of its own, since deriving an EK can take seconds.
+        (
+            "tpm-endorsement",
+            endorsement_check::check(
+                &endorsement_check::from_irlumed(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
         ),
         (
             "secure-boot-certificates",

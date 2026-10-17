@@ -13,7 +13,7 @@
 mod actions;
 mod activity;
 mod attempts;
-mod dates;
+pub(crate) mod dates;
 mod freshness;
 mod launch;
 use attempts::AttemptsReply;
@@ -335,6 +335,10 @@ enum Suspend {
     /// complete authoritative dump (incl. the info-only lines the Repair
     /// checklist omits), copy-pasteable for a bug report.
     Doctor,
+    /// `irlume doctor` as root (`sudo irlume doctor --user <user>`): its TPM
+    /// checks come from irlumed's root-only requests, which a doctor run as
+    /// the user reads as `unknown`. The CLI parity of `sudo irlume doctor`.
+    DoctorAsRoot,
     /// Create the ordinary share-safe support report in the current directory.
     /// This route is deliberately read-only: no probe and no trace flags.
     SupportReport,
@@ -4846,6 +4850,10 @@ impl App {
                 // reports on the same user the rest of the screen does.
                 let _ = crate::doctor(&["--user".to_string(), self.user.clone()]);
             }
+            Suspend::DoctorAsRoot => self.sudo_step(
+                "run the full diagnostics as administrator",
+                &["irlume", "doctor", "--user", &target],
+            ),
             Suspend::SupportReport => match crate::support_report::create_read_only_default() {
                 Ok(path) => {
                     // Print on the SUSPENDED terminal too: the report lands in
@@ -5827,6 +5835,16 @@ impl App {
             (SC_REPAIR, KeyCode::Char('d')) => {
                 self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
                 self.suspend = Some(Suspend::Doctor);
+            }
+            // The same readout as root, for the checks irlumed answers only
+            // to root (the TPM's firmware, lockout, storage keys and
+            // endorsement key certificates).
+            (SC_REPAIR, KeyCode::Char('D')) => {
+                self.confirm = Some((
+                    "Run the full diagnostics as administrator? sudo asks for your password; the TPM checks need root. Nothing is changed.".into(),
+                    "Run",
+                    ConfirmAct::Sus(Suspend::DoctorAsRoot),
+                ));
             }
             (SC_REPAIR, KeyCode::Char('s')) => {
                 self.log(
@@ -9843,7 +9861,12 @@ impl App {
         push_page_actions(
             &mut lines,
             &mut page_actions,
-            &[("r", "re-check"), ("d", "doctor"), ("w", "watch logs")],
+            &[
+                ("r", "re-check"),
+                ("d", "doctor"),
+                ("D", "doctor as administrator"),
+                ("w", "watch logs"),
+            ],
         );
         targets.extend(
             page_actions
@@ -10412,6 +10435,7 @@ impl App {
                 ("f", "Fix Selected Issue…"),
                 ("r", "Recheck"),
                 ("d", "Full Diagnostics"),
+                ("D", "Full Diagnostics as Administrator…"),
                 ("a", "TPM Diagnostics"),
                 ("T", "Record Trace (60s)"),
                 ("s", "Create Support Report"),
@@ -13082,6 +13106,47 @@ mod tests {
             app.suspend.is_some(),
             "run only after leaving the alternate screen"
         );
+    }
+
+    /// CLI parity for `sudo irlume doctor`: the Diagnostics page runs the
+    /// full readout as root, after a confirmation, for the account the TUI
+    /// is on.
+    #[test]
+    fn full_diagnostics_as_administrator_asks_first_then_runs_doctor_as_root() {
+        let _guard = dead_socket();
+        let mut app = app_with_user("carol");
+        app.screen = SC_REPAIR;
+        assert!(
+            draw_text(&app).contains("doctor as administrator"),
+            "the page's action rows offer it too"
+        );
+        app.on_key(KeyCode::Char('D'));
+        assert!(
+            app.suspend.is_none(),
+            "nothing runs before the confirmation"
+        );
+        assert!(
+            app.confirm
+                .as_ref()
+                .is_some_and(|(prompt, ..)| prompt.contains("as administrator")),
+            "a root run asks first"
+        );
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none() && app.suspend.is_none());
+        app.on_key(KeyCode::Char('D'));
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::DoctorAsRoot)));
+        let args = ["irlume", "doctor", "--user", "carol"];
+        let command = App::privileged_cmd(&args, false);
+        assert_eq!(command.get_program(), "sudo");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["irlume", "doctor", "--user", "carol"]
+        );
+        assert!(app
+            .screen_actions()
+            .iter()
+            .any(|(key, label)| *key == "D" && label.contains("as Administrator")));
     }
 
     #[test]

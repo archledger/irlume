@@ -10,7 +10,20 @@
 //! still render it as visible text (ADR-0036 section 7). Nothing here
 //! identifies the TPM: no EK public key, hash, serial or fingerprint.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+/// How long a client waits for irlumed's answer to
+/// [`crate::Request::TpmEndorsement`] (ADR-0036 section 4): deriving an EK
+/// can take more than 10 seconds on a slow firmware TPM.
+pub const CLIENT_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long irlumed lets the check run, from the request's submission to
+/// its worker: after that it sends no further TPM command and answers
+/// `unknown`. The rest of [`CLIENT_BUDGET`] covers the one slow command
+/// that may still be running and the reply.
+pub const DAEMON_DEADLINE: Duration = Duration::from_secs(45);
 
 /// The check's result, or one certificate's: worst first `warn`, then
 /// `pass`, `unknown` and `info` (ADR-0036 section 1).
@@ -53,6 +66,19 @@ pub struct EndorsementReport {
     /// keeps the result from `pass` (ADR-0036 section 4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_judged: Vec<u32>,
+}
+
+impl EndorsementReport {
+    /// A check that judged nothing: `unknown`, for `reason`.
+    pub fn stopped(reason: impl Into<String>) -> Self {
+        Self {
+            state: EndorsementState::Unknown,
+            stopped: Some(reason.into()),
+            certificates: Vec::new(),
+            skipped: Vec::new(),
+            not_judged: Vec::new(),
+        }
+    }
 }
 
 /// One judged EK certificate.

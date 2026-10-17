@@ -1014,6 +1014,15 @@ pub enum Request {
     /// ROCA fingerprint. Read-only; answered from the worker with the other
     /// TPM users. Root only. An older daemon answers `Error("bad request")`.
     TpmReadiness,
+    /// The `tpm-endorsement` doctor check (ADR-0036): whether an EK
+    /// certificate the TPM stores verifies to a vendor CA irlume pins, is for
+    /// this TPM's endorsement key, and whether irlume's storage key is in
+    /// the same TPM. Read-only; answered from the worker with the other TPM
+    /// users, which stops sending TPM commands
+    /// [`tpm_endorsement::DAEMON_DEADLINE`] after the request reached it, so
+    /// a client waits up to [`tpm_endorsement::CLIENT_BUDGET`]. Root only. An
+    /// older daemon answers `Error("bad request")`.
+    TpmEndorsement,
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer
     /// sibling of `HasSealedPassword` for status surfaces (the envelope file
@@ -2233,6 +2242,9 @@ pub enum Response {
         #[serde(default = "storage_keys_not_reported")]
         storage_keys: std::result::Result<Vec<tpm_readiness::StorageKeyEntry>, String>,
     },
+    /// Reply to [`Request::TpmEndorsement`]: the check's result, every reason
+    /// it could not judge included.
+    TpmEndorsement(tpm_endorsement::EndorsementReport),
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
     /// Outcome of a `ResealPassword`. `changed` is true when the envelope was
@@ -3173,6 +3185,40 @@ mod tests {
     /// ADR-0030 §2: the account-scoped recognition test is its own request
     /// variant, so a daemon that predates it cannot mistake it for the
     /// account-less `Identify`: it fails to parse (answered "bad request").
+    /// ADR-0036 section 4: a request of its own, which an older daemon does
+    /// not parse (it answers "bad request"), and a reply carrying the report.
+    #[test]
+    fn tpm_endorsement_is_a_request_of_its_own_and_unknown_to_an_older_daemon() {
+        let wire = serde_json::to_string(&super::Request::TpmEndorsement).unwrap();
+        assert_eq!(wire, r#""TpmEndorsement""#);
+        assert!(matches!(
+            serde_json::from_str::<super::Request>(&wire).unwrap(),
+            super::Request::TpmEndorsement
+        ));
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum OldRequest {
+            TpmReadiness,
+        }
+        assert!(serde_json::from_str::<OldRequest>(&wire).is_err());
+        assert!(serde_json::from_str::<OldRequest>(r#""TpmReadiness""#).is_ok());
+
+        let reply = serde_json::json!({"TpmEndorsement": {
+            "state": "unknown",
+            "stopped": "the endorsement hierarchy is disabled",
+            "certificates": []
+        }});
+        let parsed = serde_json::from_value::<Response>(reply.clone()).expect("the reply decodes");
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), reply);
+        let Response::TpmEndorsement(report) = parsed else {
+            panic!("a TpmEndorsement reply");
+        };
+        assert_eq!(
+            report,
+            tpm_endorsement::EndorsementReport::stopped("the endorsement hierarchy is disabled")
+        );
+    }
+
     #[test]
     fn identify_for_names_its_account_and_is_unknown_to_an_older_daemon() {
         let wire = serde_json::to_string(&super::Request::IdentifyFor {

@@ -359,6 +359,7 @@ jobs:
             --require tpm_split_whole_broken_credential_envelope_refuses_release_and_keeps_charge \
             --require tpm_split_whole_centroid_identity_releases_once_at_each_skew \
             --require tpm_split_whole_reset_preserves_template_key_and_next_authenticate_routes \
+            --require tpm_endorsement_report_keeps_its_deadline_and_notes_progress \
             -- cargo test -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
 
       # The two emitter-lock tests need a lock file another uid owns (#392),

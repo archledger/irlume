@@ -579,13 +579,7 @@ pub fn endorsement_report(
 }
 
 fn stopped(reason: String) -> EndorsementReport {
-    EndorsementReport {
-        state: EndorsementState::Unknown,
-        stopped: Some(reason),
-        certificates: Vec::new(),
-        skipped: Vec::new(),
-        not_judged: Vec::new(),
-    }
+    EndorsementReport::stopped(reason)
 }
 
 fn report_through(

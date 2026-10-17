@@ -1,0 +1,36 @@
+# Descriptor-attested YUYV IR cameras that supply no per-frame illumination
+# records (irlume's `NO_RECORDS_YUYV_IR` table in
+# crates/irlume-camera/src/uvc_descriptor.rs; the class docs/DEBUGGING.md
+# describes). On such a camera the active-IR evidence is the burst's own
+# proven alternation (ADR-0031 section 4), and irlumed reads the emitter
+# control right before and right after each burst. UVCIOC_CTRL_QUERY carries
+# no V4L2 priority, so a program holding the node could change the control and
+# undo it inside one burst. Removing the seat tag below and assigning the node
+# to root alone closes that window: no unprivileged program can open it
+# (issue #1069). Runs after 70-uaccess.rules adds the tag and 50-udev-default
+# gives the video group, and before 73-seat-late.rules would apply the ACL;
+# TAG-= needs udev 217, and := (udev 247) keeps any later rule from widening
+# the group or mode again.
+#
+# The group is root, not `video`: irlume's own EACCES advice tells users to
+# join `video`, so a seat user there would silently keep access otherwise
+# (irlume PR #1109 review). Permissions are checked at open(2): a descriptor
+# a program opened before this rule applied stays usable, so application is
+# the next plug or boot of the camera, NOT `udevadm trigger`. irlumed reads
+# the node's real state per burst, so a node in any intermediate state (stale
+# ACL, retained descriptor) keeps today's opt-in confinement until it is
+# actually closed.
+#
+# The camera keeps working: irlumed opens it as root, and records-capable IR
+# cameras are untouched. What an in-class node loses is its listing as a
+# generic camera for the seat user (PipeWire, portals, browsers); the RGB
+# camera on the same machine is unaffected. An administrator can override or
+# disable the rule like any packaged rule (a same-named file, or a /dev/null
+# symlink, in /etc/udev/rules.d/).
+
+ACTION=="remove", GOTO="irlume_ir_nodes_end"
+
+# ThinkPad T480 Bison IR module (5986:1141), an IR-only USB device.
+SUBSYSTEM=="video4linux", ENV{ID_USB_VENDOR_ID}=="5986", ENV{ID_USB_MODEL_ID}=="1141", TAG-="uaccess", GROUP:="root", MODE:="0600"
+
+LABEL="irlume_ir_nodes_end"

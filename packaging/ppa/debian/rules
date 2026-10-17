@@ -132,6 +132,11 @@ override_dh_auto_install:
 # group must be inherited at creation; postinst creates it before any start.
 	install -D -m0644 packaging/tmpfiles.d/irlume.conf \
 		debian/irlume/usr/lib/tmpfiles.d/irlume.conf
+# udev: descriptor-attested YUYV IR nodes without illumination records lose
+# the seat-user uaccess tag (#1069, ADR-0031 section 4); applies at the next
+# plug or boot.
+	install -D -m0644 packaging/udev/72-irlume-ir-nodes.rules \
+		debian/irlume/usr/lib/udev/rules.d/72-irlume-ir-nodes.rules
 	install -D -m0644 packaging/apparmor/usr.bin.irlumed \
 		debian/irlume/etc/apparmor.d/usr.bin.irlumed
 	# Plasma System Settings module -> the irlume-kcm binary package. The

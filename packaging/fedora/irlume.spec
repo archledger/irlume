@@ -201,6 +201,12 @@ install -Dm0644 packaging/fedora/10-ort.conf %{buildroot}%{_unitdir}/irlumed.ser
 # exclusion locks (#542). The daemon's bounding set has no CAP_CHOWN, so the
 # group must be inherited at creation, not corrected in-process.
 install -Dm0644 packaging/tmpfiles.d/irlume.conf %{buildroot}%{_tmpfilesdir}/irlume.conf
+# udev: the descriptor-attested YUYV IR cameras without illumination records
+# lose the seat-user uaccess tag, so no unprivileged program can reach the
+# emitter control between the burst reads (#1069, ADR-0031 section 4). Applies
+# at the next plug or boot; the daemon reads the node's real state, so every
+# intermediate state keeps today's confinement.
+install -Dm0644 packaging/udev/72-irlume-ir-nodes.rules %{buildroot}%{_udevrulesdir}/72-irlume-ir-nodes.rules
 install -Dm0644 packaging/selinux/irlume.pp %{buildroot}%{_datadir}/selinux/packages/irlume.pp
 # Preset: the daemon is enabled on install (see %%post); it only serves a local
 # socket and auth stays opt-in, so "installed" should mean "works".
@@ -338,6 +344,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_unitdir}/lightdm.service.d/50-irlume-pam.conf
 %{_presetdir}/90-irlume.preset
 %{_tmpfilesdir}/irlume.conf
+%{_udevrulesdir}/72-irlume-ir-nodes.rules
 
 %files selinux
 %{_datadir}/selinux/packages/irlume.pp

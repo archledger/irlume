@@ -550,6 +550,9 @@ APPARMOR_RUNTIME_RULES=(
   "/run/lock/.irlume-pam.lock.* rwk,"
   "capability fowner,"
   "/proc/locks r,"
+  # The node-access gate reads the camera node's udev database record (#1069).
+  "/run/udev/data/ r,"
+  "/run/udev/data/* r,"
   "/etc/pam.d/** r,"
   "/usr/lib/pam.d/** r,"
   "/usr/bin/{systemctl,dpkg-query,md5sum} mrix,"
@@ -655,6 +658,62 @@ for marker in "${TMPFILES_APPLY_MARKERS[@]}"; do
     fail=1
   fi
 done
+
+echo
+echo "== udev IR-node hardening rule shipped in every lane, keyed to NO_RECORDS_YUYV_IR (#1069) =="
+# The rule removes the seat-user uaccess tag from descriptor-attested YUYV IR
+# nodes without illumination records, so irlumed's emitter reads around a burst
+# are the whole story (ADR-0031 section 4, amendment 2026-10-17). It must sort
+# after 70-uaccess.rules (which adds the tag) and before 73-seat-late.rules
+# (which applies it), and its USB identities must equal the camera crate's
+# NO_RECORDS_YUYV_IR table exactly.
+UDEV_RULE=packaging/udev/72-irlume-ir-nodes.rules
+if [ -f "$UDEV_RULE" ]; then
+  printf '  ok    %-34s %s\n' "$UDEV_RULE" "present"
+else
+  printf '  MISS  %-34s %s\n' "$UDEV_RULE" "missing"
+  fail=1
+fi
+# Filename ordering against systemd's rules, lexicographically as udev sorts.
+for neighbour in 70-uaccess.rules 73-seat-late.rules; do
+  if [ "$neighbour" = "70-uaccess.rules" ]; then
+    [ "72-irlume-ir-nodes.rules" \> "$neighbour" ] && order=ok || { order=MISS; fail=1; }
+  else
+    [ "72-irlume-ir-nodes.rules" \< "$neighbour" ] && order=ok || { order=MISS; fail=1; }
+  fi
+  printf '  %-5s %-34s %s\n' "$order" "sorts vs $neighbour" "$UDEV_RULE"
+done
+UDEV_SHIP_MARKERS=(
+  "packaging/fedora/irlume.spec|%{_udevrulesdir}/72-irlume-ir-nodes.rules"
+  "packaging/arch/PKGBUILD|usr/lib/udev/rules.d/72-irlume-ir-nodes.rules"
+  "packaging/debian/nfpm.yaml|/usr/lib/udev/rules.d/72-irlume-ir-nodes.rules"
+  "packaging/ppa/debian/rules|usr/lib/udev/rules.d/72-irlume-ir-nodes.rules"
+  "nix/module.nix|72-irlume-ir-nodes.rules"
+)
+for marker in "${UDEV_SHIP_MARKERS[@]}"; do
+  lane="${marker%%|*}"
+  needle="${marker#*|}"
+  if uncommented "$lane" | grep -F -- "$needle" >/dev/null; then
+    printf '  ok    %-34s %s\n' "udev 72-irlume-ir-nodes.rules" "$lane"
+  else
+    printf '  MISS  %-34s %s\n' "udev 72-irlume-ir-nodes.rules" "$lane"
+    fail=1
+  fi
+done
+# The rule's identity set must be exactly the camera crate's table: an entry
+# without a fixture-proven class membership would harden the wrong node, and a
+# proven class member missing from the rule silently keeps the confinement.
+rule_ids="$(uncommented "$UDEV_RULE" | \
+  sed -nE 's/.*ID_USB_VENDOR_ID\}=="([0-9a-f]+)".*ID_USB_MODEL_ID\}=="([0-9a-f]+)".*/\1:\2/p' | \
+  sort | paste -sd' ' -)"
+code_ids="$(sed -n '/NO_RECORDS_YUYV_IR: &/p' crates/irlume-camera/src/uvc_descriptor.rs | \
+  grep -oE '0x[0-9a-f]+, 0x[0-9a-f]+' | sed 's/0x//g; s/, /:/' | sort | paste -sd' ' -)"
+if [ -n "$rule_ids" ] && [ "$rule_ids" = "$code_ids" ]; then
+  printf '  ok    %-34s %s\n' "rule ids == table ($code_ids)" "uvc_descriptor.rs"
+else
+  printf '  MISS  rule ids (%s) != table (%s)\n' "$rule_ids" "$code_ids"
+  fail=1
+fi
 
 echo
 echo "== private state root in every packaging lane =="

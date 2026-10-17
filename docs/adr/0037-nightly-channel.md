@@ -84,8 +84,13 @@ a version control repository (the `-git` suffix), not the channel name.
 ### 2. Versions sort after the release they follow
 
 Each nightly version sorts above the release of the same version and below
-the next one, so a user who also has the release lane enabled keeps the
-newer build:
+the next one, so with both lanes enabled the package manager installs the
+newer build. Right after a release that can be the release itself, for up to
+a day on the PPA, until the nightly built from its tag (the same code)
+publishes and moves past it; then the machine is on the nightly lane again.
+The channel's documentation therefore tells nightly users to enable the
+nightly lane alone, which always carries a build at least as new as the
+latest release within a day of it:
 
 - **Copr.** Packit's commit builds keep the spec's `Version` and append its
   default suffix to the Release, `{original_release_number}.{current_time}.
@@ -157,8 +162,10 @@ nothing on a nightly lane.
   (Launchpad manual, "Package upload errors"), and Launchpad never accepts a
   version twice in a PPA, also after a deletion. So the script records each
   step's state, read from Launchpad's API:
-  - the version it last saw published: when the derived version equals it,
-    there is nothing to do;
+  - the derived version it last saw published, kept apart from the PPA
+    revision it was published under: when today's derived version equals
+    it, there is nothing to do, also after a retry published it as
+    `-0ppa2`;
   - a version it uploaded: accepted once its source publication appears in
     the PPA (pending or published), and from then on only verified again,
     never uploaded again; an upload whose source publication has not
@@ -319,6 +326,8 @@ These need the maintainer's accounts, and are done once:
     (`0.15.0+git139...` becomes `0.16.0+git0...`);
   - after an accepted upload whose publication it has not seen, verifies
     again and does not upload;
+  - after a retry published as `-0ppa2`, does nothing while `main` is
+    unchanged;
   - after an upload whose source publication never appears (rejected), and
     after a failed build, uploads the same commit with the next PPA
     revision;

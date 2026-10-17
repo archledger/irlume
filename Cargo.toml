@@ -74,6 +74,16 @@ base64     = { version = "0.23", default-features = false, features = ["std"] } 
 sha2       = "0.11"     # PolicyAuthorize digest math (signed-PCR path)
 der        = { version = "0.8", features = ["derive", "pem", "alloc", "oid"] }  # parse systemd PCR-signing pubkey (SPKI/PKCS#1)
 spki       = { version = "0.8", features = ["alloc", "pem"] }  # SubjectPublicKeyInfo container for the PCR signing key
+# TPM endorsement-key certificate verification (ADR-0036 section 6): parse,
+# then verify RSA PKCS#1 v1.5 / PSS and ECDSA P-256 / P-384 / P-521 signatures.
+# Public-key operations only. rsa 0.10 is pinned exactly while it is a release
+# candidate: 0.9 sits on the previous RustCrypto generation (der 0.7, digest
+# 0.10, rand_core 0.6) and would duplicate that stack.
+x509-cert  = { version = "0.3", default-features = false }
+rsa        = { version = "=0.10.0-rc.19", default-features = false }
+p256       = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p384       = { version = "0.14", default-features = false, features = ["ecdsa"] }
+p521       = { version = "0.14", default-features = false, features = ["ecdsa"] }
 aes-gcm    = "0.11"     # AES-256-GCM for template-at-rest encryption
 argon2     = "0.6"      # Argon2id KDF for the recovery passphrase
 pbkdf2     = { version = "0.13", default-features = false, features = ["hmac"] }  # PBKDF2-HMAC-SHA512: the KDE wallet key ksecretd expects

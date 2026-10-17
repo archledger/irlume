@@ -40,10 +40,16 @@ allow = ["CDLA-Permissive-2.0"]
 version = 2
 # Every entry carries its rationale in the comment above it, and a tracking
 # issue: scripts/generate-vex.py maps that comment to an OpenVEX
-# justification and refuses unmapped wording. (The rsa crate,
-# RUSTSEC-2023-0071, was replaced by the der/spki parsers in
-# crates/irlume-core/src/tpm.rs and needs no entry.)
+# justification and refuses unmapped wording.
 ignore = [
+    # rsa (the Marvin attack): a timing side channel in operations with an RSA
+    # private key, unpatched in every release. irlume-core's EK certificate
+    # verifier (crates/irlume-core/src/ek_cert.rs, ADR-0036) uses rsa for
+    # public-key verification and encryption only: irlume holds no RSA
+    # private key and makes no private-key operations, so the vulnerable code
+    # is not reached. The PCR signing key in tpm.rs is still parsed with
+    # der/spki alone. Drop this with #1112.
+    "RUSTSEC-2023-0071",
     # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
     # whose build script extracts an archive only for its `vendored`
     # feature, which irlume does not enable: the vulnerable code is not

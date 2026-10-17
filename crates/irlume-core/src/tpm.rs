@@ -2543,10 +2543,9 @@ fn load_external_pubkey(ctx: &mut Context, pubkey_pem: &str) -> Result<KeyHandle
 /// Pure and unit-tested against a real key fixture. This deliberately parses
 /// only the public SPKI/PKCS#1 structure: the systemd PCR-signing key is
 /// public data, no RSA operation of any kind runs here, and the TPM performs
-/// every verification. Using the der/spki parsers (the same RustCrypto stack,
-/// without the rsa crate) keeps the dependency tree free of the Marvin
-/// timing-side-channel advisory, whose risk lived entirely in private-key
-/// operations this project never performs.
+/// every verification. It needs the der/spki parsers only, not the rsa crate
+/// (which irlume uses solely for public-key operations in `ek_cert`, under the
+/// justified RUSTSEC-2023-0071 ignore in deny.toml).
 fn rsa_spki_parts(pubkey_pem: &str) -> Result<(Vec<u8>, u32)> {
     use der::asn1::ObjectIdentifier;
     use der::asn1::UintRef;

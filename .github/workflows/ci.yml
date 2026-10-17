@@ -111,6 +111,14 @@ jobs:
           python3 -B scripts/test-check-agents-md.py
           python3 -B scripts/check-agents-md.py
 
+      # Offline, with the runner's openssl: the refresh script's own tests,
+      # then the shipped vendor CA certificates against their manifest
+      # (ADR-0036 section 5).
+      - name: TPM EK anchors (files, manifest and refresh script)
+        run: |
+          python3 -B scripts/test-update-tpm-ek-anchors.py
+          python3 -B scripts/update-tpm-ek-anchors.py --check
+
       # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
       # two PAD models) are fetched from the models-v1 release, not
       # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the
@@ -861,13 +869,13 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, and event-log parsers
+      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log, and EK-certificate parsers
         working-directory: fuzz
         run: |
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
-          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true

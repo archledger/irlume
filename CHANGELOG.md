@@ -12,11 +12,14 @@ All notable changes to irlume are documented here. This project adheres to
   "Uninstall"): the original key when a start's derivation matched it, the
   recorded DA-exempt key, and each key it superseded, such as a weak
   DA-exempt key a replacement left. It reads the record before the wipe
-  removes it, from every state root irlumed may use, and after the
-  evictions checks each key by handle and TPM name on the TPM they went
-  through. A key still there gets a `TPM storage key left` line with its
-  handle, its TPM name and the manual `tpm2_evictcontrol` command, with
-  the check to run first and the warning not to clear the whole TPM. The
+  removes it, from every state root irlumed may use (the unit's first,
+  even under an account's home), and after the evictions checks each key
+  by handle and TPM name on the TPM they went through. A key still there
+  gets one `TPM storage key left` line with its handle, its TPM name and
+  the manual `tpm2_evictcontrol` command, with the check to run first and
+  the warning not to clear the whole TPM; the commands pass the transport
+  irlumed's unit sets with `-T`, quoted, since tpm2-tools does not read
+  `IRLUME_TCTI`. The
   record is advisory: it chooses what is reported, never what is evicted,
   and a key no derivation gives is never evicted. A record or a TPM that
   cannot be read is named with the way to list the handles by hand. The

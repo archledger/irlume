@@ -240,7 +240,7 @@ pub fn run(args: &[String]) -> ExitCode {
     if let Some(line) = da_exempt_srk_line(&report.da_exempt_srk) {
         println!("[uninstall] DA-exempt TPM storage key: {line}");
     }
-    for line in kept_key_lines(&report.kept_keys) {
+    for line in kept_key_lines(&report.kept_keys, report.tpm_target.as_ref()) {
         println!("[uninstall] TPM storage key left: {line}");
     }
     if let Some(target) = &report.tpm_target {
@@ -781,7 +781,8 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
         Ok(snapshot) => snapshot,
         Err(e) => return refused_teardown(keep_data, e),
     };
-    let mut extra_roots = unit_state_roots(&snapshot, &default_root);
+    let unit_roots = unit_state_roots(&snapshot, &default_root);
+    let mut extra_roots = unit_roots.clone();
     extra_roots.retain(|root| !account_trees.contains(root));
     homes.extend(
         extra_roots
@@ -998,9 +999,11 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
     // The storage keys irlumed's record keeps, read now that irlumed is
     // stopped and before the wipe removes the record (ADR-0034, Phase 3
     // amendment, "Uninstall"), from each state root irlumed may use, as the
-    // unit's environment was captured before its removal. Advisory: it
-    // chooses what is reported after the evictions, never what is evicted.
-    let kept = kept_keys_in(std::iter::once(&default_root).chain(&extra_roots));
+    // unit's environment was captured before its removal: the unit's first,
+    // which irlumed itself uses, even when it is an account's tree (a
+    // source install's), then the default. Advisory: it chooses what is
+    // reported after the evictions, never what is evicted.
+    let kept = kept_keys_in(unit_roots.iter().chain(std::iter::once(&default_root)));
 
     // 3. Disarm each enrolled user's keyring seal (idempotent), and 4. wipe the
     //    per-user enrollment + sealed secrets unless data is being kept. Every
@@ -2604,18 +2607,22 @@ pub enum KeptKeys {
     },
 }
 
-/// The keys the records under `roots` keep, each once, and each record that
-/// could not be read.
+/// The keys the records under `roots` keep, each TPM object (handle and
+/// name) once, in the role the first root's record gives it, and each record
+/// that could not be read.
 fn kept_keys_in<'a>(
     roots: impl IntoIterator<Item = &'a PathBuf>,
 ) -> (Vec<irlume_core::storage_key::KeptKey>, Vec<String>) {
-    let mut kept = Vec::new();
+    let mut kept: Vec<irlume_core::storage_key::KeptKey> = Vec::new();
     let mut unread = Vec::new();
     for root in roots {
         match irlume_core::storage_key::kept_keys_in(root) {
             Ok(keys) => {
                 for key in keys {
-                    if !kept.contains(&key) {
+                    if !kept
+                        .iter()
+                        .any(|seen| seen.handle == key.handle && seen.name == key.name)
+                    {
                         kept.push(key);
                     }
                 }
@@ -2628,16 +2635,24 @@ fn kept_keys_in<'a>(
 
 /// One line per kept key still persisted, with the manual path (ADR-0034,
 /// "What doctor reports": irlume never evicts a key a fresh derivation does
-/// not give), and one per record or TPM read that failed. The handles and
-/// names come out of the record bounded and in hex; the errors are printed
-/// through [`terminal_safe`].
-fn kept_key_lines(kept: &KeptKeys) -> Vec<String> {
+/// not give), and one per record or TPM read that failed. The commands go to
+/// the TPM `target` names: tpm2-tools reads `-T`, not `IRLUME_TCTI`, so a
+/// transport irlumed's unit sets is passed with it, quoted as one argument.
+/// The handles and names come out of the record bounded and in hex; the
+/// errors are printed through [`terminal_safe`].
+fn kept_key_lines(kept: &KeptKeys, target: Option<&runtime_environment::TpmTarget>) -> Vec<String> {
     use irlume_core::storage_key::KeptKeyRole;
-    const LIST: &str = "list the owner handles with `tpm2_getcap handles-persistent` on the \
-                        TPM checked below";
     let KeptKeys::Checked { left, unread } = kept else {
         return Vec::new();
     };
+    let tcti = match target.and_then(|target| target.tcti.as_deref()) {
+        Some(tcti) => format!(" -T {}", crate::shell_single_quote(&terminal_safe(tcti))),
+        None => String::new(),
+    };
+    let list = format!(
+        "list the owner handles with `tpm2_getcap{tcti} handles-persistent` on the TPM \
+         checked below"
+    );
     let mut lines = Vec::new();
     match left {
         Ok(keys) => {
@@ -2651,25 +2666,25 @@ fn kept_key_lines(kept: &KeptKeys) -> Vec<String> {
                 lines.push(format!(
                     "{what} at {handle:#010x} (TPM name {}), which irlumed's record keeps, is \
                      still persisted: irlume evicts a storage key only when today's derivation \
-                     gives it. Find what else uses it first (`tpm2_readpublic -c {handle:#010x}` \
-                     on the TPM checked below); if nothing does, evict it by hand with `sudo \
-                     tpm2_evictcontrol -C o -c {handle:#010x}` on that TPM. Do not clear the \
-                     whole TPM for this: that also drops every other key sealed in it, such as \
-                     a disk's",
+                     gives it. Find what else uses it first (`tpm2_readpublic{tcti} -c \
+                     {handle:#010x}`); if nothing does, evict it by hand with `sudo \
+                     tpm2_evictcontrol{tcti} -C o -c {handle:#010x}`. Both go to the TPM \
+                     checked below. Do not clear the whole TPM for this: that also drops every \
+                     other key sealed in it, such as a disk's",
                     key.name
                 ));
             }
         }
         Err(e) => lines.push(format!(
             "could not check whether the storage keys irlumed's record keeps are still \
-             persisted ({}); {LIST}",
+             persisted ({}); {list}",
             terminal_safe(e)
         )),
     }
     for e in unread {
         lines.push(format!(
             "could not read irlumed's record of its storage keys ({}), so a key it keeps may \
-             still be persisted; {LIST}",
+             still be persisted; {list}",
             terminal_safe(e)
         ));
     }
@@ -2897,8 +2912,10 @@ mod tests {
     }
 
     /// ADR-0034, Phase 3 amendment, "Uninstall": the keys irlumed's record
-    /// keeps are read from every state root it may use, each once, and a
-    /// record that cannot be read is named rather than read as none.
+    /// keeps are read from every state root it may use, each TPM object once
+    /// in the role the first root's record gives it (the unit's, which
+    /// irlumed uses), and a record that cannot be read is named rather than
+    /// read as none.
     #[test]
     fn the_kept_keys_are_read_from_each_state_root() {
         let dir = std::env::temp_dir().join(format!(
@@ -2910,20 +2927,43 @@ mod tests {
         for root in [&default, &unit, &broken] {
             std::fs::create_dir_all(root).unwrap();
         }
-        let record = |persisted: &str, superseded: &str| {
+        let record = |persisted: (u32, &str), superseded: (u32, &str)| {
             format!(
-                r#"{{"version":1,"persisted":{{"handle":2164326403,"name":"{persisted}"}},
-                   "superseded":[{{"handle":2164326402,"name":"{superseded}"}}]}}"#
+                r#"{{"version":1,"persisted":{{"handle":{},"name":"{}"}},
+                   "superseded":[{{"handle":{},"name":"{}"}}]}}"#,
+                persisted.0, persisted.1, superseded.0, superseded.1
             )
         };
-        std::fs::write(default.join("tpm-storage-key"), record("000b01", "000b02")).unwrap();
-        std::fs::write(unit.join("tpm-storage-key"), record("000b01", "000b03")).unwrap();
+        // The default root's record from before a start adopted the key it
+        // superseded again; the unit's from after.
+        std::fs::write(
+            default.join("tpm-storage-key"),
+            record((0x8101_0003, "000b01"), (0x8101_0002, "000b02")),
+        )
+        .unwrap();
+        std::fs::write(
+            unit.join("tpm-storage-key"),
+            record((0x8101_0002, "000b02"), (0x8101_0004, "000b03")),
+        )
+        .unwrap();
         std::fs::write(broken.join("tpm-storage-key"), "not a record").unwrap();
-        let roots = [default, unit, broken, dir.join("absent")];
+        let roots = [unit, default, broken, dir.join("absent")];
         let (kept, unread) = super::kept_keys_in(&roots);
         std::fs::remove_dir_all(&dir).unwrap();
-        let names: Vec<&str> = kept.iter().map(|key| key.name.as_str()).collect();
-        assert_eq!(names, ["000b01", "000b02", "000b03"]);
+        use irlume_core::storage_key::KeptKeyRole;
+        let keys: Vec<(KeptKeyRole, u32, &str)> = kept
+            .iter()
+            .map(|key| (key.role, key.handle, key.name.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (KeptKeyRole::DaExempt, 0x8101_0002, "000b02"),
+                (KeptKeyRole::Superseded, 0x8101_0004, "000b03"),
+                (KeptKeyRole::DaExempt, 0x8101_0003, "000b01"),
+            ],
+            "one line per TPM object, in the unit's record's role"
+        );
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].contains("broken"), "{unread:?}");
     }
@@ -2931,30 +2971,38 @@ mod tests {
     /// Each kept key still persisted after the evictions gets its handle,
     /// its TPM name, the manual command and its warning; a TPM or record
     /// that could not be read is named with the way to look by hand; and
-    /// nothing is said when no eviction ran.
+    /// nothing is said when no eviction ran. The commands carry the
+    /// transport irlumed's unit sets with `-T`, quoted as one argument,
+    /// since tpm2-tools does not read `IRLUME_TCTI`.
     #[test]
     fn the_kept_key_lines_name_the_manual_path() {
         use super::{kept_key_lines, KeptKeys};
         use irlume_core::storage_key::{KeptKey, KeptKeyRole};
-        assert!(kept_key_lines(&KeptKeys::NotChecked).is_empty());
-        assert!(kept_key_lines(&KeptKeys::Checked {
-            left: Ok(Vec::new()),
-            unread: Vec::new(),
-        })
+        assert!(kept_key_lines(&KeptKeys::NotChecked, None).is_empty());
+        assert!(kept_key_lines(
+            &KeptKeys::Checked {
+                left: Ok(Vec::new()),
+                unread: Vec::new(),
+            },
+            None
+        )
         .is_empty());
         let key = |role, handle| KeptKey {
             role,
             handle,
             name: "000b0123".into(),
         };
-        let lines = kept_key_lines(&KeptKeys::Checked {
-            left: Ok(vec![
-                key(KeptKeyRole::Original, 0x8101_0002),
-                key(KeptKeyRole::DaExempt, 0x8101_0003),
-                key(KeptKeyRole::Superseded, 0x8101_0004),
-            ]),
-            unread: vec!["/var/lib/irlume/tpm-storage-key: \u{1b}]0;x\u{7}".into()],
-        });
+        let lines = kept_key_lines(
+            &KeptKeys::Checked {
+                left: Ok(vec![
+                    key(KeptKeyRole::Original, 0x8101_0002),
+                    key(KeptKeyRole::DaExempt, 0x8101_0003),
+                    key(KeptKeyRole::Superseded, 0x8101_0004),
+                ]),
+                unread: vec!["/var/lib/irlume/tpm-storage-key: \u{1b}]0;x\u{7}".into()],
+            },
+            None,
+        );
         assert_eq!(lines.len(), 4, "{lines:?}");
         for (line, (what, handle)) in lines.iter().zip([
             ("original storage key", "0x81010002"),
@@ -2975,10 +3023,13 @@ mod tests {
             "{:?}",
             lines[3]
         );
-        let failed = kept_key_lines(&KeptKeys::Checked {
-            left: Err("no TPM device".into()),
-            unread: Vec::new(),
-        });
+        let failed = kept_key_lines(
+            &KeptKeys::Checked {
+                left: Err("no TPM device".into()),
+                unread: Vec::new(),
+            },
+            None,
+        );
         assert_eq!(failed.len(), 1);
         assert!(
             failed[0].contains("no TPM device")
@@ -2986,6 +3037,47 @@ mod tests {
                 && !failed[0].contains("evictcontrol"),
             "{}",
             failed[0]
+        );
+
+        // irlumed's unit names a transport: every command passes it with
+        // `-T`, and a hostile value stays one shell argument.
+        let target = |tcti: &str| super::runtime_environment::TpmTarget {
+            tcti: Some(tcti.into()),
+            srk_handle: None,
+            from_unit: true,
+        };
+        let swtpm = target("swtpm:host=localhost,port=2321");
+        let one = kept_key_lines(
+            &KeptKeys::Checked {
+                left: Ok(vec![key(KeptKeyRole::Superseded, 0x8101_0004)]),
+                unread: vec!["unreadable".into()],
+            },
+            Some(&swtpm),
+        );
+        const T: &str = "-T 'swtpm:host=localhost,port=2321'";
+        assert!(
+            one[0].contains(&format!("tpm2_readpublic {T} -c 0x81010004"))
+                && one[0].contains(&format!("sudo tpm2_evictcontrol {T} -C o -c 0x81010004")),
+            "{}",
+            one[0]
+        );
+        assert!(
+            one[1].contains(&format!("tpm2_getcap {T} handles-persistent")),
+            "{}",
+            one[1]
+        );
+        let hostile = target("device:/dev/tpm0'; rm -rf / #");
+        let quoted = kept_key_lines(
+            &KeptKeys::Checked {
+                left: Ok(vec![key(KeptKeyRole::Superseded, 0x8101_0004)]),
+                unread: Vec::new(),
+            },
+            Some(&hostile),
+        );
+        assert!(
+            quoted[0].contains(r#"-T 'device:/dev/tpm0'"'"'; rm -rf / #'"#),
+            "{}",
+            quoted[0]
         );
     }
 

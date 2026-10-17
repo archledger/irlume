@@ -729,8 +729,11 @@ impl EkCertificate {
             .filter(|der| !listed(der))
             .filter_map(|der| Parsed::new(der).ok())
             .collect();
+        // irlume's own certificates come first: the search tries candidates
+        // in pool order at every level, so certificates from the untrusted
+        // chain indices cannot use up the path or step budget before every
+        // path through listed CAs has been found.
         let mut pool: Vec<(&Parsed, CertificateSource)> = Vec::new();
-        pool.extend(tpm_chain.iter().map(|c| (c, CertificateSource::TpmChain)));
         pool.extend(
             anchors
                 .intermediates
@@ -738,6 +741,7 @@ impl EkCertificate {
                 .map(|c| (c, CertificateSource::Listed)),
         );
         pool.extend(anchors.roots.iter().map(|c| (c, CertificateSource::Root)));
+        pool.extend(tpm_chain.iter().map(|c| (c, CertificateSource::TpmChain)));
 
         let mut search = PathSearch::new(&pool, &self.leaf);
         search.extend(&mut Vec::new(), &self.leaf);
@@ -891,11 +895,21 @@ fn judge_path(
         }
     }
     for (i, (pair, link)) in chain.windows(2).zip(&links).enumerate() {
-        let (child, parent) = (pair[0].0, pair[1].0);
+        let ((child, child_source), (parent, parent_source)) = (pair[0], pair[1]);
         if !link.verify(child) {
-            // Without both key identifiers, a failing signature only shows
-            // that this same-named CA did not sign it.
-            if child.authority_key_id().is_some() && parent.subject_key_id().is_some() {
+            // A failing signature is evidence only between certificates
+            // irlume vouches for (the EK certificate, its listed CAs and
+            // roots) with both key identifiers naming the key that failed.
+            // Otherwise it only shows that this same-named CA did not sign
+            // it; and a certificate from the chain indices, which any
+            // process that can define NV indices may write, never turns a
+            // path into evidence against the TPM.
+            let from_tpm_chain = child_source == CertificateSource::TpmChain
+                || parent_source == CertificateSource::TpmChain;
+            if !from_tpm_chain
+                && child.authority_key_id().is_some()
+                && parent.subject_key_id().is_some()
+            {
                 return PathResult::Refused(Refusal::Signature {
                     certificate: child.label(is_leaf(i)),
                     issuer: name_text(parent.subject()),

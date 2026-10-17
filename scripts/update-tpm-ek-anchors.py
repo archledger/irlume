@@ -21,13 +21,17 @@ script generates.
                                              shipped.rs is current
 
 A refresh writes nothing unless every download succeeds, every URL is HTTPS,
-every root is self-signed and every intermediate's signature chains to a
-listed root. Review the diff like any other pull request: a changed root is
-a change of whom irlume trusts.
+every file is exactly one DER certificate, every root is self-signed and
+every intermediate's signature chains to a listed root. A certificate that
+its URL no longer serves is kept, marked "retained": TPMs it certified stay
+in use, so only removing its manifest entry by hand retires it. Review the
+diff like any other pull request: a changed root is a change of whom irlume
+trusts.
 
 Requires Python 3.9+ and the openssl command line tool.
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -59,12 +63,41 @@ def openssl(args, data):
     return proc.stdout
 
 
+PEM_CERTIFICATE = re.compile(
+    rb"-----BEGIN CERTIFICATE-----([A-Za-z0-9+/=\s]*)-----END CERTIFICATE-----"
+)
+
+
+def der_length(data):
+    """Length of the DER SEQUENCE that starts `data`, or None."""
+    if len(data) < 2 or data[0] != 0x30:
+        return None
+    if data[1] < 0x80:
+        return 2 + data[1]
+    count = data[1] & 0x7F
+    if count == 0 or count > 4 or len(data) < 2 + count or data[2] == 0:
+        return None
+    length = int.from_bytes(data[2 : 2 + count], "big")
+    # DER uses the long form only for lengths the short form cannot hold.
+    if length < 0x80:
+        return None
+    return 2 + count + length
+
+
 def to_der(data):
-    """DER bytes of one certificate given as DER or PEM."""
-    if data.lstrip().startswith(b"-----BEGIN"):
-        return openssl(["x509", "-outform", "DER"], data)
-    # Round-trip through openssl to prove it is one certificate, then keep
-    # the vendor's own bytes: re-encoding could change what was signed.
+    """The vendor's own bytes of exactly one certificate, given as DER or PEM.
+
+    PEM is decoded here rather than by openssl, which would re-encode: the
+    shipped bytes must be the ones the issuer signed.
+    """
+    text = data.strip()
+    if text.startswith(b"-----BEGIN"):
+        blocks = PEM_CERTIFICATE.findall(text)
+        if len(blocks) != 1 or PEM_CERTIFICATE.sub(b"", text).strip():
+            raise ValueError("not exactly one PEM certificate")
+        data = base64.b64decode(b"".join(blocks[0].split()), validate=True)
+    if der_length(data) != len(data):
+        raise ValueError("not exactly one DER certificate (trailing or missing bytes)")
     openssl(["x509", "-inform", "DER", "-noout"], data)
     return data
 
@@ -96,7 +129,12 @@ def describe(der):
 
 
 def signed_by(child_der, parent_der):
-    """True when parent's key verifies child's signature (no time or trust checks)."""
+    """True when parent's key verifies child's signature (no time or trust checks).
+
+    With child and parent the same certificate, the self-signature itself is
+    checked: OpenSSL takes a certificate in -CAfile as trusted and skips its
+    own signature unless asked with -check_ss_sig.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         child = os.path.join(tmp, "child.pem")
         parent = os.path.join(tmp, "parent.pem")
@@ -111,7 +149,7 @@ def signed_by(child_der, parent_der):
         proc = subprocess.run(
             [
                 "openssl", "verify", "-auth_level", "0", "-no_check_time",
-                "-partial_chain", "-CAfile", parent, child,
+                "-partial_chain", "-check_ss_sig", "-CAfile", parent, child,
             ],
             capture_output=True,
         )
@@ -122,10 +160,13 @@ def download(url):
     if not url.startswith("https://"):
         fail(f"{url}: only HTTPS sources are accepted")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        if not response.geturl().startswith("https://"):
-            fail(f"{url}: redirected to a non-HTTPS URL")
-        data = response.read(MAX_CERT_BYTES + 1)
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            if not response.geturl().startswith("https://"):
+                fail(f"{url}: redirected to a non-HTTPS URL")
+            data = response.read(MAX_CERT_BYTES + 1)
+    except OSError as err:
+        fail(f"{url}: {err}; to keep a certificate its vendor no longer serves, mark its entry \"retained\"")
     if len(data) > MAX_CERT_BYTES:
         fail(f"{url}: larger than {MAX_CERT_BYTES} bytes")
     try:
@@ -234,25 +275,63 @@ def listed_files():
     return found
 
 
+MANIFEST_KEYS = (
+    "vendor", "role", "subject", "issuer", "not_before", "not_after",
+    "sha256", "file", "url", "retrieved",
+)
+
+
+def read_shipped(entry):
+    """The bytes of a certificate already in the directory, checked."""
+    with open(os.path.join(ANCHORS, entry["file"]), "rb") as f:
+        der = f.read()
+    if hashlib.sha256(der).hexdigest() != entry["sha256"]:
+        fail(f"{entry['file']}: SHA-256 differs from the manifest")
+    return der
+
+
+def entry_for(vendor, url, der, retrieved):
+    entry = {"vendor": vendor, "url": url, **describe(der), "sha256": hashlib.sha256(der).hexdigest()}
+    entry["role"] = "root" if entry["subject"] == entry["issuer"] else "intermediate"
+    entry["file"] = file_name(entry)
+    entry["retrieved"] = retrieved
+    return entry
+
+
 def refresh(manifest, today):
-    previous = {entry["url"]: entry for entry in manifest["certificates"]}
-    entries = []
-    ders = {}
-    for url, old in previous.items():
+    old_entries = manifest["certificates"]
+    known = {entry["sha256"]: entry for entry in old_entries if entry.get("sha256")}
+    live_urls = []
+    for entry in old_entries:
+        if not entry.get("retained") and entry["url"] not in live_urls:
+            live_urls.append(entry["url"])
+    vendors = {entry["url"]: entry["vendor"] for entry in old_entries}
+
+    certificates = {}
+    for url in live_urls:
         der = download(url)
         sha = hashlib.sha256(der).hexdigest()
-        if sha in ders:
+        if sha in certificates:
             fail(f"{url}: the same certificate is already listed under another URL")
-        ders[sha] = der
-        entry = {"vendor": old["vendor"], "url": url, **describe(der), "sha256": sha}
-        entry["role"] = "root" if entry["subject"] == entry["issuer"] else "intermediate"
-        entry["file"] = file_name(entry)
+        previous = known.get(sha)
         # The date these exact bytes were first downloaded.
-        entry["retrieved"] = old["retrieved"] if old.get("sha256") == sha and old.get("retrieved") else today
-        if old.get("sha256") and old["sha256"] != sha:
-            print(f"changed: {url}")
-        entries.append(entry)
-    entries.sort(key=sort_key)
+        retrieved = previous["retrieved"] if previous and previous.get("retrieved") else today
+        certificates[sha] = (entry_for(vendors[url], url, der, retrieved), der)
+        for old in old_entries:
+            if old["url"] == url and old.get("sha256") not in (None, sha) and not old.get("retained"):
+                print(f"changed: {url} now serves another certificate; {old['file']} stays, retained")
+    # A certificate irlume has shipped stays, also when its URL now serves
+    # another: TPMs it certified are still in use.
+    for old in old_entries:
+        sha = old.get("sha256")
+        if sha and sha not in certificates:
+            der = read_shipped(old)
+            entry = entry_for(old["vendor"], old["url"], der, old["retrieved"])
+            entry["retained"] = True
+            certificates[sha] = (entry, der)
+
+    entries = sorted((entry for entry, _ in certificates.values()), key=sort_key)
+    ders = {sha: der for sha, (_, der) in certificates.items()}
     verify_set(entries, ders)
 
     for name in listed_files():
@@ -262,20 +341,22 @@ def refresh(manifest, today):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(ders[entry["sha256"]])
-    manifest["certificates"] = [
-        {key: entry[key] for key in (
-            "vendor", "role", "subject", "issuer", "not_before", "not_after",
-            "sha256", "file", "url", "retrieved",
-        )}
-        for entry in entries
-    ]
+    manifest["certificates"] = [manifest_entry(entry) for entry in entries]
     with open(MANIFEST, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
         f.write("\n")
     with open(SHIPPED_RS, "w", encoding="utf-8") as f:
         f.write(rust_list(entries))
     roots = sum(entry["role"] == "root" for entry in entries)
-    print(f"{len(entries)} certificates ({roots} roots) written")
+    retained = sum(bool(entry.get("retained")) for entry in entries)
+    print(f"{len(entries)} certificates ({roots} roots, {retained} retained) written")
+
+
+def manifest_entry(entry):
+    out = {key: entry[key] for key in MANIFEST_KEYS}
+    if entry.get("retained"):
+        out["retained"] = True
+    return out
 
 
 def check(manifest):
@@ -286,10 +367,11 @@ def check(manifest):
             fail(f"{entry['file']}: source is not HTTPS")
         if entry["file"] != file_name(entry):
             fail(f"{entry['file']}: expected the name {file_name(entry)}")
-        with open(os.path.join(ANCHORS, entry["file"]), "rb") as f:
-            der = f.read()
-        if hashlib.sha256(der).hexdigest() != entry["sha256"]:
-            fail(f"{entry['file']}: SHA-256 differs from the manifest")
+        der = read_shipped(entry)
+        try:
+            to_der(der)
+        except ValueError as err:
+            fail(f"{entry['file']}: {err}")
         if describe(der) != {key: entry[key] for key in ("subject", "issuer", "not_before", "not_after")}:
             fail(f"{entry['file']}: subject, issuer or validity differs from the manifest")
         role = "root" if entry["subject"] == entry["issuer"] else "intermediate"
@@ -298,6 +380,11 @@ def check(manifest):
         ders[entry["sha256"]] = der
     if len(ders) != len(entries):
         fail("manifest.json lists a certificate twice")
+    live = [entry["url"] for entry in entries if not entry.get("retained")]
+    if len(live) != len(set(live)):
+        fail("manifest.json lists a URL twice without marking the older certificate retained")
+    if entries != [manifest_entry(entry) for entry in entries]:
+        fail("manifest.json has fields a refresh does not write")
     extra = listed_files() - {entry["file"] for entry in entries}
     if extra:
         fail(f"files not in manifest.json: {', '.join(sorted(extra))}")

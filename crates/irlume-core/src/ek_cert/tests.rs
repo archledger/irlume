@@ -1463,3 +1463,37 @@ fn many_same_named_cas_in_the_chain_indices_end_within_the_search_budget() {
     ));
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
+
+#[test]
+fn forged_chain_index_certificates_neither_hide_nor_refuse_a_genuine_path() {
+    let (root, issuing) = ecdsa_chain();
+    let leaf = ek(Key::p256(3), &issuing);
+    // Forty forged CAs in the chain indices, each named like the EK
+    // certificate's issuer and claiming the listed root, more than the
+    // path budget holds.
+    let forged: Vec<Vec<u8>> = (0..40u8)
+        .map(|seed| {
+            let key = Key::p256(150 + seed);
+            let mut spec = ca_spec("Test ECC EK CA 01", key, Some(&root.key));
+            // No key identifier of its own: a candidate by name alone.
+            spec.exts.remove(SKI);
+            // Signed by another key, so the forged link fails.
+            issue(&spec, &root.name, &Key::p384(seed + 50), None)
+        })
+        .collect();
+    let chain: Vec<&[u8]> = forged.iter().map(Vec::as_slice).collect();
+    assert!(matches!(
+        verify(&leaf, &chain, &anchors(&[&root], &[&issuing])),
+        ChainVerdict::Verified(_)
+    ));
+    // With the genuine CA not listed, a forged chain index certificate that
+    // even carries the right key identifiers makes the path unknown, not
+    // refused.
+    let mut spec = ca_spec("Test ECC EK CA 01", Key::p256(9), Some(&root.key));
+    spec.exts.set(SKI, false, octet(&issuing.key.key_id()));
+    let impostor = issue(&spec, &root.name, &root.key, None);
+    assert!(matches!(
+        verify(&leaf, &[impostor.as_slice()], &anchors(&[&root], &[])),
+        ChainVerdict::Unverifiable(Unverifiable::IssuerNotListed { .. })
+    ));
+}

@@ -354,11 +354,15 @@ left open:
   comparison missed the link. A matching name only nominates an issuer: its
   key must still verify the signature.
 - **When a failing signature is evidence.** A signature that does not verify
-  reads `warn` only when the child's authority key identifier equals the
-  issuer's subject key identifier, so the certificate names the very key that
-  failed. Without both identifiers, a same-named CA with another key (a
-  re-keyed CA irlume does not list) is not the issuer, and the path reads
-  `unknown`.
+  reads `warn` only between certificates irlume vouches for (the EK
+  certificate, the listed CAs and the roots), and only when the child's
+  authority key identifier equals the issuer's subject key identifier, so the
+  certificate names the very key that failed. Without both identifiers, a
+  same-named CA with another key (a re-keyed CA irlume does not list) is not
+  the issuer, and the path reads `unknown`; so does a failing signature of or
+  by a certificate from the chain indices, which any process that can define
+  NV indices may write. Listed CAs are searched before those certificates,
+  so they cannot use up the search's bounds ahead of a listed path.
 - **Roots** are trust anchors by name and key: their own extensions are not
   processed (RFC 5280 6.1.1), and a root's self-signature is never relied on.
   A CA that is not self-signed is an intermediate, also when its vendor calls
@@ -381,7 +385,9 @@ left open:
   vendors' sites, with Infineon's OPTIGA Trust M CAs (not a TPM), Intel's
   pre-production ICL-N intermediate, the TPM 1.2 era SHA-1 chains and AMD's
   Pluton chains left out; the last have no vendor source for AMD Root CA R4
-  or the factory intermediates.
+  or the factory intermediates. A refresh never drops a certificate: one
+  whose URL starts serving another stays, marked retained, as section 5
+  keeps expired ones; only removing its manifest entry retires it.
 - **Crates**: `rsa` is pinned at `=0.10.0-rc.19`, the release candidate on
   the der 0.8 and digest 0.11 generation irlume already uses; 0.9 would
   duplicate the previous generation. The RUSTSEC-2023-0071 ignore is tracked

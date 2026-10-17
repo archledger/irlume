@@ -111,6 +111,14 @@ jobs:
           python3 -B scripts/test-check-agents-md.py
           python3 -B scripts/check-agents-md.py
 
+      # Offline, with the runner's openssl: the refresh script's own tests,
+      # then the shipped vendor CA certificates against their manifest
+      # (ADR-0036 section 5).
+      - name: TPM EK anchors (files, manifest and refresh script)
+        run: |
+          python3 -B scripts/test-update-tpm-ek-anchors.py
+          python3 -B scripts/update-tpm-ek-anchors.py --check
+
       # The ONNX weights (~614 MB: the five recognizers/landmarkers plus the
       # two PAD models) are fetched from the models-v1 release, not
       # Git LFS; cache them keyed on models/SHA256SUMS (changes exactly when the

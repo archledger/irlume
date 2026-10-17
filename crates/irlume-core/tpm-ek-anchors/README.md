@@ -47,11 +47,19 @@ python3 scripts/update-tpm-ek-anchors.py --check   # offline consistency check
 ```
 
 A refresh writes nothing unless every source is HTTPS and downloads, every
-root is self-signed and every intermediate's signature chains to a listed
-root. Review it like code: a changed or new root changes whom irlume trusts,
-so compare a new root's SHA-256 with a second, independent copy before
-merging. One refresh before each release is the target.
+file is exactly one DER certificate, every root's self-signature verifies
+and every intermediate's signature chains to a listed root. Review it like
+code: a changed or new root changes whom irlume trusts, so compare a new
+root's SHA-256 with a second, independent copy before merging. One refresh
+before each release is the target.
 
+A certificate is never dropped by a refresh: when its URL starts serving
+another certificate (a re-keyed CA, say), the old one stays, marked
+`"retained": true`, since the TPMs it certified are still in use, and later
+refreshes keep it without downloading it. To keep a certificate whose URL is
+gone, mark its entry retained by hand; to retire one, remove its entry.
+
+CI runs `scripts/test-update-tpm-ek-anchors.py` and `--check`, and
 `cargo test -p irlume-core ek_cert` checks the same set with irlume's own
 verifier: every file parses and matches the manifest, the directory holds
 nothing else, and every intermediate chains to a root.

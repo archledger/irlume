@@ -106,13 +106,17 @@ the UAPI group's registries:
    running, comes back with the window open. systemd has the same open
    problem for its own phases (systemd issue #34488). S3 and s2idle keep the
    locks.
-7. **A restart cannot reopen the window.** irlumed's unit restarts it on
-   failure (`Restart=on-failure`). Without a key kept outside the process,
-   face login would stop after a crash, a `systemctl stop` and `start`, or an
-   upgrade, until the next boot. systemd's file descriptor store keeps a
-   memfd across restart jobs, which RPM's `%systemd_postun_with_restart`
-   issues, but not across a stop and a start, nor across a crash unless
-   `FileDescriptorStorePreserve=` is set (`docs/FILE_DESCRIPTOR_STORE.md`).
+7. **A restart cannot reopen the window.** Without a key kept outside the
+   process, every restart of irlumed would end face login until the next
+   boot. systemd's file descriptor store can keep the key in a memfd: "a
+   restart job for a service will leave the fdstore intact, but a separate
+   stop and start job for it ... will likely not" (`docs/FILE_DESCRIPTOR_STORE.md`).
+   An automatic restart after a crash (irlumed's unit sets
+   `Restart=on-failure`) and RPM's `%systemd_postun_with_restart` are restart
+   jobs, so the key would survive them. It would not survive a `systemctl stop`
+   followed by a `start`, or a crash loop that exhausts the restart attempts
+   and leaves the unit failed, unless `FileDescriptorStorePreserve=` keeps the
+   store. The key would then live in PID 1 as well as in irlumed.
 
 ### What it would cost
 
@@ -122,8 +126,9 @@ the UAPI group's registries:
   step 3). Each request now unseals under the PCR policy, so a PCR change
   between requests refuses at the next load; a key unsealed once at start
   would not.
-- Face login would depend on the daemon never stopping: points 3 and 7
-  above.
+- Face login would depend on how irlumed stops: a stop and start, or a crash
+  loop that leaves the unit failed, would end it until the next boot (points
+  3 and 7 above).
 - Hibernation would need its own handling (point 6): inhibit it, drop the
   key before it and require a reboot, or re-close the window from the resume
   path, which no supported init system does today.
@@ -150,8 +155,10 @@ boot-phase window.
    signing key, and irlumed starts after `multi-user.target`.
 3. Every resume from hibernation reopens the window for the userspace it
    restores.
-4. A crash, a stop and start, or an upgrade outside a restart job would turn
-   face login off until the next boot.
+4. A stop and start, an upgrade outside a restart job, or a crash loop that
+   leaves the unit failed would turn face login off until the next boot.
+   Surviving the other restarts means keeping the key in PID 1's file
+   descriptor store as well.
 
 ### 3. What stays as it is
 

@@ -151,12 +151,13 @@ nothing on a nightly lane.
   `.SRCINFO` and `irlume.install` with `main`'s and fails when one differs, which `ci-alert.yml` turns into a
   `ci-alert` issue as for any failing scheduled workflow, so a recipe change
   on `main` is not left unpublished unseen.
-- **PPA.** `scripts/ppa-nightly.sh` runs from a user timer on minihost, which
+- **PPA.** `scripts/ppa-nightly.py` runs from a user timer on minihost, which
   already runs user timers with lingering enabled. It updates a dedicated
   clone and derives the nightly version from `main` (section 2), so a release
   tag on an already uploaded commit is a new input too. It builds the source
-  package from that commit in the same Ubuntu container as a release
-  (`packaging/ppa/build-ppa-container.sh`, given the commit and the version),
+  package from a `git archive` of that commit with the script and
+  digest-pinned Ubuntu image a release uses (`packaging/ppa/container-build.sh`,
+  which `packaging/ppa/build-ppa-container.sh` runs too), given the version,
   signs it with the key Launchpad has (fingerprint F350 5339 8E3C 80FE 2089
   1B82 C10B 8492 BD7F 30C6) through gpg-agent, uploads it with dput, and then
   waits for `scripts/verify-ppa-publish.py` (with `PPA_NAME=irlume-nightly`)
@@ -176,9 +177,13 @@ nothing on a nightly lane.
   - a version whose build failed, or whose upload was rejected: while the
     derived version is unchanged, the next run uploads the same commit with
     the next PPA revision (`-0ppa2`, then `-0ppa3`), as a release's failed
-    build does (`verify-ppa-publish.py`'s own advice); once `main` moves, the
-    failed state is dropped and the new version is uploaded, so a fix on
-    `main` is never held up by retries of the commit it fixed.
+    build does (`verify-ppa-publish.py`'s own advice);
+  - a new derived version (`main` moved, or a release tag landed): the
+    older version's record is dropped, whether it was pending, accepted and
+    still building, or failed, and the new version is uploaded at `-0ppa1`,
+    so a build Launchpad keeps pending never holds the channel on an old
+    commit, and a fix on `main` is never held up by retries of the commit it
+    fixed.
   A failure before the upload (the build, the signature) records nothing,
   so the next night starts over. Once dput has run, its version is recorded
   as uploaded whether dput succeeded or not, since a connection lost after
@@ -333,7 +338,7 @@ These need the maintainer's accounts, and are done once:
   than v0.15.2.
 - The `irlume-git` recipe builds in a clean Arch container, its package
   provides `irlume`, and the parity script checks it.
-- `scripts/ppa-nightly.sh`, with Launchpad, dput and the container build
+- `scripts/ppa-nightly.py`, with Launchpad, dput and the container build
   faked:
   - uploads nothing when the derived version is the one last published;
   - uploads when a release tag lands on the already published commit
@@ -345,8 +350,9 @@ These need the maintainer's accounts, and are done once:
   - after an upload whose source publication never appears (rejected), and
     after a failed build, uploads the same commit with the next PPA
     revision;
-  - after a failed build followed by a move of `main`, uploads the new
-    version and drops the failed one;
+  - after a failed build, and after an accepted upload still building,
+    followed by a move of `main`, uploads the new version at `-0ppa1` and
+    drops the older one;
   - records nothing when the build or the signature fails;
   - after a dput failure whose upload Launchpad accepted, verifies it
     instead of uploading it again.

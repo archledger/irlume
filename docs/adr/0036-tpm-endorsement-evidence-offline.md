@@ -140,9 +140,13 @@ it cannot vouch for.
 
 ### 2. What irlumed reads and checks
 
-1. The EK certificate indices in 0x01C00000 to 0x01C07FFF: each
-   certificate index read as DER with trailing bytes and the
-   `0x10 0x01 0x00` header tolerated; the templates and, in the low range,
+1. The EK certificate indices in 0x01C00000 to 0x01C07FFF, except the chain
+   range 0x01C00100 to 0x01C001FF, which holds only chain material
+   (Credential Profile 2.2.2.5.2): each certificate index read as DER with
+   trailing bytes tolerated, and when it starts with the PC Client wrapper
+   (`0x10 0x01 0x00` then a two-byte big-endian length), exactly the
+   `length` bytes after those five, as go-attestation's `ParseEKCertificate`
+   reads them; the templates and, in the low range,
    the nonces that go with them (below); and the chain indices 0x01C00100 to
    0x01C001FF, whose contents are joined in index order and split into every
    complete DER certificate, since one index may hold several certificates
@@ -156,7 +160,9 @@ it cannot vouch for.
    populated, else the default L-1 or L-2, and the nonce at 0x01C00003 or
    0x01C0000B, when populated, goes into the template's unique field as the
    Credential Profile's EK creation procedure describes. The certificate is
-   used only when its public key equals the EK's.
+   used only when its public key equals the EK's. The firmware-limited EK
+   certificates (0x01C00040 to 0x01C00046) are skipped and named: their EKs
+   are created under `TPM_RH_FW_ENDORSEMENT`, which irlume does not use.
 3. The chain, in software: the EK certificate, then intermediates from the
    NV chain indices and from irlume's list (section 5), up to a pinned root.
    The leaf must be an EK certificate by the Credential Profile (3.2): a
@@ -176,6 +182,9 @@ it cannot vouch for.
    names an end date that has passed. Revocation is not checked: CRLs and
    OCSP need the network.
 4. The same-TPM test: a software TPM2_MakeCredential to the EK's public key
+   (RSA-OAEP or ECDH with that key, computed by irlumed, not by the TPM's own
+   `TPM2_MakeCredential`, which would show the secret to the very TPM under
+   test)
    with the Name of the storage key new seals go under (ADR-0034's recorded
    DA-exempt key, or the original key before it persists), then
    TPM2_ActivateCredential with that key as `activateHandle` and the EK as
@@ -212,7 +221,12 @@ check is `unknown` with that reason: irlume never guesses an authorization.
 The answer travels in a new root-only request, `TpmEndorsement`, with its own
 client budget of 60 seconds, not in `TpmReadiness`: deriving an EK can take
 more than 10 seconds on a slow firmware TPM, and `TpmReadiness` already stays
-within its 30-second budget only by deriving at most once (#1105). The request
+within its 30-second budget only by deriving at most once (#1105). The budget
+binds irlumed too, not only the client: the handler takes the request's
+deadline, checks it before each TPM command, and stops with `unknown` ("ran
+out of time") once it has passed, so an abandoned request releases the TPM
+within one command after its deadline. It judges at most four storage EK
+certificates, the low-range RSA and ECC ones first. The request
 is additive on the wire, gets explicit posture table arms, and an older
 irlumed's refusal reads as "irlumed predates the endorsement check"
 (`unknown`).
@@ -242,15 +256,22 @@ irlumed's refusal reads as "irlumed predates the endorsement check"
 
 ### 6. The verification code
 
-Parsing uses `x509-cert`, on the `der` and `spki` crates irlume-core already
-depends on. Signatures are verified with `ring` (RSA PKCS#1 v1.5 and PSS with
-SHA-256, SHA-384 and SHA-512; ECDSA P-256 and P-384), already in irlume's
-lockfile as a build dependency, and `p521` (Nuvoton's 2023 ECC P-521 root).
-The `rsa` crate is not used: its RUSTSEC-2023-0071 is unpatched, and although
-irlume would only verify, a dependency on it would need an advisory ignore. A
-chain signed with SHA-1, or with an algorithm outside this list, cannot be
-verified and reads `info` with the algorithm named, unless another path to a
-pinned root verifies.
+All of it is RustCrypto, on the `der` and `spki` crates irlume-core already
+depends on: `x509-cert` parses; `rsa` verifies RSA PKCS#1 v1.5 and PSS
+signatures with SHA-256, SHA-384 and SHA-512 and performs the RSA-OAEP
+encryption of section 2.4; `p256`, `p384` and `p521` verify ECDSA (P-521 for
+Nuvoton's 2023 root) and perform the ECDH of section 2.4. A chain signed
+with SHA-1, or with an algorithm outside this list, cannot be verified and
+reads `unknown` with the algorithm named, unless another path to a pinned
+root verifies.
+
+`rsa` has an unpatched advisory, RUSTSEC-2023-0071 (the Marvin attack): a
+timing side channel in operations with the RSA private key. irlume holds no
+RSA private key here and calls only public-key verification and encryption,
+so the vulnerable code is never reached. `deny.toml` therefore takes a
+justified ignore for it, with that rationale and a tracking issue, as
+AGENTS.md's dependency rule allows; `ring` is not used because it offers no
+RSA encryption.
 
 ### 7. Privacy
 
@@ -277,8 +298,9 @@ check.
 - On Intel PTT before Tiger Lake and on AMD fTPM the check usually reads
   `info` (no certificate stored), since irlume does not fetch one.
 - irlume carries and refreshes a few hundred vendor CA certificates (about
-  half a megabyte), and gains `x509-cert`, `ring` and `p521` as normal
-  dependencies of irlume-core.
+  half a megabyte), and gains `x509-cert`, `rsa`, `p256`, `p384` and `p521`
+  as normal dependencies of irlume-core, with a justified ignore of
+  RUSTSEC-2023-0071 (section 6).
 - The wire gains one root-only request.
 
 ## Phasing
@@ -320,8 +342,14 @@ check.
   that passes reads `unknown`.
 - Every shipped intermediate chains to a shipped root, and every file's
   SHA-256 matches the manifest.
-- The NV reader tolerates trailing bytes and the `0x10 0x01 0x00` header, and
-  refuses a certificate whose public key differs from the EK's.
+- The NV reader reads a certificate with trailing bytes, and one in the PC
+  Client wrapper with trailing bytes after the declared length, as exactly
+  the certificate; it refuses a wrapper whose length runs past the index, and
+  a certificate whose public key differs from the EK's. It never takes an
+  index in the chain range for an EK certificate.
+- A firmware-limited EK certificate is skipped and named.
+- A request whose deadline passes stops before its next TPM command and
+  reads `unknown`.
 - On swtpm, with an EK certificate from `swtpm_setup --create-ek-cert`: the
   check reads `unknown` (issuer not in irlume's list) with the shipped
   anchors; with the test CA added as an anchor in the test only, it reads

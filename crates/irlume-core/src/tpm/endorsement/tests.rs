@@ -643,6 +643,7 @@ fn tpm_endorsement_a_credential_bound_to_another_key_is_refused_by_the_tpm() {
         let mut run = Run {
             ctx: &mut ctx,
             before_command: &mut always,
+            persistent: Vec::new(),
         };
         let found = find_storage_key(&mut run, false)
             .unwrap_or_else(|_| panic!("the storage key"))
@@ -823,6 +824,39 @@ fn tpm_endorsement_a_persistent_ek_with_the_certified_key_is_used() {
     };
     let handles: Vec<u32> = list.into_inner().into_iter().map(u32::from).collect();
     assert_eq!(handles, [0x8101_0001, 0x8101_0002]);
+}
+
+/// irlume's original storage key persisted at its handle, 0x81010002, which
+/// lies in the endorsement primaries' range each certificate's EK scan reads:
+/// the scans meet the key the same-TPM tests run under. An ESYS before 4.1.0
+/// returns one object for a handle resolved twice and frees it for both on
+/// the first close, so the check closes no persistent object before it ends.
+#[test]
+#[ignore = "needs a swtpm of its own (IRLUME_TEST_OWN_SWTPM=1 with scripts/with-swtpm.sh); CI runs it so"]
+fn tpm_endorsement_two_certificates_beside_irlumes_persisted_storage_key_pass() {
+    let mut tpm = OwnSwtpm::new("endorsement-persisted-srk");
+    let manufacturer = tpm.manufacturer();
+    let (root, issuing) = test_ca();
+    for slot in [Slot::L1, Slot::H3] {
+        let ek = tpm.ek(slot.default_template().unwrap());
+        let index = JUDGED.iter().find(|(_, s)| *s == slot).unwrap().0;
+        tpm.provision(
+            index,
+            &test_pki::ek_certificate_for(&ek, &issuing, manufacturer),
+        );
+    }
+    let (_, persisted) = load_or_create_srk(&mut tpm.ctx(), SrkMode::Initialize).unwrap();
+    assert!(persisted);
+    tpm.persisted.push(persistent_srk_raw());
+    assert!(EK_PERSISTENT.0 <= persistent_srk_raw() && persistent_srk_raw() <= EK_PERSISTENT.1);
+
+    let report = run_check(&anchors_of(&[&root], &[&issuing]));
+    assert_eq!(report.state, EndorsementState::Pass, "{report:#?}");
+    assert_eq!(report.certificates.len(), 2);
+    assert!(report
+        .certificates
+        .iter()
+        .all(|c| c.state == EndorsementState::Pass));
 }
 
 #[test]

@@ -468,7 +468,12 @@ sections 2 to 4 left open:
   EKs it names. A persistent EK with the certificate's key is
   looked for before the template and nonce indices, which only a derivation
   needs. The storage key is found once per request, by the first same-TPM
-  test, and released after the last.
+  test, and released after the last. Each persistent object is resolved
+  once per request and closed only at its end: irlume's original storage
+  key sits at 0x81010002 by default, inside the endorsement primaries' range
+  every EK scan reads, and an ESYS before 4.1.0 (Ubuntu 24.04 ships 4.0.1)
+  returns the same object for a handle resolved twice, without a reference
+  count, so closing either frees both.
 - **The report** names a reason when the check stopped early and, for each
   judged certificate, its index, its EK's algorithm, its state, a one-line
   detail and, when its chain verified, the TPM it names and its CAs with

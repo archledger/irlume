@@ -377,9 +377,34 @@ enum Stop {
 struct Run<'a, 'f> {
     ctx: &'a mut Context,
     before_command: &'a mut (dyn FnMut() -> bool + 'f),
+    /// The persistent objects resolved so far, by TPM handle, each resolved
+    /// once and closed only when the check ends ([`Run::close_persistent`]).
+    /// An ESYS before 4.1.0 returns the same object for a handle resolved
+    /// twice and frees it for both on the first close, and the EK scan
+    /// meets irlume's original storage key (0x81010002 by default) in the
+    /// endorsement primaries' range.
+    persistent: Vec<(u32, ObjectHandle)>,
 }
 
 impl Run<'_, '_> {
+    /// The ESYS object for the persistent `handle`, resolved once per check.
+    fn persistent(&mut self, handle: u32) -> std::result::Result<ObjectHandle, Stop> {
+        if let Some((_, object)) = self.persistent.iter().find(|(h, _)| *h == handle) {
+            return Ok(*object);
+        }
+        let tpm_handle = PersistentTpmHandle::new(handle).map_err(|e| Stop::Tpm(e.to_string()))?;
+        let object = self.tpm(|ctx| ctx.tr_from_tpm_public(TpmHandle::Persistent(tpm_handle)))?;
+        self.persistent.push((handle, object));
+        Ok(object)
+    }
+
+    /// Release ESYS's records of the persistent objects; the TPM keeps them.
+    fn close_persistent(&mut self) {
+        for (_, mut object) in self.persistent.drain(..) {
+            let _ = self.ctx.tr_close(&mut object);
+        }
+    }
+
     /// Run one TPM command (or the session-wrapped derivation of the
     /// original storage key), first asking the deadline.
     fn tpm<T, E: std::fmt::Display>(
@@ -517,12 +542,15 @@ pub fn endorsement_report(
     let mut run = Run {
         ctx: &mut ctx,
         before_command,
+        persistent: Vec::new(),
     };
-    match report_through(&mut run, anchors) {
+    let report = match report_through(&mut run, anchors) {
         Ok(report) => report,
         Err(Stop::Time) => stopped("ran out of time before reading the TPM".into()),
         Err(Stop::Tpm(e)) => stopped(format!("the TPM could not be read: {e}")),
-    }
+    };
+    run.close_persistent();
+    report
 }
 
 fn stopped(reason: String) -> EndorsementReport {
@@ -684,8 +712,8 @@ fn certificate_result(
 /// An EK as its public area states it.
 struct EkObject {
     handle: KeyHandle,
-    /// Derived for this check: flush it after use. A persistent one only
-    /// has its ESYS record closed.
+    /// Derived for this check: flush it after use. A persistent one stays
+    /// resolved until the check ends ([`Run::persistent`]).
     transient: bool,
     public: Public,
 }
@@ -838,9 +866,6 @@ impl Check<'_> {
         let same_tpm = same_tpm_test(run, &ek, self.permanent, &mut self.storage);
         if ek.transient {
             let _ = run.ctx.flush_context(ek.handle.into());
-        } else {
-            let mut object = ObjectHandle::from(ek.handle);
-            let _ = run.ctx.tr_close(&mut object);
         }
         let same_tpm = same_tpm?;
 
@@ -932,35 +957,26 @@ fn persistent_ek(
     }
     let mut unread = None;
     for handle in ek_handles.clone().unwrap_or_default() {
-        let persistent = match PersistentTpmHandle::new(handle) {
-            Ok(persistent) => persistent,
-            Err(e) => {
+        let object = match run.persistent(handle) {
+            Ok(object) => object,
+            Err(Stop::Time) => return Err(Stop::Time),
+            Err(Stop::Tpm(e)) => {
                 unread.get_or_insert(format!("{handle:#010x}: {e}"));
                 continue;
             }
         };
-        let mut object =
-            match run.tpm(|ctx| ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent))) {
-                Ok(object) => object,
-                Err(Stop::Time) => return Err(Stop::Time),
-                Err(Stop::Tpm(e)) => {
-                    unread.get_or_insert(format!("{handle:#010x}: {e}"));
-                    continue;
-                }
-            };
         let key = KeyHandle::from(ESYS_TR::from(object));
         let public = match run.tpm(|ctx| ctx.read_public(key)) {
-            Ok((public, _, _)) => Some(public),
-            Err(Stop::Time) => {
-                let _ = run.ctx.tr_close(&mut object);
-                return Err(Stop::Time);
-            }
+            Ok((public, _, _)) => public,
+            Err(Stop::Time) => return Err(Stop::Time),
             Err(Stop::Tpm(e)) => {
                 unread.get_or_insert(format!("{handle:#010x}: {e}"));
-                None
+                continue;
             }
         };
-        if let Some(public) = public.filter(|p| public_key(p).as_ref() == Some(certified)) {
+        // Another persistent object stays resolved: the check may need it
+        // (irlume's storage key), and closes all when it ends.
+        if public_key(&public).as_ref() == Some(certified) {
             run.ctx
                 .tr_set_auth(object, Auth::default())
                 .map_err(|e| Stop::Tpm(e.to_string()))?;
@@ -973,9 +989,6 @@ fn persistent_ek(
                 None,
             ));
         }
-        // Another persistent object: release ESYS's record of it; the TPM
-        // keeps the object.
-        let _ = run.ctx.tr_close(&mut object);
     }
     Ok((None, unread))
 }
@@ -1154,8 +1167,8 @@ enum PolicyRoute {
 #[derive(Debug, Clone, Copy)]
 struct StorageKey {
     handle: KeyHandle,
-    /// Derived for this check: flushed after it, where a persistent key
-    /// only has its ESYS record closed.
+    /// Derived for this check: flushed after it. A persistent key stays
+    /// resolved until the check ends ([`Run::persistent`]).
     transient: bool,
 }
 
@@ -1163,9 +1176,6 @@ impl StorageKey {
     fn release(self, ctx: &mut Context) {
         if self.transient {
             let _ = ctx.flush_context(self.handle.into());
-        } else {
-            let mut object = ObjectHandle::from(self.handle);
-            let _ = ctx.tr_close(&mut object);
         }
     }
 }
@@ -1226,25 +1236,18 @@ fn find_storage_key(
 }
 
 /// The persistent key at `handle` when `wanted` accepts its public area and
-/// Name, with its empty authValue set; `None`, with its ESYS record closed,
-/// when `wanted` does not. A key that cannot be read is an error.
+/// Name, with its empty authValue set; `None` when `wanted` does not. A key
+/// that cannot be read is an error. Either way the object stays resolved
+/// until the check ends ([`Run::persistent`]).
 fn persistent_key(
     run: &mut Run<'_, '_>,
     handle: u32,
     wanted: impl FnOnce(&Public, &[u8]) -> bool,
 ) -> std::result::Result<Option<KeyHandle>, Stop> {
-    let persistent = PersistentTpmHandle::new(handle).map_err(|e| Stop::Tpm(e.to_string()))?;
-    let mut object = run.tpm(|ctx| ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)))?;
+    let object = run.persistent(handle)?;
     let key = KeyHandle::from(ESYS_TR::from(object));
-    let accepted = match run.tpm(|ctx| ctx.read_public(key)) {
-        Ok((public, name, _)) => wanted(&public, name.value()),
-        Err(stop) => {
-            let _ = run.ctx.tr_close(&mut object);
-            return Err(stop);
-        }
-    };
-    if !accepted {
-        let _ = run.ctx.tr_close(&mut object);
+    let (public, name, _) = run.tpm(|ctx| ctx.read_public(key))?;
+    if !wanted(&public, name.value()) {
         return Ok(None);
     }
     run.ctx

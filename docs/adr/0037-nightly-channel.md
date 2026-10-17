@@ -227,7 +227,10 @@ says so, and that:
   builds carry no SBOM, VEX or SLSA provenance ([VERIFY.md](../VERIFY.md)
   covers release assets only);
 - leaving the channel returns to the release: `dnf copr disable
-  archledger/irlume-nightly` then `dnf distro-sync irlume`; removing the
+  archledger/irlume-nightly`, `dnf copr enable archledger/irlume` (a machine
+  installed from the nightly Copr alone has no release repository enabled,
+  and `distro-sync` picks from enabled repositories only), then
+  `dnf distro-sync irlume`; removing the
   nightly PPA then installing the release PPA's version with
   `--allow-downgrades`, with `irlume-kcm` in the same command when it is
   installed, since it depends on the exact `irlume` version; installing
@@ -288,6 +291,8 @@ These need the maintainer's accounts, and are done once:
   as the nightly PPA.
 - Leaving the nightly PPA names `irlume-kcm` in the downgrade command beside
   `irlume`.
+- Leaving the nightly Copr enables the release Copr before `distro-sync`, so
+  a machine that had only the nightly Copr returns to the release.
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
   names the AUR nightly package and uninstall removes `irlume-git` and, when
   installed, `irlume-kcm-git`.

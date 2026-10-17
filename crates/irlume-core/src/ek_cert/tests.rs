@@ -1652,3 +1652,33 @@ fn a_self_issued_key_rollover_ca_chains_to_the_old_root() {
     assert_eq!(chain.path.len(), 4);
     assert!(Parsed::new(&rollover.der).unwrap().self_issued());
 }
+
+#[test]
+fn names_that_differ_only_by_unicode_case_folding_match() {
+    let fold = |text: &str| canonical_name(&Name::from_der(&name(text)).unwrap());
+    assert_eq!(fold("Straße CA"), fold("STRASSE ca"));
+    assert_eq!(fold("ΣΟΦΟΣ CA"), fold("σοφος CA"));
+    assert_ne!(fold("Test CA 01"), fold("Test CA 02"));
+}
+
+#[test]
+fn pss_with_mgf1_hash_parameters_other_than_null_is_not_accepted() {
+    let sha256 = seq(&[oid_der("2.16.840.1.101.3.4.2.1"), null()]);
+    let odd_sha256 = seq(&[oid_der("2.16.840.1.101.3.4.2.1"), int(&[1])]);
+    let pss = |mgf_hash: &[u8]| {
+        seq(&[
+            oid_der("1.2.840.113549.1.1.10"),
+            seq(&[
+                explicit(0, &sha256),
+                explicit(
+                    1,
+                    &seq(&[oid_der("1.2.840.113549.1.1.8"), mgf_hash.to_vec()]),
+                ),
+                explicit(2, &int(&[32])),
+            ]),
+        ])
+    };
+    let read = |der: Vec<u8>| scheme(&AlgorithmIdentifierOwned::from_der(&der).unwrap());
+    assert_eq!(read(pss(&sha256)), Ok(Scheme::RsaPss(HashAlg::Sha256, 32)));
+    assert!(read(pss(&odd_sha256)).is_err());
+}

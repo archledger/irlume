@@ -40,6 +40,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -199,12 +200,25 @@ def signed_by(child_der, parent_der):
         return proc.returncode == 0
 
 
+class HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect hop that is not HTTPS, not only the last one: a
+    plaintext hop could be answered with a redirect to any host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            raise urllib.error.HTTPError(newurl, code, f"redirect to a non-HTTPS URL: {newurl}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+OPENER = urllib.request.build_opener(HttpsOnlyRedirects)
+
+
 def download(url):
     if not url.startswith("https://"):
         fail(f"{url}: only HTTPS sources are accepted")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with OPENER.open(request, timeout=60) as response:
             if not response.geturl().startswith("https://"):
                 fail(f"{url}: redirected to a non-HTTPS URL")
             data = response.read(MAX_CERT_BYTES + 1)

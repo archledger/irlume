@@ -89,6 +89,16 @@ class ToDer(unittest.TestCase):
             ANCHORS.to_der(pem + b"trailing text")
 
 
+class Redirects(unittest.TestCase):
+    def test_a_redirect_hop_to_plain_http_is_refused(self):
+        handler = ANCHORS.HttpsOnlyRedirects()
+        request = ANCHORS.urllib.request.Request("https://pki.example/root.crt")
+        with self.assertRaises(ANCHORS.urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {}, "http://pki.example/root.crt")
+        hop = handler.redirect_request(request, None, 302, "Found", {}, "https://cdn.example/root.crt")
+        self.assertEqual(hop.full_url, "https://cdn.example/root.crt")
+
+
 class SelfSignature(unittest.TestCase):
     def test_a_root_whose_self_signature_is_broken_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

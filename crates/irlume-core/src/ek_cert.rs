@@ -286,7 +286,8 @@ fn tbs_range(der: &[u8]) -> der::Result<Range<usize>> {
 
 /// A name as RFC 5280 7.1 compares it: each RDN's attributes, sorted, with
 /// directory strings compared as text after case folding and insignificant
-/// space handling (RFC 4518, without its Unicode normalization). Vendors do
+/// space handling (RFC 4518, without its Unicode normalization; case folding
+/// approximated by upper then lower case). Vendors do
 /// not always repeat a CA's name with the same string types: ST's ECC
 /// Intermediate CA 02 names its issuer in UTF8String where that CA's own
 /// subject uses PrintableString. A match only nominates an issuer; its key
@@ -331,10 +332,14 @@ fn canonical_value(value: &der::Any) -> CanonicalValue {
         _ => None,
     };
     match text {
+        // Upper then lower case approximates Unicode case folding, which
+        // lower case alone does not ("Straße" and "STRASSE", final and
+        // medial sigma); a looser match only nominates more issuers.
         Some(text) => CanonicalValue::Text(
             text.split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
+                .to_uppercase()
                 .to_lowercase(),
         ),
         None => CanonicalValue::Other(value.tag(), bytes.to_vec()),
@@ -1124,7 +1129,9 @@ fn pss_scheme(alg: &AlgorithmIdentifierOwned) -> Option<Scheme> {
         return None;
     }
     let mgf_hash: AlgorithmIdentifierOwned = mask_gen.parameters.as_ref()?.decode_as().ok()?;
-    if HashAlg::from_oid(mgf_hash.oid) != Some(hash) {
+    if HashAlg::from_oid(mgf_hash.oid) != Some(hash)
+        || mgf_hash.parameters.as_ref().is_some_and(|p| !p.is_null())
+    {
         return None;
     }
     if params.trailer.is_some_and(|t| t != 1) {

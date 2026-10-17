@@ -254,6 +254,11 @@ profile irlumed /usr/local/bin/irlumed {
   /proc/[0-9]*/fd/ r,
   /proc/[0-9]*/fd/[0-9]* r,
   /proc/[0-9]*/comm r,
+  # The node-access gate (#1069, ADR-0031) reads the camera node's udev
+  # database record: the seat tag's absence is what makes its hardened state
+  # durable, and a record it cannot read must never read as hardened.
+  /run/udev/data/ r,
+  /run/udev/data/* r,
   # Pin and revalidate the enrollment requester before consuming OS approval.
   /proc/[0-9]*/ r,
   /proc/[0-9]*/stat r,

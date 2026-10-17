@@ -270,7 +270,10 @@ cargo build --release --locked
   support reports stay share-safe (ADR-0008).
 - New dependencies: crates.io only, a `deny.toml`-allowed license, an audit
   note in the PR ([docs/CODE_REVIEW.md](docs/CODE_REVIEW.md));
-  `advisories.ignore` stays empty. Commit `Cargo.lock`, and `fuzz/Cargo.lock`
+  `advisories.ignore` holds only advisories whose vulnerable code irlume
+  never reaches, each with its rationale and a tracking issue
+  (`scripts/generate-vex.py` maps the rationale to OpenVEX). Commit
+  `Cargo.lock`, and `fuzz/Cargo.lock`
   when a dependency of common, core, camera or vision changes.
 - Vulnerabilities go only to GitHub Private Vulnerability Reporting or the
   address in [SECURITY.md](SECURITY.md). If you find one, stop and tell the human,

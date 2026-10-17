@@ -38,12 +38,28 @@ allow = ["CDLA-Permissive-2.0"]
 
 [advisories]
 version = 2
-# Empty on purpose: the rsa crate (RUSTSEC-2023-0071) was replaced by the
-# der/spki parsers in crates/irlume-core/src/tpm.rs, so the advisory no
-# longer applies. Any future entry here must carry its rationale in a
-# comment: scripts/generate-vex.py maps that comment to an OpenVEX
-# justification and refuses unmapped wording.
-ignore = []
+# Every entry carries its rationale in the comment above it, and a tracking
+# issue: scripts/generate-vex.py maps that comment to an OpenVEX
+# justification and refuses unmapped wording. (The rsa crate,
+# RUSTSEC-2023-0071, was replaced by the der/spki parsers in
+# crates/irlume-core/src/tpm.rs and needs no entry.)
+ignore = [
+    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
+    # whose build script extracts an archive only for its `vendored`
+    # feature, which irlume does not enable: the vulnerable code is not
+    # reached. Fixed in zip 9; drop this with #1103.
+    "RUSTSEC-2026-0367",
+    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
+    # whose build script extracts an archive only for its `vendored`
+    # feature, which irlume does not enable: the vulnerable code is not
+    # reached. Fixed in zip 9; drop this with #1103.
+    "RUSTSEC-2026-0368",
+    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
+    # whose build script extracts an archive only for its `vendored`
+    # feature, which irlume does not enable: the vulnerable code is not
+    # reached. Fixed in zip 9; drop this with #1103.
+    "RUSTSEC-2026-0369",
+]
 
 [bans]
 # Duplicate crate versions cost compile time and binary size but are not errors.

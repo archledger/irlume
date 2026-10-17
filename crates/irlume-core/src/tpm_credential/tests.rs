@@ -65,7 +65,7 @@ impl TryCryptoRng for FixedRng {}
 /// What the vectors need from a marshaled TPMT_PUBLIC.
 struct ParsedPublic {
     name_alg: NameAlg,
-    symmetric_bits: u16,
+    symmetric: EkSymmetric,
     key: EkPublicKey,
 }
 
@@ -81,11 +81,16 @@ fn parse_public(bytes: &[u8]) -> ParsedPublic {
     at += 4; // objectAttributes
     let policy = usize::from(u16_at(&mut at));
     at += policy;
-    let symmetric = u16_at(&mut at);
-    let mut symmetric_bits = 0;
-    if symmetric != 0x0010 {
-        symmetric_bits = u16_at(&mut at);
-        at += 2; // mode
+    let symmetric_alg = u16_at(&mut at);
+    let mut symmetric = EkSymmetric::Aes128Cfb;
+    if symmetric_alg != 0x0010 {
+        assert_eq!(symmetric_alg, 0x0006, "AES");
+        symmetric = match u16_at(&mut at) {
+            128 => EkSymmetric::Aes128Cfb,
+            256 => EkSymmetric::Aes256Cfb,
+            other => panic!("AES-{other}"),
+        };
+        assert_eq!(u16_at(&mut at), 0x0043, "CFB");
     }
     let scheme = u16_at(&mut at);
     if scheme != 0x0010 {
@@ -129,7 +134,7 @@ fn parse_public(bytes: &[u8]) -> ParsedPublic {
     };
     ParsedPublic {
         name_alg,
-        symmetric_bits,
+        symmetric,
         key,
     }
 }
@@ -160,7 +165,7 @@ fn kdfa_matches_the_tcg_reference_self_test() {
         (NameAlg::Sha512, "8be2c1b85b78569b9fa759f5857c56d684810fd3"),
     ] {
         assert_eq!(
-            kdfa(alg, &key, &label, &u, &v, 160),
+            *kdfa(alg, &key, &label, &u, &v, 160),
             hex(expected),
             "{alg:?}"
         );
@@ -172,7 +177,7 @@ fn kdfa_and_kdfe_match_tpm2_pytss() {
     // tpm2-pytss test/test_crypto.py, master 1804b6517f3e: KDFa's label has
     // no zero octet (one is added); KDFe's Use is hashed as given.
     assert_eq!(
-        kdfa(NameAlg::Sha256, b"key data", b"label data", b"contextU data", b"contextV data", 2048),
+        *kdfa(NameAlg::Sha256, b"key data", b"label data", b"contextU data", b"contextV data", 2048),
         hex(concat!(
             "61e2b87b4066c094a3507408f5af015bce85748433f8b3032571e58478dc60814520f5a9e89fc8c99655be1b07d98f97",
             "2a7ef79b5899be86e71067249c55515497009a97fdf05dec2eed77b4f58a2f2918441357363f607b2166f5a7d93e45f7",
@@ -183,7 +188,7 @@ fn kdfa_and_kdfe_match_tpm2_pytss() {
         ))
     );
     assert_eq!(
-        kdfe(
+        *kdfe(
             NameAlg::Sha256,
             b"z data",
             b"use data",
@@ -214,7 +219,7 @@ fn kdfa_and_kdfe_match_go_tpm() {
             &hex(field(v, "ContextV")),
             bits(v),
         );
-        assert_eq!(got, hex(field(v, "Result")), "{}", field(v, "Name"));
+        assert_eq!(*got, hex(field(v, "Result")), "{}", field(v, "Name"));
     }
     let kdfe_vectors = vectors["go_tpm_kdfe"].as_array().unwrap();
     assert_eq!(kdfe_vectors.len(), 10);
@@ -230,7 +235,7 @@ fn kdfa_and_kdfe_match_go_tpm() {
             &hex(field(v, "ContextV")),
             bits(v),
         );
-        assert_eq!(got, hex(field(v, "Result")), "{}", field(v, "Name"));
+        assert_eq!(*got, hex(field(v, "Result")), "{}", field(v, "Name"));
     }
 }
 
@@ -287,7 +292,7 @@ fn the_ecc_kem_matches_go_tpm_vectors_a_tpm_activated() {
             x,
             bits,
         );
-        assert_eq!(seed, secret, "{}", field(v, "Name"));
+        assert_eq!(*seed, secret, "{}", field(v, "Name"));
         assert_eq!(
             exchange.secret(),
             hex(field(v, "Ciphertext")),
@@ -306,7 +311,7 @@ fn full_credentials_match_two_that_swtpm_activated() {
     let public = parse_public(&hex(field(rsa, "ek_tpmt_public")));
     let ek = EkTarget {
         name_alg: public.name_alg,
-        symmetric_bits: public.symmetric_bits,
+        symmetric: public.symmetric,
         key: &public.key,
     };
     let mut rng = FixedRng([hex(field(rsa, "seed")), hex(field(rsa, "oaep_seed"))].concat());
@@ -319,7 +324,7 @@ fn full_credentials_match_two_that_swtpm_activated() {
     let public = parse_public(&hex(field(ecc, "ek_tpmt_public")));
     let ek = EkTarget {
         name_alg: public.name_alg,
-        symmetric_bits: public.symmetric_bits,
+        symmetric: public.symmetric,
         key: &public.key,
     };
     let EkPublicKey::Ecc { curve, x, y } = &public.key else {
@@ -335,7 +340,7 @@ fn full_credentials_match_two_that_swtpm_activated() {
         hex(field(ecc, "id_object"))
     );
     assert_eq!(
-        kdfa(ek.name_alg, &seed, STORAGE, &name, &[], 128),
+        *kdfa(ek.name_alg, &seed, STORAGE, &name, &[], 128),
         hex(field(ecc, "sym_key"))
     );
 }
@@ -437,25 +442,31 @@ fn activate(
                 .to_vec(),
                 PrivateEk::Rsa(_) => unreachable!(),
             };
-            kdfe(alg, &z, IDENTITY, x, ek_x, digest_bits)
+            kdfe(alg, &z, IDENTITY, x, ek_x, digest_bits).to_vec()
         }
     };
     let blob = &made.id_object;
     let hmac_len = usize::from(u16::from_be_bytes([blob[0], blob[1]]));
     let (integrity, enc_identity) = blob[2..].split_at(hmac_len);
     let hmac_key = kdfa(alg, &seed, INTEGRITY, &[], &[], digest_bits);
-    if alg.hmac(&hmac_key, &[enc_identity, name]) != integrity {
+    let mut expected = Vec::new();
+    alg.hmac_into(&hmac_key, &[enc_identity, name], &mut expected);
+    if expected != integrity {
         return None;
     }
-    let sym_key = kdfa(alg, &seed, STORAGE, name, &[], u32::from(ek.symmetric_bits));
+    let sym_key = kdfa(alg, &seed, STORAGE, name, &[], ek.symmetric.key_bits());
     let mut plain = enc_identity.to_vec();
-    match ek.symmetric_bits {
-        128 => cfb_mode::Decryptor::<Aes128>::new_from_slices(&sym_key, &[0; 16])
-            .unwrap()
-            .decrypt(&mut plain),
-        _ => cfb_mode::Decryptor::<Aes256>::new_from_slices(&sym_key, &[0; 16])
-            .unwrap()
-            .decrypt(&mut plain),
+    match ek.symmetric {
+        EkSymmetric::Aes128Cfb => {
+            cfb_mode::Decryptor::<Aes128>::new_from_slices(&sym_key, &[0; 16])
+                .unwrap()
+                .decrypt(&mut plain)
+        }
+        EkSymmetric::Aes256Cfb => {
+            cfb_mode::Decryptor::<Aes256>::new_from_slices(&sym_key, &[0; 16])
+                .unwrap()
+                .decrypt(&mut plain)
+        }
     }
     let len = usize::from(u16::from_be_bytes([plain[0], plain[1]]));
     (plain.len() == 2 + len).then(|| plain[2..].to_vec())
@@ -467,32 +478,36 @@ fn a_credential_round_trips_for_every_ek_shape_irlume_supports() {
     let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
     let shapes = [
         // L-1, H-1; H-6 and H-7 use the same code with SHA-384 and AES-256.
-        (NameAlg::Sha256, 128, PrivateEk::Rsa(rsa.clone())),
-        (NameAlg::Sha384, 256, PrivateEk::Rsa(rsa)),
+        (
+            NameAlg::Sha256,
+            EkSymmetric::Aes128Cfb,
+            PrivateEk::Rsa(rsa.clone()),
+        ),
+        (NameAlg::Sha384, EkSymmetric::Aes256Cfb, PrivateEk::Rsa(rsa)),
         // L-2, H-2, H-3, H-4.
         (
             NameAlg::Sha256,
-            128,
+            EkSymmetric::Aes128Cfb,
             PrivateEk::P256(p256::SecretKey::generate_from_rng(&mut rng)),
         ),
         (
             NameAlg::Sha384,
-            256,
+            EkSymmetric::Aes256Cfb,
             PrivateEk::P384(p384::SecretKey::generate_from_rng(&mut rng)),
         ),
         (
             NameAlg::Sha512,
-            256,
+            EkSymmetric::Aes256Cfb,
             PrivateEk::P521(p521::SecretKey::generate_from_rng(&mut rng)),
         ),
     ];
     let name = hex("000bf3a3a57f799498275f749e526f667c3cf4bf89fa09bebeb80b94d550486424c0");
     let other_name = hex("000b0000000000000000000000000000000000000000000000000000000000000000");
-    for (name_alg, symmetric_bits, private) in &shapes {
+    for (name_alg, symmetric, private) in &shapes {
         let key = private.public();
         let ek = EkTarget {
             name_alg: *name_alg,
-            symmetric_bits: *symmetric_bits,
+            symmetric: *symmetric,
             key: &key,
         };
         let mut credential = vec![0u8; name_alg.digest_len()];
@@ -520,23 +535,19 @@ fn a_credential_round_trips_for_every_ek_shape_irlume_supports() {
 fn credentials_irlume_cannot_make_are_refused() {
     let point = p256::SecretKey::generate_from_rng(&mut rand::rng()).public_key();
     let key = ecc_public(EccCurve::NistP256, point.to_sec1_point(false).as_bytes());
-    let ek = |symmetric_bits| EkTarget {
+    let ek = EkTarget {
         name_alg: NameAlg::Sha256,
-        symmetric_bits,
+        symmetric: EkSymmetric::Aes128Cfb,
         key: &key,
     };
     let name = [0x00, 0x0b, 1, 2, 3];
     let mut rng = rand::rng();
     assert_eq!(
-        make_credential(&ek(192), &name, &[1; 32], &mut rng),
-        Err(CredentialError::Symmetric(192))
-    );
-    assert_eq!(
-        make_credential(&ek(128), &name, &[1; 33], &mut rng),
+        make_credential(&ek, &name, &[1; 33], &mut rng),
         Err(CredentialError::CredentialLength(33))
     );
     assert_eq!(
-        make_credential(&ek(128), &[], &[1; 32], &mut rng),
+        make_credential(&ek, &[], &[1; 32], &mut rng),
         Err(CredentialError::NoName)
     );
     let off_curve = EkPublicKey::Ecc {
@@ -546,7 +557,7 @@ fn credentials_irlume_cannot_make_are_refused() {
     };
     let ek = EkTarget {
         name_alg: NameAlg::Sha256,
-        symmetric_bits: 128,
+        symmetric: EkSymmetric::Aes128Cfb,
         key: &off_curve,
     };
     assert!(matches!(

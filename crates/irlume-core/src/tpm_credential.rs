@@ -29,7 +29,7 @@ use p256::elliptic_curve::Generate;
 use rand::CryptoRng;
 use rsa::{BoxedUint, Oaep, RsaPublicKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::ek_cert::{EccCurve, EkPublicKey};
 
@@ -71,34 +71,41 @@ impl NameAlg {
         }
     }
 
-    fn hash(self, parts: &[&[u8]]) -> Vec<u8> {
-        fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
+    /// Append `H(parts)` to `out`. The digest is copied straight from its
+    /// array, which is then wiped: a KDF output is key material.
+    fn hash_into(self, parts: &[&[u8]], out: &mut Vec<u8>) {
+        fn run<D: Digest>(parts: &[&[u8]], out: &mut Vec<u8>) {
             let mut digest = D::new();
             for part in parts {
                 digest.update(part);
             }
-            digest.finalize().to_vec()
+            let mut value = digest.finalize();
+            out.extend_from_slice(&value);
+            value.zeroize();
         }
         match self {
-            Self::Sha256 => run::<Sha256>(parts),
-            Self::Sha384 => run::<Sha384>(parts),
-            Self::Sha512 => run::<Sha512>(parts),
+            Self::Sha256 => run::<Sha256>(parts, out),
+            Self::Sha384 => run::<Sha384>(parts, out),
+            Self::Sha512 => run::<Sha512>(parts, out),
         }
     }
 
-    fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-        fn run<M: Mac + KeyInit>(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    /// Append `HMAC(key, parts)` to `out`, wiping the array it came in.
+    fn hmac_into(self, key: &[u8], parts: &[&[u8]], out: &mut Vec<u8>) {
+        fn run<M: Mac + KeyInit>(key: &[u8], parts: &[&[u8]], out: &mut Vec<u8>) {
             let mut mac =
                 <M as KeyInit>::new_from_slice(key).expect("HMAC takes a key of any length");
             for part in parts {
                 mac.update(part);
             }
-            mac.finalize().into_bytes().to_vec()
+            let mut value = mac.finalize().into_bytes();
+            out.extend_from_slice(&value);
+            value.zeroize();
         }
         match self {
-            Self::Sha256 => run::<Hmac<Sha256>>(key, parts),
-            Self::Sha384 => run::<Hmac<Sha384>>(key, parts),
-            Self::Sha512 => run::<Hmac<Sha512>>(key, parts),
+            Self::Sha256 => run::<Hmac<Sha256>>(key, parts, out),
+            Self::Sha384 => run::<Hmac<Sha384>>(key, parts, out),
+            Self::Sha512 => run::<Hmac<Sha512>>(key, parts, out),
         }
     }
 }
@@ -113,14 +120,16 @@ pub(crate) fn kdfa(
     context_u: &[u8],
     context_v: &[u8],
     bits: u32,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     debug_assert_eq!(bits % 8, 0, "irlume derives whole octets only");
     let wanted = (bits / 8) as usize;
     let terminator: &[u8] = if label.last() == Some(&0) { &[] } else { &[0] };
-    let mut out = Vec::with_capacity(wanted + alg.digest_len());
+    // Room for the last block up front, so the key material is never
+    // reallocated (and the old allocation left unwiped).
+    let mut out = Zeroizing::new(Vec::with_capacity(wanted + alg.digest_len()));
     let mut counter: u32 = 1;
     while out.len() < wanted {
-        out.extend(alg.hmac(
+        alg.hmac_into(
             key,
             &[
                 &counter.to_be_bytes(),
@@ -130,7 +139,8 @@ pub(crate) fn kdfa(
                 context_v,
                 &bits.to_be_bytes(),
             ],
-        ));
+            &mut out,
+        );
         counter += 1;
     }
     out.truncate(wanted);
@@ -147,13 +157,16 @@ pub(crate) fn kdfe(
     party_u: &[u8],
     party_v: &[u8],
     bits: u32,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     debug_assert_eq!(bits % 8, 0, "irlume derives whole octets only");
     let wanted = (bits / 8) as usize;
-    let mut out = Vec::with_capacity(wanted + alg.digest_len());
+    let mut out = Zeroizing::new(Vec::with_capacity(wanted + alg.digest_len()));
     let mut counter: u32 = 1;
     while out.len() < wanted {
-        out.extend(alg.hash(&[&counter.to_be_bytes(), z, label, party_u, party_v]));
+        alg.hash_into(
+            &[&counter.to_be_bytes(), z, label, party_u, party_v],
+            &mut out,
+        );
         counter += 1;
     }
     out.truncate(wanted);
@@ -163,9 +176,6 @@ pub(crate) fn kdfe(
 /// Why a credential cannot be made for this EK.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CredentialError {
-    /// The EK's symmetric algorithm is not AES-128 or AES-256 in CFB mode.
-    #[error("the EK's symmetric key is not AES-128 or AES-256 ({0} bits)")]
-    Symmetric(u16),
     /// The credential is longer than the nameAlg's digest, which TPMs need
     /// not accept (Part 3 12.5).
     #[error("a credential longer than the EK's digest ({0} octets)")]
@@ -190,12 +200,30 @@ pub struct Credential {
     pub encrypted_secret: Vec<u8>,
 }
 
+/// The EK's `parameters.symmetric`: TPM2_ActivateCredential decrypts the
+/// credential with it, so a credential made with any other cipher or mode
+/// could not be recovered. These are the ones the storage EK templates use
+/// (Credential Profile 5.3, 5.4) and irlume implements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EkSymmetric {
+    Aes128Cfb,
+    Aes256Cfb,
+}
+
+impl EkSymmetric {
+    fn key_bits(self) -> u32 {
+        match self {
+            Self::Aes128Cfb => 128,
+            Self::Aes256Cfb => 256,
+        }
+    }
+}
+
 /// The EK a credential is made for, as its public area states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EkTarget<'a> {
     pub name_alg: NameAlg,
-    /// `parameters.symmetric.keyBits.sym`: 128 or 256 (AES, CFB).
-    pub symmetric_bits: u16,
+    pub symmetric: EkSymmetric,
     /// The public key. For ECC, `x` is used exactly as the public area holds
     /// it, as the TPM uses it in KDFe.
     pub key: &'a EkPublicKey,
@@ -240,9 +268,6 @@ fn check_protection(
     object_name: &[u8],
     credential: &[u8],
 ) -> Result<(), CredentialError> {
-    if !matches!(ek.symmetric_bits, 128 | 256) {
-        return Err(CredentialError::Symmetric(ek.symmetric_bits));
-    }
     if credential.len() > ek.name_alg.digest_len() {
         return Err(CredentialError::CredentialLength(credential.len()));
     }
@@ -255,14 +280,14 @@ fn check_protection(
 /// Steps 2 to 5: the TPMS_ID_OBJECT from the shared seed.
 fn protect(ek: &EkTarget<'_>, seed: &[u8], object_name: &[u8], credential: &[u8]) -> Vec<u8> {
     let alg = ek.name_alg;
-    let sym_key = Zeroizing::new(kdfa(
+    let sym_key = kdfa(
         alg,
         seed,
         STORAGE,
         object_name,
         &[],
-        u32::from(ek.symmetric_bits),
-    ));
+        ek.symmetric.key_bits(),
+    );
     // The whole TPM2B_DIGEST is encrypted, its size included (Part 1 21.4).
     let mut enc_identity = u16::try_from(credential.len())
         .expect("check_protection bounds the credential")
@@ -270,22 +295,21 @@ fn protect(ek: &EkTarget<'_>, seed: &[u8], object_name: &[u8], credential: &[u8]
         .to_vec();
     enc_identity.extend_from_slice(credential);
     let iv = [0u8; 16];
-    match ek.symmetric_bits {
-        128 => cfb_mode::Encryptor::<Aes128>::new_from_slices(&sym_key, &iv)
+    match ek.symmetric {
+        EkSymmetric::Aes128Cfb => cfb_mode::Encryptor::<Aes128>::new_from_slices(&sym_key, &iv)
             .expect("KDFa derived 16 octets")
             .encrypt(&mut enc_identity),
-        _ => cfb_mode::Encryptor::<Aes256>::new_from_slices(&sym_key, &iv)
+        EkSymmetric::Aes256Cfb => cfb_mode::Encryptor::<Aes256>::new_from_slices(&sym_key, &iv)
             .expect("KDFa derived 32 octets")
             .encrypt(&mut enc_identity),
     }
     let digest_bits = u32::try_from(alg.digest_len() * 8).expect("a digest's bit count fits");
-    let hmac_key = Zeroizing::new(kdfa(alg, seed, INTEGRITY, &[], &[], digest_bits));
-    let integrity = alg.hmac(&hmac_key, &[&enc_identity, object_name]);
-    let mut id_object = u16::try_from(integrity.len())
+    let hmac_key = kdfa(alg, seed, INTEGRITY, &[], &[], digest_bits);
+    let mut id_object = u16::try_from(alg.digest_len())
         .expect("a digest's size fits")
         .to_be_bytes()
         .to_vec();
-    id_object.extend(integrity);
+    alg.hmac_into(&hmac_key, &[&enc_identity, object_name], &mut id_object);
     id_object.extend(enc_identity);
     id_object
 }
@@ -348,14 +372,14 @@ fn ecc_seed(
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>), CredentialError> {
     let exchange = ecc_exchange(curve, x, y, ephemeral)?;
     let digest_bits = u32::try_from(alg.digest_len() * 8).expect("a digest's bit count fits");
-    let seed = Zeroizing::new(kdfe(
+    let seed = kdfe(
         alg,
         &exchange.z,
         IDENTITY,
         &exchange.ephemeral_x,
         x,
         digest_bits,
-    ));
+    );
     Ok((seed, exchange.secret()))
 }
 

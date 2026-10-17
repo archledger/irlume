@@ -5,7 +5,8 @@
 # sealed envelope on disk, and the systemd PCR-signature file. A panic or
 # memory error in any of those parsers is a local denial of service against a
 # root daemon, so each gets a target here. `irlume doctor`, run as root, also
-# parses the firmware event log, some of whose data comes from devices.
+# parses the firmware event log, some of whose data comes from devices, and
+# irlumed reads TPM EK certificate and chain NV indices (ek_certificate).
 #
 # This is its own workspace (the empty [workspace] table below) so the stable
 # MSRV build of the main workspace never pulls in libfuzzer-sys, which needs
@@ -82,6 +83,13 @@ bench = false
 [[bin]]
 name = "split_generation"
 path = "fuzz_targets/split_generation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ek_certificate"
+path = "fuzz_targets/ek_certificate.rs"
 test = false
 doc = false
 bench = false

@@ -56,6 +56,17 @@ Comment: IR face liveness classifier, training data undocumented by the
  publisher (disclosed in ADR-0013); distributed as a release asset from
  the irlume models-v1 release per the upstream ModelScope artifact
 
+Files: crates/irlume-core/tpm-ek-anchors/*.der
+Copyright: the certification authorities named in each certificate:
+ Advanced Micro Devices, GlobalSign, Infineon Technologies, Intel,
+ Nuvoton Technology and STMicroelectronics
+License: vendor-published-ca-certificate
+Comment: Public TPM endorsement-key CA certificates, downloaded unmodified
+ from each vendor's PKI site (crates/irlume-core/tpm-ek-anchors/manifest.json
+ names the URL of each) and embedded in irlumed to check a TPM's EK
+ certificate offline (ADR-0036). Without this stanza they fell under
+ `Files: *` above, which is not their licence.
+
 Files: ort-prebuilt/*
 Copyright: Microsoft Corporation
 License: MIT
@@ -70,6 +81,11 @@ Comment: Vendored Rust crate sources (cargo vendor) so the package builds
  offline on Launchpad builders. Each crate's own license file is included
  under its vendor/<crate>/ directory; the dependency set is permissively
  licensed (MIT/Apache-2.0 dual for the overwhelming majority).
+
+License: vendor-published-ca-certificate
+ Each certificate is published by the certification authority that issued
+ it, for anyone verifying the certificates it signs. The vendors state no
+ licence; the files are redistributed exactly as published.
 
 License: GPL-3.0+
  This program is free software: you can redistribute it and/or modify it

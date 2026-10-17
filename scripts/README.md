@@ -16,6 +16,7 @@ pages, so it must never move.
 | `build-ppa-source.sh` | Builds the Ubuntu PPA **source** package. Launchpad's builders have no network, so the orig tarball carries vendored crates and the bundled runtime. |
 | `verify-ppa-publish.py` | Waits until a PPA upload is actually installable. `dput` saying "Successfully uploaded" only means Launchpad accepted it; build and publication happen after, and fail silently. |
 | `build-tflite-runtime.sh` | Builds the bundled TFLite C runtime from a pinned TensorFlow tag. Google publishes no stable Linux C-API artifact. |
+| `update-tpm-ek-anchors.py` | Refreshes the TPM vendor CA certificates irlume ships for the `tpm-endorsement` check (ADR-0036) from the vendors' own HTTPS PKI pages, verifies every intermediate chains to a listed root, and rewrites `crates/irlume-core/tpm-ek-anchors/` and the generated `shipped.rs`; `--check` verifies offline. Run before each release. |
 | `build-tflite-runtime-container.sh` | Runs the above inside `ubuntu:22.04`, the oldest system the universal `.deb` advertises, so the glibc and libstdc++ floors hold. |
 
 ## Checks that CI runs

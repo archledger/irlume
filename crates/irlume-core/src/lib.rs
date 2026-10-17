@@ -20,6 +20,7 @@ pub mod account;
 pub mod biopolicy;
 pub mod calib;
 pub mod crypto;
+pub mod ek_cert;
 pub mod envelope;
 pub mod fusion;
 pub mod keyring;

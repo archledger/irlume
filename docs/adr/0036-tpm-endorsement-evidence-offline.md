@@ -340,6 +340,53 @@ check.
 - **Phase 3:** the `tpm-endorsement` doctor check, its MACHINE-API row, the
   TUI readout through the shared doctor code, and the documentation.
 
+## Amendment 2026-10-17: Phase 1 verifier details
+
+Phase 1 (`crates/irlume-core/src/ek_cert.rs`, the anchors in
+`crates/irlume-core/tpm-ek-anchors/`) settles points sections 2.3, 5 and 6
+left open:
+
+- **Names.** An issuer is found by comparing names as RFC 5280 7.1 does:
+  each RDN's attributes in any order, and directory strings as text after
+  case folding and insignificant space handling (RFC 4518, without its
+  Unicode normalization). ST's ECC Intermediate CA 02 names its issuer in
+  UTF8String where that issuer's own subject is PrintableString; an exact
+  comparison missed the link. A matching name only nominates an issuer: its
+  key must still verify the signature.
+- **When a failing signature is evidence.** A signature that does not verify
+  reads `warn` only when the child's authority key identifier equals the
+  issuer's subject key identifier, so the certificate names the very key that
+  failed. Without both identifiers, a same-named CA with another key (a
+  re-keyed CA irlume does not list) is not the issuer, and the path reads
+  `unknown`.
+- **Roots** are trust anchors by name and key: their own extensions are not
+  processed (RFC 5280 6.1.1), and a root's self-signature is never relied on.
+  A CA that is not self-signed is an intermediate, also when its vendor calls
+  it a root (ST's `STM TPM EK Root CA` under GlobalSign's root).
+- **Algorithms.** RSA moduli of 2048 to 4096 bits; ECDSA on P-521 needs at
+  least SHA-384, since a shorter hash cannot fill half the order. The EK
+  certificate's own key may be named rsaEncryption or id-RSAES-OAEP (older EK
+  certificates use the latter).
+- **Extensions.** Basic Constraints, Key Usage, Extended Key Usage, Subject
+  Alternative Name, the key identifiers and Certificate Policies are
+  processed, the last with the initial policy set anyPolicy and no explicit
+  policy; name constraints, policy constraints, policy mappings and
+  inhibitAnyPolicy read `unknown` even when not critical. A processed
+  extension that does not parse, or any extension that appears twice, reads
+  `unknown`.
+- **Bounds**, since the chain indices are untrusted: at most 64 certificates
+  from them, 6 CAs between the EK certificate and a root, 32 complete paths
+  and 2048 candidate issuers tried per EK certificate.
+- **The anchors**: 279 certificates (31 roots), all over HTTPS from the
+  vendors' sites, with Infineon's OPTIGA Trust M CAs (not a TPM), Intel's
+  pre-production ICL-N intermediate, the TPM 1.2 era SHA-1 chains and AMD's
+  Pluton chains left out; the last have no vendor source for AMD Root CA R4
+  or the factory intermediates.
+- **Crates**: `rsa` is pinned at `=0.10.0-rc.19`, the release candidate on
+  the der 0.8 and digest 0.11 generation irlume already uses; 0.9 would
+  duplicate the previous generation. The RUSTSEC-2023-0071 ignore is tracked
+  in #1112.
+
 ## Acceptance tests
 
 - The verifier accepts a generated chain (root, intermediate, EK certificate)

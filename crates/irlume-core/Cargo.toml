@@ -21,9 +21,15 @@ zeroize.workspace = true
 thiserror.workspace = true
 tss-esapi.workspace = true
 base64.workspace = true
-sha2.workspace = true
+# `oid` names the digest for RSA PKCS#1 v1.5 verification (ek_cert).
+sha2 = { workspace = true, features = ["oid"] }
 der.workspace = true
 spki.workspace = true
+x509-cert.workspace = true
+rsa.workspace = true
+p256.workspace = true
+p384.workspace = true
+p521.workspace = true
 aes-gcm.workspace = true
 argon2.workspace = true
 pbkdf2.workspace = true

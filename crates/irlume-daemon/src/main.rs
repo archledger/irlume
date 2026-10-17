@@ -6222,7 +6222,8 @@ fn tpm_readiness_report() -> Response {
             pcr_bank: Err(none.clone()),
             storage_key: Err(none.clone()),
             lockout: Err(none.clone()),
-            da_exempt_key: Err(none),
+            da_exempt_key: Err(none.clone()),
+            storage_keys: Err(none),
         };
     }
     let text = |e: irlume_common::Error| e.to_string();
@@ -6232,6 +6233,7 @@ fn tpm_readiness_report() -> Response {
         storage_key: irlume_core::tpm::storage_key_check().map_err(text),
         lockout: irlume_core::tpm::lockout_state().map_err(text),
         da_exempt_key: irlume_core::storage_key::report().map_err(text),
+        storage_keys: irlume_core::storage_key::storage_keys().map_err(text),
     }
 }
 
@@ -14223,6 +14225,7 @@ mod tests {
                 storage_key,
                 lockout,
                 da_exempt_key,
+                storage_keys,
             } = tpm_readiness_report()
             else {
                 panic!("a TpmReadiness reply");
@@ -14232,6 +14235,7 @@ mod tests {
             assert_eq!(storage_key, Err("no TPM device".into()));
             assert_eq!(lockout, Err("no TPM device".into()));
             assert_eq!(da_exempt_key, Err("no TPM device".into()));
+            assert_eq!(storage_keys, Err("no TPM device".into()));
         }
     }
 

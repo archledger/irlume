@@ -87,6 +87,12 @@ pub(crate) struct Record {
     /// never evicts one: no derivation gives it now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     superseded: Vec<Persisted>,
+    /// For each superseded key (by TPM name in hex), the boot of the start
+    /// whose census first found no envelope naming it, with none found since
+    /// (as condition 1 keeps for the original key): doctor names the manual
+    /// command for a weak superseded key only once this names another boot.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    superseded_unused: std::collections::BTreeMap<String, String>,
     /// The firmware version (`TPM_PT_FIRMWARE_VERSION_1` and `_2`) on which
     /// today's derivation of the DA-exempt template was weak too: no start
     /// derives for the weak key again until the TPM reads another version.
@@ -501,6 +507,11 @@ pub fn report() -> Result<DaExemptKey> {
         }),
         on_original_key: Some(on_original_key()?),
         original_key: Some(original_key),
+        derivation_weak: record.weak_derivation.is_some(),
+        replacement_refused: record.replacement_refused.map(|refused| KeyRefusal {
+            reason: refused.reason,
+            detail: irlume_common::single_line(&refused.detail, MAX_DETAIL_CHARS),
+        }),
     })
 }
 
@@ -662,6 +673,7 @@ fn ensure_keeping_use(
     // A key persisted again keeps the weak key it superseded, and today's
     // derivation is the one the recorded firmware gave.
     next.superseded.clone_from(&record.superseded);
+    next.superseded_unused.clone_from(&record.superseded_unused);
     next.weak_derivation.clone_from(&record.weak_derivation);
     if matches!(outcome, Outcome::Present { .. } | Outcome::Found { .. }) {
         next.replacement_refused
@@ -888,6 +900,7 @@ pub(crate) fn settle_in<T: KeyTpm>(
     let record = load_record();
     let in_use = any_under_original_key()?;
     let (mut next, census) = mark_with(&record, in_use, boot);
+    mark_superseded(&mut next, boot)?;
     if next != record {
         save(&next)?;
     }
@@ -1047,6 +1060,158 @@ fn failed_retirement(
     }
     let _ = save(next);
     Retirement::Failed { handle, detail }
+}
+
+/// The census of the superseded keys' use in `next`, in boot `boot`, as
+/// condition 1 keeps it for the original key: a key some envelope names, or
+/// may name (one that cannot be read), has its mark cleared; one none names
+/// is marked with this boot unless it is marked already. A boot ID that
+/// cannot be read marks nothing. Marks for keys no longer kept go.
+fn mark_superseded(next: &mut Record, boot: Option<&str>) -> Result<()> {
+    bound_superseded(&mut next.superseded);
+    let kept: Vec<String> = next
+        .superseded
+        .iter()
+        .map(|kept| kept.name.clone())
+        .collect();
+    next.superseded_unused.retain(|name, _| kept.contains(name));
+    for name in kept {
+        let (named, unreadable) = envelopes_naming(&name)?;
+        if named.total > 0 || unreadable {
+            next.superseded_unused.remove(&name);
+        } else if let Some(boot) = boot {
+            next.superseded_unused
+                .entry(name)
+                .or_insert_with(|| boot.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// The envelopes (sealed template keys and keyring secrets) that record the
+/// key with TPM name `name` (hex) as their parent, named as
+/// [`on_original_key`] names them, and whether some envelope cannot be read,
+/// which may name it.
+fn envelopes_naming(name: &str) -> Result<(OriginalKeyEnvelopes, bool)> {
+    let mut named = Vec::new();
+    let mut total = 0u32;
+    let mut unreadable = false;
+    for (dir, kind) in [
+        (template_key::key_dir(), EnvelopeKind::TemplateKey),
+        (keyring::keyring_dir(), EnvelopeKind::KeyringSecret),
+    ] {
+        for path in envelope_paths(&dir)? {
+            let parent = match crate::envelope::SealedEnvelope::load(&path) {
+                Ok(envelope) => envelope.parent,
+                Err(_) => {
+                    unreadable = true;
+                    continue;
+                }
+            };
+            if parent.is_none_or(|parent| parent.name != name) {
+                continue;
+            }
+            total = total.saturating_add(1);
+            let user = path.file_stem().and_then(|stem| stem.to_str());
+            if let Some(user) = user.filter(|user| is_account_name(user)) {
+                named.push(OriginalKeyEnvelope {
+                    user: user.to_owned(),
+                    kind,
+                });
+            }
+        }
+    }
+    named.sort();
+    named.truncate(MAX_NAMED_ENVELOPES);
+    Ok((OriginalKeyEnvelopes { named, total }, unreadable))
+}
+
+/// Every storage key irlume knows of, for doctor's `tpm-firmware` check
+/// (ADR-0034, Phase 3 amendment, #1073 item 2): the original key at its
+/// handle, the recorded DA-exempt key, and each key it superseded, each
+/// checked for the ROCA fingerprint, with the envelopes that still name the
+/// DA-exempt and superseded keys. A weak DA-exempt key is compared with
+/// today's derivation of its template; a superseded one is not, since no
+/// derivation gives it now. The record is untrusted where it is writable
+/// offline (§5): only bounded hex names and accepted account names go out.
+///
+/// # Errors
+///
+/// When an envelope directory cannot be read, or the TPM cannot be opened
+/// or read.
+pub fn storage_keys() -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>> {
+    use irlume_common::tpm_readiness::{StorageKeyCheck, StorageKeyEntry, StorageKeyRole};
+    let mut record = load_record();
+    bound_superseded(&mut record.superseded);
+    let boot = irlume_common::boot_id();
+    let bounded = |name: &str| {
+        if name.len() <= MAX_NAME_HEX && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            name.to_owned()
+        } else {
+            String::new()
+        }
+    };
+    let mut entries = Vec::new();
+    let original = tpm::persistent_srk_raw();
+    let mut names = tpm::DaExemptKeyTpm::open()?;
+    let original_name = names
+        .name_at(original)?
+        .map(|name| hex(&name))
+        .unwrap_or_default();
+    entries.push(StorageKeyEntry {
+        role: StorageKeyRole::Original,
+        handle: original,
+        name: original_name,
+        check: tpm::storage_key_check()?,
+        envelopes: None,
+        unused_across_boots: false,
+    });
+    drop(names);
+    let keyed = |role, handle, name: &str, compare| -> Result<StorageKeyEntry> {
+        let check = match unhex(name) {
+            Some(raw) => tpm::da_exempt_key_check(handle, &raw, compare)?,
+            None => StorageKeyCheck::Absent,
+        };
+        let (envelopes, _) = envelopes_naming(name)?;
+        let unused_across_boots = role == StorageKeyRole::Superseded
+            && envelopes.total == 0
+            && matches!(
+                (record.superseded_unused.get(name), boot.as_deref()),
+                (Some(since), Some(now)) if since != now
+            );
+        Ok(StorageKeyEntry {
+            role,
+            handle,
+            name: bounded(name),
+            check,
+            envelopes: Some(envelopes),
+            unused_across_boots,
+        })
+    };
+    if let Some(persisted) = &record.persisted {
+        entries.push(keyed(
+            StorageKeyRole::DaExempt,
+            persisted.handle,
+            &persisted.name,
+            true,
+        )?);
+    }
+    let recorded = record
+        .persisted
+        .as_ref()
+        .map(|persisted| persisted.name.clone());
+    for kept in &record.superseded {
+        if recorded.as_deref() == Some(kept.name.as_str()) {
+            continue;
+        }
+        entries.push(keyed(
+            StorageKeyRole::Superseded,
+            kept.handle,
+            &kept.name,
+            false,
+        )?);
+    }
+    Ok(entries)
 }
 
 /// The record after a census that found an envelope under the original key
@@ -4212,6 +4377,67 @@ mod tests {
         drop(sandbox);
         assert!(step.is_ok(), "{step:?}");
         assert_eq!(kept.replacement_refused, None);
+    }
+
+    /// The census of a superseded key's use, as condition 1 keeps it for the
+    /// original key: an envelope naming it, or one that cannot be read,
+    /// clears the mark; none marks the boot, keeping an earlier mark; an
+    /// unreadable boot marks nothing; a key no longer kept loses its mark.
+    #[test]
+    fn a_superseded_key_is_marked_unused_when_no_envelope_names_it() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-superseded-marks");
+        let weak = Persisted {
+            handle: 0x8101_0004,
+            name: hex(b"weak"),
+        };
+        let record = Record {
+            superseded: vec![weak.clone()],
+            ..persisted_record(0x8101_0003, b"ours")
+        };
+        let mark = |record: &Record, boot: Option<&str>| {
+            let mut next = record.clone();
+            mark_superseded(&mut next, boot).expect("the census");
+            next.superseded_unused
+        };
+        let mut under_weak = envelope(true);
+        if let Some(parent) = under_weak.parent.as_mut() {
+            parent.name = hex(b"weak");
+        }
+        let alice = template_key::key_path("alice");
+
+        under_weak.save(&alice).unwrap();
+        let named = mark(&record, Some(BOOT));
+        envelope(true).save(&alice).unwrap();
+        let none = mark(&record, Some(BOOT));
+        let marked = Record {
+            superseded_unused: none.clone(),
+            ..record.clone()
+        };
+        let kept = mark(&marked, Some(LATER_BOOT));
+        let no_boot = mark(&record, None);
+        std::fs::write(keyring::envelope_path("bob"), b"not an envelope").unwrap();
+        let unreadable = mark(&marked, Some(LATER_BOOT));
+        let dropped = mark(
+            &Record {
+                superseded: Vec::new(),
+                ..marked.clone()
+            },
+            Some(LATER_BOOT),
+        );
+        drop(sandbox);
+
+        assert!(named.is_empty(), "an envelope still names it");
+        assert_eq!(none.get(&weak.name).map(String::as_str), Some(BOOT));
+        assert_eq!(kept, none, "an earlier mark is kept");
+        assert!(no_boot.is_empty(), "an unreadable boot marks nothing");
+        assert!(
+            unreadable.is_empty(),
+            "an envelope that cannot be read may name it"
+        );
+        assert!(dropped.is_empty(), "a key no longer kept loses its mark");
     }
 
     /// ADR-0034, Phase 3 amendment (#1073 item 2), over a fake TPM: a weak

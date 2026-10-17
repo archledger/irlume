@@ -174,6 +174,12 @@ fn da_exempt_key_not_reported() -> std::result::Result<tpm_readiness::DaExemptKe
     Err(tpm_readiness::DA_EXEMPT_KEY_NOT_REPORTED.to_owned())
 }
 
+/// The `storage_keys` part of a `TpmReadiness` reply from a daemon that
+/// predates it.
+fn storage_keys_not_reported() -> std::result::Result<Vec<tpm_readiness::StorageKeyEntry>, String> {
+    Err(tpm_readiness::STORAGE_KEYS_NOT_REPORTED.to_owned())
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2220,6 +2226,11 @@ pub enum Response {
         /// before the field sends none, which reads as the reason it predates.
         #[serde(default = "da_exempt_key_not_reported")]
         da_exempt_key: std::result::Result<tpm_readiness::DaExemptKey, String>,
+        /// Every storage key irlume knows of, each checked for the ROCA
+        /// fingerprint (ADR-0034, Phase 3 amendment). A daemon from before
+        /// the field sends none, which reads as the reason it predates.
+        #[serde(default = "storage_keys_not_reported")]
+        storage_keys: std::result::Result<Vec<tpm_readiness::StorageKeyEntry>, String>,
     },
     /// The sealed password was erased (`ForgetPassword`).
     PasswordForgotten,
@@ -2948,7 +2959,14 @@ mod tests {
             }},
             "da_exempt_key": {"Ok": {
                 "refused": {"reason": "no_space", "detail": "insufficient space for NV allocation"}
-            }}
+            }},
+            "storage_keys": {"Ok": [
+                {"role": "da_exempt", "handle": 2164326403_u32, "name": "000b11",
+                 "check": {"RocaFingerprint": {"handle": 2164326403_u32, "derived": "Same"}},
+                 "envelopes": {"named": [], "total": 0}},
+                {"role": "superseded", "handle": 2164326404_u32, "name": "000b00",
+                 "check": "Clean", "unused_across_boots": true}
+            ]}
         }});
         let parsed = serde_json::from_value::<Response>(reply.clone()).expect("the reply decodes");
         assert_eq!(serde_json::to_value(&parsed).unwrap(), reply);
@@ -2958,6 +2976,7 @@ mod tests {
             storage_key,
             lockout,
             da_exempt_key,
+            storage_keys,
         } = parsed
         else {
             panic!("a TpmReadiness reply");
@@ -2973,6 +2992,9 @@ mod tests {
         assert_eq!((lockout.failed_tries, lockout.max_tries), (3, 32));
         let key = da_exempt_key.expect("the DA-exempt key state");
         assert_eq!(key.handle, None);
+        let keys = storage_keys.expect("the per-key report");
+        assert_eq!(keys[0].role, tpm_readiness::StorageKeyRole::DaExempt);
+        assert!(keys[1].unused_across_boots);
         assert_eq!(
             key.refused.map(|refused| refused.reason),
             Some(tpm_readiness::RefusalReason::NoSpace)
@@ -3065,6 +3087,7 @@ mod tests {
         let Response::TpmReadiness {
             lockout,
             da_exempt_key,
+            storage_keys,
             ..
         } = serde_json::from_value::<Response>(older).expect("an older reply decodes")
         else {
@@ -3072,6 +3095,7 @@ mod tests {
         };
         assert!(lockout.unwrap_err().contains("predates"));
         assert!(da_exempt_key.unwrap_err().contains("predates"));
+        assert!(storage_keys.unwrap_err().contains("predates"));
     }
 
     #[test]

@@ -1,0 +1,272 @@
+# ADR-0036: Genuine-TPM evidence in doctor, offline
+
+## Status
+
+Proposed 2026-10-17. Adds a doctor check that says whether the TPM irlume
+seals to is a genuine one from a known manufacturer, from the TPM's
+endorsement key (EK) certificate. The maintainer decided on 2026-10-17 that:
+- the check works offline only and never contacts a vendor;
+- its trust anchors are vendor root and intermediate CA certificates that
+  irlume curates from the vendors' own PKI pages, each pinned by SHA-256,
+  refreshed by a script and reviewed in pull requests;
+- a chain irlume cannot complete reads as unknown, never as "not genuine";
+- the vendors' unstated redistribution terms for public CA certificates are
+  accepted.
+
+Item 7 of the 2026-10-14 TPM survey. Depends on ADR-0034 (irlume's storage
+key) and ADR-0008 (share-safe support reports).
+
+## Context
+
+### Why
+
+irlume seals the template key and keyring secrets to the TPM (ADR-0025,
+ADR-0034). Nothing checks today that the TPM irlumed talks to is a real one:
+a software TPM left configured (`IRLUME_TCTI` pointing at swtpm after a test),
+a device swapped on the bus, or a misconfigured transport would seal to
+something that is not a hardware TPM, and doctor would not say so. Windows
+uses the EK certificate for exactly this: "Solutions can use the certificate
+with the TPM containing the endorsement key to confirm a scenario really
+involves a TPM from a specific TPM manufacturer (instead of malware acting
+like a TPM)" (Microsoft Learn, "How Windows uses the TPM").
+
+### Where the certificate is, when there is one
+
+From the TCG EK Credential Profile 2.7 (2026-03-16), the PC Client Platform
+TPM Profile 1.05 r14 and the TPM 2.0 Library v185:
+
+- A certificate is optional: "the TPM might not be provisioned with all the
+  credentials because of NV space restrictions; the credentials could be
+  stored off the TPM" (Credential Profile 2.2), and the PTP "does not require
+  pre-provisioned certificates" (4.5.2).
+- When stored, it is in an NV index: the legacy low range (0x01C00002 for
+  RSA 2048, 0x01C0000A for ECC P-256, with templates at 0x01C00004 and
+  0x01C0000C) or the high range from 0x01C00012, where each even index holds
+  a certificate and the next odd index may hold its template. An optional
+  chain may sit at 0x01C00100 to 0x01C001FF, but "The Root CA certificate
+  MUST NOT be contained in NV". An index may carry bytes after the DER
+  certificate, and some TPMs prefix it with a `0x10 0x01 0x00` length header
+  (go-attestation `ParseEKCertificate`).
+- The certificate matches the EK when the EK's public key, recreated from its
+  template, equals the certificate's (Credential Profile 2.2.2.8).
+- "The root certificate should not be retrieved from a URL in the AIA
+  extension as this is a possible attack vector. Instead, the root
+  certificate should be provisioned in a trusted root store out of band or
+  from a trusted source" (3.2).
+
+### What the TPMs irlume meets carry
+
+- **Discrete TPMs** (Infineon, STMicroelectronics, Nuvoton) normally store a
+  certificate, issued by a per-product or per-firmware intermediate CA under a
+  long-lived vendor root (2030 to 2099). Intermediates are not in the TPM and
+  keep appearing: Microsoft's TrustedTpm.cab lists about 150 for Infineon
+  alone, and added six on 2026-04-15.
+- **Intel PTT** before Tiger Lake usually has no certificate in NV; Intel
+  serves it from `ekop.intel.com` keyed by a hash of the EK. From Tiger Lake
+  (CSME 15) Intel's On-Die CA issues the PTT EK certificate "without a need to
+  connect to the Intel server over the internet" (Intel CSME Security White
+  Paper 1.5, 5.3).
+- **AMD fTPM** usually has none in NV; AMD serves it from `ftpm.amd.com`.
+  Its two `AMDTPM` roots are not in Microsoft's bundle.
+- **swtpm** can create an EK certificate signed by a local CA
+  (`swtpm_setup --create-ek-cert`, `swtpm_localca`), so a certificate being
+  present proves nothing; only a chain to a known vendor root does.
+
+### What other tools do
+
+No Linux tool verifies the chain completely: tpm2-tools and go-attestation
+retrieve certificates only, systemd v262 checks that the EK matches its
+certificate but carries no roots, and keylime checks one issuer level against
+a store last changed in 2023. Microsoft's TrustedTpm.cab is the broadest
+anchor list (122 dated updates since 2017) but states no licence.
+
+### Linking the storage key to that TPM
+
+TPM2_MakeCredential needs no TPM secret and can run in software; the TPM
+returns its secret through TPM2_ActivateCredential only "if the public area
+is a valid object on the same TPM as the EK" (Part 1, 21.2). A key with
+`fixedTPM` cannot be placed into another TPM: TPM2_LoadExternal requires
+`fixedTPM` CLEAR when a private area is given, and TPM2_Import refuses it
+(Part 3, 12.3 and 13.3). So a software MakeCredential to the certified EK,
+bound to the Name of irlume's storage key, followed by an ActivateCredential
+the TPM completes, shows that a TPM holding that EK also holds that key.
+
+### What the check cannot claim
+
+A verdict computed on the machine is only as trustworthy as the program that
+computes it and its trust store: RFC 9334 (7.1) assumes "the Verifier has not
+been compromised", and Microsoft notes that "someone can easily spoof a
+software KSP as a TPM KSP with local administrator credentials" ("TPM Key
+Attestation"). The check catches a misconfiguration, a swapped or emulated
+device, or a non-root tampering; it does not protect against a live root
+process, which docs/SECURITY_AT_REST.md already names as the trust boundary.
+
+### Privacy
+
+"Because an Endorsement Key is unique to a TPM and usually has a long
+lifetime, it could be used to identify a user or a platform" (Credential
+Profile 2.3). Fetching a certificate from Intel or AMD sends a hash of the EK,
+a permanent device identifier, to the vendor with the client's address.
+
+## Decision
+
+### 1. A `tpm-endorsement` doctor check
+
+doctor gains a public check, `tpm-endorsement`, in the same doctor code the
+TUI's diagnostics and `irlume doctor --json` run (CLI and TUI parity). The CLI
+never opens the TPM: irlumed answers a new root-only request (section 4).
+
+| State | When |
+|---|---|
+| `pass` | A stored EK certificate matches the TPM's EK, its chain verifies to a pinned vendor root, and irlume's storage key is in the same TPM. The detail names the manufacturer, model and firmware version (the certificate's subject alternative name, as `tpm-firmware` already reports them from the TPM's properties) and the root CA. |
+| `info` | No EK certificate is stored (common on Intel PTT before Tiger Lake and on AMD fTPM; doctor says irlume does not fetch one); the certificate's issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), which does not mean the TPM is not genuine; or the chain is signed with an algorithm irlume does not accept, such as SHA-1, so it cannot be verified. |
+| `warn` | A stored certificate does not match the TPM's EK; a signature or a CA constraint in its chain to a pinned root fails; or the same-TPM test fails, so irlume's storage key is not in the TPM the certificate names. Each points at a swapped device, an emulator or a wrong `IRLUME_TCTI`. |
+| `unknown` | irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); or the TPM could not be read in the time allowed. |
+
+The check never reports `fail`: it judges evidence, and irlume works on a TPM
+it cannot vouch for.
+
+### 2. What irlumed reads and checks
+
+1. The EK certificate indices: every index in 0x01C00000 to 0x01C07FFF that
+   holds a certificate, read as DER with trailing bytes and the
+   `0x10 0x01 0x00` header tolerated. Nothing else in NV is read.
+2. The EK for each certificate: the persistent EK at 0x81010001 when its
+   public key matches (TCG provisioning guidance; systemd v262 persists one
+   there), otherwise one derived transiently from the template in the next
+   odd index, or the default low-range template (L-1, L-2). The certificate
+   is used only when its public key equals the EK's.
+3. The chain, in software: the EK certificate, then intermediates from the
+   NV chain indices and from irlume's list (section 5), up to a pinned root.
+   Each signature verifies, and each CA has `CA:TRUE` with its path length
+   and `keyCertSign`. Validity periods are reported, not enforced: EK and
+   intermediate certificates of genuine TPMs expire while the TPM stays in
+   use (a typical PC Client validity is 5 to 10 years, Credential Profile
+   2.2.3, and one Infineon intermediate expired on 2025-10-20), so a `pass`
+   names an end date that has passed. Revocation is not checked: CRLs and
+   OCSP need the network.
+4. The same-TPM test: a software TPM2_MakeCredential to the EK's public key
+   with the Name of the storage key new seals go under (ADR-0034's recorded
+   DA-exempt key, or the original key before it persists), then
+   TPM2_ActivateCredential with that key as `activateHandle` and the EK as
+   `keyHandle`, under the EK's policy (PolicySecret on the endorsement
+   hierarchy for the low-range templates, the high-range PolicyB otherwise).
+   It passes when the TPM returns the secret.
+
+irlumed computes the answer at most once per boot for a given storage key
+Name and keeps it in memory, since the EK and its certificate do not change
+within a boot.
+
+### 3. The endorsement hierarchy
+
+The test needs the endorsement hierarchy's authorization, which is empty on
+almost every Linux machine. irlumed reads `endorsementAuthSet` from
+`TPM_PT_PERMANENT` and `ehEnable` from `TPM_PT_STARTUP_CLEAR` first. When the
+authorization is set or the hierarchy is disabled, it tries nothing and the
+check is `unknown` with that reason: irlume never guesses an authorization.
+
+### 4. A request of its own
+
+The answer travels in a new root-only request, `TpmEndorsement`, with its own
+client budget of 60 seconds, not in `TpmReadiness`: deriving an EK can take
+more than 10 seconds on a slow firmware TPM, and `TpmReadiness` already stays
+within its 30-second budget only by deriving at most once (#1105). The request
+is additive on the wire, gets explicit posture table arms, and an older
+irlumed's refusal reads as "irlumed predates the endorsement check"
+(`unknown`).
+
+### 5. The trust anchors
+
+- irlume ships the vendor CA certificates it trusts in
+  `crates/irlume-core/tpm-ek-anchors/`: one DER file per root or intermediate
+  CA, grouped by vendor, with a manifest that lists for each its subject, its
+  role (root or intermediate), its validity, its SHA-256, the vendor URL it
+  was downloaded from and the date. irlumed embeds them at build time; nothing
+  is read from disk at run time.
+- Sources are the vendors' own pages: Infineon (`pki.infineon.com`),
+  STMicroelectronics and GlobalSign (`secure.globalsign.com`,
+  `sw-center.st.com`), Nuvoton (`www.nuvoton.com/security/NTC-TPM-EK-Cert/`),
+  Intel (`upgrades.intel.com` for the legacy PTT root, `tsci.intel.com` for the
+  On-Die CA) and AMD (`ftpm.amd.com/pki/aia/`). Other manufacturers are added
+  when a primary source for them is found.
+- `scripts/update-tpm-ek-anchors.py` downloads the listed URLs, checks that
+  every intermediate chains to a listed root and that each file's SHA-256 is
+  what the manifest records, and rewrites the directory and manifest. A
+  refresh is a reviewed pull request; one before each release is the target.
+  A stale list makes a new intermediate read `info` (issuer not in irlume's
+  list), never `warn`.
+- A root or intermediate that expires stays listed, since the TPMs it
+  certified stay in use (section 2.3).
+
+### 6. The verification code
+
+Parsing uses `x509-cert`, on the `der` and `spki` crates irlume-core already
+depends on. Signatures are verified with `ring` (RSA PKCS#1 v1.5 and PSS with
+SHA-256, SHA-384 and SHA-512; ECDSA P-256 and P-384), already in irlume's
+lockfile as a build dependency, and `p521` (Nuvoton's 2023 ECC P-521 root).
+The `rsa` crate is not used: its RUSTSEC-2023-0071 is unpatched, and although
+irlume would only verify, a dependency on it would need an advisory ignore. A
+chain signed with SHA-1, or with an algorithm outside this list, cannot be
+verified and reads `info` with the algorithm named, unless another path to a
+pinned root verifies.
+
+### 7. Privacy
+
+- Nothing leaves the machine: no vendor fetch, no AIA, CRL or OCSP request,
+  ever.
+- doctor's text, `--json` and support reports (ADR-0008) never carry the EK
+  public key, its hash, the certificate serial or a fingerprint of the EK
+  certificate. They carry the manufacturer, model and firmware version, the
+  names of the CAs in the chain, and the result.
+
+### 8. When to revisit
+
+Revisit if TCG or Microsoft publishes a signed, licensed anchor set usable on
+Linux (it would replace section 5's curation), if the maintainer wants an
+opt-in vendor fetch for firmware TPMs (declined on 2026-10-17), or if irlume
+gains a remote verifier, which would make the evidence stronger than a local
+check.
+
+## Consequences
+
+- doctor reports, on most discrete TPMs and recent Intel PTT, which
+  manufacturer's TPM irlume seals to, and flags an emulator or a swapped
+  device that claims a certificate it cannot back.
+- On Intel PTT before Tiger Lake and on AMD fTPM the check usually reads
+  `info` (no certificate stored), since irlume does not fetch one.
+- irlume carries and refreshes a few hundred vendor CA certificates (about
+  half a megabyte), and gains `x509-cert`, `ring` and `p521` as normal
+  dependencies of irlume-core.
+- The wire gains one root-only request.
+
+## Phasing
+
+- **Phase 1:** the anchors directory, its manifest and update script, and the
+  software chain verifier (sections 5 and 6), unit-tested on generated test
+  chains and on the shipped anchors' own consistency.
+- **Phase 2:** irlumed's `TpmEndorsement` request (sections 2 to 4), with
+  swtpm tests.
+- **Phase 3:** the `tpm-endorsement` doctor check, its MACHINE-API row, the
+  TUI readout through the shared doctor code, and the documentation.
+
+## Acceptance tests
+
+- The verifier accepts a generated chain (root, intermediate, EK certificate)
+  with RSA and ECDSA signatures, also when a certificate in it has expired
+  (the end date reported), and refuses one with a broken signature, a CA
+  without `CA:TRUE` or `keyCertSign`, or a path length exceeded; a SHA-1
+  signature and a chain that ends at a root not in the list read as
+  unverifiable, not as failed.
+- Every shipped intermediate chains to a shipped root, and every file's
+  SHA-256 matches the manifest.
+- The NV reader tolerates trailing bytes and the `0x10 0x01 0x00` header, and
+  refuses a certificate whose public key differs from the EK's.
+- On swtpm, with an EK certificate from `swtpm_setup --create-ek-cert`: the
+  check reads `info` (issuer not in irlume's list) with the shipped anchors;
+  with the test CA added as an anchor in the test only, it reads `pass` and
+  the same-TPM test succeeds against irlume's storage key; with a storage key
+  that is not in that TPM, the same-TPM test fails; with the endorsement
+  authorization set, nothing is tried and the check reads `unknown`.
+- No doctor text, `--json` field or support report contains the EK public
+  key, its hash, the certificate serial or its fingerprint.
+- irlume makes no network request in any of these paths.

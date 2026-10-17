@@ -77,7 +77,13 @@ summary lives on the [README](../README.md); this is the detail.
   the burst itself shows the emitter alternating (ADR-0031 §4, amendments
   2026-10-13 and 2026-10-14). Such a camera reports no per-frame
   illumination, so that burst's alternation also marks its lit frames, and
-  other programs with access to the camera can disturb that inference. Every
+  other programs with access to the camera can disturb that inference. The
+  packaged `72-irlume-ir-nodes.rules` closes that window for these cameras
+  by keeping their nodes to root alone (applies at the next plug or boot;
+  a descriptor opened before it applies stays usable, so a trigger is not
+  enough); on a node that reads closed, and only then, the proof no longer needs the
+  opt-in's confinement, and `irlume doctor` reports the node's state
+  (ADR-0031 §4, amendment 2026-10-17, #1069). Every
   other YUYV burst refuses the same way as NV12. The emitter counts as active
   when `irlume ir-setup` saved its control or the camera's own
   face-authentication control reads its default alternating mode; neither

@@ -549,7 +549,15 @@ installs and loads by hand.
 ## Camera use by local accounts
 
 Linux grants the camera devices only to the user of the active local session
-on a seat: udev's `uaccess` rule, applied by logind. irlumed opens the camera
+on a seat: udev's `uaccess` rule, applied by logind. One exception is shipped
+by design (#1069): the descriptor-attested YUYV IR cameras without per-frame
+illumination records (`NO_RECORDS_YUYV_IR`, today the ThinkPad T480's IR
+module) lose the `uaccess` tag via the packaged `72-irlume-ir-nodes.rules`,
+so their nodes stay with root alone (0600) and no non-root program can
+reach the emitter control between irlumed's reads around a burst (the burst
+proof of ADR-0031 §4 needs that; the capture path re-reads the node's real
+state per burst, so a node whose stale ACL outlives the rule's install keeps
+today's confinement until the node is actually closed). irlumed opens the camera
 as root on its clients' behalf, so it applies the same rule itself. A request
 that turns a camera on (streams frames from it or lights its IR emitter) from
 a non-root peer is served only while the peer's uid is the active user of a

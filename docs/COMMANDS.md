@@ -116,7 +116,11 @@ an authorized, selected split pair can enroll (`irlume enroll
 evidence stays sequential and grants only on an IR identity match. A YUYV-only
 IR side, such as the T480's, releases credentials only on a burst that earns
 its clipping ceiling (ADR-0031 section 4, amendment 2026-10-13); other bursts
-refuse as IR exposure unmeasurable.
+refuse as IR exposure unmeasurable. On a host whose package carried
+`72-irlume-ir-nodes.rules`, such a camera's IR node is closed to the seat
+user at the next plug or boot, which completes the burst proof without the
+opt-in's residual (ADR-0031, amendment 2026-10-17); `irlume doctor` reports
+the node's state as `ir-node-access`.
 
 Like a Windows Hello sensor group, a split pair uses built-in cameras: both
 sides must report `removable: fixed`, or the choice refuses with `split camera

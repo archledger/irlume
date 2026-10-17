@@ -366,6 +366,15 @@ left open:
   bounds ahead of a listed path.
 - **The EK certificate's Extended Key Usage**, when present, must also be
   non-critical, as the profile requires (3.2.16); a critical one is refused.
+- **Profile checks are about purpose, not encoding.** Section 2.3's checks,
+  and the EKU's criticality, decide whether a certificate is an EK
+  certificate for this TPM; a failure is `warn`, which points at a swapped
+  device or an emulator. Deviations the vendor's signature still covers and
+  that do not change what the certificate certifies are accepted: a TPM
+  attribute in PrintableString or IA5String rather than UTF8String, a missing
+  or critical authority key identifier (which then only stops tying a failing
+  signature to a key), rsaEncryption parameters absent rather than NULL.
+  Parameters other than NULL make the key unreadable, so `unknown`.
 - **Roots** are trust anchors by name and key: their own extensions are not
   processed (RFC 5280 6.1.1), and a root's self-signature is never relied on.
   A CA that is not self-signed is an intermediate, also when its vendor calls

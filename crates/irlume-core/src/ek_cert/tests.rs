@@ -1536,3 +1536,46 @@ fn chain_index_paths_under_one_listed_ca_do_not_hide_a_second_listed_ca() {
         ChainVerdict::Verified(_)
     ));
 }
+
+#[test]
+fn rsa_encryption_parameters_other_than_null_make_the_key_unreadable() {
+    let root = root("Test RSA Root CA", Key::rsa(0));
+    let Key::Rsa(rsa) = Key::rsa(2) else {
+        unreachable!()
+    };
+    let rsa_key = bit_string(&seq(&[int(&rsa.n_bytes()), int(&rsa.e_bytes())]));
+    let leaf_with = |algorithm: Vec<u8>| {
+        let spec = ek_spec(Key::rsa(2), &root);
+        let mut fields = vec![explicit(0, &int(&[2])), int(&[1])];
+        fields.push(root.key.default_alg());
+        fields.push(root.name.clone());
+        fields.push(seq(&[utc_time(spec.not_before), utc_time(spec.not_after)]));
+        fields.push(spec.subject.clone());
+        fields.push(seq(&[algorithm, rsa_key.clone()]));
+        fields.push(explicit(3, &spec.exts.encode()));
+        let tbs = seq(&fields);
+        let alg = root.key.default_alg();
+        seq(&[
+            tbs.clone(),
+            alg.clone(),
+            bit_string(&root.key.sign(&alg, &tbs)),
+        ])
+    };
+    let anchors = anchors(&[&root], &[]);
+    // NULL, and absent, are both read.
+    for algorithm in [
+        seq(&[oid_der("1.2.840.113549.1.1.1"), null()]),
+        seq(&[oid_der("1.2.840.113549.1.1.1")]),
+    ] {
+        assert!(matches!(
+            verify(&leaf_with(algorithm), &[], &anchors),
+            ChainVerdict::Verified(_)
+        ));
+    }
+    let odd = leaf_with(seq(&[oid_der("1.2.840.113549.1.1.1"), int(&[0])]));
+    assert_eq!(EkCertificate::from_der(&odd).unwrap().public_key(), None);
+    assert_eq!(
+        verify(&odd, &[], &anchors),
+        ChainVerdict::Unverifiable(Unverifiable::LeafKey)
+    );
+}

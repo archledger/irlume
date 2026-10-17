@@ -493,6 +493,18 @@ fn spki_key(spki: &SubjectPublicKeyInfoOwned) -> Option<EkPublicKey> {
         // An RSAES-OAEP key is an RSA key with its padding named: some older
         // EK certificates use it.
         oid::RSA_ENCRYPTION | oid::RSAES_OAEP => {
+            // RFC 3279: rsaEncryption's parameters are NULL (absent is what
+            // the RustCrypto decoders and tpm.rs accept too); anything else
+            // names a key irlume cannot interpret.
+            if spki.algorithm.oid == oid::RSA_ENCRYPTION
+                && spki
+                    .algorithm
+                    .parameters
+                    .as_ref()
+                    .is_some_and(|p| !p.is_null())
+            {
+                return None;
+            }
             let key = RsaPublicKeyDer::from_der(key_bytes).ok()?;
             let e = key.e.as_bytes();
             if e.is_empty() || e.len() > 4 {

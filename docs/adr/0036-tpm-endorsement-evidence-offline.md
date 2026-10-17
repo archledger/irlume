@@ -118,28 +118,43 @@ never opens the TPM: irlumed answers a new root-only request (section 4).
 
 | State | When |
 |---|---|
-| `pass` | A stored EK certificate matches the TPM's EK, its chain verifies to a pinned vendor root, and irlume's storage key is in the same TPM. The detail names the manufacturer, model and firmware version (the certificate's subject alternative name, as `tpm-firmware` already reports them from the TPM's properties) and the root CA. |
-| `info` | No EK certificate is stored (common on Intel PTT before Tiger Lake and on AMD fTPM; doctor says irlume does not fetch one); the certificate's issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), which does not mean the TPM is not genuine; or the chain is signed with an algorithm irlume does not accept, such as SHA-1, so it cannot be verified. |
-| `warn` | A stored certificate does not match the TPM's EK; a signature or a CA constraint in its chain to a pinned root fails; or the same-TPM test fails, so irlume's storage key is not in the TPM the certificate names. Each points at a swapped device, an emulator or a wrong `IRLUME_TCTI`. |
-| `unknown` | irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); or the TPM could not be read in the time allowed. |
+| `pass` | A stored EK certificate matches the TPM's EK, is an EK certificate by the Credential Profile (section 2.3), its chain verifies to a pinned vendor root, and irlume's storage key is in the same TPM. The detail names the manufacturer, model and firmware version (the certificate's subject alternative name, as `tpm-firmware` already reports them from the TPM's properties) and the root CA. |
+| `info` | No EK certificate is stored (common on Intel PTT before Tiger Lake and on AMD fTPM). doctor says irlume does not fetch one. |
+| `warn` | A stored certificate does not match the TPM's EK; on a chain that reaches a pinned root, a signature, a CA constraint or the leaf's EK profile (section 2.3) fails; or the same-TPM test fails with the result section 2.4 names, so irlume's storage key is not in the TPM the certificate names. Each points at a swapped device, an emulator or a wrong `IRLUME_TCTI`. |
+| `unknown` | The chain cannot be completed: its issuer is not in irlume's list (a newer intermediate, or a manufacturer irlume does not know), or it is signed with an algorithm irlume does not accept, such as SHA-1; neither means the TPM is not genuine. Also: irlumed is not running, older than the request, or the caller is not root; the endorsement hierarchy is disabled or its authorization is set (section 3); the same-TPM test hit an operational error (section 2.4); or the TPM could not be read in the time allowed. |
 
 The check never reports `fail`: it judges evidence, and irlume works on a TPM
 it cannot vouch for.
 
 ### 2. What irlumed reads and checks
 
-1. The EK certificate indices: every index in 0x01C00000 to 0x01C07FFF that
-   holds a certificate, read as DER with trailing bytes and the
-   `0x10 0x01 0x00` header tolerated. Nothing else in NV is read.
+1. The EK certificate indices in 0x01C00000 to 0x01C07FFF: each
+   certificate index read as DER with trailing bytes and the
+   `0x10 0x01 0x00` header tolerated; the templates and, in the low range,
+   the nonces that go with them (below); and the chain indices 0x01C00100 to
+   0x01C001FF, whose contents are joined in index order and split into every
+   complete DER certificate, since one index may hold several certificates
+   and one certificate may continue into the next index (Credential Profile
+   2.2.2.5.2). Nothing else in NV is read.
 2. The EK for each certificate: the persistent EK at 0x81010001 when its
    public key matches (TCG provisioning guidance; systemd v262 persists one
-   there), otherwise one derived transiently from the template in the next
-   odd index, or the default low-range template (L-1, L-2). The certificate
-   is used only when its public key equals the EK's.
+   there), otherwise one derived transiently. In the high range its template
+   is the next odd index when populated, else the default for that index. In
+   the low range the template is 0x01C00004 (RSA) or 0x01C0000C (ECC) when
+   populated, else the default L-1 or L-2, and the nonce at 0x01C00003 or
+   0x01C0000B, when populated, goes into the template's unique field as the
+   Credential Profile's EK creation procedure describes. The certificate is
+   used only when its public key equals the EK's.
 3. The chain, in software: the EK certificate, then intermediates from the
    NV chain indices and from irlume's list (section 5), up to a pinned root.
-   Each signature verifies, and each CA has `CA:TRUE` with its path length
-   and `keyCertSign`. Validity periods are reported, not enforced: EK and
+   The leaf must be an EK certificate by the Credential Profile (3.2): a
+   critical Basic Constraints with `CA:FALSE`, the critical Key Usage the
+   profile sets for the EK's algorithm, a subject alternative name carrying
+   the TPM manufacturer attribute (critical when the subject is empty) whose
+   value equals `TPM_PT_MANUFACTURER`, and, when an Extended Key Usage is
+   present, `tcg-kp-EKCertificate` (2.23.133.8.1) in it. Each signature
+   verifies, and each CA has `CA:TRUE` with its path length and
+   `keyCertSign`. Validity periods are reported, not enforced: EK and
    intermediate certificates of genuine TPMs expire while the TPM stays in
    use (a typical PC Client validity is 5 to 10 years, Credential Profile
    2.2.3, and one Infineon intermediate expired on 2025-10-20), so a `pass`
@@ -151,11 +166,22 @@ it cannot vouch for.
    TPM2_ActivateCredential with that key as `activateHandle` and the EK as
    `keyHandle`, under the EK's policy (PolicySecret on the endorsement
    hierarchy for the low-range templates, the high-range PolicyB otherwise).
-   It passes when the TPM returns the secret.
+   It passes when the TPM returns the secret. It fails, the `warn` of section
+   1, only when the TPM refuses the credential itself: `TPM_RC_INTEGRITY`
+   (the credential is not bound to that key's Name) or a seed the EK cannot
+   decrypt (`TPM_RC_VALUE` on the secret). Any other error is `unknown`:
+   `TPM_RC_LOCKOUT` and authorization failures, resource exhaustion
+   (`TPM_RC_OBJECT_MEMORY`, `TPM_RC_SESSION_MEMORY`), `TPM_RC_RETRY` and
+   transport errors. While only the original storage key exists, which is
+   not exempt from dictionary-attack protection (ADR-0034), the test is not
+   run during a lockout and reads `unknown`.
 
-irlumed computes the answer at most once per boot for a given storage key
-Name and keeps it in memory, since the EK and its certificate do not change
-within a boot.
+Each request reads the endorsement hierarchy's state (section 3) and the
+certificate indices again. irlumed keeps the EK derivation, the chain result
+and the same-TPM result in memory for the rest of the boot, and reuses them
+only while the certificate bytes and the storage key's Name are unchanged and
+the hierarchy still allows the test, since `TPM2_HierarchyControl` and
+`TPM2_HierarchyChangeAuth` can change that state within a boot.
 
 ### 3. The endorsement hierarchy
 
@@ -256,17 +282,30 @@ check.
   (the end date reported), and refuses one with a broken signature, a CA
   without `CA:TRUE` or `keyCertSign`, or a path length exceeded; a SHA-1
   signature and a chain that ends at a root not in the list read as
-  unverifiable, not as failed.
+  unverifiable (`unknown`), not as failed.
+- A leaf that is not an EK certificate is refused even when its key matches
+  and its chain verifies: `CA:TRUE`, a missing or non-critical Basic
+  Constraints, the wrong Key Usage, no TPM manufacturer attribute or one that
+  differs from `TPM_PT_MANUFACTURER`, or an Extended Key Usage without
+  `tcg-kp-EKCertificate`.
+- The chain reader joins the chain indices in order and finds every
+  certificate when one index holds two and when one certificate continues
+  into the next index.
+- A low-range certificate whose EK uses the template at 0x01C00004 with the
+  nonce at 0x01C00003 matches its EK; derived from the default template alone
+  it would not.
 - Every shipped intermediate chains to a shipped root, and every file's
   SHA-256 matches the manifest.
 - The NV reader tolerates trailing bytes and the `0x10 0x01 0x00` header, and
   refuses a certificate whose public key differs from the EK's.
 - On swtpm, with an EK certificate from `swtpm_setup --create-ek-cert`: the
-  check reads `info` (issuer not in irlume's list) with the shipped anchors;
-  with the test CA added as an anchor in the test only, it reads `pass` and
-  the same-TPM test succeeds against irlume's storage key; with a storage key
-  that is not in that TPM, the same-TPM test fails; with the endorsement
-  authorization set, nothing is tried and the check reads `unknown`.
+  check reads `unknown` (issuer not in irlume's list) with the shipped
+  anchors; with the test CA added as an anchor in the test only, it reads
+  `pass` and the same-TPM test succeeds against irlume's storage key; a
+  credential bound to another key's Name fails with `TPM_RC_INTEGRITY`
+  (`warn`); with the endorsement authorization set, nothing is tried and the
+  check reads `unknown`; after the authorization is cleared in the same boot,
+  the next request runs the test.
 - No doctor text, `--json` field or support report contains the EK public
   key, its hash, the certificate serial or its fingerprint.
 - irlume makes no network request in any of these paths.

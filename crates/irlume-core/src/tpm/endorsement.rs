@@ -843,56 +843,19 @@ impl Check<'_> {
             ));
         }
 
-        // A persistent EK with the certificate's key is the EK, whatever the
-        // template indices hold; only a derivation needs them.
-        let (persistent, unread) = persistent_ek(run, &certified_key, &mut self.ek_handles)?;
-        let ek = match persistent {
-            Some(ek) => ek,
-            None => {
-                let template = match template_for(run, slot, index, self.present)? {
-                    Ok(template) => template,
-                    Err(e) => {
-                        return Ok(result(
-                            EndorsementState::Unknown,
-                            format!("the EK template cannot be read: {e}"),
-                        ))
-                    }
-                };
-                match derive_ek(run, &certified_key, template)? {
-                    Ok(Some(ek)) => ek,
-                    // A persistent EK that could not be read may be the
-                    // certificate's: the mismatch is not evidence then.
-                    Ok(None) if unread.is_some() => {
-                        return Ok(result(
-                            EndorsementState::Unknown,
-                            format!(
-                                "a persistent endorsement key could not be read ({}), and the \
-                                 key the TPM derives from the certificate's template is not \
-                                 the certificate's",
-                                unread.unwrap_or_default()
-                            ),
-                        ))
-                    }
-                    Ok(None) => return Ok(result(
-                        EndorsementState::Warn,
-                        "the certificate is not for this TPM's endorsement key: the key the TPM \
-                         derives from the certificate's template differs from the certificate's"
-                            .into(),
-                    )),
-                    Err(e) => {
-                        return Ok(result(
-                            EndorsementState::Unknown,
-                            format!("the EK could not be derived: {e}"),
-                        ))
-                    }
-                }
+        let same_tpm = match self.ek_and_same_tpm(run, index, slot, &certified_key) {
+            Ok(TpmPart::Tested(same_tpm)) => same_tpm,
+            Ok(TpmPart::Decided(state, detail)) => return Ok(result(state, detail)),
+            Err(Stop::Time) => return Err(Stop::Time),
+            // A TPM failure keeps what a verified chain says, as every other
+            // result after it does.
+            Err(Stop::Tpm(e)) => {
+                return Ok(result(
+                    EndorsementState::Unknown,
+                    format!("the TPM could not be read: {e}"),
+                ))
             }
         };
-        let same_tpm = same_tpm_test(run, &ek, self.permanent, &mut self.storage);
-        if ek.transient {
-            let _ = run.ctx.flush_context(ek.handle.into());
-        }
-        let same_tpm = same_tpm?;
 
         Ok(match (verdict, same_tpm) {
             // Returned above.
@@ -926,6 +889,76 @@ impl Check<'_> {
             ),
         })
     }
+
+    /// Find the EK for `certified_key` (persistent, else derived from the
+    /// slot's template) and run the same-TPM test with it, or the result
+    /// decided on the way.
+    fn ek_and_same_tpm(
+        &mut self,
+        run: &mut Run<'_, '_>,
+        index: u32,
+        slot: Slot,
+        certified_key: &EkPublicKey,
+    ) -> std::result::Result<TpmPart, Stop> {
+        // A persistent EK with the certificate's key is the EK, whatever the
+        // template indices hold; only a derivation needs them.
+        let (persistent, unread) = persistent_ek(run, certified_key, &mut self.ek_handles)?;
+        let ek = match persistent {
+            Some(ek) => ek,
+            None => {
+                let template = match template_for(run, slot, index, self.present)? {
+                    Ok(template) => template,
+                    Err(e) => {
+                        return Ok(TpmPart::Decided(
+                            EndorsementState::Unknown,
+                            format!("the EK template cannot be read: {e}"),
+                        ))
+                    }
+                };
+                match derive_ek(run, certified_key, template)? {
+                    Ok(Some(ek)) => ek,
+                    // A persistent EK that could not be read may be the
+                    // certificate's: the mismatch is not evidence then.
+                    Ok(None) if unread.is_some() => {
+                        return Ok(TpmPart::Decided(
+                            EndorsementState::Unknown,
+                            format!(
+                                "a persistent endorsement key could not be read ({}), and the \
+                                 key the TPM derives from the certificate's template is not \
+                                 the certificate's",
+                                unread.unwrap_or_default()
+                            ),
+                        ))
+                    }
+                    Ok(None) => return Ok(TpmPart::Decided(
+                        EndorsementState::Warn,
+                        "the certificate is not for this TPM's endorsement key: the key the TPM \
+                         derives from the certificate's template differs from the certificate's"
+                            .into(),
+                    )),
+                    Err(e) => {
+                        return Ok(TpmPart::Decided(
+                            EndorsementState::Unknown,
+                            format!("the EK could not be derived: {e}"),
+                        ))
+                    }
+                }
+            }
+        };
+        let same_tpm = same_tpm_test(run, &ek, self.permanent, &mut self.storage);
+        if ek.transient {
+            let _ = run.ctx.flush_context(ek.handle.into());
+        }
+        Ok(TpmPart::Tested(same_tpm?))
+    }
+}
+
+/// What the TPM half of judging a certificate found.
+enum TpmPart {
+    /// A result decided before the same-TPM test could run.
+    Decided(EndorsementState, String),
+    /// The same-TPM test's result.
+    Tested(SameTpm),
 }
 
 /// The template the EK for `index` is derived from: the populated template

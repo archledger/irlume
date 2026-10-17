@@ -47,8 +47,27 @@ pub const MS_CAMERA_CONTROL_XU: [u8; 16] = [
 /// cameras irlume targets.
 pub const MSXU_FACE_AUTHENTICATION: u8 = 0x06;
 
+/// `MSXU_CONTROL_METADATA`. A unit advertising it can carry per-frame
+/// illumination records (`uvc_meta_detect_msxu`); one that cannot leaves the
+/// burst's own alternation as the only active-IR evidence (ADR-0031 §4).
+pub const MSXU_METADATA: u8 = 0x09;
+
 /// `MSXU_CONTROL_IR_TORCH`. Direct control of the IR lamp's power and mode.
 pub const MSXU_IR_TORCH: u8 = 0x0A;
+
+/// The descriptor-attested YUYV IR cameras that supply no per-frame
+/// illumination records: an IR-only USB device whose Microsoft unit advertises
+/// the face-authentication control but not the Metadata control (#1069). Their
+/// active-IR evidence comes from the burst's own proven alternation, and the
+/// reads around a burst are complete only while the seat user cannot open the
+/// node, so the packaged udev rule
+/// (`packaging/udev/72-irlume-ir-nodes.rules`) removes the `uaccess` tag from
+/// exactly these USB identities. `scripts/check-packaging-parity.sh` pins the
+/// rule to this table, and the table's test pins each entry against its
+/// committed descriptor fixture. An entry must be an IR-only device: the rule
+/// matches the whole USB identity, so a composite RGB+IR device would lose its
+/// RGB node with it; such a camera needs a finer mechanism, not a table row.
+pub const NO_RECORDS_YUYV_IR: &[(u16, u16)] = &[(0x5986, 0x1141)];
 
 const DESC_DEVICE: u8 = 0x01;
 const DESC_CONFIGURATION: u8 = 0x02;
@@ -2058,6 +2077,49 @@ mod tests {
         }
         assert_eq!(T480_IR.len(), 18 + 412);
         assert_eq!(T480_RGB.len(), 18 + 1026);
+    }
+
+    /// #1069: every entry of [`NO_RECORDS_YUYV_IR`] is proven against its
+    /// committed descriptor fixture: an attested IR function whose Microsoft
+    /// unit offers the face-authentication control but not the Metadata
+    /// control (so no per-frame illumination records), on an IR-only USB
+    /// device (no second VideoControl function, so the udev rule's device-wide
+    /// match cannot touch an RGB node). The T480's colour sibling shows the
+    /// negative: no Microsoft unit, so it can never qualify.
+    #[test]
+    fn the_no_records_yuyv_ir_table_matches_its_descriptor_fixtures() {
+        assert_eq!(NO_RECORDS_YUYV_IR, &[(0x5986, 0x1141)]);
+        let function = video_control_function(T480_IR, 0).expect("the T480 IR function parses");
+        assert_eq!(
+            function.streaming_interfaces.as_slice(),
+            &[1],
+            "one streaming interface, the attested shape"
+        );
+        let microsoft: Vec<_> = function
+            .extension_units
+            .iter()
+            .filter(|unit| unit.is_microsoft_xu())
+            .collect();
+        let [unit] = microsoft.as_slice() else {
+            panic!("the T480 IR function has exactly one Microsoft unit");
+        };
+        assert!(
+            unit.advertises(MSXU_FACE_AUTHENTICATION),
+            "the emitter control the burst proof reads"
+        );
+        assert!(
+            !unit.advertises(MSXU_METADATA),
+            "a records-capable camera never needed this table"
+        );
+        assert!(
+            video_control_function(T480_IR, 2).is_none()
+                && extension_units_for_interface(T480_IR, 2).is_empty(),
+            "a second function would make the device composite"
+        );
+        assert!(matches!(
+            ir_function_evidence(T480_RGB, 0),
+            Err(IrFunctionRefusal::NoMicrosoftXu)
+        ));
     }
 
     /// Each builder the synthetic counter-cases use lays its descriptor out

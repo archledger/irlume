@@ -11,7 +11,10 @@ burst, on a split pair under the machine owner's experimental opt-in
 of 235 on the raw decode when it passes the judgment of Amendment
 2026-10-13, and such a burst from a camera with no illumination records
 also supplies its frames' active-IR evidence (Amendment 2026-10-14). Every
-other YUYV IR burst is still refused as exposure unmeasurable. The reporter's T480 enrolled on
+other YUYV IR burst is still refused as exposure unmeasurable. Amended
+2026-10-17 (#1069): on an IR node closed to the seat user (the packaged udev
+rule, measured on the node itself per burst), that burst proof no longer
+needs the opt-in's confinement; `irlume doctor` reports the node's state. The reporter's T480 enrolled on
 the implementation (PR #1064); confirmed grants on it and qualification on
 more units remain open. Depends on ADR-0029 §1 and §9
 (camera-free classification; selection never opens a device it will not
@@ -788,6 +791,8 @@ extension-unit queries (`uvc_v4l2.c`, `uvc_ioctl_default` passes
 illumination records has no per-frame account that would show it. So the
 whole judgment is confined to the experimental split opt-in, whose warning
 names it; a stronger, per-frame evidence source is tracked in #1069.
+(Amended 2026-10-17: on a node the seat user cannot open, the reads are
+complete and the confinement relaxes; see the amendment of that date.)
 
 The content bounds stay as they are. An earlier ThinkPad IR camera
 (Chicony 04f2:b5cf, J. Henstridge, "ThinkPad Infrared Camera", 2017)
@@ -799,3 +804,101 @@ Synthetic tests check the derivation for both parities, the record and
 length guards, an inactive emitter, records inverted against the optics,
 and that frame provenance reads the derived marks while the selection does
 not. Attended qualification on the T480 remains open.
+
+## Amendment 2026-10-17: a node the seat user cannot open completes the proof
+
+#1069 asked for one stronger per-frame evidence source, with data, so the
+2026-10-14 confinement can relax, or for the limitation to be recorded as
+permanent. The source chosen is the node's own access state: while no
+unprivileged program can open the IR capture node, none can change the
+emitter control between the reads around a burst, and the burst's proven
+alternation is the whole story. The three options of the issue, each checked
+against primary sources:
+
+- **Node access (chosen).** The package ships
+  `packaging/udev/72-irlume-ir-nodes.rules`, which removes the `uaccess` tag
+  from the nodes of the descriptor-attested YUYV IR cameras without
+  illumination records and assigns them to root alone (`0600`): the
+  `NO_RECORDS_YUYV_IR` table in `crates/irlume-camera/src/uvc_descriptor.rs`
+  (today the T480's 5986:1141 module alone, an IR-only USB device, so the
+  device-wide match touches no RGB node). The rule sorts after
+  `70-uaccess.rules`, which adds the tag, and before `73-seat-late.rules`,
+  which applies it as an ACL (udev 217 for `TAG-=`, udev 247 for the `:=`
+  assignments that keep a later rule from widening the node again). The group
+  is root, not `video`: irlume's own `EACCES` advice tells users to join
+  `video`, so a seat user there would silently keep full access to a
+  root:video node (review round 1 on #1109). Verified against systemd's
+  sources: the uaccess builtin rewrites the node's whole ACL when it runs,
+  and logind re-triggers that rewrite on a seat switch only for devices still
+  tagged, so a node the rule covers can carry a stale seat ACL until its next
+  plug or boot. And permissions are checked at open(2): a descriptor opened
+  before the rule applied stays usable, so application is the next plug or
+  boot of the camera, never `udevadm trigger` (same round; a full closure
+  would need a per-burst fd census, which needs CAP_SYS_PTRACE irlumed
+  deliberately does not have, the #207 precedent, or a forced re-enumeration,
+  which disconnects the camera mid-use; both are rejected as
+  disproportionate). irlume therefore never trusts the rule's presence: the
+  capture path reads the node's current owner, group, mode and access ACL on
+  each burst (`crates/irlume-camera/src/node_access.rs`), and admits the
+  optical proof only when the node is actually closed (root-owned, root
+  group, no group or world permission, no ACL entry naming another user or
+  group, and no effective group-object permission: a writable GROUP_OBJ entry
+  would let a non-root process whose supplementary groups include gid 0 open
+  the node; review round 2 on #1109) and the node's udev database record no
+  longer carries the `uaccess` tag among its current tags (the record's `Q:`
+  lines; its `G:` lines are the historical union and keep a removed tag
+  forever - systemd `device_update_db` and `device_remove_tag`, review round
+  4 on #1109). The tag's absence is what a rule removing
+  it records; a hand-set permission change keeps the tag, so logind re-grants
+  the seat ACL at the next seat switch, and such a change proves nothing
+  about descriptors opened before it - manual hardening needs the same plug
+  or boot boundary (review round 3 on #1109). Any read error is not hardened. `irlume doctor` reports the state
+  per device (`ir-node-access`), covering also the scan's unreadable bucket:
+  a successfully hardened node is exactly one the seat user's scan cannot
+  open (same round), so a still-shared node keeps the 2026-10-14 confinement
+  and the row names the remedy (plug or boot after install, or an
+  administrator closing the node). The `camera-nodes` capability check counts
+  that deliberately hardened node (refused on permissions, in the table,
+  itself reading hardened), since the daemon opens it as root - otherwise a
+  hardened host's `doctor --check` would fail because hardening succeeded
+  (review round 5 on #1109). The kernel side stands as recorded above:
+  `UVCIOC_CTRL_QUERY` carries no V4L2 priority, and only the capture node
+  carries it (the metadata node's fops have no `.vidioc_default`; a
+  `/dev/media` node speaks a different ioctl space), so closing the capture
+  node closes the window.
+- **Driven pattern (rejected).** Driving the emitter in a sequence irlume
+  chooses and requiring the optics to follow would need the mode-change
+  effect latency per camera module (Microsoft's sequence sets the mode
+  before streaming, UVC 1.5 extensions section 2.2.2.6; mid-stream effect is
+  firmware-defined and unmeasured for every module in this class), keeps the
+  node shared for reads and streaming, and yields a probabilistic rather
+  than a hard boundary.
+- **Firmware records (census, no new source).** Cameras whose Microsoft
+  unit advertises the Metadata control already supply per-frame illumination
+  records and never had the limitation: measured on 2026-10-17, the ASUS
+  3277:0059 (unit 14) and Logitech BRIO (unit 12) advertise selectors 6 and
+  9, the NexiGo 3443:c803's IR function (unit 4) does too, and the T480's
+  5986:1141 (unit 8) advertises 2 and 6 only, matching its committed
+  descriptor fixture.
+
+Admission keeps its shape: the judgment still runs only for a split pair's
+IR session. `optical_provenance_admitted` now admits when the lease is a
+split pair and either the owner's experimental opt-in is latched (as before)
+or the session's IR node reads hardened at the burst. Nothing else moves: a
+camera with illumination records keeps them, the sequential and IR-only
+routes still require no active-IR provenance and get no ceiling, and root is
+out of scope as always. The T480's known_control
+entry and attended qualification stay with #887.
+
+Acceptance: the node-access predicate's unit tests (base ACL, named user,
+named group, world permission, group permission, the effective
+group-object permission with and without MASK, an incomplete base ACL,
+malformed ACL, missing node, the udev database record's tag lines by
+content and against a fixture directory, the record-name rdev split,
+ownership and mode on real files), the descriptor-fixture pin of
+`NO_RECORDS_YUYV_IR` (attested shape, face-authentication present, Metadata
+absent, IR-only device, the colour sibling refused), the packaging parity
+check that pins the shipped rule to the table in every lane and its sort
+order against systemd's files, the doctor row tests (classified and
+unreadable buckets, per-device worst, wording), and the capture-path
+source pins updated for the new admission.

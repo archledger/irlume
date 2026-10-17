@@ -578,6 +578,22 @@ in
       KERNEL=="video[0-9]*", SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"
     '';
 
+    # #1069: nodes of descriptor-attested YUYV IR cameras without illumination
+    # records lose the seat-user uaccess tag and become root-only (0600)
+    # (ADR-0031 section 4). extraRules lands in 99-local.rules, which would run
+    # after 73-seat-late.rules, so the packaged file ships under its own name
+    # to sit between 70 and 73; its := assignments also keep this module's
+    # blanket video-group rule above from widening these nodes again. The
+    # daemon reads the node's real state, so a host without the hardware or a
+    # rule that never matched changes nothing.
+    services.udev.packages = [
+      (pkgs.writeTextFile {
+        name = "irlume-ir-nodes-udev";
+        destination = "/etc/udev/rules.d/72-irlume-ir-nodes.rules";
+        text = builtins.readFile ../packaging/udev/72-irlume-ir-nodes.rules;
+      })
+    ];
+
     # Splice pam_irlume into each opted-in service with its resolved control.
     # The same ancestry check applies to the dedicated PAM service. Copy this
     # root-owned file rather than resolving an /etc symlink through /nix/store.

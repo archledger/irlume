@@ -2160,6 +2160,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        // The record names the key the fake seals under, which a move must
+        // land on.
+        let previous_state = std::env::var_os("IRLUME_STATE_DIR");
+        std::env::set_var("IRLUME_STATE_DIR", &dir);
+        std::fs::write(
+            dir.join("tpm-storage-key"),
+            r#"{"version":1,"persisted":{"handle":2164326403,"name":"000b00"}}"#,
+        )
+        .unwrap();
         let user = "move-da-exempt";
         let _owner = crate::account::remember(user, 4140);
         const KEY: [u8; 32] = [9; 32];
@@ -2216,6 +2225,10 @@ mod tests {
         let off_key = move_with(user, unseal, |_| true, |_| Ok(envelope(false, &KEY)));
         let stays = std::fs::read(key_path(user)).unwrap() == moved_bytes;
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        match previous_state {
+            Some(value) => std::env::set_var("IRLUME_STATE_DIR", value),
+            None => std::env::remove_var("IRLUME_STATE_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(back_on_original.unwrap().is_none());

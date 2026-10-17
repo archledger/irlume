@@ -31,6 +31,12 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 /// The longest refusal detail recorded or reported, in characters.
 const MAX_DETAIL_CHARS: usize = 300;
 
+/// The most superseded keys a record keeps or a start probes. A replacement
+/// adds one, so a few are plenty; the state directory is untrusted where it
+/// is writable offline (ADR-0034 §5), and each kept key costs TPM commands
+/// at a start.
+const MAX_SUPERSEDED: usize = 4;
+
 /// How many taken handles a persist steps past before it gives up. Each
 /// `TPM_RC_NV_DEFINED` means another stack took the handle between the scan
 /// and the command, which systemd's `tpm2_persist_handle` also answers by
@@ -366,9 +372,15 @@ pub fn ensure_at_start_reporting() -> Result<(Option<Outcome>, bool)> {
         };
         // Written only when it changes, so a host with nothing to record
         // gets no record file.
-        if record.refused.is_some() || original != record.original {
+        // A refused replacement goes with the refusal: with no envelope left
+        // it concerns nothing, and a new envelope gets a fresh try.
+        if record.refused.is_some()
+            || record.replacement_refused.is_some()
+            || original != record.original
+        {
             save_record(&Record {
                 refused: None,
+                replacement_refused: None,
                 version: RECORD_VERSION,
                 original,
                 ..record
@@ -1469,6 +1481,16 @@ fn replace_weak_with(
     )))
 }
 
+/// `superseded` with each name once, at most [`MAX_SUPERSEDED`] of them, the
+/// latest kept: a record edited offline could list any number.
+fn bound_superseded(superseded: &mut Vec<Persisted>) {
+    let mut seen = std::collections::HashSet::new();
+    superseded.retain(|kept| seen.insert(kept.name.clone()));
+    if superseded.len() > MAX_SUPERSEDED {
+        superseded.drain(..superseded.len() - MAX_SUPERSEDED);
+    }
+}
+
 /// Keep `old` in `next` as a superseded key, once, unless it is the key
 /// `next` records.
 fn supersede(next: &mut Record, old: Persisted) {
@@ -1480,6 +1502,7 @@ fn supersede(next: &mut Record, old: Persisted) {
         && !next.superseded.iter().any(|kept| kept.name == old.name)
     {
         next.superseded.push(old);
+        bound_superseded(&mut next.superseded);
     }
 }
 
@@ -1495,6 +1518,7 @@ fn supersede(next: &mut Record, old: Persisted) {
 /// envelope, which no start rewrites, loads through that handle; one found
 /// nowhere keeps its entry, for the report.
 fn keep_superseded(tpm: &mut impl KeyTpm, record: &Record, next: &mut Record) -> Result<()> {
+    bound_superseded(&mut next.superseded);
     let mut owners = None;
     if let (Some(old), Some(new)) = (&record.persisted, &next.persisted) {
         if old.name != new.name {
@@ -1564,7 +1588,8 @@ pub(crate) type KeyAt = (u32, String);
 /// ([`superseded_keys`]), from one read of the record, so a caller that uses
 /// both sees one state of it.
 pub(crate) fn da_exempt_keys() -> (Option<KeyAt>, Vec<KeyAt>) {
-    let record = load_record();
+    let mut record = load_record();
+    bound_superseded(&mut record.superseded);
     let recorded = record
         .persisted
         .map(|persisted| (persisted.handle, persisted.name));
@@ -4133,6 +4158,60 @@ mod tests {
             itself.superseded.is_empty(),
             "never the recorded key itself"
         );
+    }
+
+    /// A record edited offline to list the same superseded key many times,
+    /// or many keys, is bounded before any TPM command: each name once, at
+    /// most `MAX_SUPERSEDED`, the latest kept.
+    #[test]
+    fn the_superseded_keys_are_bounded_before_the_tpm_is_asked() {
+        let entry = |n: u32| Persisted {
+            handle: 0x8101_0010 + n,
+            name: hex(&n.to_be_bytes()),
+        };
+        let mut repeated: Vec<Persisted> = (0..300).map(|_| entry(1)).collect();
+        bound_superseded(&mut repeated);
+        assert_eq!(repeated, vec![entry(1)]);
+        let mut many: Vec<Persisted> = (0..20).map(entry).collect();
+        bound_superseded(&mut many);
+        assert_eq!(many, (16..20).map(entry).collect::<Vec<_>>());
+
+        let record = Record {
+            superseded: (0..300).map(|_| entry(1)).collect(),
+            ..persisted_record(DA_EXEMPT, b"ours")
+        };
+        let mut tpm = FakeTpm::new();
+        tpm.objects.insert(DA_EXEMPT, b"ours".to_vec());
+        let mut next = record.clone();
+        keep_superseded(&mut tpm, &record, &mut next).expect("kept");
+        assert_eq!(next.superseded, vec![entry(1)]);
+        assert!(tpm.scans <= 1, "one scan of the owner handles at most");
+    }
+
+    /// With no envelope left, a refused replacement goes with the ordinary
+    /// refusal, so an envelope made later in the same boot gets a fresh try.
+    #[test]
+    fn a_refused_replacement_is_dropped_once_no_envelope_remains() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let sandbox = Sandbox::new("storage-key-replacement-refused");
+        let refused = Refused {
+            reason: RefusalReason::OwnerAuthorization,
+            detail: "an owner authorization".into(),
+            boot_id: Some(BOOT.into()),
+        };
+        save_record(&Record {
+            replacement_refused: Some(refused),
+            ..persisted_record(DA_EXEMPT, b"weak")
+        })
+        .unwrap();
+        let step = ensure_at_start_reporting();
+        let kept = load_record();
+        drop(sandbox);
+        assert!(step.is_ok(), "{step:?}");
+        assert_eq!(kept.replacement_refused, None);
     }
 
     /// ADR-0034, Phase 3 amendment (#1073 item 2), over a fake TPM: a weak

@@ -1765,25 +1765,30 @@ fn with_envelope_parent<T>(
     };
     let name = storage_key::unhex(&parent.name)
         .ok_or_else(|| Error::Protocol("the envelope's storage key name is not hex".into()))?;
-    // The handle is a hint and the name decides (ADR-0034 §3.3): when the key
-    // is no longer at the envelope's handle but irlumed recorded the same key
-    // at another one, as its DA-exempt key or as the weak key a replacement
-    // superseded (whose envelopes move off it at their move points), that is
-    // the parent.
-    let mut key = da_exempt_key_at(ctx, parent.handle, &name, false)?;
-    // Both from one read of the record, so a start that supersedes the
-    // recorded key meanwhile cannot hide it from both.
+    // The handle is a hint and the name decides (ADR-0034 §3.3). irlumed
+    // records the key with this name, as its DA-exempt key or as a weak key a
+    // replacement superseded (whose envelopes move off it at their move
+    // points), at a handle its start checked it can seal under; that handle
+    // is tried first, then the envelope's own. The TPM name does not cover
+    // the authorization value, so a same-named copy another stack persisted
+    // at the envelope's handle since cannot shadow the recorded one. Both
+    // the recorded key and the superseded ones come from one read of the
+    // record, so a start that supersedes the recorded key meanwhile cannot
+    // hide it from both.
     let (recorded, superseded) = storage_key::da_exempt_keys();
-    let known = recorded
+    let mut handles: Vec<u32> = recorded
         .into_iter()
         .chain(superseded)
-        .filter_map(|(handle, hex)| storage_key::unhex(&hex).map(|raw| (handle, raw)));
-    for (handle, recorded) in known {
+        .filter(|(_, hex)| storage_key::unhex(hex).as_deref() == Some(name.as_slice()))
+        .map(|(handle, _)| handle)
+        .collect();
+    handles.push(parent.handle);
+    handles.dedup();
+    let mut key = None;
+    for handle in handles {
+        key = da_exempt_key_at(ctx, handle, &name, false)?;
         if key.is_some() {
             break;
-        }
-        if recorded == name && handle != parent.handle {
-            key = da_exempt_key_at(ctx, handle, &name, false)?;
         }
     }
     let key = key.ok_or_else(|| {
@@ -6071,6 +6076,41 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let released = crate::keyring::unseal_password("alice");
         let login = crate::keyring::reseal_password("alice", b"alice-password", None);
         let keyring_under = parent(&keyring);
+        // A same-named copy of the new key, persisted with an authorization
+        // value irlume does not hold, at the keyring envelope's own handle:
+        // the load goes through the handle the record keeps for the key.
+        const COPY: u32 = 0x8101_0012;
+        {
+            let mut ctx = open_context().expect("context");
+            let auth = Auth::try_from(b"someone else's".to_vec()).expect("auth");
+            let primary = ctx
+                .execute_with_nullauth_session(|ctx| {
+                    ctx.create_primary(
+                        Hierarchy::Owner,
+                        da_exempt_srk_template().expect("the template"),
+                        Some(auth),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .expect("the copy");
+            ctx.execute_with_nullauth_session(|ctx| {
+                ctx.evict_control(
+                    Provision::Owner,
+                    primary.key_handle.into(),
+                    Persistent::Persistent(PersistentTpmHandle::new(COPY).expect("handle")),
+                )
+            })
+            .expect("persist the copy");
+            let _ = ctx.flush_context(primary.key_handle.into());
+        }
+        let mut shadowed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&keyring).expect("envelope")).expect("json");
+        shadowed["parent"]["handle"] = serde_json::json!(COPY);
+        std::fs::write(&keyring, serde_json::to_vec(&shadowed).unwrap()).expect("shadowed");
+        let through_record = crate::keyring::unseal_password("alice");
+        evict_fixture_at(COPY);
         let template_key = crate::template_key::load_key("alice");
         let new_seal = seal_with_pcrs(b"a seal after the replacement", &[7]).map(|env| env.parent);
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -6137,6 +6177,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             crate::keyring::Reseal::MovedToDaExemptKey
         );
         assert_eq!(keyring_under.as_deref(), Some(new_hex.as_str()));
+        assert_eq!(
+            through_record
+                .expect("the recorded handle first")
+                .as_slice(),
+            b"alice-password",
+            "a same-named copy irlume cannot use at the envelope's handle does not shadow it"
+        );
         assert_eq!(template_key.expect("the key").as_slice(), key.as_slice());
         assert_eq!(
             new_seal.expect("a seal").map(|p| p.name).as_deref(),

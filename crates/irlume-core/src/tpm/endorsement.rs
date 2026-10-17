@@ -14,11 +14,12 @@
 //! holds both keys. Nothing is kept between calls, and nothing is persisted
 //! or written.
 //!
-//! The caller's `before_command` runs before each TPM command irlume sends
-//! (an ESYS helper that sends a few counts once); when it answers `false`
-//! the check stops and reads `unknown` ("ran out of time"). Flushing what
-//! the check loaded still runs after that, so an abandoned check leaves no
-//! object or session in the TPM.
+//! The caller's `before_command` runs before each TPM command irlume sends,
+//! and once for deriving the original storage key, which ESYS wraps in a
+//! session it starts and flushes; when it answers `false` the check stops
+//! and reads `unknown` ("ran out of time"). Flushing what the check loaded
+//! still runs after that, so an abandoned check leaves no object or session
+//! in the TPM.
 
 use irlume_common::tpm_endorsement::{
     CertificateAuthority, CertifiedTpm, EndorsementCertificate, EndorsementReport,
@@ -355,8 +356,8 @@ struct Run<'a, 'f> {
 }
 
 impl Run<'_, '_> {
-    /// Run one TPM command (or an ESYS helper that sends a few), first
-    /// asking the deadline.
+    /// Run one TPM command (or the session-wrapped derivation of the
+    /// original storage key), first asking the deadline.
     fn tpm<T, E: std::fmt::Display>(
         &mut self,
         command: impl FnOnce(&mut Context) -> std::result::Result<T, E>,
@@ -581,6 +582,7 @@ fn report_through(
         permanent,
         present: &present,
         ek_handles: None,
+        storage: None,
     };
     let mut certificates = Vec::with_capacity(judged.len());
     let mut out_of_time = false;
@@ -598,6 +600,9 @@ fn report_through(
                 format!("the TPM could not be read: {e}"),
             )),
         }
+    }
+    if let Some(Ok(storage)) = check.storage.take() {
+        storage.release(run.ctx);
     }
     let mut report = EndorsementReport {
         state: overall(&certificates, &not_judged),
@@ -674,6 +679,10 @@ struct Check<'c> {
     present: &'c [u32],
     /// The persistent endorsement primaries, read once when first needed.
     ek_handles: Option<Vec<u32>>,
+    /// The storage key the same-TPM test runs under, or why it is not
+    /// available: found once, by the first test, and released after the
+    /// last.
+    storage: Option<std::result::Result<StorageKey, String>>,
 }
 
 impl Check<'_> {
@@ -712,32 +721,44 @@ impl Check<'_> {
         ));
         };
         let verdict = certificate.verify(self.chain, self.anchors, self.manufacturer);
+        // Evidence against the certificate is the result whatever the TPM
+        // answers next, so no TPM failure or deadline can turn it unknown.
+        if let ChainVerdict::Refused(refusal) = &verdict {
+            return Ok(result(EndorsementState::Warn, refused(refusal)));
+        }
 
-        let template = match template_for(run, slot, index, self.present)? {
-            Ok(template) => template,
-            Err(e) => {
-                return Ok(result(
-                    EndorsementState::Unknown,
-                    format!("the EK template cannot be read: {e}"),
-                ))
+        // A persistent EK with the certificate's key is the EK, whatever the
+        // template indices hold; only a derivation needs them.
+        let ek = match persistent_ek(run, &certified_key, &mut self.ek_handles)? {
+            Some(ek) => ek,
+            None => {
+                let template = match template_for(run, slot, index, self.present)? {
+                    Ok(template) => template,
+                    Err(e) => {
+                        return Ok(result(
+                            EndorsementState::Unknown,
+                            format!("the EK template cannot be read: {e}"),
+                        ))
+                    }
+                };
+                match derive_ek(run, &certified_key, template)? {
+                    Ok(Some(ek)) => ek,
+                    Ok(None) => return Ok(result(
+                        EndorsementState::Warn,
+                        "the certificate is not for this TPM's endorsement key: the key the TPM \
+                         derives from the certificate's template differs from the certificate's"
+                            .into(),
+                    )),
+                    Err(e) => {
+                        return Ok(result(
+                            EndorsementState::Unknown,
+                            format!("the EK could not be derived: {e}"),
+                        ))
+                    }
+                }
             }
         };
-        let ek = match find_ek(run, &certified_key, template, &mut self.ek_handles)? {
-            Ok(Some(ek)) => ek,
-            Ok(None) => return Ok(result(
-                EndorsementState::Warn,
-                "the certificate is not for this TPM's endorsement key: the key the TPM derives \
-                 from the certificate's template differs from the certificate's"
-                    .into(),
-            )),
-            Err(e) => {
-                return Ok(result(
-                    EndorsementState::Unknown,
-                    format!("the EK could not be derived: {e}"),
-                ))
-            }
-        };
-        let same_tpm = same_tpm_test(run, &ek, self.permanent);
+        let same_tpm = same_tpm_test(run, &ek, self.permanent, &mut self.storage);
         if ek.transient {
             let _ = run.ctx.flush_context(ek.handle.into());
         } else {
@@ -747,6 +768,7 @@ impl Check<'_> {
         let same_tpm = same_tpm?;
 
         Ok(match (verdict, same_tpm) {
+        // Returned above.
         (ChainVerdict::Refused(refusal), _) => result(EndorsementState::Warn, refused(&refusal)),
         (_, SameTpm::Failed(why)) => result(
             EndorsementState::Warn,
@@ -827,15 +849,13 @@ fn unmarshal_exactly(bytes: &[u8]) -> Result<Public> {
     Ok(public)
 }
 
-/// The EK for a certified key: a persistent endorsement primary whose key is
-/// the certificate's, else one derived from `template` if its key is.
-/// `Ok(None)` when the derived key differs.
-fn find_ek(
+/// A persistent endorsement primary whose key is the certificate's, if one
+/// is there.
+fn persistent_ek(
     run: &mut Run<'_, '_>,
     certified: &EkPublicKey,
-    template: Public,
     ek_handles: &mut Option<Vec<u32>>,
-) -> std::result::Result<Result<Option<EkObject>>, Stop> {
+) -> std::result::Result<Option<EkObject>, Stop> {
     if ek_handles.is_none() {
         *ek_handles = Some(run.handles(EK_PERSISTENT)?);
     }
@@ -862,16 +882,26 @@ fn find_ek(
             run.ctx
                 .tr_set_auth(object, Auth::default())
                 .map_err(|e| Stop::Tpm(e.to_string()))?;
-            return Ok(Ok(Some(EkObject {
+            return Ok(Some(EkObject {
                 handle: key,
                 transient: false,
                 public,
-            })));
+            }));
         }
         // Another persistent object: release ESYS's record of it; the TPM
         // keeps the object.
         let _ = run.ctx.tr_close(&mut object);
     }
+    Ok(None)
+}
+
+/// The EK `template` derives, if its key is the certificate's. `Ok(None)`
+/// when the derived key differs.
+fn derive_ek(
+    run: &mut Run<'_, '_>,
+    certified: &EkPublicKey,
+    template: Public,
+) -> std::result::Result<Result<Option<EkObject>>, Stop> {
     let created = run.tpm_rc(|ctx| {
         ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
             ctx.create_primary(Hierarchy::Endorsement, template, None, None, None, None)
@@ -949,6 +979,7 @@ fn same_tpm_test(
     run: &mut Run<'_, '_>,
     ek: &EkObject,
     permanent: u32,
+    storage: &mut Option<std::result::Result<StorageKey, String>>,
 ) -> std::result::Result<SameTpm, Stop> {
     let Some(name_alg) = NameAlg::from_tpm_alg(u16::from(ek.public.name_hashing_algorithm()))
     else {
@@ -990,33 +1021,35 @@ fn same_tpm_test(
         ));
     };
 
-    let (storage, da_exempt, flush_storage) = match run.tpm(read_only_storage_key) {
-        Ok(found) => found,
-        Err(Stop::Time) => return Err(Stop::Time),
-        Err(Stop::Tpm(e)) => {
+    if storage.is_none() {
+        *storage = Some(match find_storage_key(run) {
+            Ok(found) => Ok(found),
+            Err(Stop::Time) => return Err(Stop::Time),
+            Err(Stop::Tpm(e)) => Err(e),
+        });
+    }
+    let storage = match storage {
+        Some(Ok(storage)) => *storage,
+        Some(Err(e)) => {
             return Ok(SameTpm::NotRun(format!(
                 "irlume's storage key is not available: {e}"
             )))
         }
+        None => unreachable!("found above"),
     };
     let target = EkTarget {
         name_alg,
         symmetric,
         key: &key,
     };
-    let result = if !da_exempt && permanent & IN_LOCKOUT != 0 {
+    if !storage.da_exempt && permanent & IN_LOCKOUT != 0 {
         // The original storage key is not exempt from dictionary-attack
         // protection, so the test does not run during a lockout.
-        Ok(SameTpm::NotRun(
+        return Ok(SameTpm::NotRun(
             "the TPM is in dictionary-attack lockout, and irlume's storage key is not exempt from it".into(),
-        ))
-    } else {
-        activate(run, ek, storage, &target, &policies, route)
-    };
-    if flush_storage {
-        let _ = run.ctx.flush_context(storage.into());
+        ));
     }
-    result
+    activate(run, ek, storage.handle, &target, &policies, route)
 }
 
 /// How an EK's authorization policy is satisfied for the USER role of
@@ -1031,18 +1064,104 @@ enum PolicyRoute {
     SecretOr,
 }
 
-/// The storage key new seals go under, found without persisting anything:
-/// irlume's recorded DA-exempt key at its handle, else the original key (at
-/// its handle, or derived for this call). Returns the handle, whether it is
-/// DA-exempt, and whether the caller must flush it.
-fn read_only_storage_key(ctx: &mut Context) -> Result<(KeyHandle, bool, bool)> {
-    if let Some((handle, name)) = storage_key::recorded_key() {
-        if let Some(key) = da_exempt_key_at(ctx, handle, &name, true)? {
-            return Ok((key, true, false));
+/// The storage key the same-TPM test runs under.
+#[derive(Debug, Clone, Copy)]
+struct StorageKey {
+    handle: KeyHandle,
+    /// ADR-0034's DA-exempt key, which works during a lockout.
+    da_exempt: bool,
+    /// Derived for this check: flushed after it, where a persistent key
+    /// only has its ESYS record closed.
+    transient: bool,
+}
+
+impl StorageKey {
+    fn release(self, ctx: &mut Context) {
+        if self.transient {
+            let _ = ctx.flush_context(self.handle.into());
+        } else {
+            let mut object = ObjectHandle::from(self.handle);
+            let _ = ctx.tr_close(&mut object);
         }
     }
-    let (key, persistent) = load_or_create_srk(ctx, SrkMode::ReadOnly)?;
-    Ok((key, false, !persistent))
+}
+
+/// The storage key new seals go under, found without persisting anything
+/// and with the deadline asked before each command: irlume's recorded
+/// DA-exempt key at its handle (as `da_exempt_key_at` finds it), else the
+/// original key at its handle, or derived for this check (as
+/// `load_or_create_srk` does read-only).
+fn find_storage_key(run: &mut Run<'_, '_>) -> std::result::Result<StorageKey, Stop> {
+    if let Some((handle, name)) = storage_key::recorded_key() {
+        if OWNER_PERSISTENT.contains(&handle)
+            && run.tpm(|ctx| persistent_handle_present(ctx, handle))?
+        {
+            let template = da_exempt_srk_template().map_err(|e| Stop::Tpm(e.to_string()))?;
+            if let Some(handle) = persistent_key(run, handle, |public, found| {
+                found == name.as_slice() && has_template_shape(public, &template)
+            })? {
+                return Ok(StorageKey {
+                    handle,
+                    da_exempt: true,
+                    transient: false,
+                });
+            }
+        }
+    }
+    let persistent = persistent_srk_handle().map_err(|e| Stop::Tpm(e.to_string()))?;
+    if run
+        .tpm(|ctx| tpm_handle_exists(ctx, TPM2_HR_PERSISTENT, TpmHandle::Persistent(persistent)))?
+    {
+        let srk = srk_template().map_err(|e| Stop::Tpm(e.to_string()))?;
+        if let Some(handle) = persistent_key(run, u32::from(persistent), |public, _| {
+            has_template_shape(public, &srk)
+        })? {
+            return Ok(StorageKey {
+                handle,
+                da_exempt: false,
+                transient: false,
+            });
+        }
+    }
+    Ok(StorageKey {
+        handle: run.tpm(create_srk)?,
+        da_exempt: false,
+        transient: true,
+    })
+}
+
+/// The persistent key at `handle` when `wanted` accepts its public area and
+/// Name, with its empty authValue set; else `None`, and its ESYS record
+/// closed.
+fn persistent_key(
+    run: &mut Run<'_, '_>,
+    handle: u32,
+    wanted: impl FnOnce(&Public, &[u8]) -> bool,
+) -> std::result::Result<Option<KeyHandle>, Stop> {
+    let persistent = PersistentTpmHandle::new(handle).map_err(|e| Stop::Tpm(e.to_string()))?;
+    let mut object = match run.tpm(|ctx| ctx.tr_from_tpm_public(TpmHandle::Persistent(persistent)))
+    {
+        Ok(object) => object,
+        Err(Stop::Time) => return Err(Stop::Time),
+        Err(Stop::Tpm(_)) => return Ok(None),
+    };
+    let key = KeyHandle::from(ESYS_TR::from(object));
+    let accepted = match run.tpm(|ctx| ctx.read_public(key)) {
+        Ok((public, name, _)) => wanted(&public, name.value()),
+        Err(Stop::Time) => {
+            let _ = run.ctx.tr_close(&mut object);
+            return Err(Stop::Time);
+        }
+        Err(Stop::Tpm(_)) => false,
+    };
+    if !accepted {
+        let _ = run.ctx.tr_close(&mut object);
+        return Ok(None);
+    }
+    run.ctx
+        .tr_set_auth(object, Auth::default())
+        .map_err(|e| Stop::Tpm(e.to_string()))?;
+    Ok(Some(key))
 }
 
 fn hashing(alg: NameAlg) -> HashingAlgorithm {
@@ -1170,6 +1289,8 @@ fn satisfy_and_activate(
 /// that EK cannot decrypt. Anything else cannot be judged.
 fn classify(outcome: std::result::Result<Digest, tss_esapi::Error>, credential: &[u8]) -> SameTpm {
     match outcome {
+        // tss-esapi keeps a `Digest`'s bytes in `Zeroizing`, so the released
+        // copy is wiped when it drops here.
         Ok(released) if released.value() == credential => SameTpm::Passed,
         Ok(_) => SameTpm::Failed("the TPM released a different credential".into()),
         Err(tss_esapi::Error::Tss2Error(rc)) => match (rc.kind(), parameter_number(rc)) {

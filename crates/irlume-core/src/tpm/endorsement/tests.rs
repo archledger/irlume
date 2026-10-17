@@ -486,9 +486,16 @@ fn tpm_endorsement_rsa_and_ecc_certificates_pass_with_their_ca_and_are_unknown_w
             &test_pki::ek_certificate_for(&ek, &issuing, manufacturer),
         );
     }
+    let derived = || super::super::ORIGINAL_DERIVATIONS.with(std::cell::Cell::get);
+    let before = derived();
     let report = run_check(&anchors_of(&[&root], &[&issuing]));
     assert_eq!(report.state, EndorsementState::Pass, "{report:#?}");
     assert_eq!(report.certificates.len(), 2);
+    assert_eq!(
+        derived() - before,
+        1,
+        "the storage key, not persisted here, is derived once for both tests"
+    );
     for certificate in &report.certificates {
         assert_eq!(
             certificate.state,
@@ -587,7 +594,8 @@ fn tpm_endorsement_a_credential_bound_to_another_key_is_refused_by_the_tpm() {
             ctx: &mut ctx,
             before_command: &mut always,
         };
-        let (storage, _, flush) = read_only_storage_key(run.ctx).unwrap();
+        let found = find_storage_key(&mut run).unwrap_or_else(|_| panic!("the storage key"));
+        let storage = found.handle;
         // Bound to a Name the storage key does not have.
         let mut wrong_name = run.ctx.read_public(storage).unwrap().1.value().to_vec();
         *wrong_name.last_mut().unwrap() ^= 1;
@@ -627,9 +635,7 @@ fn tpm_endorsement_a_credential_bound_to_another_key_is_refused_by_the_tpm() {
         assert!(
             matches!(classify(Err(e), &[5; 32]), SameTpm::Failed(why) if why.contains("TPM_RC_INTEGRITY"))
         );
-        if flush {
-            let _ = run.ctx.flush_context(storage.into());
-        }
+        found.release(run.ctx);
         let _ = run.ctx.flush_context(ek.handle.into());
     }
 }
@@ -699,6 +705,43 @@ fn tpm_endorsement_a_low_range_template_and_nonce_derive_the_certified_ek() {
 
 #[test]
 #[ignore = "needs a swtpm of its own (IRLUME_TEST_OWN_SWTPM=1 with scripts/with-swtpm.sh); CI runs it so"]
+fn tpm_endorsement_a_refused_chain_warns_before_any_tpm_work_for_it() {
+    let mut tpm = OwnSwtpm::new("endorsement-refused");
+    let manufacturer = tpm.manufacturer();
+    let (root, issuing) = test_ca();
+    let ek = tpm.ek(Slot::L1.default_template().unwrap());
+    let mut certificate = test_pki::ek_certificate_for(&ek, &issuing, manufacturer);
+    // One byte of the model text, inside what the issuing CA signed.
+    let at = certificate.windows(5).position(|w| w == b"swtpm").unwrap();
+    certificate[at] = b'X';
+    tpm.provision(0x01C0_0002, &certificate);
+    // A template index that does not parse, which the EK derivation would
+    // have to read.
+    tpm.provision(0x01C0_0004, &[0xFF; 8]);
+    let anchors = anchors_of(&[&root], &[&issuing]);
+    let mut all = 0;
+    let report = endorsement_report(&anchors, &mut || {
+        all += 1;
+        true
+    });
+    assert_eq!(report.state, EndorsementState::Warn, "{report:#?}");
+    assert!(
+        report.certificates[0].detail.contains("signature"),
+        "{report:#?}"
+    );
+    // The certificate's own read is the last command: cut before it, the
+    // certificate is not judged; nothing after it is left for a deadline or
+    // a TPM failure to cut.
+    let report = endorsement_report(&anchors, &mut || {
+        all -= 1;
+        all > 0
+    });
+    assert_eq!(report.state, EndorsementState::Unknown, "{report:#?}");
+    assert!(report.certificates.is_empty(), "{report:#?}");
+}
+
+#[test]
+#[ignore = "needs a swtpm of its own (IRLUME_TEST_OWN_SWTPM=1 with scripts/with-swtpm.sh); CI runs it so"]
 fn tpm_endorsement_a_persistent_ek_with_the_certified_key_is_used() {
     let mut tpm = OwnSwtpm::new("endorsement-persistent");
     let manufacturer = tpm.manufacturer();
@@ -714,6 +757,8 @@ fn tpm_endorsement_a_persistent_ek_with_the_certified_key_is_used() {
         0x01C0_0002,
         &test_pki::ek_certificate_for(&persisted, &issuing, manufacturer),
     );
+    // A template index that does not parse: only a derivation would need it.
+    tpm.provision(0x01C0_0004, &[0xFF; 8]);
     let report = run_check(&anchors_of(&[&root], &[&issuing]));
     assert_eq!(report.state, EndorsementState::Pass, "{report:#?}");
     // The persistent objects stay.

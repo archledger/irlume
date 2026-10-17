@@ -449,10 +449,17 @@ sections 2 to 4 left open:
   16 KiB is not read. The chain indices are read from 0x01C00100 up to the
   first one that is absent or cannot be read.
 - **The deadline.** The check takes a hook it asks before each TPM command,
-  or before each ESYS helper that sends a few. When the hook answers no, the
-  check stops: `unknown`, "ran out of time", unless a certificate already
-  judged is in a `warn` case. What the check loaded is still flushed. Phase
-  2b's handler supplies the hook from the request's deadline.
+  and once for deriving the original storage key, which ESYS wraps in a
+  session it starts and flushes. When the hook answers no, the check stops:
+  `unknown`, "ran out of time", unless a certificate already judged is in a
+  `warn` case. What the check loaded is still flushed. Phase 2b's handler
+  supplies the hook from the request's deadline.
+- **Order of work per certificate.** A chain refused in software is `warn`
+  before any TPM command for that certificate, so no later TPM failure or
+  deadline turns it `unknown`. A persistent EK with the certificate's key is
+  looked for before the template and nonce indices, which only a derivation
+  needs. The storage key is found once per request, by the first same-TPM
+  test, and released after the last.
 - **The report** names a reason when the check stopped early and, for each
   judged certificate, its index, its EK's algorithm, its state, a one-line
   detail and, when its chain verified, the TPM it names and its CAs with

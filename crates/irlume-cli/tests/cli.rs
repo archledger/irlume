@@ -5636,6 +5636,103 @@ esac"#,
     }
 }
 
+/// ADR-0037 §4: a nightly lane upgrades through itself every time, since a
+/// nightly build is at or past the latest release; the release feed says a
+/// newer release is out, and the update still goes to the nightly lane.
+#[test]
+fn update_on_a_nightly_lane_upgrades_through_that_lane() {
+    let sb = Sandbox::new("updatenightly");
+    sb.fake_tool("curl", r#"printf '%s' '{"tag_name": "v99.99.99"}'"#);
+    match host_family() {
+        "fedora" => {
+            sb.fake_tool("rpm", "printf '0.15.0-1.20261017.main.139.g3c162b83.fc44'");
+            sb.fake_tool(
+                "dnf",
+                r#"case "$1" in
+  repoquery) printf 'copr:copr.fedorainfracloud.org:archledger:irlume-nightly\n' ;;
+  *) exit 0 ;;
+esac"#,
+            );
+            sb.fake_tool("sudo", r#"exec "$@""#);
+            let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update", "--check"]));
+            assert_eq!(code, 0);
+            assert!(
+                out.contains("install method: Fedora Copr nightly (archledger/irlume-nightly)"),
+                "{out}"
+            );
+            assert!(out.contains("nightly channel"), "{out}");
+            assert!(!out.contains("available:"), "{out}");
+            assert!(
+                out.contains("would run: sudo dnf upgrade --refresh irlume"),
+                "{out}"
+            );
+            assert!(
+                out.contains("copr disable archledger/irlume-nightly"),
+                "{out}"
+            );
+            let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update"]));
+            assert_eq!(code, 0);
+            assert!(out.contains("[update] done."), "{out}");
+        }
+        "debian" => {
+            sb.fake_tool(
+                "dpkg-query",
+                r#"case "$*" in
+  *Status*) printf 'install ok installed' ;;
+  *) printf '0.15.0+git139.g3c162b83-0ppa1~resolute1' ;;
+esac"#,
+            );
+            sb.fake_tool(
+                "apt-cache",
+                r#"printf 'irlume:\n  Version table:\n *** 0.15.0+git139.g3c162b83-0ppa1~resolute1 500\n        500 https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu resolute/main amd64 Packages\n        100 /var/lib/dpkg/status\n     0.15.0-0ppa1~resolute1 500\n        500 https://ppa.launchpadcontent.net/archledger/irlume/ubuntu resolute/main amd64 Packages\n'"#,
+            );
+            let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update", "--check"]));
+            assert_eq!(code, 0);
+            assert!(
+                out.contains(
+                    "install method: Launchpad PPA nightly (ppa:archledger/irlume-nightly)"
+                ),
+                "{out}"
+            );
+            assert!(!out.contains("available:"), "{out}");
+            assert!(
+                out.contains(
+                    "would run: sudo apt update && sudo apt install --only-upgrade irlume"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("--remove ppa:archledger/irlume-nightly"),
+                "{out}"
+            );
+        }
+        "arch" => {
+            sb.fake_tool(
+                "pacman",
+                r#"case "$1" in
+  -Qq) printf 'irlume-git\n' ;;
+  *) printf 'irlume-git 0.15.0.r139.g3c162b83-1\n' ;;
+esac"#,
+            );
+            let (code, out, _) = run(&mut sb.cmd_with_fakes(&["update", "--check"]));
+            assert_eq!(code, 0);
+            assert!(
+                out.contains("install method: AUR irlume-git (nightly, builds main)"),
+                "{out}"
+            );
+            assert!(
+                out.contains("[update] installed: 0.15.0.r139.g3c162b83-1"),
+                "{out}"
+            );
+            assert!(!out.contains("available:"), "{out}");
+            assert!(out.contains("yay -Syu --devel"), "{out}");
+            assert!(out.contains("aur.archlinux.org/irlume-git.git"), "{out}");
+            assert!(out.contains("yay -S irlume"), "{out}");
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn retired_blinkcap_is_not_dispatchable() {
     let sandbox = Sandbox::new("blinkcap-retired");

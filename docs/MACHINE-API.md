@@ -268,7 +268,7 @@ reused for a different meaning. The registry as of this contract:
 | Check id | Reports on |
 |---|---|
 | `platform` | the distribution family irlume detected |
-| `install-origin` | where this build came from: a distro package, the Copr, or a source install |
+| `install-origin` | where this build came from: a distro package, the Copr, or a source install; a nightly lane ([ADR-0037](adr/0037-nightly-channel.md): the nightly Copr, the nightly PPA, or the AUR's `irlume-git`) is named as such, with its package version |
 | `tpm` | a usable TPM 2.0 resource-manager device |
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `secure-boot-certificates` | where the Secure Boot `KEK` and `db` stand in Microsoft's 2026 certificate rollover, read from efivarfs. Microsoft's certificates are recognized by SHA-256 hash, of the certificate or, for an entry held as a bare RSA-2048 key, of its modulus, never by subject. `pass` when every Microsoft 2011 certificate enrolled has its 2023 replacement; `warn` naming the 2023 certificates still to be enrolled, since enrolling them changes PCR 7 and a seal bound to PCR 7 then stops opening; `info` for a machine with its own keys, no keys enrolled (setup mode) or no UEFI boot; `unknown` when a database exists but cannot be read, or both are absent outside setup mode (efivarfs unmounted, empty databases in user mode) |

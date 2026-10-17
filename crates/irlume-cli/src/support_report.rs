@@ -53,10 +53,14 @@ pub(crate) enum CheckId {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InstallChannel {
     FedoraCopr,
+    /// The nightly lanes (ADR-0037).
+    FedoraCoprNightly,
     LocalRpm,
     UbuntuPpa,
+    UbuntuPpaNightly,
     LocalDeb,
     ArchPackage,
+    ArchGit,
     Source,
 }
 
@@ -112,10 +116,13 @@ pub(crate) fn parse_since(raw: Option<&str>) -> Result<Duration, &'static str> {
 pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     let install_channel = match crate::commands::install_origin() {
         crate::commands::InstallOrigin::Copr => InstallChannel::FedoraCopr,
+        crate::commands::InstallOrigin::CoprNightly => InstallChannel::FedoraCoprNightly,
         crate::commands::InstallOrigin::LocalRpm(_) => InstallChannel::LocalRpm,
         crate::commands::InstallOrigin::Ppa => InstallChannel::UbuntuPpa,
+        crate::commands::InstallOrigin::PpaNightly => InstallChannel::UbuntuPpaNightly,
         crate::commands::InstallOrigin::LocalDeb => InstallChannel::LocalDeb,
         crate::commands::InstallOrigin::ArchPkg => InstallChannel::ArchPackage,
+        crate::commands::InstallOrigin::ArchGit => InstallChannel::ArchGit,
         crate::commands::InstallOrigin::Source => InstallChannel::Source,
     };
     let platform = irlume_common::platform::distro_family().as_str();
@@ -692,10 +699,13 @@ fn check_state_name(value: CheckState) -> &'static str {
 fn install_channel_name(value: InstallChannel) -> &'static str {
     match value {
         InstallChannel::FedoraCopr => "fedora_copr",
+        InstallChannel::FedoraCoprNightly => "fedora_copr_nightly",
         InstallChannel::LocalRpm => "local_rpm",
         InstallChannel::UbuntuPpa => "ubuntu_ppa",
+        InstallChannel::UbuntuPpaNightly => "ubuntu_ppa_nightly",
         InstallChannel::LocalDeb => "local_deb",
         InstallChannel::ArchPackage => "arch_package",
+        InstallChannel::ArchGit => "arch_git",
         InstallChannel::Source => "source",
     }
 }

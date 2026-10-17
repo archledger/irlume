@@ -622,6 +622,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume uninstall` on Arch removes `irlume-kcm` in the same pacman
+  transaction as `irlume` when it is installed: pacman refuses to remove
+  `irlume` alone while `irlume-kcm`, which depends on it, stays. It removes
+  the packages under the names they are installed as, which is how it also
+  removes the AUR's `irlume-git` and `irlume-kcm-git` of the nightly channel
+  (ADR-0037), and on a nightly lane it removes the nightly Copr repository
+  or PPA, never the release one in its place. `irlume doctor`'s
+  `install-origin` and `irlume update` name the three nightly lanes, and
+  `update` on one upgrades through it whatever the latest release; version
+  comparisons read the nightly snapshot versions as the release they
+  follow.
+
 - `irlume uninstall` evicts irlume's storage keys through the TPM irlumed
   uses: the `IRLUME_TCTI` and `IRLUME_SRK_HANDLE` that irlumed's unit sets,
   checked against the running daemon as its store directories are, not

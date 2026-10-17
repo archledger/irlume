@@ -20,9 +20,18 @@ use std::process::ExitCode;
 /// exists for the family. `--check` reports without running anything. No
 /// network library is bundled; we shell out to curl and degrade gracefully.
 /// The upstream-version part of a package version string ("0.10.0-1.fc44" →
-/// "0.10.0"), for comparing the running binary against the package.
+/// "0.10.0"), for comparing the running binary against the package. A nightly
+/// snapshot (ADR-0037 §2) reads as the release it follows: the RPM caret
+/// (`0.15.0^…`), the Debian `+git…`, and the AUR's `0.15.0.r139.g3c162b83`.
 fn version_base(v: &str) -> &str {
-    v.split(['-', '+']).next().unwrap_or(v)
+    let v = v.split(['-', '+', '^', '~']).next().unwrap_or(v);
+    match v
+        .match_indices(".r")
+        .find(|(i, _)| v[i + 2..].starts_with(|c: char| c.is_ascii_digit()))
+    {
+        Some((i, _)) => &v[..i],
+        None => v,
+    }
 }
 
 pub fn update(args: &[String]) -> ExitCode {
@@ -34,6 +43,12 @@ pub fn update(args: &[String]) -> ExitCode {
     let current = installed_version(&origin);
     println!("[update] installed: {current}");
     println!("[update] install method: {}", origin.describe());
+    // A nightly lane follows main, so the latest release is not its gate
+    // (ADR-0037 §4); its versions start from the last tag, which the crate
+    // version passes at release preparation, so the note below would mislead.
+    if origin.is_nightly() {
+        return nightly_update(&origin, check_only);
+    }
     // A hand-installed/overlaid build (dev box) can run a binary newer than
     // the package. `installed:` above stays the package truth — it is what
     // the update replaces — but say so instead of letting the two versions
@@ -135,6 +150,9 @@ pub fn update(args: &[String]) -> ExitCode {
             );
             println!("  (local/source builds: makepkg -si  in packaging/arch/)");
         }
+        InstallOrigin::CoprNightly | InstallOrigin::PpaNightly | InstallOrigin::ArchGit => {
+            unreachable!("nightly lanes update through nightly_update")
+        }
         InstallOrigin::Source => {
             println!("  Source install. Update the checkout at the tag:");
             println!(
@@ -148,27 +166,100 @@ pub fn update(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `irlume update` on a nightly lane (ADR-0037 §4): the lane's own upgrade
+/// runs every time, since a nightly build is always at or past the latest
+/// release. `--check` only says what it would run.
+fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
+    println!("[update] nightly channel: builds of main, not releases (ADR-0037)");
+    match origin {
+        InstallOrigin::CoprNightly => {
+            if check_only {
+                println!("  would run: sudo dnf upgrade --refresh irlume");
+            } else {
+                println!("[update] updating from the nightly Copr (the channel this was installed from):");
+                return run_pkg_steps(&[&["dnf", "upgrade", "--refresh", "irlume"]]);
+            }
+            println!("  Back to releases: sudo dnf copr disable archledger/irlume-nightly");
+            println!(
+                "    && sudo dnf copr enable archledger/irlume && sudo dnf distro-sync irlume"
+            );
+        }
+        InstallOrigin::PpaNightly => {
+            if check_only {
+                println!("  would run: sudo apt update && sudo apt install --only-upgrade irlume");
+            } else {
+                println!(
+                    "[update] updating from the nightly PPA (the channel this was installed from):"
+                );
+                return run_pkg_steps(&[
+                    &["apt", "update"],
+                    &["apt", "install", "--only-upgrade", "irlume"],
+                ]);
+            }
+            println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
+            println!("    && sudo add-apt-repository ppa:archledger/irlume");
+            // irlume-kcm depends on the exact irlume version, so it moves too.
+            println!("    && sudo apt install --allow-downgrades irlume/<your Ubuntu codename>");
+            println!("       (add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed)");
+        }
+        InstallOrigin::ArchGit => {
+            // An AUR helper does not run as root, so, as for the AUR release
+            // package, these are the steps rather than a run.
+            println!("  Rebuild irlume-git from main through the AUR:");
+            println!("    yay -Syu --devel        # or: paru -Syu --devel");
+            println!("  Without an AUR helper:");
+            println!(
+                "    git clone https://aur.archlinux.org/irlume-git.git && cd irlume-git && makepkg -si"
+            );
+            // Each release package replaces only its own nightly counterpart.
+            println!("  Back to releases: yay -S irlume  (replaces irlume-git; add irlume-kcm");
+            println!("    in the same command when irlume-kcm-git is installed)");
+        }
+        _ => unreachable!("only the nightly lanes update here"),
+    }
+    ExitCode::SUCCESS
+}
+
 /// How this irlume install got onto the system; decides the update channel.
 pub enum InstallOrigin {
     /// Fedora Copr repo, the recommended Fedora channel.
     Copr,
+    /// The nightly Copr, `archledger/irlume-nightly` (ADR-0037).
+    CoprNightly,
     /// rpm-owned but not from the Copr (hand-built / local rpm). Carries
     /// dnf's `from_repo` string for display (may be empty or a history hash).
     LocalRpm(String),
     /// Launchpad PPA, the recommended Ubuntu channel.
     Ppa,
+    /// The nightly PPA, `ppa:archledger/irlume-nightly` (ADR-0037).
+    PpaNightly,
     /// dpkg-owned with no PPA source behind it (release-asset .deb).
     LocalDeb,
     /// pacman-owned (AUR or local makepkg).
     ArchPkg,
+    /// The AUR's `irlume-git`, built from main (ADR-0037).
+    ArchGit,
     /// Not owned by any package manager (source / dev install).
     Source,
 }
 
 impl InstallOrigin {
+    /// A nightly lane (ADR-0037): it follows main, not releases.
+    pub fn is_nightly(&self) -> bool {
+        matches!(
+            self,
+            InstallOrigin::CoprNightly | InstallOrigin::PpaNightly | InstallOrigin::ArchGit
+        )
+    }
+
     pub fn describe(&self) -> String {
         match self {
             InstallOrigin::Copr => "Fedora Copr (archledger/irlume)".into(),
+            InstallOrigin::CoprNightly => "Fedora Copr nightly (archledger/irlume-nightly)".into(),
+            InstallOrigin::PpaNightly => {
+                "Launchpad PPA nightly (ppa:archledger/irlume-nightly)".into()
+            }
+            InstallOrigin::ArchGit => "AUR irlume-git (nightly, builds main)".into(),
             InstallOrigin::LocalRpm(repo) if repo.is_empty() || repo.len() == 32 => {
                 "local RPM (not from the Copr)".into()
             }
@@ -206,6 +297,8 @@ pub fn install_origin() -> InstallOrigin {
             .to_string();
             if is_copr_repo(&repo) {
                 InstallOrigin::Copr
+            } else if is_nightly_copr_repo(&repo) {
+                InstallOrigin::CoprNightly
             } else {
                 InstallOrigin::LocalRpm(repo)
             }
@@ -217,19 +310,18 @@ pub fn install_origin() -> InstallOrigin {
                 return InstallOrigin::Source;
             }
             let policy = cmd_stdout("apt-cache", &["policy", "irlume"]).unwrap_or_default();
-            if policy.contains("ppa.launchpadcontent.net/archledger/irlume") {
-                InstallOrigin::Ppa
-            } else {
-                InstallOrigin::LocalDeb
+            match ppa_lane(&policy) {
+                Some(PpaLane::Release) => InstallOrigin::Ppa,
+                Some(PpaLane::Nightly) => InstallOrigin::PpaNightly,
+                None => InstallOrigin::LocalDeb,
             }
         }
-        DistroFamily::Arch => {
-            if cmd_ok("pacman", &["-Qq", "irlume"]) {
-                InstallOrigin::ArchPkg
-            } else {
-                InstallOrigin::Source
-            }
-        }
+        // `-Qq` resolves what a package provides and prints its own name, so
+        // the AUR's irlume-git answers as itself (ADR-0037 §4).
+        DistroFamily::Arch => match cmd_stdout("pacman", &["-Qq", "irlume"]) {
+            Some(name) => arch_origin(&name),
+            None => InstallOrigin::Source,
+        },
         DistroFamily::Other => InstallOrigin::Source,
     }
 }
@@ -238,6 +330,90 @@ pub fn install_origin() -> InstallOrigin {
 /// `copr:copr.fedorainfracloud.org:archledger:irlume`.
 fn is_copr_repo(repo: &str) -> bool {
     repo.starts_with("copr:") && repo.ends_with(":archledger:irlume")
+}
+
+/// The nightly Copr's `from_repo`: `...:archledger:irlume-nightly`.
+fn is_nightly_copr_repo(repo: &str) -> bool {
+    repo.starts_with("copr:") && repo.ends_with(":archledger:irlume-nightly")
+}
+
+/// Which of irlume's PPAs an apt origin line names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PpaLane {
+    Release,
+    Nightly,
+}
+
+const RELEASE_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume/ubuntu";
+const NIGHTLY_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu";
+
+/// The PPA `apt-cache policy irlume` shows the installed version came from:
+/// the origins listed under the version table's `***` line, matched by whole
+/// path so neither PPA is taken for the other (ADR-0037 §4). An installed
+/// nightly version no origin lists any more (the PPA removed it after newer
+/// nightlies) reads as the nightly PPA while that PPA is configured. Any
+/// other installed version no PPA lists (a release-asset .deb) falls back to
+/// any origin the policy names, as before, the release PPA first.
+fn ppa_lane(policy: &str) -> Option<PpaLane> {
+    let lane = |text: &str| {
+        if text.contains(NIGHTLY_PPA) {
+            Some(PpaLane::Nightly)
+        } else if text.contains(RELEASE_PPA) {
+            Some(PpaLane::Release)
+        } else {
+            None
+        }
+    };
+    let mut lines = policy
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("*** "));
+    if let Some(installed) = lines.next() {
+        // The installed version's origins are indented under its line; the
+        // next version line is indented less.
+        let origins: Vec<&str> = lines
+            .take_while(|l| l.len() - l.trim_start().len() > 6)
+            .collect();
+        if let Some(found) = origins.iter().find_map(|l| lane(l)) {
+            return Some(found);
+        }
+        let version = installed.trim_start().trim_start_matches("*** ");
+        if is_nightly_deb_version(version) && policy.contains(NIGHTLY_PPA) {
+            return Some(PpaLane::Nightly);
+        }
+    }
+    if policy.contains(RELEASE_PPA) {
+        Some(PpaLane::Release)
+    } else {
+        lane(policy)
+    }
+}
+
+/// A nightly PPA version, `<tag>+git<commits>.g<hash>-…` (ADR-0037 §2).
+fn is_nightly_deb_version(version: &str) -> bool {
+    let upstream = version.split(char::is_whitespace).next().unwrap_or("");
+    upstream.split_once("+git").is_some_and(|(_, rest)| {
+        rest.split_once(".g").is_some_and(|(commits, _)| {
+            !commits.is_empty() && commits.chars().all(|c| c.is_ascii_digit())
+        })
+    })
+}
+
+/// The Arch origin from the name `pacman -Qq irlume` printed.
+fn arch_origin(name: &str) -> InstallOrigin {
+    match name.split_whitespace().next() {
+        Some("irlume-git") => InstallOrigin::ArchGit,
+        _ => InstallOrigin::ArchPkg,
+    }
+}
+
+/// doctor's `install-origin` detail: how irlume was installed and, on a
+/// nightly lane, the package version, which names the build (ADR-0037 §4).
+pub fn origin_detail(origin: &InstallOrigin) -> String {
+    if origin.is_nightly() {
+        format!("{}, {}", origin.describe(), installed_version(origin))
+    } else {
+        origin.describe()
+    }
 }
 
 /// Point release-asset installs at the dedicated repo for their family (when
@@ -431,11 +607,17 @@ fn installed_version_via(
         InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
             cmd_output(rpm, &["-q", "--qf", "%{VERSION}", "irlume"])
         }
-        InstallOrigin::Ppa | InstallOrigin::LocalDeb => {
+        // A nightly RPM keeps the release's Version; Packit's Release suffix
+        // is what names the build (ADR-0037 §2).
+        InstallOrigin::CoprNightly => {
+            cmd_output(rpm, &["-q", "--qf", "%{VERSION}-%{RELEASE}", "irlume"])
+        }
+        InstallOrigin::Ppa | InstallOrigin::PpaNightly | InstallOrigin::LocalDeb => {
             cmd_output(dpkg_query, &["-W", "-f", "${Version}", "irlume"])
         }
-        InstallOrigin::ArchPkg => {
-            // `pacman -Q irlume` → "irlume 0.1.3-1"; take the version field.
+        InstallOrigin::ArchPkg | InstallOrigin::ArchGit => {
+            // `pacman -Q irlume` → "irlume 0.1.3-1" (or, through what it
+            // provides, "irlume-git 0.15.0.r139.g3c162b83-1"); the version.
             cmd_output(pacman, &["-Q", "irlume"])
                 .and_then(|s| s.split_whitespace().nth(1).map(str::to_string))
         }
@@ -586,10 +768,12 @@ fn release_asset_steps(assets: &[String], ver: &str, asset: &str, install_cmd: &
 }
 
 /// True if dotted version `a` is strictly greater than `b` (numeric per field,
-/// missing fields = 0). Pre-release suffixes are ignored (compared as the base).
+/// missing fields = 0). Pre-release and snapshot suffixes are ignored
+/// (compared as the base, [`version_base`]).
 fn version_gt(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
-        s.split(['.', '-'])
+        version_base(s)
+            .split('.')
             .take_while(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
             .map(|p| p.parse().unwrap_or(0))
             .collect()
@@ -2189,8 +2373,9 @@ mod origin_tests {
     }
 
     use super::{
-        arch_names, gz_lists_irlume, installed_version_via, is_copr_repo, latest_release_via,
-        ppa_serves_via, ubuntu_codename, version_gt, InstallOrigin,
+        arch_names, arch_origin, gz_lists_irlume, installed_version_via, is_copr_repo,
+        is_nightly_copr_repo, latest_release_via, ppa_lane, ppa_serves_via, ubuntu_codename,
+        version_gt, InstallOrigin, PpaLane,
     };
 
     #[test]
@@ -2205,6 +2390,119 @@ mod origin_tests {
         assert!(!is_copr_repo("@commandline"));
         assert!(!is_copr_repo("")); // no dnf history record
         assert!(!is_copr_repo("6ecc2dfaa0dc41e5ad51e007707a786b")); // history hash
+                                                                    // The nightly Copr is its own lane, never the release one (ADR-0037).
+        assert!(!is_copr_repo(
+            "copr:copr.fedorainfracloud.org:archledger:irlume-nightly"
+        ));
+        assert!(is_nightly_copr_repo(
+            "copr:copr.fedorainfracloud.org:archledger:irlume-nightly"
+        ));
+        assert!(!is_nightly_copr_repo(
+            "copr:copr.fedorainfracloud.org:archledger:irlume"
+        ));
+        assert!(!is_nightly_copr_repo("irlume-nightly"));
+    }
+
+    /// ADR-0037 §4: the installed version's own origins decide the PPA, so the
+    /// nightly PPA is never read as the release one, nor the reverse, also
+    /// when both are configured.
+    #[test]
+    fn the_installed_versions_origin_names_the_ppa() {
+        let table = |installed_from_nightly: bool| {
+            let (nightly, release) = (
+                "0.15.0+git139.g3c162b83-0ppa1~resolute1",
+                "0.15.0-0ppa1~resolute1",
+            );
+            let (first, second) = if installed_from_nightly {
+                (format!(" *** {nightly} 500"), format!("     {release} 500"))
+            } else {
+                (format!("     {nightly} 500"), format!(" *** {release} 500"))
+            };
+            let nightly_origin = "        500 https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu resolute/main amd64 Packages";
+            let release_origin = "        500 https://ppa.launchpadcontent.net/archledger/irlume/ubuntu resolute/main amd64 Packages";
+            let status = "        100 /var/lib/dpkg/status";
+            let (first_origins, second_origins) = if installed_from_nightly {
+                (
+                    format!("{nightly_origin}\n{status}"),
+                    release_origin.to_owned(),
+                )
+            } else {
+                (
+                    nightly_origin.to_owned(),
+                    format!("{release_origin}\n{status}"),
+                )
+            };
+            format!(
+                "irlume:\n  Installed: x\n  Candidate: x\n  Version table:\n{first}\n{first_origins}\n{second}\n{second_origins}\n"
+            )
+        };
+        assert_eq!(ppa_lane(&table(true)), Some(PpaLane::Nightly));
+        assert_eq!(ppa_lane(&table(false)), Some(PpaLane::Release));
+
+        let only = |origin: &str| {
+            format!(
+                "irlume:\n  Version table:\n *** 1.0 500\n        500 https://ppa.launchpadcontent.net/archledger/{origin}/ubuntu resolute/main amd64 Packages\n        100 /var/lib/dpkg/status\n"
+            )
+        };
+        assert_eq!(ppa_lane(&only("irlume-nightly")), Some(PpaLane::Nightly));
+        assert_eq!(ppa_lane(&only("irlume")), Some(PpaLane::Release));
+        assert_eq!(ppa_lane(&only("irlumeish")), None);
+
+        // A nightly the PPA has since removed, listed only at dpkg status,
+        // beside a newer nightly candidate and the release PPA's version:
+        // still the nightly PPA.
+        let stale = "irlume:\n  Version table:\n     0.15.0+git150.gaaaa-0ppa1~resolute1 500\n        500 https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu resolute/main amd64 Packages\n *** 0.15.0+git139.g3c162b83-0ppa1~resolute1 100\n        100 /var/lib/dpkg/status\n     0.15.0-0ppa1~resolute1 500\n        500 https://ppa.launchpadcontent.net/archledger/irlume/ubuntu resolute/main amd64 Packages\n";
+        assert_eq!(ppa_lane(stale), Some(PpaLane::Nightly));
+        // Without the nightly PPA configured, it is a local package as before.
+        let unconfigured = "irlume:\n  Version table:\n *** 0.15.0+git139.g3c162b83-0ppa1~resolute1 100\n        100 /var/lib/dpkg/status\n";
+        assert_eq!(ppa_lane(unconfigured), None);
+        // A release-asset .deb beside a configured PPA reads as before: the
+        // policy's PPA, the release one first.
+        let local = "irlume:\n  Version table:\n *** 1.1 100\n        100 /var/lib/dpkg/status\n     1.0 500\n        500 https://ppa.launchpadcontent.net/archledger/irlume/ubuntu resolute/main amd64 Packages\n";
+        assert_eq!(ppa_lane(local), Some(PpaLane::Release));
+        // A policy without a version table (as a test fake prints it).
+        assert_eq!(
+            ppa_lane("     500 https://ppa.launchpadcontent.net/archledger/irlume/ubuntu resolute/main amd64 Packages\n"),
+            Some(PpaLane::Release)
+        );
+        assert_eq!(
+            ppa_lane("irlume:\n  Version table:\n *** 1.1 100\n        100 /var/lib/dpkg/status\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn pacmans_package_name_tells_the_aur_lanes_apart() {
+        assert!(matches!(arch_origin("irlume\n"), InstallOrigin::ArchPkg));
+        assert!(matches!(
+            arch_origin("irlume-git\n"),
+            InstallOrigin::ArchGit
+        ));
+        // A fake that prints the -Q form still reads by its first word.
+        assert!(matches!(
+            arch_origin("irlume 0.0.1-1\n"),
+            InstallOrigin::ArchPkg
+        ));
+        for nightly in [
+            InstallOrigin::CoprNightly,
+            InstallOrigin::PpaNightly,
+            InstallOrigin::ArchGit,
+        ] {
+            assert!(nightly.is_nightly());
+            assert!(
+                nightly.describe().contains("nightly"),
+                "{}",
+                nightly.describe()
+            );
+        }
+        for release in [
+            InstallOrigin::Copr,
+            InstallOrigin::Ppa,
+            InstallOrigin::ArchPkg,
+        ] {
+            assert!(!release.is_nightly());
+            assert!(!release.describe().contains("nightly"));
+        }
     }
 
     #[test]
@@ -2303,6 +2601,19 @@ mod origin_tests {
         // A distro "+" revision suffix also strips, so a 0.10.0+r1 local
         // package does not read as skewing from a 0.10.0 binary.
         assert_eq!(version_base("0.10.0+g1"), "0.10.0");
+        // Nightly snapshots read as the release they follow (ADR-0037 §2).
+        assert_eq!(version_base("0.15.0^20261017git3c162b8"), "0.15.0");
+        assert_eq!(
+            version_base("0.15.0+git139.g3c162b83-0ppa1~resolute1"),
+            "0.15.0"
+        );
+        assert_eq!(version_base("0.15.0.r139.g3c162b83-1"), "0.15.0");
+        assert_eq!(
+            version_base("0.15.0-1.20261017193000.main.139.g3c162b83.fc44"),
+            "0.15.0"
+        );
+        // Only `.r` followed by a digit starts the AUR's revision count.
+        assert_eq!(version_base("1.2.rc"), "1.2.rc");
     }
 
     #[test]
@@ -2332,6 +2643,27 @@ mod origin_tests {
                 no_tool()
             ),
             "9.9.9"
+        );
+        // The nightly Copr asks for the Release too, which names the build
+        // (ADR-0037 §2); the fake answers with the query format it was given
+        // (`sh -c` numbers the arguments from $0).
+        assert_eq!(
+            installed_version_via(
+                &InstallOrigin::CoprNightly,
+                fake(r#"printf '%s' "$2""#),
+                no_tool(),
+                no_tool()
+            ),
+            "%{VERSION}-%{RELEASE}"
+        );
+        assert_eq!(
+            installed_version_via(
+                &InstallOrigin::ArchGit,
+                no_tool(),
+                no_tool(),
+                fake("printf 'irlume-git 0.15.0.r139.g3c162b83-1\\n'")
+            ),
+            "0.15.0.r139.g3c162b83-1"
         );
         // Source installs have no owning package; the binary's version is the
         // documented fallback.
@@ -2383,6 +2715,28 @@ mod origin_tests {
         // Pre-release tags compare as their base version.
         assert!(!version_gt("1.0.0-rc1", "1.0.0"));
         assert!(!version_gt("1.0.0", "1.0.0-rc1"));
+        // A nightly keeps its patch field: not older than its own release's
+        // tag, older than the next (ADR-0037 §4).
+        for nightly in [
+            "0.15.0^20261017git3c162b8",
+            "0.15.0+git139.g3c162b83-0ppa1~resolute1",
+            "0.15.0.r139.g3c162b83-1",
+        ] {
+            assert!(!version_gt("0.15.0", nightly), "{nightly}");
+            assert!(version_gt("0.15.1", nightly), "{nightly}");
+            assert!(!version_gt("0.14.9", nightly), "{nightly}");
+        }
+        // A nonzero patch field survives the suffix: a 0.15.1 snapshot is not
+        // older than v0.15.1, newer than v0.15.0, older than v0.15.2.
+        for nightly in [
+            "0.15.1+git3.g3c162b83-0ppa1~resolute1",
+            "0.15.1^20261017git3c162b8",
+            "0.15.1.r3.g3c162b83-1",
+        ] {
+            assert!(!version_gt("0.15.1", nightly), "{nightly}");
+            assert!(version_gt(nightly, "0.15.0"), "{nightly}");
+            assert!(version_gt("0.15.2", nightly), "{nightly}");
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

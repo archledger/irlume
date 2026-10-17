@@ -188,14 +188,19 @@ fn package_query_available() -> bool {
 /// binary is still the packaged one.
 fn report_overlay(report: &mut crate::doctor_report::Report, origin: &InstallOrigin) -> bool {
     let (verify, reinstall): (&[&str], &str) = match origin {
-        InstallOrigin::Copr | InstallOrigin::LocalRpm(_) => {
+        InstallOrigin::Copr | InstallOrigin::CoprNightly | InstallOrigin::LocalRpm(_) => {
             (&["rpm", "-V", "irlume"], "sudo dnf reinstall irlume")
         }
-        InstallOrigin::Ppa | InstallOrigin::LocalDeb => (
+        InstallOrigin::Ppa | InstallOrigin::PpaNightly | InstallOrigin::LocalDeb => (
             &["dpkg", "--verify", "irlume"],
             "sudo apt install --reinstall irlume",
         ),
         InstallOrigin::ArchPkg => (&["pacman", "-Qkk", "irlume"], "sudo pacman -S irlume"),
+        // `-Qkk` resolves what irlume-git provides (ADR-0037).
+        InstallOrigin::ArchGit => (
+            &["pacman", "-Qkk", "irlume"],
+            "rebuild irlume-git (yay -S irlume-git)",
+        ),
         // No package to verify against; a source install IS the hand-install.
         InstallOrigin::Source => return false,
     };

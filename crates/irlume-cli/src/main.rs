@@ -5921,8 +5921,9 @@ fn doctor_run(
         irlume_common::platform::distro_family().as_str(),
     );
     let origin = commands::install_origin();
-    dout!(report, "[doctor] install origin: {}", origin.describe());
-    report.check_detail("install-origin", State::Info, origin.describe());
+    let origin_detail = commands::origin_detail(&origin);
+    dout!(report, "[doctor] install origin: {origin_detail}");
+    report.check_detail("install-origin", State::Info, origin_detail);
     // `irlume logs debug on` persists across reboots, and while it is on the
     // journal gets exact scores and liveness measurements.
     match logs::debug_state() {

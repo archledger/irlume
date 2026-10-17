@@ -102,6 +102,8 @@ newer build:
 - **PPA.** The same `describe` gives `0.15.0+git139.g3c162b83-0ppa1~resolute1`:
   `+git` sorts above the release's `0.15.0-0ppa1~resolute1`, and the commit
   count keeps each upload higher than the last, which Launchpad requires.
+  The `+git` form also names a nightly package on a machine whose installed
+  version the PPA has since removed (section 4).
 
 The AUR and PPA versions start from the last tag, not from `Cargo.toml`, so
 the release-preparation bump does not move a nightly above the release it
@@ -130,11 +132,15 @@ nothing on a nightly lane.
   `validpgpkeys`, so the source is fetched over HTTPS without a signature
   check. `scripts/arch-git-pkgbuild.py` generates it from the release
   recipe, and CI fails when the committed copy is stale.
+  The generator also writes the recipe's `.SRCINFO`, the metadata AUR
+  helpers and the AUR's RPC read for the split packages, dependencies,
+  `provides` and `conflicts`, with `makepkg --printsrcinfo` in a pinned Arch
+  container, and CI checks it too.
   An AUR helper builds from the AUR's own copy of the recipe, which only the
   maintainer's AUR key can update, so a change to `packaging/arch-git/`
   reaches users once the maintainer pushes it, as each release's AUR update
-  does today. A scheduled workflow compares the AUR's `PKGBUILD` with
-  `main`'s and fails when they differ, which `ci-alert.yml` turns into a
+  does today. A scheduled workflow compares the AUR's `PKGBUILD`,
+  `.SRCINFO` and `irlume.install` with `main`'s and fails when one differs, which `ci-alert.yml` turns into a
   `ci-alert` issue as for any failing scheduled workflow, so a recipe change
   on `main` is not left unpublished unseen.
 - **PPA.** `scripts/ppa-nightly.sh` runs from a user timer on minihost, which
@@ -171,6 +177,14 @@ nothing on a nightly lane.
   reports it unprotected), as it already signs that host's commits
   unattended, so the timer needs no cached passphrase; if the key gains one,
   signing fails and the night's upload is skipped and logged.
+  The script holds the key's use, so it does not run code it fetched: it is
+  installed from a reviewed checkout, not run from the clone it updates, and
+  code from `main` (the build scripts, `cargo vendor`, the model fetch) runs
+  only inside the build container, which is not given the key. Signing and
+  the upload run in containers of their own with fixed commands on the
+  built files, the signing one reaching the key only through gpg-agent's
+  extra socket, made for "signing data on a remote machine without exposing
+  the private keys" (GnuPG manual, `--extra-socket`).
 
 ### 4. irlume's tools know the channel
 
@@ -180,8 +194,10 @@ nothing on a nightly lane.
   "AUR irlume-git (nightly)", with the installed package version. The Copr
   lane is told by the package's `from_repo`; the PPA lane by the origin
   `apt-cache policy` lists for the installed version, matched as a whole path
-  segment, so neither PPA is mistaken for the other; the AUR lane by the name
-  `pacman -Qq irlume` prints. The support report gains the channel values
+  segment, so neither PPA is mistaken for the other, and, when the PPA has
+  since removed that version (a machine that missed several nightlies sees
+  it only at `/var/lib/dpkg/status`), by its `+git` version while the nightly
+  PPA is configured; the AUR lane by the name `pacman -Qq irlume` prints. The support report gains the channel values
   `fedora_copr_nightly`, `ubuntu_ppa_nightly` and `arch_git`.
 - `irlume update` on a nightly lane upgrades through that lane every time,
   since GitHub releases are not its gate: `dnf upgrade --refresh irlume` from
@@ -213,7 +229,9 @@ says so, and that:
 - leaving the channel returns to the release: `dnf copr disable
   archledger/irlume-nightly` then `dnf distro-sync irlume`; removing the
   nightly PPA then installing the release PPA's version with
-  `--allow-downgrades`; installing `irlume` from the AUR, which replaces
+  `--allow-downgrades`, with `irlume-kcm` in the same command when it is
+  installed, since it depends on the exact `irlume` version; installing
+  `irlume` from the AUR, which replaces
   `irlume-git`, in the same transaction as `irlume-kcm` when
   `irlume-kcm-git` is installed (`yay -S irlume irlume-kcm`), since each
   release package replaces only its own nightly counterpart.
@@ -264,7 +282,12 @@ These need the maintainer's accounts, and are done once:
   release Copr as before.
 - With a fake `apt-cache policy` listing only the nightly PPA for the
   installed version, `install-origin` names the nightly PPA; with only the
-  release PPA, the release PPA; uninstall removes only the PPA named.
+  release PPA, the release PPA; uninstall removes only the PPA named. A
+  nightly version listed only at `/var/lib/dpkg/status`, beside a newer
+  candidate from the nightly PPA and the release PPA's version, still reads
+  as the nightly PPA.
+- Leaving the nightly PPA names `irlume-kcm` in the downgrade command beside
+  `irlume`.
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
   names the AUR nightly package and uninstall removes `irlume-git` and, when
   installed, `irlume-kcm-git`.
@@ -292,5 +315,6 @@ These need the maintainer's accounts, and are done once:
   - after a failed build followed by a move of `main`, uploads the new
     version and drops the failed one;
   - records nothing when the build, the signature or dput fails.
-- The scheduled AUR drift check reports a `PKGBUILD` that differs from
-  `main`'s `packaging/arch-git/PKGBUILD`, and passes when they match.
+- The scheduled AUR drift check reports a `PKGBUILD`, `.SRCINFO` or
+  `irlume.install` that differs from `main`'s `packaging/arch-git/`, also a
+  stale `.SRCINFO` beside a current `PKGBUILD`, and passes when all match.

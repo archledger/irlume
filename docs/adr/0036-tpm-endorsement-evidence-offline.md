@@ -167,12 +167,16 @@ it cannot vouch for.
    NV chain indices and from irlume's list (section 5), up to a pinned root.
    The leaf must be an EK certificate by the Credential Profile (3.2): a
    critical Basic Constraints with `CA:FALSE`, the critical Key Usage the
-   profile sets for the EK's algorithm, a subject alternative name carrying
-   the TPM manufacturer attribute (critical when the subject is empty) whose
-   value equals `TPM_PT_MANUFACTURER`, and, when an Extended Key Usage is
-   present, `tcg-kp-EKCertificate` (2.23.133.8.1) in it. Each signature
-   verifies, and each CA has `CA:TRUE` with its path length and
-   `keyCertSign`. Every critical extension on the path must be one the
+   profile sets for the EK's algorithm, a subject alternative name (critical
+   when the subject is empty) carrying all three attributes the profile
+   requires there (3.2.9): the TPM manufacturer, whose value equals
+   `TPM_PT_MANUFACTURER`, the model and the firmware version, and, when an
+   Extended Key Usage is present, `tcg-kp-EKCertificate` (2.23.133.8.1) in
+   it. Each signature verifies, and each CA has `CA:TRUE` with its path
+   length and `keyCertSign`; a CA that carries an Extended Key Usage must
+   include `tcg-kp-EKCertificate` or `anyExtendedKeyUsage` in it, since an
+   issuing CA's Extended Key Usage limits what it may issue (Credential
+   Profile 3.2.16, RFC 5280 4.2.1.12). Every critical extension on the path must be one the
    verifier processes, as RFC 5280 (4.2) requires; a path with any other
    critical extension, such as name or policy constraints it does not
    implement, cannot be judged and reads `unknown`. Validity periods are reported, not enforced: EK and
@@ -252,8 +256,8 @@ irlumed's refusal reads as "irlumed predates the endorsement check"
   every intermediate chains to a listed root and that each file's SHA-256 is
   what the manifest records, and rewrites the directory and manifest. A
   refresh is a reviewed pull request; one before each release is the target.
-  A stale list makes a new intermediate read `info` (issuer not in irlume's
-  list), never `warn`.
+  A stale list makes a new intermediate read `unknown` (issuer not in
+  irlume's list), never `warn`.
 - A root or intermediate that expires stays listed, since the TPMs it
   certified stay in use (section 2.3).
 
@@ -333,8 +337,10 @@ check.
 - A leaf that is not an EK certificate is refused even when its key matches
   and its chain verifies: `CA:TRUE`, a missing or non-critical Basic
   Constraints, the wrong Key Usage, no TPM manufacturer attribute or one that
-  differs from `TPM_PT_MANUFACTURER`, or an Extended Key Usage without
-  `tcg-kp-EKCertificate`.
+  differs from `TPM_PT_MANUFACTURER`, no model or no firmware version
+  attribute, or an Extended Key Usage without `tcg-kp-EKCertificate`.
+- A path through an issuing CA whose Extended Key Usage leaves out both
+  `tcg-kp-EKCertificate` and `anyExtendedKeyUsage` is refused.
 - The chain reader joins the chain indices in order and finds every
   certificate when one index holds two and when one certificate continues
   into the next index.
@@ -363,12 +369,13 @@ check.
 - A certificate whose subject alternative name or CA name carries control
   characters or terminal sequences reaches doctor's output as visible ASCII
   on one bounded line.
-- On swtpm, with an EK certificate from `swtpm_setup --create-ek-cert`: the
-  check reads `unknown` (issuer not in irlume's list) with the shipped
-  anchors; with the test CA added as an anchor in the test only, it reads
-  `pass` and the same-TPM test succeeds against irlume's storage key; a
+- On swtpm, for an RSA EK (`swtpm_setup --create-ek-cert`, RSA by default)
+  and an ECC one (with `--ecc`) alike: the check reads `unknown` (issuer not
+  in irlume's list) with the shipped anchors; with the test CA added as an
+  anchor in the test only, it reads `pass` and the same-TPM test succeeds
+  against irlume's storage key, through RSA-OAEP and through ECDH; a
   credential bound to another key's Name fails with `TPM_RC_INTEGRITY`
-  (`warn`); with the endorsement authorization set, nothing is tried and the
+  (`warn`) on both; with the endorsement authorization set, nothing is tried and the
   check reads `unknown`; after the authorization is cleared in the same boot,
   the next request runs the test.
 - No doctor text, `--json` field or support report contains the EK public

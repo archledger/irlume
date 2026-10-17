@@ -15,7 +15,8 @@ All notable changes to irlume are documented here. This project adheres to
   reports two more cases:
   - a weak DA-exempt key, with why it is not replaced yet (update the TPM
     firmware first, or the replacement was refused and when irlumed tries
-    again) or that irlumed's next start replaces it;
+    again) or that irlumed's next start replaces it (while no envelope is
+    stored, the first start after one is);
   - a weak key that DA-exempt key superseded, with the envelopes still
     under it.
 

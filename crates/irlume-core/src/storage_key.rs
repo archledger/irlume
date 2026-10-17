@@ -472,9 +472,10 @@ fn checked_original(
 /// the TPM cannot be opened or read.
 pub fn report() -> Result<DaExemptKey> {
     let mut record = load_record();
+    let any_envelope = any_envelope()?;
     // With no envelope left a refusal concerns nothing, and irlumed's next
     // start clears it: a refused replacement goes with the refused persist.
-    if !any_envelope()? {
+    if !any_envelope {
         record.refused = None;
         record.replacement_refused = None;
     }
@@ -515,6 +516,7 @@ pub fn report() -> Result<DaExemptKey> {
             reason: refused.reason,
             detail: irlume_common::single_line(&refused.detail, MAX_DETAIL_CHARS),
         }),
+        any_envelope,
     })
 }
 
@@ -4406,8 +4408,11 @@ mod tests {
             .unwrap();
         let with = report();
         drop(sandbox);
-        assert_eq!(without.expect("the report").replacement_refused, None);
-        assert!(with.expect("the report").replacement_refused.is_some());
+        let (without, with) = (without.expect("the report"), with.expect("the report"));
+        assert_eq!(without.replacement_refused, None);
+        assert!(!without.any_envelope);
+        assert!(with.replacement_refused.is_some());
+        assert!(with.any_envelope);
     }
 
     /// The census of a superseded key's use, as condition 1 keeps it for the

@@ -265,6 +265,11 @@ pub struct DaExemptKey {
     /// irlumed tries again by the rules for the key itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_refused: Option<KeyRefusal>,
+    /// Whether any envelope is stored (a template key or a keyring secret,
+    /// readable or not): irlumed's start checks and replaces the DA-exempt
+    /// key only while one is, so until then new seals go under it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_envelope: bool,
 }
 
 /// The `storage_keys` part of a `TpmReadiness` reply from an irlumed that
@@ -554,6 +559,25 @@ mod tests {
         };
         let json = serde_json::to_string(&failed).unwrap();
         assert_eq!(serde_json::from_str::<DaExemptKey>(&json).unwrap(), failed);
+        // The replacement state round-trips, and an older irlumed's reply
+        // without it reads as no weak derivation, no refusal and no envelope.
+        let replacing = DaExemptKey {
+            derivation_weak: true,
+            replacement_refused: Some(KeyRefusal {
+                reason: RefusalReason::NoSpace,
+                detail: "no room".into(),
+            }),
+            any_envelope: true,
+            ..DaExemptKey::default()
+        };
+        let json = serde_json::to_string(&replacing).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DaExemptKey>(&json).unwrap(),
+            replacing
+        );
+        let older: DaExemptKey = serde_json::from_str("{}").unwrap();
+        assert!(!older.derivation_weak && !older.any_envelope);
+        assert_eq!(older.replacement_refused, None);
     }
 
     #[test]

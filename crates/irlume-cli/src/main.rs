@@ -4765,6 +4765,8 @@ fn storage_key_notes(
                      fingerprint (CVE-2017-15361)"
                 );
                 let refused = key.and_then(|key| key.replacement_refused.as_ref());
+                let firmware_weak =
+                    key.is_some_and(|key| key.derivation_weak) || derived == Some(DerivedKey::Same);
                 let note = if let Some(refused) = refused {
                     format!(
                         "{what}, and irlumed could not persist its replacement: {}. The weak \
@@ -4772,9 +4774,22 @@ fn storage_key_notes(
                         refusal_text(refused),
                         refused.reason.when_retried()
                     )
-                } else if key.is_some_and(|key| key.derivation_weak)
-                    || derived == Some(DerivedKey::Same)
-                {
+                } else if key.is_some_and(|key| !key.any_envelope) {
+                    // irlumed's start checks the key only while an envelope
+                    // is stored, so it promises nothing before one is.
+                    let then = if firmware_weak {
+                        "once the TPM firmware is updated with the machine vendor's tool, since \
+                         today's derivation of its template is weak too"
+                    } else {
+                        "onto a clean key when today's derivation of its template gives one"
+                    };
+                    format!(
+                        "{what}. No envelope is stored yet, so irlumed's start leaves it and new \
+                         seals go under it; the first start after one is made (`sudo systemctl \
+                         restart irlumed` after enrolling) replaces it by moving its envelopes, \
+                         {then}"
+                    )
+                } else if firmware_weak {
                     format!(
                         "{what}, and so does the key today's derivation of its template gives: \
                          update the TPM firmware with the machine vendor's tool. irlumed then \
@@ -7440,6 +7455,7 @@ mod tests {
                 handle: Some(0x8101_0003),
                 derivation_weak,
                 replacement_refused,
+                any_envelope: true,
                 ..Default::default()
             })
         };
@@ -7505,6 +7521,25 @@ mod tests {
             detail.contains("next start derives its template again"),
             "{detail}"
         );
+        // With no envelope stored, irlumed's start leaves the key: no
+        // promise of a replacement at the next start.
+        let empty = |derivation_weak| {
+            Ok(DaExemptKey {
+                handle: Some(0x8101_0003),
+                derivation_weak,
+                ..Default::default()
+            })
+        };
+        for derivation_weak in [false, true] {
+            let (state, detail) = report(vec![da_exempt(None)], empty(derivation_weak));
+            assert_eq!(state, State::Warn);
+            assert!(
+                detail.contains("No envelope is stored yet")
+                    && !detail.contains("replaces it at its next start")
+                    && detail.contains("update") == derivation_weak,
+                "{detail}"
+            );
+        }
         let refused = KeyRefusal {
             reason: RefusalReason::NoSpace,
             detail: "insufficient space\nforged".into(),

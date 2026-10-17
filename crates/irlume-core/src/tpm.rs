@@ -3208,6 +3208,117 @@ pub fn pcrlock_for_sealing() -> Option<u32> {
     (binding.rank > 0).then_some(binding.nv_index)
 }
 
+/// Whether [`seal`] takes the pcrlock rung on this boot, checked without
+/// sealing anything (#1077). The checks are what the seal's round trip
+/// unseals through:
+/// - a provisioned policy that binds firmware state ([`pcrlock_for_sealing`]);
+/// - its NV index defined;
+/// - a policy session that replays the predicted super-PCR policy against
+///   the live PCRs and passes `PolicyAuthorizeNV`, which accepts the session
+///   only when its digest is the policy the index holds.
+///
+/// `false` is where the seal falls back to the literal PCR policy: no such
+/// policy, a prediction no policy session can replay (a PCR no selection
+/// carries, such as 17 to 22, or more branches than one PolicyOR takes), no
+/// index, or a replay the TPM refuses as a mismatch (a stale index, PCRs no
+/// branch predicts, an owner authorization the empty one does not satisfy).
+/// Nothing is loaded, sealed or unsealed.
+///
+/// # Errors
+///
+/// When the TPM cannot be opened, its handles cannot be listed, a session
+/// cannot be started, or a policy command fails for another reason than a
+/// mismatch: a transport error, or a PCR that changed during the replay (a
+/// race the seal itself retries). The check then says nothing either way.
+pub fn pcrlock_seals_here() -> Result<bool> {
+    let Some(nv_index) = pcrlock_for_sealing() else {
+        return Ok(false);
+    };
+    // The seal reads the prediction and builds the same selections; one it
+    // cannot build fails there too, and the seal falls back.
+    let replayable = (|| -> Result<_> {
+        let super_pcr = build_super_pcr(&read_pcrlock_json()?)?;
+        let singles = if super_pcr.singles.is_empty() {
+            None
+        } else {
+            Some(pcr_selection(&super_pcr.singles)?)
+        };
+        let multis = super_pcr
+            .multis
+            .iter()
+            .map(|(pcr, branches)| Ok((pcr_selection(&[*pcr])?, digest_list(branches)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((singles, multis))
+    })();
+    let Ok((singles, multis)) = replayable else {
+        return Ok(false);
+    };
+    let mut ctx = open_context()?;
+    let wanted = TpmHandle::NvIndex(NvIndexTpmHandle::new(nv_index).map_err(tpm_err)?);
+    if !tpm_handle_exists(&mut ctx, TPM2_HR_NV_INDEX, wanted)? {
+        return Ok(false);
+    }
+    let nv = nv_index_handle(&mut ctx, nv_index)?;
+    with_session(&mut ctx, None, SessionType::Policy, |ctx, session| {
+        let policy = PolicySession::try_from(session).map_err(tpm_err)?;
+        let replayed = (|| -> std::result::Result<(), tss_esapi::Error> {
+            if let Some(singles) = singles {
+                ctx.policy_pcr(policy, Digest::default(), singles)?;
+            }
+            for (selection, branches) in multis {
+                ctx.policy_pcr(policy, Digest::default(), selection)?;
+                ctx.policy_or(policy, branches)?;
+            }
+            ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+                ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
+            })
+        })();
+        match replayed {
+            Ok(()) => Ok(true),
+            Err(e) if policy_refused(&e) => Ok(false),
+            Err(e) => Err(retryable_tpm_err(e)),
+        }
+    })
+}
+
+/// Whether a policy command failed because the policy is not satisfied, not
+/// because the TPM could not run it: PolicyOR with no matching branch, and
+/// PolicyAuthorizeNV over an index that does not hold the session's policy
+/// (TPM 2.0 Library Part 3, 23.6 and 23.22: `TPM_RC_VALUE`,
+/// `TPM_RC_NV_UNINITIALIZED`, `TPM_RC_NV_LOCKED`, `TPM_RC_INSUFFICIENT`,
+/// `TPM_RC_HASH`), or an owner authorization or NV access the empty one does
+/// not satisfy.
+fn policy_refused(e: &tss_esapi::Error) -> bool {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind as Kind;
+    matches!(
+        e,
+        tss_esapi::Error::Tss2Error(rc) if matches!(
+            rc.kind(),
+            Some(
+                Kind::Value
+                    | Kind::PolicyFail
+                    | Kind::NvUninitialized
+                    | Kind::NvLocked
+                    | Kind::NvAuthorization
+                    | Kind::Insufficient
+                    | Kind::Hash
+                    | Kind::AuthFail
+                    | Kind::BadAuth
+            )
+        )
+    )
+}
+
+/// The policy PCRs ([`policy_pcrs`]) a literal seal cannot bind: `IRLUME_PCRS`
+/// naming PCRs 17 to 22, or one past 23, which the seal refuses as
+/// unsupported. A configuration error, unlike a bank that cannot be read now.
+pub fn unsupported_policy_pcrs() -> Vec<u32> {
+    policy_pcrs()
+        .into_iter()
+        .filter(|&pcr| pcr_slot(pcr).is_err())
+        .collect()
+}
+
 /// Marker `policy_aware_err` embeds when it diagnoses PCR drift;
 /// [`is_pcr_mismatch`] keys on it, so the two stay in sync here.
 const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
@@ -3562,6 +3673,24 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
                 .nv_index,
             None
         );
+    }
+
+    /// #1077: only a policy the TPM refuses as unsatisfied reads as "the
+    /// pcrlock rung does not seal" (`TPM_RC_VALUE`, with or without a
+    /// parameter number, `POLICY_FAIL`, `NV_UNINITIALIZED`, `NV_LOCKED`,
+    /// `NV_AUTHORIZATION`, `INSUFFICIENT`, `HASH`, `AUTH_FAIL`, `BAD_AUTH`);
+    /// a PCR race, a retry, a TPM failure or a transport error says nothing.
+    #[test]
+    fn only_a_refused_policy_reads_as_not_sealing() {
+        let code = |rc: u32| tss_esapi::Error::Tss2Error(rc.into());
+        for refused in [
+            0x084, 0x1c4, 0x09d, 0x14a, 0x148, 0x149, 0x09a, 0x083, 0x08e, 0x0a2,
+        ] {
+            assert!(policy_refused(&code(refused)), "{refused:#x}");
+        }
+        for operational in [0x128, 0x922, 0x101, 0x000a_000a] {
+            assert!(!policy_refused(&code(operational)), "{operational:#x}");
+        }
     }
 
     /// The retry decision, as a value.
@@ -6823,6 +6952,41 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         assert_eq!(&*unseal(&ladder).expect("unseal the ladder seal"), secret);
     }
 
+    /// #1077: a prediction no policy session can replay (here PCR 18, which
+    /// no selection carries, beside a firmware PCR) cannot seal, so the
+    /// preflight must not exempt it. That is decided from the file, before
+    /// any TPM is opened.
+    #[test]
+    fn a_pcrlock_prediction_no_session_can_replay_does_not_seal() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = std::path::PathBuf::from(crate::test_tmp_dir("pcrlock-unreplayable"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("pcrlock.json");
+        let value = "ab".repeat(32);
+        std::fs::write(
+            &json,
+            format!(
+                r#"{{"pcrBank":"sha256","pcrValues":[{{"pcr":7,"values":["{value}"]}},{{"pcr":18,"values":["{value}"]}}],"nvIndex":27981881}}"#
+            ),
+        )
+        .unwrap();
+        let previous = std::env::var_os("IRLUME_PCRLOCK_JSON");
+        std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+        let usable = pcrlock_for_sealing();
+        let seals = pcrlock_seals_here();
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_PCRLOCK_JSON", value),
+            None => std::env::remove_var("IRLUME_PCRLOCK_JSON"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(usable.is_some(), "the file reads as a firmware policy");
+        assert!(!seals.expect("decided without a TPM"));
+    }
+
     /// Only a pcrlock policy covering a firmware-measured PCR is sealed under
     /// or counted as an upgrade: one over PCR 15 alone, as a real machine
     /// here provisioned, binds less than the literal PCR 7 seal.
@@ -7467,6 +7631,34 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // honest, since a fixture only this test's twin exercised would drift.
         let fixture = PcrlockFixture::provision(NV_INDEX);
 
+        // #1077: the enrollment preflight's check that the pcrlock rung seals
+        // on this boot, without sealing. True for the provisioned policy;
+        // false for one naming an index that is not defined (and, below, for
+        // a stale one).
+        let json = fixture.dir.join("pcrlock.json");
+        let firmware = std::fs::read_to_string(&json).unwrap();
+        let with_json = |text: &str, name: &str| {
+            let path = fixture.dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &path);
+            let answer = pcrlock_seals_here();
+            std::env::set_var("IRLUME_PCRLOCK_JSON", &json);
+            answer
+        };
+        assert!(
+            pcrlock_seals_here().expect("the pcrlock check"),
+            "a working policy"
+        );
+        let undefined = firmware.replace(
+            &format!("\"nvIndex\":{NV_INDEX}"),
+            &format!("\"nvIndex\":{}", NV_INDEX + 1),
+        );
+        assert_ne!(undefined, firmware);
+        assert!(
+            !with_json(&undefined, "undefined.json").expect("the pcrlock check"),
+            "an index that is not defined"
+        );
+
         // Round trip through the public Tier-2 entry points.
         let env = seal_with_pcrlock(secret, NV_INDEX).expect("pcrlock seal");
         assert!(matches!(env.policy, PolicyKind::PcrlockNv { .. }));
@@ -7501,6 +7693,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         .unwrap();
         drop(ctx);
         assert!(unseal(&env).is_err(), "stale policy must not unseal");
+        assert!(
+            !with_json(&firmware, "stale.json").expect("the pcrlock check"),
+            "a stale index: the seal would fall back to the literal policy"
+        );
 
         // Cleanup is the fixture's Drop, which also runs if an assertion above
         // fails; the hand-rolled version here did not.

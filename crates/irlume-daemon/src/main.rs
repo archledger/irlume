@@ -6258,6 +6258,21 @@ fn captures_enrollment(req: &Request) -> bool {
     )
 }
 
+/// Whether `req` adds to an existing enrollment: more scans (`AddScan`, or a
+/// guided session that improves one) or an added camera group, on any route.
+/// Its handler answers that the account `is not enrolled` for one with no
+/// enrollment, before any save.
+fn adds_to_enrollment(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::AddScan { .. }
+            | Request::AddCameraGroup { .. }
+            | Request::AddCameraGroupOn { .. }
+            | Request::AddSplitCameraGroupOn { .. }
+            | Request::EnrollmentSession { improve: true, .. }
+    )
+}
+
 /// The account whose enrollment `req` captures for, or frames for: a capture
 /// into an enrollment ([`captures_enrollment`]), or the enrollment guide's
 /// framing session or sample, which the TUI runs first with a camera open.
@@ -6274,21 +6289,40 @@ fn enrollment_capture_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str>
     }
 }
 
+/// The account an enrollment capture's seal is checked for before any camera
+/// opens ([`enrollment_capture_user`]), unless the request adds to an
+/// enrollment the account does not have ([`adds_to_enrollment`], and
+/// `irlume_core::storage::has_enrollment_for` is false: no profile, or one or
+/// its key recorded for another uid): that reaches no save, and its handler
+/// answers that the account is not enrolled (#1077).
+fn seal_preflight_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str> {
+    enrollment_capture_user(req, peer)
+        .filter(|user| !adds_to_enrollment(req) || irlume_core::storage::has_enrollment_for(user))
+}
+
 /// The refusal for an enrollment capture whose new template key could not be
-/// sealed: the account has no sealed key, no pcrlock policy may seal one, and
-/// the SHA-256 PCR bank has no value for a literal policy PCR, so the seal
-/// would refuse once the scans were taken (#1071;
+/// sealed: the account has no sealed key, the pcrlock policy does not seal on
+/// this boot, and the literal seal would refuse once the scans were taken,
+/// because the SHA-256 PCR bank has no value for a policy PCR (#1071) or
+/// `IRLUME_PCRS` names a PCR no seal can bind (#1077;
 /// `irlume_core::template_key::new_key_seal_blocked`). A bank that cannot be
 /// read refuses nothing; the seal then reports what it finds.
 fn enrollment_seal_refusal(
-    blocked: impl FnOnce() -> irlume_common::Result<Option<Vec<u32>>>,
+    blocked: impl FnOnce() -> irlume_common::Result<Option<irlume_core::template_key::SealBlocked>>,
 ) -> Option<String> {
+    use irlume_core::template_key::SealBlocked;
     match blocked() {
-        Ok(Some(pcrs)) => Some(format!(
+        Ok(Some(SealBlocked::MissingBank(pcrs))) => Some(format!(
             "enrollment refused before capture: the TPM's SHA-256 PCR bank has no value \
              for PCRs {pcrs:?}, so a template key cannot be sealed; activate the SHA-256 \
              bank in the firmware setup's TPM options (`sudo irlume doctor` reports \
              tpm-pcr-bank)"
+        )),
+        Ok(Some(SealBlocked::UnsupportedPcrs(pcrs))) => Some(format!(
+            "enrollment refused before capture: irlumed's IRLUME_PCRS names PCRs {pcrs:?}, \
+             which a template key cannot be sealed to (PCRs 17 to 22 and above 23 are not \
+             supported); set IRLUME_PCRS in irlumed's unit to supported PCRs, or remove it \
+             for the default, PCR 7"
         )),
         Ok(None) | Err(_) => None,
     }
@@ -9151,7 +9185,7 @@ fn dispatch_scoped_session_inner(
     // finish when the SHA-256 PCR bank cannot carry that seal. Refuse it, and
     // the enrollment guide's framing before it, before any camera opens rather
     // than after the scans.
-    if let Some(user) = enrollment_capture_user(&req, peer) {
+    if let Some(user) = seal_preflight_user(&req, peer) {
         if let Some(refusal) =
             enrollment_seal_refusal(|| irlume_core::template_key::new_key_seal_blocked(user))
         {
@@ -14307,9 +14341,16 @@ mod tests {
 
     #[test]
     fn only_a_blocked_new_key_seal_refuses_an_enrollment_capture() {
-        let refusal =
-            enrollment_seal_refusal(|| Ok(Some(vec![7]))).expect("a blocked seal refuses");
+        use irlume_core::template_key::SealBlocked;
+        let refusal = enrollment_seal_refusal(|| Ok(Some(SealBlocked::MissingBank(vec![7]))))
+            .expect("a blocked seal refuses");
         for needle in ["before capture", "PCRs [7]", "tpm-pcr-bank"] {
+            assert!(refusal.contains(needle), "{needle}: {refusal}");
+        }
+        // A policy PCR no seal can bind is a configuration error (#1077).
+        let refusal = enrollment_seal_refusal(|| Ok(Some(SealBlocked::UnsupportedPcrs(vec![17]))))
+            .expect("an unsupported PCR refuses");
+        for needle in ["before capture", "IRLUME_PCRS names PCRs [17]", "PCR 7"] {
             assert!(refusal.contains(needle), "{needle}: {refusal}");
         }
         assert_eq!(
@@ -14322,6 +14363,69 @@ mod tests {
             None,
             "an unread bank refuses nothing; the seal reports"
         );
+    }
+
+    /// #1077: a request that adds to an enrollment is checked only once the
+    /// account has one, so an account with none gets its handler's "not
+    /// enrolled"; a new enrollment, and the guide's framing, are checked
+    /// either way.
+    #[test]
+    fn the_seal_is_checked_only_for_a_request_that_can_reach_a_save() {
+        // The env lock is the passwd lock's writer side, so it covers the
+        // lookups `authorized_for` makes.
+        let _g = env_lock();
+        let sb = sandbox("seal-preflight-reaches-save");
+        let _ = &sb;
+        let adding: Vec<&str> = request_samples()
+            .iter()
+            .filter(|req| adds_to_enrollment(req))
+            .map(variant_name)
+            .collect();
+        for name in [
+            "AddScan",
+            "AddCameraGroup",
+            "AddCameraGroupOn",
+            "AddSplitCameraGroupOn",
+        ] {
+            assert!(adding.contains(&name), "{name}: {adding:?}");
+        }
+        let improve = |improve| Request::EnrollmentSession {
+            user: SAMPLE_USER.into(),
+            profile: Some("Face".into()),
+            scans: 3,
+            improve,
+        };
+        assert!(adds_to_enrollment(&improve(true)));
+        assert!(!adds_to_enrollment(&improve(false)));
+        let add_scan = Request::AddScan {
+            user: SAMPLE_USER.into(),
+            profile: "Face".into(),
+            scans: Some(3),
+            report_enrollment: false,
+        };
+        let enroll = Request::Enroll {
+            user: SAMPLE_USER.into(),
+            profile: None,
+            scans: Some(3),
+            reset: false,
+        };
+        let root = peer(0);
+        assert_eq!(seal_preflight_user(&add_scan, &root), None, "not enrolled");
+        assert_eq!(seal_preflight_user(&improve(true), &root), None);
+        assert_eq!(seal_preflight_user(&enroll, &root), Some(SAMPLE_USER));
+        assert_eq!(
+            seal_preflight_user(&improve(false), &root),
+            Some(SAMPLE_USER)
+        );
+        let profile = irlume_core::storage::profile_path(SAMPLE_USER);
+        std::fs::create_dir_all(profile.parent().expect("a state directory")).unwrap();
+        std::fs::write(&profile, b"{}").unwrap();
+        assert_eq!(seal_preflight_user(&add_scan, &root), Some(SAMPLE_USER));
+        assert_eq!(
+            seal_preflight_user(&improve(true), &root),
+            Some(SAMPLE_USER)
+        );
+        let _ = std::fs::remove_file(&profile);
     }
 
     /// The enrollment guide's framing is checked for its own account only, and

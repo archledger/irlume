@@ -384,10 +384,18 @@ All notable changes to irlume are documented here. This project adheres to
   framing guide on, more scans, an added camera, a split pair) is refused
   before any camera opens when it would seal a new template key under the
   literal PCR policy and the TPM's SHA-256 PCR bank has no value for a
-  configured PCR. That seal would refuse, and until now that showed only
-  after the scans. A sealed key the account keeps (one not recorded for
-  another uid), a provisioned pcrlock policy, or a bank that cannot be read
-  does not refuse; the seal still reports what it finds (#1071).
+  configured PCR, or when irlumed's `IRLUME_PCRS` names a PCR no seal can
+  bind (17 to 22, or above 23). That seal would refuse, and until now that
+  showed only after the scans. These do not refuse, and the seal still
+  reports what it finds (#1071, #1077):
+  - a sealed key the account keeps (one not recorded for another uid);
+  - a pcrlock policy that seals on this boot: its NV index defined, and a
+    policy session that replays it against the live PCRs passing
+    `PolicyAuthorizeNV`, checked without sealing anything;
+  - a bank that cannot be read.
+
+  More scans or an added camera for an account with no enrollment get that
+  request's "not enrolled" instead.
 
 - Split camera pairs use built-in cameras: both sides must report
   `removable: fixed`, as a Windows Hello sensor group requires, or the

@@ -215,23 +215,41 @@ pub fn has_key(user: &str) -> bool {
     key_path(user).exists()
 }
 
-/// The policy PCRs with no SHA-256 value when the next enrollment write for
-/// `user` would have to seal a new template key and that seal would refuse
-/// (#1071). `None` on a host without a TPM, when the write would keep the
-/// account's sealed key (`reusable_key`; it unseals under its own envelope's
-/// PCRs), when a provisioned pcrlock policy may seal the new key instead
-/// ([`tpm::seal`] tries it first), or when every literal policy PCR has a
-/// SHA-256 value. Reads the TPM only in the last case.
+/// Why the next enrollment write for an account could not seal the new
+/// template key it needs ([`new_key_seal_blocked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealBlocked {
+    /// The TPM's SHA-256 bank has no value for these literal policy PCRs
+    /// (#1071).
+    MissingBank(Vec<u32>),
+    /// `IRLUME_PCRS` names these PCRs, which no literal seal can bind
+    /// ([`tpm::unsupported_policy_pcrs`]): a configuration error (#1077).
+    UnsupportedPcrs(Vec<u32>),
+}
+
+/// Why the next enrollment write for `user` would refuse at its seal, when it
+/// would have to seal a new template key. `None`:
+/// - on a host without a TPM;
+/// - when the write would keep the account's sealed key (`reusable_key`; it
+///   unseals under its own envelope's PCRs);
+/// - when the provisioned pcrlock policy seals on this boot
+///   ([`tpm::pcrlock_seals_here`]; [`tpm::seal`] tries it first, and a check
+///   that cannot run counts as sealing, so the seal reports what it finds);
+/// - when every literal policy PCR is one a seal can bind and has a SHA-256
+///   value.
+///
+/// The bank is read only in the last case.
 ///
 /// # Errors
 /// Returns an error when the SHA-256 bank cannot be read.
-pub fn new_key_seal_blocked(user: &str) -> Result<Option<Vec<u32>>> {
+pub fn new_key_seal_blocked(user: &str) -> Result<Option<SealBlocked>> {
     if !tpm_available() {
         return Ok(None);
     }
     new_key_seal_blocked_with(
         reusable_key(user),
-        tpm::pcrlock_for_sealing().is_some(),
+        || tpm::pcrlock_seals_here().unwrap_or(true),
+        tpm::unsupported_policy_pcrs,
         tpm::pcr_bank_readiness,
     )
 }
@@ -249,14 +267,19 @@ fn reusable_key(user: &str) -> bool {
 
 fn new_key_seal_blocked_with(
     reuses_key: bool,
-    pcrlock: bool,
+    pcrlock_seals: impl FnOnce() -> bool,
+    unsupported: impl FnOnce() -> Vec<u32>,
     readiness: impl FnOnce() -> Result<tpm::PcrBankReadiness>,
-) -> Result<Option<Vec<u32>>> {
-    if reuses_key || pcrlock {
+) -> Result<Option<SealBlocked>> {
+    if reuses_key || pcrlock_seals() {
         return Ok(None);
     }
+    let unsupported = unsupported();
+    if !unsupported.is_empty() {
+        return Ok(Some(SealBlocked::UnsupportedPcrs(unsupported)));
+    }
     Ok(match readiness()? {
-        tpm::PcrBankReadiness::Missing(pcrs) => Some(pcrs),
+        tpm::PcrBankReadiness::Missing(pcrs) => Some(SealBlocked::MissingBank(pcrs)),
         tpm::PcrBankReadiness::Ready(_) | tpm::PcrBankReadiness::Unextended(_) => None,
     })
 }
@@ -1382,16 +1405,22 @@ mod tests {
             env.uid = uid;
             env.save(&key_path(user)).unwrap();
         };
-        let blocked =
-            || new_key_seal_blocked_with(reusable_key(user), false, || Ok(Missing(vec![7])));
+        let blocked = || {
+            new_key_seal_blocked_with(
+                reusable_key(user),
+                || false,
+                Vec::new,
+                || Ok(Missing(vec![7])),
+            )
+        };
         assert!(!reusable_key(user), "no key is stored");
-        assert_eq!(blocked().unwrap(), Some(vec![7]));
+        assert_eq!(blocked().unwrap(), Some(SealBlocked::MissingBank(vec![7])));
         write(Some(4141));
         assert!(
             !reusable_key(user),
             "a key sealed for the name's former uid is replaced"
         );
-        assert_eq!(blocked().unwrap(), Some(vec![7]));
+        assert_eq!(blocked().unwrap(), Some(SealBlocked::MissingBank(vec![7])));
         for uid in [Some(4142), None] {
             write(uid);
             assert!(reusable_key(user), "{uid:?}");
@@ -1406,24 +1435,47 @@ mod tests {
     #[test]
     fn a_new_key_seal_is_blocked_only_on_the_literal_path_with_a_missing_bank() {
         use tpm::PcrBankReadiness::{Missing, Ready, Unextended};
-        let never = || -> Result<tpm::PcrBankReadiness> { panic!("the TPM is not read") };
-        assert_eq!(new_key_seal_blocked_with(true, false, never).unwrap(), None);
-        assert_eq!(new_key_seal_blocked_with(false, true, never).unwrap(), None);
+        let never = || -> Result<tpm::PcrBankReadiness> { panic!("the bank is not read") };
+        let unchecked = || -> bool { panic!("the pcrlock route is not checked") };
+        let listed = || -> Vec<u32> { panic!("the policy PCRs are not listed") };
+        type Readiness = Box<dyn FnOnce() -> Result<tpm::PcrBankReadiness>>;
+        let blocked = |pcrlock: bool, unsupported: Vec<u32>, readiness: Readiness| {
+            new_key_seal_blocked_with(false, || pcrlock, || unsupported, readiness)
+        };
+        // A kept key needs no seal: nothing else is asked.
         assert_eq!(
-            new_key_seal_blocked_with(false, false, || Ok(Missing(vec![7]))).unwrap(),
-            Some(vec![7])
+            new_key_seal_blocked_with(true, unchecked, listed, never).unwrap(),
+            None
         );
+        // A pcrlock policy that seals on this boot takes the seal (#1077).
         assert_eq!(
-            new_key_seal_blocked_with(false, false, || Ok(Ready(vec![7]))).unwrap(),
+            new_key_seal_blocked_with(false, || true, listed, never).unwrap(),
             None
         );
         assert_eq!(
-            new_key_seal_blocked_with(false, false, || Ok(Unextended(vec![7]))).unwrap(),
+            blocked(false, Vec::new(), Box::new(|| Ok(Missing(vec![7])))).unwrap(),
+            Some(SealBlocked::MissingBank(vec![7])),
+            "one that does not leaves the literal seal"
+        );
+        // An unsupported policy PCR refuses before the bank is read (#1077).
+        assert_eq!(
+            blocked(false, vec![17], Box::new(never)).unwrap(),
+            Some(SealBlocked::UnsupportedPcrs(vec![17]))
+        );
+        assert_eq!(
+            blocked(false, Vec::new(), Box::new(|| Ok(Ready(vec![7])))).unwrap(),
             None
         );
-        assert!(
-            new_key_seal_blocked_with(false, false, || Err(Error::Tpm("busy".into()))).is_err()
+        assert_eq!(
+            blocked(false, Vec::new(), Box::new(|| Ok(Unextended(vec![7])))).unwrap(),
+            None
         );
+        assert!(blocked(
+            false,
+            Vec::new(),
+            Box::new(|| Err(Error::Tpm("busy".into())))
+        )
+        .is_err());
     }
 
     use super::*;

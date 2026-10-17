@@ -4706,9 +4706,10 @@ fn worse_state(
 /// refused) or that irlumed's next start replaces it; and each superseded
 /// key still persisted, with the envelopes that still name it, or, once none
 /// has named it since a start in an earlier boot, the manual command with
-/// its warning, since irlume never evicts a key no derivation gives. Nothing
-/// from an irlumed that predates the report. What irlumed sent is cleaned
-/// again.
+/// its warning, since irlume never evicts a key no derivation gives; a weak
+/// key in a role a newer irlumed added, with no command; and `unknown` when
+/// a current irlumed could not make the report. Nothing from an irlumed that
+/// predates the report. What irlumed sent is cleaned again.
 fn storage_key_notes(
     storage_keys: &Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>, String>,
     da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
@@ -4829,6 +4830,16 @@ fn storage_key_notes(
                 };
                 notes.push((state, note));
             }
+            // A role a newer irlumed added: what to do about it is that
+            // release's to say, but a weak key must not read as clean.
+            StorageKeyRole::Unknown if weak => notes.push((
+                State::Warn,
+                format!(
+                    "irlumed reports a storage key at {handle:#010x} (TPM name {name}), in a \
+                     role this irlume does not know, that carries the ROCA fingerprint \
+                     (CVE-2017-15361); update irlume to see what irlumed does about it"
+                ),
+            )),
             _ => {}
         }
     }
@@ -7518,6 +7529,20 @@ mod tests {
                 across,
             )
         };
+        // A role a newer irlumed added: a weak key warns, with no command.
+        let unknown = |check| entry(StorageKeyRole::Unknown, 0x8101_0006, check, 0, true);
+        let (state, detail) = report(vec![unknown(weak(0x8101_0006, None))], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("role this irlume does not know") && !detail.contains("evictcontrol"),
+            "{detail}"
+        );
+        let (state, detail) = report(vec![unknown(StorageKeyCheck::Clean)], key(false, None));
+        assert_eq!(
+            (state, detail),
+            tpm_firmware_check(&identity, &clean),
+            "a clean key in an unknown role adds nothing"
+        );
         const EVICT: &str = "sudo tpm2_evictcontrol -C o -c 0x81010004";
         let (state, detail) = report(vec![superseded(1, false)], key(false, None));
         assert_eq!(state, State::Warn);

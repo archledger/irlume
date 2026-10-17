@@ -35,8 +35,10 @@ the `Request::ListProfiles` doc in `crates/irlume-common/src/lib.rs`).
   clients), or the `wire_compatible` pattern of `IrOnlyReadiness`, where the
   old field carries a value old clients know and the precise one travels in a
   new field. Only `OutcomeCause`, `OperationErrorCode`, `IrOnlyReadiness`,
-  `IrScope`, `IrTargetIssue`, `LiveStage` and `LiveOperationKind` have the
-  `Unknown` arm; other reply enums, such as `KeyringSecretKind`, have none.
+  `IrScope`, `IrTargetIssue`, `LiveStage`, `LiveOperationKind`,
+  `StorageEncryption` and, in `TpmReadiness`, `OriginalKey`, `RetirementWait`,
+  `EnvelopeKind`, `RefusalReason` and `StorageKeyRole` have the `Unknown` arm;
+  other reply enums, such as `KeyringSecretKind`, have none.
 - Never add a field to a `#[serde(deny_unknown_fields)]` wire type
   (`EnrollmentDecision` in `crates/irlume-common/src/lib.rs`, the `*Wire` types
   in `crates/irlume-common/src/live_camera.rs`): an older peer rejects the whole

@@ -89,8 +89,11 @@ newer build. Right after a release that can be the release itself, for up to
 a day on the PPA, until the nightly built from its tag (the same code)
 publishes and moves past it; then the machine is on the nightly lane again.
 The channel's documentation therefore tells nightly users to enable the
-nightly lane alone, which always carries a build at least as new as the
-latest release within a day of it:
+nightly lane alone, which carries a build at least as new as the latest
+release within a day of it when the nightly of the release's tag builds;
+while that build fails, the nightly lane stays on the snapshot before the
+release until a retry or the next commit on `main` succeeds, which the
+uploader logs and the PPA page shows:
 
 - **Copr.** Packit's commit builds keep the spec's `Version` and append its
   default suffix to the Release, `{original_release_number}.{current_time}.
@@ -220,7 +223,10 @@ nothing on a nightly lane.
   `0.15.0+git...` and `0.15.0.r139.g...` compare as `0.15.0` against a
   release tag.
 - `irlume uninstall` removes the packages that are installed under their own
-  names (`irlume-git`, `irlume-kcm-git`) and the channel they came from: the
+  names: the one that provides `irlume` (`irlume` or `irlume-git`) and the
+  one that provides `irlume-kcm`, whichever it is, so the release KCM beside
+  `irlume-git` (its unversioned `depends=('irlume')` lets that pair form) is
+  removed with it, in one transaction; and the channel they came from: the
   nightly Copr repository or the nightly PPA, never the release one in their
   place.
 
@@ -307,7 +313,7 @@ These need the maintainer's accounts, and are done once:
   a machine that had only the nightly Copr returns to the release.
 - With a fake `pacman -Qq irlume` printing `irlume-git`, `install-origin`
   names the AUR nightly package and uninstall removes `irlume-git` and, when
-  installed, `irlume-kcm-git`.
+  installed, `irlume-kcm-git`, or the release `irlume-kcm` beside it.
 - On a nightly lane `irlume update` prints no "running binary" note, also
   when the crate version is `0.16.0` and the package version
   `0.15.0+git150.g...` (the release-preparation commit before its tag).

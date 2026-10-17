@@ -1875,7 +1875,7 @@ fn main() {
                             // request and let PAM fall back to the password, never
                             // unwind out of the worker and take down all face auth for
                             // every user.
-                            let mut delivery = Delivery::attached(&reply);
+                            let mut delivery = Delivery::attached(&reply, enqueued_at);
                             // The camera as sysfs describes it now, before the
                             // engine runs; the attempt is armed on the delivery
                             // outside the unwind boundary (ADR-0030 §5).
@@ -2714,6 +2714,11 @@ struct WorkerReply {
 struct Delivery<'a> {
     sender: Option<&'a std::sync::mpsc::Sender<WorkerReply>>,
     delivered: bool,
+    /// When the request was submitted to the worker, from which a request
+    /// that bounds its own work counts its deadline, so the time it queued
+    /// counts against its client's budget (`TpmEndorsement`). Tests count
+    /// from the dispatch.
+    submitted: Option<std::time::Instant>,
     /// The attempt to file with the reply (ADR-0030 §5), with the scope
     /// whose capture evidence it needs. Whichever sends the reply takes
     /// it — the early hook or the ordinary return path — and a panic finds
@@ -2729,14 +2734,19 @@ impl<'a> Delivery<'a> {
         Self {
             sender: None,
             delivered: false,
+            submitted: None,
             attempt: None,
         }
     }
 
-    fn attached(sender: &'a std::sync::mpsc::Sender<WorkerReply>) -> Self {
+    fn attached(
+        sender: &'a std::sync::mpsc::Sender<WorkerReply>,
+        submitted: std::time::Instant,
+    ) -> Self {
         Self {
             sender: Some(sender),
             delivered: false,
+            submitted: Some(submitted),
             attempt: None,
         }
     }
@@ -5138,6 +5148,17 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
             camera: NoCapture,
         },
+        // Reads the EK certificates and runs TPM2_ActivateCredential with
+        // the EK and irlume's storage key (ADR-0036 section 4): root only,
+        // like TpmReadiness. Nothing is persisted or written.
+        TpmEndorsement => RequestPosture {
+            user: None,
+            privilege: RootOnly {
+                command: "TPM endorsement",
+            },
+            enrollment: Reads,
+            camera: NoCapture,
+        },
         SplitStatus => RequestPosture {
             user: None,
             privilege: RootOnly {
@@ -6240,6 +6261,88 @@ fn tpm_readiness_report() -> Response {
         lockout: irlume_core::tpm::lockout_state().map_err(text),
         da_exempt_key: irlume_core::storage_key::report().map_err(text),
     }
+}
+
+/// The longest the kernel lets one TPM 2.0 command run: 300 s for
+/// TPM2_CreatePrimary, TPM2_Create and TPM2_CreateLoaded, which generate
+/// keys (`tpm2_ordinal_duration_map` in Linux's drivers/char/tpm/tpm2-cmd.c).
+const TPM_COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest the kernel lets the TPM2_FlushContext commands run that
+/// release what the check loaded after its deadline (at most a policy
+/// session, a derived EK and a derived storage key): each has the kernel's
+/// default limit, `TPM2_DURATION_DEFAULT`, 120 s (include/linux/tpm_command.h).
+/// They run even after the deadline, since a handle loaded through the raw
+/// device belongs to the chip until flushed (ADR-0026).
+const TPM_CLEANUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * 120);
+
+/// How often a TPM check reports the worker's progress while it runs: well
+/// inside the watchdog's no-progress interval (half of `WatchdogSec=90s`).
+const TPM_PROGRESS_BEAT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `tpm-endorsement` check (ADR-0036 sections 2 to 4), from the worker
+/// that serializes TPM use. No TPM command that does work starts after
+/// `deadline`; the flushes that release what the check loaded still run.
+///
+/// One command that derives an EK can outlast the watchdog's no-progress
+/// interval on a slow TPM, and a restart would not end it: the kernel runs
+/// it to completion, or times it out, before the TPM takes another. So the
+/// worker reports progress while the check runs, until the last command that
+/// may start (before `deadline`) has had [`TPM_COMMAND_LIMIT`] and the
+/// flushes after it [`TPM_CLEANUP_LIMIT`]; a worker still in the check after
+/// that reads as wedged.
+fn tpm_endorsement_report(deadline: std::time::Instant) -> Response {
+    use irlume_common::tpm_endorsement::EndorsementReport;
+    // An explicit transport is tried even with no standard device node, as
+    // for TpmReadiness.
+    if std::env::var_os("IRLUME_TCTI").is_none() && !irlume_core::template_key::tpm_available() {
+        return Response::TpmEndorsement(EndorsementReport::stopped("no TPM device"));
+    }
+    let bound = deadline + TPM_COMMAND_LIMIT + TPM_CLEANUP_LIMIT;
+    let report = reporting_progress_until(bound, TPM_PROGRESS_BEAT, || {
+        irlume_core::tpm::endorsement_report(irlume_core::ek_cert::Anchors::shipped(), &mut || {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            // Also here, in case the reporting thread could not start.
+            note_worker_progress();
+            true
+        })
+    });
+    Response::TpmEndorsement(report)
+}
+
+/// Run `work`, reporting the worker's progress every `beat` from a thread of
+/// its own until `work` returns or `until` passes, whichever is first.
+fn reporting_progress_until<T>(
+    until: std::time::Instant,
+    beat: std::time::Duration,
+    work: impl FnOnce() -> T,
+) -> T {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let reporter = std::thread::Builder::new()
+            .name("irlume-tpm-progress".into())
+            .spawn_scoped(scope, move || loop {
+                if std::time::Instant::now() >= until {
+                    return;
+                }
+                note_worker_progress();
+                if !matches!(
+                    finished.recv_timeout(beat),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            });
+        if let Err(e) = reporter {
+            jout_err!("irlumed: could not start the TPM progress reporter: {e}");
+        }
+        let result = work();
+        // Ends the reporter; the scope waits for it, so no report follows.
+        drop(done);
+        result
+    })
 }
 
 /// Whether `req` captures faces into an enrollment: a new one, more scans for
@@ -7853,6 +7956,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | PreferencesStatus
         | SealedStorage
         | TpmReadiness
+        | TpmEndorsement
         | LastAttempts { .. }
         | ListProfiles { .. }
         | DeleteProfile { .. }
@@ -9559,6 +9663,10 @@ fn dispatch_after_authorization(
             )
         }
         Request::TpmReadiness => tpm_readiness_report(),
+        Request::TpmEndorsement => tpm_endorsement_report(
+            delivery.submitted.unwrap_or_else(std::time::Instant::now)
+                + irlume_common::tpm_endorsement::DAEMON_DEADLINE,
+        ),
         Request::KeyringInfo { user } => keyring_info(&user, |env| {
             irlume_core::tpm::diagnose_pcrs(env)
                 .ok()
@@ -11793,7 +11901,7 @@ mod tests {
     #[test]
     fn early_delivery_sends_once_and_reports_absence_of_a_channel() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut delivery = Delivery::attached(&tx);
+        let mut delivery = Delivery::attached(&tx, std::time::Instant::now());
         assert!(!delivery.delivered);
         assert!(delivery.send(plain_reply("first")));
         assert!(delivery.delivered);
@@ -11818,7 +11926,7 @@ mod tests {
     fn early_delivery_on_a_closed_channel_is_not_counted_as_delivered() {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerReply>();
         drop(rx);
-        let mut delivery = Delivery::attached(&tx);
+        let mut delivery = Delivery::attached(&tx, std::time::Instant::now());
         assert!(!delivery.send(plain_reply("orphaned")));
         assert!(!delivery.delivered);
     }
@@ -14091,6 +14199,7 @@ mod tests {
         PreferencesStatus => Request::PreferencesStatus,
         SealedStorage => Request::SealedStorage,
         TpmReadiness => Request::TpmReadiness,
+        TpmEndorsement => Request::TpmEndorsement,
         SelfTest => Request::SelfTest {
             kind: irlume_common::SelfTestKind::Liveness,
         },
@@ -14302,6 +14411,105 @@ mod tests {
             "{lockout:?}"
         );
         assert!(!lockout.storage_key_no_da, "{lockout:?}");
+    }
+
+    /// ADR-0036 section 4: the endorsement check is root only, and a host
+    /// without a TPM device answers it `unknown` without opening one.
+    #[test]
+    fn the_tpm_endorsement_check_is_root_only_and_reads_no_absent_tpm() {
+        let _passwd = passwd_lock();
+        match pregate(&Request::TpmEndorsement, &peer(1000)) {
+            Some(Response::Error(error)) => {
+                assert_eq!(error, "TPM endorsement requires root (peer uid 1000)");
+            }
+            other => panic!("a non-root peer is refused: {other:?}"),
+        }
+        assert!(pregate(&Request::TpmEndorsement, &peer(0)).is_none());
+        if std::env::var_os("IRLUME_TCTI").is_none() && !irlume_core::template_key::tpm_available()
+        {
+            let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+            let Response::TpmEndorsement(report) = tpm_endorsement_report(far) else {
+                panic!("a TpmEndorsement reply");
+            };
+            assert_eq!(
+                report,
+                irlume_common::tpm_endorsement::EndorsementReport::stopped("no TPM device")
+            );
+        }
+    }
+
+    /// ADR-0036 section 4 against a software TPM: once the deadline has
+    /// passed no TPM command is sent and the check reads `unknown`; with time
+    /// left it reads the swtpm, which stores no EK certificate (`info`).
+    #[test]
+    #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
+    fn tpm_endorsement_report_keeps_its_deadline_and_notes_progress() {
+        use irlume_common::tpm_endorsement::{EndorsementState, DAEMON_DEADLINE};
+        let _g = env_lock();
+        let _clock = worker_clock_lock();
+        assert!(
+            std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
+            "this test only runs against swtpm"
+        );
+        let Response::TpmEndorsement(late) = tpm_endorsement_report(std::time::Instant::now())
+        else {
+            panic!("a TpmEndorsement reply");
+        };
+        assert_eq!(late.state, EndorsementState::Unknown, "{late:?}");
+        assert!(
+            late.stopped
+                .as_deref()
+                .is_some_and(|why| why.contains("ran out of time")),
+            "{late:?}"
+        );
+
+        note_worker_idle();
+        let Response::TpmEndorsement(report) =
+            tpm_endorsement_report(std::time::Instant::now() + DAEMON_DEADLINE)
+        else {
+            panic!("a TpmEndorsement reply");
+        };
+        let noted = worker_wedged(std::time::Duration::ZERO);
+        note_worker_idle();
+        assert_eq!(report.state, EndorsementState::Info, "{report:?}");
+        assert!(report.certificates.is_empty() && report.stopped.is_none());
+        assert!(noted, "the check reports the worker's progress");
+    }
+
+    /// A TPM check reports the worker's progress while it runs, not after it
+    /// returns, and not past its bound, so the watchdog still sees a worker
+    /// stuck longer than the kernel lets a TPM command run.
+    #[test]
+    fn a_tpm_check_reports_progress_while_it_runs_and_within_its_bound() {
+        let _clock = worker_clock_lock();
+        let beat = std::time::Duration::from_millis(10);
+        let wait = || std::thread::sleep(beat * 10);
+        let reported = || worker_wedged(std::time::Duration::ZERO);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let during = reporting_progress_until(far, beat, || {
+            note_worker_idle();
+            // A loaded runner may schedule the reporter late; it has 5 s.
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !reported() && std::time::Instant::now() < give_up {
+                std::thread::sleep(beat);
+            }
+            reported()
+        });
+        assert!(during, "progress is reported while the check runs");
+        note_worker_idle();
+        wait();
+        assert!(!reported(), "and nothing after it returned");
+
+        let passed = std::time::Instant::now();
+        let beyond = reporting_progress_until(passed, beat, || {
+            note_worker_idle();
+            wait();
+            reported()
+        });
+        assert!(!beyond, "nothing past the bound");
+        assert_eq!(reporting_progress_until(far, beat, || 7), 7);
+        note_worker_idle();
     }
 
     /// The early TPM refusal covers exactly the captures into an enrollment,
@@ -17031,8 +17239,10 @@ mod tests {
         // one command at a time, so it serves from the worker with the
         // other TPM users, not from a connection thread.
         assert_eq!(classify(&Request::KeyringInfo { user: u() }), Class::Plain);
-        // So does the TPM readiness report doctor asks for.
+        // So does the TPM readiness report doctor asks for, and the
+        // endorsement check.
         assert_eq!(classify(&Request::TpmReadiness), Class::Plain);
+        assert_eq!(classify(&Request::TpmEndorsement), Class::Plain);
         for req in [
             Request::CaptureEarMedian { user: u() },
             Request::SetClosureCalibration {

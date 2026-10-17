@@ -175,6 +175,7 @@ pub fn classify(req: &Request) -> Class {
         FaceSensorStatus { user: Some(_) }
         | SealPassword { .. }
         | TpmReadiness
+        | TpmEndorsement
         | KeyringInfo { .. }
         | ForgetPassword { .. }
         | ReleaseTokenForDisarm { .. }

@@ -90,6 +90,7 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         | Request::PreferencesStatus
         | Request::SealedStorage
         | Request::TpmReadiness
+        | Request::TpmEndorsement
         | Request::SelfTest { .. }
         | Request::ListCameras
         | Request::CameraDiagnostics

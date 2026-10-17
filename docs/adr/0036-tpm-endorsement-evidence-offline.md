@@ -491,6 +491,44 @@ sections 2 to 4 left open:
   and AES-256). They run on a swtpm of their own, and the lockout test on
   another, since its lockout outlasts the run.
 
+## Amendment 2026-10-17: Phase 2b request
+
+irlumed's `TpmEndorsement` request (section 4) is wired as follows:
+
+- **Wire.** `Request::TpmEndorsement` is a unit variant; the reply is
+  `Response::TpmEndorsement`, carrying the report of the Phase 2 amendment.
+  An older irlumed answers `Error("bad request")`, which Phase 3's doctor
+  reads as "irlumed predates the endorsement check".
+- **Posture.** Root only ("TPM endorsement requires root"), no target
+  account, no enrollment effect, no camera, no OS approval. It is a `Plain`
+  request: it runs on the worker with the other TPM users, never on a
+  connection thread, and live status does not register it (an observer
+  read), as for `TpmReadiness`.
+- **Budget.** A client waits up to 60 seconds
+  (`tpm_endorsement::CLIENT_BUDGET`). irlumed starts no TPM command that
+  does work later than 45 seconds (`DAEMON_DEADLINE`) after the request
+  reached the worker's queue, so time spent queued behind an authentication
+  counts. The flushes that release what the check loaded (at most a policy
+  session, a derived EK and a derived storage key) still run after it: a
+  handle loaded through the raw device belongs to the chip until flushed
+  (ADR-0026). The other 15 seconds cover one slow command still running,
+  those flushes and the reply.
+- **No device.** Without `IRLUME_TCTI` and with no TPM device node, the
+  reply is `unknown` ("no TPM device") without opening a transport, as for
+  `TpmReadiness`.
+- **Watchdog.** irlumed's watchdog takes a worker that reports no progress
+  for 45 seconds (half of `WatchdogSec=90s`) as wedged, and systemd then
+  restarts irlumed. One command that derives an RSA EK can take longer: the
+  kernel allows TPM2_CreatePrimary 300 seconds
+  (`tpm2_ordinal_duration_map` in drivers/char/tpm/tpm2-cmd.c), and a
+  restart would not end it, since the kernel finishes the command before
+  the TPM takes another. So while the check runs, a thread of its own
+  reports the worker's progress every 5 seconds, until the deadline plus
+  those 300 seconds plus 360 for the three flushes, each limited to the
+  kernel's default of 120 seconds (`TPM2_DURATION_DEFAULT` in
+  include/linux/tpm_command.h). A worker still in the check after that
+  reads as wedged.
+
 ## Acceptance tests
 
 - The verifier accepts a generated chain (root, intermediate, EK certificate)

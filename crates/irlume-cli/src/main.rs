@@ -5072,11 +5072,14 @@ fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, Stri
     };
     let why = match irlume_common::event_log::verified_pcr7(bytes, value) {
         Ok(pcr7) => return pcr7_binding_verdict(&pcr7),
-        Err(Untrusted::NotCryptoAgile) => {
-            "the firmware event log is not in the crypto-agile format".to_owned()
-        }
+        Err(Untrusted::NotCryptoAgile) => "the firmware event log is not in the crypto-agile \
+                                           format, or its Spec ID header is not one that \
+                                           format allows"
+            .to_owned(),
         Err(Untrusted::Incomplete) => "the firmware event log ends in an event that does not \
-                                       parse, so the events after it are unread"
+                                       parse (one that runs past the end, or does not carry \
+                                       one digest for each algorithm the log declares), so \
+                                       the events after it are unread"
             .to_owned(),
         Err(Untrusted::NoSha256) => "a PCR 7 event in the firmware event log carries no \
                                      SHA-256 digest, so the log cannot be checked against \
@@ -5092,9 +5095,10 @@ fn pcr7_binding_check(read: &EventLogRead) -> (crate::doctor_report::State, Stri
              digest, so the log does not show what PCR 7 was extended with"
         ),
         Err(Untrusted::Malformed(count)) => format!(
-            "{count} PCR 7 configuration or authority event(s) in the firmware event log do \
-             not parse as UEFI variable data, so the log does not show what PCR 7 was \
-             extended with"
+            "{count} PCR 7 event(s) in the firmware event log do not have the form their type \
+             requires (UEFI variable data for a configuration or authority event, a 4-byte \
+             0, 1 or all ones for a separator, 0 or 1 for SecureBoot), so the log does not \
+             show what PCR 7 was extended with"
         ),
     };
     (State::Unknown, why)
@@ -5119,6 +5123,15 @@ fn pcr7_binding_verdict(
     const AFTER: &str = "Turn it back on in the firmware setup. That changes PCR 7, so set a \
                          recovery passphrase first (`irlume recovery setup`)";
     use irlume_common::event_log::SECURE_BOOT_CONFIGURATION;
+    if pcr7.separator_errors > 0 {
+        return (
+            State::Warn,
+            "the firmware recorded a measurement error in PCR 7 (a separator of 1, not 0), \
+             so what it measured there may be incomplete and PCR 7 may not show what \
+             booted"
+                .to_owned(),
+        );
+    }
     if pcr7.actions.iter().any(|a| a == "UEFI Debug Mode") {
         return (
             State::Warn,
@@ -5142,8 +5155,9 @@ fn pcr7_binding_verdict(
     if pcr7.secure_boot == Some(false) {
         return (
             State::Warn,
-            "Secure Boot was measured as off, so PCR 7 binds no signature check and a \
-             seal bound to it does not depend on what boots"
+            "Secure Boot was measured as off (or its SecureBoot variable as absent), so \
+             PCR 7 binds no signature check and a seal bound to it does not depend on \
+             what boots"
                 .to_owned(),
         );
     }
@@ -5247,6 +5261,33 @@ fn pcr7_binding_verdict(
             )
         };
         return (State::Warn, detail);
+    }
+    if pcr7.extraneous > 0 {
+        return (
+            State::Warn,
+            format!(
+                "the firmware measured {} image or driver load(s) into PCR 7, which \
+                 Microsoft's guidance calls extraneous there: PCR 7 then changes whenever \
+                 those binaries do, and BitLocker does not bind to it over such a log",
+                pcr7.extraneous
+            ),
+        );
+    }
+    if pcr7.other > 0 {
+        let kinds: Vec<String> = pcr7
+            .other_kinds
+            .iter()
+            .map(|kind| format!("{kind:#010x}"))
+            .collect();
+        return (
+            State::Unknown,
+            format!(
+                "PCR 7 also holds {} event(s) of a type doctor does not read ({}), so what \
+                 PCR 7 binds is not fully known",
+                pcr7.other,
+                kinds.join(", ")
+            ),
+        );
     }
     // Firmware decides how many authorities there are: name at most eight.
     const MAX_NAMES: usize = 8;
@@ -8081,6 +8122,10 @@ mod tests {
                 },
             ],
             actions: vec![],
+            separator_errors: 0,
+            extraneous: 0,
+            other: 0,
+            other_kinds: vec![],
             unverified: 0,
             malformed: 0,
         };
@@ -8105,6 +8150,31 @@ mod tests {
             assert_eq!(state, State::Warn, "{action}");
             assert!(detail.contains(needle) && detail.contains("`irlume recovery setup`"));
         }
+        // A separator the firmware recorded as a measurement error.
+        let mut error = shim();
+        error.separator_errors = 1;
+        let (state, detail) = pcr7_binding_verdict(&error);
+        assert_eq!(state, State::Warn);
+        assert!(detail.contains("measurement error in PCR 7"), "{detail}");
+        // An image or driver load in PCR 7 is extraneous there.
+        let mut loaded = shim();
+        loaded.extraneous = 2;
+        let (state, detail) = pcr7_binding_verdict(&loaded);
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("2 image or driver load(s) into PCR 7"),
+            "{detail}"
+        );
+        // An event of a type doctor does not read leaves PCR 7 unknown.
+        let mut spdm = shim();
+        spdm.other = 3;
+        spdm.other_kinds = vec![0x8000_00e3, 0x8000_00e4];
+        let (state, detail) = pcr7_binding_verdict(&spdm);
+        assert_eq!(state, State::Unknown);
+        assert!(
+            detail.contains("3 event(s) of a type doctor does not read (0x800000e3, 0x800000e4)"),
+            "{detail}"
+        );
         let mut off = shim();
         off.secure_boot = Some(false);
         off.configuration[0].data = false;

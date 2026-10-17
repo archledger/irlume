@@ -317,6 +317,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
+  strictly (#1081). It now judges these cases:
+  - A separator that records a measurement error (1) is a `warn`; one that
+    is not a 4-byte 0, 1 or all ones is malformed.
+  - An image or driver load measured into PCR 7, extraneous under
+    Microsoft's PCR 7 guidance, is a `warn`.
+  - A PCR 7 event of a type doctor does not read, such as SPDM device
+    policy or authority, is `unknown`, named by type.
+  - A Spec ID header must give version 2.0 or later, a UINTN size of 1 or
+    2, and at least one algorithm, each once.
+  - Every event must carry one digest per declared algorithm, in any
+    order, as the kernel also requires.
+  - SecureBoot must be one byte, 0 or 1; one measured with no data, as
+    EDK2 measures an absent variable, reads as off.
+
 - `deny.toml` suppresses RUSTSEC-2026-0367, 0368 and 0369, three
   extraction flaws in `zip` 8.6.0 (#1103). `zip` is only a build
   dependency of `edgefirst-tflite-sys` 0.10.3, whose build script extracts

@@ -6268,19 +6268,29 @@ fn tpm_readiness_report() -> Response {
 /// keys (`tpm2_ordinal_duration_map` in Linux's drivers/char/tpm/tpm2-cmd.c).
 const TPM_COMMAND_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The longest the kernel lets the TPM2_FlushContext commands run that
+/// release what the check loaded after its deadline (at most a policy
+/// session, a derived EK and a derived storage key): each has the kernel's
+/// default limit, `TPM2_DURATION_DEFAULT`, 120 s (include/linux/tpm_command.h).
+/// They run even after the deadline, since a handle loaded through the raw
+/// device belongs to the chip until flushed (ADR-0026).
+const TPM_CLEANUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(3 * 120);
+
 /// How often a TPM check reports the worker's progress while it runs: well
 /// inside the watchdog's no-progress interval (half of `WatchdogSec=90s`).
 const TPM_PROGRESS_BEAT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `tpm-endorsement` check (ADR-0036 sections 2 to 4), from the worker
-/// that serializes TPM use. No TPM command starts after `deadline`.
+/// that serializes TPM use. No TPM command that does work starts after
+/// `deadline`; the flushes that release what the check loaded still run.
 ///
 /// One command that derives an EK can outlast the watchdog's no-progress
 /// interval on a slow TPM, and a restart would not end it: the kernel runs
 /// it to completion, or times it out, before the TPM takes another. So the
 /// worker reports progress while the check runs, until the last command that
-/// may start (before `deadline`) has had [`TPM_COMMAND_LIMIT`]; a worker
-/// still in the check after that reads as wedged.
+/// may start (before `deadline`) has had [`TPM_COMMAND_LIMIT`] and the
+/// flushes after it [`TPM_CLEANUP_LIMIT`]; a worker still in the check after
+/// that reads as wedged.
 fn tpm_endorsement_report(deadline: std::time::Instant) -> Response {
     use irlume_common::tpm_endorsement::EndorsementReport;
     // An explicit transport is tried even with no standard device node, as
@@ -6288,7 +6298,8 @@ fn tpm_endorsement_report(deadline: std::time::Instant) -> Response {
     if std::env::var_os("IRLUME_TCTI").is_none() && !irlume_core::template_key::tpm_available() {
         return Response::TpmEndorsement(EndorsementReport::stopped("no TPM device"));
     }
-    let report = reporting_progress_until(deadline + TPM_COMMAND_LIMIT, TPM_PROGRESS_BEAT, || {
+    let bound = deadline + TPM_COMMAND_LIMIT + TPM_CLEANUP_LIMIT;
+    let report = reporting_progress_until(bound, TPM_PROGRESS_BEAT, || {
         irlume_core::tpm::endorsement_report(irlume_core::ek_cert::Anchors::shipped(), &mut || {
             if std::time::Instant::now() >= deadline {
                 return false;

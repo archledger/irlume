@@ -1018,10 +1018,11 @@ pub enum Request {
     /// certificate the TPM stores verifies to a vendor CA irlume pins, is for
     /// this TPM's endorsement key, and whether irlume's storage key is in
     /// the same TPM. Read-only; answered from the worker with the other TPM
-    /// users, which stops sending TPM commands
-    /// [`tpm_endorsement::DAEMON_DEADLINE`] after the request reached it, so
-    /// a client waits up to [`tpm_endorsement::CLIENT_BUDGET`]. Root only. An
-    /// older daemon answers `Error("bad request")`.
+    /// users, which starts no TPM command that does work later than
+    /// [`tpm_endorsement::DAEMON_DEADLINE`] after the request reached it
+    /// (releasing what it loaded still runs), so a client waits up to
+    /// [`tpm_endorsement::CLIENT_BUDGET`]. Root only. An older daemon answers
+    /// `Error("bad request")`.
     TpmEndorsement,
     /// Describe `user`'s sealed-password envelope: whether one is armed and,
     /// when it is, the policy tier, bound PCRs, and live PCR drift. The richer

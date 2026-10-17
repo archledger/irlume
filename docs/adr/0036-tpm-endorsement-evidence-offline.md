@@ -505,10 +505,14 @@ irlumed's `TpmEndorsement` request (section 4) is wired as follows:
   connection thread, and live status does not register it (an observer
   read), as for `TpmReadiness`.
 - **Budget.** A client waits up to 60 seconds
-  (`tpm_endorsement::CLIENT_BUDGET`). irlumed sends no TPM command later
-  than 45 seconds (`DAEMON_DEADLINE`) after the request reached the worker's
-  queue, so time spent queued behind an authentication counts. The other
-  15 seconds cover one slow command still running and the reply.
+  (`tpm_endorsement::CLIENT_BUDGET`). irlumed starts no TPM command that
+  does work later than 45 seconds (`DAEMON_DEADLINE`) after the request
+  reached the worker's queue, so time spent queued behind an authentication
+  counts. The flushes that release what the check loaded (at most a policy
+  session, a derived EK and a derived storage key) still run after it: a
+  handle loaded through the raw device belongs to the chip until flushed
+  (ADR-0026). The other 15 seconds cover one slow command still running,
+  those flushes and the reply.
 - **No device.** Without `IRLUME_TCTI` and with no TPM device node, the
   reply is `unknown` ("no TPM device") without opening a transport, as for
   `TpmReadiness`.
@@ -520,8 +524,10 @@ irlumed's `TpmEndorsement` request (section 4) is wired as follows:
   restart would not end it, since the kernel finishes the command before
   the TPM takes another. So while the check runs, a thread of its own
   reports the worker's progress every 5 seconds, until the deadline plus
-  those 300 seconds. A worker still in the check after that reads as
-  wedged.
+  those 300 seconds plus 360 for the three flushes, each limited to the
+  kernel's default of 120 seconds (`TPM2_DURATION_DEFAULT` in
+  include/linux/tpm_command.h). A worker still in the check after that
+  reads as wedged.
 
 ## Acceptance tests
 

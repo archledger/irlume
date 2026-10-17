@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 pub const CLIENT_BUDGET: Duration = Duration::from_secs(60);
 
 /// How long irlumed lets the check run, from the request's submission to
-/// its worker: after that it sends no further TPM command and answers
-/// `unknown`. The rest of [`CLIENT_BUDGET`] covers the one slow command
-/// that may still be running and the reply.
+/// its worker: after that it starts no TPM command that does work, releases
+/// what it loaded (at most three TPM2_FlushContext) and answers `unknown`.
+/// The rest of [`CLIENT_BUDGET`] covers the one slow command that may still
+/// be running, those flushes and the reply.
 pub const DAEMON_DEADLINE: Duration = Duration::from_secs(45);
 
 /// The check's result, or one certificate's: worst first `warn`, then

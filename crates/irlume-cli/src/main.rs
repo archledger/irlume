@@ -4714,9 +4714,24 @@ fn storage_key_notes(
     da_exempt_key: &Result<irlume_common::tpm_readiness::DaExemptKey, String>,
 ) -> Vec<(crate::doctor_report::State, String)> {
     use crate::doctor_report::State;
-    use irlume_common::tpm_readiness::{DerivedKey, StorageKeyCheck, StorageKeyRole};
-    let Ok(entries) = storage_keys else {
-        return Vec::new();
+    use irlume_common::tpm_readiness::{
+        DerivedKey, StorageKeyCheck, StorageKeyRole, STORAGE_KEYS_NOT_REPORTED,
+    };
+    let entries = match storage_keys {
+        Ok(entries) => entries,
+        // An older irlumed reports the original key alone, as before.
+        Err(e) if e == STORAGE_KEYS_NOT_REPORTED => return Vec::new(),
+        // A current one that could not check the others must not read as
+        // clean for them.
+        Err(e) => {
+            return vec![(
+                State::Unknown,
+                format!(
+                    "irlumed could not check irlume's DA-exempt and superseded storage keys: {}",
+                    irlume_common::single_line(e, 300)
+                ),
+            )]
+        }
     };
     let key = da_exempt_key.as_ref().ok();
     const ON_IRLUMES_TPM: &str =
@@ -4772,8 +4787,9 @@ fn storage_key_notes(
                     )
                 } else {
                     format!(
-                        "{what}, and irlumed could not compare it with today's derivation of \
-                         its template; update the TPM firmware with the machine vendor's tool"
+                        "{what}. irlumed's next start derives its template again and replaces \
+                         it by moving its envelopes when that gives a clean key; when it is \
+                         weak too, update the TPM firmware with the machine vendor's tool"
                     )
                 };
                 notes.push((State::Warn, note));
@@ -7442,6 +7458,18 @@ mod tests {
             &key(false, None),
         );
         assert_eq!(older, tpm_firmware_check(&identity, &clean));
+        // A current irlumed that could not check them does not read as clean.
+        let (state, detail) = tpm_firmware_report(
+            &identity,
+            &clean,
+            &Err("the keyring store could not be read\nforged".into()),
+            &key(false, None),
+        );
+        assert_eq!(state, State::Unknown);
+        assert!(
+            detail.contains("could not check") && !detail.contains('\n'),
+            "{detail}"
+        );
 
         let da_exempt = |derived| {
             entry(
@@ -7460,6 +7488,12 @@ mod tests {
             key(false, None),
         );
         assert!(detail.contains("replaces it at its next start"), "{detail}");
+        let (state, detail) = report(vec![da_exempt(None)], key(false, None));
+        assert_eq!(state, State::Warn);
+        assert!(
+            detail.contains("next start derives its template again"),
+            "{detail}"
+        );
         let refused = KeyRefusal {
             reason: RefusalReason::NoSpace,
             detail: "insufficient space\nforged".into(),

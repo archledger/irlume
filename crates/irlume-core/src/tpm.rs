@@ -568,15 +568,11 @@ pub fn storage_key_check() -> Result<StorageKeyCheck> {
 /// The ROCA check of a DA-exempt key at `handle` whose TPM name the record
 /// keeps as `name` (ADR-0034, Phase 3 amendment, #1073 item 2): the recorded
 /// key, or one it superseded. [`StorageKeyCheck::Absent`] when the handle is
-/// free or holds another key. With `compare`, a weak key is compared with
-/// today's derivation of the DA-exempt template, as [`storage_key_check`]
-/// compares the original key: the same key means the firmware still
-/// generates affected keys, a clean one that irlumed's start replaces it.
-pub(crate) fn da_exempt_key_check(
-    handle: u32,
-    name: &[u8],
-    compare: bool,
-) -> Result<StorageKeyCheck> {
+/// free or holds another key. Nothing is derived, so doctor's request stays
+/// within its client's budget on a slow TPM: whether today's derivation is
+/// weak too is irlumed's start's to find, and its record says so. A weak key
+/// reports no comparison (`derived: None`).
+pub(crate) fn da_exempt_key_check(handle: u32, name: &[u8]) -> Result<StorageKeyCheck> {
     let mut ctx = open_context()?;
     if !OWNER_PERSISTENT.contains(&handle) || !persistent_handle_present(&mut ctx, handle)? {
         return Ok(StorageKeyCheck::Absent);
@@ -596,12 +592,7 @@ pub(crate) fn da_exempt_key_check(
     }
     Ok(StorageKeyCheck::RocaFingerprint {
         handle,
-        derived: compare
-            .then(|| {
-                let derived = derive_public(&mut ctx, da_exempt_srk_template()?)?;
-                Ok::<_, Error>(compare_moduli(&public, &derived))
-            })
-            .and_then(Result::ok),
+        derived: None,
     })
 }
 
@@ -6112,7 +6103,7 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         let replaced = ensure_at_start_reporting();
         let after_replacement = record();
         // doctor's per-key report before the envelopes move.
-        let keys_before = crate::storage_key::storage_keys();
+        let keys_before = crate::storage_key::storage_keys(storage_key_check().ok());
         let moved = crate::template_key::move_to_stronger_policy("alice");
         let moved_under = parent(&alice);
         // Credential release before the login's reseal, through the
@@ -6159,7 +6150,14 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // key: the report then offers it for the manual path.
         const EARLIER_BOOT: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
         let settled = crate::storage_key::settle_at_start_in(Some(EARLIER_BOOT), false);
-        let keys_after = crate::storage_key::storage_keys();
+        let keys_after = crate::storage_key::storage_keys(storage_key_check().ok());
+        // An envelope that cannot be read may name the weak key: not unused.
+        std::fs::write(crate::keyring::envelope_path("mallory"), b"not an envelope")
+            .expect("an unreadable envelope");
+        let keys_unreadable = crate::storage_key::storage_keys(storage_key_check().ok());
+        // It would also keep doctor's lockout warning, which is checked next.
+        std::fs::remove_file(crate::keyring::envelope_path("mallory"))
+            .expect("the unreadable envelope is removed");
         let template_key = crate::template_key::load_key("alice");
         let new_seal = seal_with_pcrs(b"a seal after the replacement", &[7]).map(|env| env.parent);
         let spared = lockout_state().map(|l| l.storage_key_no_da);
@@ -6256,6 +6254,13 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             assert!(
                 weak_after.unused_across_boots,
                 "unused since a start in an earlier boot"
+            );
+            let keys_unreadable = keys_unreadable.expect("the per-key report");
+            let weak_unreadable =
+                role(&keys_unreadable, StorageKeyRole::Superseded).expect("the weak key");
+            assert!(
+                !weak_unreadable.unused_across_boots,
+                "an unreadable envelope may still name it"
             );
         }
         assert_eq!(

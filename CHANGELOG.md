@@ -22,7 +22,9 @@ All notable changes to irlume are documented here. This project adheres to
   Once no envelope has named a superseded key since a start in an earlier
   boot (each start now counts them), doctor names the manual
   `tpm2_evictcontrol` command, with its warning, since irlume never evicts
-  a key no derivation gives. The TUI's doctor readout runs the same check.
+  a key no derivation gives. When irlumed could not check those keys, the
+  check reads `unknown` rather than clean for them. The TUI's doctor
+  readout runs the same check.
 
 - irlumed replaces a weak DA-exempt storage key by moving its envelopes
   first (ADR-0034, Phase 3 amendment; #1073 item 2). When the key at its

@@ -472,8 +472,11 @@ fn checked_original(
 /// the TPM cannot be opened or read.
 pub fn report() -> Result<DaExemptKey> {
     let mut record = load_record();
+    // With no envelope left a refusal concerns nothing, and irlumed's next
+    // start clears it: a refused replacement goes with the refused persist.
     if !any_envelope()? {
         record.refused = None;
+        record.replacement_refused = None;
     }
     let mut tpm = match (&record.persisted, &record.original) {
         (None, None) => None,
@@ -1128,18 +1131,21 @@ fn envelopes_naming(name: &str) -> Result<(OriginalKeyEnvelopes, bool)> {
 
 /// Every storage key irlume knows of, for doctor's `tpm-firmware` check
 /// (ADR-0034, Phase 3 amendment, #1073 item 2): the original key at its
-/// handle, the recorded DA-exempt key, and each key it superseded, each
-/// checked for the ROCA fingerprint, with the envelopes that still name the
-/// DA-exempt and superseded keys. A weak DA-exempt key is compared with
-/// today's derivation of its template; a superseded one is not, since no
-/// derivation gives it now. The record is untrusted where it is writable
+/// handle with `original`, the check the same request already made of it
+/// (`tpm::storage_key_check`, left out when that failed), then the recorded
+/// DA-exempt key and each key it superseded, each checked for the ROCA
+/// fingerprint with nothing derived, with the envelopes that still name
+/// them. A superseded key is unused across boots only while no envelope
+/// names it or cannot be read. The record is untrusted where it is writable
 /// offline (§5): only bounded hex names and accepted account names go out.
 ///
 /// # Errors
 ///
 /// When an envelope directory cannot be read, or the TPM cannot be opened
 /// or read.
-pub fn storage_keys() -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>> {
+pub fn storage_keys(
+    original: Option<irlume_common::tpm_readiness::StorageKeyCheck>,
+) -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntry>> {
     use irlume_common::tpm_readiness::{StorageKeyCheck, StorageKeyEntry, StorageKeyRole};
     let mut record = load_record();
     bound_superseded(&mut record.superseded);
@@ -1152,29 +1158,31 @@ pub fn storage_keys() -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntr
         }
     };
     let mut entries = Vec::new();
-    let original = tpm::persistent_srk_raw();
-    let mut names = tpm::DaExemptKeyTpm::open()?;
-    let original_name = names
-        .name_at(original)?
-        .map(|name| hex(&name))
-        .unwrap_or_default();
-    entries.push(StorageKeyEntry {
-        role: StorageKeyRole::Original,
-        handle: original,
-        name: original_name,
-        check: tpm::storage_key_check()?,
-        envelopes: None,
-        unused_across_boots: false,
-    });
-    drop(names);
-    let keyed = |role, handle, name: &str, compare| -> Result<StorageKeyEntry> {
+    if let Some(check) = original {
+        let handle = tpm::persistent_srk_raw();
+        let mut names = tpm::DaExemptKeyTpm::open()?;
+        let name = names
+            .name_at(handle)?
+            .map(|name| hex(&name))
+            .unwrap_or_default();
+        entries.push(StorageKeyEntry {
+            role: StorageKeyRole::Original,
+            handle,
+            name,
+            check,
+            envelopes: None,
+            unused_across_boots: false,
+        });
+    }
+    let keyed = |role, handle, name: &str| -> Result<StorageKeyEntry> {
         let check = match unhex(name) {
-            Some(raw) => tpm::da_exempt_key_check(handle, &raw, compare)?,
+            Some(raw) => tpm::da_exempt_key_check(handle, &raw)?,
             None => StorageKeyCheck::Absent,
         };
-        let (envelopes, _) = envelopes_naming(name)?;
+        let (envelopes, unreadable) = envelopes_naming(name)?;
         let unused_across_boots = role == StorageKeyRole::Superseded
             && envelopes.total == 0
+            && !unreadable
             && matches!(
                 (record.superseded_unused.get(name), boot.as_deref()),
                 (Some(since), Some(now)) if since != now
@@ -1193,7 +1201,6 @@ pub fn storage_keys() -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntr
             StorageKeyRole::DaExempt,
             persisted.handle,
             &persisted.name,
-            true,
         )?);
     }
     let recorded = record
@@ -1204,12 +1211,7 @@ pub fn storage_keys() -> Result<Vec<irlume_common::tpm_readiness::StorageKeyEntr
         if recorded.as_deref() == Some(kept.name.as_str()) {
             continue;
         }
-        entries.push(keyed(
-            StorageKeyRole::Superseded,
-            kept.handle,
-            &kept.name,
-            false,
-        )?);
+        entries.push(keyed(StorageKeyRole::Superseded, kept.handle, &kept.name)?);
     }
     Ok(entries)
 }
@@ -4377,6 +4379,35 @@ mod tests {
         drop(sandbox);
         assert!(step.is_ok(), "{step:?}");
         assert_eq!(kept.replacement_refused, None);
+    }
+
+    /// doctor's report hides a refused replacement once no envelope is left,
+    /// as it hides a refused persist: irlumed's next start clears both.
+    #[test]
+    fn a_refused_replacement_is_not_reported_without_an_envelope() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let sandbox = Sandbox::new("storage-key-report-refused-replacement");
+        save_record(&Record {
+            version: RECORD_VERSION,
+            replacement_refused: Some(Refused {
+                reason: RefusalReason::NoSpace,
+                detail: "no room".into(),
+                boot_id: Some(BOOT.into()),
+            }),
+            ..Record::default()
+        })
+        .unwrap();
+        let without = report();
+        envelope(false)
+            .save(&template_key::key_path("alice"))
+            .unwrap();
+        let with = report();
+        drop(sandbox);
+        assert_eq!(without.expect("the report").replacement_refused, None);
+        assert!(with.expect("the report").replacement_refused.is_some());
     }
 
     /// The census of a superseded key's use, as condition 1 keeps it for the

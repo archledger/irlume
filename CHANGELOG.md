@@ -642,12 +642,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- `scripts/build-ppa-source.sh` no longer copies an in-tree build
-  directory into itself. The container builds stage into
-  `/work/ppa-build` inside the tree they copy, and rsync reads
+- The PPA container build no longer copies its source tree into itself.
+  It staged into `/work/ppa-build`, inside the tree
+  `scripts/build-ppa-source.sh` copies with rsync, and rsync reads
   directories while it copies, so a large tree could be copied again one
   level deeper each time until the disk filled (a nightly dry run reached
-  50 GB). A build root inside the tree is now left out of the copy.
+  50 GB). The build root is now a mount of its own, `/out`, so rebuilding
+  an older tag is safe too, and `build-ppa-source.sh` leaves a build root
+  inside the tree out of the copy.
 
 - On Arch, removing only `irlume-kcm` no longer stops irlumed. The
   recipe set its install script (and `backup`, `optdepends`) before the

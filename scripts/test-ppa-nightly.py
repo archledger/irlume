@@ -156,6 +156,34 @@ class Agreement(unittest.TestCase):
                     mock.patch.object(N, "run", return_value=mock.Mock(stdout=version + "\n")):
                 self.assertEqual(N.owner(), expected, (path, version))
 
+    def test_rootless_docker_gets_no_hand_back_either(self) -> None:
+        # Its root is this user too; docker info names the mode.
+        def answers(rootless: bool):
+            def run(cmd, **kwargs):
+                if "--version" in cmd:
+                    return mock.Mock(stdout="Docker version 29.9.1, build dfc520dcc2\n")
+                options = '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]'
+                return mock.Mock(stdout=options if rootless else '["name=seccomp,profile=builtin"]')
+            return run
+        for rootless, expected in ((True, None), (False, f"{os.getuid()}:{os.getgid()}")):
+            with mock.patch.object(N, "engine", return_value="/usr/bin/docker"), \
+                    mock.patch.object(N, "run", side_effect=answers(rootless)):
+                self.assertEqual(N.owner(), expected, rootless)
+        release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
+        self.assertIn("info --format '{{json .SecurityOptions}}'", release)
+        self.assertIn("*rootless*) ;;", release)
+
+    def test_the_build_root_is_outside_the_tree(self) -> None:
+        # An older tag's build-ppa-source.sh lacks the in-tree exclusion and
+        # would copy a build root inside /work into itself.
+        build = (ROOT / "packaging" / "ppa" / "container-build.sh").read_text()
+        self.assertIn("export BUILDROOT=/out\n", build)
+        self.assertNotIn("/work/ppa-build", build)
+        release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
+        self.assertIn('-v "$BUILD:/out:z"', release)
+        self.assertNotIn("$WORK/ppa-build", release)
+        self.assertIn('"-v", f"{built}:/out:z"', (ROOT / "scripts" / "ppa-nightly.py").read_text())
+
     def test_the_release_wrapper_asks_the_runtime_too(self) -> None:
         release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
         self.assertIn('case "$("$ENGINE" --version 2>/dev/null)" in', release)
@@ -200,6 +228,34 @@ class Clone(unittest.TestCase):
             self.assertEqual(N.nightly_version(describe).split("+")[0], "0.15.0")
             self.assertEqual(len(commit), 40)
             self.assertGreater(when, 0)
+
+    def test_a_failed_fetch_is_tried_again(self) -> None:
+        # At boot the catch-up run can start before the network is up.
+        calls = {"fetch": 0}
+
+        def run(cmd, **kwargs):
+            if "fetch" in cmd:
+                calls["fetch"] += 1
+                if calls["fetch"] < 3:
+                    raise subprocess.CalledProcessError(128, cmd)
+                return mock.Mock(stdout="")
+            answers = {"rev-parse": "c" * 40, "describe": "v0.15.0-139-g3c162b83", "log": "1700000000"}
+            return mock.Mock(stdout=next(v for k, v in answers.items() if k in cmd) + "\n")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(N, "run", side_effect=run), \
+                mock.patch.object(N.time, "sleep") as sleep, mock.patch.object(N, "log"):
+            (Path(d) / ".git").mkdir()
+            commit, describe, when = N.update_clone(Path(d))
+        self.assertEqual((calls["fetch"], sleep.call_count), (3, 2))
+        self.assertEqual(describe, "v0.15.0-139-g3c162b83")
+        # And it gives up after FETCH_TRIES.
+        calls["fetch"] = -100
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(N, "run", side_effect=run), \
+                mock.patch.object(N.time, "sleep") as sleep, mock.patch.object(N, "log"):
+            (Path(d) / ".git").mkdir()
+            with self.assertRaises(subprocess.CalledProcessError):
+                N.update_clone(Path(d))
+        self.assertEqual(sleep.call_count, N.FETCH_TRIES - 1)
 
     def test_a_dry_run_of_another_repository_gets_its_own_clone(self) -> None:
         self.assertNotEqual(N.DRY_RUN_CLONE, N.DEFAULT_CLONE)

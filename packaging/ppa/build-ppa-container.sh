@@ -59,20 +59,29 @@ WORK="$(mktemp -d)"
 # tag's. Outside $WORK, so it is not packed into the orig tarball.
 HELPER="$(mktemp -d)"
 cp "$REPO/packaging/ppa/container-build.sh" "$HELPER/"
+# The build root, mounted at /out: outside $WORK, so an older tag's
+# build-ppa-source.sh never copies it into itself.
+BUILD="$(mktemp -d)"
 # Rootless podman writes into the mount as a mapped subuid; clean via unshare so
 # leftovers from a prior run can't poison this one, and reclaim ownership after.
 cleanup() {
-  podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null || true
+  podman unshare rm -rf "$WORK" "$BUILD" 2>/dev/null || rm -rf "$WORK" "$BUILD" 2>/dev/null || true
   rm -rf "$HELPER"
 }
-# docker runs the build as root in the mount: hand the files back at the end.
-# Rootless podman's root already is this user (a chown to this uid would map
-# to a subuid). The runtime is asked what it is: podman-docker installs a
-# `docker` command that runs podman.
+# Rootful docker runs the build as the real root: hand the files back at the
+# end. Rootless podman's and rootless docker's root already is this user (a
+# chown to this uid would map to a subuid). The runtime is asked what it is:
+# podman-docker installs a `docker` command that runs podman, and docker info
+# lists rootless mode among its security options.
 OWNER_ENV=()
 case "$("$ENGINE" --version 2>/dev/null)" in
   *[Pp]odman*) ;;
-  *) OWNER_ENV=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)") ;;
+  *)
+    case "$("$ENGINE" info --format '{{json .SecurityOptions}}' 2>/dev/null)" in
+      *rootless*) ;;
+      *) OWNER_ENV=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)") ;;
+    esac
+    ;;
 esac
 trap cleanup EXIT
 
@@ -82,16 +91,16 @@ cp "$REPO"/models/*.onnx "$WORK/models/"
 
 echo "==> building PPA source in $BASE (SERIES=$SERIES, SOURCE_DATE_EPOCH=$SDE)"
 "$ENGINE" run --rm \
-  -v "$WORK:/work:z" -v "$HELPER:/helper:ro,z" \
+  -v "$WORK:/work:z" -v "$BUILD:/out:z" -v "$HELPER:/helper:ro,z" \
   -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" -e "PPAREV=${PPAREV:-0ppa1}" \
   "${OWNER_ENV[@]}" \
   "$BASE" bash /helper/container-build.sh
 
 # Reclaim the subuid-owned artifacts to the host user (rootless podman),
 # then copy them out.
-podman unshare chown -R 0:0 "$WORK/ppa-build" 2>/dev/null || true
+podman unshare chown -R 0:0 "$BUILD" 2>/dev/null || true
 mkdir -p "$OUT"
-cp "$WORK"/ppa-build/irlume_"${VERSION}"* "$OUT"/
+cp "$BUILD"/irlume_"${VERSION}"* "$OUT"/
 cp "$REPO/.github/release-signing-key.asc" "$OUT/release-key.asc"
 
 echo

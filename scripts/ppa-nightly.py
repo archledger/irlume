@@ -73,6 +73,11 @@ MAX_PPAREV = 5
 # After an upload, how long to poll Launchpad before leaving it to the next run.
 POLL_FOR = 4 * 3600
 POLL_EVERY = 600
+# A failed fetch is tried again this often, this far apart: at boot a
+# lingering user manager can start the timer's catch-up run before the
+# network is up, and a user manager has no network-online.target to wait on.
+FETCH_TRIES = 6
+FETCH_WAIT = 120
 
 HOME = Path.home()
 DEFAULT_CLONE = HOME / ".local" / "share" / "irlume-nightly" / "irlume"
@@ -262,11 +267,20 @@ def update_clone(clone: Path, url: str = REPO_URL, ref: str = "main") -> tuple[s
     if not (clone / ".git").is_dir():
         clone.mkdir(parents=True, exist_ok=True)
         run(["git", "init", "--quiet", str(clone)])
-    run([
+    fetch = [
         # --update-shallow: a dry run's local checkout may itself be shallow.
         "git", "-C", str(clone), "fetch", "--quiet", "--force", "--prune", "--no-tags", "--update-shallow", url,
         f"+refs/heads/{ref}:refs/nightly/head", "+refs/tags/*:refs/tags/*",
-    ])
+    ]
+    for attempt in range(1, FETCH_TRIES + 1):
+        try:
+            run(fetch)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == FETCH_TRIES:
+                raise
+            log(f"git fetch failed (try {attempt} of {FETCH_TRIES}); trying again in {FETCH_WAIT} s")
+            time.sleep(FETCH_WAIT)
     git = lambda *args: run(["git", "-C", str(clone), *args], capture_output=True, text=True).stdout.strip()
     commit = git("rev-parse", "refs/nightly/head^{commit}")
     describe = git("describe", "--long", "--tags", "--match", "v[0-9]*", commit)
@@ -285,10 +299,15 @@ def owner() -> str | None:
     """The uid:gid a container hands its files back to, as
     packaging/ppa/build-ppa-container.sh does: docker runs them as the real
     root, while rootless podman's root already is this user, where a chown to
-    this uid would map to a subuid instead. The runtime is asked what it is,
-    since podman-docker installs a `docker` command that runs podman."""
+    this uid would map to a subuid instead, as under rootless docker. The
+    runtime is asked what it is: podman-docker installs a `docker` command
+    that runs podman, and docker info lists rootless mode among its security
+    options."""
     version = run([engine(), "--version"], capture_output=True, text=True).stdout
-    return None if "podman" in version.lower() else f"{os.getuid()}:{os.getgid()}"
+    if "podman" in version.lower():
+        return None
+    options = run([engine(), "info", "--format", "{{json .SecurityOptions}}"], capture_output=True, text=True).stdout
+    return None if "rootless" in options else f"{os.getuid()}:{os.getgid()}"
 
 
 def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev: int) -> Path:
@@ -297,6 +316,9 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
     private_dir(work)
     tree = work / "tree"
     tree.mkdir()
+    # The build root, outside the tree it stages from (container-build.sh).
+    built = work / "build"
+    built.mkdir()
     archive = subprocess.Popen(["git", "-C", str(clone), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
     run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout)
     if archive.wait() != 0:
@@ -315,8 +337,11 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
         env += ["-e", f"HOST_UID={uid}", "-e", f"HOST_GID={gid}"]
     # :z relabels the mounts for an SELinux host's container policy (Podman
     # changes no label otherwise), as build-ppa-container.sh does.
-    run([engine(), "run", "--rm", "-v", f"{tree}:/work:z", *env, BASE, "bash", "/work/packaging/ppa/container-build.sh"])
-    return collect(tree / "ppa-build", work / "out", upstream, debian_version(upstream, pparev))
+    run([
+        engine(), "run", "--rm", "-v", f"{tree}:/work:z", "-v", f"{built}:/out:z",
+        *env, BASE, "bash", "/work/packaging/ppa/container-build.sh",
+    ])
+    return collect(built, work / "out", upstream, debian_version(upstream, pparev))
 
 
 def private_dir(path: Path) -> None:

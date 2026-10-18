@@ -2,8 +2,8 @@
 # A user unit on minihost; see packaging/ppa/nightly/README.md to install it.
 [Unit]
 Description=Upload irlume main to ppa:archledger/irlume-nightly
-Wants=network-online.target
-After=network-online.target
+# No network-online.target: a user manager has none to order after. The
+# script tries a failed fetch again for ten minutes instead.
 
 [Service]
 Type=oneshot

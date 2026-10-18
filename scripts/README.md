@@ -53,6 +53,7 @@ Run by hand on a machine with the hardware. Nothing automated calls them.
 
 | Script | What it does |
 |---|---|
+| `emitter-capture-evidence-test.sh` | Records what ADR-0031 §4 requires before the built-in emitter table gains a camera: the capture path's D1 write, its read-back, the bursts' D1 proof and the restore, in one face authentication. Writes nothing to the camera itself. Lists the ThinkPad T480 IR camera (#887). |
 | `emitter-journal-hardware-test.sh` | Hardware validation for the IR emitter undo record (#181). |
 | `emitter-journal-container-test.sh` | The same undo record against a throwaway state directory, no camera needed. |
 | `emitter-journal-strace-test.sh` | Proves from syscalls that the undo record is durable **before** the camera is written to. |

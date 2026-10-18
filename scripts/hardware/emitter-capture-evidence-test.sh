@@ -85,7 +85,10 @@ ceiling_suffix=": YUYV clipping ceiling 235 for this burst"
 
 remove_dropin() {
     [ "$dropin_written" = yes ] || return 0
-    rm -f "$DROPIN"
+    # A drop-in that stays would keep the override and the traces on every
+    # later authentication, so a failed removal stops here and is reported.
+    rm -f "$DROPIN" || return 1
+    [ ! -e "$DROPIN" ] || return 1
     rmdir "$DROPIN_DIR" 2>/dev/null || true
     systemctl daemon-reload || return 1
     dropin_written=no
@@ -140,6 +143,13 @@ hex_to_payload() {
 # line number, or nothing.
 first_exact_after() { # line, from
     awk -v want="$1" -v from="$2" 'NR >= from && $0 == want { print NR; exit }' "$OUT/irlumed.log"
+}
+
+# The first write outcome for the listed control on this node after line $1,
+# as a line number: whether the camera accepted the write or not.
+outcome_after() { # from
+    awk -v from="$1" -v prefix="${expected_accepted% accepted} " \
+        'NR > from && index($0, prefix) == 1 { print NR; exit }' "$OUT/irlumed.log"
 }
 
 # The first write outcome for the listed control on this node after line $1
@@ -304,7 +314,8 @@ done
 [ -n "$decided" ] || { echo "no face authentication reached irlumed within ${AUTH_WAIT}s"; exit 2; }
 echo "    face authentication: $(auth_outcome)"
 
-# The restore is the stream's end, which can come after the decision.
+# The restore is the stream's end, which can come after the decision, and its
+# outcome line follows once the camera answers.
 write_at=$(first_exact_after "$expected_write" 1)
 restored_at=""
 for _ in $(seq 1 "$RESTORE_WAIT"); do
@@ -312,7 +323,7 @@ for _ in $(seq 1 "$RESTORE_WAIT"); do
     write_at=$(first_exact_after "$expected_write" 1)
     if [ -n "$write_at" ]; then
         restored_at=$(first_exact_after "$expected_restore" "$((write_at + 1))")
-        [ -n "$restored_at" ] && break
+        [ -n "$restored_at" ] && [ -n "$(outcome_after "$restored_at")" ] && break
         grep -q "^irlume: leaving unit$model_unit/sel6 " "$OUT/irlumed.log" && break
     fi
     sleep 1
@@ -327,6 +338,11 @@ for attempt in 1 2 3 4 5; do
     sleep 1
 done
 [ -n "$final" ] || exit 2
+# Whatever irlumed logged while the read waited for its lease.
+journal
+write_at=$(first_exact_after "$expected_write" 1)
+restored_at=""
+[ -n "$write_at" ] && restored_at=$(first_exact_after "$expected_restore" "$((write_at + 1))")
 
 echo
 completed_at=""

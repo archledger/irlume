@@ -791,12 +791,25 @@ fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> Xu
     // from the camera.
     let result = xu_query_device(fd, unit, selector, query, data);
     if query != UVC_SET_CUR && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        eprintln!(
-            "{}",
-            read_trace(query, unit, selector, data, &result, &trace_node(fd))
-        );
+        emit_trace(&read_trace(
+            query,
+            unit,
+            selector,
+            data,
+            &result,
+            &trace_node(fd),
+        ));
     }
     result
+}
+
+/// Print one emitter trace line, ignoring a failed write. `eprintln!` panics
+/// when stderr cannot be written, and these lines sit between a write and the
+/// bookkeeping that arms its restore: a panic there leaves the camera changed
+/// with no guard to put it back.
+fn emit_trace(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 /// The node an emitter trace line names: the open descriptor's own device,
@@ -1238,14 +1251,14 @@ fn set_cur_admitted(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResu
         .is_some()
         .then(|| trace_node(fd));
     if let Some(node) = &traced {
-        eprintln!("{}", write_trace(unit, selector, payload, node));
+        emit_trace(&write_trace(unit, selector, payload, node));
     }
     #[cfg(test)]
     writes_attempted().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut data = payload.to_vec();
     let result = xu_query(fd, unit, selector, UVC_SET_CUR, &mut data);
     if let Some(node) = &traced {
-        eprintln!("{}", write_outcome_trace(unit, selector, node, &result));
+        emit_trace(&write_outcome_trace(unit, selector, node, &result));
     }
     result
 }

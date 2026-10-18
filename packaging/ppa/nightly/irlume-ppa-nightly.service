@@ -12,4 +12,6 @@ ExecStart=/usr/bin/python3 -B %h/.local/lib/irlume-nightly/ppa-nightly.py
 # A build is about an hour; the script then polls Launchpad for up to four.
 TimeoutStartSec=6h
 Nice=10
+# What it writes stays the user's own: a signed upload is not for other readers.
+UMask=0077
 IOSchedulingClass=idle

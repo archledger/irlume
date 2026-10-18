@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -213,7 +214,13 @@ class Collect(unittest.TestCase):
     def test_the_upload_moves_out_of_the_build_tree(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             built = self.built(Path(d))
-            changes = N.collect(built, Path(d) / "out", V, self.DEBVER)
+            old = os.umask(0o022)
+            try:
+                changes = N.collect(built, Path(d) / "out", V, self.DEBVER)
+            finally:
+                os.umask(old)
+            # A signed upload is for this user alone, whatever the umask.
+            self.assertEqual(stat.S_IMODE(changes.parent.stat().st_mode), 0o700)
             self.assertEqual(changes, Path(d) / "out" / f"irlume_{self.DEBVER}_source.changes")
             self.assertEqual(sorted(p.name for p in changes.parent.iterdir()), sorted(N.artifacts(V, self.DEBVER)))
             self.assertEqual(list(built.iterdir()), [])
@@ -300,6 +307,30 @@ class DryRun(unittest.TestCase):
                          f"upload {V}-0ppa2~resolute1 (its build failed at -0ppa1)")
         self.assertEqual(N.what(N.Published(V)), f"record {V} as published")
         self.assertEqual(N.what(N.Nothing("x")), "x")
+
+
+class Uploaded(unittest.TestCase):
+    def test_the_signed_changes_is_deleted_after_the_upload(self) -> None:
+        # Never used again, and it is what an upload to another PPA needs.
+        for push in (lambda *a: None, mock.Mock(side_effect=subprocess.CalledProcessError(1, ["dput"]))):
+            with tempfile.TemporaryDirectory() as d:
+                state = Path(d) / "ppa.json"
+                changes = Path(d) / "out" / "x_source.changes"
+                changes.parent.mkdir()
+                changes.write_text("signed")
+                argv = ["ppa-nightly.py", "--state", str(state), "--clone", d, "--work", d]
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(N, "LOCK", Path(d) / "lock"), \
+                        mock.patch.object(N, "POLL_FOR", 0), \
+                        mock.patch.object(N, "update_clone", return_value=("c" * 40, "v0.15.0-139-g3c162b83", 1)), \
+                        mock.patch.object(N, "launchpad", return_value=lp({})), \
+                        mock.patch.object(N, "build", return_value=changes), \
+                        mock.patch.object(N, "export_key", return_value=Path(d)), \
+                        mock.patch.object(N, "sign"), \
+                        mock.patch.object(N, "upload", side_effect=push):
+                    N.main()
+                self.assertFalse(changes.exists())
+                self.assertEqual(N.load_state(state)["pending"]["upstream"], V)
 
 
 class Mounts(unittest.TestCase):

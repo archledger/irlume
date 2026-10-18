@@ -278,8 +278,9 @@ def owner() -> str | None:
 def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev: int) -> Path:
     """The unsigned source package of `commit`, built in the release container."""
     shutil.rmtree(work, ignore_errors=True)
+    private_dir(work)
     tree = work / "tree"
-    tree.mkdir(parents=True)
+    tree.mkdir()
     archive = subprocess.Popen(["git", "-C", str(clone), "archive", "--format=tar", commit], stdout=subprocess.PIPE)
     run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout)
     if archive.wait() != 0:
@@ -302,6 +303,14 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
     return collect(tree / "ppa-build", work / "out", upstream, debian_version(upstream, pparev))
 
 
+def private_dir(path: Path) -> None:
+    """A new directory only this user can enter, whatever the umask: a signed
+    .changes in it would let a reader upload it to any PPA the key can upload
+    to (Launchpad strips the signature from the copy it publishes)."""
+    path.mkdir(parents=True)
+    path.chmod(0o700)
+
+
 def artifacts(upstream: str, debver: str) -> list[str]:
     """The files a source upload is made of, the .changes last."""
     return [
@@ -322,7 +331,7 @@ def collect(built: Path, out: Path, upstream: str, debver: str) -> Path:
     work on `out` alone."""
     if built.is_symlink() or not built.is_dir():
         raise RuntimeError(f"the build left no {built.name} directory")
-    out.mkdir()
+    private_dir(out)
     for name in artifacts(upstream, debver):
         source = built / name
         if source.is_symlink() or not source.is_file():
@@ -334,7 +343,7 @@ def collect(built: Path, out: Path, upstream: str, debver: str) -> Path:
 def export_key(directory: Path) -> Path:
     """The public key, for the containers to check signatures with, in a
     directory of its own that they get read-only."""
-    directory.mkdir()
+    private_dir(directory)
     public = directory / "signing-key.asc"
     public.write_bytes(run(["gpg", "--export", "--armor", KEY], capture_output=True).stdout)
     return directory
@@ -492,6 +501,9 @@ def main() -> int:
         log(f"built and signed {changes}; not uploaded (--no-upload)")
         return 0
     recorded, uploaded, message = attempt_upload(state, action, time.time(), lambda: upload(changes, key))
+    # The signed .changes is never used again (a retry signs a new revision),
+    # and it is what an upload to another PPA would need.
+    changes.unlink(missing_ok=True)
     if recorded is not None:
         state = recorded
         save_state(args.state, state)

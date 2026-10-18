@@ -30,7 +30,10 @@ gpg-agent. The PPA `irlume-nightly` must exist under `~archledger` first.
 - `~/.local/share/irlume-nightly/irlume`: its clone of the repository.
 - `~/.local/state/irlume-nightly/ppa.json`: the version last published, a
   pending upload or a failed one (the decisions are in `decide()`).
-- `~/.cache/irlume-nightly`: the last build, a few GB, on disk.
+- `~/.cache/irlume-nightly`: the last build, a few GB, on disk, in directories
+  only this user can enter. The signed `.changes` is deleted once dput has
+  run: Launchpad strips the signature from the copy it publishes, and a
+  signed one would upload to any PPA the key can upload to.
 
 ## Checking on it
 

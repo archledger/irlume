@@ -181,6 +181,9 @@ pub(crate) fn tick(
     if !scan(endpoints) {
         return Vec::new();
     }
+    // Backoff counts from the end of the scan: one slowed by busy nodes must
+    // not use up its own wait. (`now` is later than the clock in tests.)
+    let now = now.max(Instant::now());
     irlume_common::jout_info!(
         "irlumed: classified the capture nodes of {} connected camera(s) \
          that had no roles yet (ADR-0029 §1)",
@@ -204,6 +207,28 @@ pub(crate) fn tick(
         );
     }
     due
+}
+
+/// The worker's scan of `endpoints`: true when it ran to the end, false when
+/// a stop (an authentication waiting, or the face sensor policy no longer
+/// permitting it) ended it before a node. A stop that comes once the last node
+/// is classified ends nothing, so the scan counts.
+pub(crate) fn run_scan(
+    endpoints: &[String],
+    token: &crate::arbiter::CancelToken,
+    permitted: fn() -> bool,
+    classify: Classify,
+) -> bool {
+    let halted = std::cell::Cell::new(false);
+    classify(endpoints, &|| {
+        // The watchdog reads worker progress; a scan of many busy nodes is
+        // progress at each one, as a long capture is between scans.
+        crate::note_worker_progress();
+        let stop = token.stop_requested() || !permitted();
+        halted.set(halted.get() || stop);
+        stop
+    });
+    !halted.get()
 }
 
 /// The cameras of `keys` that `view` still lists as unclassified.
@@ -235,16 +260,7 @@ pub(crate) fn scan_on_worker<T: Send + 'static>(
 ) -> bool {
     let (done, finished) = std::sync::mpsc::channel();
     let task: crate::arbiter::BackgroundTask = Box::new(move |token| {
-        let halted = std::cell::Cell::new(false);
-        classify(&endpoints, &|| {
-            // The watchdog reads worker progress; a scan of many busy nodes
-            // is progress at each one, as a long capture is between scans.
-            crate::note_worker_progress();
-            let stop = token.stop_requested() || !permitted();
-            halted.set(halted.get() || stop);
-            stop
-        });
-        let _ = done.send(!halted.get() && !token.stop_requested());
+        let _ = done.send(run_scan(&endpoints, token, permitted, classify));
     });
     match arbiter.submit_background(task) {
         Ok(()) => finished.recv().unwrap_or(false),
@@ -512,6 +528,57 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&"/dev/irlume-worker-off".to_owned()));
+    }
+
+    /// Set by a test to stop a token once the recording classifier finishes.
+    static STOP_AFTER: std::sync::Mutex<Option<crate::arbiter::CancelToken>> =
+        std::sync::Mutex::new(None);
+
+    fn classify_then_stop(endpoints: &[String], stop: &dyn Fn() -> bool) {
+        recording_classify(endpoints, stop);
+        if let Some(token) = STOP_AFTER.lock().unwrap().take() {
+            token.request_stop();
+        }
+    }
+
+    #[test]
+    fn a_stop_after_the_last_node_still_counts_the_scan() {
+        // An authentication arriving during the last open takes the worker
+        // next; the scan itself finished, so it is a try.
+        let token = crate::arbiter::CancelToken::new();
+        *STOP_AFTER.lock().unwrap() = Some(token.clone());
+        let endpoints = vec!["/dev/irlume-worker-late".to_owned()];
+        assert!(run_scan(&endpoints, &token, || true, classify_then_stop));
+        assert!(token.stop_requested());
+        // A stop seen before a node does end it.
+        let stopped = crate::arbiter::CancelToken::new();
+        stopped.request_stop();
+        assert!(!run_scan(&endpoints, &stopped, || true, recording_classify));
+    }
+
+    #[test]
+    fn backoff_counts_from_the_end_of_a_slow_scan() {
+        let guard = unclassified_camera();
+        let mut classifier = RoleClassifier::default();
+        let start = Instant::now();
+        let slow = |endpoints: Vec<String>| {
+            std::thread::sleep(Duration::from_millis(300));
+            // Nothing recorded: the camera stays unclassified.
+            let _ = endpoints;
+            true
+        };
+        assert_eq!(tick(&mut classifier, &|| true, &slow, start).len(), 1);
+        let listed = irlume_auth::connected_pairs();
+        // Measured from the scan's start the wait would be over; from its
+        // end it is not.
+        assert!(classifier.due(&listed, start + RETRY_AFTER[0]).is_empty());
+        assert_eq!(
+            classifier
+                .due(&listed, start + RETRY_AFTER[0] + Duration::from_secs(1))
+                .len(),
+            1
+        );
+        assert!(guard.calls().is_empty());
     }
 
     #[test]

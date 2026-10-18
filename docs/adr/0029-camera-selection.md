@@ -395,6 +395,10 @@ runs the discovery scan `ListCameras` runs: each capture node is opened for
 its capabilities and formats under a diagnostics lease, with no stream started
 and no emitter fired. A camera generation that stays unclassified is tried
 again after 5, 30, 120 and 600 seconds and then left alone until it changes.
+A camera that comes back unclassified after each scan, as a camera that
+answered an open with a udev change would, is scanned ever less often, down
+to once every 10 minutes, so it is never reopened every few seconds; other
+cameras keep their own pace.
 The classifier runs only under the face sensor policy that permits background
 requalification (Dual), so the IR-only policy's camera discovery stays off.
 

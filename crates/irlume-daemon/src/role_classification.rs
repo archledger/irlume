@@ -41,13 +41,35 @@ const RETRY_AFTER: [Duration; 4] = [
 /// Tries at one camera generation, the first included.
 pub(crate) const MAX_TRIES: usize = RETRY_AFTER.len() + 1;
 
+/// The least time between two scans for one camera, by how many scans its
+/// current run has made. A camera that answered a scan with a udev change
+/// would come back as a new, unclassified generation each time; this keeps
+/// such a camera from being opened every few seconds. Other cameras keep
+/// their own runs, so one appearing meanwhile is still classified at once.
+const SCAN_GAP: [Duration; 5] = [
+    POLL,
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+];
+
+/// A scan this long after a camera's previous one starts a new run for it.
+const RUN_ENDS_AFTER: Duration = Duration::from_secs(900);
+
+/// The scans in a run after which the classifier says it is spacing them.
+const THROTTLE_NOTICE_AT: usize = 3;
+
 /// One camera's connection generation, as the publication names it.
 pub(crate) type CameraKey = (String, u64);
 
-/// The tries made at each camera generation that is still unclassified.
+/// The tries made at each camera generation that is still unclassified, and
+/// each camera's current run of scans.
 #[derive(Debug, Default)]
 pub(crate) struct RoleClassifier {
     tries: BTreeMap<CameraKey, (usize, Instant)>,
+    /// Per camera instance: its last scan, and the scans in its run.
+    runs: BTreeMap<String, (Instant, usize)>,
 }
 
 impl RoleClassifier {
@@ -65,8 +87,17 @@ impl RoleClassifier {
             .map(|camera| (camera.instance_id.clone(), camera.generation))
             .collect();
         self.tries.retain(|key, _| listed.contains(key));
+        self.runs
+            .retain(|_, (last, _)| now.saturating_duration_since(*last) < RUN_ENDS_AFTER);
         listed
             .into_iter()
+            .filter(|key| match self.runs.get(&key.0) {
+                Some((last, scans)) => {
+                    now.saturating_duration_since(*last)
+                        >= SCAN_GAP[(*scans).min(SCAN_GAP.len()) - 1]
+                }
+                None => true,
+            })
             .filter(|key| match self.tries.get(key) {
                 None => true,
                 Some((made, last)) => RETRY_AFTER
@@ -74,6 +105,23 @@ impl RoleClassifier {
                     .is_some_and(|wait| now.saturating_duration_since(*last) >= *wait),
             })
             .collect()
+    }
+
+    /// Record that a scan for `keys` ran at `now`; returns the most scans
+    /// any of their cameras' runs has now made.
+    pub(crate) fn scanned(&mut self, keys: &[CameraKey], now: Instant) -> usize {
+        let mut most = 0;
+        for (instance, _) in keys {
+            let scans = match self.runs.get(instance) {
+                Some((last, scans)) if now.saturating_duration_since(*last) < RUN_ENDS_AFTER => {
+                    scans + 1
+                }
+                _ => 1,
+            };
+            self.runs.insert(instance.clone(), (now, scans));
+            most = most.max(scans);
+        }
+        most
     }
 
     /// Record a try at `keys` at `now`; returns the cameras whose last try
@@ -111,6 +159,13 @@ pub(crate) fn tick(
     // The same discovery scan as the classifying ListCameras: it records
     // roles only for generations unchanged across it.
     let _ = irlume_auth::list_pairs();
+    if classifier.scanned(&due, now) == THROTTLE_NOTICE_AT {
+        irlume_common::jout_notice!(
+            "irlumed: cameras keep coming back unclassified after a scan (a udev \
+             change each time?); scans are now spaced up to {} s apart",
+            SCAN_GAP[SCAN_GAP.len() - 1].as_secs()
+        );
+    }
     for (instance, _) in classifier.tried(&due, now) {
         irlume_common::jout_warn!(
             "irlumed: camera {} is still unclassified after {MAX_TRIES} tries; \
@@ -309,6 +364,65 @@ mod tests {
         // A replug is a new generation, due at once.
         let replugged = view(CameraInventoryState::Current, &[("a", 2)]);
         assert_eq!(classifier.due(&replugged, now), [key("a", 2)]);
+    }
+
+    #[test]
+    fn a_camera_that_returns_unclassified_after_each_scan_is_scanned_ever_less_often() {
+        // A camera answering each open with a udev change is a new
+        // generation every time; the gap between scans grows to the cap.
+        let mut classifier = RoleClassifier::default();
+        let start = Instant::now();
+        let mut now = start;
+        let mut scans = Vec::new();
+        for generation in 1..=200u64 {
+            let listed = view(CameraInventoryState::Current, &[("a", generation)]);
+            // Poll until it is due again, at most an hour on.
+            let deadline = now + Duration::from_secs(3600);
+            while classifier.due(&listed, now).is_empty() {
+                assert!(
+                    now < deadline,
+                    "never due again after {} scans",
+                    scans.len()
+                );
+                now += POLL;
+            }
+            classifier.scanned(&[key("a", generation)], now);
+            classifier.tried(&[key("a", generation)], now);
+            scans.push(now);
+            if now.duration_since(start) > Duration::from_secs(4 * 3600) {
+                break;
+            }
+        }
+        let gaps: Vec<Duration> = scans.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "{gaps:?}");
+        assert!(gaps
+            .iter()
+            .all(|gap| *gap <= SCAN_GAP[SCAN_GAP.len() - 1] + POLL));
+        assert!(*gaps.last().unwrap() >= SCAN_GAP[SCAN_GAP.len() - 1]);
+        // Four hours of a misbehaving camera open it a few dozen times, not
+        // once every poll.
+        assert!(scans.len() < 40, "{} scans", scans.len());
+    }
+
+    #[test]
+    fn a_throttled_camera_never_delays_another_and_a_quiet_period_ends_its_run() {
+        let mut classifier = RoleClassifier::default();
+        let mut now = Instant::now();
+        // Camera `a` has come back unclassified enough to be spaced out.
+        for generation in 1..=SCAN_GAP.len() as u64 {
+            classifier.scanned(&[key("a", generation)], now);
+            now += POLL;
+        }
+        let a_again = view(CameraInventoryState::Current, &[("a", 99)]);
+        assert!(classifier.due(&a_again, now).is_empty());
+        // A different camera plugged in meanwhile is due at once.
+        let both = view(CameraInventoryState::Current, &[("a", 99), ("b", 1)]);
+        assert_eq!(classifier.due(&both, now), [key("b", 1)]);
+        assert_eq!(classifier.scanned(&[key("b", 1)], now), 1);
+        // After a quiet quarter hour, `a` starts a fresh run.
+        let later = now + RUN_ENDS_AFTER;
+        assert_eq!(classifier.due(&a_again, later), [key("a", 99)]);
+        assert_eq!(classifier.scanned(&[key("a", 99)], later), 1);
     }
 
     #[test]

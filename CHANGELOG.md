@@ -652,8 +652,10 @@ All notable changes to irlume are documented here. This project adheres to
   with `NoEnrolledCameraConnected`, and `irlume split list` named no
   candidates. irlumed now classifies a camera's roles in the background
   as it appears, under the Dual face sensor policy: the same discovery
-  scan as the listing, which starts no stream and fires no emitter, tried
-  again with a backoff if a camera stays unclassified.
+  scan as the listing, which starts no stream and fires no emitter. A
+  camera that stays unclassified is tried again with a backoff, and one
+  that comes back unclassified after every scan is scanned at most every
+  10 minutes.
 
 - The PPA container build no longer copies its source tree into itself.
   It staged into `/work/ppa-build`, inside the tree

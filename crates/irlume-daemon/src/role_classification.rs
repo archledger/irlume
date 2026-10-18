@@ -47,9 +47,11 @@ pub(crate) const MAX_TRIES: usize = RETRY_AFTER.len() + 1;
 
 /// The least time between two scans for one camera, by how many scans its
 /// current run has made. A camera that answered a scan with a udev change
-/// would come back as a new, unclassified generation each time; this keeps
-/// such a camera from being opened every few seconds. Other cameras keep
-/// their own runs, so one appearing meanwhile is still classified at once.
+/// would come back as a new, unclassified generation each time (or, after a
+/// reset, a new instance at the same port); this keeps such a camera from
+/// being opened every few seconds. Runs are per USB topology path, so other
+/// cameras keep their own, and one appearing meanwhile is still classified at
+/// once.
 const SCAN_GAP: [Duration; 5] = [
     POLL,
     Duration::from_secs(10),
@@ -58,7 +60,8 @@ const SCAN_GAP: [Duration; 5] = [
     Duration::from_secs(600),
 ];
 
-/// A scan this long after a camera's previous one starts a new run for it.
+/// A scan this long after the previous one at a camera's port starts a new
+/// run for it.
 const RUN_ENDS_AFTER: Duration = Duration::from_secs(900);
 
 /// The scans in a run after which the classifier says it is spacing them.
@@ -72,7 +75,7 @@ pub(crate) type CameraKey = (String, u64);
 #[derive(Debug, Default)]
 pub(crate) struct RoleClassifier {
     tries: BTreeMap<CameraKey, (usize, Instant)>,
-    /// Per camera instance: its last scan, and the scans in its run.
+    /// Per USB topology path: its last scan, and the scans in its run.
     runs: BTreeMap<String, (Instant, usize)>,
 }
 
@@ -93,15 +96,16 @@ impl RoleClassifier {
         self.tries.retain(|key, _| listed.contains(key));
         self.runs
             .retain(|_, (last, _)| now.saturating_duration_since(*last) < RUN_ENDS_AFTER);
-        listed
-            .into_iter()
-            .filter(|key| match self.runs.get(&key.0) {
+        view.unclassified
+            .iter()
+            .filter(|camera| match self.runs.get(&camera.topology) {
                 Some((last, scans)) => {
                     now.saturating_duration_since(*last)
                         >= SCAN_GAP[(*scans).min(SCAN_GAP.len()) - 1]
                 }
                 None => true,
             })
+            .map(|camera| (camera.instance_id.clone(), camera.generation))
             .filter(|key| match self.tries.get(key) {
                 None => true,
                 Some((made, last)) => RETRY_AFTER
@@ -111,18 +115,18 @@ impl RoleClassifier {
             .collect()
     }
 
-    /// Record that a scan for `keys` ran at `now`; returns the most scans
-    /// any of their cameras' runs has now made.
-    pub(crate) fn scanned(&mut self, keys: &[CameraKey], now: Instant) -> usize {
+    /// Record that a scan of the cameras at `topologies` ran at `now`;
+    /// returns the most scans any of their runs has now made.
+    pub(crate) fn scanned(&mut self, topologies: &[String], now: Instant) -> usize {
         let mut most = 0;
-        for (instance, _) in keys {
-            let scans = match self.runs.get(instance) {
+        for topology in topologies {
+            let scans = match self.runs.get(topology) {
                 Some((last, scans)) if now.saturating_duration_since(*last) < RUN_ENDS_AFTER => {
                     scans + 1
                 }
                 _ => 1,
             };
-            self.runs.insert(instance.clone(), (now, scans));
+            self.runs.insert(topology.clone(), (now, scans));
             most = most.max(scans);
         }
         most
@@ -159,12 +163,21 @@ pub(crate) fn tick(
     if due.is_empty() || !permitted() {
         return Vec::new();
     }
-    let endpoints: Vec<String> = view
+    let cameras: Vec<_> = view
         .unclassified
         .iter()
         .filter(|camera| due.contains(&(camera.instance_id.clone(), camera.generation)))
+        .collect();
+    let endpoints = cameras
+        .iter()
         .flat_map(|camera| camera.endpoints.iter().cloned())
         .collect();
+    let mut topologies: Vec<String> = cameras
+        .iter()
+        .map(|camera| camera.topology.clone())
+        .collect();
+    topologies.sort();
+    topologies.dedup();
     if !scan(endpoints) {
         return Vec::new();
     }
@@ -173,7 +186,7 @@ pub(crate) fn tick(
          that had no roles yet (ADR-0029 §1)",
         due.len()
     );
-    if classifier.scanned(&due, now) == THROTTLE_NOTICE_AT {
+    if classifier.scanned(&topologies, now) == THROTTLE_NOTICE_AT {
         irlume_common::jout_notice!(
             "irlumed: cameras keep coming back unclassified after a scan (a udev \
              change each time?); scans are now spaced up to {} s apart",
@@ -224,6 +237,9 @@ pub(crate) fn scan_on_worker<T: Send + 'static>(
     let task: crate::arbiter::BackgroundTask = Box::new(move |token| {
         let halted = std::cell::Cell::new(false);
         classify(&endpoints, &|| {
+            // The watchdog reads worker progress; a scan of many busy nodes
+            // is progress at each one, as a long capture is between scans.
+            crate::note_worker_progress();
             let stop = token.stop_requested() || !permitted();
             halted.set(halted.get() || stop);
             stop
@@ -236,18 +252,32 @@ pub(crate) fn scan_on_worker<T: Send + 'static>(
     }
 }
 
-/// Start the classifier thread, which hands its scans to `arbiter`'s camera
-/// worker. `permitted` is read only when a camera is due a try: the face
+/// Run a first pass and wait for it, then start the classifier thread, which
+/// hands its scans to `arbiter`'s camera worker. Called once the worker runs
+/// and before the daemon reports ready. `permitted` is read only when a camera is due a try: the face
 /// sensor policy decides, as for background requalification, so the IR-only
 /// policy's "no discovery" stays true.
 pub(crate) fn spawn<T: Send + 'static>(
     arbiter: std::sync::Arc<crate::arbiter::Arbiter<T>>,
     permitted: fn() -> bool,
 ) {
+    // The first pass at once, before the daemon reports ready, so the first
+    // authentication finds the cameras already classified.
+    let mut classifier = RoleClassifier::default();
+    {
+        let scan = |endpoints| {
+            scan_on_worker(
+                &arbiter,
+                endpoints,
+                permitted,
+                irlume_auth::classify_endpoints,
+            )
+        };
+        tick(&mut classifier, &permitted, &scan, Instant::now());
+    }
     let spawned = std::thread::Builder::new()
         .name("irlume-camera-roles".into())
         .spawn(move || {
-            let mut classifier = RoleClassifier::default();
             let scan = |endpoints| {
                 scan_on_worker(
                     &arbiter,
@@ -544,6 +574,7 @@ mod tests {
                     instance_id: (*instance).to_owned(),
                     generation: *generation,
                     endpoints: vec!["/dev/video0".into()],
+                    topology: topology(instance),
                 })
                 .collect(),
             ..ConnectedPairs::default()
@@ -552,6 +583,11 @@ mod tests {
 
     fn key(instance: &str, generation: u64) -> CameraKey {
         (instance.to_owned(), generation)
+    }
+
+    /// The USB topology path `view` gives camera `instance`.
+    fn topology(instance: &str) -> String {
+        format!("/devices/test/{instance}")
     }
 
     #[test]
@@ -622,7 +658,11 @@ mod tests {
         let mut now = start;
         let mut scans = Vec::new();
         for generation in 1..=200u64 {
-            let listed = view(CameraInventoryState::Current, &[("a", generation)]);
+            // Each return is a fresh instance at the same port, as after a
+            // reset that retired the old one.
+            let mut listed = view(CameraInventoryState::Current, &[("a", generation)]);
+            listed.unclassified[0].instance_id = format!("a-{generation}");
+            listed.unclassified[0].topology = topology("a");
             // Poll until it is due again, at most an hour on.
             let deadline = now + Duration::from_secs(3600);
             while classifier.due(&listed, now).is_empty() {
@@ -633,8 +673,8 @@ mod tests {
                 );
                 now += POLL;
             }
-            classifier.scanned(&[key("a", generation)], now);
-            classifier.tried(&[key("a", generation)], now);
+            classifier.scanned(&[topology("a")], now);
+            classifier.tried(&[key(&format!("a-{generation}"), generation)], now);
             scans.push(now);
             if now.duration_since(start) > Duration::from_secs(4 * 3600) {
                 break;
@@ -656,8 +696,8 @@ mod tests {
         let mut classifier = RoleClassifier::default();
         let mut now = Instant::now();
         // Camera `a` has come back unclassified enough to be spaced out.
-        for generation in 1..=SCAN_GAP.len() as u64 {
-            classifier.scanned(&[key("a", generation)], now);
+        for _ in 0..SCAN_GAP.len() {
+            classifier.scanned(&[topology("a")], now);
             now += POLL;
         }
         let a_again = view(CameraInventoryState::Current, &[("a", 99)]);
@@ -665,11 +705,11 @@ mod tests {
         // A different camera plugged in meanwhile is due at once.
         let both = view(CameraInventoryState::Current, &[("a", 99), ("b", 1)]);
         assert_eq!(classifier.due(&both, now), [key("b", 1)]);
-        assert_eq!(classifier.scanned(&[key("b", 1)], now), 1);
+        assert_eq!(classifier.scanned(&[topology("b")], now), 1);
         // After a quiet quarter hour, `a` starts a fresh run.
         let later = now + RUN_ENDS_AFTER;
         assert_eq!(classifier.due(&a_again, later), [key("a", 99)]);
-        assert_eq!(classifier.scanned(&[key("a", 99)], later), 1);
+        assert_eq!(classifier.scanned(&[topology("a")], later), 1);
     }
 
     #[test]

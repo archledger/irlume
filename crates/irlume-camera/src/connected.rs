@@ -384,6 +384,10 @@ pub struct UnclassifiedCamera {
     pub generation: u64,
     /// The capture nodes without a role, sorted.
     pub endpoints: Vec<String>,
+    /// The camera's USB topology path. It stays the same when the camera
+    /// returns at the same port with a fresh instance id, after a continuity
+    /// loss retired the old one.
+    pub topology: String,
 }
 
 /// The camera-free pairing view of one inventory publication; see
@@ -500,6 +504,7 @@ pub(crate) fn pair_camera(
             instance_id: input.instance_id.to_owned(),
             generation: input.generation,
             endpoints: unclassified,
+            topology: input.topology_path.to_owned(),
         });
     }
     let ([rgb], [ir]) = (rgb.as_slice(), ir.as_slice()) else {
@@ -1110,6 +1115,7 @@ mod tests {
             instance_id: INSTANCE.into(),
             generation: GENERATION,
             endpoints: video(endpoints),
+            topology: TOPOLOGY.into(),
         })
     }
 

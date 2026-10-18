@@ -4052,8 +4052,9 @@ fn uvc_endpoint_scan(endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
 /// Classify the named capture nodes and record their roles for the camera
 /// generation they belong to (ADR-0029 §1), for the daemon's background
 /// classification of cameras that appeared without roles. Only nodes the
-/// current inventory publication lists are touched, one at a time, as
-/// discovery does (a diagnostics lease, capabilities and formats; no stream,
+/// current inventory publication lists as unclassified are touched (one
+/// another scan classified meanwhile is not), one at a time, as discovery
+/// does (a diagnostics lease, capabilities and formats; no stream,
 /// no emitter); `stop` is asked before each, so a waiting authentication
 /// can take the camera worker back. A node whose generation changed during
 /// the scan is not recorded.

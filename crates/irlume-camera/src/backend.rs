@@ -345,14 +345,21 @@ impl CameraSupervisor {
         pairs
     }
 
-    /// Classify the named endpoints the current publication lists, and no
-    /// other node.
+    /// Classify the named endpoints the current publication lists as
+    /// unclassified, and no other node: one another scan classified while
+    /// this waited, or one no longer published, is not opened.
     fn classify_endpoints(&self, endpoints: &[String], stop: &dyn Fn() -> bool) {
         let before = self.endpoint_generations();
+        let pending: std::collections::BTreeSet<String> = self
+            .connected_pairs()
+            .unclassified
+            .into_iter()
+            .flat_map(|camera| camera.endpoints)
+            .collect();
         let published: Vec<&str> = endpoints
             .iter()
             .map(String::as_str)
-            .filter(|endpoint| before.contains_key(*endpoint))
+            .filter(|endpoint| before.contains_key(*endpoint) && pending.contains(*endpoint))
             .collect();
         if published.is_empty() {
             return;
@@ -2404,6 +2411,12 @@ pub(crate) mod tests {
         // Nothing published among the names: no backend call at all.
         crate::classify_endpoints(&["/dev/not-published".into()], &|| false);
         assert_eq!(calls.lock().unwrap().len(), 1);
+        // Already classified (by this scan, or a ListCameras that ran while
+        // the request waited): not opened again.
+        crate::classify_endpoints(&["/dev/video0".into(), "/dev/video2".into()], &|| false);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        crate::classify_endpoints(&["/dev/video0".into(), "/dev/video4".into()], &|| false);
+        assert_eq!(calls.lock().unwrap()[1], "endpoint_scan:/dev/video4");
     }
 
     #[test]

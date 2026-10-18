@@ -2383,6 +2383,7 @@ mod tests {
                 instance_id,
                 generation: 2,
                 endpoints: vec!["/dev/video0".into(), "/dev/video2".into()],
+                topology: CAMERA_A.into(),
             }]
         );
     }

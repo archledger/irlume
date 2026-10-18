@@ -180,7 +180,9 @@ pub(crate) fn tick(
             SCAN_GAP[SCAN_GAP.len() - 1].as_secs()
         );
     }
-    for (instance, _) in classifier.tried(&due, now) {
+    // A last try that classified the camera leaves nothing to warn about.
+    let exhausted = classifier.tried(&due, now);
+    for (instance, _) in still_unclassified(exhausted, &irlume_auth::connected_pairs()) {
         irlume_common::jout_warn!(
             "irlumed: camera {} is still unclassified after {MAX_TRIES} tries; \
              face authentication cannot route to it until it is replugged \
@@ -191,18 +193,42 @@ pub(crate) fn tick(
     due
 }
 
+/// The cameras of `keys` that `view` still lists as unclassified.
+pub(crate) fn still_unclassified(keys: Vec<CameraKey>, view: &ConnectedPairs) -> Vec<CameraKey> {
+    keys.into_iter()
+        .filter(|(instance, generation)| {
+            view.unclassified
+                .iter()
+                .any(|camera| &camera.instance_id == instance && camera.generation == *generation)
+        })
+        .collect()
+}
+
+/// What classifies the named endpoints, asking `stop` before each:
+/// [`irlume_auth::classify_endpoints`] outside tests.
+pub(crate) type Classify = fn(&[String], &dyn Fn() -> bool);
+
 /// Classify `endpoints` as the camera worker's background work, and wait for
 /// it: true when the scan ran to the end; false when the arbiter refused it
-/// (an authentication pending), an authentication stopped it, or the worker
-/// shut down without running it.
+/// (an authentication pending), an authentication or the face sensor policy
+/// stopped it, or the worker shut down without running it. `permitted` is
+/// asked again before each node, on the worker: a policy switched to IR-only
+/// while the scan queued opens nothing more.
 pub(crate) fn scan_on_worker<T: Send + 'static>(
     arbiter: &crate::arbiter::Arbiter<T>,
     endpoints: Vec<String>,
+    permitted: fn() -> bool,
+    classify: Classify,
 ) -> bool {
     let (done, finished) = std::sync::mpsc::channel();
     let task: crate::arbiter::BackgroundTask = Box::new(move |token| {
-        irlume_auth::classify_endpoints(&endpoints, &|| token.stop_requested());
-        let _ = done.send(!token.stop_requested());
+        let halted = std::cell::Cell::new(false);
+        classify(&endpoints, &|| {
+            let stop = token.stop_requested() || !permitted();
+            halted.set(halted.get() || stop);
+            stop
+        });
+        let _ = done.send(!halted.get() && !token.stop_requested());
     });
     match arbiter.submit_background(task) {
         Ok(()) => finished.recv().unwrap_or(false),
@@ -216,13 +242,20 @@ pub(crate) fn scan_on_worker<T: Send + 'static>(
 /// policy's "no discovery" stays true.
 pub(crate) fn spawn<T: Send + 'static>(
     arbiter: std::sync::Arc<crate::arbiter::Arbiter<T>>,
-    permitted: impl Fn() -> bool + Send + 'static,
+    permitted: fn() -> bool,
 ) {
     let spawned = std::thread::Builder::new()
         .name("irlume-camera-roles".into())
         .spawn(move || {
             let mut classifier = RoleClassifier::default();
-            let scan = |endpoints| scan_on_worker(&arbiter, endpoints);
+            let scan = |endpoints| {
+                scan_on_worker(
+                    &arbiter,
+                    endpoints,
+                    permitted,
+                    irlume_auth::classify_endpoints,
+                )
+            };
             loop {
                 std::thread::sleep(POLL);
                 tick(&mut classifier, &permitted, &scan, Instant::now());
@@ -371,31 +404,95 @@ mod tests {
         );
     }
 
+    /// Endpoints the recording classifier was asked to open, per test.
+    static OPENED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// A classifier for worker threads, which have no fixture supervisor:
+    /// records each endpoint it would open, asking `stop` first as the real
+    /// one does.
+    fn recording_classify(endpoints: &[String], stop: &dyn Fn() -> bool) {
+        for endpoint in endpoints {
+            if stop() {
+                break;
+            }
+            OPENED.lock().unwrap().push(endpoint.clone());
+        }
+    }
+
+    /// Run the next piece of worker work on its own thread.
+    fn worker<T: Send + 'static>(
+        arbiter: &std::sync::Arc<crate::arbiter::Arbiter<T>>,
+    ) -> std::thread::JoinHandle<bool> {
+        let arbiter = std::sync::Arc::clone(arbiter);
+        std::thread::spawn(move || match arbiter.take_work() {
+            Some(crate::arbiter::Work::Background(task)) => {
+                task(&arbiter.cancel_token());
+                true
+            }
+            _ => false,
+        })
+    }
+
     #[test]
     fn the_scan_runs_on_the_worker_and_waits_for_it() {
-        // Refused while an authentication is pending; otherwise run by
-        // whoever takes the worker's work, and answered once it ran.
+        // Refused while an authentication is pending; otherwise run by the
+        // worker, and answered once it ran.
         let arbiter = std::sync::Arc::new(crate::arbiter::Arbiter::<()>::new());
         arbiter.submit(crate::arbiter::Class::Auth, 0, ()).unwrap();
-        assert!(!scan_on_worker(&arbiter, vec!["/dev/irlume-none".into()]));
+        let endpoints = vec!["/dev/irlume-worker-a".to_owned()];
+        assert!(!scan_on_worker(
+            &arbiter,
+            endpoints.clone(),
+            || true,
+            recording_classify
+        ));
         let Some(crate::arbiter::Work::Job(job)) = arbiter.take_work() else {
             panic!("the authentication was not taken first");
         };
         arbiter.finish(job.class, job.uid);
-        let worker = {
-            let arbiter = std::sync::Arc::clone(&arbiter);
-            std::thread::spawn(move || match arbiter.take_work() {
-                Some(crate::arbiter::Work::Background(task)) => {
-                    task(&arbiter.cancel_token());
-                    true
-                }
-                _ => false,
-            })
-        };
-        // No camera is published on this thread's supervisor for the path,
-        // so the worker's scan touches nothing and runs to the end.
-        assert!(scan_on_worker(&arbiter, vec!["/dev/irlume-none".into()]));
+        let worker = worker(&arbiter);
+        assert!(scan_on_worker(
+            &arbiter,
+            endpoints,
+            || true,
+            recording_classify
+        ));
         assert!(worker.join().unwrap());
+        assert!(OPENED
+            .lock()
+            .unwrap()
+            .contains(&"/dev/irlume-worker-a".to_owned()));
+    }
+
+    #[test]
+    fn a_policy_switched_off_while_the_scan_queued_opens_nothing() {
+        // `irlume auth sensor ir-only` rewrites settings.conf at once; the
+        // worker asks again before each node.
+        let arbiter = std::sync::Arc::new(crate::arbiter::Arbiter::<()>::new());
+        let worker = worker(&arbiter);
+        let endpoints = vec!["/dev/irlume-worker-off".to_owned()];
+        assert!(!scan_on_worker(
+            &arbiter,
+            endpoints,
+            || false,
+            recording_classify
+        ));
+        assert!(worker.join().unwrap());
+        assert!(!OPENED
+            .lock()
+            .unwrap()
+            .contains(&"/dev/irlume-worker-off".to_owned()));
+    }
+
+    #[test]
+    fn only_a_camera_still_unclassified_is_warned_about() {
+        // The last try classified `a`; `b` stayed unclassified.
+        let after = view(CameraInventoryState::Current, &[("b", 1)]);
+        assert_eq!(
+            still_unclassified(vec![key("a", 1), key("b", 1)], &after),
+            [key("b", 1)]
+        );
+        assert!(still_unclassified(vec![key("b", 2)], &after).is_empty());
     }
 
     #[test]

@@ -109,9 +109,12 @@ cleanup() {
     exit "$status"
 }
 
+# GET_CUR on the camera the snapshot identified: a replug, or another device
+# taking the node, refuses rather than reading a different camera's value.
 read_cur() { # tag
     local value
-    if ! value=$("$XU_SET" "$IR" "$model_unit" 6 get 2>"$OUT/get-$1.err"); then
+    if ! value=$("$XU_SET" "$IR" "$model_unit" 6 get --expect-camera "$identity" \
+        2>"$OUT/get-$1.err"); then
         echo "GET_CUR failed ($1):" >&2
         sed 's/^/    /' "$OUT/get-$1.err" >&2
         return 1
@@ -147,11 +150,12 @@ accepted_after() { # from
         'NR > from && index($0, prefix) == 1 { if ($0 == want) print NR; exit }' "$OUT/irlumed.log"
 }
 
-# Burst lines for this camera after line $1 that end in $3, counted. irlumed
-# names the camera by the node it captures from, which is either spelling.
-count_bursts() { # from, prefix, suffix
-    awk -v from="$1" -v a="$2$node: " -v b="$2$IR: " -v suffix="$3" '
-        NR > from && (index($0, a) == 1 || index($0, b) == 1) &&
+# Burst lines for this camera strictly between lines $1 and $2 that end in $4,
+# counted. irlumed names the camera by the node it captures from, which is
+# either spelling.
+count_bursts() { # from, to, prefix, suffix
+    awk -v from="$1" -v to="$2" -v a="$3$node: " -v b="$3$IR: " -v suffix="$4" '
+        NR > from && NR < to && (index($0, a) == 1 || index($0, b) == 1) &&
             substr($0, length($0) - length(suffix) + 1) == suffix { n++ }
         END { print n + 0 }' "$OUT/irlumed.log"
 }
@@ -265,6 +269,11 @@ pid=$(systemctl show -p MainPID --value "$SERVICE")
 [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo "irlumed has no main process"; exit 2; }
 invocation=$(systemctl show -p InvocationID --value "$SERVICE")
 [[ "$invocation" =~ ^[0-9a-f]{32}$ ]] || { echo "irlumed has no invocation ID"; exit 2; }
+# The binary this daemon is executing, read through its own exe link, so a
+# package replaced on disk during the run cannot stand in for it.
+exe=$(readlink "/proc/$pid/exe" 2>/dev/null || echo unknown)
+exe_sha=$(sha256sum <"/proc/$pid/exe" 2>/dev/null | cut -d' ' -f1)
+[[ "$exe_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "refusing: cannot hash the running irlumed (pid $pid)"; exit 2; }
 # The daemon's own environment, not the unit's text, so a later drop-in that
 # overrides one of these is caught before the run rather than after it.
 for wanted in "IRLUME_IR_EMITTER=$model_override" IRLUME_LOG=debug \
@@ -335,12 +344,17 @@ else
         "no '$expected_write' followed by '$expected_accepted' and 'irlume: capture emitter write completed'"
 fi
 
+# Every observation below comes from the first write's cycle: after the write
+# and before its restore, so a later attempt's bursts cannot stand in.
+cycle_end=${restored_at:-$(($(wc -l <"$OUT/irlumed.log") + 1))}
+cycles=$(awk -v want="$expected_write" '$0 == want { n++ } END { print n + 0 }' "$OUT/irlumed.log")
 readback_at=""
 [ -n "$write_at" ] && readback_at=$(first_exact_after "$expected_readback" "$((write_at + 1))")
+[ -n "$readback_at" ] && [ "$readback_at" -ge "$cycle_end" ] && readback_at=""
 if [ -n "$readback_at" ]; then
     ok "the camera read D1 back after the write"
 else
-    hint="no '$expected_readback' after the write"
+    hint="no '$expected_readback' between the write and its restore"
     grep -Eq "^irlume: GET_CUR unit$model_unit/sel6 size=[0-9]+(: .*)?$" "$OUT/irlumed.log" &&
         hint="$hint; irlumed prints reads without the node, so it predates this harness"
     bad "the camera read D1 back after the write" "$hint"
@@ -350,22 +364,22 @@ proven=0
 bursts=0
 ceilings=0
 if [ -n "$write_at" ]; then
-    bursts=$(count_bursts "$write_at" "$d1_line_prefix" "")
-    proven=$(count_bursts "$write_at" "$d1_line_prefix" "$d1_proven_suffix")
+    bursts=$(count_bursts "$write_at" "$cycle_end" "$d1_line_prefix" "")
+    proven=$(count_bursts "$write_at" "$cycle_end" "$d1_line_prefix" "$d1_proven_suffix")
     # The ceiling line carries the debug prefix ahead of the camera.
-    ceilings=$(awk -v from="$write_at" -v a="$ceiling_line_prefix$node$ceiling_suffix" \
-        -v b="$ceiling_line_prefix$IR$ceiling_suffix" '
-            NR > from && (index($0, a) || index($0, b)) { n++ }
+    ceilings=$(awk -v from="$write_at" -v to="$cycle_end" \
+        -v a="$ceiling_line_prefix$node$ceiling_suffix" -v b="$ceiling_line_prefix$IR$ceiling_suffix" '
+            NR > from && NR < to && (index($0, a) || index($0, b)) { n++ }
             END { print n + 0 }' "$OUT/irlumed.log")
 fi
 if [ "$proven" -gt 0 ] && [ "$ceilings" -gt 0 ]; then
-    ok "$proven of $bursts bursts captured with D1 selected proved the alternation; $ceilings qualified for the YUYV ceiling"
+    ok "$proven of the cycle's $bursts bursts proved the alternation with D1 selected; $ceilings qualified for the YUYV ceiling"
 elif [ "$bursts" -eq 0 ]; then
     bad "bursts captured with D1 selected prove the alternation" \
-        "no [ir_d1] line for $node after the write; irlumed predates this harness or captured no IR burst there"
+        "no [ir_d1] line for $node between the write and its restore; irlumed predates this harness or captured no IR burst there"
 else
     bad "bursts captured with D1 selected prove the alternation" \
-        "$proven of $bursts bursts proved D1 and $ceilings qualified for the ceiling; see $OUT/irlumed.log"
+        "$proven of the cycle's $bursts bursts proved D1 and $ceilings qualified for the ceiling; see $OUT/irlumed.log"
 fi
 
 restore_accepted_at=""
@@ -405,12 +419,12 @@ fi
     echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "camera: $model_name, USB $usb_id, unit $model_unit, selector 6"
     echo "kernel: $(uname -r)"
-    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-    echo "irlumed: ${exe:-unknown} sha256 $(sha256sum "${exe:-/dev/null}" 2>/dev/null | cut -d' ' -f1)"
+    echo "irlumed: $exe sha256 $exe_sha (read from the running process)"
     echo "tree: $(git -C "$TREE" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "GET_CUR before: $initial"
     echo "GET_CUR after:  $final"
     echo "face authentication: $(auth_outcome)"
+    echo "write/restore cycles: $cycles (the checks read the first)"
     echo "result: $pass passed, $fail failed"
     echo
     # The emitter and burst lines only: the face authentication's own line

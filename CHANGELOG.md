@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The nightly channel's Ubuntu lane, `ppa:archledger/irlume-nightly`
+  (ADR-0037 section 3; docs/PLATFORMS.md "Nightly channel"):
+  `scripts/ppa-nightly.py`, run once a day by a user timer on the
+  maintainer's machine (`packaging/ppa/nightly/`), builds `main` when it
+  moved, with the release's container script and image, signs it through
+  gpg-agent's extra socket, uploads it and follows it on Launchpad. A
+  failed or rejected upload retries with the next PPA revision while `main`
+  is unchanged, and a new commit supersedes a pending one.
+
 - A nightly channel builds `main` for trying a fix before the next release
   (ADR-0037; docs/PLATFORMS.md "Nightly channel"): on Fedora the Copr
   project `archledger/irlume-nightly`, built by Packit on every push to
@@ -632,6 +641,15 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- The PPA container build no longer copies its source tree into itself.
+  It staged into `/work/ppa-build`, inside the tree
+  `scripts/build-ppa-source.sh` copies with rsync, and rsync reads
+  directories while it copies, so a large tree could be copied again one
+  level deeper each time until the disk filled (a nightly dry run reached
+  50 GB). The build root is now a mount of its own, `/out`, so rebuilding
+  an older tag is safe too, and `build-ppa-source.sh` leaves a build root
+  inside the tree out of the copy.
 
 - On Arch, removing only `irlume-kcm` no longer stops irlumed. The
   recipe set its install script (and `backup`, `optdepends`) before the

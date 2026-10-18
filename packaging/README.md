@@ -79,7 +79,10 @@ These checks do not launch the TUI or prove desktop-session compatibility.
   from `arch/PKGBUILD` by `scripts/arch-git-pkgbuild.py` (CI fails when the
   committed copy is stale); the maintainer pushes it to the AUR, and the
   daily `aur-recipe.yml` fails, raising a `ci-alert` issue, when the AUR's
-  copy differs from `main`'s.
+  copy differs from `main`'s. Ubuntu: `ppa:archledger/irlume-nightly`,
+  uploaded at most once a day by `scripts/ppa-nightly.py` from a user timer
+  on the maintainer's machine (`ppa/nightly/`), built with the release's
+  `ppa/container-build.sh` in the same pinned image.
 - **Ubuntu** ([`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume)):
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled

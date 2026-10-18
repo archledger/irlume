@@ -23,6 +23,9 @@
 #
 # Env knobs: SERIES (default resolute), PPAREV (0ppa1), ORT_VER (1.28.1),
 # BUILDROOT (~/ppa-build), SKIP_BUILD_CHECK=1 to skip the offline test build.
+# A nightly (ADR-0037, scripts/ppa-nightly.py) also sets PPA_VERSION, its
+# upstream version (0.15.0+git139.g3c162b83), and PPA_CHANGELOG, its
+# changelog entry; a release sets neither and keeps the crate version.
 set -euo pipefail
 
 SERIES="${SERIES:-resolute}"
@@ -35,7 +38,7 @@ ORT_SHA256="${ORT_SHA256:-2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c9
 BUILDROOT="${BUILDROOT:-$HOME/ppa-build}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)"
+VERSION="${PPA_VERSION:-$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)}"
 DEBVER="${VERSION}-${PPAREV}~${SERIES}1"
 TREE="$BUILDROOT/irlume-$VERSION"
 
@@ -49,10 +52,19 @@ bash "$REPO/scripts/fetch-models.sh"
 echo "==> staging source tree $TREE (irlume $DEBVER)"
 mkdir -p "$BUILDROOT"
 rm -rf "$TREE"
+# A BUILDROOT inside the tree (the container builds use /work/ppa-build) is
+# left out of the copy: rsync reads directories while it copies, so it would
+# find the staged tree inside its source and copy it into itself again, one
+# level deeper each time, until the disk is full.
+buildroot_abs="$(cd "$BUILDROOT" && pwd)"
+skip_buildroot=()
+case "$buildroot_abs" in
+  "$REPO"/*) skip_buildroot=(--exclude "/${buildroot_abs#"$REPO"/}") ;;
+esac
 # Leading / anchors each exclude to the tree root (a bare "debian" would
 # also strip packaging/ppa/debian and packaging/debian).
 rsync -a --exclude .git --exclude /target --exclude /.deb-staging \
-      --exclude /debian --exclude /vendor "$REPO/" "$TREE/"
+      --exclude /debian --exclude /vendor "${skip_buildroot[@]}" "$REPO/" "$TREE/"
 
 echo "==> bundling onnxruntime $ORT_VER"
 ORT_TGZ="$BUILDROOT/onnxruntime-linux-x64-${ORT_VER}.tgz"
@@ -105,7 +117,7 @@ cp -r "$TREE/packaging/ppa/debian" "$TREE/debian"
 cat > "$TREE/debian/changelog" <<EOF
 irlume (${DEBVER}) ${SERIES}; urgency=medium
 
-  * PPA release of irlume ${VERSION} for ${SERIES}.
+  * ${PPA_CHANGELOG:-PPA release of irlume ${VERSION} for ${SERIES}.}
     Self-contained source: vendored crates, bundled onnxruntime ${ORT_VER},
     bundled model weights (see debian/copyright and the README model BOM).
 
@@ -120,10 +132,14 @@ echo
 echo "Artifacts in $BUILDROOT:"
 ls -lh "$BUILDROOT"/irlume_"${DEBVER%%~*}"* "$BUILDROOT"/irlume_"${VERSION}".orig.tar.gz 2>/dev/null || ls -lh "$BUILDROOT"
 echo
+# PPA_NAME names the target PPA (the nightly channel's is irlume-nightly).
+ppa="${PPA_NAME:-irlume}"
+verify_env=""
+[ "$ppa" = irlume ] || verify_env="PPA_NAME=$ppa "
 echo "Next: sign with the release key, upload, then VERIFY IT PUBLISHED:"
 echo "  debsign $BUILDROOT/irlume_${DEBVER}_source.changes"
-echo "  dput ppa:archledger/irlume $BUILDROOT/irlume_${DEBVER}_source.changes"
-echo "  python3 $REPO/scripts/verify-ppa-publish.py $VERSION"
+echo "  dput ppa:archledger/$ppa $BUILDROOT/irlume_${DEBVER}_source.changes"
+echo "  ${verify_env}python3 $REPO/scripts/verify-ppa-publish.py $VERSION"
 echo
 # dput's "Successfully uploaded packages." only means Launchpad accepted the
 # upload. 0.6.1 was accepted, then its build failed, and Ubuntu users sat on

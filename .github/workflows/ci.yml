@@ -679,6 +679,11 @@ jobs:
       - name: PPA publish verifier (verdict logic)
         run: python3 scripts/verify-ppa-publish.py --self-test
 
+      # The nightly PPA uploader's decisions (ADR-0037 section 3): fixtures
+      # only, no Launchpad, clone or container.
+      - name: Nightly PPA uploader (decisions and state)
+        run: python3 -B scripts/test-ppa-nightly.py
+
       # The nightly hardware suite finds its IR node by parsing `irlume doctor`,
       # and that parse is why the camera stage did not run for the eight nights
       # after 42c03c6 changed the node line. Nothing hosted has a camera, so the

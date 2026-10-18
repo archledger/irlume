@@ -4,7 +4,7 @@
 # scripts/build-ppa-source.sh (which this runs inside ubuntu:26.04/resolute) and
 # to packaging/debian/build-deb-container.sh (the same idea for the .deb).
 #
-# What it does, from any box with podman + a real LFS checkout:
+# What it does, from any box with podman (or docker) + a checkout:
 #   1. git-archive the release tag to a CLEAN tree (no .git worktree, no LFS
 #      pointer/host-path surprises), and overlay the real model weights.
 #   2. Run scripts/build-ppa-source.sh inside the container with a fixed
@@ -39,7 +39,9 @@ OUT="${OUT:-$REPO/ppa-out}"
 VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)"
 TAG="v${VERSION}"
 
-command -v podman >/dev/null || { echo "need podman"; exit 1; }
+# podman (rootless, the original route) or docker; CONTAINER overrides.
+ENGINE="${CONTAINER:-$(command -v podman || command -v docker || true)}"
+[ -n "$ENGINE" ] || { echo "need podman or docker"; exit 1; }
 git -C "$REPO" rev-parse "$TAG" >/dev/null 2>&1 || { echo "no git tag $TAG in $REPO"; exit 1; }
 
 # Models are release assets (not Git LFS); fetch + verify them so the orig
@@ -51,9 +53,36 @@ bash "$REPO/scripts/fetch-models.sh"
 SDE="$(git -C "$REPO" log -1 --format=%ct "$TAG")"
 
 WORK="$(mktemp -d)"
+# The container's build script is this checkout's, not the tag's: a tag made
+# before packaging/ppa/container-build.sh existed (v0.15.0 and older) has none,
+# and the build script it runs, scripts/build-ppa-source.sh, is still the
+# tag's. Outside $WORK, so it is not packed into the orig tarball.
+HELPER="$(mktemp -d)"
+cp "$REPO/packaging/ppa/container-build.sh" "$HELPER/"
+# The build root, mounted at /out: outside $WORK, so an older tag's
+# build-ppa-source.sh never copies it into itself.
+BUILD="$(mktemp -d)"
 # Rootless podman writes into the mount as a mapped subuid; clean via unshare so
 # leftovers from a prior run can't poison this one, and reclaim ownership after.
-cleanup() { podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null || true; }
+cleanup() {
+  podman unshare rm -rf "$WORK" "$BUILD" 2>/dev/null || rm -rf "$WORK" "$BUILD" 2>/dev/null || true
+  rm -rf "$HELPER"
+}
+# Rootful docker runs the build as the real root: hand the files back at the
+# end. Rootless podman's and rootless docker's root already is this user (a
+# chown to this uid would map to a subuid). The runtime is asked what it is:
+# podman-docker installs a `docker` command that runs podman, and docker info
+# lists rootless mode among its security options.
+OWNER_ENV=()
+case "$("$ENGINE" --version 2>/dev/null)" in
+  *[Pp]odman*) ;;
+  *)
+    case "$("$ENGINE" info --format '{{json .SecurityOptions}}' 2>/dev/null)" in
+      *rootless*) ;;
+      *) OWNER_ENV=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)") ;;
+    esac
+    ;;
+esac
 trap cleanup EXIT
 
 echo "==> exporting $TAG (git archive) + real models into a clean tree"
@@ -61,29 +90,17 @@ git -C "$REPO" archive --format=tar "$TAG" | tar -x -C "$WORK"
 cp "$REPO"/models/*.onnx "$WORK/models/"
 
 echo "==> building PPA source in $BASE (SERIES=$SERIES, SOURCE_DATE_EPOCH=$SDE)"
-podman run --rm \
-  -v "$WORK:/work:z" \
+"$ENGINE" run --rm \
+  -v "$WORK:/work:z" -v "$BUILD:/out:z" -v "$HELPER:/helper:ro,z" \
   -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" -e "PPAREV=${PPAREV:-0ppa1}" \
-  "$BASE" bash -euc '
-    export DEBIAN_FRONTEND=noninteractive HOME=/work CARGO_HOME=/work/.cargo-home
-    apt-get update -qq >/dev/null
-    # debhelper (debhelper-compat 13) + linux-libc-dev are Build-Depends the
-    # bare image lacks; without them dpkg-checkbuilddeps aborts the source build.
-    apt-get install -y -qq --no-install-recommends \
-      ca-certificates curl rsync git xz-utils \
-      build-essential dpkg-dev debhelper devscripts fakeroot linux-libc-dev \
-      cargo rustc pkg-config clang libclang-dev libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon \
-      cmake extra-cmake-modules qt6-base-dev qt6-declarative-dev \
-      libkf6kcmutils-dev libkf6coreaddons-dev libkf6kio-dev >/dev/null
-    cd /work
-    export BUILDROOT=/work/ppa-build
-    bash scripts/build-ppa-source.sh
-  '
+  "${OWNER_ENV[@]}" \
+  "$BASE" bash /helper/container-build.sh
 
-# Reclaim the subuid-owned artifacts to the host user, then copy them out.
-podman unshare chown -R 0:0 "$WORK/ppa-build" 2>/dev/null || true
+# Reclaim the subuid-owned artifacts to the host user (rootless podman),
+# then copy them out.
+podman unshare chown -R 0:0 "$BUILD" 2>/dev/null || true
 mkdir -p "$OUT"
-cp "$WORK"/ppa-build/irlume_"${VERSION}"* "$OUT"/
+cp "$BUILD"/irlume_"${VERSION}"* "$OUT"/
 cp "$REPO/.github/release-signing-key.asc" "$OUT/release-key.asc"
 
 echo

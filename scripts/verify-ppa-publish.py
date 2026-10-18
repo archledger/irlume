@@ -157,7 +157,13 @@ def published_binaries(debver):
             "exact_match": "true",
         },
     )
-    return binaries_for_source(d.get("entries") or [], debver)
+    entries = list(d.get("entries") or [])
+    # Every page: the nightly PPA (ADR-0037) carries a version a day, so the
+    # one asked about can fall past the first page of the collection.
+    while d.get("next_collection_link"):
+        d = get(d["next_collection_link"])
+        entries.extend(d.get("entries") or [])
+    return binaries_for_source(entries, debver)
 
 
 def binaries_for_source(entries, debver):

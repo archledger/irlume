@@ -83,6 +83,9 @@ pub use irlume_camera::{
 };
 /// Resolve explicitly configured devices without camera discovery or image opens.
 pub use irlume_camera::{configured_ir_target, configured_pair_no_probe};
+/// The camera-free pairing view, whose unclassified cameras the daemon's
+/// background role classification acts on (ADR-0029 §1).
+pub use irlume_camera::{connected_pairs, ConnectedPairs};
 /// Whether a split preparation failed on an external-camera rule the owner
 /// can act on (ADR-0032, amendment 2026-10-13, section 3).
 pub use request_preparation::is_split_external_refusal;

@@ -91,6 +91,7 @@ mod operation_authorization;
 mod position_session;
 mod retry_recovery;
 mod retry_throttle;
+mod role_classification;
 mod shared_unlock;
 mod token_delivery;
 mod users;
@@ -1343,6 +1344,13 @@ fn main() {
             // initialization must not delay the already-bound accept loop.
             // LiveStatus only copies an existing publication; it never starts it.
             irlume_auth::initialize_camera_monitor();
+            // Classify each camera's roles as it appears (ADR-0029 §1), from
+            // here on rather than after the model load: account routing reads
+            // them, and nothing else records them until a client lists the
+            // cameras (#887).
+            role_classification::spawn(|| {
+                permits_background_requalification(irlume_common::config::observe_face_sensor_policy())
+            });
             jout_info!("irlumed: loading models (det={det}, model={model})…");
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
@@ -13551,7 +13559,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 27] = [
+        let sources: [(&str, &str); 28] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
@@ -13606,6 +13614,10 @@ mod tests {
             ("live.rs", include_str!("live.rs")),
             ("users.rs", include_str!("users.rs")),
             ("token_delivery.rs", include_str!("token_delivery.rs")),
+            (
+                "role_classification.rs",
+                include_str!("role_classification.rs"),
+            ),
             (
                 "retry_throttle.rs",
                 concat!(
@@ -26582,6 +26594,23 @@ mod tests {
         assert!(startup.contains("observe_camera_conf()"));
         assert!(startup.contains("camera_conf_startup_warnings("));
         assert!(startup.contains("jout_warn!"));
+    }
+
+    /// #887: roles are classified from the monitor's start, not after the
+    /// model load or when a client lists cameras, and under the policy that
+    /// gates background requalification.
+    #[test]
+    fn startup_classifies_camera_roles_once_the_monitor_runs() {
+        let source = include_str!("main.rs");
+        let startup = source
+            .split("irlume_auth::initialize_camera_monitor();")
+            .nth(1)
+            .unwrap()
+            .split("let verified_recognizer = verify_models(")
+            .next()
+            .unwrap();
+        assert!(startup.contains("role_classification::spawn("));
+        assert!(startup.contains("permits_background_requalification("));
     }
 
     #[test]

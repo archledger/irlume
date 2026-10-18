@@ -642,6 +642,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Face authentication works again right after irlumed starts, a reboot
+  or a package upgrade, and after a camera is replugged, without opening
+  the TUI's Cameras page first (ADR-0029 item 1, #887). Account routing
+  and split pairs read each camera's RGB/IR role, recorded when its nodes
+  were last classified, but nothing classified a camera when it appeared:
+  only the startup device selection, after the model load, and a client's
+  camera listing did. Until then authentication refused to the password
+  with `NoEnrolledCameraConnected`, and `irlume split list` named no
+  candidates. irlumed now classifies a camera's roles in the background
+  as it appears, under the Dual face sensor policy: the same discovery
+  scan as the listing, which starts no stream and fires no emitter, tried
+  again with a backoff if a camera stays unclassified.
+
 - The PPA container build no longer copies its source tree into itself.
   It staged into `/work/ppa-build`, inside the tree
   `scripts/build-ppa-source.sh` copies with rsync, and rsync reads

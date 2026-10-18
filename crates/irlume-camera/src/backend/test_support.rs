@@ -37,7 +37,13 @@ pub enum Call {
     Scan,
 }
 
-struct Recorder(Arc<Mutex<Vec<Call>>>, BTreeMap<String, String>);
+/// The boundary recorder: calls, endpoint identities, and what a scan
+/// answers (`None`: nothing, as for [`Guard::install`]).
+struct Recorder(
+    Arc<Mutex<Vec<Call>>>,
+    BTreeMap<String, String>,
+    Option<Vec<(String, Role)>>,
+);
 
 impl Recorder {
     fn record(&self, call: Call) {
@@ -60,7 +66,14 @@ impl CameraBackend for Recorder {
     }
     fn scan_nodes(&self) -> NodeScan {
         self.record(Call::Scan);
-        NodeScan::default()
+        let mut scan = NodeScan::default();
+        for (path, role) in self.2.iter().flatten() {
+            match role {
+                Role::Other => scan.other.push(path.clone()),
+                _ => scan.classified.push((path.clone(), *role)),
+            }
+        }
+        scan
     }
     fn discovery_scan(&self) -> NodeScan {
         self.scan_nodes()
@@ -98,6 +111,20 @@ impl Guard {
     /// # Errors
     /// Refuses invalid physical identities or inventory reconciliation.
     pub fn install(cameras: &[Camera]) -> irlume_common::Result<Self> {
+        Self::install_with(cameras, true)
+    }
+
+    /// Publish the same facts with no role recorded, as after a daemon start
+    /// or a replug; a scan then answers each endpoint's role from its formats,
+    /// as discovery would, and still opens nothing.
+    ///
+    /// # Errors
+    /// Refuses invalid physical identities or inventory reconciliation.
+    pub fn install_unclassified(cameras: &[Camera]) -> irlume_common::Result<Self> {
+        Self::install_with(cameras, false)
+    }
+
+    fn install_with(cameras: &[Camera], classified: bool) -> irlume_common::Result<Self> {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let identities = cameras
             .iter()
@@ -108,7 +135,26 @@ impl Guard {
                     .map(|endpoint| (endpoint.path.clone(), camera.identity.to_lowercase()))
             })
             .collect();
-        let supervisor = Arc::new(CameraSupervisor::new(Recorder(calls.clone(), identities)));
+        let roles = || {
+            cameras.iter().flat_map(|camera| {
+                camera.endpoints.iter().map(|endpoint| {
+                    (
+                        endpoint.path.as_str(),
+                        crate::role_from_formats(&endpoint.formats),
+                    )
+                })
+            })
+        };
+        let scan = (!classified).then(|| {
+            roles()
+                .map(|(path, role)| (path.to_owned(), role))
+                .collect()
+        });
+        let supervisor = Arc::new(CameraSupervisor::new(Recorder(
+            calls.clone(),
+            identities,
+            scan,
+        )));
         let observations = cameras
             .iter()
             .map(|camera| {
@@ -146,18 +192,10 @@ impl Guard {
             .map_err(|error| {
                 irlume_common::Error::Protocol(format!("fixture inventory refused: {error:?}"))
             })?;
-        let generations = supervisor.endpoint_generations();
-        supervisor.record_roles(
-            &generations,
-            cameras.iter().flat_map(|camera| {
-                camera.endpoints.iter().map(|endpoint| {
-                    (
-                        endpoint.path.as_str(),
-                        crate::role_from_formats(&endpoint.formats),
-                    )
-                })
-            }),
-        );
+        if classified {
+            let generations = supervisor.endpoint_generations();
+            supervisor.record_roles(&generations, roles());
+        }
         let installed = Arc::downgrade(&supervisor);
         let previous = TEST_SUPERVISOR.with(|slot| slot.borrow_mut().replace(supervisor));
         Ok(Self {

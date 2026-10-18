@@ -91,6 +91,7 @@ mod operation_authorization;
 mod position_session;
 mod retry_recovery;
 mod retry_throttle;
+mod role_classification;
 mod shared_unlock;
 mod token_delivery;
 mod users;
@@ -1823,8 +1824,30 @@ fn main() {
                         // Attaching it is part of becoming the worker's engine, not a
                         // startup step: see WorkerEngine (#359).
                         let mut engine = WorkerEngine::attach(engine, &arbiter);
-                        while let Some(job) = arbiter.take() {
+                        while let Some(work) = arbiter.take_work() {
                             note_worker_progress();
+                            let job = match work {
+                                arbiter::Work::Job(job) => job,
+                                // The daemon's own camera work (ADR-0029 §1's
+                                // role classification): serialized here like any
+                                // camera request, with no client to answer.
+                                arbiter::Work::Background(task) => {
+                                    let token = arbiter.cancel_token();
+                                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        task(&token)
+                                    }))
+                                    .is_err()
+                                    {
+                                        jout_err!(
+                                            "irlumed: background camera work PANICKED and was \
+                                             abandoned; please report this with the backtrace above"
+                                        );
+                                    }
+                                    arbiter.finish(arbiter::Class::Camera, 0);
+                                    note_worker_idle();
+                                    continue;
+                                }
+                            };
                             let Queued {
                                 authorization,
                                 session,
@@ -2008,6 +2031,13 @@ fn main() {
                         std::process::exit(1);
                     })
             };
+                // Classify each camera's roles as it appears (ADR-0029 §1), on
+                // the worker just started: account routing reads them, and
+                // nothing else records them until a client lists the cameras
+                // (#887). Before this point no authentication can run.
+                role_classification::spawn(std::sync::Arc::clone(&arbiter), || {
+                    permits_background_requalification(irlume_common::config::observe_face_sensor_policy())
+                });
                 // Published LAST: until this flips, `serve` answers from the
                 // engine-free path. Release pairs with the Acquire load there,
                 // so a thread that sees `true` also sees the worker it needs.
@@ -13551,7 +13581,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 27] = [
+        let sources: [(&str, &str); 28] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
@@ -13606,6 +13636,10 @@ mod tests {
             ("live.rs", include_str!("live.rs")),
             ("users.rs", include_str!("users.rs")),
             ("token_delivery.rs", include_str!("token_delivery.rs")),
+            (
+                "role_classification.rs",
+                include_str!("role_classification.rs"),
+            ),
             (
                 "retry_throttle.rs",
                 concat!(
@@ -26582,6 +26616,32 @@ mod tests {
         assert!(startup.contains("observe_camera_conf()"));
         assert!(startup.contains("camera_conf_startup_warnings("));
         assert!(startup.contains("jout_warn!"));
+    }
+
+    /// #887: roles are classified once the camera worker runs, on it, before
+    /// the daemon reports ready, and under the policy that gates background
+    /// requalification.
+    #[test]
+    fn startup_classifies_camera_roles_once_the_worker_runs() {
+        let source = include_str!("main.rs");
+        let startup = source
+            .split("could not start the camera worker: {e}")
+            .nth(1)
+            .unwrap()
+            .split("engine_ready.store(true")
+            .next()
+            .unwrap();
+        assert!(startup.contains("role_classification::spawn(std::sync::Arc::clone(&arbiter),"));
+        assert!(startup.contains("permits_background_requalification("));
+        // The worker runs the daemon's own camera work it is handed.
+        let worker = source
+            .split("let mut engine = WorkerEngine::attach(engine, &arbiter);")
+            .nth(1)
+            .unwrap();
+        assert!(worker
+            .trim_start()
+            .starts_with("while let Some(work) = arbiter.take_work() {"));
+        assert!(worker.contains("arbiter::Work::Background(task) =>"));
     }
 
     #[test]

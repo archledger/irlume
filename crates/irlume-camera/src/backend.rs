@@ -36,6 +36,9 @@ trait CameraBackend: Send + Sync + 'static {
     /// The same scan and the pairs made from its `classified` bucket.
     /// Pairing callers receive only the pairs.
     fn pairing_scan(&self) -> (NodeScan, Vec<CameraPair>);
+    /// The discovery scan of only `endpoints`, stopping before the next one
+    /// once `stop` answers true.
+    fn endpoint_scan(&self, endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan;
     fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera>;
     fn open_ir(&self, device: &str, lease: CameraLease) -> irlume_common::Result<IrCamera>;
 
@@ -342,6 +345,29 @@ impl CameraSupervisor {
         pairs
     }
 
+    /// Classify the named endpoints the current publication lists as
+    /// unclassified, and no other node: one another scan classified while
+    /// this waited, or one no longer published, is not opened.
+    fn classify_endpoints(&self, endpoints: &[String], stop: &dyn Fn() -> bool) {
+        let before = self.endpoint_generations();
+        let pending: std::collections::BTreeSet<String> = self
+            .connected_pairs()
+            .unclassified
+            .into_iter()
+            .flat_map(|camera| camera.endpoints)
+            .collect();
+        let published: Vec<&str> = endpoints
+            .iter()
+            .map(String::as_str)
+            .filter(|endpoint| before.contains_key(*endpoint) && pending.contains(*endpoint))
+            .collect();
+        if published.is_empty() {
+            return;
+        }
+        let scan = self.backend.endpoint_scan(&published, stop);
+        self.record_scan(&before, &scan);
+    }
+
     /// The published endpoints' generations, copied under the inventory lock
     /// and released before any backend call: classification takes leases,
     /// which lock the inventory themselves.
@@ -429,6 +455,7 @@ impl CameraSupervisor {
 type ScanNodes = fn() -> NodeScan;
 type DiscoveryScan = fn() -> NodeScan;
 type PairingScan = fn() -> (NodeScan, Vec<CameraPair>);
+type EndpointScan = fn(&[&str], &dyn Fn() -> bool) -> NodeScan;
 type OpenRgb = fn(&str, CameraLease) -> irlume_common::Result<RgbCamera>;
 type OpenIr = fn(&str, CameraLease) -> irlume_common::Result<IrCamera>;
 
@@ -444,6 +471,10 @@ fn production_pairing_scan() -> (NodeScan, Vec<CameraPair>) {
     crate::uvc_pairing_scan()
 }
 
+fn production_endpoint_scan(endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
+    crate::uvc_endpoint_scan(endpoints, stop)
+}
+
 fn production_open_rgb(device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
     RgbCamera::open_uvc(device, lease)
 }
@@ -457,6 +488,7 @@ struct UvcV4l2Backend {
     scan_nodes: ScanNodes,
     discovery_scan: DiscoveryScan,
     pairing_scan: PairingScan,
+    endpoint_scan: EndpointScan,
     open_rgb: OpenRgb,
     open_ir: OpenIr,
 }
@@ -467,6 +499,7 @@ impl Default for UvcV4l2Backend {
             scan_nodes: production_scan_nodes,
             discovery_scan: production_discovery_scan,
             pairing_scan: production_pairing_scan,
+            endpoint_scan: production_endpoint_scan,
             open_rgb: production_open_rgb,
             open_ir: production_open_ir,
         }
@@ -486,6 +519,10 @@ impl CameraBackend for UvcV4l2Backend {
         (self.pairing_scan)()
     }
 
+    fn endpoint_scan(&self, endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
+        (self.endpoint_scan)(endpoints, stop)
+    }
+
     fn open_rgb(&self, device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
         (self.open_rgb)(device, lease)
     }
@@ -502,6 +539,7 @@ impl CameraBackend for UvcV4l2Backend {
                 production_discovery_scan as DiscoveryScan,
             )
             && std::ptr::fn_addr_eq(self.pairing_scan, production_pairing_scan as PairingScan)
+            && std::ptr::fn_addr_eq(self.endpoint_scan, production_endpoint_scan as EndpointScan)
             && std::ptr::fn_addr_eq(self.open_rgb, production_open_rgb as OpenRgb)
             && std::ptr::fn_addr_eq(self.open_ir, production_open_ir as OpenIr)
     }
@@ -799,6 +837,10 @@ pub(crate) fn discover_nodes() -> Vec<(String, Role)> {
 
 pub(crate) fn list_pairs() -> Vec<CameraPair> {
     with_camera_supervisor(CameraSupervisor::list_pairs)
+}
+
+pub(crate) fn classify_endpoints(endpoints: &[String], stop: &dyn Fn() -> bool) {
+    with_camera_supervisor(|supervisor| supervisor.classify_endpoints(endpoints, stop));
 }
 
 pub(crate) fn open_rgb(device: &str, lease: CameraLease) -> irlume_common::Result<RgbCamera> {
@@ -1271,6 +1313,29 @@ pub(crate) mod tests {
             }
         }
 
+        fn endpoint_scan(&self, endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
+            self.record(format!("endpoint_scan:{}", endpoints.join(",")));
+            self.run_hook();
+            let mut scan = NodeScan::default();
+            for endpoint in endpoints {
+                if stop() {
+                    break;
+                }
+                if let Some((path, role)) = self
+                    .nodes
+                    .iter()
+                    .flatten()
+                    .find(|(path, _)| path == endpoint)
+                {
+                    scan.classified.push((path.clone(), *role));
+                }
+                if self.other.iter().any(|path| path == endpoint) {
+                    scan.other.push((*endpoint).to_owned());
+                }
+            }
+            scan
+        }
+
         fn pairing_scan(&self) -> (NodeScan, Vec<CameraPair>) {
             self.record("pairing_scan");
             self.run_hook();
@@ -1444,6 +1509,7 @@ pub(crate) mod tests {
             scan_nodes: fixture_scan_nodes,
             discovery_scan: fixture_discovery_scan,
             pairing_scan: fixture_pairing_scan,
+            endpoint_scan: |_, _| NodeScan::default(),
             open_rgb: fixture_open_rgb,
             open_ir: fixture_open_ir,
         };
@@ -2291,6 +2357,107 @@ pub(crate) mod tests {
         assert_eq!(view.pairs.len(), 1);
         assert_eq!(view.pairs[0].generation, 2);
         assert!(view.unclassified.is_empty());
+    }
+
+    /// The daemon's role classification (ADR-0029 §1): only the named
+    /// endpoints the publication lists are classified, and only their roles
+    /// are recorded.
+    #[test]
+    fn classifying_named_endpoints_touches_and_records_only_them() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let answer = [
+            ("/dev/video0", Role::Rgb),
+            ("/dev/video2", Role::Ir),
+            ("/dev/video4", Role::Rgb),
+            ("/dev/video6", Role::Ir),
+        ];
+        let backend = RecordingBackend::new(calls.clone()).discovering(&answer);
+        let supervisor = spy_supervisor(
+            &backend,
+            vec![
+                brio().build(),
+                ObservationFixture::usb("/devices/pci0000:00/0000:00:14.0/usb3/3-2", "1111:2222")
+                    .serial("DEF456")
+                    .fixed()
+                    .four_node(4)
+                    .build(),
+            ],
+        );
+        let _installed = install_test_supervisor(supervisor);
+        assert_eq!(crate::connected_pairs().unclassified.len(), 2);
+
+        // An unpublished path is dropped before the backend sees the list.
+        crate::classify_endpoints(
+            &[
+                "/dev/video0".into(),
+                "/dev/video2".into(),
+                "/dev/not-published".into(),
+            ],
+            &|| false,
+        );
+        let view = crate::connected_pairs();
+        assert_eq!(view.pairs.len(), 1);
+        assert_eq!(view.pairs[0].rgb, "/dev/video0");
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(
+            view.unclassified[0].endpoints,
+            ["/dev/video4", "/dev/video6"]
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["endpoint_scan:/dev/video0,/dev/video2"]
+        );
+
+        // Nothing published among the names: no backend call at all.
+        crate::classify_endpoints(&["/dev/not-published".into()], &|| false);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        // Already classified (by this scan, or a ListCameras that ran while
+        // the request waited): not opened again.
+        crate::classify_endpoints(&["/dev/video0".into(), "/dev/video2".into()], &|| false);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        crate::classify_endpoints(&["/dev/video0".into(), "/dev/video4".into()], &|| false);
+        assert_eq!(calls.lock().unwrap()[1], "endpoint_scan:/dev/video4");
+    }
+
+    #[test]
+    fn a_stop_ends_the_endpoint_scan_before_the_next_node() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let _installed = install_test_supervisor(spy_supervisor(&backend, vec![brio().build()]));
+        let asked = std::cell::Cell::new(0);
+        // A waiting authentication answers `stop` true after the first node.
+        crate::classify_endpoints(&["/dev/video0".into(), "/dev/video2".into()], &|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        });
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty(), "the IR node was never classified");
+        assert_eq!(view.unclassified.len(), 1);
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn an_endpoint_classification_that_raced_a_generation_change_is_not_recorded() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = RecordingBackend::new(calls).discovering(&BRIO_ANSWER);
+        let supervisor = spy_supervisor(&backend, vec![brio().build()]);
+        let inventory = supervisor.inventory.clone();
+        backend.on_next_classification(move || {
+            inventory
+                .try_lock()
+                .expect("the supervisor held the inventory lock across the scan")
+                .reconcile(vec![brio().evidence("changed").build()])
+                .unwrap();
+        });
+        let _installed = install_test_supervisor(supervisor);
+        let endpoints = ["/dev/video0".to_owned(), "/dev/video2".to_owned()];
+        crate::classify_endpoints(&endpoints, &|| false);
+        let view = crate::connected_pairs();
+        assert!(view.pairs.is_empty());
+        assert_eq!(view.unclassified[0].generation, 2);
+        // The new generation records on the next classification.
+        crate::classify_endpoints(&endpoints, &|| false);
+        assert_eq!(crate::connected_pairs().pairs.len(), 1);
     }
 
     #[test]

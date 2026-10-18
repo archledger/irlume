@@ -70,6 +70,10 @@ pub use irlume_camera::{
 pub use irlume_camera::{
     capabilities, device_identity, nodes_share_usb_device, select_pair, select_rgb,
 };
+/// The camera-free pairing view, whose unclassified cameras the daemon's
+/// background role classification acts on, and the targeted scan it runs on
+/// the camera worker (ADR-0029 §1).
+pub use irlume_camera::{classify_endpoints, connected_pairs, ConnectedPairs};
 /// IR-emitter auto-setup (integrated linux-enable-ir-emitter), re-exported for
 /// the daemon. See [`irlume_camera::setup_ir_emitter`].
 pub use irlume_camera::{

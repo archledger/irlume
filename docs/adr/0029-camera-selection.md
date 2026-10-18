@@ -375,3 +375,38 @@ Legacy requests retain their encodings and behavior. Guided choice, fresh-instal
 ranked selection, the proposed handle-facing interface in ADR-0030 and complete
 split request/capture integration remain later slices. Split activation stays
 closed and hardware acceptance is not established by the synthetic tests.
+
+## Amendment 2026-10-18: roles are classified when a camera appears
+
+Item 1 has the lifecycle supervisor classify each node's role when the device
+appears. It did not. The passive coordinator never opens a node
+(`crates/irlume-camera/src/lifecycle.rs`), and the role cache is held in
+memory, keyed by each camera's connection generation, so a daemon start and
+every udev change for a camera left it unclassified. Only a scan recorded
+roles: the startup device selection under the Dual policy, after the model
+load, and the classifying `ListCameras` a client sends. Until one ran, account
+routing found no enrolled camera and refused to the password with
+`NoEnrolledCameraConnected`, and the split listing named no candidates (#887).
+
+The daemon now classifies a camera when it appears, on the camera worker.
+Once the worker runs, a classifier reads the passive publication in memory
+every 2 seconds. While the Current publication lists a camera as
+unclassified, the capture nodes of the cameras due a try, and no others, are
+classified as discovery does: each is opened for its capabilities and formats
+under a diagnostics lease, with no stream started and no emitter fired. The
+scan is the worker's own background camera work: the arbiter refuses it while
+an authentication is pending, it waits behind every queued request, and an
+authentication arriving during it stops it before the next node, without
+counting as a try. A camera generation that stays unclassified is tried
+again after 5, 30, 120 and 600 seconds and then left alone until it changes.
+A camera that comes back unclassified after each scan, as a camera that
+answered an open with a udev change would, is scanned ever less often, down
+to once every 10 minutes, so it is never reopened every few seconds; other
+cameras keep their own pace.
+The classifier runs only under the face sensor policy that permits background
+requalification (Dual), so the IR-only policy's camera discovery stays off.
+
+The coordinator stays camera-free. The classifier lives in the daemon, so a
+CLI process that starts a supervisor opens nothing in the background.
+Authentication, selection and the split listing stay camera-free reads of the
+recorded roles, as item 1 and ADR-0032 require.

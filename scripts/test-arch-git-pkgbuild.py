@@ -74,13 +74,26 @@ class ArchGitRecipe(unittest.TestCase):
         }
         main = "".join(l for l in function(NIGHTLY, "package_irlume-git").splitlines(True) if l not in added)
         self.assertEqual(main, function(RELEASE, "package_irlume"))
-        self.assertIn("\ninstall=irlume.install\n", NIGHTLY)
         for marker in ("sha256sums=(", "depends=('onnxruntime'", "backup=("):
             self.assertEqual(
                 NIGHTLY.split(marker, 1)[1].split(")", 1)[0],
                 RELEASE.split(marker, 1)[1].split(")", 1)[0],
                 marker,
             )
+
+    def test_only_the_main_package_carries_the_install_hooks(self) -> None:
+        # Set before the package functions, install= gave the KCM package
+        # irlume's pre_remove, so removing only the KCM stopped irlumed;
+        # backup= and optdepends= name what only irlume ships or uses.
+        for text, main, kcm in (
+            (RELEASE, "package_irlume", "package_irlume-kcm"),
+            (NIGHTLY, "package_irlume-git", "package_irlume-kcm-git"),
+        ):
+            header = text.split("\nprepare() {", 1)[0]
+            for name in ("install=", "backup=", "optdepends="):
+                self.assertNotIn("\n" + name, header, name)
+                self.assertNotIn(name, function(text, kcm), name)
+            self.assertIn("    install=irlume.install\n", function(text, main))
 
     def test_the_committed_srcinfo_describes_the_split_packages(self) -> None:
         # Its exact content is checked by `arch-git-pkgbuild.py --check`,
@@ -95,6 +108,10 @@ class ArchGitRecipe(unittest.TestCase):
         ):
             self.assertIn(line, info)
         self.assertIn("\tsource = irlume::git+https://github.com/archledger/irlume.git#branch=main\n", info)
+        main, kcm = info.split("pkgname = irlume-git\n", 1)[1].split("pkgname = irlume-kcm-git\n", 1)
+        self.assertIn("\tinstall = irlume.install\n", main)
+        self.assertNotIn("install =", kcm)
+        self.assertNotIn("install =", info.split("pkgname = ", 1)[0])
 
     def test_a_missing_anchor_is_an_error(self) -> None:
         with self.assertRaises(SystemExit):

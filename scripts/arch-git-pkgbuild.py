@@ -89,7 +89,7 @@ EDITS: list[tuple[str, str]] = [
         "validpgpkeys=('F35053398E3C80FE20891B82C10B8492BD7F30C6') # archledger, signs the release tags\n",
         "",
     ),
-    ("install=irlume.install\n\nprepare() {", "install=irlume.install\n\n" + PKGVER + "prepare() {"),
+    ("\n\nprepare() {", "\n\n" + PKGVER + "prepare() {"),
     (
         "package_irlume() {\n",
         "package_irlume-git() {\n"

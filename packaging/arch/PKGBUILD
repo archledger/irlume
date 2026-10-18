@@ -11,8 +11,6 @@ license=('GPL-3.0-or-later')
 # the user has satisfies it (no conflict); a fresh install prompts to pick one,
 # choose onnxruntime-cpu unless you want GPU execution providers.
 depends=('onnxruntime' 'tpm2-tss' 'pam' 'polkit' 'dbus')
-optdepends=('fprintd: fingerprint companion factor')
-backup=('etc/pam.d/irlume-retry-reset')
 # clang: v4l2-sys-mit generates its V4L2 bindings with bindgen, which needs
 # libclang at build time; without it makepkg fails on a clean system.
 makedepends=('rust' 'cargo' 'gcc' 'clang' 'cmake' 'extra-cmake-modules' 'qt6-base' 'qt6-declarative' 'kcmutils' 'kcoreaddons' 'kio')
@@ -46,7 +44,6 @@ sha256sums=('SKIP'
             'df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72'
             'dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311')
 validpgpkeys=('F35053398E3C80FE20891B82C10B8492BD7F30C6') # archledger, signs the release tags
-install=irlume.install
 
 prepare() {
     cd "$srcdir/irlume"
@@ -68,6 +65,12 @@ build() {
 }
 
 package_irlume() {
+    optdepends=('fprintd: fingerprint companion factor')
+    backup=('etc/pam.d/irlume-retry-reset')
+    # irlume's alone: set globally, the KCM package carried the hooks too, and
+    # removing only irlume-kcm ran pre_remove, which stops and disables
+    # irlumed while irlume stays installed.
+    install=irlume.install
     cd "$srcdir/irlume"
     install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
     install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"

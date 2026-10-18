@@ -86,7 +86,9 @@ p384       = { version = "0.14", default-features = false, features = ["ecdsa", 
 p521       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
 # Software TPM2_MakeCredential (ADR-0036 section 2.4): AES-CFB over the
 # credential, HMAC-based KDFa. aes and hmac are already in the tree.
-aes        = "0.9"
+# MSRV hold: aes 0.9.3 needs Rust 1.89 and resolver 2 picks the newest 0.9.x, so
+# cap it here as well as in .github/dependabot.yml. Drop both at MSRV 1.89.
+aes        = ">=0.9, <0.9.3"
 cfb-mode   = "0.9"
 hmac       = "0.13"
 aes-gcm    = "0.11"     # AES-256-GCM for template-at-rest encryption

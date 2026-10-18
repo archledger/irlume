@@ -7,6 +7,27 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- IR camera node hardening for the cameras whose active-IR evidence is a
+  burst's own proven alternation (#1069, ADR-0031 section 4, amendment
+  2026-10-17; ADR-0032, amendment 2026-10-17): the descriptor-attested YUYV
+  IR cameras without per-frame illumination records (the
+  `NO_RECORDS_YUYV_IR` table, today the ThinkPad T480's 5986:1141 module)
+  ship `72-irlume-ir-nodes.rules`, which removes the seat-user `uaccess`
+  tag and assigns root-only (0600) nodes, so no non-root program can
+  reach the emitter control between irlumed's reads around a burst. The rule sorts between `70-uaccess.rules` and
+  `73-seat-late.rules` and applies at the next plug or boot. On a node
+  that reads closed, the capture path admits the burst proof without the
+  experimental split opt-in's confinement, measured on the node's real
+  state per burst rather than the rule's presence, so a node whose seat
+  ACL is still stale keeps the confinement until it is actually closed.
+  `irlume doctor` reports each such node's access state
+  (`ir-node-access`), and the TUI runs the same doctor; a hardened node the
+  seat user cannot open still counts as IR capability in the camera-nodes
+  check, since the daemon opens it as root. Nothing changes for
+  cameras with illumination records, and the experimental split opt-in
+  itself is unchanged. (#887's T480 emitter-table entry and qualification
+  are unaffected.)
+
 - The nightly channel's Ubuntu lane, `ppa:archledger/irlume-nightly`
   (ADR-0037 section 3; docs/PLATFORMS.md "Nightly channel"):
   `scripts/ppa-nightly.py`, run once a day by a user timer on the

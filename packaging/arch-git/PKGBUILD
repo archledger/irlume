@@ -147,6 +147,10 @@ package_irlume-git() {
     # the group must be inherited at creation, not corrected in-process.
     # irlume.install applies it before any daemon start.
     install -Dm0644 packaging/tmpfiles.d/irlume.conf "$pkgdir/usr/lib/tmpfiles.d/irlume.conf"
+    # udev: descriptor-attested YUYV IR nodes without illumination records lose
+    # the seat-user uaccess tag (#1069, ADR-0031 section 4); applies at the
+    # next plug or boot.
+    install -Dm0644 packaging/udev/72-irlume-ir-nodes.rules "$pkgdir/usr/lib/udev/rules.d/72-irlume-ir-nodes.rules"
     # AppArmor profile for the daemon. Arch does not run AppArmor by default, so
     # it sits inert unless the user boots with `lsm=...,apparmor`; irlume.install
     # loads it only when apparmor_parser is present. The profile confines the

@@ -1544,3 +1544,17 @@ the IR burst's own proven alternation, as ADR-0031 §4 (Amendment
 camera's records. The opt-in's warning says so: such a camera's lit frames
 are inferred from each burst, which other programs with access to the
 camera can disturb.
+
+## Amendment 2026-10-17: the burst proof's confinement gains a hard boundary
+
+#1069. The 2026-10-14 amendment confined the optical burst proof to this
+opt-in because a program with access to the IR node could change the emitter
+control within a burst, undetected by the reads around it. On a node closed
+to every non-root program that program cannot run, so the proof admits such a
+node without the opt-in's residual: the packaged `72-irlume-ir-nodes.rules`
+removes the `uaccess` tag from the cameras the proof covers, and the capture
+path re-reads the node's real access state per burst rather than trusting
+the rule's presence (ADR-0031, amendment 2026-10-17). The opt-in itself is
+unchanged: split enrollment and authentication still need it until the
+activation work in #1030 completes, and every other IR side still needs the
+camera's records.

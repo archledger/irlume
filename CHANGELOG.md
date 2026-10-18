@@ -12,12 +12,13 @@ All notable changes to irlume are documented here. This project adheres to
   `scripts/hardware/emitter-capture-evidence-test.sh` records, during one
   face authentication on the packaged irlumed, the capture path's write of
   the camera's D1 value, the camera reading it back, each burst's D1 proof
-  and the restore. It writes nothing to the camera itself. For it,
-  `IRLUME_LOG_EMITTER_WRITES=1` now prints each extension-unit read with the
-  bytes the camera returned, or why it returned none, and
-  `IRLUME_DEBUG_IR_FRAMES` prints each frame's raw sequence number and, per
-  burst, an `[ir_d1]` line with the D1 proof's numbers and verdict. The
-  debug journal is unchanged.
+  and the restore, on the node under test only. It writes nothing to the
+  camera itself. For it, `IRLUME_LOG_EMITTER_WRITES=1` now names the camera
+  node on every line, prints each extension-unit read with the bytes the
+  camera returned, or why it returned none, and says after each write
+  whether the camera accepted it; `IRLUME_DEBUG_IR_FRAMES` prints each
+  frame's raw sequence number and, per burst, an `[ir_d1]` line with the D1
+  proof's numbers and verdict. The debug journal is unchanged.
 
 - IR camera node hardening for the cameras whose active-IR evidence is a
   burst's own proven alternation (#1069, ADR-0031 section 4, amendment

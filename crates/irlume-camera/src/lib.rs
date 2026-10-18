@@ -7725,7 +7725,8 @@ impl IrSession<'_> {
                 .map(|(&sequence, &mean)| (sequence, mean as f32))
                 .collect();
             eprintln!(
-                "[ir_d1] {}",
+                "[ir_d1] {}: {}",
+                camera_text(device),
                 ir_emitter::D1OpticalEvidence::from_sequence_means(&observations)
             );
         }

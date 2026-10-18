@@ -784,19 +784,41 @@ fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> Xu
     // ioctl appears exactly once and the order can be read straight off.
     //
     // A read is printed once the camera has answered, with the bytes it
-    // returned or the error. A trace of requests alone could not show that a
-    // write read back (#887): the ADR-0031 §4 evidence for a built-in table
-    // entry is the write, its read-back and the restore, all from the camera.
+    // returned or the error, and a write gets a second line saying whether the
+    // camera took it. A trace of requests alone could not show that a write
+    // read back or that a restore landed (#887): the ADR-0031 §4 evidence for
+    // a built-in table entry is the write, its read-back and the restore, all
+    // from the camera.
     let result = xu_query_device(fd, unit, selector, query, data);
     if query != UVC_SET_CUR && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        eprintln!("{}", read_trace(query, unit, selector, data, &result));
+        eprintln!(
+            "{}",
+            read_trace(query, unit, selector, data, &result, &trace_node(fd))
+        );
     }
     result
 }
 
-/// The `IRLUME_LOG_EMITTER_WRITES` line for one read: the request, and the
-/// bytes the camera returned or why it returned none.
-fn read_trace(query: u8, unit: u8, selector: u8, data: &[u8], result: &XuResult<()>) -> String {
+/// The node an emitter trace line names: the open descriptor's own device,
+/// so a run on a machine with two cameras that publish the same unit and
+/// selector shows which one each request reached.
+fn trace_node(fd: c_int) -> String {
+    match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        Ok(path) => crate::camera_text(&path.to_string_lossy()),
+        Err(_) => format!("fd {fd}"),
+    }
+}
+
+/// The `IRLUME_LOG_EMITTER_WRITES` line for one read: the request, the node,
+/// and the bytes the camera returned or why it returned none.
+fn read_trace(
+    query: u8,
+    unit: u8,
+    selector: u8,
+    data: &[u8],
+    result: &XuResult<()>,
+    node: &str,
+) -> String {
     let name = match query {
         UVC_GET_CUR => "GET_CUR",
         UVC_GET_LEN => "GET_LEN",
@@ -809,17 +831,31 @@ fn read_trace(query: u8, unit: u8, selector: u8, data: &[u8], result: &XuResult<
     };
     let size = data.len();
     match result {
-        Ok(()) => format!("irlume: {name} unit{unit}/sel{selector} size={size}: {data:02x?}"),
+        Ok(()) => {
+            format!("irlume: {name} unit{unit}/sel{selector} size={size} on {node}: {data:02x?}")
+        }
         Err(error) => {
-            format!("irlume: {name} unit{unit}/sel{selector} size={size} failed: {error}")
+            format!("irlume: {name} unit{unit}/sel{selector} size={size} on {node} failed: {error}")
         }
     }
 }
 
 /// The `IRLUME_LOG_EMITTER_WRITES` line for one write, printed before it is
-/// sent.
-fn write_trace(unit: u8, selector: u8, payload: &[u8]) -> String {
-    format!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}")
+/// sent, so a write that never returns is still on record. The node follows
+/// the payload: the hardware harnesses match the text up to it.
+fn write_trace(unit: u8, selector: u8, payload: &[u8], node: &str) -> String {
+    format!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?} on {node}")
+}
+
+/// The line after a write: whether the camera took it. Worded without
+/// `SET_CUR`, which the harnesses count as one line per write.
+fn write_outcome_trace(unit: u8, selector: u8, node: &str, result: &XuResult<()>) -> String {
+    match result {
+        Ok(()) => format!("irlume: write to unit{unit}/sel{selector} on {node} accepted"),
+        Err(error) => {
+            format!("irlume: write to unit{unit}/sel{selector} on {node} failed: {error}")
+        }
+    }
 }
 
 /// The one ioctl, or the test's stand-in camera.
@@ -1198,13 +1234,20 @@ fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
 // admission; an owned restore checks its surviving original fd separately.
 fn set_cur_admitted(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_query_configuration(fd)?;
-    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        eprintln!("{}", write_trace(unit, selector, payload));
+    let traced = std::env::var_os("IRLUME_LOG_EMITTER_WRITES")
+        .is_some()
+        .then(|| trace_node(fd));
+    if let Some(node) = &traced {
+        eprintln!("{}", write_trace(unit, selector, payload, node));
     }
     #[cfg(test)]
     writes_attempted().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut data = payload.to_vec();
-    xu_query(fd, unit, selector, UVC_SET_CUR, &mut data)
+    let result = xu_query(fd, unit, selector, UVC_SET_CUR, &mut data);
+    if let Some(node) = &traced {
+        eprintln!("{}", write_outcome_trace(unit, selector, node, &result));
+    }
+    result
 }
 
 /// Counts every write this module attempts, so a test can assert that a path
@@ -6091,13 +6134,26 @@ mod tests {
     #[test]
     fn the_emitter_trace_prints_what_the_camera_returned() {
         let d1 = [1, 1, 2, 0, 0, 0, 0, 0, 0];
+        let node = "/dev/video0";
         assert_eq!(
-            write_trace(8, 6, &d1),
-            "irlume: SET_CUR unit8/sel6: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
+            write_trace(8, 6, &d1, node),
+            "irlume: SET_CUR unit8/sel6: [01, 01, 02, 00, 00, 00, 00, 00, 00] on /dev/video0"
         );
         assert_eq!(
-            read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(())),
-            "irlume: GET_CUR unit8/sel6 size=9: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
+            write_outcome_trace(8, 6, node, &Ok(())),
+            "irlume: write to unit8/sel6 on /dev/video0 accepted"
+        );
+        assert!(
+            !write_outcome_trace(8, 6, node, &Err(XuError::Unsupported)).contains("SET_CUR"),
+            "the harnesses count SET_CUR lines as writes"
+        );
+        assert_eq!(
+            write_outcome_trace(8, 6, node, &Err(XuError::Unsupported)),
+            "irlume: write to unit8/sel6 on /dev/video0 failed: control not supported"
+        );
+        assert_eq!(
+            read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(()), node),
+            "irlume: GET_CUR unit8/sel6 size=9 on /dev/video0: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
         );
         assert_eq!(
             read_trace(
@@ -6105,36 +6161,44 @@ mod tests {
                 8,
                 6,
                 &[0, 0],
-                &Err(XuError::Unresponsive(libc::EPIPE))
+                &Err(XuError::Unresponsive(libc::EPIPE)),
+                node
             ),
             format!(
-                "irlume: GET_LEN unit8/sel6 size=2 failed: camera did not answer ({})",
+                "irlume: GET_LEN unit8/sel6 size=2 on /dev/video0 failed: camera did not answer ({})",
                 std::io::Error::from_raw_os_error(libc::EPIPE)
             )
         );
         assert_eq!(
-            read_trace(0x99, 8, 6, &[3], &Ok(())),
-            "irlume: GET_0x99 unit8/sel6 size=1: [03]"
+            read_trace(0x99, 8, 6, &[3], &Ok(()), node),
+            "irlume: GET_0x99 unit8/sel6 size=1 on /dev/video0: [03]"
         );
+        // A descriptor with no /proc link still names itself.
+        assert_eq!(trace_node(-1), "fd -1");
     }
 
     /// The capture-evidence harness matches these lines exactly, so a reworded
-    /// trace would turn its four checks into ones that can never pass. Its
-    /// expected lines are built here from the code that prints them, from the
-    /// T480's D0 and D1 values and its unit, and the journal markers it counts
-    /// are checked against their producers.
+    /// trace would turn its checks into ones that can never pass. Its expected
+    /// lines are built here from the code that prints them, from the T480's D0
+    /// and D1 values and its unit, with the harness's node placeholder, and
+    /// the burst markers it counts are checked against their producers.
     #[test]
     fn the_capture_evidence_harness_expects_what_irlumed_prints() {
         let script = include_str!("../../../scripts/hardware/emitter-capture-evidence-test.sh");
         let d0 = [1, 1, 1, 0, 0, 0, 0, 0, 0];
         let d1 = [1, 1, 2, 0, 0, 0, 0, 0, 0];
+        let node = "@NODE@";
         for (name, line) in [
-            ("expected_write", write_trace(8, 6, &d1)),
+            ("expected_write", write_trace(8, 6, &d1, node)),
+            (
+                "expected_accepted",
+                write_outcome_trace(8, 6, node, &Ok(())),
+            ),
             (
                 "expected_readback",
-                read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(())),
+                read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(()), node),
             ),
-            ("expected_restore", write_trace(8, 6, &d0)),
+            ("expected_restore", write_trace(8, 6, &d0, node)),
         ] {
             assert!(
                 script.contains(&format!("{name}=\"{line}\"")),
@@ -6144,6 +6208,9 @@ mod tests {
         assert!(script.contains("model_override=8:6:1,1,2,0,0,0,0,0,0"));
         assert!(script.contains("model_d0=010101000000000000"));
         assert!(script.contains("model_d1=010102000000000000"));
+        // The harness finds a write's outcome by the accepted line's prefix.
+        assert!(write_outcome_trace(8, 6, node, &Err(XuError::Unsupported))
+            .starts_with(&format!("irlume: write to unit8/sel6 on {node} ")));
 
         let proven = D1OpticalEvidence::from_sequence_means(&[
             (10, 10.0),
@@ -6156,12 +6223,17 @@ mod tests {
             (17, 41.0),
         ]);
         assert!(proven.to_string().ends_with(": D1 proven"));
-        assert!(script.contains("/^\\[ir_d1\\] .*: D1 proven$/"));
+        assert!(script.contains("d1_proven_suffix=\": D1 proven\""));
+        assert!(script.contains("d1_line_prefix=\"[ir_d1] \""));
         let lib = include_str!("lib.rs");
-        assert!(lib.contains(concat!("\"[ir_d1] ", "{}\",")));
-        assert!(lib.contains(concat!("YUYV clipping ceiling ", "{} for this burst")));
+        assert!(lib.contains(concat!("\"[ir_d1] ", "{}: {}\",")));
+        assert!(lib.contains(concat!(
+            "\"[ir] {}: YUYV clipping ceiling ",
+            "{} for this burst\","
+        )));
+        assert!(script.contains("ceiling_line_prefix=\"[ir] \""));
         assert!(script.contains(&format!(
-            "YUYV clipping ceiling {} for this burst",
+            "ceiling_suffix=\": YUYV clipping ceiling {} for this burst\"",
             crate::yuyv_exposure::YUYV_LIMITED_WHITE_LEVEL
         )));
         let src = include_str!("ir_emitter.rs");

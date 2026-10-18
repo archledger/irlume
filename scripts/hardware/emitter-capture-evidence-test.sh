@@ -53,11 +53,12 @@ fail=0
 ok() { pass=$((pass + 1)); echo "  ok      $1"; }
 bad() { fail=$((fail + 1)); echo "  FAILED  $1"; echo "            $2"; }
 
-# One camera per line: USB id, Microsoft unit, the Face Authentication value
+# One camera per entry: USB id, Microsoft unit, the Face Authentication value
 # the camera reports by default (D0), the D1 value discovery derives from its
 # GET_DEF and GET_MAX, and the trace lines the run must produce, exactly as
-# irlumed prints them. A unit test pins these lines to the code that prints
-# them, so a reworded trace fails the build rather than this script.
+# irlumed prints them, with @NODE@ for the camera node each line names. A unit
+# test pins these lines to the code that prints them, so a reworded trace
+# fails the build rather than this script.
 model_for() { # usb-id
     case "$1" in
         5986:1141)
@@ -66,13 +67,21 @@ model_for() { # usb-id
             model_d0=010101000000000000
             model_d1=010102000000000000
             model_override=8:6:1,1,2,0,0,0,0,0,0
-            expected_write="irlume: SET_CUR unit8/sel6: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
-            expected_readback="irlume: GET_CUR unit8/sel6 size=9: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
-            expected_restore="irlume: SET_CUR unit8/sel6: [01, 01, 01, 00, 00, 00, 00, 00, 00]"
+            expected_write="irlume: SET_CUR unit8/sel6: [01, 01, 02, 00, 00, 00, 00, 00, 00] on @NODE@"
+            expected_accepted="irlume: write to unit8/sel6 on @NODE@ accepted"
+            expected_readback="irlume: GET_CUR unit8/sel6 size=9 on @NODE@: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
+            expected_restore="irlume: SET_CUR unit8/sel6: [01, 01, 01, 00, 00, 00, 00, 00, 00] on @NODE@"
             ;;
         *) return 1 ;;
     esac
 }
+
+# The journal lines the burst checks read, as irlumed prints them after the
+# capture's device text; pinned by the same unit test.
+d1_line_prefix="[ir_d1] "
+d1_proven_suffix=": D1 proven"
+ceiling_line_prefix="[ir] "
+ceiling_suffix=": YUYV clipping ceiling 235 for this burst"
 
 remove_dropin() {
     [ "$dropin_written" = yes ] || return 0
@@ -130,7 +139,39 @@ first_exact_after() { # line, from
     awk -v want="$1" -v from="$2" 'NR >= from && $0 == want { print NR; exit }' "$OUT/irlumed.log"
 }
 
-journal() { journalctl -q -b -o cat _PID="$pid" >"$OUT/irlumed.log" 2>/dev/null; }
+# The first write outcome for the listed control on this node after line $1
+# is the accepted one: a failed restore prints its SET_CUR line too, before
+# the camera answers.
+accepted_after() { # from
+    awk -v from="$1" -v prefix="${expected_accepted% accepted} " -v want="$expected_accepted" \
+        'NR > from && index($0, prefix) == 1 { if ($0 == want) print NR; exit }' "$OUT/irlumed.log"
+}
+
+# Burst lines for this camera after line $1 that end in $3, counted. irlumed
+# names the camera by the node it captures from, which is either spelling.
+count_bursts() { # from, prefix, suffix
+    awk -v from="$1" -v a="$2$node: " -v b="$2$IR: " -v suffix="$3" '
+        NR > from && (index($0, a) == 1 || index($0, b) == 1) &&
+            substr($0, length($0) - length(suffix) + 1) == suffix { n++ }
+        END { print n + 0 }' "$OUT/irlumed.log"
+}
+
+# Only this invocation of irlumed, and only what it logged after the run began:
+# a recycled PID or an earlier evidence run cannot satisfy a check.
+journal() {
+    journalctl -q -o cat --after-cursor="$cursor" _SYSTEMD_INVOCATION_ID="$invocation" \
+        >"$OUT/irlumed.log" 2>/dev/null
+}
+
+# What the face authentication decided, without the account, score or reason.
+auth_outcome() {
+    local line
+    line=$(grep -m1 "^irlumed: face auth '" "$OUT/irlumed.log") || return 1
+    case "$line" in
+        *" granted=true "*) echo "granted" ;;
+        *) echo "refused" ;;
+    esac
+}
 
 [ "$(id -u)" -eq 0 ] || { echo "refusing: reading the camera and restarting irlumed require root"; exit 2; }
 [ -x "$XU_SET" ] || {
@@ -139,6 +180,7 @@ journal() { journalctl -q -b -o cat _PID="$pid" >"$OUT/irlumed.log" 2>/dev/null;
     exit 2
 }
 [ -e "$IR" ] || { echo "refusing: $IR is absent"; exit 2; }
+node=$(readlink -f -- "$IR") || { echo "refusing: cannot resolve $IR"; exit 2; }
 systemctl is-active --quiet "$SERVICE" || {
     echo "refusing: the packaged irlumed is not running; this run needs it, with your"
     echo "enrolled profile and the camera pairing it authenticates with"
@@ -197,7 +239,11 @@ if [ "$initial" != "$model_d0" ]; then
     echo "'sudo irlume doctor' reports an emitter change irlume left outstanding."
     exit 2
 fi
-echo "$model_name $usb_id on $IR: unit $model_unit selector 6 holds $initial (D0)"
+echo "$model_name $usb_id on $node: unit $model_unit selector 6 holds $initial (D0)"
+expected_write=${expected_write//@NODE@/$node}
+expected_accepted=${expected_accepted//@NODE@/$node}
+expected_readback=${expected_readback//@NODE@/$node}
+expected_restore=${expected_restore//@NODE@/$node}
 
 mkdir -p "$DROPIN_DIR" || exit 2
 dropin_written=yes
@@ -211,10 +257,14 @@ Environment="IRLUME_LOG_EMITTER_WRITES=1"
 Environment="IRLUME_DEBUG_IR_FRAMES=1"
 EOF
 systemctl daemon-reload || exit 2
+cursor=$(journalctl -n 0 --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p')
+[ -n "$cursor" ] || { echo "refusing: the journal returned no cursor to start the run from"; exit 2; }
 systemctl restart "$SERVICE" || exit 2
 systemctl is-active --quiet "$SERVICE" || { echo "irlumed did not start with the drop-in"; exit 2; }
 pid=$(systemctl show -p MainPID --value "$SERVICE")
 [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { echo "irlumed has no main process"; exit 2; }
+invocation=$(systemctl show -p InvocationID --value "$SERVICE")
+[[ "$invocation" =~ ^[0-9a-f]{32}$ ]] || { echo "irlumed has no invocation ID"; exit 2; }
 # The daemon's own environment, not the unit's text, so a later drop-in that
 # overrides one of these is caught before the run rather than after it.
 for wanted in "IRLUME_IR_EMITTER=$model_override" IRLUME_LOG=debug \
@@ -243,7 +293,7 @@ for _ in $(seq 1 "$AUTH_WAIT"); do
     sleep 1
 done
 [ -n "$decided" ] || { echo "no face authentication reached irlumed within ${AUTH_WAIT}s"; exit 2; }
-grep "^irlumed: face auth '" "$OUT/irlumed.log" | head -1 | sed 's/^/    /'
+echo "    face authentication: $(auth_outcome)"
 
 # The restore is the stream's end, which can come after the decision.
 write_at=$(first_exact_after "$expected_write" 1)
@@ -271,14 +321,18 @@ done
 
 echo
 completed_at=""
-[ -n "$write_at" ] && completed_at=$(awk -v from="$write_at" \
-    'NR > from && $0 == "irlume: capture emitter write completed" { print NR; exit }' \
-    "$OUT/irlumed.log")
-if [ -n "$write_at" ] && [ -n "$completed_at" ]; then
-    ok "the capture path wrote D1 ($model_d1) to unit $model_unit selector 6"
+write_accepted_at=""
+if [ -n "$write_at" ]; then
+    completed_at=$(awk -v from="$write_at" \
+        'NR > from && $0 == "irlume: capture emitter write completed" { print NR; exit }' \
+        "$OUT/irlumed.log")
+    write_accepted_at=$(accepted_after "$write_at")
+fi
+if [ -n "$completed_at" ] && [ -n "$write_accepted_at" ]; then
+    ok "the capture path wrote D1 ($model_d1) to unit $model_unit selector 6 on $node"
 else
-    bad "the capture path wrote D1 ($model_d1) to unit $model_unit selector 6" \
-        "no '$expected_write' followed by 'irlume: capture emitter write completed'"
+    bad "the capture path wrote D1 ($model_d1) to unit $model_unit selector 6 on $node" \
+        "no '$expected_write' followed by '$expected_accepted' and 'irlume: capture emitter write completed'"
 fi
 
 readback_at=""
@@ -287,8 +341,8 @@ if [ -n "$readback_at" ]; then
     ok "the camera read D1 back after the write"
 else
     hint="no '$expected_readback' after the write"
-    grep -Eq "^irlume: GET_CUR unit$model_unit/sel6 size=[0-9]+$" "$OUT/irlumed.log" &&
-        hint="$hint; irlumed prints reads without their bytes, so it predates this harness"
+    grep -Eq "^irlume: GET_CUR unit$model_unit/sel6 size=[0-9]+(: .*)?$" "$OUT/irlumed.log" &&
+        hint="$hint; irlumed prints reads without the node, so it predates this harness"
     bad "the camera read D1 back after the write" "$hint"
 fi
 
@@ -296,28 +350,33 @@ proven=0
 bursts=0
 ceilings=0
 if [ -n "$write_at" ]; then
-    bursts=$(awk -v from="$write_at" 'NR > from && /^\[ir_d1\] / { n++ } END { print n + 0 }' \
-        "$OUT/irlumed.log")
-    proven=$(awk -v from="$write_at" 'NR > from && /^\[ir_d1\] .*: D1 proven$/ { n++ } END { print n + 0 }' \
-        "$OUT/irlumed.log")
-    ceilings=$(awk -v from="$write_at" \
-        'NR > from && index($0, "YUYV clipping ceiling 235 for this burst") { n++ } END { print n + 0 }' \
-        "$OUT/irlumed.log")
+    bursts=$(count_bursts "$write_at" "$d1_line_prefix" "")
+    proven=$(count_bursts "$write_at" "$d1_line_prefix" "$d1_proven_suffix")
+    # The ceiling line carries the debug prefix ahead of the camera.
+    ceilings=$(awk -v from="$write_at" -v a="$ceiling_line_prefix$node$ceiling_suffix" \
+        -v b="$ceiling_line_prefix$IR$ceiling_suffix" '
+            NR > from && (index($0, a) || index($0, b)) { n++ }
+            END { print n + 0 }' "$OUT/irlumed.log")
 fi
 if [ "$proven" -gt 0 ] && [ "$ceilings" -gt 0 ]; then
     ok "$proven of $bursts bursts captured with D1 selected proved the alternation; $ceilings qualified for the YUYV ceiling"
 elif [ "$bursts" -eq 0 ]; then
     bad "bursts captured with D1 selected prove the alternation" \
-        "no [ir_d1] line after the write; irlumed predates this harness or captured no IR burst"
+        "no [ir_d1] line for $node after the write; irlumed predates this harness or captured no IR burst there"
 else
     bad "bursts captured with D1 selected prove the alternation" \
         "$proven of $bursts bursts proved D1 and $ceilings qualified for the ceiling; see $OUT/irlumed.log"
 fi
 
-if [ -n "$restored_at" ] && { [ -z "$readback_at" ] || [ "$restored_at" -gt "$readback_at" ]; }; then
-    ok "the stream's end restored the displaced D0 value"
+restore_accepted_at=""
+[ -n "$restored_at" ] && restore_accepted_at=$(accepted_after "$restored_at")
+if [ -n "$restore_accepted_at" ] && { [ -z "$readback_at" ] || [ "$restored_at" -gt "$readback_at" ]; }; then
+    ok "the stream's end restored the displaced D0 value, and the camera accepted it"
+elif [ -n "$restored_at" ]; then
+    bad "the stream's end restored the displaced D0 value, and the camera accepted it" \
+        "'$expected_restore' was not followed by '$expected_accepted'"
 else
-    bad "the stream's end restored the displaced D0 value" \
+    bad "the stream's end restored the displaced D0 value, and the camera accepted it" \
         "no '$expected_restore' after the write within ${RESTORE_WAIT}s"
 fi
 
@@ -329,11 +388,16 @@ else
     echo "            sudo $XU_SET $IR $model_unit 6 $(hex_to_payload "$initial") --expect-camera $identity"
 fi
 
-others=$(grep -E "^irlume: SET_CUR " "$OUT/irlumed.log" | grep -Fv "SET_CUR unit$model_unit/sel6: " || true)
+# Every write irlumed traced went to the listed control on this node; a write
+# to another selector or to another camera fails the run.
+others=$(awk -v prefix="irlume: SET_CUR unit$model_unit/sel6: " -v suffix=" on $node" '
+    index($0, "irlume: SET_CUR ") == 1 &&
+        !(index($0, prefix) == 1 && substr($0, length($0) - length(suffix) + 1) == suffix)
+    ' "$OUT/irlumed.log")
 if [ -z "$others" ]; then
-    ok "irlumed wrote to no other control"
+    ok "irlumed wrote to no other control or camera"
 else
-    bad "irlumed wrote to no other control" "$others"
+    bad "irlumed wrote to no other control or camera" "$others"
 fi
 
 {
@@ -346,13 +410,16 @@ fi
     echo "tree: $(git -C "$TREE" rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "GET_CUR before: $initial"
     echo "GET_CUR after:  $final"
+    echo "face authentication: $(auth_outcome)"
     echo "result: $pass passed, $fail failed"
     echo
-    grep -E "^irlume: (SET_CUR|GET_CUR) unit$model_unit/sel6|^irlume: stream-record |^irlume: capture emitter |^irlume: leaving unit|^\[ir_d1\] |YUYV clipping ceiling|^irlumed: face auth '" \
+    # The emitter and burst lines only: the face authentication's own line
+    # names the account and carries its score, so it stays in irlumed.log.
+    grep -E "^irlume: (SET_CUR|GET_CUR|write to) unit$model_unit/sel6|^irlume: stream-record |^irlume: capture emitter |^irlume: leaving unit|^\[ir_d1\] |YUYV clipping ceiling" \
         "$OUT/irlumed.log"
 } >"$OUT/evidence.txt"
 
 echo
 echo "$pass passed, $fail failed"
-echo "evidence for #887: $OUT/evidence.txt"
+echo "evidence for #887: $OUT/evidence.txt (irlumed.log beside it is the full journal; keep it local)"
 [ "$fail" -eq 0 ]

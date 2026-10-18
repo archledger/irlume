@@ -35,6 +35,8 @@ pub enum Call {
     OpenRgb(String),
     OpenIr(String),
     Scan,
+    /// A scan of only these endpoints (the daemon's role classification).
+    ScanEndpoints(Vec<String>),
 }
 
 /// The boundary recorder: calls, endpoint identities, and what a scan
@@ -77,6 +79,27 @@ impl CameraBackend for Recorder {
     }
     fn discovery_scan(&self) -> NodeScan {
         self.scan_nodes()
+    }
+    fn endpoint_scan(&self, endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
+        self.record(Call::ScanEndpoints(
+            endpoints
+                .iter()
+                .map(|endpoint| (*endpoint).to_owned())
+                .collect(),
+        ));
+        let mut scan = NodeScan::default();
+        for endpoint in endpoints {
+            if stop() {
+                break;
+            }
+            for (path, role) in self.2.iter().flatten().filter(|(path, _)| path == endpoint) {
+                match role {
+                    Role::Other => scan.other.push(path.clone()),
+                    _ => scan.classified.push((path.clone(), *role)),
+                }
+            }
+        }
+        scan
     }
     fn pairing_scan(&self) -> (NodeScan, Vec<CameraPair>) {
         (self.scan_nodes(), Vec::new())

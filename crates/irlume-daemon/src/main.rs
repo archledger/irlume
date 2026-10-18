@@ -1344,13 +1344,6 @@ fn main() {
             // initialization must not delay the already-bound accept loop.
             // LiveStatus only copies an existing publication; it never starts it.
             irlume_auth::initialize_camera_monitor();
-            // Classify each camera's roles as it appears (ADR-0029 §1), from
-            // here on rather than after the model load: account routing reads
-            // them, and nothing else records them until a client lists the
-            // cameras (#887).
-            role_classification::spawn(|| {
-                permits_background_requalification(irlume_common::config::observe_face_sensor_policy())
-            });
             jout_info!("irlumed: loading models (det={det}, model={model})…");
             // The recognizer's verified bytes come back and go straight into the
             // engine below (#346), so the 260MB file is read and hashed once per
@@ -1831,8 +1824,30 @@ fn main() {
                         // Attaching it is part of becoming the worker's engine, not a
                         // startup step: see WorkerEngine (#359).
                         let mut engine = WorkerEngine::attach(engine, &arbiter);
-                        while let Some(job) = arbiter.take() {
+                        while let Some(work) = arbiter.take_work() {
                             note_worker_progress();
+                            let job = match work {
+                                arbiter::Work::Job(job) => job,
+                                // The daemon's own camera work (ADR-0029 §1's
+                                // role classification): serialized here like any
+                                // camera request, with no client to answer.
+                                arbiter::Work::Background(task) => {
+                                    let token = arbiter.cancel_token();
+                                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        task(&token)
+                                    }))
+                                    .is_err()
+                                    {
+                                        jout_err!(
+                                            "irlumed: background camera work PANICKED and was \
+                                             abandoned; please report this with the backtrace above"
+                                        );
+                                    }
+                                    arbiter.finish(arbiter::Class::Camera, 0);
+                                    note_worker_idle();
+                                    continue;
+                                }
+                            };
                             let Queued {
                                 authorization,
                                 session,
@@ -2016,6 +2031,13 @@ fn main() {
                         std::process::exit(1);
                     })
             };
+                // Classify each camera's roles as it appears (ADR-0029 §1), on
+                // the worker just started: account routing reads them, and
+                // nothing else records them until a client lists the cameras
+                // (#887). Before this point no authentication can run.
+                role_classification::spawn(std::sync::Arc::clone(&arbiter), || {
+                    permits_background_requalification(irlume_common::config::observe_face_sensor_policy())
+                });
                 // Published LAST: until this flips, `serve` answers from the
                 // engine-free path. Release pairs with the Acquire load there,
                 // so a thread that sees `true` also sees the worker it needs.
@@ -26596,21 +26618,30 @@ mod tests {
         assert!(startup.contains("jout_warn!"));
     }
 
-    /// #887: roles are classified from the monitor's start, not after the
-    /// model load or when a client lists cameras, and under the policy that
-    /// gates background requalification.
+    /// #887: roles are classified once the camera worker runs, on it, before
+    /// the daemon reports ready, and under the policy that gates background
+    /// requalification.
     #[test]
-    fn startup_classifies_camera_roles_once_the_monitor_runs() {
+    fn startup_classifies_camera_roles_once_the_worker_runs() {
         let source = include_str!("main.rs");
         let startup = source
-            .split("irlume_auth::initialize_camera_monitor();")
+            .split("could not start the camera worker: {e}")
             .nth(1)
             .unwrap()
-            .split("let verified_recognizer = verify_models(")
+            .split("engine_ready.store(true")
             .next()
             .unwrap();
-        assert!(startup.contains("role_classification::spawn("));
+        assert!(startup.contains("role_classification::spawn(std::sync::Arc::clone(&arbiter),"));
         assert!(startup.contains("permits_background_requalification("));
+        // The worker runs the daemon's own camera work it is handed.
+        let worker = source
+            .split("let mut engine = WorkerEngine::attach(engine, &arbiter);")
+            .nth(1)
+            .unwrap();
+        assert!(worker
+            .trim_start()
+            .starts_with("while let Some(work) = arbiter.take_work() {"));
+        assert!(worker.contains("arbiter::Work::Background(task) =>"));
     }
 
     #[test]

@@ -4036,6 +4036,31 @@ fn uvc_scan(with_holders: bool) -> NodeScan {
     scan
 }
 
+/// Classify only `endpoints`, in order, each as [`uvc_scan`] does without the
+/// holder lookup, and stop before the next node once `stop` answers true.
+fn uvc_endpoint_scan(endpoints: &[&str], stop: &dyn Fn() -> bool) -> NodeScan {
+    let mut scan = NodeScan::default();
+    for path in endpoints {
+        if stop() {
+            break;
+        }
+        file_node(&mut scan, (*path).to_owned(), classify_node(path));
+    }
+    scan
+}
+
+/// Classify the named capture nodes and record their roles for the camera
+/// generation they belong to (ADR-0029 §1), for the daemon's background
+/// classification of cameras that appeared without roles. Only nodes the
+/// current inventory publication lists are touched, one at a time, as
+/// discovery does (a diagnostics lease, capabilities and formats; no stream,
+/// no emitter); `stop` is asked before each, so a waiting authentication
+/// can take the camera worker back. A node whose generation changed during
+/// the scan is not recorded.
+pub fn classify_endpoints(endpoints: &[String], stop: &dyn Fn() -> bool) {
+    backend::classify_endpoints(endpoints, stop);
+}
+
 /// Classify every video node, keeping the failures and naming what holds a
 /// busy one. For reports; use `discover_nodes` to pick a camera.
 pub fn scan_nodes() -> NodeScan {

@@ -147,6 +147,7 @@ mod split_diagnostics {
             Call::Lease { endpoints, .. } => endpoints.iter().any(|e| e == RGB || e == IR),
             Call::OpenRgb(path) | Call::OpenIr(path) => path == RGB || path == IR,
             Call::Scan => false,
+            Call::ScanEndpoints(endpoints) => endpoints.iter().any(|e| e == RGB || e == IR),
         }
     }
 

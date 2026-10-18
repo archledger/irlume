@@ -388,12 +388,16 @@ load, and the classifying `ListCameras` a client sends. Until one ran, account
 routing found no enrolled camera and refused to the password with
 `NoEnrolledCameraConnected`, and the split listing named no candidates (#887).
 
-The daemon now classifies a camera when it appears. From the camera monitor's
-start, a background classifier reads the passive publication in memory every
-2 seconds. While the Current publication lists a camera as unclassified, it
-runs the discovery scan `ListCameras` runs: each capture node is opened for
-its capabilities and formats under a diagnostics lease, with no stream started
-and no emitter fired. A camera generation that stays unclassified is tried
+The daemon now classifies a camera when it appears, on the camera worker.
+Once the worker runs, a classifier reads the passive publication in memory
+every 2 seconds. While the Current publication lists a camera as
+unclassified, the capture nodes of the cameras due a try, and no others, are
+classified as discovery does: each is opened for its capabilities and formats
+under a diagnostics lease, with no stream started and no emitter fired. The
+scan is the worker's own background camera work: the arbiter refuses it while
+an authentication is pending, it waits behind every queued request, and an
+authentication arriving during it stops it before the next node, without
+counting as a try. A camera generation that stays unclassified is tried
 again after 5, 30, 120 and 600 seconds and then left alone until it changes.
 A camera that comes back unclassified after each scan, as a camera that
 answered an open with a udev change would, is scanned ever less often, down

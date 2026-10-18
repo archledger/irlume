@@ -283,6 +283,19 @@ impl CancelToken {
     }
 }
 
+/// Camera work the daemon starts itself, with no client: the background role
+/// classification (ADR-0029 §1). It runs on the worker like any camera
+/// request and is given the arbiter's stop signal, so a waiting
+/// authentication can take the camera back between nodes.
+pub type BackgroundTask = Box<dyn FnOnce(&CancelToken) + Send>;
+
+/// What the worker takes next: a queued request, or the daemon's own camera
+/// work.
+pub enum Work<T> {
+    Job(Job<T>),
+    Background(BackgroundTask),
+}
+
 /// One queued unit of work: what to run, and who asked.
 pub struct Job<T> {
     pub class: Class,
@@ -293,6 +306,8 @@ pub struct Job<T> {
 struct Inner<T> {
     auth: VecDeque<Job<T>>,
     other: VecDeque<Job<T>>,
+    /// The daemon's own camera work, taken after every queued request.
+    background: VecDeque<BackgroundTask>,
     /// Uids with a camera job queued or running. Root is never tracked: the
     /// greeter and PAM run as root, and holding them to one camera operation
     /// would be a denial of the login path rather than a fairness rule.
@@ -327,6 +342,7 @@ impl<T> Arbiter<T> {
             inner: Mutex::new(Inner {
                 auth: VecDeque::new(),
                 other: VecDeque::new(),
+                background: VecDeque::new(),
                 camera_slots: Vec::new(),
                 auth_running: false,
                 closed: false,
@@ -395,8 +411,10 @@ impl<T> Arbiter<T> {
 
     /// Block until there is work, and take the most urgent job.
     ///
-    /// `None` once the arbiter is closed and drained, which is the worker's
-    /// signal to exit.
+    /// `None` once the arbiter is closed and drained. Never hands out
+    /// background work; the worker takes through [`Arbiter::take_work`], and
+    /// this is for tests of request scheduling.
+    #[cfg(test)]
     pub fn take(&self) -> Option<Job<T>> {
         let mut inner = self.lock();
         loop {
@@ -414,6 +432,53 @@ impl<T> Arbiter<T> {
             }
             if inner.closed {
                 return None;
+            }
+            inner = self
+                .ready
+                .wait(inner)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Offer the daemon's own camera work, admitted as client camera work is:
+    /// refused while an authentication is pending or the queue is closed. It
+    /// waits behind every queued request, and only [`Arbiter::take_work`]
+    /// hands it out.
+    pub fn submit_background(&self, task: BackgroundTask) -> Result<(), Refusal> {
+        let mut inner = self.lock();
+        if inner.closed {
+            return Err(Refusal::ShuttingDown);
+        }
+        if inner.auth_pending() {
+            return Err(Refusal::Busy);
+        }
+        inner.background.push_back(task);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// The worker's take, which also runs the daemon's own
+    /// camera work once no request is queued. `None` once the arbiter is
+    /// closed and its requests are drained; background work still queued
+    /// then is dropped unrun.
+    pub fn take_work(&self) -> Option<Work<T>> {
+        let mut inner = self.lock();
+        loop {
+            if let Some(job) = inner.auth.pop_front() {
+                inner.auth_running = true;
+                self.cancel.reset();
+                return Some(Work::Job(job));
+            }
+            if let Some(job) = inner.other.pop_front() {
+                self.cancel.reset();
+                return Some(Work::Job(job));
+            }
+            if inner.closed {
+                return None;
+            }
+            if let Some(task) = inner.background.pop_front() {
+                self.cancel.reset();
+                return Some(Work::Background(task));
             }
             inner = self
                 .ready
@@ -459,6 +524,90 @@ mod tests {
 
     fn arb() -> Arbiter<&'static str> {
         Arbiter::new()
+    }
+
+    fn background(ran: &Arc<Mutex<Vec<&'static str>>>, name: &'static str) -> BackgroundTask {
+        let ran = Arc::clone(ran);
+        Box::new(move |_| ran.lock().unwrap().push(name))
+    }
+
+    fn run(work: Work<&'static str>) -> Option<&'static str> {
+        match work {
+            Work::Job(job) => Some(job.payload),
+            Work::Background(task) => {
+                task(&CancelToken::new());
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn background_camera_work_waits_behind_every_request() {
+        let a = arb();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        a.submit_background(background(&ran, "classify")).unwrap();
+        a.submit(Class::Camera, 1000, "preview").unwrap();
+        assert_eq!(run(a.take_work().unwrap()), Some("preview"));
+        a.finish(Class::Camera, 1000);
+        a.submit(Class::Auth, 0, "login").unwrap();
+        assert_eq!(run(a.take_work().unwrap()), Some("login"));
+        assert!(ran.lock().unwrap().is_empty());
+        a.finish(Class::Auth, 0);
+        assert_eq!(run(a.take_work().unwrap()), None);
+        assert_eq!(*ran.lock().unwrap(), ["classify"]);
+    }
+
+    #[test]
+    fn background_camera_work_is_refused_while_an_authentication_is_pending() {
+        let a = arb();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        a.submit(Class::Auth, 0, "login").unwrap();
+        assert_eq!(
+            a.submit_background(background(&ran, "queued")).unwrap_err(),
+            Refusal::Busy
+        );
+        // Still refused while it runs, not only while it queues.
+        assert_eq!(run(a.take_work().unwrap()), Some("login"));
+        assert_eq!(
+            a.submit_background(background(&ran, "running"))
+                .unwrap_err(),
+            Refusal::Busy
+        );
+        a.finish(Class::Auth, 0);
+        a.submit_background(background(&ran, "after")).unwrap();
+        a.close();
+        assert_eq!(
+            a.submit_background(background(&ran, "closed")).unwrap_err(),
+            Refusal::ShuttingDown
+        );
+        // Closing drops queued background work unrun.
+        assert!(a.take_work().is_none());
+        assert!(ran.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_authentication_asks_running_background_work_to_stop() {
+        let a = arb();
+        a.submit_background(Box::new(|_| {})).unwrap();
+        let Some(Work::Background(task)) = a.take_work() else {
+            panic!("background work was not taken");
+        };
+        let token = a.cancel_token();
+        assert!(!token.stop_requested());
+        a.submit(Class::Auth, 0, "login").unwrap();
+        assert!(token.stop_requested(), "the running task sees the stop");
+        task(&token);
+    }
+
+    #[test]
+    fn take_never_hands_out_background_work() {
+        let a = arb();
+        a.submit_background(Box::new(|_| panic!("ran through take")))
+            .unwrap();
+        a.submit(Class::Plain, 1000, "listing").unwrap();
+        assert_eq!(a.take().unwrap().payload, "listing");
+        a.close();
+        assert!(a.take().is_none());
     }
 
     #[test]

@@ -12,13 +12,17 @@
 //! TUI's Cameras page): authentication refused with
 //! `NoEnrolledCameraConnected` until then (#887).
 //!
-//! ADR-0029 §1 classifies each node's role when the device appears, and this
-//! does that. While the Current publication lists a camera as unclassified,
-//! one discovery scan classifies it: each capture node is opened for its
+//! ADR-0029 §1 classifies each node's role when the device appears, on the
+//! camera worker, and this does that. While the Current publication lists a
+//! camera as unclassified, the capture nodes of the cameras due a try, and no
+//! others, are classified as discovery does: each is opened for its
 //! capabilities and formats under a diagnostics lease, with no stream started
-//! and no emitter fired. The publication is read in memory every [`POLL`];
-//! nothing is opened while every camera has its roles. Authentication itself
-//! stays camera-free until its capture.
+//! and no emitter fired. The scan is the worker's background camera work: the
+//! arbiter refuses it while an authentication is pending, and an
+//! authentication arriving during it stops it before the next node. The
+//! publication is read in memory every [`POLL`]; nothing is opened while every
+//! camera has its roles. Authentication itself stays camera-free until its
+//! capture.
 
 use irlume_auth::ConnectedPairs;
 use irlume_common::live_camera::CameraInventoryState;
@@ -141,24 +145,34 @@ impl RoleClassifier {
 }
 
 /// One poll at `now`: when a camera is due a try and `permitted` (read only
-/// then) allows it, one discovery scan. Returns the cameras tried.
+/// then) allows it, `scan` classifies the capture nodes of exactly the due
+/// cameras; it answers whether the scan ran to the end. A scan refused or
+/// stopped for an authentication is not a try. Returns the cameras tried.
 pub(crate) fn tick(
     classifier: &mut RoleClassifier,
     permitted: &dyn Fn() -> bool,
+    scan: &dyn Fn(Vec<String>) -> bool,
     now: Instant,
 ) -> Vec<CameraKey> {
-    let due = classifier.due(&irlume_auth::connected_pairs(), now);
+    let view = irlume_auth::connected_pairs();
+    let due = classifier.due(&view, now);
     if due.is_empty() || !permitted() {
         return Vec::new();
     }
+    let endpoints: Vec<String> = view
+        .unclassified
+        .iter()
+        .filter(|camera| due.contains(&(camera.instance_id.clone(), camera.generation)))
+        .flat_map(|camera| camera.endpoints.iter().cloned())
+        .collect();
+    if !scan(endpoints) {
+        return Vec::new();
+    }
     irlume_common::jout_info!(
-        "irlumed: classifying the camera roles of {} connected camera(s) \
-         that have none yet (ADR-0029 §1)",
+        "irlumed: classified the capture nodes of {} connected camera(s) \
+         that had no roles yet (ADR-0029 §1)",
         due.len()
     );
-    // The same discovery scan as the classifying ListCameras: it records
-    // roles only for generations unchanged across it.
-    let _ = irlume_auth::list_pairs();
     if classifier.scanned(&due, now) == THROTTLE_NOTICE_AT {
         irlume_common::jout_notice!(
             "irlumed: cameras keep coming back unclassified after a scan (a udev \
@@ -177,17 +191,41 @@ pub(crate) fn tick(
     due
 }
 
-/// Start the classifier thread. `permitted` is read only when a camera is
-/// due a try: the face sensor policy decides, as for background
-/// requalification, so the IR-only policy's "no discovery" stays true.
-pub(crate) fn spawn(permitted: impl Fn() -> bool + Send + 'static) {
+/// Classify `endpoints` as the camera worker's background work, and wait for
+/// it: true when the scan ran to the end; false when the arbiter refused it
+/// (an authentication pending), an authentication stopped it, or the worker
+/// shut down without running it.
+pub(crate) fn scan_on_worker<T: Send + 'static>(
+    arbiter: &crate::arbiter::Arbiter<T>,
+    endpoints: Vec<String>,
+) -> bool {
+    let (done, finished) = std::sync::mpsc::channel();
+    let task: crate::arbiter::BackgroundTask = Box::new(move |token| {
+        irlume_auth::classify_endpoints(&endpoints, &|| token.stop_requested());
+        let _ = done.send(!token.stop_requested());
+    });
+    match arbiter.submit_background(task) {
+        Ok(()) => finished.recv().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Start the classifier thread, which hands its scans to `arbiter`'s camera
+/// worker. `permitted` is read only when a camera is due a try: the face
+/// sensor policy decides, as for background requalification, so the IR-only
+/// policy's "no discovery" stays true.
+pub(crate) fn spawn<T: Send + 'static>(
+    arbiter: std::sync::Arc<crate::arbiter::Arbiter<T>>,
+    permitted: impl Fn() -> bool + Send + 'static,
+) {
     let spawned = std::thread::Builder::new()
         .name("irlume-camera-roles".into())
         .spawn(move || {
             let mut classifier = RoleClassifier::default();
+            let scan = |endpoints| scan_on_worker(&arbiter, endpoints);
             loop {
                 std::thread::sleep(POLL);
-                tick(&mut classifier, &permitted, Instant::now());
+                tick(&mut classifier, &permitted, &scan, Instant::now());
             }
         });
     if let Err(error) = spawned {
@@ -225,6 +263,12 @@ mod tests {
         .unwrap()
     }
 
+    /// The worker task's scan, run on the test thread the fixture lives on.
+    fn scan_here(endpoints: Vec<String>) -> bool {
+        irlume_auth::classify_endpoints(&endpoints, &|| false);
+        true
+    }
+
     #[test]
     fn a_tick_classifies_an_unclassified_camera_into_a_pair() {
         // #887: after a daemon start the camera was listed but unclassified,
@@ -236,16 +280,122 @@ mod tests {
         assert_eq!(before.unclassified.len(), 1);
         let mut classifier = RoleClassifier::default();
         let now = Instant::now();
-        assert_eq!(tick(&mut classifier, &|| true, now).len(), 1);
+        assert_eq!(tick(&mut classifier, &|| true, &scan_here, now).len(), 1);
         let after = irlume_auth::connected_pairs();
         assert!(after.unclassified.is_empty(), "{after:?}");
         assert_eq!(after.pairs.len(), 1);
         assert_eq!(after.pairs[0].rgb, "/dev/irlume-roles-rgb");
         assert_eq!(after.pairs[0].ir, "/dev/irlume-roles-ir");
         // Classified: the next ticks scan nothing more. The fixture opens no
-        // device; the scan is the only boundary call.
-        assert!(tick(&mut classifier, &|| true, now + RETRY_AFTER[3]).is_empty());
-        assert_eq!(guard.calls(), [Call::Scan]);
+        // device; the one boundary call is a scan of that camera's nodes.
+        assert!(tick(&mut classifier, &|| true, &scan_here, now + RETRY_AFTER[3]).is_empty());
+        assert_eq!(
+            guard.calls(),
+            [Call::ScanEndpoints(vec![
+                "/dev/irlume-roles-ir".into(),
+                "/dev/irlume-roles-rgb".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_refused_or_stopped_scan_is_not_a_try() {
+        // An authentication pending (refused) or arriving (stopped): the
+        // camera is due again on the next poll, its tries untouched.
+        let guard = unclassified_camera();
+        let mut classifier = RoleClassifier::default();
+        let now = Instant::now();
+        assert!(tick(&mut classifier, &|| true, &|_| false, now).is_empty());
+        assert!(guard.calls().is_empty());
+        assert_eq!(
+            tick(&mut classifier, &|| true, &scan_here, now + POLL).len(),
+            1
+        );
+        assert!(irlume_auth::connected_pairs().unclassified.is_empty());
+    }
+
+    #[test]
+    fn only_the_due_cameras_nodes_are_scanned() {
+        // A camera held back by its backoff is not opened on another
+        // camera's schedule.
+        let endpoint = |path: &str, format| Endpoint {
+            path: path.into(),
+            formats: vec![format],
+        };
+        let camera = |topology: &str, identity: &str, port: u8, rgb: &str, ir: &str| Camera {
+            topology: topology.into(),
+            identity: identity.into(),
+            fixed: true,
+            controller: "0000:00:14.0".into(),
+            domain: irlume_common::split_key::SplitDomain::Usb2,
+            ports: vec![port],
+            endpoints: vec![endpoint(rgb, *b"YUYV"), endpoint(ir, *b"GREY")],
+        };
+        let guard = Guard::install_unclassified(&[
+            camera(
+                "/devices/role-classification/a",
+                "1234:00ac:a",
+                6,
+                "/dev/irlume-a-rgb",
+                "/dev/irlume-a-ir",
+            ),
+            camera(
+                "/devices/role-classification/b",
+                "1234:00ad:b",
+                7,
+                "/dev/irlume-b-rgb",
+                "/dev/irlume-b-ir",
+            ),
+        ])
+        .unwrap();
+        let view = irlume_auth::connected_pairs();
+        let a = view
+            .unclassified
+            .iter()
+            .find(|camera| camera.endpoints.contains(&"/dev/irlume-a-rgb".to_owned()))
+            .unwrap();
+        let now = Instant::now();
+        // `a` was tried a poll ago and is backing off; `b` is new.
+        let mut classifier = RoleClassifier::default();
+        classifier.tried(&[(a.instance_id.clone(), a.generation)], now);
+        assert_eq!(
+            tick(&mut classifier, &|| true, &scan_here, now + POLL).len(),
+            1
+        );
+        assert_eq!(
+            guard.calls(),
+            [Call::ScanEndpoints(vec![
+                "/dev/irlume-b-ir".into(),
+                "/dev/irlume-b-rgb".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn the_scan_runs_on_the_worker_and_waits_for_it() {
+        // Refused while an authentication is pending; otherwise run by
+        // whoever takes the worker's work, and answered once it ran.
+        let arbiter = std::sync::Arc::new(crate::arbiter::Arbiter::<()>::new());
+        arbiter.submit(crate::arbiter::Class::Auth, 0, ()).unwrap();
+        assert!(!scan_on_worker(&arbiter, vec!["/dev/irlume-none".into()]));
+        let Some(crate::arbiter::Work::Job(job)) = arbiter.take_work() else {
+            panic!("the authentication was not taken first");
+        };
+        arbiter.finish(job.class, job.uid);
+        let worker = {
+            let arbiter = std::sync::Arc::clone(&arbiter);
+            std::thread::spawn(move || match arbiter.take_work() {
+                Some(crate::arbiter::Work::Background(task)) => {
+                    task(&arbiter.cancel_token());
+                    true
+                }
+                _ => false,
+            })
+        };
+        // No camera is published on this thread's supervisor for the path,
+        // so the worker's scan touches nothing and runs to the end.
+        assert!(scan_on_worker(&arbiter, vec!["/dev/irlume-none".into()]));
+        assert!(worker.join().unwrap());
     }
 
     #[test]
@@ -253,7 +403,7 @@ mod tests {
         // The IR-only policy disables discovery, as for requalification.
         let guard = unclassified_camera();
         let mut classifier = RoleClassifier::default();
-        assert!(tick(&mut classifier, &|| false, Instant::now()).is_empty());
+        assert!(tick(&mut classifier, &|| false, &scan_here, Instant::now()).is_empty());
         assert!(guard.calls().is_empty());
         assert_eq!(irlume_auth::connected_pairs().unclassified.len(), 1);
     }
@@ -283,7 +433,7 @@ mod tests {
             asked.set(true);
             true
         };
-        assert!(tick(&mut classifier, &permitted, Instant::now()).is_empty());
+        assert!(tick(&mut classifier, &permitted, &scan_here, Instant::now()).is_empty());
         assert!(!asked.get());
         assert!(guard.calls().is_empty());
     }

@@ -650,9 +650,11 @@ All notable changes to irlume are documented here. This project adheres to
   only the startup device selection, after the model load, and a client's
   camera listing did. Until then authentication refused to the password
   with `NoEnrolledCameraConnected`, and `irlume split list` named no
-  candidates. irlumed now classifies a camera's roles in the background
-  as it appears, under the Dual face sensor policy: the same discovery
-  scan as the listing, which starts no stream and fires no emitter. A
+  candidates. irlumed now classifies a camera's roles as it appears,
+  under the Dual face sensor policy: the camera worker scans only that
+  camera's capture nodes, as discovery does (no stream, no emitter),
+  behind any queued request and never while an authentication is
+  pending. A
   camera that stays unclassified is tried again with a backoff, and one
   that comes back unclassified after every scan is scanned at most every
   10 minutes.

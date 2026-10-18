@@ -67,5 +67,15 @@ updates:
         patterns: ["toml"]
       cargo-minor:
         update-types: ["minor", "patch"]
+    # MSRV holds. irlume builds on Rust 1.88 (`rust-version` in Cargo.toml;
+    # CI and the Nix shell pin 1.88.0), and Dependabot's cargo updater does
+    # not read `rust-version`, so a release that raises its MSRV past it
+    # breaks the grouped PR for every crate in it. Drop an entry when the
+    # MSRV reaches the version named; the daily cargo-deny job still reports
+    # an advisory against a held version.
+    ignore:
+      # aes 0.9.3 enables the VAES backends by default and needs Rust 1.89.
+      - dependency-name: "aes"
+        versions: [">= 0.9.3"]
     commit-message:
       prefix: "deps"

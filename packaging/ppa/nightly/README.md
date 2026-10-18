@@ -40,3 +40,7 @@ journalctl --user -u irlume-ppa-nightly.service -n 50
 cat ~/.local/state/irlume-nightly/ppa.json
 python3 ~/.local/lib/irlume-nightly/ppa-nightly.py --no-upload   # build and sign only
 ```
+
+One run at a time: a run started while another holds
+`~/.local/state/irlume-nightly/lock` (the timer's, or a dry run) exits 1
+without touching anything.

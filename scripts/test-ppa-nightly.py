@@ -144,13 +144,16 @@ class Agreement(unittest.TestCase):
         self.assertEqual(N.BASE, base)
 
     def test_files_are_handed_back_under_docker_only(self) -> None:
-        # As build-ppa-container.sh: rootless podman's root is this user.
-        for path, expected in (
-            ("/usr/bin/docker", f"{os.getuid()}:{os.getgid()}"),
-            ("/usr/bin/podman", None),
+        # As build-ppa-container.sh: rootless podman's root is this user. The
+        # runtime says what it is: podman-docker's `docker` runs podman.
+        for path, version, expected in (
+            ("/usr/bin/docker", "Docker version 29.9.1, build dfc520dcc2", f"{os.getuid()}:{os.getgid()}"),
+            ("/usr/bin/podman", "podman version 5.4.2", None),
+            ("/usr/bin/docker", "podman version 5.4.2", None),
         ):
-            with mock.patch.object(N, "engine", return_value=path):
-                self.assertEqual(N.owner(), expected, path)
+            with mock.patch.object(N, "engine", return_value=path), \
+                    mock.patch.object(N, "run", return_value=mock.Mock(stdout=version + "\n")):
+                self.assertEqual(N.owner(), expected, (path, version))
 
     def test_the_build_runs_the_release_containers_script(self) -> None:
         release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
@@ -253,6 +256,7 @@ class DryRun(unittest.TestCase):
             changes = Path(d) / "out" / "x_source.changes"
             argv = ["ppa-nightly.py", "--no-upload", "--state", str(path), "--clone", d, "--work", d]
             with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(N, "LOCK", Path(d) / "lock"), \
                     mock.patch.object(N, "update_clone", return_value=("c" * 40, "v0.15.0-139-g3c162b83", 1)), \
                     mock.patch.object(N, "launchpad", return_value=lp({N.debian_version(V, 1): "pending"})), \
                     mock.patch.object(N, "build", side_effect=lambda *a: ran.append("build") or changes), \
@@ -274,6 +278,23 @@ class DryRun(unittest.TestCase):
             self.assertEqual(ran, ["build", "sign"], state)
             self.assertEqual(after, state)
 
+    def test_one_run_at_a_time(self) -> None:
+        # A dry run beside the timer would delete its work directory.
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "state" / "lock"
+            first = N.hold_lock(lock)
+            self.assertIsNotNone(first)
+            self.assertIsNone(N.hold_lock(lock))
+            with mock.patch.object(N, "LOCK", lock), \
+                    mock.patch.object(sys, "argv", ["ppa-nightly.py", "--no-upload"]), \
+                    mock.patch.object(N, "update_clone") as clone:
+                self.assertEqual(N.main(), 1)
+                clone.assert_not_called()
+            first.close()
+            again = N.hold_lock(lock)
+            self.assertIsNotNone(again)
+            again.close()
+
     def test_what_the_timer_would_do_is_a_sentence(self) -> None:
         self.assertEqual(N.what(N.Upload(V, 2, "its build failed at -0ppa1")),
                          f"upload {V}-0ppa2~resolute1 (its build failed at -0ppa1)")
@@ -290,7 +311,8 @@ class Mounts(unittest.TestCase):
             return mock.Mock(stdout="/run/user/1000/gnupg/S.gpg-agent.extra" if "gpgconf" in cmd else b"")
 
         with mock.patch.object(N, "run", side_effect=fake), \
-                mock.patch.object(N, "engine", return_value="/usr/bin/podman"):
+                mock.patch.object(N, "engine", return_value="/usr/bin/podman"), \
+                mock.patch.object(N, "owner", return_value=None):
             call()
         return next(c for c in calls if c[1:2] == ["run"])
 

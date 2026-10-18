@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import importlib.util
 import json
 import os
@@ -80,6 +81,9 @@ DRY_RUN_CLONE = DEFAULT_CLONE.with_name("irlume-dry-run")
 DEFAULT_STATE = HOME / ".local" / "state" / "irlume-nightly" / "ppa.json"
 # On disk: a build needs a few GB, more than a tmpfs /tmp may have.
 DEFAULT_WORK = HOME / ".cache" / "irlume-nightly"
+# One run at a time, the timer's or a dry run: a build starts by deleting
+# its work directory, and two runs share the default one.
+LOCK = DEFAULT_STATE.parent / "lock"
 
 
 def log(message: str) -> None:
@@ -265,8 +269,10 @@ def owner() -> str | None:
     """The uid:gid a container hands its files back to, as
     packaging/ppa/build-ppa-container.sh does: docker runs them as the real
     root, while rootless podman's root already is this user, where a chown to
-    this uid would map to a subuid instead."""
-    return f"{os.getuid()}:{os.getgid()}" if Path(engine()).name == "docker" else None
+    this uid would map to a subuid instead. The runtime is asked what it is,
+    since podman-docker installs a `docker` command that runs podman."""
+    version = run([engine(), "--version"], capture_output=True, text=True).stdout
+    return None if "podman" in version.lower() else f"{os.getuid()}:{os.getgid()}"
 
 
 def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev: int) -> Path:
@@ -412,6 +418,19 @@ def attempt_upload(state: dict, action: Upload, now: float, push) -> tuple[dict 
 # --- a run ---------------------------------------------------------------------
 
 
+def hold_lock(path: Path):
+    """This run's exclusive lock (keep the returned file open), or None when
+    another run holds it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Upload main to the nightly PPA (ADR-0037).")
     parser.add_argument("--clone", type=Path, default=DEFAULT_CLONE)
@@ -426,6 +445,10 @@ def main() -> int:
     if (args.repo_url != REPO_URL or args.ref != "main") and args.clone == DEFAULT_CLONE:
         # Another repository's refs never enter the clone the timer uploads from.
         args.clone = DRY_RUN_CLONE
+    lock = hold_lock(LOCK)
+    if lock is None:
+        log(f"another run holds {LOCK}; nothing done, try again when it finishes")
+        return 1
 
     commit, describe, when = update_clone(args.clone, args.repo_url, args.ref)
     upstream = nightly_version(describe)

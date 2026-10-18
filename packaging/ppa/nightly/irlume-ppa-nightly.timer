@@ -1,0 +1,11 @@
+# Once a day: ADR-0037 keeps at most one upload a day, inside the PPA quota.
+[Unit]
+Description=Daily irlume nightly PPA upload
+
+[Timer]
+OnCalendar=*-*-* 03:20
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

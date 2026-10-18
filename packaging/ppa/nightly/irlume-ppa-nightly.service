@@ -1,0 +1,15 @@
+# The nightly channel's Ubuntu lane (docs/adr/0037-nightly-channel.md).
+# A user unit on minihost; see packaging/ppa/nightly/README.md to install it.
+[Unit]
+Description=Upload irlume main to ppa:archledger/irlume-nightly
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# The installed, reviewed copy, never the clone the script updates.
+ExecStart=/usr/bin/python3 -B %h/.local/lib/irlume-nightly/ppa-nightly.py
+# A build is about an hour; the script then polls Launchpad for up to four.
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle

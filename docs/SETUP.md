@@ -694,8 +694,10 @@ automatically at daemon start and during enrollment. That permanently destroyed 
 reporter's camera ([#159]). It is now only ever run when you ask for it.
 
 To see exactly what irlume sends to the camera, set `IRLUME_LOG_EMITTER_WRITES=1`
-and it prints each emitter write before making it, interleaved with the undo
-record's own events so the order is visible.
+and it prints each emitter write before making it and whether the camera
+accepted it, and each read with the bytes the camera returned, each naming the
+camera node, interleaved with the undo record's own events so the order is
+visible.
 
 Setup writes that undo record before it touches the control and removes it only
 once the control reads back holding its original value again, so a crash, a kill

@@ -7691,7 +7691,7 @@ impl IrSession<'_> {
         // reason this path exists, and it can only be observed against a scene
         // that produces one, so the instrument is kept rather than reasoned about.
         if std::env::var("IRLUME_DEBUG_IR_FRAMES").is_ok() {
-            for (i, (&m, f)) in means.iter().zip(&flags).enumerate() {
+            for (i, ((&m, f), sequence)) in means.iter().zip(&flags).zip(&sequences).enumerate() {
                 let camera = match f {
                     Some(ir_metadata::Illumination::Lit) => "lit",
                     Some(ir_metadata::Illumination::Dark) => "dark",
@@ -7711,11 +7711,24 @@ impl IrSession<'_> {
                 // constant is spread, not level (#197 wants the saturated
                 // cover's spread measured, and this line is the instrument).
                 eprintln!(
-                    "[ir_frame] {i:2} mean {m:6.1}  stddev {:6.2}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
+                    "[ir_frame] {i:2} seq {sequence}  mean {m:6.1}  stddev {:6.2}  camera {camera:6}  threshold(>={:.0}) {threshold:4}  {verdict}",
                     ir_dark::frame_stddev(&frames[i]),
                     ir_emitter::IR_LIT_MEAN
                 );
             }
+            // The D1 proof's numbers for this burst, from the same raw
+            // sequences and means a YUYV ceiling judges, so a hardware run
+            // records the optical result and not only its name (#887).
+            let observations: Vec<(u32, f32)> = sequences
+                .iter()
+                .zip(&means)
+                .map(|(&sequence, &mean)| (sequence, mean as f32))
+                .collect();
+            eprintln!(
+                "[ir_d1] {}: {}",
+                camera_text(device),
+                ir_emitter::D1OpticalEvidence::from_sequence_means(&observations)
+            );
         }
         let bmin = means.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = means.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

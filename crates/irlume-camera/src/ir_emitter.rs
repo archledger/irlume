@@ -264,6 +264,37 @@ impl D1OpticalEvidence {
     }
 }
 
+impl std::fmt::Display for D1OpticalEvidence {
+    /// Every number the verdict is read from, and the verdict, for the
+    /// `IRLUME_DEBUG_IR_FRAMES` instrument that already prints the burst's
+    /// per-frame means. The phase delta is a difference of luma means, so
+    /// this never goes to the debug journal, which names reasons only
+    /// (ADR-0031 §4).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let verdict = match self.verdict() {
+            OpticalD1Verdict::Proven => "proven",
+            OpticalD1Verdict::Refuted => "refuted",
+            OpticalD1Verdict::Inconclusive => "inconclusive",
+        };
+        write!(
+            f,
+            "{} even and {} odd frames, bright phase {}, phase delta {:.1} (proof needs >= \
+             {AUTOCONF_MIN_LIFT:.1}), bright support {} and dark support {} (needs >= 3 each), \
+             consistent pairs {} (needs >= 3), conflicting pairs {} (needs 0), invalid \
+             sequence steps {} (needs 0): D1 {verdict}",
+            self.even_frames,
+            self.odd_frames,
+            if self.bright_even { "even" } else { "odd" },
+            self.phase_delta,
+            self.bright_phase_support,
+            self.dark_phase_support,
+            self.consistent_pairs,
+            self.conflicting_pairs,
+            self.invalid_sequence_steps,
+        )
+    }
+}
+
 /// Camera-reported illumination observations from one setup burst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct D1MetadataEvidence {
@@ -751,22 +782,97 @@ fn xu_query(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> Xu
     //
     // `SET_CUR` is left to `set_cur`, which prints the payload bytes, so each
     // ioctl appears exactly once and the order can be read straight off.
+    //
+    // A read is printed once the camera has answered, with the bytes it
+    // returned or the error, and a write gets a second line saying whether the
+    // camera took it. A trace of requests alone could not show that a write
+    // read back or that a restore landed (#887): the ADR-0031 §4 evidence for
+    // a built-in table entry is the write, its read-back and the restore, all
+    // from the camera.
+    let result = xu_query_device(fd, unit, selector, query, data);
     if query != UVC_SET_CUR && std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        let name = match query {
-            UVC_GET_CUR => "GET_CUR",
-            UVC_GET_LEN => "GET_LEN",
-            UVC_GET_INFO => "GET_INFO",
-            UVC_GET_DEF => "GET_DEF",
-            UVC_GET_MIN => "GET_MIN",
-            UVC_GET_MAX => "GET_MAX",
-            UVC_GET_RES => "GET_RES",
-            other => &format!("GET_{other:#04x}"),
-        };
-        eprintln!(
-            "irlume: {name} unit{unit}/sel{selector} size={}",
-            data.len()
-        );
+        emit_trace(&read_trace(
+            query,
+            unit,
+            selector,
+            data,
+            &result,
+            &trace_node(fd),
+        ));
     }
+    result
+}
+
+/// Print one emitter trace line, ignoring a failed write. `eprintln!` panics
+/// when stderr cannot be written, and these lines sit between a write and the
+/// bookkeeping that arms its restore: a panic there leaves the camera changed
+/// with no guard to put it back.
+fn emit_trace(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// The node an emitter trace line names: the open descriptor's own device,
+/// so a run on a machine with two cameras that publish the same unit and
+/// selector shows which one each request reached.
+fn trace_node(fd: c_int) -> String {
+    match std::fs::read_link(format!("/proc/self/fd/{fd}")) {
+        Ok(path) => crate::camera_text(&path.to_string_lossy()),
+        Err(_) => format!("fd {fd}"),
+    }
+}
+
+/// The `IRLUME_LOG_EMITTER_WRITES` line for one read: the request, the node,
+/// and the bytes the camera returned or why it returned none.
+fn read_trace(
+    query: u8,
+    unit: u8,
+    selector: u8,
+    data: &[u8],
+    result: &XuResult<()>,
+    node: &str,
+) -> String {
+    let name = match query {
+        UVC_GET_CUR => "GET_CUR",
+        UVC_GET_LEN => "GET_LEN",
+        UVC_GET_INFO => "GET_INFO",
+        UVC_GET_DEF => "GET_DEF",
+        UVC_GET_MIN => "GET_MIN",
+        UVC_GET_MAX => "GET_MAX",
+        UVC_GET_RES => "GET_RES",
+        other => &format!("GET_{other:#04x}"),
+    };
+    let size = data.len();
+    match result {
+        Ok(()) => {
+            format!("irlume: {name} unit{unit}/sel{selector} size={size} on {node}: {data:02x?}")
+        }
+        Err(error) => {
+            format!("irlume: {name} unit{unit}/sel{selector} size={size} on {node} failed: {error}")
+        }
+    }
+}
+
+/// The `IRLUME_LOG_EMITTER_WRITES` line for one write, printed before it is
+/// sent, so a write that never returns is still on record. The node follows
+/// the payload: the hardware harnesses match the text up to it.
+fn write_trace(unit: u8, selector: u8, payload: &[u8], node: &str) -> String {
+    format!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?} on {node}")
+}
+
+/// The line after a write: whether the camera took it. Worded without
+/// `SET_CUR`, which the harnesses count as one line per write.
+fn write_outcome_trace(unit: u8, selector: u8, node: &str, result: &XuResult<()>) -> String {
+    match result {
+        Ok(()) => format!("irlume: write to unit{unit}/sel{selector} on {node} accepted"),
+        Err(error) => {
+            format!("irlume: write to unit{unit}/sel{selector} on {node} failed: {error}")
+        }
+    }
+}
+
+/// The one ioctl, or the test's stand-in camera.
+fn xu_query_device(fd: c_int, unit: u8, selector: u8, query: u8, data: &mut [u8]) -> XuResult<()> {
     // A test may stand in for the camera here. Every read and every write in
     // this module funnels through this one call, so a fake installed here can
     // drive the whole discovery sequence, record the exact order of requests,
@@ -1141,13 +1247,20 @@ fn set_cur(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
 // admission; an owned restore checks its surviving original fd separately.
 fn set_cur_admitted(fd: c_int, unit: u8, selector: u8, payload: &[u8]) -> XuResult<()> {
     validate_query_configuration(fd)?;
-    if std::env::var_os("IRLUME_LOG_EMITTER_WRITES").is_some() {
-        eprintln!("irlume: SET_CUR unit{unit}/sel{selector}: {payload:02x?}");
+    let traced = std::env::var_os("IRLUME_LOG_EMITTER_WRITES")
+        .is_some()
+        .then(|| trace_node(fd));
+    if let Some(node) = &traced {
+        emit_trace(&write_trace(unit, selector, payload, node));
     }
     #[cfg(test)]
     writes_attempted().fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut data = payload.to_vec();
-    xu_query(fd, unit, selector, UVC_SET_CUR, &mut data)
+    let result = xu_query(fd, unit, selector, UVC_SET_CUR, &mut data);
+    if let Some(node) = &traced {
+        emit_trace(&write_outcome_trace(unit, selector, node, &result));
+    }
+    result
 }
 
 /// Counts every write this module attempts, so a test can assert that a path
@@ -6026,6 +6139,119 @@ mod tests {
             src.contains(produced) && src.contains(format),
             "the marker is no longer produced here; the workflow gate has no source"
         );
+    }
+
+    /// A read is traced once the camera answers, with its bytes or the error,
+    /// so a run shows what the control held and not only that it was asked
+    /// (#887). A write is traced before it is sent, with the payload.
+    #[test]
+    fn the_emitter_trace_prints_what_the_camera_returned() {
+        let d1 = [1, 1, 2, 0, 0, 0, 0, 0, 0];
+        let node = "/dev/video0";
+        assert_eq!(
+            write_trace(8, 6, &d1, node),
+            "irlume: SET_CUR unit8/sel6: [01, 01, 02, 00, 00, 00, 00, 00, 00] on /dev/video0"
+        );
+        assert_eq!(
+            write_outcome_trace(8, 6, node, &Ok(())),
+            "irlume: write to unit8/sel6 on /dev/video0 accepted"
+        );
+        assert!(
+            !write_outcome_trace(8, 6, node, &Err(XuError::Unsupported)).contains("SET_CUR"),
+            "the harnesses count SET_CUR lines as writes"
+        );
+        assert_eq!(
+            write_outcome_trace(8, 6, node, &Err(XuError::Unsupported)),
+            "irlume: write to unit8/sel6 on /dev/video0 failed: control not supported"
+        );
+        assert_eq!(
+            read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(()), node),
+            "irlume: GET_CUR unit8/sel6 size=9 on /dev/video0: [01, 01, 02, 00, 00, 00, 00, 00, 00]"
+        );
+        assert_eq!(
+            read_trace(
+                UVC_GET_LEN,
+                8,
+                6,
+                &[0, 0],
+                &Err(XuError::Unresponsive(libc::EPIPE)),
+                node
+            ),
+            format!(
+                "irlume: GET_LEN unit8/sel6 size=2 on /dev/video0 failed: camera did not answer ({})",
+                std::io::Error::from_raw_os_error(libc::EPIPE)
+            )
+        );
+        assert_eq!(
+            read_trace(0x99, 8, 6, &[3], &Ok(()), node),
+            "irlume: GET_0x99 unit8/sel6 size=1 on /dev/video0: [03]"
+        );
+        // A descriptor with no /proc link still names itself.
+        assert_eq!(trace_node(-1), "fd -1");
+    }
+
+    /// The capture-evidence harness matches these lines exactly, so a reworded
+    /// trace would turn its checks into ones that can never pass. Its expected
+    /// lines are built here from the code that prints them, from the T480's D0
+    /// and D1 values and its unit, with the harness's node placeholder, and
+    /// the burst markers it counts are checked against their producers.
+    #[test]
+    fn the_capture_evidence_harness_expects_what_irlumed_prints() {
+        let script = include_str!("../../../scripts/hardware/emitter-capture-evidence-test.sh");
+        let d0 = [1, 1, 1, 0, 0, 0, 0, 0, 0];
+        let d1 = [1, 1, 2, 0, 0, 0, 0, 0, 0];
+        let node = "@NODE@";
+        for (name, line) in [
+            ("expected_write", write_trace(8, 6, &d1, node)),
+            (
+                "expected_accepted",
+                write_outcome_trace(8, 6, node, &Ok(())),
+            ),
+            (
+                "expected_readback",
+                read_trace(UVC_GET_CUR, 8, 6, &d1, &Ok(()), node),
+            ),
+            ("expected_restore", write_trace(8, 6, &d0, node)),
+        ] {
+            assert!(
+                script.contains(&format!("{name}=\"{line}\"")),
+                "the harness no longer expects {line:?} as {name}"
+            );
+        }
+        assert!(script.contains("model_override=8:6:1,1,2,0,0,0,0,0,0"));
+        assert!(script.contains("model_d0=010101000000000000"));
+        assert!(script.contains("model_d1=010102000000000000"));
+        // The harness finds a write's outcome by the accepted line's prefix.
+        assert!(write_outcome_trace(8, 6, node, &Err(XuError::Unsupported))
+            .starts_with(&format!("irlume: write to unit8/sel6 on {node} ")));
+
+        let proven = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 41.0),
+            (12, 11.0),
+            (13, 40.0),
+            (14, 9.0),
+            (15, 42.0),
+            (16, 10.0),
+            (17, 41.0),
+        ]);
+        assert!(proven.to_string().ends_with(": D1 proven"));
+        assert!(script.contains("d1_proven_suffix=\": D1 proven\""));
+        assert!(script.contains("d1_line_prefix=\"[ir_d1] \""));
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains(concat!("\"[ir_d1] ", "{}: {}\",")));
+        assert!(lib.contains(concat!(
+            "\"[ir] {}: YUYV clipping ceiling ",
+            "{} for this burst\","
+        )));
+        assert!(script.contains("ceiling_line_prefix=\"[ir] \""));
+        assert!(script.contains(&format!(
+            "ceiling_suffix=\": YUYV clipping ceiling {} for this burst\"",
+            crate::yuyv_exposure::YUYV_LIMITED_WHITE_LEVEL
+        )));
+        let src = include_str!("ir_emitter.rs");
+        assert!(src.contains(concat!("\"write ", "completed\"")));
+        assert!(script.contains("\"irlume: capture emitter write completed\""));
     }
 
     /// Keep the privileged invocation and its operator guidance in agreement.
@@ -11879,6 +12105,66 @@ mod tests {
         assert!(
             !two_spikes.proves_d1(),
             "two transient spikes are not stable phase support: {two_spikes:?}"
+        );
+    }
+
+    /// The `[ir_d1]` line names every number the verdict is read from and the
+    /// verdict itself, so a hardware run records the optical result rather
+    /// than only that one was reached (#887). The three bursts are the
+    /// periodicity test's: one of each verdict.
+    #[test]
+    fn the_d1_summary_names_each_proof_number_and_the_verdict() {
+        let periodic = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 41.0),
+            (12, 11.0),
+            (13, 40.0),
+            (14, 9.0),
+            (15, 42.0),
+            (16, 10.0),
+            (17, 41.0),
+        ]);
+        assert_eq!(
+            periodic.to_string(),
+            "4 even and 4 odd frames, bright phase odd, phase delta 31.0 (proof needs >= 20.0), \
+             bright support 4 and dark support 4 (needs >= 3 each), consistent pairs 7 (needs \
+             >= 3), conflicting pairs 0 (needs 0), invalid sequence steps 0 (needs 0): D1 proven"
+        );
+        let exposure_drift = D1OpticalEvidence::from_sequence_means(&[
+            (10, 10.0),
+            (11, 20.0),
+            (12, 30.0),
+            (13, 40.0),
+            (14, 35.0),
+            (15, 30.0),
+            (16, 20.0),
+            (17, 10.0),
+        ]);
+        assert!(
+            exposure_drift.to_string().ends_with(
+                "phase delta 0.0 (proof needs >= 20.0), bright support 0 and dark support 0 \
+                 (needs >= 3 each), consistent pairs 0 (needs >= 3), conflicting pairs 0 (needs \
+                 0), invalid sequence steps 0 (needs 0): D1 refuted"
+            ),
+            "{exposure_drift}"
+        );
+        let two_spikes = D1OpticalEvidence::from_sequence_means(&[
+            (10, 0.0),
+            (11, 40.0),
+            (12, 0.0),
+            (13, 40.0),
+            (14, 0.0),
+            (15, 0.0),
+            (16, 0.0),
+            (17, 0.0),
+        ]);
+        assert!(
+            two_spikes.to_string().ends_with(
+                "phase delta 20.0 (proof needs >= 20.0), bright support 2 and dark support 4 \
+                 (needs >= 3 each), consistent pairs 4 (needs >= 3), conflicting pairs 0 (needs \
+                 0), invalid sequence steps 0 (needs 0): D1 inconclusive"
+            ),
+            "{two_spikes}"
         );
     }
 

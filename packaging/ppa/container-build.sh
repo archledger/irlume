@@ -3,10 +3,11 @@
 # Copyright the irlume contributors.
 # Build the PPA source package inside the Ubuntu container, from the tree at
 # /work (a git archive of the commit being packaged, never a checkout with
-# .git). Shared by packaging/ppa/build-ppa-container.sh (a release) and
-# scripts/ppa-nightly.py (the nightly channel, ADR-0037): both run this same
-# script in the same digest-pinned image, so a nightly is built the way a
-# release is.
+# .git). Shared by packaging/ppa/build-ppa-container.sh (a release, which
+# mounts its checkout's copy at /helper, since older tags have none) and
+# scripts/ppa-nightly.py (the nightly channel, ADR-0037, from the tree it
+# builds): both run this script in the same digest-pinned image, so a nightly
+# is built the way a release is.
 #
 # Environment (all passed through by the callers):
 #   SERIES, PPAREV, SOURCE_DATE_EPOCH    as scripts/build-ppa-source.sh takes them

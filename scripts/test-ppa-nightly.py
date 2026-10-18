@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -153,8 +154,122 @@ class Agreement(unittest.TestCase):
 
     def test_the_build_runs_the_release_containers_script(self) -> None:
         release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
-        self.assertIn("bash /work/packaging/ppa/container-build.sh", release)
+        # A release runs its checkout's copy, which tags older than the
+        # script lack; the nightly runs the copy in the tree it builds.
+        self.assertIn('cp "$REPO/packaging/ppa/container-build.sh" "$HELPER/"', release)
+        self.assertIn("bash /helper/container-build.sh", release)
         self.assertIn('"bash", "/work/packaging/ppa/container-build.sh"', (ROOT / "scripts" / "ppa-nightly.py").read_text())
+
+
+def git_env(home: str) -> dict[str, str]:
+    """git without the user's or the system's configuration (signing, hooks)."""
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "HOME": home,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+
+
+class Clone(unittest.TestCase):
+    def test_tags_from_another_repository_never_outlive_its_fetch(self) -> None:
+        # A dry run of a fork with a newer tag on official main's commit must
+        # not leave that tag for the next real run's git describe.
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, git_env(d)):
+            git = lambda *args: subprocess.run(["git", *args], check=True, capture_output=True)
+            official, fork, clone = (Path(d) / n for n in ("official", "fork", "clone"))
+            git("init", "--quiet", "-b", "main", str(official))
+            git("-C", str(official), "commit", "--quiet", "--allow-empty", "-m", "one")
+            git("-C", str(official), "tag", "v0.15.0")
+            git("-C", str(official), "commit", "--quiet", "--allow-empty", "-m", "two")
+            git("clone", "--quiet", str(official), str(fork))
+            git("-C", str(fork), "tag", "-a", "-m", "not ours", "v999.0.0", "HEAD")
+            _, describe, _ = N.update_clone(clone, str(fork), "main")
+            self.assertTrue(describe.startswith("v999.0.0-0-g"), describe)
+            commit, describe, when = N.update_clone(clone, str(official), "main")
+            self.assertTrue(describe.startswith("v0.15.0-1-g"), describe)
+            self.assertEqual(N.nightly_version(describe).split("+")[0], "0.15.0")
+            self.assertEqual(len(commit), 40)
+            self.assertGreater(when, 0)
+
+    def test_a_dry_run_of_another_repository_gets_its_own_clone(self) -> None:
+        self.assertNotEqual(N.DRY_RUN_CLONE, N.DEFAULT_CLONE)
+        self.assertEqual(N.DRY_RUN_CLONE.parent, N.DEFAULT_CLONE.parent)
+
+
+class Collect(unittest.TestCase):
+    DEBVER = N.debian_version(V, 1)
+
+    def built(self, root: Path) -> Path:
+        built = root / "tree" / "ppa-build"
+        built.mkdir(parents=True)
+        for name in N.artifacts(V, self.DEBVER):
+            (built / name).write_text(name)
+        return built
+
+    def test_the_upload_moves_out_of_the_build_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            built = self.built(Path(d))
+            changes = N.collect(built, Path(d) / "out", V, self.DEBVER)
+            self.assertEqual(changes, Path(d) / "out" / f"irlume_{self.DEBVER}_source.changes")
+            self.assertEqual(sorted(p.name for p in changes.parent.iterdir()), sorted(N.artifacts(V, self.DEBVER)))
+            self.assertEqual(list(built.iterdir()), [])
+
+    def test_a_symlink_from_the_build_is_refused(self) -> None:
+        # The build container ran main's code; a link it left could aim a
+        # later host write at the installed uploader or anything else.
+        with tempfile.TemporaryDirectory() as d:
+            victim = Path(d) / "victim"
+            victim.write_text("keep")
+            built = self.built(Path(d))
+            dsc = built / f"irlume_{self.DEBVER}.dsc"
+            dsc.unlink()
+            dsc.symlink_to(victim)
+            with self.assertRaises(RuntimeError):
+                N.collect(built, Path(d) / "out", V, self.DEBVER)
+            self.assertEqual(victim.read_text(), "keep")
+        with tempfile.TemporaryDirectory() as d:
+            elsewhere = Path(d) / "elsewhere"
+            elsewhere.mkdir()
+            (Path(d) / "tree").mkdir()
+            (Path(d) / "tree" / "ppa-build").symlink_to(elsewhere)
+            with self.assertRaises(RuntimeError):
+                N.collect(Path(d) / "tree" / "ppa-build", Path(d) / "out", V, self.DEBVER)
+
+    def test_the_key_is_exported_beside_the_build_never_into_it(self) -> None:
+        source = (ROOT / "scripts" / "ppa-nightly.py").read_text()
+        self.assertIn('export_key(args.work / "key")', source)
+        self.assertNotIn("changes.parent / \"signing-key.asc\"", source)
+
+
+class Upload(unittest.TestCase):
+    ACTION = N.Upload(V, 2, "its build failed at -0ppa1")
+
+    def test_a_failure_before_dput_records_nothing(self) -> None:
+        def push() -> None:
+            raise N.NotUploaded("the upload container failed before dput (exit 87)")
+        recorded, uploaded, message = N.attempt_upload({"published": "x"}, self.ACTION, NOW, push)
+        self.assertIsNone(recorded)
+        self.assertFalse(uploaded)
+        self.assertIn("nothing recorded", message)
+
+    def test_once_dput_ran_the_upload_is_pending_whatever_dput_said(self) -> None:
+        def fails() -> None:
+            raise subprocess.CalledProcessError(1, ["dput"])
+        for push, ok in ((fails, False), (lambda: None, True)):
+            recorded, uploaded, _ = N.attempt_upload({"published": "x"}, self.ACTION, NOW, push)
+            self.assertEqual(recorded["pending"], {"upstream": V, "pparev": 2, "uploaded_at": NOW})
+            self.assertEqual(uploaded, ok)
+
+    def test_the_upload_container_tells_setup_from_dput(self) -> None:
+        changes = Path("/x/irlume_1_source.changes")
+        for code, raised in ((N.BEFORE_DPUT, N.NotUploaded), (125, N.NotUploaded), (1, subprocess.CalledProcessError)):
+            failure = subprocess.CalledProcessError(code, ["docker"])
+            with mock.patch.object(N, "engine", return_value="/usr/bin/docker"), \
+                    mock.patch.object(N, "run", side_effect=failure):
+                with self.assertRaises(raised, msg=str(code)) as caught:
+                    N.upload(changes, Path("/k"))
+                if raised is subprocess.CalledProcessError:
+                    self.assertNotIsInstance(caught.exception, N.NotUploaded)
 
 
 if __name__ == "__main__":

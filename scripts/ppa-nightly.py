@@ -75,6 +75,8 @@ POLL_EVERY = 600
 
 HOME = Path.home()
 DEFAULT_CLONE = HOME / ".local" / "share" / "irlume-nightly" / "irlume"
+# A dry run of another repository or branch gets a clone of its own.
+DRY_RUN_CLONE = DEFAULT_CLONE.with_name("irlume-dry-run")
 DEFAULT_STATE = HOME / ".local" / "state" / "irlume-nightly" / "ppa.json"
 # On disk: a build needs a few GB, more than a tmpfs /tmp may have.
 DEFAULT_WORK = HOME / ".cache" / "irlume-nightly"
@@ -224,13 +226,19 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 
 def update_clone(clone: Path, url: str = REPO_URL, ref: str = "main") -> tuple[str, str, int]:
-    """Fetch `ref` and the tags; the commit, its describe and its commit time."""
+    """Fetch `ref` and exactly `url`'s tags; the commit, its describe and its
+    commit time. The tags come through an explicit refspec with --prune, so a
+    tag the repository does not have (one a dry run of another repository
+    left) is deleted before git describe can derive a version from it."""
     if not (clone / ".git").is_dir():
-        clone.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "--quiet", url, str(clone)])
-    run(["git", "-C", str(clone), "fetch", "--quiet", "--tags", "--force", url, ref])
+        clone.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "--quiet", str(clone)])
+    run([
+        "git", "-C", str(clone), "fetch", "--quiet", "--force", "--prune", "--no-tags", url,
+        f"+refs/heads/{ref}:refs/nightly/head", "+refs/tags/*:refs/tags/*",
+    ])
     git = lambda *args: run(["git", "-C", str(clone), *args], capture_output=True, text=True).stdout.strip()
-    commit = git("rev-parse", "FETCH_HEAD")
+    commit = git("rev-parse", "refs/nightly/head^{commit}")
     describe = git("describe", "--long", "--tags", "--match", "v[0-9]*", commit)
     when = int(git("log", "-1", "--format=%ct", commit))
     return commit, describe, when
@@ -273,29 +281,64 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
         uid, gid = own.split(":")
         env += ["-e", f"HOST_UID={uid}", "-e", f"HOST_GID={gid}"]
     run([engine(), "run", "--rm", "-v", f"{tree}:/work", *env, BASE, "bash", "/work/packaging/ppa/container-build.sh"])
-    changes = tree / "ppa-build" / f"irlume_{debian_version(upstream, pparev)}_source.changes"
-    if not changes.is_file():
-        raise RuntimeError(f"the build left no {changes.name}")
-    return changes
+    return collect(tree / "ppa-build", work / "out", upstream, debian_version(upstream, pparev))
 
 
-def sign(changes: Path) -> None:
+def artifacts(upstream: str, debver: str) -> list[str]:
+    """The files a source upload is made of, the .changes last."""
+    return [
+        f"irlume_{upstream}.orig.tar.gz",
+        f"irlume_{debver}.debian.tar.xz",
+        f"irlume_{debver}.dsc",
+        f"irlume_{debver}_source.buildinfo",
+        f"irlume_{debver}_source.changes",
+    ]
+
+
+def collect(built: Path, out: Path, upstream: str, debver: str) -> Path:
+    """Move the upload's files out of the tree the build container wrote into
+    `out`, a directory only this script writes, and return the .changes.
+    Code from main ran in that container, so the tree is not trusted: only
+    regular files under the expected names move (a symlink there could
+    otherwise point a later host write anywhere), and signing and the upload
+    work on `out` alone."""
+    if built.is_symlink() or not built.is_dir():
+        raise RuntimeError(f"the build left no {built.name} directory")
+    out.mkdir()
+    for name in artifacts(upstream, debver):
+        source = built / name
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeError(f"the build left no regular {name}")
+        source.rename(out / name)
+    return out / artifacts(upstream, debver)[-1]
+
+
+def export_key(directory: Path) -> Path:
+    """The public key, for the containers to check signatures with, in a
+    directory of its own that they get read-only."""
+    directory.mkdir()
+    public = directory / "signing-key.asc"
+    public.write_bytes(run(["gpg", "--export", "--armor", KEY], capture_output=True).stdout)
+    return directory
+
+
+def sign(changes: Path, key: Path) -> None:
     """debsign in a container that reaches the key only through gpg-agent's
     extra socket ("signing ... without exposing the private keys")."""
     socket = run(["gpgconf", "--list-dirs", "agent-extra-socket"], capture_output=True, text=True).stdout.strip()
-    public = changes.parent / "signing-key.asc"
-    public.write_bytes(run(["gpg", "--export", "--armor", KEY], capture_output=True).stdout)
     script = (
         "export DEBIAN_FRONTEND=noninteractive GNUPGHOME=/gnupg; "
         "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends devscripts gnupg >/dev/null; "
-        "chmod 700 /gnupg; gpg --batch --import /pkg/signing-key.asc 2>/dev/null; "
+        "chmod 700 /gnupg; gpg --batch --import /key/signing-key.asc 2>/dev/null; "
         f"debsign --no-re-sign -k{KEY} /pkg/{changes.name}"
     )
     if own := owner():
-        script += f"; chown {own} /pkg/*"
+        # Regular files only: chown follows a symlink.
+        script += f"; find /pkg -maxdepth 1 -type f -exec chown {own} {{}} +"
     run([
         engine(), "run", "--rm", "--network=host",
         "-v", f"{changes.parent}:/pkg",
+        "-v", f"{key}:/key:ro",
         "-v", f"{socket}:/gnupg/S.gpg-agent",
         BASE, "bash", "-euc", script,
     ])
@@ -303,15 +346,53 @@ def sign(changes: Path) -> None:
     run(["gpg", "--batch", "--verify", str(changes)], capture_output=True)
 
 
-def upload(changes: Path) -> None:
+# The upload container's exit when its own setup failed, before dput ran;
+# docker's own failures to start a container are 125 to 127.
+BEFORE_DPUT = 87
+
+
+class NotUploaded(RuntimeError):
+    """The upload failed before dput ran: nothing reached Launchpad."""
+
+
+def upload(changes: Path, key: Path) -> None:
+    """dput in a container. Raises NotUploaded when the container failed
+    before dput started, CalledProcessError when dput itself failed."""
     script = (
         "export DEBIAN_FRONTEND=noninteractive; "
-        "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends "
-        "dput-ng python3-distro-info gnupg ca-certificates >/dev/null; "
-        "gpg --batch --import /pkg/signing-key.asc 2>/dev/null; "
-        f"cd /pkg && dput ppa:{OWNER}/{PPA} {changes.name}"
+        "{ apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends "
+        "dput-ng python3-distro-info gnupg ca-certificates >/dev/null "
+        f"&& gpg --batch --import /key/signing-key.asc 2>/dev/null; }} || exit {BEFORE_DPUT}; "
+        f"cd /pkg && exec dput ppa:{OWNER}/{PPA} {changes.name}"
     )
-    run([engine(), "run", "--rm", "--network=host", "-v", f"{changes.parent}:/pkg", BASE, "bash", "-euc", script])
+    try:
+        run([
+            engine(), "run", "--rm", "--network=host",
+            "-v", f"{changes.parent}:/pkg", "-v", f"{key}:/key:ro",
+            BASE, "bash", "-euc", script,
+        ])
+    except subprocess.CalledProcessError as error:
+        if error.returncode in (BEFORE_DPUT, 125, 126, 127):
+            raise NotUploaded(f"the upload container failed before dput (exit {error.returncode})") from error
+        raise
+
+
+def attempt_upload(state: dict, action: Upload, now: float, push) -> tuple[dict | None, bool, str]:
+    """Run `push` (the upload) and say what to record: (the state to save,
+    or None for nothing; whether it uploaded; a log line). Once dput has run
+    the version is pending, whether dput succeeded or not: a connection lost
+    after the last byte fails dput while Launchpad accepts the upload, so the
+    source publication decides. A failure before dput records nothing."""
+    try:
+        push()
+    except NotUploaded as error:
+        return None, False, f"not uploaded ({error}); nothing recorded"
+    except (subprocess.CalledProcessError, RuntimeError) as error:
+        return after_upload(state, action, now), False, (
+            f"dput failed ({error}); recorded as uploaded, since Launchpad may have it, "
+            "so the next run reads its source publication instead of uploading it again"
+        )
+    return after_upload(state, action, now), True, "uploaded; waiting for Launchpad"
 
 
 # --- a run ---------------------------------------------------------------------
@@ -328,6 +409,9 @@ def main() -> int:
     args = parser.parse_args()
     if (args.repo_url != REPO_URL or args.ref != "main") and not args.no_upload:
         parser.error("--repo-url and --ref are for dry runs: only main is ever uploaded")
+    if (args.repo_url != REPO_URL or args.ref != "main") and args.clone == DEFAULT_CLONE:
+        # Another repository's refs never enter the clone the timer uploads from.
+        args.clone = DRY_RUN_CLONE
 
     commit, describe, when = update_clone(args.clone, args.repo_url, args.ref)
     upstream = nightly_version(describe)
@@ -355,7 +439,8 @@ def main() -> int:
     log(f"building {debver} to upload: {action.reason}")
     try:
         changes = build(args.clone, args.work, commit, when, action.upstream, action.pparev)
-        sign(changes)
+        key = export_key(args.work / "key")
+        sign(changes, key)
     except (subprocess.CalledProcessError, RuntimeError) as error:
         # Before dput: nothing reached Launchpad, so nothing is recorded.
         log(f"{debver} was not uploaded: {error}")
@@ -363,16 +448,13 @@ def main() -> int:
     if args.no_upload:
         log(f"built and signed {changes}; not uploaded (--no-upload)")
         return 0
-    state = after_upload(state, action, time.time())
-    try:
-        upload(changes)
-    except (subprocess.CalledProcessError, RuntimeError) as error:
+    recorded, uploaded, message = attempt_upload(state, action, time.time(), lambda: upload(changes, key))
+    if recorded is not None:
+        state = recorded
         save_state(args.state, state)
-        log(f"dput failed for {debver} ({error}); recorded as uploaded, since Launchpad may "
-            "have it, so the next run reads its source publication instead of uploading it again")
+    log(f"{debver}: {message}")
+    if not uploaded:
         return 1
-    save_state(args.state, state)
-    log(f"{debver} uploaded; waiting for Launchpad")
 
     deadline = time.time() + POLL_FOR
     while time.time() < deadline:

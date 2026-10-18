@@ -53,9 +53,18 @@ bash "$REPO/scripts/fetch-models.sh"
 SDE="$(git -C "$REPO" log -1 --format=%ct "$TAG")"
 
 WORK="$(mktemp -d)"
+# The container's build script is this checkout's, not the tag's: a tag made
+# before packaging/ppa/container-build.sh existed (v0.15.0 and older) has none,
+# and the build script it runs, scripts/build-ppa-source.sh, is still the
+# tag's. Outside $WORK, so it is not packed into the orig tarball.
+HELPER="$(mktemp -d)"
+cp "$REPO/packaging/ppa/container-build.sh" "$HELPER/"
 # Rootless podman writes into the mount as a mapped subuid; clean via unshare so
 # leftovers from a prior run can't poison this one, and reclaim ownership after.
-cleanup() { podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null || true; }
+cleanup() {
+  podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null || true
+  rm -rf "$HELPER"
+}
 # docker runs the build as root in the mount: hand the files back at the end.
 OWNER_ENV=()
 case "$(basename "$ENGINE")" in
@@ -69,10 +78,10 @@ cp "$REPO"/models/*.onnx "$WORK/models/"
 
 echo "==> building PPA source in $BASE (SERIES=$SERIES, SOURCE_DATE_EPOCH=$SDE)"
 "$ENGINE" run --rm \
-  -v "$WORK:/work:z" \
+  -v "$WORK:/work:z" -v "$HELPER:/helper:ro,z" \
   -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" -e "PPAREV=${PPAREV:-0ppa1}" \
   "${OWNER_ENV[@]}" \
-  "$BASE" bash /work/packaging/ppa/container-build.sh
+  "$BASE" bash /helper/container-build.sh
 
 # Reclaim the subuid-owned artifacts to the host user (rootless podman),
 # then copy them out.

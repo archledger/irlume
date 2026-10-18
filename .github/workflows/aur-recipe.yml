@@ -1,0 +1,33 @@
+# AUR recipe drift (ADR-0037 section 3)
+#
+# An AUR helper builds the nightly channel's irlume-git from the AUR's own
+# copy of the recipe, which only the maintainer's AUR key can update. Daily,
+# compare that copy with main's packaging/arch-git/ and fail when they differ
+# or the AUR does not serve the package; ci-alert.yml turns a failing
+# scheduled workflow into a ci-alert issue. Logic and tests:
+# scripts/check-aur-recipe.py and scripts/test-check-aur-recipe.py (run in
+# ci.yml). No secrets beyond the default read token.
+name: AUR recipe drift
+
+on:
+  schedule:
+    - cron: "40 7 * * *" # daily, before ci-alert.yml's 09:15 UTC run
+  workflow_dispatch:
+
+concurrency:
+  group: aur-recipe
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare the AUR's irlume-git with packaging/arch-git
+        run: python3 -B scripts/check-aur-recipe.py

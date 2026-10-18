@@ -12,7 +12,7 @@ body:
     id: version
     attributes:
       label: irlume version and install channel
-      description: "`irlume version`, plus how you installed (Copr, PPA, .deb, AUR, Nix, source)"
+      description: "`irlume version`, plus how you installed (Copr, PPA, .deb, AUR, Nix, source, or a nightly lane: Copr irlume-nightly, AUR irlume-git); `irlume doctor`'s install-origin line names it"
       placeholder: "0.15.0, Fedora Copr"
     validations:
       required: true

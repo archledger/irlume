@@ -70,6 +70,16 @@ These checks do not launch the TUI or prove desktop-session compatibility.
   and also serves local source builds (`makepkg -si`). Depends on `onnxruntime`
   (system pkg is current), `tpm2-tss`, `pam`; PAM to `/usr/lib/security`.
   Update path: `yay -Syu` / `paru -Syu`, driven by `irlume update`.
+- **Nightly** ([ADR-0037](../docs/adr/0037-nightly-channel.md)): builds of
+  `main`, beside the release lanes and never in their place. Fedora: the
+  Copr project `archledger/irlume-nightly`, built by the `.packit.yaml`
+  commit job on every push to `main`. Arch: the AUR's `irlume-git` and
+  `irlume-kcm-git`, whose recipe `arch-git/PKGBUILD` and its `.SRCINFO`
+  (made by `makepkg --printsrcinfo` in a pinned Arch container) are generated
+  from `arch/PKGBUILD` by `scripts/arch-git-pkgbuild.py` (CI fails when the
+  committed copy is stale); the maintainer pushes it to the AUR, and the
+  daily `aur-recipe.yml` fails, raising a `ci-alert` issue, when the AUR's
+  copy differs from `main`'s.
 - **Ubuntu** ([`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume)):
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled

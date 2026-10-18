@@ -13,6 +13,7 @@ branch; security fixes land on `main` and ship in the next release.
 | Version | Supported |
 |---|---|
 | `main` / latest release | ✅ |
+| the [nightly channel](docs/PLATFORMS.md#nightly-channel) (builds of `main`) | ✅ |
 | older pre-1.0 tags | ❌ |
 
 ## Component risk tiers

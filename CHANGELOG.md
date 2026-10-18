@@ -633,6 +633,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- On Arch, removing only `irlume-kcm` no longer stops irlumed. The
+  recipe set its install script (and `backup`, `optdepends`) before the
+  package functions, so the KCM package carried irlume's hooks too, and
+  `pacman -R irlume-kcm` ran `pre_remove`, which disables and stops
+  `irlumed.socket`, `irlumed.service` and the reconcile units while irlume
+  stays installed. They are now `irlume`'s alone, as on the other lanes,
+  and the AUR's `irlume-git` recipe follows (ADR-0037).
+
 - `irlume uninstall` on Arch removes `irlume-kcm` in the same pacman
   transaction as `irlume` when it is installed: pacman refuses to remove
   `irlume` alone while `irlume-kcm`, which depends on it, stays. It removes

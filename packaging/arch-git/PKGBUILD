@@ -15,8 +15,6 @@ license=('GPL-3.0-or-later')
 # the user has satisfies it (no conflict); a fresh install prompts to pick one,
 # choose onnxruntime-cpu unless you want GPU execution providers.
 depends=('onnxruntime' 'tpm2-tss' 'pam' 'polkit' 'dbus')
-optdepends=('fprintd: fingerprint companion factor')
-backup=('etc/pam.d/irlume-retry-reset')
 # clang: v4l2-sys-mit generates its V4L2 bindings with bindgen, which needs
 # libclang at build time; without it makepkg fails on a clean system.
 makedepends=('git' 'rust' 'cargo' 'gcc' 'clang' 'cmake' 'extra-cmake-modules' 'qt6-base' 'qt6-declarative' 'kcmutils' 'kcoreaddons' 'kio')
@@ -49,7 +47,6 @@ sha256sums=('SKIP'
             'c7f8a6f3054b11f9719f5e24d37ec227721608fff8b90373c6c3e7659864161c'
             'df80cea7228b92562692e56aac965d35766c77399159798c552fb3c77b410c72'
             'dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311')
-install=irlume.install
 
 # The last release tag, the commits since it and the commit, as the Arch VCS
 # package guidelines spell it: v0.15.0-139-g3c162b83 -> 0.15.0.r139.g3c162b83,
@@ -81,6 +78,12 @@ build() {
 package_irlume-git() {
     provides=("irlume=${pkgver}")
     conflicts=('irlume')
+    optdepends=('fprintd: fingerprint companion factor')
+    backup=('etc/pam.d/irlume-retry-reset')
+    # irlume's alone: set globally, the KCM package carried the hooks too, and
+    # removing only irlume-kcm ran pre_remove, which stops and disables
+    # irlumed while irlume stays installed.
+    install=irlume.install
     cd "$srcdir/irlume"
     install -Dm0755 target/release/irlumed "$pkgdir/usr/bin/irlumed"
     install -Dm0755 target/release/irlume  "$pkgdir/usr/bin/irlume"

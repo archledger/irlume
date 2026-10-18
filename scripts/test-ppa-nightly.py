@@ -242,6 +242,73 @@ class Collect(unittest.TestCase):
         self.assertNotIn("changes.parent / \"signing-key.asc\"", source)
 
 
+class DryRun(unittest.TestCase):
+    def run_main(self, state: dict) -> tuple[dict, list[str]]:
+        """main() with --no-upload over `state`: the state file afterwards, and
+        which of build, sign and upload ran."""
+        ran: list[str] = []
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ppa.json"
+            N.save_state(path, state)
+            changes = Path(d) / "out" / "x_source.changes"
+            argv = ["ppa-nightly.py", "--no-upload", "--state", str(path), "--clone", d, "--work", d]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(N, "update_clone", return_value=("c" * 40, "v0.15.0-139-g3c162b83", 1)), \
+                    mock.patch.object(N, "launchpad", return_value=lp({N.debian_version(V, 1): "pending"})), \
+                    mock.patch.object(N, "build", side_effect=lambda *a: ran.append("build") or changes), \
+                    mock.patch.object(N, "export_key", return_value=Path(d)), \
+                    mock.patch.object(N, "sign", side_effect=lambda *a: ran.append("sign")), \
+                    mock.patch.object(N, "upload", side_effect=lambda *a: ran.append("upload")):
+                self.assertEqual(N.main(), 0)
+            return N.load_state(path), ran
+
+    def test_a_dry_run_builds_and_signs_whatever_the_state_says(self) -> None:
+        # Caught up, pending or empty: the check still builds, never uploads,
+        # and records nothing.
+        for state in (
+            {"published": V},
+            {"pending": {"upstream": V, "pparev": 1, "uploaded_at": NOW}},
+            {},
+        ):
+            after, ran = self.run_main(state)
+            self.assertEqual(ran, ["build", "sign"], state)
+            self.assertEqual(after, state)
+
+    def test_what_the_timer_would_do_is_a_sentence(self) -> None:
+        self.assertEqual(N.what(N.Upload(V, 2, "its build failed at -0ppa1")),
+                         f"upload {V}-0ppa2~resolute1 (its build failed at -0ppa1)")
+        self.assertEqual(N.what(N.Published(V)), f"record {V} as published")
+        self.assertEqual(N.what(N.Nothing("x")), "x")
+
+
+class Mounts(unittest.TestCase):
+    def argv(self, call) -> list[str]:
+        calls: list[list[str]] = []
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(stdout="/run/user/1000/gnupg/S.gpg-agent.extra" if "gpgconf" in cmd else b"")
+
+        with mock.patch.object(N, "run", side_effect=fake), \
+                mock.patch.object(N, "engine", return_value="/usr/bin/podman"):
+            call()
+        return next(c for c in calls if c[1:2] == ["run"])
+
+    def test_an_selinux_host_lets_the_containers_read_their_mounts(self) -> None:
+        # Podman changes no label by default; the release wrapper uses :z.
+        out, key = Path("/w/out"), Path("/w/key")
+        changes = out / "irlume_1_source.changes"
+        upload = self.argv(lambda: N.upload(changes, key))
+        self.assertIn(f"{out}:/pkg:z", upload)
+        self.assertIn(f"{key}:/key:ro,z", upload)
+        # Signing disables label separation instead: :z would relabel the
+        # user's own gpg-agent socket.
+        sign = self.argv(lambda: N.sign(changes, key))
+        self.assertIn("label=disable", sign)
+        self.assertIn("/run/user/1000/gnupg/S.gpg-agent.extra:/gnupg/S.gpg-agent", sign)
+        self.assertIn('f"{tree}:/work:z"', (ROOT / "scripts" / "ppa-nightly.py").read_text())
+
+
 class Upload(unittest.TestCase):
     ACTION = N.Upload(V, 2, "its build failed at -0ppa1")
 

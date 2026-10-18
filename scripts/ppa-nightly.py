@@ -158,6 +158,15 @@ def decide(state: dict, upstream: str, now: float, status) -> object:
     return Upload(upstream, 1, "main moved")
 
 
+def what(action: object) -> str:
+    """A decision as a log line."""
+    if isinstance(action, Upload):
+        return f"upload {debian_version(action.upstream, action.pparev)} ({action.reason})"
+    if isinstance(action, Published):
+        return f"record {action.upstream} as published"
+    return action.reason
+
+
 def retry(upstream: str, rev: int, why: str) -> object:
     if rev >= MAX_PPAREV:
         return Wait(f"{upstream}: {why} at -0ppa{rev}; waiting for main to move")
@@ -281,7 +290,9 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
     if own := owner():
         uid, gid = own.split(":")
         env += ["-e", f"HOST_UID={uid}", "-e", f"HOST_GID={gid}"]
-    run([engine(), "run", "--rm", "-v", f"{tree}:/work", *env, BASE, "bash", "/work/packaging/ppa/container-build.sh"])
+    # :z relabels the mounts for an SELinux host's container policy (Podman
+    # changes no label otherwise), as build-ppa-container.sh does.
+    run([engine(), "run", "--rm", "-v", f"{tree}:/work:z", *env, BASE, "bash", "/work/packaging/ppa/container-build.sh"])
     return collect(tree / "ppa-build", work / "out", upstream, debian_version(upstream, pparev))
 
 
@@ -336,8 +347,10 @@ def sign(changes: Path, key: Path) -> None:
     if own := owner():
         # Regular files only: chown follows a symlink.
         script += f"; find /pkg -maxdepth 1 -type f -exec chown {own} {{}} +"
+    # Label separation off rather than :z: relabeling would change the
+    # label of the user's own gpg-agent socket.
     run([
-        engine(), "run", "--rm", "--network=host",
+        engine(), "run", "--rm", "--network=host", "--security-opt", "label=disable",
         "-v", f"{changes.parent}:/pkg",
         "-v", f"{key}:/key:ro",
         "-v", f"{socket}:/gnupg/S.gpg-agent",
@@ -369,7 +382,7 @@ def upload(changes: Path, key: Path) -> None:
     try:
         run([
             engine(), "run", "--rm", "--network=host",
-            "-v", f"{changes.parent}:/pkg", "-v", f"{key}:/key:ro",
+            "-v", f"{changes.parent}:/pkg:z", "-v", f"{key}:/key:ro,z",
             BASE, "bash", "-euc", script,
         ])
     except subprocess.CalledProcessError as error:
@@ -421,7 +434,13 @@ def main() -> int:
     state = load_state(args.state)
     action = decide(state, upstream, time.time(), status)
 
-    if isinstance(action, (Nothing, Wait)):
+    if args.no_upload:
+        # A dry run builds and signs whatever the state says, and records
+        # nothing; it reports what the timer would do.
+        log(f"the timer would: {what(action)}")
+        pparev = action.pparev if isinstance(action, Upload) else 1
+        action = Upload(upstream, pparev, "a dry run (--no-upload)")
+    elif isinstance(action, (Nothing, Wait)):
         log(action.reason)
         return 0
     if isinstance(action, Published):

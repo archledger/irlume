@@ -156,6 +156,11 @@ class Agreement(unittest.TestCase):
                     mock.patch.object(N, "run", return_value=mock.Mock(stdout=version + "\n")):
                 self.assertEqual(N.owner(), expected, (path, version))
 
+    def test_the_release_wrapper_asks_the_runtime_too(self) -> None:
+        release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
+        self.assertIn('case "$("$ENGINE" --version 2>/dev/null)" in', release)
+        self.assertNotIn('case "$(basename "$ENGINE")"', release)
+
     def test_the_build_runs_the_release_containers_script(self) -> None:
         release = (ROOT / "packaging" / "ppa" / "build-ppa-container.sh").read_text()
         # A release runs its checkout's copy, which tags older than the
@@ -284,6 +289,17 @@ class DryRun(unittest.TestCase):
             after, ran = self.run_main(state)
             self.assertEqual(ran, ["build", "sign"], state)
             self.assertEqual(after, state)
+
+    def test_a_dry_run_builds_when_launchpad_cannot_be_read(self) -> None:
+        # A pending record makes the timer's decision ask Launchpad; the
+        # verifier exits when it cannot, and the dry run builds anyway.
+        def unreachable(debver: str) -> str:
+            raise SystemExit(2)
+        state = {"pending": {"upstream": V, "pparev": 1, "uploaded_at": NOW}}
+        with mock.patch.object(N, "log") as log:
+            action = N.dry_run(state, V, unreachable)
+        self.assertEqual((action.upstream, action.pparev), (V, 1))
+        self.assertIn("could not be read", log.call_args.args[0])
 
     def test_one_run_at_a_time(self) -> None:
         # A dry run beside the timer would delete its work directory.

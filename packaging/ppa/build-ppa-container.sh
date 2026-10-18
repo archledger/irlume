@@ -66,9 +66,13 @@ cleanup() {
   rm -rf "$HELPER"
 }
 # docker runs the build as root in the mount: hand the files back at the end.
+# Rootless podman's root already is this user (a chown to this uid would map
+# to a subuid). The runtime is asked what it is: podman-docker installs a
+# `docker` command that runs podman.
 OWNER_ENV=()
-case "$(basename "$ENGINE")" in
-  docker) OWNER_ENV=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)") ;;
+case "$("$ENGINE" --version 2>/dev/null)" in
+  *[Pp]odman*) ;;
+  *) OWNER_ENV=(-e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)") ;;
 esac
 trap cleanup EXIT
 

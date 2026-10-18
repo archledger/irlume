@@ -162,6 +162,22 @@ def decide(state: dict, upstream: str, now: float, status) -> object:
     return Upload(upstream, 1, "main moved")
 
 
+def dry_run(state: dict, upstream: str, status) -> Upload:
+    """A dry run builds and signs whatever the state says, and records
+    nothing. It reports what the timer would do, which can need Launchpad:
+    when Launchpad cannot be read (verify-ppa-publish.py exits), the dry run
+    says so and builds anyway."""
+    try:
+        decided = decide(state, upstream, time.time(), status)
+    except SystemExit:
+        log("the timer's decision needs Launchpad, which could not be read")
+        decided = None
+    else:
+        log(f"the timer would: {what(decided)}")
+    pparev = decided.pparev if isinstance(decided, Upload) else 1
+    return Upload(upstream, pparev, "a dry run (--no-upload)")
+
+
 def what(action: object) -> str:
     """A decision as a log line."""
     if isinstance(action, Upload):
@@ -464,15 +480,11 @@ def main() -> int:
     log(f"main is {commit[:12]} ({describe}), nightly version {upstream}")
     status = launchpad(Path(__file__).resolve().parent)
     state = load_state(args.state)
-    action = decide(state, upstream, time.time(), status)
-
     if args.no_upload:
-        # A dry run builds and signs whatever the state says, and records
-        # nothing; it reports what the timer would do.
-        log(f"the timer would: {what(action)}")
-        pparev = action.pparev if isinstance(action, Upload) else 1
-        action = Upload(upstream, pparev, "a dry run (--no-upload)")
-    elif isinstance(action, (Nothing, Wait)):
+        action = dry_run(state, upstream, status)
+    else:
+        action = decide(state, upstream, time.time(), status)
+    if isinstance(action, (Nothing, Wait)):
         log(action.reason)
         return 0
     if isinstance(action, Published):

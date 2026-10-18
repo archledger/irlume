@@ -234,7 +234,8 @@ def update_clone(clone: Path, url: str = REPO_URL, ref: str = "main") -> tuple[s
         clone.mkdir(parents=True, exist_ok=True)
         run(["git", "init", "--quiet", str(clone)])
     run([
-        "git", "-C", str(clone), "fetch", "--quiet", "--force", "--prune", "--no-tags", url,
+        # --update-shallow: a dry run's local checkout may itself be shallow.
+        "git", "-C", str(clone), "fetch", "--quiet", "--force", "--prune", "--no-tags", "--update-shallow", url,
         f"+refs/heads/{ref}:refs/nightly/head", "+refs/tags/*:refs/tags/*",
     ])
     git = lambda *args: run(["git", "-C", str(clone), *args], capture_output=True, text=True).stdout.strip()

@@ -181,7 +181,8 @@ class Clone(unittest.TestCase):
             git("-C", str(official), "commit", "--quiet", "--allow-empty", "-m", "one")
             git("-C", str(official), "tag", "v0.15.0")
             git("-C", str(official), "commit", "--quiet", "--allow-empty", "-m", "two")
-            git("clone", "--quiet", str(official), str(fork))
+            # Shallow, as a dry run's local checkout can be.
+            git("clone", "--quiet", "--depth", "2", f"file://{official}", str(fork))
             git("-C", str(fork), "tag", "-a", "-m", "not ours", "v999.0.0", "HEAD")
             _, describe, _ = N.update_clone(clone, str(fork), "main")
             self.assertTrue(describe.startswith("v999.0.0-0-g"), describe)

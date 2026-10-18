@@ -74,7 +74,8 @@ updates:
     # MSRV reaches the version named; the daily cargo-deny job still reports
     # an advisory against a held version.
     ignore:
-      # aes 0.9.3 enables the VAES backends by default and needs Rust 1.89.
+      # aes 0.9.3 enables the VAES backends by default and needs Rust 1.89;
+      # the workspace Cargo.toml caps it too, so a fresh resolve stays on 0.9.2.
       - dependency-name: "aes"
         versions: [">= 0.9.3"]
     commit-message:

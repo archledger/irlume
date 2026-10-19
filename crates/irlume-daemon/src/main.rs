@@ -2754,6 +2754,36 @@ struct FaceCompletion {
     attempt: retry_throttle::FaceAttempt,
     window: irlume_auth::AuthenticationWindow,
     shared_unlock: Option<std::sync::Arc<shared_unlock::Binding>>,
+    /// How a grant the final admission check withholds is journaled, by the
+    /// rule of the request's own decision line; `None` where that decision is
+    /// not journaled (a secure-tier Authenticate without tracing).
+    withheld_line: Option<WithheldLine>,
+}
+
+/// The line for a grant the connection thread's last admission check
+/// withheld: the request's prefix and whether it journals at notice level.
+struct WithheldLine {
+    prefix: String,
+    notice: bool,
+}
+
+impl WithheldLine {
+    fn text(&self, error: &std::io::Error) -> String {
+        format!(
+            "{}grant not delivered ({})",
+            self.prefix,
+            journal_prose(&error.to_string())
+        )
+    }
+
+    fn journal(&self, error: &std::io::Error) {
+        let text = self.text(error);
+        if self.notice {
+            jout_notice!("{text}");
+        } else {
+            jout_info!("{text}");
+        }
+    }
 }
 
 struct WorkerReply {
@@ -2959,6 +2989,11 @@ impl WorkerReply {
             }
             completion.window.check().map_err(expired)
         });
+        // A grant withheld here was already journaled as granted, where its
+        // request journals decisions: say it did not reach the client.
+        if let (Err(error), Some(line)) = (&result, &completion.withheld_line) {
+            line.journal(error);
+        }
         if result.is_ok() && completion.attempt.delivered().is_err() {
             // The admitted response cannot be retracted. Disk stays authoritative;
             // retain conservative accounting and never send a second response.
@@ -9341,7 +9376,7 @@ fn request_failure_line(label: &str, account: Option<&str>, response: &Response)
         {
             return None;
         }
-        Response::Error(message) => irlume_common::single_line(message, 240),
+        Response::Error(message) => journal_prose(message),
         // A probe that caught its capture failure answers with a result, not
         // an error; its categorical fields say what failed, no measurement.
         Response::SupportProbe(result)
@@ -9406,13 +9441,42 @@ impl FailureLineLimiter {
     }
 }
 
+/// Handler or engine prose for one of the request-failure, no-decision,
+/// identification or withdrawn-grant journal lines. Numbers are stripped
+/// unless tracing is on, as for a deny reason ([`deny_reason`]): a failure can
+/// quote a match score (an added scan that belongs to another profile).
+/// Invisible Unicode formatting (bidi overrides and isolates, zero-width
+/// marks, the set `camera_text` removes from device text) is dropped, and the
+/// rest is put on one line of at most 240 characters ([`single_line`]), so a
+/// name the peer chose cannot reorder, hide or split the line.
+///
+/// [`single_line`]: irlume_common::single_line
+fn journal_prose(text: &str) -> String {
+    let visible: String = deny_reason(text)
+        .chars()
+        .filter(|&c| !is_invisible_format(c))
+        .collect();
+    irlume_common::single_line(&visible, 240)
+}
+
+/// Unicode format characters that change how a line renders without being
+/// seen: the Arabic letter mark, zero-width marks and joiners, bidi embeddings,
+/// overrides and isolates, and the byte-order mark. The same set as
+/// irlume-camera's device-text sanitizer.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
 /// The journal line for an identification that failed before a decision:
 /// the request and the engine's error, on one line. An identification
 /// journals no decision, so this carries no account, score or match.
 fn identify_failure_line(label: &str, error: &irlume_common::Error) -> String {
     format!(
         "irlumed: {label} failed: {}",
-        irlume_common::single_line(&error.to_string(), 240)
+        journal_prose(&error.to_string())
     )
 }
 
@@ -9429,7 +9493,7 @@ fn journals_face_decisions(convenience: bool) -> bool {
 fn no_decision_line(user: &str, error: &irlume_common::Error) -> String {
     format!(
         "irlumed: face auth '{user}': no decision: {}",
-        irlume_common::single_line(&error.to_string(), 240)
+        journal_prose(&error.to_string())
     )
 }
 
@@ -9514,6 +9578,10 @@ fn verify_reply(
                     attempt: retry_attempt,
                     window,
                     shared_unlock: shared_unlock.clone(),
+                    withheld_line: journals_face_decisions(convenience).then(|| WithheldLine {
+                        prefix: format!("irlumed: face auth '{user}': "),
+                        notice: false,
+                    }),
                 });
                 Ok(())
             } else {
@@ -9524,10 +9592,7 @@ fn verify_reply(
         |error| authentication_error(error, structured_errors),
         |why| {
             if journals_face_decisions(convenience) {
-                jout_info!(
-                    "irlumed: face auth '{user}': {}",
-                    irlume_common::single_line(why, 240)
-                );
+                jout_info!("irlumed: face auth '{user}': {}", journal_prose(why));
             }
         },
     )
@@ -12061,6 +12126,10 @@ fn unseal_reply(
                     attempt: retry_attempt,
                     window,
                     shared_unlock: None,
+                    withheld_line: Some(WithheldLine {
+                        prefix: format!("irlumed: UnsealPassword: '{user}': "),
+                        notice: true,
+                    }),
                 });
                 Ok(())
             } else {
@@ -12075,10 +12144,7 @@ fn unseal_reply(
             Response::Error(error.to_string())
         },
         |why| {
-            jout_notice!(
-                "irlumed: UnsealPassword: '{user}': {}",
-                irlume_common::single_line(why, 240)
-            );
+            jout_notice!("irlumed: UnsealPassword: '{user}': {}", journal_prose(why));
         },
     )
 }
@@ -14879,6 +14945,44 @@ mod tests {
         ] {
             assert_eq!(request_failure_line("Enroll", None, &routine), None);
         }
+    }
+
+    /// Generic failure prose loses its measurements unless tracing is on: an
+    /// added scan that belongs to another profile quotes the match score
+    /// (review on #1135). Invisible formatting is dropped as well.
+    #[test]
+    fn journal_prose_strips_scores_and_invisible_formatting() {
+        if !irlume_common::dbglog::on() {
+            assert_eq!(
+                journal_prose("the scanned face belongs to 'other' (match 0.73)"),
+                "the scanned face belongs to 'other' (match …)"
+            );
+        }
+        assert_eq!(
+            journal_prose("no profile 'a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}'"),
+            "no profile 'abcd'"
+        );
+        assert_eq!(
+            journal_prose("x\u{2028}y\u{85}z\nirlumed: forged"),
+            "x y z irlumed: forged"
+        );
+    }
+
+    /// A grant the last admission check withheld says so with its request's
+    /// prefix (review on #1135).
+    #[test]
+    fn a_withheld_grant_names_why_it_was_not_delivered() {
+        let line = WithheldLine {
+            prefix: "irlumed: UnsealPassword: 'alice': ".into(),
+            notice: true,
+        };
+        assert_eq!(
+            line.text(&std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "authentication window expired"
+            )),
+            "irlumed: UnsealPassword: 'alice': grant not delivered (authentication window expired)"
+        );
     }
 
     /// A failed identification names the request and the error only: an

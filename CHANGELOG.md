@@ -412,9 +412,11 @@ All notable changes to irlume are documented here. This project adheres to
   checked it, and comes at most once a minute per request, peer and
   account, with repeats in the debug log. The face requests and `UnsealKeyring` keep
   their own lines, refusals answered before a request reaches the worker
-  are not journaled, and every line's text is put on one line, with
-  control characters and Unicode line separators removed. A support probe
-  that caught its capture failure is a failed request too.
+  are not journaled. Every line's prose loses its numbers unless tracing is
+  on, as a deny reason does (a failure can quote a match score), drops
+  invisible Unicode formatting and is put on one line. A support probe that
+  caught its capture failure is a failed request too, and a grant the last
+  admission check withholds says it was not delivered.
 
 - `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
   strictly (#1081). It now judges these cases:

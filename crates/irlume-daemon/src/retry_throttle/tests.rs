@@ -475,6 +475,7 @@ mod cumulative {
                 attempt: start_attempt(f).unwrap().unwrap(),
                 window: irlume_auth::AuthenticationWindow::for_service(None),
                 shared_unlock: None,
+                withheld_line: None,
             }),
             filing: None,
         }

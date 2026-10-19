@@ -179,6 +179,51 @@ disable NPU use; an unreadable settings file or an empty, unknown or non-UTF-8
 switch value disables it too. Recognized on values leave admission and
 certification to decide. They cannot enable native loading.
 
+## AppArmor provider paths
+
+The daemon profiles grant read and executable-map access to OpenVINO and Level
+Zero libraries in the six automatic search directories above, including their
+versioned `openvino-*/` plugin directories. Cache writes and locks are limited
+to `/var/cache/irlume/npu/`; accelerator discovery and firmware reads are
+read-only, while the accelerator device node needs read and write access.
+These rules prepare confinement for a future admitted runtime. They do not
+establish loading admission, model certification or enforcing hardware coverage.
+
+For an administrator-selected installation outside those directories, both
+executable-path profiles include the optional
+`/etc/apparmor.d/local/irlumed-npu` file. Keep this file root-owned without
+group/other writes, and grant only the installation paths that need access.
+For the `/opt/my-openvino/runtime/lib/intel64/` selection above, the following
+rules cover the ancestor metadata checks and the C API file read before the
+closed loading-admission gate:
+
+```text
+/opt/ r,
+/opt/my-openvino/ r,
+/opt/my-openvino/runtime/ r,
+/opt/my-openvino/runtime/lib/ r,
+/opt/my-openvino/runtime/lib/intel64/ r,
+/opt/my-openvino/runtime/lib/intel64/libopenvino_c.so.2621 r,
+/opt/my-openvino/runtime/lib/intel64/libopenvino_c.so.2026.2.1 r,
+```
+
+Adjust the file rules for the selected alias and its actual canonical target,
+and add every ancestor if a symlink leads outside this prefix. Selecting a file
+does not add AppArmor permission. Avoid a blanket `/opt/** mr,` or rules for
+user-writable libraries. A future admitted layout also needs read and map rules
+for its actual core, plugins, frontends, compiler, Level Zero and other native
+dependencies; the C API example above covers only the current pre-load gate.
+
+Parse the installed executable-path profile with
+`apparmor_parser -QK /etc/apparmor.d/usr.bin.irlumed` (or
+`usr.local.bin.irlumed` for a source installation), then reload that profile
+with `apparmor_parser -r` and restart the daemon after a provider change.
+Validate under enforce: the documented selection must reach the closed
+loading-admission refusal, doctor must report CPU with unknown runtime
+observation, and its audit interval must have no related AppArmor denial.
+An admitted runtime additionally needs actual NPU identity, cache and marker
+coverage under enforce before it is qualified.
+
 ## Loading admission remains future work
 
 A loading profile must establish the launch environment, effective native
@@ -190,8 +235,8 @@ C API file and post-load content checks do not establish that contract.
 The current gate refuses before `dlopen`, binding loading or device
 enumeration. Opening it requires a separately reviewed implementation and
 installation/launch conformance evidence. Enforcing AppArmor validation and
-any required profile rules remain future work; selecting a file supplies
-neither loading admission nor AppArmor enforcement evidence.
+any additional layout-specific profile rules remain future work; selecting a
+file supplies neither loading admission nor AppArmor enforcement evidence.
 
 ## Exact identity and portable qualification
 

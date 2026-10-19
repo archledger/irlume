@@ -1911,7 +1911,7 @@ fn main() {
                             delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
                             // Kept before the request moves into dispatch: a
                             // reply that ends in an error gets one journal line.
-                            let failure_note = RequestFailureNote::for_request(&req);
+                            let failure_note = RequestFailureNote::for_request(&req, peer.uid);
                             let capture_mode_before = capture_mode_changes();
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
@@ -9251,9 +9251,11 @@ fn request_label(req: &Request) -> &'static str {
 }
 
 /// What the worker keeps of a request to journal it if it ends in an error:
-/// its label and the account it names, when that name is valid.
+/// its label, the peer that sent it, and the account it names when the
+/// request's privilege checked that name.
 struct RequestFailureNote {
     label: &'static str,
+    peer_uid: u32,
     account: Option<String>,
 }
 
@@ -9264,7 +9266,7 @@ impl RequestFailureNote {
     /// decision or its error under [`journals_face_decisions`]), and
     /// `UnsealKeyring`, whose "no sealed password" is the routine answer to
     /// an unarmed account's fingerprint login.
-    fn for_request(req: &Request) -> Option<Self> {
+    fn for_request(req: &Request, peer_uid: u32) -> Option<Self> {
         if matches!(
             req,
             Request::Authenticate { .. }
@@ -9275,11 +9277,18 @@ impl RequestFailureNote {
         ) {
             return None;
         }
+        let posture = posture(req);
+        // Only a name the pregate checked against the peer (root, or the
+        // account itself) is the request's account. An `AnyPeer` request's
+        // name is a hint any local user can set (`PositionSample`'s pitch
+        // band), so a line never attributes a failure to it.
+        let checked = !matches!(posture.privilege, Privilege::AnyPeer);
         Some(Self {
             label: request_label(req),
-            account: posture(req)
+            peer_uid,
+            account: posture
                 .user
-                .filter(|user| valid_username(user))
+                .filter(|user| checked && valid_username(user))
                 .map(str::to_owned),
         })
     }
@@ -9298,7 +9307,7 @@ impl RequestFailureNote {
         let Some(line) = request_failure_line(self.label, self.account.as_deref(), response) else {
             return FailureJournal::NotAFailure;
         };
-        if limiter.admit(self.label, self.account.as_deref(), now) {
+        if limiter.admit(self.label, self.peer_uid, self.account.as_deref(), now) {
             jout_notice!("{line}");
             FailureJournal::Journaled
         } else {
@@ -9366,13 +9375,14 @@ fn request_failure_line(label: &str, account: Option<&str>, response: &Response)
     Some(format!("irlumed: {label}{account} failed: {what}"))
 }
 
-/// One request-failure line per request label and account per minute. A
-/// client polling a failing request (the TUI's capture-mode status, the
-/// positioning loop) cannot flood the journal; the repeats go to the debug
-/// log. The map holds only keys seen within the last minute.
+/// One request-failure line per request label, peer and account per
+/// minute. A client polling a failing request (the TUI's capture-mode status,
+/// the positioning loop) cannot flood the journal, and one peer's repeats
+/// cannot silence another's; the repeats go to the debug log. The map holds
+/// only keys seen within the last minute.
 #[derive(Default)]
 struct FailureLineLimiter {
-    last: std::collections::HashMap<(&'static str, Option<String>), std::time::Instant>,
+    last: std::collections::HashMap<(&'static str, u32, Option<String>), std::time::Instant>,
 }
 
 impl FailureLineLimiter {
@@ -9381,12 +9391,13 @@ impl FailureLineLimiter {
     fn admit(
         &mut self,
         label: &'static str,
+        peer_uid: u32,
         account: Option<&str>,
         now: std::time::Instant,
     ) -> bool {
         self.last
             .retain(|_, at| now.saturating_duration_since(*at) < Self::WINDOW);
-        let key = (label, account.map(str::to_owned));
+        let key = (label, peer_uid, account.map(str::to_owned));
         if self.last.contains_key(&key) {
             return false;
         }
@@ -14726,31 +14737,43 @@ mod tests {
     }
 
     /// The face requests and `UnsealKeyring` keep their own outcome lines;
-    /// every other request is noted with the account it names, when valid.
+    /// every other request is noted with its peer and, when the request's
+    /// privilege checked it, the account it names (review on #1135: an
+    /// `AnyPeer` request's name is a hint any local user sets).
     #[test]
     fn a_failure_note_skips_requests_with_their_own_outcome_lines() {
         for (name, req) in named_samples(SAMPLE_USER) {
-            let note = RequestFailureNote::for_request(&req);
+            let note = RequestFailureNote::for_request(&req, 1000);
             let own = matches!(
                 name,
                 "Authenticate" | "UnsealPassword" | "UnsealKeyring" | "Identify" | "IdentifyFor"
             );
             assert_eq!(note.is_none(), own, "{name}");
             if let Some(note) = note {
+                let posture = posture(&req);
                 assert_eq!(note.label, name);
+                assert_eq!(note.peer_uid, 1000);
                 assert_eq!(
                     note.account.as_deref(),
-                    posture(&req).user,
-                    "{name} names its account when it names one"
+                    posture
+                        .user
+                        .filter(|_| !matches!(posture.privilege, Privilege::AnyPeer)),
+                    "{name} names its account only when its privilege checked it"
                 );
             }
         }
+        let hinted = Request::PositionSample {
+            user: Some("alice".into()),
+        };
+        assert!(matches!(posture(&hinted).privilege, Privilege::AnyPeer));
+        let note = RequestFailureNote::for_request(&hinted, 1000).unwrap();
+        assert_eq!(note.account, None, "a peer's hint never names an account");
         let invalid = Request::RenameProfile {
             user: "../etc\nirlumed: forged".into(),
             profile: "p".into(),
             new_name: "q".into(),
         };
-        let note = RequestFailureNote::for_request(&invalid).unwrap();
+        let note = RequestFailureNote::for_request(&invalid, 0).unwrap();
         assert_eq!(
             note.account, None,
             "an invalid account name is never journaled"
@@ -14876,26 +14899,35 @@ mod tests {
         assert!(!forged.contains('\n'), "{forged}");
     }
 
-    /// One line per request and account per minute; repeats are debug only,
-    /// and keys older than the window are dropped.
+    /// One line per request, peer and account per minute; repeats are debug
+    /// only, one peer cannot use up another's, and keys older than the window
+    /// are dropped.
     #[test]
     fn request_failure_lines_repeat_at_most_once_a_minute() {
         let start = std::time::Instant::now();
         let mut limiter = FailureLineLimiter::default();
-        assert!(limiter.admit("CaptureModeStatus", None, start));
+        assert!(limiter.admit("CaptureModeStatus", 0, None, start));
         assert!(!limiter.admit(
             "CaptureModeStatus",
+            0,
             None,
             start + std::time::Duration::from_secs(59)
         ));
-        assert!(limiter.admit("CaptureModeStatus", Some("alice"), start));
-        assert!(limiter.admit("PositionSample", None, start));
+        assert!(limiter.admit("CaptureModeStatus", 0, Some("alice"), start));
+        assert!(limiter.admit("CaptureModeStatus", 1000, None, start));
+        assert!(limiter.admit("PositionSample", 0, None, start));
         assert!(limiter.admit(
             "CaptureModeStatus",
+            0,
             None,
             start + std::time::Duration::from_secs(60)
         ));
-        limiter.admit("Enroll", None, start + std::time::Duration::from_secs(200));
+        limiter.admit(
+            "Enroll",
+            0,
+            None,
+            start + std::time::Duration::from_secs(200),
+        );
         assert_eq!(
             limiter.last.len(),
             1,
@@ -14909,11 +14941,14 @@ mod tests {
     /// is debug only.
     #[test]
     fn a_failed_request_gets_its_line_after_its_handlers_own() {
-        let note = RequestFailureNote::for_request(&Request::RenameProfile {
-            user: "alice".into(),
-            profile: "p".into(),
-            new_name: "q".into(),
-        })
+        let note = RequestFailureNote::for_request(
+            &Request::RenameProfile {
+                user: "alice".into(),
+                profile: "p".into(),
+                new_name: "q".into(),
+            },
+            0,
+        )
         .unwrap();
         let failed = Response::Error("profile 'q' already exists".into());
         let now = std::time::Instant::now();

@@ -408,8 +408,9 @@ All notable changes to irlume are documented here. This project adheres to
   profiles, camera groups, split pairs, `ir-setup`, self-tests,
   diagnostics, recovery, keyring sealing) ends with one notice line,
   `irlumed: <Request> for '<user>' failed: <error>`, also after a line its
-  handler wrote; at most once a minute per request and account, with
-  repeats in the debug log. The face requests and `UnsealKeyring` keep
+  handler wrote; it names the account only when the request's privilege
+  checked it, and comes at most once a minute per request, peer and
+  account, with repeats in the debug log. The face requests and `UnsealKeyring` keep
   their own lines, refusals answered before a request reaches the worker
   are not journaled, and every line's text is put on one line, with
   control characters and Unicode line separators removed. A support probe

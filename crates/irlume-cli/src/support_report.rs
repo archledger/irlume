@@ -151,11 +151,12 @@ pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
         crate::commands::InstallOrigin::ArchGit => InstallChannel::ArchGit,
         crate::commands::InstallOrigin::Source => InstallChannel::Source,
     };
-    // One os-release reading for the platform text and its check, from the
-    // reader that falls back to /usr/lib/os-release when /etc/os-release is
-    // absent; `distro_family()` reads /etc/os-release only.
+    // One reading of the system's os-release for the platform text and its
+    // check: /etc/os-release, then /usr/lib/os-release, where
+    // `distro_family()` reads /etc/os-release only. IRLUME_OS_RELEASE does
+    // not apply: the report describes the host.
     let (platform, platform_state) =
-        platform_facts(&crate::os_release::read_host().unwrap_or_default());
+        platform_facts(&crate::os_release::read_system().unwrap_or_default());
     let mut checks = vec![
         SupportCheck {
             id: CheckId::PlatformSupported,

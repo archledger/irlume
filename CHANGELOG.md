@@ -713,8 +713,8 @@ All notable changes to irlume are documented here. This project adheres to
   it was written to. It compared the family's display text,
   `other/unknown`, with `"other"`, which never matched, so every platform
   reported `pass`. The check and the report's `platform` text read the
-  host's os-release once, falling back to `/usr/lib/os-release` when
-  `/etc/os-release` is absent.
+  system's os-release once, falling back to `/usr/lib/os-release` when
+  `/etc/os-release` is absent; `IRLUME_OS_RELEASE` does not change them.
 
 - irlumed's background-requalification journal lines ("camera context
   changed since the last qualification", "background requalification

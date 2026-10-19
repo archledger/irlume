@@ -18,9 +18,20 @@ pub(crate) const OS_RELEASE_ENV: &str = "IRLUME_OS_RELEASE";
 pub(crate) fn read_host() -> std::io::Result<String> {
     match std::env::var_os(OS_RELEASE_ENV) {
         Some(path) => std::fs::read_to_string(path),
-        None => std::fs::read_to_string("/etc/os-release")
-            .or_else(|_| std::fs::read_to_string("/usr/lib/os-release")),
+        None => read_system(),
     }
+}
+
+/// The system's own os-release, `/etc/os-release` then
+/// `/usr/lib/os-release`, ignoring [`OS_RELEASE_ENV`]. The support report's
+/// `platform` facts describe the host a reader is shown, whatever the
+/// override says (docs/DEVELOPMENT.md).
+///
+/// # Errors
+/// Neither file can be read.
+pub(crate) fn read_system() -> std::io::Result<String> {
+    std::fs::read_to_string("/etc/os-release")
+        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
 }
 
 /// The value of `key` in os-release text. Values may be bare or quoted; as

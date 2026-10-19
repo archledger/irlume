@@ -113,6 +113,32 @@ pub(crate) fn parse_since(raw: Option<&str>) -> Result<Duration, &'static str> {
     Ok(Duration::from_millis(milliseconds))
 }
 
+/// The `platform_supported` state: a warning off the three supported
+/// distribution families and NixOS. Decided on the family itself: its display
+/// text is `other/unknown`, which the comparison with `"other"` this replaced
+/// never matched, so an unsupported platform reported `pass`. NixOS is its own
+/// supported platform, the flake's module (docs/NIXOS.md), although its family
+/// is `Other`.
+fn platform_check(family: &irlume_common::platform::DistroFamily, nixos: bool) -> CheckState {
+    match family {
+        irlume_common::platform::DistroFamily::Other if nixos => CheckState::Pass,
+        irlume_common::platform::DistroFamily::Other => CheckState::Warn,
+        irlume_common::platform::DistroFamily::Debian
+        | irlume_common::platform::DistroFamily::Fedora
+        | irlume_common::platform::DistroFamily::Arch => CheckState::Pass,
+    }
+}
+
+/// The report's `platform` text and its `platform_supported` state, both from
+/// one os-release text.
+fn platform_facts(os_release: &str) -> (&'static str, CheckState) {
+    let family = irlume_common::platform::distro_family_from(os_release);
+    (
+        family.as_str(),
+        platform_check(&family, crate::nixos::is_nixos(os_release)),
+    )
+}
+
 pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     let install_channel = match crate::commands::install_origin() {
         crate::commands::InstallOrigin::Copr => InstallChannel::FedoraCopr,
@@ -125,15 +151,16 @@ pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
         crate::commands::InstallOrigin::ArchGit => InstallChannel::ArchGit,
         crate::commands::InstallOrigin::Source => InstallChannel::Source,
     };
-    let platform = irlume_common::platform::distro_family().as_str();
+    // One reading of the system's os-release for the platform text and its
+    // check: /etc/os-release, then /usr/lib/os-release, where
+    // `distro_family()` reads /etc/os-release only. IRLUME_OS_RELEASE does
+    // not apply: the report describes the host.
+    let (platform, platform_state) =
+        platform_facts(&crate::os_release::read_system().unwrap_or_default());
     let mut checks = vec![
         SupportCheck {
             id: CheckId::PlatformSupported,
-            state: if platform == "other" {
-                CheckState::Warn
-            } else {
-                CheckState::Pass
-            },
+            state: platform_state,
         },
         SupportCheck {
             id: CheckId::InstallChannel,
@@ -939,6 +966,48 @@ mod tests {
         QualificationReason, QualificationState, RateShortfallEvidence, RateShortfallsByArm,
         RateShortfallsByRole, RuntimeViolationLabel, SafeLabel, SanitizedCameraContext,
     };
+
+    /// An unsupported distribution warns; the three supported families and
+    /// NixOS, whose family is `Other`, pass.
+    #[test]
+    fn platform_supported_warns_off_the_supported_families() {
+        use irlume_common::platform::DistroFamily;
+        assert!(matches!(
+            platform_check(&DistroFamily::Other, false),
+            CheckState::Warn
+        ));
+        assert!(matches!(
+            platform_check(&DistroFamily::Other, true),
+            CheckState::Pass
+        ));
+        for family in [
+            DistroFamily::Debian,
+            DistroFamily::Fedora,
+            DistroFamily::Arch,
+        ] {
+            assert!(matches!(platform_check(&family, false), CheckState::Pass));
+        }
+    }
+
+    /// The platform text and its check come from the same os-release text,
+    /// whichever file it was read from (review on #1143).
+    #[test]
+    fn platform_facts_read_one_os_release_text() {
+        let cases = [
+            ("ID=debian\n", "Debian-family", true),
+            ("ID=fedora\n", "Fedora-family", true),
+            ("ID=arch\n", "Arch-family", true),
+            ("NAME=NixOS\nID=nixos\n", "other/unknown", true),
+            ("ID=opensuse-tumbleweed\n", "other/unknown", false),
+            ("", "other/unknown", false),
+        ];
+        for (text, platform, passes) in cases {
+            let (shown, state) = platform_facts(text);
+            assert_eq!(shown, platform, "{text:?}");
+            assert_eq!(matches!(state, CheckState::Pass), passes, "{text:?}");
+            assert_eq!(matches!(state, CheckState::Warn), !passes, "{text:?}");
+        }
+    }
 
     fn fixture_report() -> SupportReport {
         SupportReport {

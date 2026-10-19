@@ -9321,8 +9321,9 @@ enum FailureJournal {
 
 /// The journal line for a request that ended in an error, or `None` when the
 /// reply is not one. The retired requests' fixed answers are their contract,
-/// not failures, as [`categorical_outcome`] counts them. Error prose is made
-/// journal-safe: it can carry names the peer chose.
+/// not failures, as [`categorical_outcome`] counts them. Error prose is put on
+/// one line (`single_line`: every control character and Unicode line or
+/// paragraph separator becomes a space): it can carry names the peer chose.
 fn request_failure_line(label: &str, account: Option<&str>, response: &Response) -> Option<String> {
     let what = match response {
         Response::Error(message)
@@ -9331,7 +9332,21 @@ fn request_failure_line(label: &str, account: Option<&str>, response: &Response)
         {
             return None;
         }
-        Response::Error(message) => journal_safe_up_to(message, 240),
+        Response::Error(message) => irlume_common::single_line(message, 240),
+        // A probe that caught its capture failure answers with a result, not
+        // an error; its categorical fields say what failed, no measurement.
+        Response::SupportProbe(result)
+            if result.outcome == irlume_common::diagnostics::ProbeOutcome::Failed =>
+        {
+            let fallback = result
+                .fallback_reason
+                .map(|label| format!(", fallback {label:?}"))
+                .unwrap_or_default();
+            format!(
+                "probe {:?}, rgb {:?}, ir {:?}{fallback}",
+                result.outcome, result.rgb, result.ir
+            )
+        }
         Response::OperationError {
             code,
             retryable,
@@ -9381,12 +9396,12 @@ impl FailureLineLimiter {
 }
 
 /// The journal line for an identification that failed before a decision:
-/// the request and the engine's error, made journal-safe. An identification
+/// the request and the engine's error, on one line. An identification
 /// journals no decision, so this carries no account, score or match.
 fn identify_failure_line(label: &str, error: &irlume_common::Error) -> String {
     format!(
         "irlumed: {label} failed: {}",
-        journal_safe_up_to(&error.to_string(), 240)
+        irlume_common::single_line(&error.to_string(), 240)
     )
 }
 
@@ -9398,12 +9413,12 @@ fn journals_face_decisions(convenience: bool) -> bool {
 }
 
 /// The journal line for an Authenticate attempt that ended without a
-/// decision. The error's prose is engine text, not a score, and is made
-/// journal-safe so it cannot forge a line.
+/// decision. The error's prose is engine text, not a score, and is put on
+/// one line (`single_line`) so it cannot forge a line.
 fn no_decision_line(user: &str, error: &irlume_common::Error) -> String {
     format!(
         "irlumed: face auth '{user}': no decision: {}",
-        journal_safe_up_to(&error.to_string(), 240)
+        irlume_common::single_line(&error.to_string(), 240)
     )
 }
 
@@ -9500,7 +9515,7 @@ fn verify_reply(
             if journals_face_decisions(convenience) {
                 jout_info!(
                     "irlumed: face auth '{user}': {}",
-                    journal_safe_up_to(why, 240)
+                    irlume_common::single_line(why, 240)
                 );
             }
         },
@@ -12051,7 +12066,7 @@ fn unseal_reply(
         |why| {
             jout_notice!(
                 "irlumed: UnsealPassword: '{user}': {}",
-                journal_safe_up_to(why, 240)
+                irlume_common::single_line(why, 240)
             );
         },
     )
@@ -12176,16 +12191,11 @@ fn set_mode(path: &str, mode: u32) -> std::io::Result<()> {
 /// newlines in its service name (2026-08-29 audit). Newlines and tabs become
 /// spaces, other control characters become `?`, and the result is clamped.
 fn journal_safe(s: &str) -> String {
-    journal_safe_up_to(s, 64)
-}
-
-/// [`journal_safe`] with a caller's clamp, for longer daemon-side prose such as
-/// an engine error.
-fn journal_safe_up_to(s: &str, max: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max + 3));
+    const MAX: usize = 64;
+    let mut out = String::with_capacity(s.len().min(MAX + 3));
     let mut clamped = false;
     for c in s.chars() {
-        if out.chars().count() >= max {
+        if out.chars().count() >= MAX {
             clamped = true;
             break;
         }
@@ -14784,6 +14794,61 @@ mod tests {
         )
         .unwrap();
         assert!(!forged.contains('\n'), "{forged}");
+        // A peer-chosen name with a C1 control or a Unicode line or paragraph
+        // separator renders as one line too (review on #1135).
+        let separated = request_failure_line(
+            "RenameScan",
+            Some("alice"),
+            &Response::Error("no scan 'a\u{85}b\u{2028}c\u{2029}irlumed: forged'".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            separated,
+            "irlumed: RenameScan for 'alice' failed: no scan 'a b c irlumed: forged'"
+        );
+        // A support probe that caught its capture failure answers with a
+        // result; its categorical fields are the line.
+        let probe = |outcome| {
+            Response::SupportProbe(Box::new(irlume_common::diagnostics::SupportProbeResult {
+                snapshot: irlume_common::diagnostics::SupportSnapshot::bounded(
+                    0,
+                    0,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
+                source: irlume_common::diagnostics::CaptureScheduleSource::StoredQualification,
+                outcome,
+                fallback_reason: Some(
+                    irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                ),
+                rgb: irlume_common::diagnostics::ProbeRoleOutcome::Captured,
+                ir: irlume_common::diagnostics::ProbeRoleOutcome::Failed,
+            }))
+        };
+        assert_eq!(
+            request_failure_line(
+                "SupportProbe",
+                None,
+                &probe(irlume_common::diagnostics::ProbeOutcome::Failed)
+            )
+            .as_deref(),
+            Some(
+                "irlumed: SupportProbe failed: \
+                 probe Failed, rgb Captured, ir Failed, fallback PairOpenFailure"
+            )
+        );
+        assert_eq!(
+            request_failure_line(
+                "SupportProbe",
+                None,
+                &probe(irlume_common::diagnostics::ProbeOutcome::FallbackCaptured)
+            ),
+            None,
+            "a probe that captured is not a failure"
+        );
         for routine in [
             Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
             Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into()),

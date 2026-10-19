@@ -217,7 +217,10 @@ dependencies; the C API example above covers only the current pre-load gate.
 Parse the installed executable-path profile with
 `apparmor_parser -QK /etc/apparmor.d/usr.bin.irlumed` (or
 `usr.local.bin.irlumed` for a source installation), then reload that profile
-with `apparmor_parser -r` and restart the daemon after a provider change.
+with `apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed` (or
+`apparmor_parser -r /etc/apparmor.d/usr.local.bin.irlumed` for a source
+installation; with no profile argument the parser reads standard input
+instead) and restart the daemon after a provider change.
 Validate under enforce: the documented selection must reach the closed
 loading-admission refusal, doctor must report CPU with unknown runtime
 observation, and its audit interval must have no related AppArmor denial.

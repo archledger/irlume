@@ -249,7 +249,7 @@ fn split_capture_rejects_foreign_frame_binding() {
         ),
         Instant::now(),
     );
-    assert!(validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir).is_err());
+    assert!(validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir, 0).is_err());
 }
 
 #[test]
@@ -338,20 +338,23 @@ fn split_capture_rejects_unhealthy_delivery_or_unknown_ir_illumination() {
         } else {
             ir = frame;
         }
-        assert!(validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir).is_err());
+        assert!(validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir, 0).is_err());
     }
 }
 
-/// #1063: an IR frame no illumination record named is typed, so the engine
-/// can capture once more within the window; one the camera recorded as
-/// ambient keeps the generic refusal. Both still refuse, with the same prose.
+/// #1063: an unknown IR frame from a burst no illumination record named is
+/// typed, so the engine can capture once more within the window. An unknown
+/// aggregate over frames the camera did classify, and a frame recorded as
+/// ambient, keep the generic refusal. All refuse, with the same prose.
 #[test]
 fn split_ir_frames_no_record_named_are_typed_for_a_retry() {
     let (_guard, expected) = fixture();
     let operation = acquire(&expected);
-    for (illumination, unreported) in [
-        (contracts::IlluminationProvenance::Unknown, true),
-        (contracts::IlluminationProvenance::Ambient, false),
+    for (illumination, classified, unreported) in [
+        (contracts::IlluminationProvenance::Unknown, 0, true),
+        (contracts::IlluminationProvenance::Unknown, 4, false),
+        (contracts::IlluminationProvenance::Ambient, 0, false),
+        (contracts::IlluminationProvenance::Ambient, 4, false),
     ] {
         let (rgb, ir, _) = frames(&operation);
         let ir = bound_uniform_frame_with(
@@ -364,11 +367,12 @@ fn split_ir_frames_no_record_named_are_typed_for_a_retry() {
             true,
             false,
         );
-        let error = validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir).unwrap_err();
+        let error = validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir, classified)
+            .unwrap_err();
         assert_eq!(
             matches!(error, Error::IrIlluminationUnreported(_)),
             unreported,
-            "{illumination:?}: {error:?}"
+            "{illumination:?} with {classified} classified: {error:?}"
         );
         assert_eq!(
             error.to_string(),
@@ -390,7 +394,7 @@ fn split_capture_rejects_mutated_geometry_role_or_window() {
             _ => unreachable!(),
         }
         assert!(
-            validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir).is_err(),
+            validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir, 0).is_err(),
             "{fault}"
         );
     }

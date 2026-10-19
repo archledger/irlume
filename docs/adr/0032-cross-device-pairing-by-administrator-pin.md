@@ -1568,11 +1568,15 @@ frame carried no active-IR provenance and the split frame contract refused
 it. The next request granted. The contract's check is unchanged; only what
 follows the refusal changes.
 
-- **Typed.** A split IR frame whose provenance is unknown, because no
-  illumination record named it, refuses with
-  `Error::IrIlluminationUnreported` (cause `camera-unavailable`), with the
-  same prose as before. A frame the camera recorded as ambient keeps the
-  generic hardware refusal.
+- **Typed.** A split IR frame whose provenance is unknown and whose burst
+  no illumination record named at all (`IrCaptureStats` counts no
+  camera-classified frame) refuses with `Error::IrIlluminationUnreported`
+  (cause `camera-unavailable`), with the same prose as before. An aggregate
+  that is unknown although records classified the burst's frames (an
+  ambient subtraction over unsuitable states, mixed contributors) and a
+  frame recorded as ambient keep the generic hardware refusal. A YUYV side
+  without records whose burst proved no alternation is the first case:
+  nothing named its frames.
 - **Captured once more within the window.** The attempt loop treats that
   refusal as it treats an attempt with incomplete face evidence: when
   another complete attempt fits before the deadline, by the same estimate

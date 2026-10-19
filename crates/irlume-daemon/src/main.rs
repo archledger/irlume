@@ -9380,6 +9380,16 @@ impl FailureLineLimiter {
     }
 }
 
+/// The journal line for an identification that failed before a decision:
+/// the request and the engine's error, made journal-safe. An identification
+/// journals no decision, so this carries no account, score or match.
+fn identify_failure_line(label: &str, error: &irlume_common::Error) -> String {
+    format!(
+        "irlumed: {label} failed: {}",
+        journal_safe_up_to(&error.to_string(), 240)
+    )
+}
+
 /// Whether an Authenticate attempt's outcome is journaled: always on the
 /// convenience tier, and on the secure tier only while tracing. A decision and
 /// an attempt that ended without one follow the same rule.
@@ -11362,8 +11372,11 @@ fn identify_reply(
         // stays in `reason` and the record reads the cause from it.
         Err(e) => {
             // A failure, not a decision about a face: the record
-            // files it as such (ADR-0030 §5).
+            // files it as such (ADR-0030 §5), and the journal says it
+            // in the request-failure form. Only the error, never a
+            // score or a name the search might have found.
             note_engine_error(&e);
+            jout_notice!("{}", identify_failure_line(request_label(req), &e));
             Response::Identified {
                 cause: Some(e.cause()),
                 user: None,
@@ -14778,6 +14791,24 @@ mod tests {
         ] {
             assert_eq!(request_failure_line("Enroll", None, &routine), None);
         }
+    }
+
+    /// A failed identification names the request and the error only: an
+    /// identification journals no decision, so no account or score (#1135).
+    #[test]
+    fn a_failed_identification_names_only_its_error() {
+        assert_eq!(
+            identify_failure_line(
+                "IdentifyFor",
+                &irlume_common::Error::CameraUnavailable("no camera found".into())
+            ),
+            "irlumed: IdentifyFor failed: hardware: no camera found"
+        );
+        let forged = identify_failure_line(
+            "Identify",
+            &irlume_common::Error::Hardware("x\nirlumed: face auth 'alice': granted=true".into()),
+        );
+        assert!(!forged.contains('\n'), "{forged}");
     }
 
     /// One line per request and account per minute; repeats are debug only,

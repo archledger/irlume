@@ -401,7 +401,9 @@ All notable changes to irlume are documented here. This project adheres to
   or `IRLUME_LOG=debug`), as the first split capture after a replug showed
   (#1063). So does a decided attempt whose reply is not that decision: a
   grant withdrawn at the completion boundary, or a refusal of the retry
-  accounting, which a credential release journals at notice level. Every
+  accounting, which a credential release journals at notice level. An
+  identification that fails before a decision journals
+  `irlumed: Identify failed: <error>`, with no account or score. Every
   other request that runs on the camera worker (enrollment, scans,
   profiles, camera groups, split pairs, `ir-setup`, self-tests,
   diagnostics, recovery, keyring sealing) ends with one notice line,

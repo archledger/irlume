@@ -965,6 +965,13 @@ impl IlluminationLog {
                 // ring until its main producer is quiescent.
                 let remaining = self.buffers.len().saturating_sub(self.parked as usize + 1);
                 if self.delivered || self.parked >= MAX_PARKED_STARTUP_ERRORS || remaining == 0 {
+                    // Said once, so "closed after 0 classified frames" can be
+                    // told apart from a camera that sent no records (#1063).
+                    irlume_common::dlog!(
+                        "{}: illumination metadata retired after an ERROR-marked buffer ({} parked); later frames carry no records",
+                        self.device,
+                        self.parked
+                    );
                     self.retired = true;
                     self.by_timestamp.clear();
                     return;

@@ -676,6 +676,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The first split-pair authentication after the IR camera is replugged no
+  longer ends at once with `operation-failed` when the camera's metadata
+  stream, just opened, names none of the burst's IR frames (ADR-0032,
+  amendment 2026-10-18; #1063). The split frame contract still refuses such
+  a frame, now as a typed error, and the attempt loop captures once more
+  within the window when another attempt fits, at most once per request. If
+  it does not fit or fails again, the error is reported as retryable to
+  clients that asked for structured errors. irlumed's debug log also says
+  when an illumination metadata ring retires after an ERROR-marked buffer.
+
 - Face authentication works again right after irlumed starts, a reboot
   or a package upgrade, and after a camera is replugged, without opening
   the TUI's Cameras page first (ADR-0029 item 1, #887). Account routing

@@ -342,6 +342,41 @@ fn split_capture_rejects_unhealthy_delivery_or_unknown_ir_illumination() {
     }
 }
 
+/// #1063: an IR frame no illumination record named is typed, so the engine
+/// can capture once more within the window; one the camera recorded as
+/// ambient keeps the generic refusal. Both still refuse, with the same prose.
+#[test]
+fn split_ir_frames_no_record_named_are_typed_for_a_retry() {
+    let (_guard, expected) = fixture();
+    let operation = acquire(&expected);
+    for (illumination, unreported) in [
+        (contracts::IlluminationProvenance::Unknown, true),
+        (contracts::IlluminationProvenance::Ambient, false),
+    ] {
+        let (rgb, ir, _) = frames(&operation);
+        let ir = bound_uniform_frame_with(
+            operation
+                .lease()
+                .frame_binding(IR, contracts::StreamRole::Ir)
+                .unwrap(),
+            ir.captured.start,
+            illumination,
+            true,
+            false,
+        );
+        let error = validate_split_pair_in_operation(RGB, IR, &operation, &rgb, &ir).unwrap_err();
+        assert_eq!(
+            matches!(error, Error::IrIlluminationUnreported(_)),
+            unreported,
+            "{illumination:?}: {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "hardware: split IR frame lacks active illumination provenance"
+        );
+    }
+}
+
 #[test]
 fn split_capture_rejects_mutated_geometry_role_or_window() {
     let (_guard, expected) = fixture();

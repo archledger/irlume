@@ -2447,6 +2447,14 @@ pub enum Error {
     /// at a camera that worked. Display keeps the legacy hardware prose.
     #[error("hardware: {0}")]
     CameraUnavailable(String),
+    /// The IR camera delivered its frames, but its illumination records
+    /// classified none of them, so the selected frame carries no active-IR
+    /// provenance and a split pair's frame contract refuses it (ADR-0032).
+    /// A metadata stream that has just opened, as after a replug, does this
+    /// once (#1063); a fresh capture usually reports. Raised only by the
+    /// camera layer. Display keeps the legacy hardware prose.
+    #[error("hardware: {0}")]
+    IrIlluminationUnreported(String),
     /// The account's enrollment exists but could not be read or decoded
     /// (ADR-0030 §5): no biometric comparison happened. Wraps the storage
     /// error's own text so the prose reply is unchanged.
@@ -2462,9 +2470,10 @@ impl Error {
     pub fn cause(&self) -> OutcomeCause {
         match self {
             Error::PrivacyShutter(_) => OutcomeCause::PrivacyShutter,
-            Error::CameraUnavailable(_) | Error::CameraBusy(_) | Error::DeliveredRate(_) => {
-                OutcomeCause::CameraUnavailable
-            }
+            Error::CameraUnavailable(_)
+            | Error::CameraBusy(_)
+            | Error::DeliveredRate(_)
+            | Error::IrIlluminationUnreported(_) => OutcomeCause::CameraUnavailable,
             Error::Enrollment(_) => OutcomeCause::SetupUnavailable,
             Error::Preempted(_) => OutcomeCause::Cancelled,
             Error::DeadlineExpired => OutcomeCause::TimedOut,
@@ -3781,6 +3790,16 @@ mod tests {
         assert_eq!(
             Error::CameraBusy("b".into()).cause(),
             OutcomeCause::CameraUnavailable
+        );
+        // #1063: the IR camera named none of its frames; the camera's fault,
+        // with the legacy hardware prose.
+        assert_eq!(
+            Error::IrIlluminationUnreported("split IR frame".into()).cause(),
+            OutcomeCause::CameraUnavailable
+        );
+        assert_eq!(
+            Error::IrIlluminationUnreported("split IR frame".into()).to_string(),
+            "hardware: split IR frame"
         );
         assert!(OutcomeCause::NoFace.is_face_verdict());
         assert!(!OutcomeCause::RetryThrottled.is_face_verdict());

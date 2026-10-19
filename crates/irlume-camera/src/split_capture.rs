@@ -384,10 +384,20 @@ fn validate_split_pair_in_operation(
             "split capture windows are not RGB then IR".into(),
         ));
     }
-    if ir.provenance().illumination() != IlluminationProvenance::ActiveIr {
-        return Err(Error::Hardware(
-            "split IR frame lacks active illumination provenance".into(),
-        ));
+    match ir.provenance().illumination() {
+        IlluminationProvenance::ActiveIr => {}
+        // No record named the frame at all: typed, so the attempt loop can
+        // capture again within the window (#1063). The check is unchanged.
+        IlluminationProvenance::Unknown => {
+            return Err(Error::IrIlluminationUnreported(
+                "split IR frame lacks active illumination provenance".into(),
+            ));
+        }
+        IlluminationProvenance::Ambient => {
+            return Err(Error::Hardware(
+                "split IR frame lacks active illumination provenance".into(),
+            ));
+        }
     }
     operation
         .lease()

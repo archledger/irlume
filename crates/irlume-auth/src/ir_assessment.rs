@@ -1809,9 +1809,9 @@ mod pipeline {
             irlume_common::Error::CameraBusy(_) => IrFailure::CameraBusy,
             irlume_common::Error::DeliveredRate(_) => IrFailure::CameraRateRefused,
             irlume_common::Error::Io(_) => IrFailure::CameraIoFailed,
-            irlume_common::Error::Hardware(_) | irlume_common::Error::CameraUnavailable(_) => {
-                IrFailure::CameraHardwareFailed
-            }
+            irlume_common::Error::Hardware(_)
+            | irlume_common::Error::CameraUnavailable(_)
+            | irlume_common::Error::IrIlluminationUnreported(_) => IrFailure::CameraHardwareFailed,
             irlume_common::Error::PrivacyShutter(_) => IrFailure::PrivacyShutter,
             irlume_common::Error::Enrollment(_) => IrFailure::IncompatibleEnrollment,
             irlume_common::Error::NotAuthorized(_) => IrFailure::CameraAuthorizationRefused,

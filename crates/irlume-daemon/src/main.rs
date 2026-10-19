@@ -1906,6 +1906,9 @@ fn main() {
                                 attempt.camera = irlume_auth::camera_location(engine.rgb_device());
                             }
                             delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
+                            // Kept before the request moves into dispatch: a
+                            // reply that ends in an error gets one journal line.
+                            let failure_note = RequestFailureNote::for_request(&req, peer.uid);
                             let capture_mode_before = capture_mode_changes();
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
@@ -1998,6 +2001,13 @@ fn main() {
                                 }
                             }
                             link.finish_activity();
+                            if let Some(note) = &failure_note {
+                                note.journal(
+                                    &resp.response,
+                                    &mut failure_lines(),
+                                    std::time::Instant::now(),
+                                );
+                            }
                             scope.finish(categorical_outcome(&resp.response));
                             // The client may already be gone; its thread owns that.
                             // ADR-0027: a decision handed over inside the engine
@@ -2007,6 +2017,7 @@ fn main() {
                                 if let Err(std::sync::mpsc::SendError(resp)) = reply.send(resp) {
                                     // The connection thread is gone: no reply
                                     // reaches the client, so a grant is not one.
+                                    resp.journal_unreceived();
                                     if let Some(filing) = resp.filing {
                                         filing
                                             .undelivered(irlume_common::OutcomeCause::Cancelled)
@@ -2165,6 +2176,7 @@ fn recorded_face_response(
     record: impl FnOnce() -> Result<(), &'static str>,
     refuse: fn(&str) -> Response,
     complete: impl FnOnce() -> Response,
+    withdrawn: impl Fn(&str),
 ) -> Response {
     match record() {
         Ok(()) => complete(),
@@ -2172,6 +2184,7 @@ fn recorded_face_response(
             // The face was decided and the camera used; only the retry
             // accounting failed. The refusal reply must not read as a
             // pre-camera policy refusal in the record (ADR-0030 §5).
+            withdrawn(&format!("refused by the retry accounting ({reason})"));
             let refused = refuse(reason);
             note_decided(match &refused {
                 Response::AuthResult { cause, .. } => *cause,
@@ -2193,16 +2206,27 @@ fn bounded_face_response(
     // gone, binding failed): the caller decides the reply shape, typed for
     // a client that asked for it (ADR-0030 §5), prose otherwise.
     boundary: impl Fn(irlume_common::Error) -> Response,
+    // Told why the reply is not the prepared one: a grant withdrawn at the
+    // completion boundary or a refusal the retry accounting decided. The
+    // prepared reply journals itself; the caller journals this under its
+    // own rule, so neither ends silently.
+    withdrawn: impl Fn(&str),
 ) -> Response {
     if !granted {
-        return recorded_face_response(record, refuse, prepare);
+        return recorded_face_response(record, refuse, prepare, withdrawn);
     }
+    let withdraw = |error: irlume_common::Error| {
+        withdrawn(&format!(
+            "grant withdrawn at the completion boundary ({error})"
+        ));
+        boundary(error)
+    };
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     let response = prepare();
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     // A failed TPM operation never publishes a credential or clears history.
     // Prepared secret responses remain zeroizing owners on every refusal path.
@@ -2214,11 +2238,14 @@ fn bounded_face_response(
     }
     let recorded = record();
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     match recorded {
         Ok(()) => response,
-        Err(reason) => refuse(reason),
+        Err(reason) => {
+            withdrawn(&format!("refused by the retry accounting ({reason})"));
+            refuse(reason)
+        }
     }
 }
 
@@ -2725,6 +2752,36 @@ struct FaceCompletion {
     attempt: retry_throttle::FaceAttempt,
     window: irlume_auth::AuthenticationWindow,
     shared_unlock: Option<std::sync::Arc<shared_unlock::Binding>>,
+    /// How a grant the final admission check withholds is journaled, by the
+    /// rule of the request's own decision line; `None` where that decision is
+    /// not journaled (a secure-tier Authenticate without tracing).
+    withheld_line: Option<WithheldLine>,
+}
+
+/// The line for a grant the connection thread's last admission check
+/// withheld: the request's prefix and whether it journals at notice level.
+struct WithheldLine {
+    prefix: String,
+    notice: bool,
+}
+
+impl WithheldLine {
+    fn text(&self, error: &std::io::Error) -> String {
+        format!(
+            "{}grant not delivered ({})",
+            self.prefix,
+            journal_prose(&error.to_string())
+        )
+    }
+
+    fn journal(&self, error: &std::io::Error) {
+        let text = self.text(error);
+        if self.notice {
+            jout_notice!("{text}");
+        } else {
+            jout_info!("{text}");
+        }
+    }
 }
 
 struct WorkerReply {
@@ -2805,6 +2862,7 @@ impl<'a> Delivery<'a> {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
+                reply.journal_unreceived();
                 if let Some(filing) = reply.filing {
                     filing
                         .undelivered(irlume_common::OutcomeCause::Cancelled)
@@ -2889,6 +2947,22 @@ fn is_face_grant(response: &Response) -> bool {
 }
 
 impl WorkerReply {
+    /// For a reply the connection thread was gone to take: a grant in it
+    /// was journaled as granted where its request journals decisions, so the
+    /// journal says it was not delivered, as the last admission check does.
+    fn journal_unreceived(&self) {
+        if let Some(line) = self
+            .completion
+            .as_ref()
+            .and_then(|completion| completion.withheld_line.as_ref())
+        {
+            line.journal(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the connection closed before the reply was handed over",
+            ));
+        }
+    }
+
     fn respond(self, stream: UnixStream) -> std::io::Result<()> {
         let WorkerReply {
             response,
@@ -2930,6 +3004,11 @@ impl WorkerReply {
             }
             completion.window.check().map_err(expired)
         });
+        // A grant withheld here was already journaled as granted, where its
+        // request journals decisions: say it did not reach the client.
+        if let (Err(error), Some(line)) = (&result, &completion.withheld_line) {
+            line.journal(error);
+        }
         if result.is_ok() && completion.attempt.delivered().is_err() {
             // The admitted response cannot be retracted. Disk stays authoritative;
             // retain conservative accounting and never send a second response.
@@ -9151,6 +9230,321 @@ struct VerifyReplyInputs {
     peer_uid: u32,
 }
 
+/// The request's variant name, for journal lines. Exhaustive with no wildcard
+/// arm, like [`posture`], so a new variant names itself before it compiles.
+fn request_label(req: &Request) -> &'static str {
+    match req {
+        Request::Authenticate { .. } => "Authenticate",
+        Request::Enroll { .. } => "Enroll",
+        Request::EnrollOn { .. } => "EnrollOn",
+        Request::EnrollSplitOn { .. } => "EnrollSplitOn",
+        Request::EnrollmentSession { .. } => "EnrollmentSession",
+        Request::Identify => "Identify",
+        Request::SetCameras { .. } => "SetCameras",
+        Request::SetCamerasIfCurrent { .. } => "SetCamerasIfCurrent",
+        Request::AddScan { .. } => "AddScan",
+        Request::AddCameraGroup { .. } => "AddCameraGroup",
+        Request::AddCameraGroupOn { .. } => "AddCameraGroupOn",
+        Request::AddSplitCameraGroupOn { .. } => "AddSplitCameraGroupOn",
+        Request::RemoveCameraGroup { .. } => "RemoveCameraGroup",
+        Request::ListProfiles { .. } => "ListProfiles",
+        Request::DeleteProfile { .. } => "DeleteProfile",
+        Request::DeleteScan { .. } => "DeleteScan",
+        Request::ForgetRecognizer { .. } => "ForgetRecognizer",
+        Request::RenameProfile { .. } => "RenameProfile",
+        Request::RenameScan { .. } => "RenameScan",
+        Request::SetRequireEyesOpen { .. } => "SetRequireEyesOpen",
+        Request::CaptureEarMedian { .. } => "CaptureEarMedian",
+        Request::SetClosureCalibration { .. } => "SetClosureCalibration",
+        Request::SetupIrEmitter { .. } => "SetupIrEmitter",
+        Request::TuneCaptureMode { .. } => "TuneCaptureMode",
+        Request::CaptureModeStatus => "CaptureModeStatus",
+        Request::FaceSensorStatus { .. } => "FaceSensorStatus",
+        Request::LastAttempts { .. } => "LastAttempts",
+        Request::IdentifyFor { .. } => "IdentifyFor",
+        Request::PreferencesStatus => "PreferencesStatus",
+        Request::SelfTest { .. } => "SelfTest",
+        Request::ListCameras => "ListCameras",
+        Request::CameraDiagnostics => "CameraDiagnostics",
+        Request::SupportSnapshot { .. } => "SupportSnapshot",
+        Request::LiveStatus => "LiveStatus",
+        Request::SupportProbe { .. } => "SupportProbe",
+        Request::TraceSubscribe { .. } => "TraceSubscribe",
+        Request::Ping => "Ping",
+        Request::Health => "Health",
+        Request::PositionSample { .. } => "PositionSample",
+        Request::PositionSession { .. } => "PositionSession",
+        Request::SealPassword { .. } => "SealPassword",
+        Request::UnsealPassword { .. } => "UnsealPassword",
+        Request::UnsealKeyring { .. } => "UnsealKeyring",
+        Request::HasSealedPassword { .. } => "HasSealedPassword",
+        Request::KeyringMetadata { .. } => "KeyringMetadata",
+        Request::SealedStorage => "SealedStorage",
+        Request::TpmReadiness => "TpmReadiness",
+        Request::TpmEndorsement => "TpmEndorsement",
+        Request::KeyringInfo { .. } => "KeyringInfo",
+        Request::ForgetPassword { .. } => "ForgetPassword",
+        Request::ReleaseTokenForDisarm { .. } => "ReleaseTokenForDisarm",
+        Request::ResealPassword { .. } => "ResealPassword",
+        Request::RecoverySetup { .. } => "RecoverySetup",
+        Request::RecoveryRestore { .. } => "RecoveryRestore",
+        Request::RecoveryStatus { .. } => "RecoveryStatus",
+        Request::RecoveryForget { .. } => "RecoveryForget",
+        Request::RetryStatus { .. } => "RetryStatus",
+        Request::RetryReset { .. } => "RetryReset",
+        Request::ListSplitAuthorizations => "ListSplitAuthorizations",
+        Request::SplitStatus => "SplitStatus",
+        Request::AddSplitAuthorization { .. } => "AddSplitAuthorization",
+        Request::RemoveSplitAuthorization { .. } => "RemoveSplitAuthorization",
+        Request::SelectSplitPair { .. } => "SelectSplitPair",
+    }
+}
+
+/// What the worker keeps of a request to journal it if it ends in an error:
+/// its label, the peer that sent it, and the account it names when the
+/// request's privilege checked that name.
+struct RequestFailureNote {
+    label: &'static str,
+    peer_uid: u32,
+    account: Option<String>,
+}
+
+impl RequestFailureNote {
+    /// `None` for the requests whose outcome lines follow their own rules:
+    /// the face requests, whose replies can carry match measurements and
+    /// whose attempts the attempt record files (Authenticate journals its
+    /// decision or its error under [`journals_face_decisions`]), and
+    /// `UnsealKeyring`, whose "no sealed password" is the routine answer to
+    /// an unarmed account's fingerprint login.
+    fn for_request(req: &Request, peer_uid: u32) -> Option<Self> {
+        if matches!(
+            req,
+            Request::Authenticate { .. }
+                | Request::UnsealPassword { .. }
+                | Request::UnsealKeyring { .. }
+                | Request::Identify
+                | Request::IdentifyFor { .. }
+        ) {
+            return None;
+        }
+        let posture = posture(req);
+        // Only a name the pregate checked against the peer (root, or the
+        // account itself) is the request's account. An `AnyPeer` request's
+        // name is a hint any local user can set (`PositionSample`'s pitch
+        // band), so a line never attributes a failure to it.
+        let checked = !matches!(posture.privilege, Privilege::AnyPeer);
+        Some(Self {
+            label: request_label(req),
+            peer_uid,
+            account: posture
+                .user
+                .filter(|user| checked && valid_username(user))
+                .map(str::to_owned),
+        })
+    }
+
+    /// Journal the reply if it is a failure. Every failed request ends with
+    /// this one line, also after a line its handler wrote: whether an earlier
+    /// line reported this failure cannot be told from its priority, since a
+    /// handler also writes notices and warnings that report nothing failing
+    /// (an enrollment's one-time contention probe).
+    fn journal(
+        &self,
+        response: &Response,
+        limiter: &mut FailureLineLimiter,
+        now: std::time::Instant,
+    ) -> FailureJournal {
+        let Some(line) = request_failure_line(self.label, self.account.as_deref(), response) else {
+            return FailureJournal::NotAFailure;
+        };
+        if limiter.admit(self.label, self.peer_uid, self.account.as_deref(), now) {
+            jout_notice!("{line}");
+            FailureJournal::Journaled
+        } else {
+            irlume_common::dlog!("{line} (repeated within a minute)");
+            FailureJournal::Repeated
+        }
+    }
+}
+
+/// What [`RequestFailureNote::journal`] did with a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureJournal {
+    /// A success, or a failure that is routine by contract.
+    NotAFailure,
+    /// One notice line.
+    Journaled,
+    /// The same request and account failed within the minute: debug only.
+    Repeated,
+}
+
+/// The journal line for a request that ended in an error, or `None` when the
+/// reply is not one. The retired requests' fixed answers are their contract,
+/// not failures, as [`categorical_outcome`] counts them. Error prose is put on
+/// one line (`single_line`: every control character and Unicode line or
+/// paragraph separator becomes a space): it can carry names the peer chose.
+fn request_failure_line(label: &str, account: Option<&str>, response: &Response) -> Option<String> {
+    let what = match response {
+        Response::Error(message)
+            if message == CAPTURE_EAR_MEDIAN_RETIRED
+                || message == SET_CLOSURE_CALIBRATION_RETIRED =>
+        {
+            return None;
+        }
+        Response::Error(message) => journal_prose(message),
+        // A probe that caught its capture failure answers with a result, not
+        // an error; its categorical fields say what failed, no measurement.
+        Response::SupportProbe(result)
+            if result.outcome == irlume_common::diagnostics::ProbeOutcome::Failed =>
+        {
+            let fallback = result
+                .fallback_reason
+                .map(|label| format!(", fallback {label:?}"))
+                .unwrap_or_default();
+            format!(
+                "probe {:?}, rgb {:?}, ir {:?}{fallback}",
+                result.outcome, result.rgb, result.ir
+            )
+        }
+        Response::OperationError {
+            code,
+            retryable,
+            cause,
+        } => {
+            let cause = cause
+                .map(|cause| format!(", cause {cause:?}"))
+                .unwrap_or_default();
+            let retry = if *retryable { ", retryable" } else { "" };
+            format!("{code:?}{cause}{retry}")
+        }
+        _ => return None,
+    };
+    let account = account
+        .map(|user| format!(" for '{user}'"))
+        .unwrap_or_default();
+    Some(format!("irlumed: {label}{account} failed: {what}"))
+}
+
+/// One request-failure line per request label, peer and account per
+/// minute. A client polling a failing request (the TUI's capture-mode status,
+/// the positioning loop) cannot flood the journal, and one peer's repeats
+/// cannot silence another's; the repeats go to the debug log. The map holds
+/// only keys seen within the last minute.
+#[derive(Default)]
+struct FailureLineLimiter {
+    last: std::collections::HashMap<(&'static str, u32, Option<String>), std::time::Instant>,
+}
+
+impl FailureLineLimiter {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn admit(
+        &mut self,
+        label: &'static str,
+        peer_uid: u32,
+        account: Option<&str>,
+        now: std::time::Instant,
+    ) -> bool {
+        self.last
+            .retain(|_, at| now.saturating_duration_since(*at) < Self::WINDOW);
+        let key = (label, peer_uid, account.map(str::to_owned));
+        if self.last.contains_key(&key) {
+            return false;
+        }
+        self.last.insert(key, now);
+        true
+    }
+}
+
+/// Handler or engine prose for one of the request-failure, no-decision,
+/// identification or withdrawn-grant journal lines. Numbers are stripped
+/// unless tracing is on, as for a deny reason ([`deny_reason`]): a failure can
+/// quote a match score (an added scan that belongs to another profile).
+/// Invisible Unicode formatting (bidi overrides and isolates, zero-width
+/// marks, the set `camera_text` removes from device text) is dropped, and the
+/// rest is put on one line of at most 240 characters ([`single_line`]), so a
+/// name the peer chose cannot reorder, hide or split the line.
+///
+/// [`single_line`]: irlume_common::single_line
+fn journal_prose(text: &str) -> String {
+    let visible: String = deny_reason(text)
+        .chars()
+        .filter(|&c| !is_invisible_format(c))
+        .collect();
+    irlume_common::single_line(&visible, 240)
+}
+
+/// Unicode format characters that change how a line renders without being
+/// seen: the Arabic letter mark, zero-width marks and joiners, bidi embeddings,
+/// overrides and isolates, and the byte-order mark. The same set as
+/// irlume-camera's device-text sanitizer.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
+/// The process's request-failure line limiter, shared by the worker's
+/// request-failure lines and the identification failure lines, so every
+/// repeatable failure line keeps to one per request, peer and account a
+/// minute.
+fn failure_lines() -> std::sync::MutexGuard<'static, FailureLineLimiter> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<FailureLineLimiter>> =
+        std::sync::OnceLock::new();
+    LINES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Journal an identification that failed before a decision, through the
+/// shared limiter: a peer may identify every two seconds while the camera
+/// stays unavailable.
+fn journal_identify_failure(
+    label: &'static str,
+    peer_uid: u32,
+    error: &irlume_common::Error,
+    limiter: &mut FailureLineLimiter,
+    now: std::time::Instant,
+) -> FailureJournal {
+    let line = identify_failure_line(label, error);
+    if limiter.admit(label, peer_uid, None, now) {
+        jout_notice!("{line}");
+        FailureJournal::Journaled
+    } else {
+        irlume_common::dlog!("{line} (repeated within a minute)");
+        FailureJournal::Repeated
+    }
+}
+
+/// The journal line for an identification that failed before a decision:
+/// the request and the engine's error, on one line. An identification
+/// journals no decision, so this carries no account, score or match.
+fn identify_failure_line(label: &str, error: &irlume_common::Error) -> String {
+    format!(
+        "irlumed: {label} failed: {}",
+        journal_prose(&error.to_string())
+    )
+}
+
+/// Whether an Authenticate attempt's outcome is journaled: always on the
+/// convenience tier, and on the secure tier only while tracing. A decision and
+/// an attempt that ended without one follow the same rule.
+fn journals_face_decisions(convenience: bool) -> bool {
+    convenience || irlume_common::dbglog::on()
+}
+
+/// The journal line for an Authenticate attempt that ended without a
+/// decision. The error's prose is engine text, not a score, and is put on
+/// one line (`single_line`) so it cannot forge a line.
+fn no_decision_line(user: &str, error: &irlume_common::Error) -> String {
+    format!(
+        "irlumed: face auth '{user}': no decision: {}",
+        journal_prose(&error.to_string())
+    )
+}
+
 /// The Authenticate arm's reply for an engine outcome: the completion and
 /// shared-unlock checks, journal line, response, and retry accounting, in the
 /// bounded order `bounded_face_response` enforces. Reads the engine only.
@@ -9182,7 +9576,7 @@ fn verify_reply(
             engine.check_authentication_completion(window)
         },
         || {
-            if convenience || irlume_common::dbglog::on() {
+            if journals_face_decisions(convenience) {
                 // Denied score + reason measurements quantized/redacted
                 // unless tracing (anti-oracle); grants log exact.
                 let (score, reason) = if o.granted {
@@ -9232,6 +9626,10 @@ fn verify_reply(
                     attempt: retry_attempt,
                     window,
                     shared_unlock: shared_unlock.clone(),
+                    withheld_line: journals_face_decisions(convenience).then(|| WithheldLine {
+                        prefix: format!("irlumed: face auth '{user}': "),
+                        notice: false,
+                    }),
                 });
                 Ok(())
             } else {
@@ -9240,6 +9638,11 @@ fn verify_reply(
         },
         retry_verify_refusal,
         |error| authentication_error(error, structured_errors),
+        |why| {
+            if journals_face_decisions(convenience) {
+                jout_info!("irlumed: face auth '{user}': {}", journal_prose(why));
+            }
+        },
     )
 }
 
@@ -9996,7 +10399,21 @@ fn dispatch_after_authorization(
                         .expect("the reply inputs are consumed exactly once");
                     verify_reply(engine, &o, &user, inputs, completion)
                 }
-                Err(e) => authentication_error(e, structured_errors),
+                Err(e) => {
+                    // Where a decision gets its journal line, an attempt that
+                    // ended without one gets one too: the first split capture
+                    // after a replug (#1063) left the journal silent while
+                    // the attempt record named a camera fault. The tier is
+                    // the selected camera's once selection ran.
+                    let convenience = reply_inputs
+                        .borrow()
+                        .as_ref()
+                        .map_or(convenience, |inputs| inputs.convenience);
+                    if journals_face_decisions(convenience) {
+                        jout_info!("{}", no_decision_line(&user, &e));
+                    }
+                    authentication_error(e, structured_errors)
+                }
             }
         }
         identify @ (Request::Identify | Request::IdentifyFor { .. }) => {
@@ -11094,8 +11511,17 @@ fn identify_reply(
         // stays in `reason` and the record reads the cause from it.
         Err(e) => {
             // A failure, not a decision about a face: the record
-            // files it as such (ADR-0030 §5).
+            // files it as such (ADR-0030 §5), and the journal says it
+            // in the request-failure form. Only the error, never a
+            // score or a name the search might have found.
             note_engine_error(&e);
+            journal_identify_failure(
+                request_label(req),
+                peer.uid,
+                &e,
+                &mut failure_lines(),
+                std::time::Instant::now(),
+            );
             Response::Identified {
                 cause: Some(e.cause()),
                 user: None,
@@ -11754,6 +12180,10 @@ fn unseal_reply(
                     attempt: retry_attempt,
                     window,
                     shared_unlock: None,
+                    withheld_line: Some(WithheldLine {
+                        prefix: format!("irlumed: UnsealPassword: '{user}': "),
+                        notice: true,
+                    }),
                 });
                 Ok(())
             } else {
@@ -11766,6 +12196,9 @@ fn unseal_reply(
         |error| {
             note_engine_error(&error);
             Response::Error(error.to_string())
+        },
+        |why| {
+            jout_notice!("irlumed: UnsealPassword: '{user}': {}", journal_prose(why));
         },
     )
 }
@@ -12180,6 +12613,7 @@ mod tests {
             let stage = Cell::new(0);
             let records = Cell::new(0);
             let preparations = Cell::new(0);
+            let withdrawn = std::cell::RefCell::new(Vec::new());
             let response = bounded_face_response(
                 true,
                 || {
@@ -12204,6 +12638,19 @@ mod tests {
                 },
                 retry_unseal_refusal,
                 |error| Response::Error(error.to_string()),
+                |why| withdrawn.borrow_mut().push(why.to_string()),
+            );
+            // A withdrawn grant is told to the caller to journal (#1135).
+            assert_eq!(
+                withdrawn.take(),
+                if stop_at == 3 {
+                    Vec::new()
+                } else {
+                    vec!["grant withdrawn at the completion boundary \
+                          (authentication window expired; use your password)"
+                        .to_string()]
+                },
+                "stage {stop_at}"
             );
             assert_eq!(
                 matches!(response, Response::PasswordUnsealed { .. }),
@@ -14396,6 +14843,315 @@ mod tests {
 
     fn request_samples() -> Vec<Request> {
         request_samples_with_user(SAMPLE_USER)
+    }
+
+    /// The production label agrees with the catalogue for every variant, so
+    /// a request-failure line names the request that failed.
+    #[test]
+    fn each_request_labels_itself_by_its_variant_name() {
+        let samples = named_samples(SAMPLE_USER);
+        assert_eq!(samples.len(), 63, "one sample per Request variant");
+        for (name, req) in samples {
+            assert_eq!(request_label(&req), name);
+        }
+    }
+
+    /// The face requests and `UnsealKeyring` keep their own outcome lines;
+    /// every other request is noted with its peer and, when the request's
+    /// privilege checked it, the account it names (review on #1135: an
+    /// `AnyPeer` request's name is a hint any local user sets).
+    #[test]
+    fn a_failure_note_skips_requests_with_their_own_outcome_lines() {
+        for (name, req) in named_samples(SAMPLE_USER) {
+            let note = RequestFailureNote::for_request(&req, 1000);
+            let own = matches!(
+                name,
+                "Authenticate" | "UnsealPassword" | "UnsealKeyring" | "Identify" | "IdentifyFor"
+            );
+            assert_eq!(note.is_none(), own, "{name}");
+            if let Some(note) = note {
+                let posture = posture(&req);
+                assert_eq!(note.label, name);
+                assert_eq!(note.peer_uid, 1000);
+                assert_eq!(
+                    note.account.as_deref(),
+                    posture
+                        .user
+                        .filter(|_| !matches!(posture.privilege, Privilege::AnyPeer)),
+                    "{name} names its account only when its privilege checked it"
+                );
+            }
+        }
+        let hinted = Request::PositionSample {
+            user: Some("alice".into()),
+        };
+        assert!(matches!(posture(&hinted).privilege, Privilege::AnyPeer));
+        let note = RequestFailureNote::for_request(&hinted, 1000).unwrap();
+        assert_eq!(note.account, None, "a peer's hint never names an account");
+        let invalid = Request::RenameProfile {
+            user: "../etc\nirlumed: forged".into(),
+            profile: "p".into(),
+            new_name: "q".into(),
+        };
+        let note = RequestFailureNote::for_request(&invalid, 0).unwrap();
+        assert_eq!(
+            note.account, None,
+            "an invalid account name is never journaled"
+        );
+    }
+
+    /// The line names the request, the account and the reply's error, made
+    /// journal-safe; successes and the retired requests' fixed answers get
+    /// none.
+    #[test]
+    fn a_request_failure_line_names_the_request_and_its_error() {
+        assert_eq!(
+            request_failure_line(
+                "RenameProfile",
+                Some("alice"),
+                &Response::Error("profile 'q' already exists".into())
+            )
+            .as_deref(),
+            Some("irlumed: RenameProfile for 'alice' failed: profile 'q' already exists")
+        );
+        assert_eq!(
+            request_failure_line(
+                "CameraDiagnostics",
+                None,
+                &Response::OperationError {
+                    code: irlume_common::OperationErrorCode::OperationFailed,
+                    retryable: true,
+                    cause: Some(irlume_common::OutcomeCause::CameraUnavailable),
+                }
+            )
+            .as_deref(),
+            Some(
+                "irlumed: CameraDiagnostics failed: \
+                 OperationFailed, cause CameraUnavailable, retryable"
+            )
+        );
+        let forged = request_failure_line(
+            "RenameProfile",
+            Some("alice"),
+            &Response::Error("x\nirlumed: face auth 'alice': granted=true".into()),
+        )
+        .unwrap();
+        assert!(!forged.contains('\n'), "{forged}");
+        // A peer-chosen name with a C1 control or a Unicode line or paragraph
+        // separator renders as one line too (review on #1135).
+        let separated = request_failure_line(
+            "RenameScan",
+            Some("alice"),
+            &Response::Error("no scan 'a\u{85}b\u{2028}c\u{2029}irlumed: forged'".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            separated,
+            "irlumed: RenameScan for 'alice' failed: no scan 'a b c irlumed: forged'"
+        );
+        // A support probe that caught its capture failure answers with a
+        // result; its categorical fields are the line.
+        let probe = |outcome| {
+            Response::SupportProbe(Box::new(irlume_common::diagnostics::SupportProbeResult {
+                snapshot: irlume_common::diagnostics::SupportSnapshot::bounded(
+                    0,
+                    0,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
+                source: irlume_common::diagnostics::CaptureScheduleSource::StoredQualification,
+                outcome,
+                fallback_reason: Some(
+                    irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                ),
+                rgb: irlume_common::diagnostics::ProbeRoleOutcome::Captured,
+                ir: irlume_common::diagnostics::ProbeRoleOutcome::Failed,
+            }))
+        };
+        assert_eq!(
+            request_failure_line(
+                "SupportProbe",
+                None,
+                &probe(irlume_common::diagnostics::ProbeOutcome::Failed)
+            )
+            .as_deref(),
+            Some(
+                "irlumed: SupportProbe failed: \
+                 probe Failed, rgb Captured, ir Failed, fallback PairOpenFailure"
+            )
+        );
+        assert_eq!(
+            request_failure_line(
+                "SupportProbe",
+                None,
+                &probe(irlume_common::diagnostics::ProbeOutcome::FallbackCaptured)
+            ),
+            None,
+            "a probe that captured is not a failure"
+        );
+        for routine in [
+            Response::Error(CAPTURE_EAR_MEDIAN_RETIRED.into()),
+            Response::Error(SET_CLOSURE_CALIBRATION_RETIRED.into()),
+            Response::Ok("done".into()),
+        ] {
+            assert_eq!(request_failure_line("Enroll", None, &routine), None);
+        }
+    }
+
+    /// Generic failure prose loses its measurements unless tracing is on: an
+    /// added scan that belongs to another profile quotes the match score
+    /// (review on #1135). Invisible formatting is dropped as well.
+    #[test]
+    fn journal_prose_strips_scores_and_invisible_formatting() {
+        if !irlume_common::dbglog::on() {
+            assert_eq!(
+                journal_prose("the scanned face belongs to 'other' (match 0.73)"),
+                "the scanned face belongs to 'other' (match …)"
+            );
+        }
+        assert_eq!(
+            journal_prose("no profile 'a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}'"),
+            "no profile 'abcd'"
+        );
+        assert_eq!(
+            journal_prose("x\u{2028}y\u{85}z\nirlumed: forged"),
+            "x y z irlumed: forged"
+        );
+    }
+
+    /// Identification failure lines share the request-failure limit: one per
+    /// request and peer a minute (review on #1135).
+    #[test]
+    fn identification_failure_lines_repeat_at_most_once_a_minute() {
+        let error = irlume_common::Error::CameraUnavailable("no camera found".into());
+        let now = std::time::Instant::now();
+        let mut limiter = FailureLineLimiter::default();
+        assert_eq!(
+            journal_identify_failure("Identify", 1000, &error, &mut limiter, now),
+            FailureJournal::Journaled
+        );
+        assert_eq!(
+            journal_identify_failure(
+                "Identify",
+                1000,
+                &error,
+                &mut limiter,
+                now + std::time::Duration::from_secs(2)
+            ),
+            FailureJournal::Repeated
+        );
+        assert_eq!(
+            journal_identify_failure("Identify", 1001, &error, &mut limiter, now),
+            FailureJournal::Journaled,
+            "another peer keeps its own line"
+        );
+    }
+
+    /// A grant the last admission check withheld says so with its request's
+    /// prefix (review on #1135).
+    #[test]
+    fn a_withheld_grant_names_why_it_was_not_delivered() {
+        let line = WithheldLine {
+            prefix: "irlumed: UnsealPassword: 'alice': ".into(),
+            notice: true,
+        };
+        assert_eq!(
+            line.text(&std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "authentication window expired"
+            )),
+            "irlumed: UnsealPassword: 'alice': grant not delivered (authentication window expired)"
+        );
+    }
+
+    /// A failed identification names the request and the error only: an
+    /// identification journals no decision, so no account or score (#1135).
+    #[test]
+    fn a_failed_identification_names_only_its_error() {
+        assert_eq!(
+            identify_failure_line(
+                "IdentifyFor",
+                &irlume_common::Error::CameraUnavailable("no camera found".into())
+            ),
+            "irlumed: IdentifyFor failed: hardware: no camera found"
+        );
+        let forged = identify_failure_line(
+            "Identify",
+            &irlume_common::Error::Hardware("x\nirlumed: face auth 'alice': granted=true".into()),
+        );
+        assert!(!forged.contains('\n'), "{forged}");
+    }
+
+    /// One line per request, peer and account per minute; repeats are debug
+    /// only, one peer cannot use up another's, and keys older than the window
+    /// are dropped.
+    #[test]
+    fn request_failure_lines_repeat_at_most_once_a_minute() {
+        let start = std::time::Instant::now();
+        let mut limiter = FailureLineLimiter::default();
+        assert!(limiter.admit("CaptureModeStatus", 0, None, start));
+        assert!(!limiter.admit(
+            "CaptureModeStatus",
+            0,
+            None,
+            start + std::time::Duration::from_secs(59)
+        ));
+        assert!(limiter.admit("CaptureModeStatus", 0, Some("alice"), start));
+        assert!(limiter.admit("CaptureModeStatus", 1000, None, start));
+        assert!(limiter.admit("PositionSample", 0, None, start));
+        assert!(limiter.admit(
+            "CaptureModeStatus",
+            0,
+            None,
+            start + std::time::Duration::from_secs(60)
+        ));
+        limiter.admit(
+            "Enroll",
+            0,
+            None,
+            start + std::time::Duration::from_secs(200),
+        );
+        assert_eq!(
+            limiter.last.len(),
+            1,
+            "only the last minute's keys are kept"
+        );
+    }
+
+    /// Every failed request ends with its line, also after a line its
+    /// handler wrote: an earlier notice or warning need not report the failure
+    /// (review on #1135). Successes get none, and a repeat within the minute
+    /// is debug only.
+    #[test]
+    fn a_failed_request_gets_its_line_after_its_handlers_own() {
+        let note = RequestFailureNote::for_request(
+            &Request::RenameProfile {
+                user: "alice".into(),
+                profile: "p".into(),
+                new_name: "q".into(),
+            },
+            0,
+        )
+        .unwrap();
+        let failed = Response::Error("profile 'q' already exists".into());
+        let now = std::time::Instant::now();
+        let mut limiter = FailureLineLimiter::default();
+        jout_notice!("irlumed: RenameProfile: an unrelated notice before the failure");
+        assert_eq!(
+            note.journal(&Response::Ok("renamed".into()), &mut limiter, now),
+            FailureJournal::NotAFailure
+        );
+        assert_eq!(
+            note.journal(&failed, &mut limiter, now),
+            FailureJournal::Journaled
+        );
+        assert_eq!(
+            note.journal(&failed, &mut limiter, now),
+            FailureJournal::Repeated
+        );
     }
 
     /// The macro pairs a name with an expression and cannot check that the
@@ -19704,6 +20460,43 @@ mod tests {
         let out = journal_safe(&long);
         assert_eq!(out.len(), 64 + 3, "clamped to 64 plus an ellipsis marker");
         assert!(out.ends_with("..."));
+    }
+
+    /// An Authenticate attempt that ended without a decision gets a journal
+    /// line where a decision would (#1063): the engine's error, made
+    /// journal-safe, on one line.
+    #[test]
+    fn an_attempt_without_a_decision_names_its_error_on_one_line() {
+        assert_eq!(
+            no_decision_line(
+                "alice",
+                &irlume_common::Error::IrIlluminationUnreported(
+                    "split IR frame lacks active illumination provenance".into()
+                )
+            ),
+            "irlumed: face auth 'alice': no decision: \
+             hardware: split IR frame lacks active illumination provenance"
+        );
+        assert_eq!(
+            no_decision_line("alice", &irlume_common::Error::DeadlineExpired),
+            "irlumed: face auth 'alice': no decision: \
+             authentication window expired; use your password"
+        );
+        // Engine prose carrying a newline cannot forge a second line.
+        let forged = no_decision_line(
+            "alice",
+            &irlume_common::Error::Hardware("x\nirlumed: face auth 'alice': granted=true".into()),
+        );
+        assert!(!forged.contains('\n'), "{forged}");
+        // Longer than journal_safe's 64 characters, clamped at 240.
+        let long = no_decision_line("alice", &irlume_common::Error::Hardware("y".repeat(400)));
+        assert!(long.ends_with("..."));
+        assert_eq!(
+            long.len(),
+            "irlumed: face auth 'alice': no decision: ".len() + 240 + 3
+        );
+        // The convenience tier journals both, whatever the trace setting.
+        assert!(journals_face_decisions(true));
     }
 
     #[test]

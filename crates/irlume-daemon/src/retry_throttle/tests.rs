@@ -475,6 +475,7 @@ mod cumulative {
                 attempt: start_attempt(f).unwrap().unwrap(),
                 window: irlume_auth::AuthenticationWindow::for_service(None),
                 shared_unlock: None,
+                withheld_line: None,
             }),
             filing: None,
         }
@@ -1002,6 +1003,7 @@ fn both_completion_paths_refuse_before_grant_or_secret_release_on_failed_commit(
             let f = Fixture::new();
             f.record(Kind::Spoof);
             let released = std::cell::Cell::new(false);
+            let withdrawn = std::cell::RefCell::new(Vec::new());
             let response = crate::recorded_face_response(
                 || {
                     f.store
@@ -1013,10 +1015,16 @@ fn both_completion_paths_refuse_before_grant_or_secret_release_on_failed_commit(
                     released.set(true);
                     irlume_common::Response::Ok("synthetic completion".into())
                 },
+                |why| withdrawn.borrow_mut().push(why.to_string()),
             );
             assert!(
                 !released.get(),
                 "no grant or password release after failed commit"
+            );
+            // The refusal is told to the caller to journal (#1135).
+            assert_eq!(
+                withdrawn.take(),
+                vec![format!("refused by the retry accounting ({UNAVAILABLE})")]
             );
             match response {
                 irlume_common::Response::AuthResult {
@@ -1052,8 +1060,13 @@ fn both_completion_paths_refuse_before_grant_or_secret_release_on_failed_commit(
                     released.set(true);
                     irlume_common::Response::Ok("synthetic completion".into())
                 },
+                |why| withdrawn.borrow_mut().push(why.to_string()),
             );
             assert!(matches!(response, irlume_common::Response::Ok(_)));
+            assert!(
+                withdrawn.take().is_empty(),
+                "a completed reply tells nothing"
+            );
             assert!(released.get());
             assert_eq!(f.saved().strikes, 0);
         }

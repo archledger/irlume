@@ -4912,6 +4912,13 @@ impl Engine {
         )
         .map_err(lease_unavailable)?;
         self.emit_capture_setup(diagnostics);
+        // Announce the selection this one-shot path resolved without the
+        // sink: identify's trace carries rgb_capture/ir_capture stages, and
+        // without the marker a schedule-aware reader cannot tell a
+        // sequential pair from a concurrent one (found on the #856 BRIO
+        // acceptance trace). Every other capture route emits the same
+        // context after its selection.
+        emit_capture_context(&selection, self.ir_available, diagnostics);
         operation
             .run(|| {
                 if self.ir_available {
@@ -17906,5 +17913,26 @@ mod engine_tests {
             }
             other => panic!("a panicked loader must fail closed: {other:?}"),
         }
+    }
+    #[test]
+    fn assess_prepared_announces_the_capture_schedule_it_runs() {
+        // The identify one-shot path selects a capture mode without the
+        // diagnostics sink, so its trace carried rgb_capture/ir_capture
+        // stages with no capture_schedule_selected marker - and the
+        // schedule-aware sequential envelope read 0 for a sequential pair
+        // (found on the #856 BRIO acceptance trace). Every other capture
+        // route announces its selection through emit_capture_context.
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("fn assess_prepared(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("emit_capture_context("),
+            "assess_prepared must announce its capture-mode selection"
+        );
     }
 }

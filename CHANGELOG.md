@@ -708,6 +708,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume support-report`'s `platform_supported` check warns on a
+  distribution outside the Debian, Fedora and Arch families, as it was
+  written to. It compared the family's display text, `other/unknown`, with
+  `"other"`, which never matched, so every platform reported `pass`.
+
 - irlumed's background-requalification journal lines ("camera context
   changed since the last qualification", "background requalification
   failed") and the engine's proactive-degradation debug line no longer

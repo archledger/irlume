@@ -113,6 +113,19 @@ pub(crate) fn parse_since(raw: Option<&str>) -> Result<Duration, &'static str> {
     Ok(Duration::from_millis(milliseconds))
 }
 
+/// The `platform_supported` state: a warning off the three supported
+/// distribution families. Decided on the family itself: its display text is
+/// `other/unknown`, which the comparison with `"other"` this replaced never
+/// matched, so an unsupported platform reported `pass`.
+fn platform_check(family: &irlume_common::platform::DistroFamily) -> CheckState {
+    match family {
+        irlume_common::platform::DistroFamily::Other => CheckState::Warn,
+        irlume_common::platform::DistroFamily::Debian
+        | irlume_common::platform::DistroFamily::Fedora
+        | irlume_common::platform::DistroFamily::Arch => CheckState::Pass,
+    }
+}
+
 pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     let install_channel = match crate::commands::install_origin() {
         crate::commands::InstallOrigin::Copr => InstallChannel::FedoraCopr,
@@ -125,15 +138,12 @@ pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
         crate::commands::InstallOrigin::ArchGit => InstallChannel::ArchGit,
         crate::commands::InstallOrigin::Source => InstallChannel::Source,
     };
-    let platform = irlume_common::platform::distro_family().as_str();
+    let family = irlume_common::platform::distro_family();
+    let platform = family.as_str();
     let mut checks = vec![
         SupportCheck {
             id: CheckId::PlatformSupported,
-            state: if platform == "other" {
-                CheckState::Warn
-            } else {
-                CheckState::Pass
-            },
+            state: platform_check(&family),
         },
         SupportCheck {
             id: CheckId::InstallChannel,
@@ -939,6 +949,23 @@ mod tests {
         QualificationReason, QualificationState, RateShortfallEvidence, RateShortfallsByArm,
         RateShortfallsByRole, RuntimeViolationLabel, SafeLabel, SanitizedCameraContext,
     };
+
+    /// An unsupported distribution warns; the three supported families pass.
+    #[test]
+    fn platform_supported_warns_off_the_supported_families() {
+        use irlume_common::platform::DistroFamily;
+        assert!(matches!(
+            platform_check(&DistroFamily::Other),
+            CheckState::Warn
+        ));
+        for family in [
+            DistroFamily::Debian,
+            DistroFamily::Fedora,
+            DistroFamily::Arch,
+        ] {
+            assert!(matches!(platform_check(&family), CheckState::Pass));
+        }
+    }
 
     fn fixture_report() -> SupportReport {
         SupportReport {

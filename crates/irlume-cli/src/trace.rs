@@ -5,8 +5,8 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    parse_trace, TraceEventKind, TraceLimits, TraceRecord, TraceStage, TraceValidator,
-    CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
+    parse_trace, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord, TraceStage,
+    TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
     MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
 use irlume_common::{Request, Response};
@@ -542,6 +542,26 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                     end_us: record.monotonic_us,
                 });
             }
+        }
+        // A trace whose recording deadline expired mid-operation ends with
+        // only the stream's global terminal record: the operation never got
+        // its OperationFinished transition, so its remaining stages went
+        // unobserved and full-looking envelope numbers would be fiction.
+        let completed = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished { .. },
+                }
+            )
+        });
+        if !completed {
+            writeln!(
+                output,
+                "  REFUSED: operation cut off before completion (no OperationFinished event)"
+            )
+            .unwrap();
+            continue;
         }
         if intervals.is_empty() {
             writeln!(output, "  no stage timings").unwrap();
@@ -1129,8 +1149,19 @@ mod tests {
             // sequential stage appended inside it.
             stage_record(12, 565_000, TraceStage::EngineAuthenticate, 555_000),
         ]);
-        records.push(fixture_record(
+        let mut operation_finished = fixture_record(
             13,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+            false,
+        );
+        operation_finished.monotonic_us = 568_000;
+        records.push(operation_finished);
+        records.push(fixture_record(
+            14,
             TraceEventKind::Finished {
                 outcome: CategoricalOutcome::Completed,
             },
@@ -1205,13 +1236,22 @@ mod tests {
             ),
             fixture_record(
                 2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
                 TraceEventKind::Finished {
                     outcome: CategoricalOutcome::Completed,
                 },
                 true,
             ),
         ];
-        let times = [100_000_u64, 115_000, 120_000];
+        let times = [100_000_u64, 115_000, 118_000, 120_000];
         for (record, time) in records.iter_mut().zip(times) {
             record.monotonic_us = time;
         }
@@ -1372,6 +1412,15 @@ mod tests {
             ),
             fixture_record(
                 3,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                4,
                 TraceEventKind::Finished {
                     outcome: CategoricalOutcome::Completed,
                 },
@@ -1389,6 +1438,48 @@ mod tests {
             rendered.contains("REFUSED: 2 Finalization records"),
             "{rendered}"
         );
+
+        // A trace whose deadline expired mid-operation: the stream terminal
+        // record is present, but the operation never finished, so its
+        // envelope numbers must be refused rather than rendered.
+        let cutoff = dir.join("cutoff.jsonl");
+        let cutoff_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::SequentialRgbSample,
+                    elapsed_us: 5_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let mut bytes = Vec::new();
+        for record in &cutoff_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&cutoff, bytes).unwrap();
+        let rendered = analyze(&cutoff).unwrap();
+        assert!(
+            rendered.contains("REFUSED: operation cut off before completion"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("sequential_union_us"), "{rendered}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

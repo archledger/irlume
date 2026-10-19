@@ -1434,8 +1434,8 @@ fn main() {
                                 irlume_auth::QualificationMismatch::ContextChanged,
                             )) => {
                                 jout_notice!(
-                                    "irlumed: camera context changed since the last \\
-                                     qualification; running a background requalification \\
+                                    "irlumed: camera context changed since the last \
+                                     qualification; running a background requalification \
                                      (the IR emitter fires for up to a minute)"
                                 );
                                 // This task bypasses the request worker. Its
@@ -1453,7 +1453,7 @@ fn main() {
                                         "irlumed: background requalification complete: {note}"
                                     ),
                                     Err(e) => jout_warn!(
-                                        "irlumed: background requalification failed ({e}); \\
+                                        "irlumed: background requalification failed ({e}); \
                                          run `sudo irlume camera-tune` to requalify manually"
                                     ),
                                 }
@@ -12618,6 +12618,54 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Ratchet: no line of the workspace's Rust sources ends in an escaped
+    /// backslash. In a string literal, `\\` at the end of a line is a
+    /// backslash character followed by the line break and the next line's
+    /// indentation, so a message meant to continue on the next source line
+    /// printed all three; three background-requalification journal lines and
+    /// an assessment debug line did. A continuation is a single `\`. The
+    /// needle is built so this test does not match its own source.
+    #[test]
+    fn workspace_sources_have_no_escaped_backslash_line_ends() {
+        let needle = concat!("\\", "\\");
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the daemon crate sits in crates/")
+            .to_path_buf();
+        let mut offenders = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name != "target") {
+                        stack.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    for (no, line) in std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                        .lines()
+                        .enumerate()
+                    {
+                        // An even run of backslashes at the end: escaped
+                        // backslashes, not a continuation.
+                        let run = line.len() - line.trim_end_matches('\\').len();
+                        if line.ends_with(needle) && run % 2 == 0 {
+                            offenders.push(format!("{}:{}", path.display(), no + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a line ends in an escaped backslash, which prints a backslash and a line break; \
+             end a continued string with a single backslash: {offenders:#?}"
+        );
     }
 
     /// Ratchet: daemon source must emit through the leveled jout_* macros (or

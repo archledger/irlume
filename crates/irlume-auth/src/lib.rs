@@ -5949,8 +5949,8 @@ impl Engine {
                         );
                     }
                     irlume_common::dlog!(
-                        "assess: proactive degradation: concurrent capture succeeded \\
-                         but showed warning signs (rgb_gap={rgb_gap}, ir_gap={ir_gap}, \\
+                        "assess: proactive degradation: concurrent capture succeeded \
+                         but showed warning signs (rgb_gap={rgb_gap}, ir_gap={ir_gap}, \
                          ts_discontinuity={ts_disc}); subsequent captures go sequential"
                     );
                 }

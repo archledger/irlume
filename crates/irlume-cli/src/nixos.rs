@@ -34,7 +34,7 @@ pub(crate) const PAM_POINTER: &str = "on NixOS the system configuration owns the
 
 /// Whether os-release text describes NixOS: its `ID` is `nixos`. An `ID`
 /// that is empty or quoted on one side only names no distribution.
-fn is_nixos(os_release: &str) -> bool {
+pub(crate) fn is_nixos(os_release: &str) -> bool {
     crate::os_release::field(os_release, "ID") == Some(Ok("nixos"))
 }
 

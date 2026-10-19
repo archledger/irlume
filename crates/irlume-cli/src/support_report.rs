@@ -129,6 +129,16 @@ fn platform_check(family: &irlume_common::platform::DistroFamily, nixos: bool) -
     }
 }
 
+/// The report's `platform` text and its `platform_supported` state, both from
+/// one os-release text.
+fn platform_facts(os_release: &str) -> (&'static str, CheckState) {
+    let family = irlume_common::platform::distro_family_from(os_release);
+    (
+        family.as_str(),
+        platform_check(&family, crate::nixos::is_nixos(os_release)),
+    )
+}
+
 pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     let install_channel = match crate::commands::install_origin() {
         crate::commands::InstallOrigin::Copr => InstallChannel::FedoraCopr,
@@ -141,12 +151,15 @@ pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
         crate::commands::InstallOrigin::ArchGit => InstallChannel::ArchGit,
         crate::commands::InstallOrigin::Source => InstallChannel::Source,
     };
-    let family = irlume_common::platform::distro_family();
-    let platform = family.as_str();
+    // One os-release reading for the platform text and its check, from the
+    // reader that falls back to /usr/lib/os-release when /etc/os-release is
+    // absent; `distro_family()` reads /etc/os-release only.
+    let (platform, platform_state) =
+        platform_facts(&crate::os_release::read_host().unwrap_or_default());
     let mut checks = vec![
         SupportCheck {
             id: CheckId::PlatformSupported,
-            state: platform_check(&family, crate::nixos::host_is_nixos()),
+            state: platform_state,
         },
         SupportCheck {
             id: CheckId::InstallChannel,
@@ -972,6 +985,26 @@ mod tests {
             DistroFamily::Arch,
         ] {
             assert!(matches!(platform_check(&family, false), CheckState::Pass));
+        }
+    }
+
+    /// The platform text and its check come from the same os-release text,
+    /// whichever file it was read from (review on #1143).
+    #[test]
+    fn platform_facts_read_one_os_release_text() {
+        let cases = [
+            ("ID=debian\n", "Debian-family", true),
+            ("ID=fedora\n", "Fedora-family", true),
+            ("ID=arch\n", "Arch-family", true),
+            ("NAME=NixOS\nID=nixos\n", "other/unknown", true),
+            ("ID=opensuse-tumbleweed\n", "other/unknown", false),
+            ("", "other/unknown", false),
+        ];
+        for (text, platform, passes) in cases {
+            let (shown, state) = platform_facts(text);
+            assert_eq!(shown, platform, "{text:?}");
+            assert_eq!(matches!(state, CheckState::Pass), passes, "{text:?}");
+            assert_eq!(matches!(state, CheckState::Warn), !passes, "{text:?}");
         }
     }
 

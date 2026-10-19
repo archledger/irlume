@@ -125,10 +125,13 @@ pub fn omarchy_present_in(root: &std::path::Path) -> bool {
     root.join("usr/share/omarchy").is_dir()
 }
 
-/// Classify raw `os-release` contents. Split out of [`distro_family`] verbatim
-/// (test seam: the parse is exercised against fixture strings without touching
-/// the host's `/etc/os-release`); behavior unchanged.
-fn distro_family_from(os: &str) -> DistroFamily {
+/// Classify raw `os-release` contents. [`distro_family`] reads
+/// `/etc/os-release` itself; a caller holding os-release text from elsewhere
+/// (the CLI's reader, which falls back to `/usr/lib/os-release` as
+/// os-release(5) describes) classifies it here, and the tests exercise the
+/// parse against fixture strings without touching the host's file.
+#[must_use]
+pub fn distro_family_from(os: &str) -> DistroFamily {
     let field = |key: &str| -> String {
         os.lines()
             .find_map(|l| l.strip_prefix(key))

@@ -712,7 +712,9 @@ All notable changes to irlume are documented here. This project adheres to
   distribution outside the Debian, Fedora and Arch families and NixOS, as
   it was written to. It compared the family's display text,
   `other/unknown`, with `"other"`, which never matched, so every platform
-  reported `pass`.
+  reported `pass`. The check and the report's `platform` text read the
+  host's os-release once, falling back to `/usr/lib/os-release` when
+  `/etc/os-release` is absent.
 
 - irlumed's background-requalification journal lines ("camera context
   changed since the last qualification", "background requalification

@@ -9518,6 +9518,34 @@ fn journal_identify_failure(
     }
 }
 
+/// Journal a face request its retry admission refused before it started: the
+/// account reached the retry ceiling, or its retry state could not be read
+/// (#1136). A refusal is not a decision about a face, so it is journaled on
+/// every tier at notice level, as the other policy refusals are, once a
+/// minute per request, peer and account; a lock screen in `wait` mode asks
+/// every 400 ms, and its repeats go to the debug log.
+fn journal_retry_refusal(
+    prefix: &str,
+    label: &'static str,
+    peer_uid: u32,
+    user: &str,
+    reason: &str,
+    limiter: &mut FailureLineLimiter,
+    now: std::time::Instant,
+) -> FailureJournal {
+    let line = format!(
+        "{prefix}refused by the retry accounting ({})",
+        journal_prose(reason)
+    );
+    if limiter.admit(label, peer_uid, Some(user), now) {
+        jout_notice!("{line}");
+        FailureJournal::Journaled
+    } else {
+        irlume_common::dlog!("{line} (repeated within a minute)");
+        FailureJournal::Repeated
+    }
+}
+
 /// The journal line for an identification that failed before a decision:
 /// the request and the engine's error, on one line. An identification
 /// journals no decision, so this carries no account, score or match.
@@ -10304,7 +10332,18 @@ fn dispatch_after_authorization(
             let account_uid = request_account_uid(peer, scope.owner());
             let retry_attempt = match retry_throttle::FaceAttempt::for_account(account_uid) {
                 Ok(attempt) => attempt,
-                Err(reason) => return retry_verify_refusal(reason),
+                Err(reason) => {
+                    journal_retry_refusal(
+                        &format!("irlumed: face auth '{user}': "),
+                        "Authenticate",
+                        peer.uid,
+                        &user,
+                        reason,
+                        &mut failure_lines(),
+                        std::time::Instant::now(),
+                    );
+                    return retry_verify_refusal(reason);
+                }
             };
             let convenience = tier == irlume_core::biopolicy::Tier::Convenience;
             let t = std::time::Instant::now();
@@ -12055,7 +12094,19 @@ fn do_unseal_password_scoped(
     // written for against it.
     let retry_attempt = match retry_throttle::FaceAttempt::for_account(account_uid) {
         Ok(attempt) => attempt,
-        Err(reason) => return retry_unseal_refusal(reason),
+        Err(reason) => {
+            // UnsealPassword is root-only (its posture), so its peer is uid 0.
+            journal_retry_refusal(
+                &format!("irlumed: UnsealPassword: '{user}': "),
+                "UnsealPassword",
+                0,
+                user,
+                reason,
+                &mut failure_lines(),
+                std::time::Instant::now(),
+            );
+            return retry_unseal_refusal(reason);
+        }
     };
     // ADR-0027, same shape as the Authenticate arm: one reply builder, run by
     // the engine's decision hook before the concurrent pair is released, or
@@ -15019,6 +15070,53 @@ mod tests {
         assert_eq!(
             journal_prose("x\u{2028}y\u{85}z\nirlumed: forged"),
             "x y z irlumed: forged"
+        );
+    }
+
+    /// A face request the retry ceiling refuses before it starts gets one
+    /// notice line a minute per request, peer and account, whatever the tier
+    /// (#1136).
+    #[test]
+    fn a_retry_ceiling_refusal_is_journaled_once_a_minute() {
+        let now = std::time::Instant::now();
+        let mut limiter = FailureLineLimiter::default();
+        let refuse = |limiter: &mut FailureLineLimiter, uid, user, at| {
+            journal_retry_refusal(
+                &format!("irlumed: face auth '{user}': "),
+                "Authenticate",
+                uid,
+                user,
+                retry_throttle::LIMITED,
+                limiter,
+                at,
+            )
+        };
+        assert_eq!(
+            refuse(&mut limiter, 1000, "alice", now),
+            FailureJournal::Journaled
+        );
+        assert_eq!(
+            refuse(
+                &mut limiter,
+                1000,
+                "alice",
+                now + std::time::Duration::from_millis(400)
+            ),
+            FailureJournal::Repeated,
+            "a wait-mode lock screen's next request"
+        );
+        assert_eq!(
+            refuse(&mut limiter, 1001, "bob", now),
+            FailureJournal::Journaled
+        );
+        assert_eq!(
+            refuse(
+                &mut limiter,
+                1000,
+                "alice",
+                now + std::time::Duration::from_secs(60)
+            ),
+            FailureJournal::Journaled
         );
     }
 

@@ -136,6 +136,95 @@ does not supply the retained-model endurance or suspend protocols.
 The historical campaign remains bound to its recorded source and binary
 in [the cache receipt](research/2026-10-12-gpu-cache-provenance.md).
 
+### Retained-process reliability control
+
+The separate ignored control
+`onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control`
+keeps one recognizer request and four immutable synthetic references through
+400 pre-event, 300 runtime-event and 300 system-event calls. The first calls
+after each event count; setup, platform warm-up and CPU canaries do not. Every
+counted result must reproduce all finite output bits. An error or failed
+CPU/inventory/device-binding boundary stops the run without replacement calls.
+
+From the same root/provider/model/CPU/TFLite environment used for the cache
+controls, set `IRLUME_GPU_RELIABILITY_REFERENCE` to a regular JSON file with
+exactly these five fields (maximum 8192 bytes):
+
+| Field | Required value |
+|---|---|
+| `identity` | Prior matching GPU identity digest, 64 lowercase hex characters |
+| `cpu_reference` | Prior matching CPU reference digest, 64 lowercase hex characters |
+| `gpu_bits` | Array of four prior raw GPU output digests for `chip(0..3)`, in order |
+| `runtime_wait_secs` | Integer 0 through 600 |
+| `system_wait_secs` | Integer 0 through 600 |
+
+Use digests from the same previously verified synthetic receipt; the control
+refuses a changed identity or baseline. It compiles with verified model-cache
+bypass, fixed batch1/LATENCY/f16 and explicit placement on the platform's sole
+enumerated device; the accepted assignment is that device's name (for example
+`GPU.0`) or the generic `GPU` some `EXECUTION_DEVICES` answers report. Do not
+derive a replacement reference from a failed run.
+
+Zero system wait supports unattended operational evidence only. A nonzero
+system wait additionally requires `IRLUME_GPU_RELIABILITY_ATTENDED=1`, set only
+after the operator is ready for this particular retained process. At the
+`RELIABILITY_READY` line after 700 counted calls, the operator initiates system
+suspend/resume. The control never invokes suspend or changes runtime-PM policy.
+
+```sh
+ulimit -c 0
+: "${IRLUME_GPU_RELIABILITY_REFERENCE:?set the prior-reference JSON path}"
+export IRLUME_GPU_RELIABILITY_REFERENCE
+control=onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control
+cargo test -p irlume-vision --features npu --release --lib -- \
+  --ignored --exact "$control" --test-threads 1 --nocapture
+```
+
+The runtime witness reads the bound PCI device's power metadata and counters,
+requiring active/suspended/suspended/active endpoints and positive suspended
+growth, with conservative clock bounds excluding material system sleep across
+the whole leg and its first four post-wait calls. System evidence requires a
+fresh clock-offset increase strictly greater than 1 ms. Neither idle delay nor
+historical counter totals suffice. Missing events yield explicitly inconclusive
+coverage even if all 1000 operational calls succeed; unavailable observations
+can refuse the run without attributing a GPU failure.
+
+Archive actual phase counts, witnesses, identity, source and binary hashes.
+`RELIABILITY_COVERAGE_READY=true` is conditional evidence after owned resources
+are dropped, with `NORMAL_PROCESS_EXIT=PENDING`. Accept it only together with
+the exact process's normal exit and one passed selected test, no timeout/crash.
+Cargo exit zero alone is insufficient. This control supplies neither full
+certification nor production admission; CPU remains authoritative.
+
+### Runtime-PM lifetime diagnosis
+
+For an unexplained missing runtime event, the separate ignored selector
+`onnx::gpu_tests::gpu_pm_diagnostic_tests::gpu_pm_hw_lifetime_diagnostic`
+compares CPU-only baseline, warmed GPU platform/Core, retained recognizer request,
+request dropped, and platform dropped. Library-global state can survive Core
+destruction; observe a separate `baseline` process after the `lifetime` process
+has exited as well. This intentionally changes object lifetimes and counts **zero
+qualification/endurance calls**. It never initiates system sleep, changes power
+policy, blanks the display or stops other clients.
+
+Use the same root/runtime/model environment and current prior-reference JSON as
+the retained control, with its system wait set to0. Supply all four additional
+settings explicitly:
+
+- `IRLUME_GPU_PM_MODE=baseline` or `lifetime`;
+- `IRLUME_GPU_PM_RENDER_NODE=renderD128` (the selected device's actual node);
+- `IRLUME_GPU_PM_IDLE_SECONDS=60` (integer1 through120, identical across phases);
+- `IRLUME_GPU_PM_OUTPUT_DIR` naming an existing empty absolute directory owned
+  by the test's effective user and inaccessible to group/other users.
+
+Run with `--ignored --exact` and `--test-threads 1 --nocapture`. Each phase saves
+every valid metadata sample, clock bounds, counters and owned device handles in
+private JSON. Console output stays quiet inside each window to avoid per-sample
+rendering activity. Missing/changed metadata, non-AUTO control, counter decreases,
+unexcluded system sleep or changed reference/inventory refuses the comparison.
+Keep the external desktop conditions comparable; a difference or lack of one is
+diagnostic evidence, not automatic attribution to the provider or certification.
+
 ## Select a C API file
 
 Automatic selection checks `libopenvino_c.so.2621` first, then

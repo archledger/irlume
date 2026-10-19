@@ -2219,6 +2219,7 @@ SETUP & STATUS
   support-report [--output FILE.txt] [--since 10m] [--probe]
   trace [record] [--duration 60s] [--output FILE.jsonl]
   trace explain FILE.jsonl [--output FILE.txt]
+  trace analyze FILE.jsonl [--output FILE.txt]
                         create a private 0600 report; default is read-only and
                         camera-free, while --probe is explicit and root-only
   deps                  verify runtime dependencies (onnxruntime, models, TPM)

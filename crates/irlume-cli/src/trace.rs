@@ -459,21 +459,43 @@ struct StageInterval {
     end_us: u64,
 }
 
-/// Merge sorted, possibly nested intervals into disjoint blocks, keeping the
-/// stages each block covers so gap attribution can name its borders.
-fn merge_intervals(mut intervals: Vec<StageInterval>) -> Vec<(u64, u64, Vec<String>)> {
+/// A merged block keeps the stages that form its boundaries: the interval
+/// with the earliest start and the interval whose end is the block's end,
+/// which is not necessarily the last one appended.
+struct MergedBlock {
+    start_us: u64,
+    end_us: u64,
+    start_stage: String,
+    end_stage: String,
+}
+
+fn merge_intervals(mut intervals: Vec<StageInterval>) -> Vec<MergedBlock> {
     intervals.sort_by_key(|interval| (interval.start_us, interval.end_us));
-    let mut merged: Vec<(u64, u64, Vec<String>)> = Vec::new();
+    let mut merged: Vec<MergedBlock> = Vec::new();
     for interval in intervals {
         match merged.last_mut() {
-            Some((_, end, stages)) if interval.start_us <= *end => {
-                *end = (*end).max(interval.end_us);
-                stages.push(interval.stage);
+            Some(block) if interval.start_us <= block.end_us => {
+                if interval.end_us > block.end_us {
+                    block.end_us = interval.end_us;
+                    block.end_stage = interval.stage;
+                }
             }
-            _ => merged.push((interval.start_us, interval.end_us, vec![interval.stage])),
+            _ => merged.push(MergedBlock {
+                start_us: interval.start_us,
+                end_us: interval.end_us,
+                start_stage: interval.stage.clone(),
+                end_stage: interval.stage,
+            }),
         }
     }
     merged
+}
+
+fn union_us(blocks: &[MergedBlock]) -> u64 {
+    blocks
+        .iter()
+        .map(|block| block.end_us - block.start_us)
+        .sum()
 }
 
 fn render_analysis(records: &[TraceRecord]) -> String {
@@ -511,11 +533,6 @@ fn render_analysis(records: &[TraceRecord]) -> String {
             operation_records[0].operation
         )
         .unwrap();
-        let span_us = operation_records
-            .last()
-            .zip(operation_records.first())
-            .map(|(last, first)| last.monotonic_us.saturating_sub(first.monotonic_us))
-            .unwrap_or(0);
         let mut intervals = Vec::new();
         for record in &operation_records {
             if let TraceEventKind::StageTiming { stage, elapsed_us } = record.event {
@@ -530,41 +547,70 @@ fn render_analysis(records: &[TraceRecord]) -> String {
             writeln!(output, "  no stage timings").unwrap();
             continue;
         }
-        let blocks = merge_intervals(intervals);
-        let union_us: u64 = blocks.iter().map(|(s, e, _)| e - s).sum();
-        let residual_us = span_us.saturating_sub(union_us);
-        writeln!(output, "  span_us={span_us}").unwrap();
-        writeln!(output, "  stage_union_us={union_us}").unwrap();
-        writeln!(output, "  residual_us={residual_us}").unwrap();
-        let sequential_union_us: u64 = blocks
+        // The span starts at the earliest reconstructed interval start when
+        // recording began mid-operation, so the union never exceeds it and
+        // the leading edge stays an explicit edge rather than vanishing.
+        let span_start_us = operation_records
             .iter()
-            .filter(|(_, _, stages)| stages.iter().any(|s| s.starts_with("Sequential")))
-            .map(|(s, e, _)| e - s)
-            .sum();
-        writeln!(output, "  sequential_union_us={sequential_union_us}").unwrap();
+            .map(|record| record.monotonic_us)
+            .chain(intervals.iter().map(|interval| interval.start_us))
+            .min()
+            .unwrap_or(0);
+        let span_end_us = operation_records
+            .last()
+            .map(|record| record.monotonic_us)
+            .unwrap_or(span_start_us);
+        let span_us = span_end_us.saturating_sub(span_start_us);
+        let blocks = merge_intervals(intervals);
+        let stage_union = union_us(&blocks);
+        let residual_us = span_us.saturating_sub(stage_union);
+        writeln!(output, "  span_us={span_us}").unwrap();
+        writeln!(output, "  stage_union_us={stage_union}").unwrap();
+        writeln!(output, "  residual_us={residual_us}").unwrap();
+        // The sequential envelope is the union of the sequential intervals
+        // alone: an end-to-end stage that spans the whole engine call must
+        // not absorb setup, evaluation or matching into this number.
+        let sequential_blocks = merge_intervals(sequential_intervals(&operation_records));
+        let sequential_union = union_us(&sequential_blocks);
+        writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
         writeln!(output, "  blocks:").unwrap();
-        for (start_us, end_us, stages) in &blocks {
+        for block in &blocks {
             writeln!(
                 output,
-                "    {start_us:>10}..{end_us:<10} {}",
-                stages.join("+")
+                "    {:>10}..{:<10} {}..{}",
+                block.start_us, block.end_us, block.start_stage, block.end_stage
             )
             .unwrap();
         }
-        if blocks.len() > 1 {
-            writeln!(output, "  gaps:").unwrap();
-            for pair in blocks.windows(2) {
-                let gap_us = pair[1].0.saturating_sub(pair[0].1);
-                if gap_us > 0 {
-                    writeln!(
-                        output,
-                        "    gap_us={gap_us} after {} before {}",
-                        pair[0].2.last().unwrap(),
-                        pair[1].2.first().unwrap()
-                    )
-                    .unwrap();
-                }
+        writeln!(output, "  gaps:").unwrap();
+        let leading_us = blocks[0].start_us.saturating_sub(span_start_us);
+        if leading_us > 0 {
+            writeln!(
+                output,
+                "    gap_us={leading_us} after operation-start before {}",
+                blocks[0].start_stage
+            )
+            .unwrap();
+        }
+        for pair in blocks.windows(2) {
+            let gap_us = pair[1].start_us.saturating_sub(pair[0].end_us);
+            if gap_us > 0 {
+                writeln!(
+                    output,
+                    "    gap_us={gap_us} after {} before {}",
+                    pair[0].end_stage, pair[1].start_stage
+                )
+                .unwrap();
             }
+        }
+        let trailing_us = span_end_us.saturating_sub(blocks[blocks.len() - 1].end_us);
+        if trailing_us > 0 {
+            writeln!(
+                output,
+                "    gap_us={trailing_us} after {} before operation-end",
+                blocks[blocks.len() - 1].end_stage
+            )
+            .unwrap();
         }
         for record in &operation_records {
             if let TraceEventKind::StageTiming {
@@ -602,12 +648,55 @@ fn render_analysis(records: &[TraceRecord]) -> String {
     output
 }
 
+fn sequential_intervals(operation_records: &[&TraceRecord]) -> Vec<StageInterval> {
+    operation_records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEventKind::StageTiming { stage, elapsed_us } => format!("{stage:?}")
+                .starts_with("Sequential")
+                .then_some(StageInterval {
+                    stage: format!("{stage:?}"),
+                    start_us: record.monotonic_us.saturating_sub(elapsed_us),
+                    end_us: record.monotonic_us,
+                }),
+            _ => None,
+        })
+        .collect()
+}
+
 fn analyze(input: &Path) -> Result<String, String> {
     let file =
         std::fs::File::open(input).map_err(|error| format!("{}: {error}", input.display()))?;
     let limits = TraceLimits::bounded(MAX_TRACE_DURATION_MS);
     let parsed = parse_trace(BufReader::new(file), limits).map_err(|error| error.to_string())?;
-    Ok(render_analysis(parsed.records()))
+    let records = parsed.records();
+    // The envelope projection is only defined for the schema that carries
+    // the sequential capture stages; an older trace without them would
+    // report a sequential envelope of zero that is indistinguishable from
+    // an operation that never used sequential capture.
+    if let Some(first) = records.first() {
+        if first.trace_schema < CURRENT_TRACE_SCHEMA_VERSION {
+            return Err(format!(
+                "trace analyze requires schema {CURRENT_TRACE_SCHEMA_VERSION}; this trace is schema {}",
+                first.trace_schema
+            ));
+        }
+    }
+    // Dropped events make every per-operation decomposition incomplete, so
+    // refuse instead of rendering authoritative-looking numbers.
+    let dropped: u64 = records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEventKind::EventsDropped { count } => Some(count),
+            _ => None,
+        })
+        .sum();
+    if dropped > 0 {
+        return Err(format!(
+            "trace dropped {dropped} events before recording; timing analysis refused"
+        ));
+    }
+    Ok(render_analysis(records))
 }
 
 #[cfg(test)]
@@ -1007,9 +1096,14 @@ mod tests {
             stage_record(9, 506_000, TraceStage::SequentialIrRelease, 6_000),
             stage_record(10, 540_000, TraceStage::GroupedEvaluation, 10_000),
             stage_record(11, 560_000, TraceStage::Finalization, 30_000),
+            // An end-to-end stage spanning nearly the whole operation: the
+            // sequential envelope must still exclude it, and the trailing
+            // edge gap must name it as the block's end stage, not the last
+            // sequential stage appended inside it.
+            stage_record(12, 565_000, TraceStage::EngineAuthenticate, 555_000),
         ]);
         records.push(fixture_record(
-            12,
+            13,
             TraceEventKind::Finished {
                 outcome: CategoricalOutcome::Completed,
             },
@@ -1028,13 +1122,13 @@ mod tests {
         let rendered = analyze(&path).unwrap();
         // Span covers TraceStarted (0) to the terminal Finished record.
         assert!(rendered.contains("span_us=570000"), "{rendered}");
-        // Union of every stage interval; the nested GroupedEvaluation (10 ms
-        // inside the 30 ms Finalization) is counted once.
-        assert!(rendered.contains("stage_union_us=399000"), "{rendered}");
-        // Residual = span - union, including the leading and trailing edges.
-        assert!(rendered.contains("residual_us=171000"), "{rendered}");
-        // The sequential capture envelope: Rgb 2+105 us blocks and the IR
-        // block, gaps between them excluded.
+        // The EngineAuthenticate end-to-end interval merges everything into
+        // one block [2_000, 565_000]; the nested GroupedEvaluation still
+        // counts once inside it.
+        assert!(rendered.contains("stage_union_us=563000"), "{rendered}");
+        assert!(rendered.contains("residual_us=7000"), "{rendered}");
+        // The P1 pin: the sequential envelope is the union of the sequential
+        // intervals ALONE, never the end-to-end block that contains them.
         assert!(
             rendered.contains("sequential_union_us=233000"),
             "{rendered}"
@@ -1044,12 +1138,150 @@ mod tests {
             rendered.contains("finalization_us=30000 contains=GroupedEvaluation"),
             "{rendered}"
         );
-        // Gap attribution names the bordering stages.
+        // Edge gaps are listed and attributed: the leading edge names the
+        // block's start stage, and the trailing edge names the stage whose
+        // end forms the block boundary (EngineAuthenticate, not the last
+        // sequential stage appended inside it).
         assert!(
-            rendered.contains("gap_us=62000 between CameraOpen and EnrollmentLoad")
-                || rendered.contains("gap_us=62000 after CameraOpen"),
+            rendered.contains("gap_us=2000 after operation-start before CameraOpen"),
             "{rendered}"
         );
+        assert!(
+            rendered.contains("gap_us=5000 after EngineAuthenticate before operation-end"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn analyze_derives_partial_operation_spans_from_reconstructed_starts() {
+        use irlume_common::diagnostics::TraceStage;
+        // Recording began mid-operation: the first record is a stage whose
+        // interval started before it. The span must start at the
+        // reconstructed start so the union never exceeds the span.
+        let mut records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 50_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 10_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 115_000, 120_000];
+        for (record, time) in records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        let dir = sandbox("analyze-partial");
+        let path = dir.join("trace.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let rendered = analyze(&path).unwrap();
+        // Span from the reconstructed CameraOpen start (50_000) to the
+        // terminal record (120_000); union 55_000; the trailing 5_000 gap
+        // is listed instead of hiding inside a saturated zero residual.
+        assert!(rendered.contains("span_us=70000"), "{rendered}");
+        assert!(rendered.contains("stage_union_us=60000"), "{rendered}");
+        assert!(rendered.contains("residual_us=10000"), "{rendered}");
+        assert!(
+            rendered.contains("gap_us=5000 after CameraOpen before Finalization"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("gap_us=5000 after Finalization before operation-end"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn analyze_refuses_dropped_events_and_older_schemas() {
+        use irlume_common::diagnostics::{TraceStage, V4_TRACE_SCHEMA_VERSION};
+        // A legacy-schema trace whose stages all predate the sequential
+        // vocabulary parses cleanly, but the envelope projection refuses it:
+        // a zero sequential envelope would read as "no sequential capture".
+        let mut records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        for record in &mut records {
+            record.trace_schema = V4_TRACE_SCHEMA_VERSION;
+        }
+        let dir = sandbox("analyze-refusals");
+        let older = dir.join("older.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&older, bytes).unwrap();
+        let error = analyze(&older).unwrap_err();
+        assert!(error.contains("requires schema"), "{error}");
+
+        // Dropped events make every decomposition incomplete: refuse rather
+        // than render authoritative-looking numbers.
+        let dropped = dir.join("dropped.jsonl");
+        let mut dropped_records = vec![fixture_record(
+            0,
+            TraceEventKind::EventsDropped { count: 3 },
+            false,
+        )];
+        dropped_records.push(fixture_record(
+            1,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::CameraOpen,
+                elapsed_us: 1_000,
+            },
+            false,
+        ));
+        dropped_records.push(fixture_record(
+            2,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        let mut bytes = Vec::new();
+        for record in &dropped_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&dropped, bytes).unwrap();
+        let error = analyze(&dropped).unwrap_err();
+        assert!(error.contains("dropped 3 events"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

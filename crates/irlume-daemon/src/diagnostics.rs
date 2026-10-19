@@ -57,7 +57,7 @@ struct TraceSubscriber {
     sender: SyncSender<TraceRecord>,
     inner: Mutex<TraceInner>,
     limits: TraceLimits,
-    started_ms: u64,
+    started_us: u64,
     trace_schema: u32,
 }
 
@@ -355,7 +355,7 @@ impl DiagnosticState {
                 finished: false,
             }),
             limits,
-            started_ms: monotonic_ms(),
+            started_us: monotonic_us(),
             trace_schema,
         });
         *active = Some(Arc::downgrade(&subscriber));
@@ -556,13 +556,11 @@ impl TraceSubscriber {
         event: TraceEventKind,
         terminal: bool,
     ) -> TraceRecord {
-        let monotonic_ms = monotonic_ms();
+        let monotonic_us = monotonic_us();
         TraceRecord {
             trace_schema: self.trace_schema,
             sequence,
-            monotonic_us: monotonic_ms
-                .saturating_sub(self.started_ms)
-                .saturating_mul(1_000),
+            monotonic_us: monotonic_us.saturating_sub(self.started_us),
             utc_unix_ms: utc_unix_ms(),
             operation_id,
             operation,
@@ -619,9 +617,14 @@ impl TraceSubscription {
     }
 }
 
-fn monotonic_ms() -> u64 {
+/// Microsecond monotonic time for `TraceRecord::monotonic_us`: the field is
+/// microsecond-named, and offline interval reconstruction
+/// (`irlume trace analyze`) subtracts microsecond `elapsed_us` from it, so a
+/// millisecond clock quantizes stage starts to whole ticks and collapses
+/// sub-millisecond stages into overlaps.
+fn monotonic_us() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn utc_unix_ms() -> u64 {

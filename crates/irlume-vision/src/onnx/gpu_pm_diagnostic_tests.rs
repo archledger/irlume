@@ -5,7 +5,7 @@
 
 #![cfg(test)]
 
-use super::gpu_reliability_clock_tests::excludes_material_system_sleep;
+use super::gpu_reliability_clock_tests::{excludes_material_system_sleep, SleepOffsetBounds};
 use super::gpu_reliability_reader_tests::{sleep_bounds, Observation, Reader};
 use crate::npu::gpu;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -64,18 +64,43 @@ fn device_handles() -> Result<Vec<String>, String> {
     Ok(handles)
 }
 
+/// Whether the gap between two adjacent stages stayed free of material
+/// system sleep. The first stage has no previous end and cannot have a gap.
+fn gap_sleep_excluded(
+    previous_end: Option<SleepOffsetBounds>,
+    clock_start: Option<SleepOffsetBounds>,
+) -> bool {
+    match previous_end {
+        Some(previous) => excludes_material_system_sleep(Some(previous), clock_start),
+        None => true,
+    }
+}
+
+/// The refusal for a gap that grew beyond the resume budget: a suspend while
+/// platform open, compilation, validation or drops ran between two stages is
+/// invisible to both stages' own windows, so the comparison must refuse.
+fn stage_gap_error(
+    previous_end: Option<SleepOffsetBounds>,
+    clock_start: Option<SleepOffsetBounds>,
+) -> Option<String> {
+    (!gap_sleep_excluded(previous_end, clock_start))
+        .then(|| "material system sleep between stages not excluded".to_owned())
+}
+
 fn observe_stage(
     reader: &mut Reader,
     output: &Path,
     name: &str,
     duration: Duration,
-) -> Result<(), String> {
+    previous_end: Option<SleepOffsetBounds>,
+) -> Result<Option<SleepOffsetBounds>, String> {
     let handles_before = device_handles()?;
     let clock_start = sleep_bounds();
+    let gap_excluded = gap_sleep_excluded(previous_end, clock_start);
+    let mut error = stage_gap_error(previous_end, clock_start);
     let start = Instant::now();
     let deadline = start + duration;
     let mut observations = Vec::<Observation>::new();
-    let mut error = None;
     // Keep the console quiet throughout the window: rendering a per-sample
     // progress stream would itself add desktop GPU activity to this comparison.
     loop {
@@ -142,7 +167,8 @@ fn observe_stage(
         "elapsed_ns": elapsed.as_nanos(), "sample_count": observations.len(),
         "stable_suspended_samples": suspended, "active_suspended_delta_ms": delta,
         "sleep_start": format!("{clock_start:?}"), "sleep_end": format!("{clock_end:?}"),
-        "system_sleep_excluded": sleep_excluded, "error": error,
+        "system_sleep_excluded": sleep_excluded, "gap_sleep_excluded": gap_excluded,
+        "error": error,
         "own_device_handles_before": handles_before, "own_device_handles_after": device_handles()?,
         "binding": {"canonical_device": binding.canonical_device, "pci": binding.pci,
             "vendor": binding.vendor, "device": binding.device, "driver": binding.driver, "boot_id": binding.boot_id},
@@ -158,7 +184,7 @@ fn observe_stage(
     if let Some(error) = error {
         return Err(error);
     }
-    Ok(())
+    Ok(clock_end)
 }
 
 fn diagnostic_node(name: &str) -> gpu::RenderNode {
@@ -228,7 +254,7 @@ fn gpu_pm_hw_lifetime_diagnostic() {
         device_handles().unwrap().is_empty(),
         "CPU baseline must have no owned accelerator handles"
     );
-    observe_stage(&mut reader, output, "a_cpu_only", duration).unwrap();
+    let stage_end = observe_stage(&mut reader, output, "a_cpu_only", duration, None).unwrap();
     if !lifetime {
         assert_eq!(cpu.cpu_reference_digest().unwrap(), reference.cpu_reference);
         println!("GPU_PM_BASELINE_COMPLETE provider_opened=false counted_endurance_calls=0 qualification=false");
@@ -244,7 +270,8 @@ fn gpu_pm_hw_lifetime_diagnostic() {
         "bind the pre-open observations to the selected GPU"
     );
     assert_eq!(platform.identity().digest(), reference.identity);
-    observe_stage(&mut reader, output, "b_platform_only", duration).unwrap();
+    let stage_end =
+        observe_stage(&mut reader, output, "b_platform_only", duration, stage_end).unwrap();
     platform.still_loaded_as_hashed().unwrap();
 
     let (mut model, assignment, _cache) = platform
@@ -268,7 +295,14 @@ fn gpu_pm_hw_lifetime_diagnostic() {
             result.into_iter().map(f32::to_bits).collect::<Vec<_>>(),
         ));
     }
-    observe_stage(&mut reader, output, "c_retained_request", duration).unwrap();
+    let stage_end = observe_stage(
+        &mut reader,
+        output,
+        "c_retained_request",
+        duration,
+        stage_end,
+    )
+    .unwrap();
     for (input, bits) in &originals {
         let result = model.infer(input).unwrap();
         assert_eq!(result.len(), bits.len());
@@ -279,16 +313,26 @@ fn gpu_pm_hw_lifetime_diagnostic() {
     }
     platform.still_loaded_as_hashed().unwrap();
     drop(model);
-    observe_stage(&mut reader, output, "d_request_dropped", duration).unwrap();
+    let stage_end = observe_stage(
+        &mut reader,
+        output,
+        "d_request_dropped",
+        duration,
+        stage_end,
+    )
+    .unwrap();
     platform.still_loaded_as_hashed().unwrap();
     drop(platform);
     // Core destruction is not shared-library unloading. Global runtime state can
     // survive this phase; a separate parent must also observe AFTER process exit.
+    // The final stage's end bound has no successor: it is only consumed if
+    // this lane is ever extended with a further stage.
     observe_stage(
         &mut reader,
         output,
         "e_platform_dropped_libraries_retained",
         duration,
+        stage_end,
     )
     .unwrap();
     assert_eq!(cpu.cpu_reference_digest().unwrap(), reference.cpu_reference);
@@ -359,7 +403,7 @@ mod tests {
                 device: "0x64a0".into(),
             };
             let mut reader = Reader::new(&drm, &boot, &node).unwrap();
-            let error = observe_stage(&mut reader, &output, "bad_status", Duration::ZERO)
+            let error = observe_stage(&mut reader, &output, "bad_status", Duration::ZERO, None)
                 .expect_err("unusable status must refuse the comparison");
             assert!(error.contains("unusable runtime status"), "{error}");
             let saved: serde_json::Value =
@@ -373,6 +417,43 @@ mod tests {
             assert_eq!(saved["error"], error);
             assert_eq!(saved["qualification"], false);
         }
+    }
+
+    #[test]
+    fn material_sleep_between_stages_refuses_the_next_stage() {
+        let before_gap =
+            SleepOffsetBounds::new(Duration::from_secs(1000), Duration::from_secs(1000)).unwrap();
+        // A suspend between two stages grows the BOOTTIME-minus-MONOTONIC
+        // offset far beyond the one-millisecond budget: the next stage's
+        // fresh clock snapshot must refuse the comparison, even though no
+        // stage's own window contains the jump.
+        let after_gap = SleepOffsetBounds::new(
+            Duration::from_secs(1000) + crate::npu::RESUME_GRANULARITY,
+            Duration::from_secs(1002),
+        )
+        .unwrap();
+        assert!(!gap_sleep_excluded(Some(before_gap), Some(after_gap)));
+        assert_eq!(
+            stage_gap_error(Some(before_gap), Some(after_gap)).unwrap(),
+            "material system sleep between stages not excluded"
+        );
+    }
+
+    #[test]
+    fn equal_adjacent_bounds_and_the_first_stage_have_no_gap_error() {
+        let bound =
+            SleepOffsetBounds::new(Duration::from_secs(1000), Duration::from_secs(1000)).unwrap();
+        // The first stage has no previous end: nothing began before it.
+        assert!(gap_sleep_excluded(None, Some(bound)));
+        assert!(stage_gap_error(None, Some(bound)).is_none());
+        // Adjacent stages with no offset growth pass the gap check; the
+        // stage's own window check still applies to what it samples.
+        assert!(gap_sleep_excluded(Some(bound), Some(bound)));
+        assert!(stage_gap_error(Some(bound), Some(bound)).is_none());
+        // A missing current reading is not silent acceptance: the
+        // conservative bounds semantics refuse.
+        assert!(!gap_sleep_excluded(Some(bound), None));
+        assert!(stage_gap_error(Some(bound), None).is_some());
     }
 
     #[test]

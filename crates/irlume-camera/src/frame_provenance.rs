@@ -1599,24 +1599,39 @@ impl RuntimeFrameProvenance {
     /// epoch without a sequence gap, recovery marker, or aggregate drop.
     #[must_use]
     pub fn is_continuous(&self) -> bool {
-        match self {
-            Self::Single(single) => {
-                single.timestamp().clock() == TimestampClock::Monotonic
-                    && !single.timestamp().discontinuity()
-                    && !single.sequence().discontinuity()
-                    && single.sequence().gap() == 0
-                    && single.rate_evidence().sequence_gap() == 0
+        self.continuity_fault().is_none()
+    }
+
+    /// The first condition that makes this frame not continuous, by name, or
+    /// `None` when it is ([`Self::is_continuous`]). Names only, no values, so
+    /// a refusal can say which condition failed (#1144).
+    #[must_use]
+    pub fn continuity_fault(&self) -> Option<&'static str> {
+        fn single_fault(single: &SingleFrameProvenance) -> Option<&'static str> {
+            if single.timestamp().clock() != TimestampClock::Monotonic {
+                Some("timestamp clock not monotonic")
+            } else if single.timestamp().discontinuity() {
+                Some("timestamp discontinuity")
+            } else if single.sequence().discontinuity() {
+                Some("sequence discontinuity")
+            } else if single.sequence().gap() != 0 {
+                Some("sequence gap")
+            } else if single.rate_evidence().sequence_gap() != 0 {
+                Some("sequence gap in the rate window")
+            } else {
+                None
             }
+        }
+        match self {
+            Self::Single(single) => single_fault(single),
             Self::Aggregate(aggregate) => {
-                aggregate.drops_within() == 0
-                    && aggregate.worst_gap() == 0
-                    && aggregate.contributors().iter().all(|contributor| {
-                        contributor.timestamp().clock() == TimestampClock::Monotonic
-                            && !contributor.timestamp().discontinuity()
-                            && !contributor.sequence().discontinuity()
-                            && contributor.sequence().gap() == 0
-                            && contributor.rate_evidence().sequence_gap() == 0
-                    })
+                if aggregate.drops_within() != 0 {
+                    Some("buffers dropped within the aggregate")
+                } else if aggregate.worst_gap() != 0 {
+                    Some("sequence gap within the aggregate")
+                } else {
+                    aggregate.contributors().iter().find_map(single_fault)
+                }
             }
         }
     }
@@ -2502,6 +2517,45 @@ mod tests {
         assert_eq!(aggregate.capture_window().start, expected_start);
         assert_eq!(aggregate.capture_window().end, expected_end);
         assert_eq!(aggregate.illumination(), IlluminationProvenance::ActiveIr);
+    }
+
+    /// The first failed continuity condition is named, so a refusal can say
+    /// which (#1144); a continuous aggregate names none.
+    #[test]
+    fn continuity_fault_names_the_first_failing_condition() {
+        let dropped = super::AggregateFrameProvenance::new(
+            runtime_series(
+                &[10, 13, 17],
+                &[100, 200, 500],
+                &[IlluminationProvenance::Unknown; 3],
+            ),
+            super::ContributorSelection::ReducedOverAll,
+        )
+        .expect("coherent aggregate");
+        assert_eq!(
+            super::RuntimeFrameProvenance::Aggregate(dropped).continuity_fault(),
+            Some("buffers dropped within the aggregate")
+        );
+        let wrapped = super::AggregateFrameProvenance::new(
+            runtime_series(
+                &[u32::MAX - 1, u32::MAX, 0],
+                &[100, 200, 300],
+                &[IlluminationProvenance::Unknown; 3],
+            ),
+            super::ContributorSelection::ReducedOverAll,
+        )
+        .expect("wrap is consecutive");
+        let wrapped = super::RuntimeFrameProvenance::Aggregate(wrapped);
+        assert_eq!(wrapped.continuity_fault(), None);
+        assert!(wrapped.is_continuous());
+        let recovered = super::AggregateFrameProvenance::new(
+            recovered_series(),
+            super::ContributorSelection::ReducedOverAll,
+        )
+        .expect("a marker after a discard is accepted");
+        let recovered = super::RuntimeFrameProvenance::Aggregate(recovered);
+        assert!(recovered.continuity_fault().is_some());
+        assert!(!recovered.is_continuous());
     }
 
     #[test]

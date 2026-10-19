@@ -708,6 +708,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A face request the retry ceiling refuses before it starts is journaled
+  (#1136): `irlumed: face auth '<user>': refused by the retry accounting
+  (<reason>)`, or the same after `irlumed: UnsealPassword: '<user>':`, when
+  the account reached its 50 unsuccessful requests or its retry state could
+  not be read. A lock screen that fell back to the password with no camera
+  now says why. It is a policy refusal, not a decision about a face, so it
+  is journaled on every tier at notice level, at most once a minute per
+  account.
+
 - The first split-pair authentication after the IR camera is replugged no
   longer ends at once with `operation-failed` when the camera's metadata
   stream, just opened, names none of the burst's IR frames (ADR-0032,

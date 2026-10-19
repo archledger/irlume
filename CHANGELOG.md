@@ -395,6 +395,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- docs/LIMITATIONS.md records that the NexiGo HelloCam N930W measured
+  here (`3443:c803`) streams IR at 14.73 to 14.79 fps, about 1.2 to 1.7%
+  above the 14.55 fps delivered-rate floor, so an occasional capture
+  refuses with `delivered rate below floor` (#1063). An authentication then
+  falls back to the password, and an enrollment ends with the error and
+  saves nothing; the next capture usually passes. The 97%
+  tolerance stays: it is already fitted to this camera.
+
 - irlumed journals requests that end in an error. An authentication that
   ends without a decision gets `irlumed: face auth '<user>': no decision:
   <error>` wherever its decision would be journaled (the convenience tier,

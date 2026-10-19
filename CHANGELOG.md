@@ -708,6 +708,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- A split camera pair no longer refuses every batch with "split frame does
+  not match its retained capture contract" when the RGB median is slow
+  (#1144). The RGB session computed each sample's temporal median on its
+  capture thread while the camera kept streaming; once that outlasted the
+  queue's spare buffers, the driver dropped frames before the next
+  sample's burst, and that sample's own continuity check refused it. Seen
+  on a Lenovo T480. The median now runs while the capture thread keeps
+  consuming the stream, on every path that denoises from a held session
+  (split, sequential, RGB-only and concurrent captures, and the
+  `camera-tune` concurrent probe). The refusal also names the frame's role
+  and the failing condition, for example `(RGB: continuity, buffers dropped
+  within the aggregate)`.
+
 - `irlume support-report`'s `platform_supported` check warns on a
   distribution outside the Debian, Fedora and Arch families and NixOS, as
   it was written to. It compared the family's display text,

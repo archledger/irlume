@@ -463,6 +463,29 @@ fn split_bindings(
 }
 
 fn validate_frame(frame: &Frame, binding: &FrameBinding, spectrum: Spectrum) -> Result<()> {
+    match frame_contract_fault(frame, binding, spectrum) {
+        None => Ok(()),
+        // The first failed condition by name (#1144): one message for nine
+        // conditions sent the reporter to an instrumented build to learn
+        // which. The prefix is unchanged for anyone matching on it.
+        Some(fault) => Err(Error::Hardware(format!(
+            "split frame does not match its retained capture contract ({}: {fault})",
+            if spectrum == Spectrum::Rgb {
+                "RGB"
+            } else {
+                "IR"
+            }
+        ))),
+    }
+}
+
+/// The first condition of the split frame contract `frame` fails, by name,
+/// in the order the contract checks them; `None` when it holds.
+fn frame_contract_fault(
+    frame: &Frame,
+    binding: &FrameBinding,
+    spectrum: Spectrum,
+) -> Option<String> {
     let provenance = frame.provenance();
     let channels = if spectrum == Spectrum::Rgb { 3_u64 } else { 1 };
     let length = u64::from(frame.width)
@@ -470,22 +493,28 @@ fn validate_frame(frame: &Frame, binding: &FrameBinding, spectrum: Spectrum) -> 
         .and_then(|pixels| pixels.checked_mul(channels))
         .and_then(|bytes| usize::try_from(bytes).ok());
     let window = provenance.capture_window();
-    if provenance.binding() != binding
-        || frame.spectrum != spectrum
-        || (frame.width, frame.height)
-            != (provenance.format().width(), provenance.format().height())
-        || length != Some(frame.data.len())
-        || frame.captured.start != window.start
+    if provenance.binding() != binding {
+        Some("binding".into())
+    } else if frame.spectrum != spectrum {
+        Some("spectrum".into())
+    } else if (frame.width, frame.height)
+        != (provenance.format().width(), provenance.format().height())
+    {
+        Some("geometry".into())
+    } else if length != Some(frame.data.len()) {
+        Some("data length".into())
+    } else if frame.captured.start != window.start
         || frame.captured.end != window.end
         || window.start > window.end
-        || !provenance.rate_evidence().meets_floor()
-        || !provenance.is_continuous()
     {
-        return Err(Error::Hardware(
-            "split frame does not match its retained capture contract".into(),
-        ));
+        Some("capture window".into())
+    } else if !provenance.rate_evidence().meets_floor() {
+        Some("delivered rate below floor".into())
+    } else {
+        provenance
+            .continuity_fault()
+            .map(|fault| format!("continuity, {fault}"))
     }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "test-support"))]

@@ -2803,7 +2803,7 @@ fn process_while_draining<T: Send, R: Send>(
         while !worker.is_finished() {
             if drained == 2 * MAX_RATE_FILL_ATTEMPTS {
                 transport = Err(Error::Hardware(
-                    "framing processing exceeded its bounded drain".into(),
+                    "capture processing exceeded its bounded drain".into(),
                 ));
                 break;
             }
@@ -5990,9 +5990,15 @@ impl<'a> RgbSession<'a> {
 
     /// The recognition path's denoised frame: a per-pixel temporal median over
     /// the burst, so one blurry or over-exposed frame cannot decide a match.
+    ///
+    /// The median runs while this thread keeps consuming the stream (ADR-0020).
+    /// A queue left idle while it runs can overflow, and the next burst of a
+    /// batch then finds the driver's dropped buffers inside its contributors
+    /// (#1144: a T480 refused every split batch on that drop).
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn denoised(&mut self) -> irlume_common::Result<Frame> {
-        median_frame(self.burst(RGB_BURST)?)
+        let frames = self.burst(RGB_BURST)?;
+        process_while_draining(frames, median_frame, || self.discard_frame())
     }
 }
 
@@ -10234,7 +10240,7 @@ fn held_concurrent_arm<'d>(
                     capture_pair_with(
                         &mut rs,
                         &mut is,
-                        |session| session.burst(RGB_BURST).and_then(median_frame),
+                        |session| session.denoised(),
                         |session| {
                             operation
                                 .run(|| session.capture_with_stats())
@@ -22698,6 +22704,93 @@ mod tests {
         .unwrap();
         assert_eq!(result, 14);
         assert!(drained > 0, "processing must not pause the camera queue");
+    }
+
+    /// #1144: the RGB median runs on a worker while the capture thread keeps
+    /// consuming the stream (ADR-0020), so a slow CPU cannot leave the queue
+    /// idle long enough for the driver to drop buffers before a batch's next
+    /// burst. Moving the median keeps its value and provenance, and a gap met
+    /// while draining still refuses it.
+    #[test]
+    fn rgb_denoise_computes_its_median_while_the_stream_drains() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        let start = production
+            .find("    pub fn denoised(&mut self)")
+            .expect("RgbSession::denoised moved; update this test");
+        let end = production[start..]
+            .find("\n    }\n")
+            .expect("a method that ends at column 4");
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            compact(&production[start..start + end])
+                .contains("process_while_draining(frames,median_frame,||self.discard_frame())"),
+            "RgbSession::denoised must keep draining its stream while the median runs"
+        );
+
+        let burst = || {
+            vec![
+                frame(&[100, 50, 200]),
+                frame(&[101, 49, 201]),
+                frame(&[255, 255, 255]),
+                frame(&[99, 51, 199]),
+                frame(&[100, 50, 200]),
+            ]
+        };
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let mut release = Some(release);
+        let mut drained = 0;
+        let median = process_while_draining(
+            burst(),
+            move |frames| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                median_frame(frames)
+            },
+            || {
+                drained += 1;
+                if let Some(release) = release.take() {
+                    release.send(()).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(())
+            },
+        )
+        .expect("a healthy drain keeps the median");
+        assert!(drained > 0, "the median must not pause the camera queue");
+        assert_eq!(median.data, vec![100, 50, 200]);
+        match median.provenance() {
+            frame_provenance::RuntimeFrameProvenance::Aggregate(aggregate) => {
+                assert_eq!(aggregate.contributors().len(), 5);
+            }
+            frame_provenance::RuntimeFrameProvenance::Single(_) => {
+                panic!("the median must retain all contributors")
+            }
+        }
+
+        let (release, waiting) = std::sync::mpsc::sync_channel(0);
+        let refused = process_while_draining(
+            burst(),
+            move |frames| {
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                median_frame(frames)
+            },
+            || {
+                release.send(()).unwrap();
+                Err(Error::Hardware(
+                    "fixture: continuity failed while draining paired capture".into(),
+                ))
+            },
+        );
+        assert!(
+            matches!(refused, Err(Error::Hardware(ref error)) if error.contains("continuity")),
+            "a drop met while draining must refuse the median"
+        );
     }
 
     #[test]

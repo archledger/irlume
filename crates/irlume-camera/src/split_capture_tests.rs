@@ -381,6 +381,54 @@ fn split_ir_frames_no_record_named_are_typed_for_a_retry() {
     }
 }
 
+/// The contract refusal names the role and the first failed condition
+/// (#1144), after the unchanged message.
+#[test]
+fn split_contract_refusal_names_the_role_and_condition() {
+    let (_guard, expected) = fixture();
+    let operation = acquire(&expected);
+    let refusal = |rgb: &Frame, ir: &Frame| {
+        validate_split_pair_in_operation(RGB, IR, &operation, rgb, ir, 0)
+            .unwrap_err()
+            .to_string()
+    };
+    let prefix = "hardware: split frame does not match its retained capture contract";
+    let (mut rgb, ir, _) = frames(&operation);
+    rgb.width += 1;
+    assert_eq!(refusal(&rgb, &ir), format!("{prefix} (RGB: geometry)"));
+    let (rgb, ir, _) = frames(&operation);
+    let slow = bound_uniform_frame_with(
+        operation
+            .lease()
+            .frame_binding(IR, contracts::StreamRole::Ir)
+            .unwrap(),
+        ir.captured.start,
+        contracts::IlluminationProvenance::ActiveIr,
+        false,
+        false,
+    );
+    assert_eq!(
+        refusal(&rgb, &slow),
+        format!("{prefix} (IR: delivered rate below floor)")
+    );
+    let (rgb, ir, _) = frames(&operation);
+    let gapped = bound_uniform_frame_with(
+        operation
+            .lease()
+            .frame_binding(RGB, contracts::StreamRole::Rgb)
+            .unwrap(),
+        rgb.captured.start,
+        contracts::IlluminationProvenance::Unknown,
+        true,
+        true,
+    );
+    let text = refusal(&gapped, &ir);
+    assert!(
+        text.starts_with(&format!("{prefix} (RGB: continuity, ")),
+        "{text}"
+    );
+}
+
 #[test]
 fn split_capture_rejects_mutated_geometry_role_or_window() {
     let (_guard, expected) = fixture();

@@ -160,8 +160,10 @@ exactly these five fields (maximum 8192 bytes):
 
 Use digests from the same previously verified synthetic receipt; the control
 refuses a changed identity or baseline. It compiles with verified model-cache
-bypass, fixed batch1/LATENCY/f16 and explicit GPU.0 assignment. Do not derive a
-replacement reference from a failed run.
+bypass, fixed batch1/LATENCY/f16 and explicit placement on the platform's sole
+enumerated device; the accepted assignment is that device's name (for example
+`GPU.0`) or the generic `GPU` some `EXECUTION_DEVICES` answers report. Do not
+derive a replacement reference from a failed run.
 
 Zero system wait supports unattended operational evidence only. A nonzero
 system wait additionally requires `IRLUME_GPU_RELIABILITY_ATTENDED=1`, set only
@@ -172,6 +174,7 @@ suspend/resume. The control never invokes suspend or changes runtime-PM policy.
 ```sh
 ulimit -c 0
 : "${IRLUME_GPU_RELIABILITY_REFERENCE:?set the prior-reference JSON path}"
+export IRLUME_GPU_RELIABILITY_REFERENCE
 control=onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control
 cargo test -p irlume-vision --features npu --release --lib -- \
   --ignored --exact "$control" --test-threads 1 --nocapture

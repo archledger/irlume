@@ -103,6 +103,11 @@ pub(super) fn read_reference(path: &Path, attended: Option<&str>) -> Result<Conf
 }
 
 pub(super) trait Observations {
+    /// Capture the runtime endpoint's active state before the BeforeRuntime
+    /// boundary checks run: the CPU canary, mapped-library hashing and
+    /// binding reads can outlast a short autosuspend delay, and a device
+    /// already suspended when runtime_start polls would hide the transition.
+    fn runtime_bracket(&mut self) -> Result<(), String>;
     fn boundary(&mut self, boundary: Boundary) -> Result<(), String>;
     fn runtime_start(&mut self) -> Result<(), String>;
     fn runtime_end(&mut self) -> Result<bool, String>;
@@ -120,6 +125,9 @@ pub(super) fn drive(
     loop {
         let result = match protocol.next() {
             Step::Boundary(boundary) => {
+                if boundary == Boundary::BeforeRuntime {
+                    observations.runtime_bracket()?;
+                }
                 if let Err(error) = observations.boundary(boundary) {
                     let _ = protocol.boundary(boundary, false, false);
                     return Err(error);
@@ -177,12 +185,28 @@ impl Observations for HardwareObservations<'_> {
         Ok(())
     }
 
-    fn runtime_start(&mut self) -> Result<(), String> {
+    fn runtime_bracket(&mut self) -> Result<(), String> {
         self.runtime_clock = sleep_bounds();
         self.samples[0] = Some(self.reader.sample()?);
         let before = self.samples[0].as_ref().unwrap().view();
         if before.status != [Some("active"); 2] || before.control != [Some("auto"); 2] {
             println!("RELIABILITY_RUNTIME no active/AUTO start: INCONCLUSIVE");
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn runtime_start(&mut self) -> Result<(), String> {
+        // The endpoint and clock were captured by runtime_bracket before the
+        // BeforeRuntime boundary checks; a start that was not active/AUTO was
+        // reported there and leaves the witness incomplete on purpose.
+        let active = self.samples[0]
+            .as_ref()
+            .map(|s| {
+                s.view().status == [Some("active"); 2] && s.view().control == [Some("auto"); 2]
+            })
+            .unwrap_or(false);
+        if !active {
             return Ok(());
         }
         let deadline = Instant::now() + self.config.runtime_wait;
@@ -358,6 +382,7 @@ mod tests {
     enum Event {
         Infer,
         Boundary(Boundary),
+        RuntimeBracket,
         RuntimeStart,
         RuntimeEnd,
         System,
@@ -404,6 +429,9 @@ mod tests {
     }
 
     impl Observations for TraceObservations {
+        fn runtime_bracket(&mut self) -> Result<(), String> {
+            self.observe(Event::RuntimeBracket)
+        }
         fn boundary(&mut self, boundary: Boundary) -> Result<(), String> {
             self.observe(Event::Boundary(boundary))
         }
@@ -457,6 +485,20 @@ mod tests {
             assert!(!report.accepted(false));
             let position = |event, count| trace.iter().position(|v| *v == (event, count)).unwrap();
             assert!(position(Event::Infer, 400) < position(Event::RuntimeStart, 400));
+            // The active endpoint is bracketed before the BeforeRuntime
+            // boundary checks: their CPU canary, mapped-library hashing and
+            // binding reads can outlast a short autosuspend delay, and a
+            // device already suspended at runtime_start would wrongly read
+            // as an inconclusive transition.
+            assert!(position(Event::Infer, 400) < position(Event::RuntimeBracket, 400));
+            assert!(
+                position(Event::RuntimeBracket, 400)
+                    < position(Event::Boundary(Boundary::BeforeRuntime), 400)
+            );
+            assert!(
+                position(Event::Boundary(Boundary::BeforeRuntime), 400)
+                    < position(Event::RuntimeStart, 400)
+            );
             assert!(position(Event::RuntimeStart, 400) < position(Event::Infer, 401));
             assert!(position(Event::Infer, 404) < position(Event::RuntimeEnd, 404));
             assert!(position(Event::RuntimeEnd, 404) < position(Event::Infer, 405));
@@ -479,6 +521,7 @@ mod tests {
             (Event::RuntimeEnd, 404),
             (Event::System, 700),
             (Event::Boundary(Boundary::Setup), 0),
+            (Event::RuntimeBracket, 400),
             (Event::Boundary(Boundary::BeforeRuntime), 400),
             (Event::Boundary(Boundary::AfterRuntime), 404),
             (Event::Boundary(Boundary::BeforeSystem), 700),

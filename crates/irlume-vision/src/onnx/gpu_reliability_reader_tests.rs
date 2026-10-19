@@ -393,6 +393,9 @@ mod tests {
             }
         }
         impl Observations for CounterObservations {
+            fn runtime_bracket(&mut self) -> Result<(), String> {
+                Ok(())
+            }
             fn boundary(&mut self, _: Boundary) -> Result<(), String> {
                 Ok(())
             }

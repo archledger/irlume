@@ -547,6 +547,31 @@ fn render_analysis(records: &[TraceRecord]) -> String {
             writeln!(output, "  no stage timings").unwrap();
             continue;
         }
+        // Finalization is reported at most once per operation (the release
+        // of the owned streaming sessions through the engine return), so a
+        // second record is structurally impossible; refusing it keeps the
+        // containment pairing a single linear scan instead of quadratic
+        // rescans on a bounded 50,000-event trace.
+        let finalization_count = operation_records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::Finalization,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if finalization_count > 1 {
+            writeln!(
+                output,
+                "  REFUSED: {finalization_count} Finalization records; at most one is possible per operation"
+            )
+            .unwrap();
+            continue;
+        }
         // The span starts at the earliest reconstructed interval start when
         // recording began mid-operation, so the union never exceeds it and
         // the leading edge stays an explicit edge rather than vanishing.
@@ -683,14 +708,16 @@ fn analyze(input: &Path) -> Result<String, String> {
         }
     }
     // Dropped events make every per-operation decomposition incomplete, so
-    // refuse instead of rendering authoritative-looking numbers.
+    // refuse instead of rendering authoritative-looking numbers. The marker
+    // count is attacker-influenced input: saturate rather than wrap, or
+    // u64::MAX followed by 1 would fold back under the refusal threshold.
     let dropped: u64 = records
         .iter()
         .filter_map(|record| match record.event {
             TraceEventKind::EventsDropped { count } => Some(count),
             _ => None,
         })
-        .sum();
+        .fold(0_u64, u64::saturating_add);
     if dropped > 0 {
         return Err(format!(
             "trace dropped {dropped} events before recording; timing analysis refused"
@@ -1282,6 +1309,86 @@ mod tests {
         std::fs::write(&dropped, bytes).unwrap();
         let error = analyze(&dropped).unwrap_err();
         assert!(error.contains("dropped 3 events"), "{error}");
+
+        // Saturating accumulation: a maximal count followed by one more
+        // marker must still refuse rather than wrap back under the
+        // threshold in release builds.
+        let wrapping = dir.join("wrapping.jsonl");
+        let mut wrapping_records = vec![
+            fixture_record(0, TraceEventKind::EventsDropped { count: u64::MAX }, false),
+            fixture_record(1, TraceEventKind::EventsDropped { count: 1 }, false),
+        ];
+        wrapping_records.push(fixture_record(
+            2,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::CameraOpen,
+                elapsed_us: 1_000,
+            },
+            false,
+        ));
+        wrapping_records.push(fixture_record(
+            3,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        let mut bytes = Vec::new();
+        for record in &wrapping_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&wrapping, bytes).unwrap();
+        assert!(analyze(&wrapping).is_err(), "saturated sum must refuse");
+
+        // At most one Finalization per operation: a second is structurally
+        // impossible and the pairing stays linear, so the operation is
+        // refused instead of rescanned.
+        let doubled = dir.join("doubled.jsonl");
+        let doubled_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let mut bytes = Vec::new();
+        for record in &doubled_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&doubled, bytes).unwrap();
+        let rendered = analyze(&doubled).unwrap();
+        assert!(
+            rendered.contains("REFUSED: 2 Finalization records"),
+            "{rendered}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

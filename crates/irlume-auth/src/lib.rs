@@ -5876,18 +5876,56 @@ impl Engine {
             );
             let (fresh_rgb, fresh_ir) = capture_pair_sequentially(
                 || {
+                    // Reported at the stage's real end boundary: interval
+                    // reconstruction offline subtracts elapsed_us from this
+                    // record's timestamp, so a deferred report after the IR
+                    // side would place the RGB stage beside the IR one.
                     let started = std::time::Instant::now();
-                    let frame =
-                        irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
-                    Ok((frame, started.elapsed().as_millis()))
+                    match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)
+                    {
+                        Ok(frame) => {
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                elapsed,
+                            );
+                            Ok((frame, elapsed))
+                        }
+                        Err(error) => {
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                0,
+                            );
+                            Err(error)
+                        }
+                    }
                 },
                 || {
                     let started = std::time::Instant::now();
-                    let frame = irlume_camera::capture_ir_sequential_with_stats_and_control(
+                    match irlume_camera::capture_ir_sequential_with_stats_and_control(
                         &self.ir_dev,
                         &control,
-                    )?;
-                    Ok((frame, started.elapsed().as_millis()))
+                    ) {
+                        Ok(frame) => {
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::IrCapture,
+                                elapsed,
+                            );
+                            Ok((frame, elapsed))
+                        }
+                        Err(error) => {
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::IrCapture,
+                                0,
+                            );
+                            Err(error)
+                        }
+                    }
                 },
             );
             match fresh_rgb {
@@ -5916,18 +5954,10 @@ impl Engine {
             }
             pair_sequential_retried = true;
         }
-        if pair_sequential_retried {
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RgbCapture,
-                rgb_ms,
-            );
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::IrCapture,
-                ir_ms,
-            );
-        }
+        // The retried pair's RgbCapture and IrCapture timings were emitted
+        // inside their closures at each stage's real end boundary above; a
+        // batched report here would timestamp the RGB stage beside the IR
+        // one and misplace its reconstructed interval.
         // Proactive degradation (#586): a concurrent capture that SUCCEEDED
         // but carried provenance warning signs (sequence gaps, timestamp
         // discontinuity) is the leading indicator the next one will fail

@@ -688,3 +688,32 @@ own background qualification, which are daemon-wide.
 - The wire does not change: `unknown` and `not_authorized` are values
   released clients already decode, the refusal is an `Error` string as
   before, and `state_revision` keeps its type.
+
+## Amendment 2026-10-19: the Cameras page keys as shipped
+
+The Cameras page shipped with different letters from the ones this ADR
+names, and its classifying listing runs without a confirmation (reported
+on #887). The letters below are what `crates/irlume-cli/src/tui.rs` binds
+and docs/TUI.md describes. Where the verb list of §1 item 3 (Stable keys),
+the docking item in §6 and the "Keys" acceptance test name `p` *probe
+cameras* or `c` *add camera* on Cameras, they record the original plan:
+
+- `r` refreshes the page, as on every page. On Cameras the refresh
+  includes the classifying `ListCameras`, which opens every node and
+  checks privacy. The page also sends it when its listing is due and the
+  daemon is idle. There is no separate probe letter, and no confirmation
+  comes before it.
+- `p` lists the IR emitter units: the read-only `ir-setup --dry-run`
+  (`SetupIrEmitter { dry_run: true }`). It writes nothing.
+- `c` inspects the capture qualification, after a confirmation. It opens
+  camera controls when they are available and captures no frames.
+- `s` runs `sudo irlume ir-setup`, which writes to the camera, and `t`
+  tunes the capture mode, after a confirmation.
+- Adding a camera has no key: the details of a `not enrolled` pair name
+  `irlume enroll --add-camera`.
+
+Since ADR-0029 item 1 was built (#1123), the daemon classifies each
+camera's roles when it appears. Authentication therefore no longer needs
+a client to have sent the classifying listing first. Whether that listing
+should go back behind its own confirmed letter, as §6 planned, is left
+open here.

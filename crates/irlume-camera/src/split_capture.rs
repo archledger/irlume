@@ -56,6 +56,7 @@ impl SplitPairCapture {
             operation,
             &self.rgb,
             &self.ir,
+            self.stats.camera_classified_frames,
         )
     }
 
@@ -155,7 +156,14 @@ fn capture_split_pair_observed_with(
             observe(StreamRole::Ir, started.elapsed());
             let (ir, stats) = ir?;
             control.check()?;
-            validate_split_pair_in_operation(rgb_dev, ir_dev, operation, &rgb, &ir)?;
+            validate_split_pair_in_operation(
+                rgb_dev,
+                ir_dev,
+                operation,
+                &rgb,
+                &ir,
+                stats.camera_classified_frames,
+            )?;
             control.check()?;
             Ok(SplitPairCapture {
                 operation: operation.lease().clone(),
@@ -343,7 +351,14 @@ pub(crate) fn capture_split_batch_with(
                         "split batch samples are not ordered and disjoint".into(),
                     ));
                 }
-                validate_split_pair_in_operation(rgb_dev, ir_dev, operation, &rgb, &ir)?;
+                validate_split_pair_in_operation(
+                    rgb_dev,
+                    ir_dev,
+                    operation,
+                    &rgb,
+                    &ir,
+                    stats.camera_classified_frames,
+                )?;
                 previous = Some((rgb.captured, ir.captured));
                 pairs.push(SplitPairCapture {
                     operation: operation.lease().clone(),
@@ -366,15 +381,21 @@ pub(crate) fn capture_split_batch_with(
 /// delivery/continuity and active-IR evidence. It does not authorize a concurrent
 /// schedule or change the downstream stale-RGB pairing budget.
 ///
+/// `ir_classified` is how many of the IR burst's frames the camera's own
+/// illumination records classified (`IrCaptureStats::camera_classified_frames`).
+///
 /// # Errors
 /// Refuses an unsupported/stale operation, wrong endpoint/role/incarnation,
 /// malformed frame, unhealthy delivery, unknown illumination or reversed windows.
+/// Unknown illumination on a burst none of whose frames a record classified is
+/// [`Error::IrIlluminationUnreported`]; every other refusal keeps its type.
 fn validate_split_pair_in_operation(
     rgb_dev: &str,
     ir_dev: &str,
     operation: &CameraOperationSession,
     rgb: &Frame,
     ir: &Frame,
+    ir_classified: usize,
 ) -> Result<()> {
     let (rgb_binding, ir_binding) = split_bindings(rgb_dev, ir_dev, operation)?;
     validate_frame(rgb, &rgb_binding, Spectrum::Rgb)?;
@@ -384,10 +405,23 @@ fn validate_split_pair_in_operation(
             "split capture windows are not RGB then IR".into(),
         ));
     }
-    if ir.provenance().illumination() != IlluminationProvenance::ActiveIr {
-        return Err(Error::Hardware(
-            "split IR frame lacks active illumination provenance".into(),
-        ));
+    match ir.provenance().illumination() {
+        IlluminationProvenance::ActiveIr => {}
+        // No record named any frame of the burst: typed, so the attempt loop
+        // can capture again within the window (#1063). An aggregate that is
+        // unknown although records classified its frames (an ambient
+        // subtraction over unsuitable states, mixed contributors) is not that
+        // case. The check is unchanged.
+        IlluminationProvenance::Unknown if ir_classified == 0 => {
+            return Err(Error::IrIlluminationUnreported(
+                "split IR frame lacks active illumination provenance".into(),
+            ));
+        }
+        IlluminationProvenance::Unknown | IlluminationProvenance::Ambient => {
+            return Err(Error::Hardware(
+                "split IR frame lacks active illumination provenance".into(),
+            ));
+        }
     }
     operation
         .lease()

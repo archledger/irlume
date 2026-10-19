@@ -621,7 +621,7 @@ daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
 | `unsupported-contract` | The engine does not implement the requested contract. Refused before any side effect. Exits 2. | no |
 | `daemon-unavailable` | The daemon could not be reached. | yes |
 | `not-authorized` | The caller may not act on the named account. From `auth test`, it can also mean the calling account does not hold the active local session on a seat, which a request that turns the camera on needs unless it comes from root. | no |
-| `operation-failed` | The engine could not carry out a well-formed request. | no |
+| `operation-failed` | The engine could not carry out a well-formed request. | no, except for a pre-empted operation and for IR frames no illumination record named, which a camera stream that has just opened can produce once ([ADR-0032](adr/0032-cross-device-pairing-by-administrator-pin.md), amendment 2026-10-18) |
 | `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
 | `deadline-expired` | The authentication window elapsed before a decision; the attempt ended without a verdict. Not retryable as this transaction; a fresh attempt starts a new window. | no |
 | `protocol-error` | The daemon replied with something this command did not expect. | no |

@@ -1648,6 +1648,7 @@ fn enrollment_unreadable(error: irlume_common::Error) -> irlume_common::Error {
         | irlume_common::Error::Preempted(_)
         | irlume_common::Error::CameraBusy(_)
         | irlume_common::Error::CameraUnavailable(_)
+        | irlume_common::Error::IrIlluminationUnreported(_)
         | irlume_common::Error::PrivacyShutter(_)
         | irlume_common::Error::Enrollment(_) => error,
         other => irlume_common::Error::Enrollment(other.to_string()),
@@ -7467,6 +7468,10 @@ impl Engine {
         // feed the retry estimate, where the pending release is added
         // explicitly, or a round's release would be counted twice.
         let mut costliest_capture = *costliest_attempt;
+        // Whether this request already captured again after IR frames that no
+        // illumination record named (#1063). Once: a camera whose records
+        // never arrive must not spend the whole window on it.
+        let mut unreported_retried = false;
         // The costliest attempt so far (caller-seeded: the sequential fallback
         // starts with the concurrent loop's observed worst). A retry that
         // cannot FINISH before the deadline would overrun mid-capture —
@@ -7498,6 +7503,42 @@ impl Engine {
             *costliest_attempt = (*costliest_attempt).max(capture_cost);
             let out = match attempt_result {
                 Ok(out) => out,
+                Err(error @ irlume_common::Error::IrIlluminationUnreported(_))
+                    if window != 0 && !unreported_retried =>
+                {
+                    // ADR-0032, amendment 2026-10-18: a metadata stream that
+                    // has just opened, as after a replug, can name no frame of
+                    // the first burst. The split frame contract still refused
+                    // it; one more complete attempt runs if it fits, as a
+                    // presence retry would, and nothing it captured is kept.
+                    let pending_release = if deferred.is_some() {
+                        self.last_release_cost.unwrap_or(RELEASE_ALLOWANCE_FLOOR)
+                    } else {
+                        std::time::Duration::ZERO
+                    };
+                    let estimate = pending_release + costliest_capture;
+                    let left = deadline.saturating_duration_since(now());
+                    if left < estimate {
+                        irlume_common::dlog!(
+                            "grace: attempt {attempt}: {error}, no illumination record named its IR frames; \
+                             retry skipped ({}ms left, costliest attempt {}ms)",
+                            left.as_millis(),
+                            estimate.as_millis()
+                        );
+                        self.release_deferred(deferred, &now);
+                        return (Err(error), held_pair_failed, None);
+                    }
+                    unreported_retried = true;
+                    self.release_deferred(deferred, &now);
+                    *costliest_attempt =
+                        (*costliest_attempt).max(now().duration_since(attempt_started));
+                    irlume_common::dlog!(
+                        "grace: attempt {attempt}: {error}, no illumination record named its IR frames; \
+                         capturing once more within window"
+                    );
+                    self.note_capture_boundary();
+                    continue;
+                }
                 Err(error) => {
                     self.release_deferred(deferred, &now);
                     return (Err(error), held_pair_failed, None);
@@ -14767,6 +14808,149 @@ mod engine_tests {
             Some("too dark"),
             "the label the line carried, not a later timeout"
         );
+    }
+
+    /// One scripted attempt of [`scripted_unreported_retry`].
+    #[derive(Clone, Copy)]
+    enum UnreportedStep {
+        /// The split frame contract refused IR frames no record named.
+        Unreported,
+        /// Any other capture failure.
+        Hardware,
+        /// A complete assessment with a passing PAD score.
+        Pad,
+    }
+
+    /// Drive the production attempt loop through scripted attempts, each
+    /// advancing a fake clock by its cost; returns the loop's result and how
+    /// many attempts ran. No camera is opened.
+    fn scripted_unreported_retry(
+        e: &mut Engine,
+        window_ms: u64,
+        steps: &[(UnreportedStep, u64)],
+    ) -> (irlume_common::Result<Outcome>, usize) {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let calls = Cell::new(0);
+        let mut costliest = Duration::ZERO;
+        e.vit_scores.clear();
+        let (result, fallback, _deferred) = e.authentication_attempt_loop_with(
+            start + Duration::from_millis(window_ms),
+            window_ms,
+            &mut costliest,
+            |engine| {
+                let index = calls.get();
+                let (step, cost) = *steps.get(index).expect("unexpected extra attempt");
+                calls.set(index + 1);
+                clock.set(clock.get() + Duration::from_millis(cost));
+                let result = match step {
+                    UnreportedStep::Unreported => {
+                        Err(irlume_common::Error::IrIlluminationUnreported(
+                            "split IR frame lacks active illumination provenance".into(),
+                        ))
+                    }
+                    UnreportedStep::Hardware => Err(irlume_common::Error::Hardware(
+                        "split capture windows are not RGB then IR".into(),
+                    )),
+                    UnreportedStep::Pad => {
+                        let deny = engine.vit_pad_votes_deny(0.20);
+                        let (enr, assessment) = pad_matching_fixture(0.20, deny);
+                        engine.last_attempt_facts = AttemptFacts::from_assessment(&assessment);
+                        engine.authenticate_assessment(
+                            &enr,
+                            AuthenticationPurpose::Verify,
+                            Some("login"),
+                            assessment,
+                            &(),
+                        )
+                    }
+                };
+                (result, false, None::<()>)
+            },
+            || clock.get(),
+        );
+        e.vit_scores.clear();
+        assert!(!fallback);
+        (result, calls.get())
+    }
+
+    /// #1063 (ADR-0032, amendment 2026-10-18): IR frames no illumination
+    /// record named, as a metadata stream that has just opened produces, are
+    /// captured once more within the window, and the request still grants on
+    /// complete evidence.
+    #[test]
+    fn unreported_ir_illumination_is_captured_once_more_within_the_window() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let mut steps = vec![(UnreportedStep::Unreported, 2_000)];
+        steps.extend([(UnreportedStep::Pad, 2_000); 5]);
+        let (result, calls) = scripted_unreported_retry(&mut s.engine, 15_000, &steps);
+        assert_eq!(calls, 6);
+        assert!(result.unwrap().granted);
+    }
+
+    /// The retry runs once per request: a camera whose records never arrive
+    /// ends the request with the typed error, which the daemon reports as
+    /// retryable.
+    #[test]
+    fn unreported_ir_illumination_is_retried_only_once() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (result, calls) = scripted_unreported_retry(
+            &mut s.engine,
+            15_000,
+            &[
+                (UnreportedStep::Unreported, 2_000),
+                (UnreportedStep::Unreported, 2_000),
+            ],
+        );
+        assert_eq!(calls, 2);
+        assert!(matches!(
+            result,
+            Err(irlume_common::Error::IrIlluminationUnreported(_))
+        ));
+    }
+
+    /// A retry that cannot finish before the deadline is not started, as for
+    /// presence retries.
+    #[test]
+    fn unreported_ir_illumination_retry_must_fit_the_window() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (result, calls) =
+            scripted_unreported_retry(&mut s.engine, 5_000, &[(UnreportedStep::Unreported, 3_000)]);
+        assert_eq!(calls, 1, "2000 ms left cannot hold a 3000 ms attempt");
+        assert!(matches!(
+            result,
+            Err(irlume_common::Error::IrIlluminationUnreported(_))
+        ));
+    }
+
+    /// The one-shot mode (a zero window) never retries.
+    #[test]
+    fn unreported_ir_illumination_is_not_retried_in_one_shot_mode() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (result, calls) =
+            scripted_unreported_retry(&mut s.engine, 0, &[(UnreportedStep::Unreported, 100)]);
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            result,
+            Err(irlume_common::Error::IrIlluminationUnreported(_))
+        ));
+    }
+
+    /// Every other capture failure still ends the request at once.
+    #[test]
+    fn other_capture_failures_are_not_retried() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let (result, calls) =
+            scripted_unreported_retry(&mut s.engine, 15_000, &[(UnreportedStep::Hardware, 2_000)]);
+        assert_eq!(calls, 1);
+        assert!(matches!(result, Err(irlume_common::Error::Hardware(_))));
     }
 
     #[test]

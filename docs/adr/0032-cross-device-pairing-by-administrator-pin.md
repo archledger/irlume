@@ -1558,3 +1558,37 @@ the rule's presence (ADR-0031, amendment 2026-10-17). The opt-in itself is
 unchanged: split enrollment and authentication still need it until the
 activation work in #1030 completes, and every other IR side still needs the
 camera's records.
+
+## Amendment 2026-10-18: IR frames no illumination record named
+
+#1063. On the attended split rig, the first authentication after the IR
+camera was replugged ended with `operation-failed`, not retryable: its
+metadata stream classified none of the burst's frames, so the selected IR
+frame carried no active-IR provenance and the split frame contract refused
+it. The next request granted. The contract's check is unchanged; only what
+follows the refusal changes.
+
+- **Typed.** A split IR frame whose provenance is unknown and whose burst
+  no illumination record named at all (`IrCaptureStats` counts no
+  camera-classified frame) refuses with `Error::IrIlluminationUnreported`
+  (cause `camera-unavailable`), with the same prose as before. An aggregate
+  that is unknown although records classified the burst's frames (an
+  ambient subtraction over unsuitable states, mixed contributors) and a
+  frame recorded as ambient keep the generic hardware refusal. A YUYV side
+  without records whose burst proved no alternation is the first case:
+  nothing named its frames.
+- **Captured once more within the window.** The attempt loop treats that
+  refusal as it treats an attempt with incomplete face evidence: when
+  another complete attempt fits before the deadline, by the same estimate
+  (the costliest capture this request has measured, plus a pending
+  release), it runs one, with fresh RGB and IR sessions under the same split
+  Authentication operation. Nothing the refused attempt captured is kept, and
+  no other capture failure retries. This happens at most once per request,
+  so a camera whose records never arrive cannot spend the window, and never
+  in the one-shot mode.
+- **Reported as retryable.** When the retry does not fit or also fails, the
+  request ends with `operation-failed` marked retryable for a client that
+  asked for structured errors, as a pre-emption is, since an identical
+  request can succeed once the stream is warm. A legacy client and the PAM
+  module see the same prose and fall back as before. The retry charge is
+  unchanged: an error is not a denial.

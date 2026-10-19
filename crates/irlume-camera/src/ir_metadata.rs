@@ -578,6 +578,8 @@ impl Drop for MappedBuffer {
 /// the buffer timestamp that identifies its image frame.
 pub(crate) struct IlluminationLog {
     fd: c_int,
+    /// The node's path as journal-safe device text (`camera_text`); it is
+    /// only ever printed, never opened.
     device: String,
     buffers: Vec<MappedBuffer>,
     /// Illumination by image-buffer timestamp in microseconds. Timestamp
@@ -680,7 +682,9 @@ impl IlluminationLog {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             irlume_common::dlog!(
-                "{ir_device}: metadata node {node} would not open; using brightness"
+                "{}: metadata node {} would not open; using brightness",
+                crate::camera_text(ir_device),
+                crate::camera_text(node)
             );
             return Err(format!("metadata node {node} would not open"));
         }
@@ -689,7 +693,9 @@ impl IlluminationLog {
             Ok(()) => Ok(log),
             Err(why) => {
                 irlume_common::dlog!(
-                    "{ir_device}: no illumination metadata from {node} ({why}); using brightness"
+                    "{}: no illumination metadata from {} ({why}); using brightness",
+                    crate::camera_text(ir_device),
+                    crate::camera_text(node)
                 );
                 Err(why)
             }
@@ -700,7 +706,7 @@ impl IlluminationLog {
     fn from_fd(fd: c_int, node: &str) -> Self {
         Self {
             fd,
-            device: node.to_string(),
+            device: crate::camera_text(node),
             buffers: Vec::new(),
             by_timestamp: std::collections::HashMap::new(),
             restore_format: None,
@@ -965,6 +971,13 @@ impl IlluminationLog {
                 // ring until its main producer is quiescent.
                 let remaining = self.buffers.len().saturating_sub(self.parked as usize + 1);
                 if self.delivered || self.parked >= MAX_PARKED_STARTUP_ERRORS || remaining == 0 {
+                    // Said once, so "closed after 0 classified frames" can be
+                    // told apart from a camera that sent no records (#1063).
+                    irlume_common::dlog!(
+                        "{}: illumination metadata retired after an ERROR-marked buffer ({} parked); later frames carry no records",
+                        self.device,
+                        self.parked
+                    );
                     self.retired = true;
                     self.by_timestamp.clear();
                     return;
@@ -1384,6 +1397,17 @@ fn offers_uvcm(node: &str) -> bool {
 #[cfg(test)]
 mod tests {
     pub(super) mod lifecycle;
+
+    /// The node's path is journal text in every metadata debug line, so it
+    /// is stored through the camera-text sanitizer: a control character in a
+    /// configured path cannot forge a line.
+    #[test]
+    fn the_metadata_node_is_journaled_as_camera_text() {
+        let log = super::IlluminationLog::from_fd(-1, "/dev/video3\nirlumed: forged");
+        assert_eq!(log.device, "/dev/video3 irlumed: forged");
+        // No descriptor and nothing streaming: skip the teardown entirely.
+        std::mem::forget(log);
+    }
     #[cfg(feature = "capture-timing")]
     #[test]
     fn teardown_timing_keeps_close_after_metadata_ioctl_failures() {

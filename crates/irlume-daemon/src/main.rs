@@ -6534,10 +6534,16 @@ fn authentication_error(error: irlume_common::Error, structured: bool) -> Respon
             },
             // Every other engine failure: the client asked for typed
             // errors, so it gets the code and the cause it can branch on
-            // (ADR-0030 §5); a pre-emption is worth retrying.
+            // (ADR-0030 §5). A pre-emption is worth retrying, and so are IR
+            // frames no illumination record named, which a cold metadata
+            // stream produces once (ADR-0032, amendment 2026-10-18).
             error => Response::OperationError {
                 code: irlume_common::OperationErrorCode::OperationFailed,
-                retryable: matches!(error, irlume_common::Error::Preempted(_)),
+                retryable: matches!(
+                    error,
+                    irlume_common::Error::Preempted(_)
+                        | irlume_common::Error::IrIlluminationUnreported(_)
+                ),
                 cause,
             },
         }
@@ -12068,6 +12074,25 @@ mod tests {
                 cause: Some(OutcomeCause::Cancelled),
             }
         ));
+        // #1063: IR frames no illumination record named, after the engine's
+        // one retry: a camera fault worth trying again.
+        let resp = authentication_error(
+            irlume_common::Error::IrIlluminationUnreported("split IR frame".into()),
+            true,
+        );
+        assert!(matches!(
+            resp,
+            Response::OperationError {
+                code: OperationErrorCode::OperationFailed,
+                retryable: true,
+                cause: Some(OutcomeCause::CameraUnavailable),
+            }
+        ));
+        let resp = authentication_error(
+            irlume_common::Error::IrIlluminationUnreported("split IR frame".into()),
+            false,
+        );
+        assert!(matches!(&resp, Response::Error(text) if text.starts_with("hardware: ")));
         let resp = authentication_error(irlume_common::Error::Io("boom".into()), false);
         assert!(matches!(resp, Response::Error(_)));
     }

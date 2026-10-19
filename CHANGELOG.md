@@ -403,7 +403,8 @@ All notable changes to irlume are documented here. This project adheres to
   grant withdrawn at the completion boundary, or a refusal of the retry
   accounting, which a credential release journals at notice level. An
   identification that fails before a decision journals
-  `irlumed: Identify failed: <error>`, with no account or score. Every
+  `irlumed: Identify failed: <error>`, with no account or score, at most
+  once a minute per peer. Every
   other request that runs on the camera worker (enrollment, scans,
   profiles, camera groups, split pairs, `ir-setup`, self-tests,
   diagnostics, recovery, keyring sealing) ends with one notice line,

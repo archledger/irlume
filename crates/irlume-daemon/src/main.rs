@@ -1817,9 +1817,6 @@ fn main() {
                     .name("irlume-camera".into())
                     .spawn(move || {
                         let _live_worker_lifetime = diagnostic_state.live().worker_lifetime();
-                        // One request-failure line per request and account a
-                        // minute, across every job this worker runs.
-                        let mut failure_lines = FailureLineLimiter::default();
                         // The engine asks this between whole captures, so a long
                         // enrolment yields the camera to an authentication instead of
                         // making it wait for ten scans, and the watchdog (#141) reads
@@ -2007,7 +2004,7 @@ fn main() {
                             if let Some(note) = &failure_note {
                                 note.journal(
                                     &resp.response,
-                                    &mut failure_lines,
+                                    &mut failure_lines(),
                                     std::time::Instant::now(),
                                 );
                             }
@@ -2020,6 +2017,7 @@ fn main() {
                                 if let Err(std::sync::mpsc::SendError(resp)) = reply.send(resp) {
                                     // The connection thread is gone: no reply
                                     // reaches the client, so a grant is not one.
+                                    resp.journal_unreceived();
                                     if let Some(filing) = resp.filing {
                                         filing
                                             .undelivered(irlume_common::OutcomeCause::Cancelled)
@@ -2864,6 +2862,7 @@ impl<'a> Delivery<'a> {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
+                reply.journal_unreceived();
                 if let Some(filing) = reply.filing {
                     filing
                         .undelivered(irlume_common::OutcomeCause::Cancelled)
@@ -2948,6 +2947,22 @@ fn is_face_grant(response: &Response) -> bool {
 }
 
 impl WorkerReply {
+    /// For a reply the connection thread was gone to take: a grant in it
+    /// was journaled as granted where its request journals decisions, so the
+    /// journal says it was not delivered, as the last admission check does.
+    fn journal_unreceived(&self) {
+        if let Some(line) = self
+            .completion
+            .as_ref()
+            .and_then(|completion| completion.withheld_line.as_ref())
+        {
+            line.journal(&std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the connection closed before the reply was handed over",
+            ));
+        }
+    }
+
     fn respond(self, stream: UnixStream) -> std::io::Result<()> {
         let WorkerReply {
             response,
@@ -9470,6 +9485,39 @@ fn is_invisible_format(c: char) -> bool {
     )
 }
 
+/// The process's request-failure line limiter, shared by the worker's
+/// request-failure lines and the identification failure lines, so every
+/// repeatable failure line keeps to one per request, peer and account a
+/// minute.
+fn failure_lines() -> std::sync::MutexGuard<'static, FailureLineLimiter> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<FailureLineLimiter>> =
+        std::sync::OnceLock::new();
+    LINES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Journal an identification that failed before a decision, through the
+/// shared limiter: a peer may identify every two seconds while the camera
+/// stays unavailable.
+fn journal_identify_failure(
+    label: &'static str,
+    peer_uid: u32,
+    error: &irlume_common::Error,
+    limiter: &mut FailureLineLimiter,
+    now: std::time::Instant,
+) -> FailureJournal {
+    let line = identify_failure_line(label, error);
+    if limiter.admit(label, peer_uid, None, now) {
+        jout_notice!("{line}");
+        FailureJournal::Journaled
+    } else {
+        irlume_common::dlog!("{line} (repeated within a minute)");
+        FailureJournal::Repeated
+    }
+}
+
 /// The journal line for an identification that failed before a decision:
 /// the request and the engine's error, on one line. An identification
 /// journals no decision, so this carries no account, score or match.
@@ -11467,7 +11515,13 @@ fn identify_reply(
             // in the request-failure form. Only the error, never a
             // score or a name the search might have found.
             note_engine_error(&e);
-            jout_notice!("{}", identify_failure_line(request_label(req), &e));
+            journal_identify_failure(
+                request_label(req),
+                peer.uid,
+                &e,
+                &mut failure_lines(),
+                std::time::Instant::now(),
+            );
             Response::Identified {
                 cause: Some(e.cause()),
                 user: None,
@@ -14965,6 +15019,34 @@ mod tests {
         assert_eq!(
             journal_prose("x\u{2028}y\u{85}z\nirlumed: forged"),
             "x y z irlumed: forged"
+        );
+    }
+
+    /// Identification failure lines share the request-failure limit: one per
+    /// request and peer a minute (review on #1135).
+    #[test]
+    fn identification_failure_lines_repeat_at_most_once_a_minute() {
+        let error = irlume_common::Error::CameraUnavailable("no camera found".into());
+        let now = std::time::Instant::now();
+        let mut limiter = FailureLineLimiter::default();
+        assert_eq!(
+            journal_identify_failure("Identify", 1000, &error, &mut limiter, now),
+            FailureJournal::Journaled
+        );
+        assert_eq!(
+            journal_identify_failure(
+                "Identify",
+                1000,
+                &error,
+                &mut limiter,
+                now + std::time::Duration::from_secs(2)
+            ),
+            FailureJournal::Repeated
+        );
+        assert_eq!(
+            journal_identify_failure("Identify", 1001, &error, &mut limiter, now),
+            FailureJournal::Journaled,
+            "another peer keeps its own line"
         );
     }
 

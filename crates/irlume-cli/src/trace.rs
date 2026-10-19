@@ -5,9 +5,9 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    parse_trace, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord, TraceStage,
-    TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
-    MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
+    parse_trace, CaptureSchedule, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord,
+    TraceStage, TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS,
+    MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
@@ -543,10 +543,18 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                 });
             }
         }
+        if intervals.is_empty() {
+            // Every daemon trace also carries a control group (the stream's
+            // TraceStarted and terminal Finished) that records no stages and
+            // never receives OperationFinished; it is not a timed operation.
+            writeln!(output, "  no stage timings").unwrap();
+            continue;
+        }
         // A trace whose recording deadline expired mid-operation ends with
-        // only the stream's global terminal record: the operation never got
-        // its OperationFinished transition, so its remaining stages went
-        // unobserved and full-looking envelope numbers would be fiction.
+        // only the stream's global terminal record: the timed operation
+        // never got its OperationFinished transition, so its remaining
+        // stages went unobserved and full-looking envelope numbers would be
+        // fiction.
         let completed = operation_records.iter().any(|record| {
             matches!(
                 record.event,
@@ -561,10 +569,6 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                 "  REFUSED: operation cut off before completion (no OperationFinished event)"
             )
             .unwrap();
-            continue;
-        }
-        if intervals.is_empty() {
-            writeln!(output, "  no stage timings").unwrap();
             continue;
         }
         // Finalization is reported at most once per operation (the release
@@ -614,8 +618,28 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         writeln!(output, "  residual_us={residual_us}").unwrap();
         // The sequential envelope is the union of the sequential intervals
         // alone: an end-to-end stage that spans the whole engine call must
-        // not absorb setup, evaluation or matching into this number.
-        let sequential_blocks = merge_intervals(sequential_intervals(&operation_records));
+        // not absorb setup, evaluation or matching into this number. The
+        // grouped route reports its batch through the Sequential* stages,
+        // but the ordinary sequential branch, split-pair capture and the
+        // concurrent-failure fallback report plain RgbCapture/IrCapture:
+        // those intervals join the envelope only when the operation's own
+        // evidence shows a sequential schedule or a fallback to one, so a
+        // concurrent pair's simultaneous captures stay excluded.
+        let sequential_schedule = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureScheduleSelected {
+                        schedule: CaptureSchedule::Sequential,
+                        ..
+                    } | ShareSafeEventKind::CaptureFallback { .. },
+                }
+            )
+        });
+        let sequential_blocks = merge_intervals(sequential_intervals(
+            &operation_records,
+            sequential_schedule,
+        ));
         let sequential_union = union_us(&sequential_blocks);
         writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
         writeln!(output, "  blocks:").unwrap();
@@ -693,17 +717,24 @@ fn render_analysis(records: &[TraceRecord]) -> String {
     output
 }
 
-fn sequential_intervals(operation_records: &[&TraceRecord]) -> Vec<StageInterval> {
+fn sequential_intervals(
+    operation_records: &[&TraceRecord],
+    sequential_schedule: bool,
+) -> Vec<StageInterval> {
     operation_records
         .iter()
         .filter_map(|record| match record.event {
-            TraceEventKind::StageTiming { stage, elapsed_us } => format!("{stage:?}")
-                .starts_with("Sequential")
-                .then_some(StageInterval {
-                    stage: format!("{stage:?}"),
+            TraceEventKind::StageTiming { stage, elapsed_us } => {
+                let name = format!("{stage:?}");
+                let sequential_stage = name.starts_with("Sequential")
+                    || (sequential_schedule
+                        && matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture));
+                sequential_stage.then_some(StageInterval {
+                    stage: name,
                     start_us: record.monotonic_us.saturating_sub(elapsed_us),
                     end_us: record.monotonic_us,
-                }),
+                })
+            }
             _ => None,
         })
         .collect()
@@ -1109,7 +1140,9 @@ mod tests {
     /// Finalization paired with the stages it contains.
     #[test]
     fn analyze_pairs_finalization_and_reports_union_residual_and_gaps() {
-        use irlume_common::diagnostics::TraceStage;
+        use irlume_common::diagnostics::{
+            CaptureSchedule, CaptureScheduleSource, OperationId, TraceStage,
+        };
         let stage_record =
             |sequence: u64, monotonic_us: u64, stage: TraceStage, elapsed_us: u64| {
                 let mut record = fixture_record(
@@ -1120,37 +1153,72 @@ mod tests {
                 record.monotonic_us = monotonic_us;
                 record
             };
-        let mut records = vec![fixture_record(
+        // Production shape: a control operation carries the stream's
+        // TraceStarted and terminal Finished (no stages, never an
+        // OperationFinished), the timed work operation carries the schedule
+        // evidence, its stages and its completion, and a second timed
+        // operation runs the concurrent schedule.
+        let control = |sequence: u64, event: TraceEventKind, monotonic_us: u64, terminal: bool| {
+            let mut record = fixture_record(sequence, event, terminal);
+            record.monotonic_us = monotonic_us;
+            record.operation_id = OperationId::from_bytes([9; 16]);
+            record
+        };
+        let mut records = vec![control(
             0,
             TraceEventKind::TraceStarted {
                 limits: TraceLimits::bounded(1_000),
                 warning: TraceWarning::PrivilegedDiagnosticOracle,
             },
+            0,
             false,
         )];
+        let schedule = |sequence: u64, monotonic_us: u64, sequential: bool| {
+            let mut record = fixture_record(
+                sequence,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureScheduleSelected {
+                        schedule: if sequential {
+                            CaptureSchedule::Sequential
+                        } else {
+                            CaptureSchedule::Concurrent
+                        },
+                        source: CaptureScheduleSource::SequentialDefault,
+                    },
+                },
+                false,
+            );
+            record.monotonic_us = monotonic_us;
+            record
+        };
+        records.push(schedule(1, 5_000, true));
         // Interval plan (us): nesting GroupedEvaluation inside Finalization
         // must not double count in the union, and the deliberate gaps must
         // surface as residual attributed to their bordering stages.
         records.extend([
-            stage_record(1, 100_000, TraceStage::CameraOpen, 98_000),
-            stage_record(2, 200_000, TraceStage::EnrollmentLoad, 38_000),
-            stage_record(3, 250_000, TraceStage::SequentialRgbStart, 2_000),
-            stage_record(4, 350_000, TraceStage::SequentialRgbSample, 90_000),
-            stage_record(5, 360_000, TraceStage::SequentialRgbSample, 10_000),
-            stage_record(6, 365_000, TraceStage::SequentialRgbRelease, 5_000),
-            stage_record(7, 480_000, TraceStage::SequentialIrStart, 100_000),
-            stage_record(8, 500_000, TraceStage::SequentialIrSample, 20_000),
-            stage_record(9, 506_000, TraceStage::SequentialIrRelease, 6_000),
-            stage_record(10, 540_000, TraceStage::GroupedEvaluation, 10_000),
-            stage_record(11, 560_000, TraceStage::Finalization, 30_000),
+            stage_record(2, 100_000, TraceStage::CameraOpen, 98_000),
+            // Generic sequential captures: plain RgbCapture/IrCapture stages
+            // under a sequential schedule join the envelope.
+            stage_record(3, 140_000, TraceStage::RgbCapture, 20_000),
+            stage_record(4, 160_000, TraceStage::IrCapture, 10_000),
+            stage_record(5, 200_000, TraceStage::EnrollmentLoad, 38_000),
+            stage_record(6, 250_000, TraceStage::SequentialRgbStart, 2_000),
+            stage_record(7, 350_000, TraceStage::SequentialRgbSample, 90_000),
+            stage_record(8, 360_000, TraceStage::SequentialRgbSample, 10_000),
+            stage_record(9, 365_000, TraceStage::SequentialRgbRelease, 5_000),
+            stage_record(10, 480_000, TraceStage::SequentialIrStart, 100_000),
+            stage_record(11, 500_000, TraceStage::SequentialIrSample, 20_000),
+            stage_record(12, 506_000, TraceStage::SequentialIrRelease, 6_000),
+            stage_record(13, 540_000, TraceStage::GroupedEvaluation, 10_000),
+            stage_record(14, 560_000, TraceStage::Finalization, 30_000),
             // An end-to-end stage spanning nearly the whole operation: the
             // sequential envelope must still exclude it, and the trailing
             // edge gap must name it as the block's end stage, not the last
             // sequential stage appended inside it.
-            stage_record(12, 565_000, TraceStage::EngineAuthenticate, 555_000),
+            stage_record(15, 565_000, TraceStage::EngineAuthenticate, 555_000),
         ]);
         let mut operation_finished = fixture_record(
-            13,
+            16,
             TraceEventKind::Shared {
                 transition: ShareSafeEventKind::OperationFinished {
                     outcome: CategoricalOutcome::Completed,
@@ -1160,14 +1228,38 @@ mod tests {
         );
         operation_finished.monotonic_us = 568_000;
         records.push(operation_finished);
-        records.push(fixture_record(
-            14,
+        // A concurrent-schedule operation: its RgbCapture/IrCapture stay out
+        // of the sequential envelope.
+        records.push(schedule(17, 9_000, false));
+        records.last_mut().unwrap().operation_id = OperationId::from_bytes([5; 16]);
+        for (sequence, monotonic_us, stage, elapsed_us) in [
+            (18_u64, 12_000_u64, TraceStage::RgbCapture, 2_000_u64),
+            (19, 14_000, TraceStage::IrCapture, 1_000),
+        ] {
+            let mut record = stage_record(sequence, monotonic_us, stage, elapsed_us);
+            record.operation_id = OperationId::from_bytes([5; 16]);
+            records.push(record);
+        }
+        let mut concurrent_finished = fixture_record(
+            20,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+            false,
+        );
+        concurrent_finished.monotonic_us = 15_000;
+        concurrent_finished.operation_id = OperationId::from_bytes([5; 16]);
+        records.push(concurrent_finished);
+        records.push(control(
+            21,
             TraceEventKind::Finished {
                 outcome: CategoricalOutcome::Completed,
             },
+            570_000,
             true,
         ));
-        records.last_mut().unwrap().monotonic_us = 570_000;
         let dir = sandbox("analyze-v5");
         let path = dir.join("trace.jsonl");
         let mut bytes = Vec::new();
@@ -1178,19 +1270,26 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let rendered = analyze(&path).unwrap();
-        // Span covers TraceStarted (0) to the terminal Finished record.
-        assert!(rendered.contains("span_us=570000"), "{rendered}");
+        // The work operation's span runs from the earliest reconstructed
+        // interval start (2_000) to its OperationFinished (568_000).
+        assert!(rendered.contains("span_us=566000"), "{rendered}");
         // The EngineAuthenticate end-to-end interval merges everything into
         // one block [2_000, 565_000]; the nested GroupedEvaluation still
         // counts once inside it.
         assert!(rendered.contains("stage_union_us=563000"), "{rendered}");
-        assert!(rendered.contains("residual_us=7000"), "{rendered}");
-        // The P1 pin: the sequential envelope is the union of the sequential
-        // intervals ALONE, never the end-to-end block that contains them.
+        assert!(rendered.contains("residual_us=3000"), "{rendered}");
+        // The sequential envelope: the Sequential* intervals plus the plain
+        // RgbCapture/IrCapture the sequential schedule covers, never the
+        // end-to-end block that contains them.
         assert!(
-            rendered.contains("sequential_union_us=233000"),
+            rendered.contains("sequential_union_us=263000"),
             "{rendered}"
         );
+        // The concurrent-schedule operation's captures stay excluded.
+        assert!(rendered.contains("sequential_union_us=0"), "{rendered}");
+        // The control group records no stages and is never refused.
+        assert!(rendered.contains("no stage timings"), "{rendered}");
+        assert!(!rendered.contains("cut off"), "{rendered}");
         // Finalization pairing names the evaluation it contains.
         assert!(
             rendered.contains("finalization_us=30000 contains=GroupedEvaluation"),
@@ -1200,12 +1299,14 @@ mod tests {
         // block's start stage, and the trailing edge names the stage whose
         // end forms the block boundary (EngineAuthenticate, not the last
         // sequential stage appended inside it).
+        // The concurrent operation's leading edge (schedule record at 9_000
+        // before its first capture interval at 10_000) is listed too.
         assert!(
-            rendered.contains("gap_us=2000 after operation-start before CameraOpen"),
+            rendered.contains("gap_us=1000 after operation-start before RgbCapture"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("gap_us=5000 after EngineAuthenticate before operation-end"),
+            rendered.contains("gap_us=3000 after EngineAuthenticate before operation-end"),
             "{rendered}"
         );
         std::fs::remove_dir_all(dir).unwrap();

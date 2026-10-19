@@ -105,12 +105,28 @@ pub fn emitted_lines() -> u64 {
 
 static EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+thread_local! {
+    static NOTICED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Lines at notice priority or above emitted on this thread. Two readings
+/// tell a caller whether a stretch of its own work already said something a
+/// person sees in the default journal view; the daemon's request-failure line
+/// stays quiet where the request's handler spoke.
+pub fn noticed_on_this_thread() -> u64 {
+    NOTICED.with(std::cell::Cell::get)
+}
+
 /// Emit one leveled line to stderr, journal-prefixed when applicable.
 pub fn line(level: Level, args: fmt::Arguments<'_>) {
+    let noticed = matches!(level, Level::Error | Level::Warning | Level::Notice);
     let out = format_line(level, stderr_is_journal(), &args.to_string());
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(out.as_bytes());
     EMITTED.fetch_add(1, Ordering::Relaxed);
+    if noticed {
+        NOTICED.with(|count| count.set(count.get() + 1));
+    }
 }
 
 #[macro_export]
@@ -151,6 +167,25 @@ macro_rules! jout_debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only notice and above count: they are what the default journal view
+    /// shows. The count is this thread's, so a line another thread writes
+    /// meanwhile cannot speak for this thread's work.
+    #[test]
+    fn the_thread_counts_its_own_notice_and_higher_lines() {
+        let before = noticed_on_this_thread();
+        line(Level::Info, format_args!("irlume-test: info"));
+        line(Level::Debug, format_args!("irlume-test: debug"));
+        assert_eq!(noticed_on_this_thread(), before);
+        line(Level::Notice, format_args!("irlume-test: notice"));
+        line(Level::Warning, format_args!("irlume-test: warning"));
+        line(Level::Error, format_args!("irlume-test: error"));
+        assert_eq!(noticed_on_this_thread(), before + 3);
+        std::thread::spawn(|| line(Level::Error, format_args!("irlume-test: other thread")))
+            .join()
+            .unwrap();
+        assert_eq!(noticed_on_this_thread(), before + 3);
+    }
 
     #[test]
     fn level_numbers_match_syslog_priorities() {

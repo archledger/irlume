@@ -395,6 +395,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- irlumed journals requests that end in an error. An authentication that
+  ends without a decision gets `irlumed: face auth '<user>': no decision:
+  <error>` wherever its decision would be journaled (the convenience tier,
+  or `IRLUME_LOG=debug`), as the first split capture after a replug showed
+  (#1063). Every other request that runs on the camera worker (enrollment,
+  scans, profiles, camera groups, split pairs, `ir-setup`, self-tests,
+  diagnostics, recovery, keyring sealing) gets one notice line,
+  `irlumed: <Request> for '<user>' failed: <error>`, unless its handler
+  already wrote one, at most once a minute per request and account, with
+  repeats in the debug log. The face requests and `UnsealKeyring` keep
+  their own lines, and the text is made journal-safe.
+
 - `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
   strictly (#1081). It now judges these cases:
   - A separator that records a measurement error (its digest is that of

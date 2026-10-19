@@ -2178,6 +2178,7 @@ fn recorded_face_response(
     record: impl FnOnce() -> Result<(), &'static str>,
     refuse: fn(&str) -> Response,
     complete: impl FnOnce() -> Response,
+    withdrawn: impl Fn(&str),
 ) -> Response {
     match record() {
         Ok(()) => complete(),
@@ -2185,6 +2186,7 @@ fn recorded_face_response(
             // The face was decided and the camera used; only the retry
             // accounting failed. The refusal reply must not read as a
             // pre-camera policy refusal in the record (ADR-0030 §5).
+            withdrawn(&format!("refused by the retry accounting ({reason})"));
             let refused = refuse(reason);
             note_decided(match &refused {
                 Response::AuthResult { cause, .. } => *cause,
@@ -2206,16 +2208,27 @@ fn bounded_face_response(
     // gone, binding failed): the caller decides the reply shape, typed for
     // a client that asked for it (ADR-0030 §5), prose otherwise.
     boundary: impl Fn(irlume_common::Error) -> Response,
+    // Told why the reply is not the prepared one: a grant withdrawn at the
+    // completion boundary or a refusal the retry accounting decided. The
+    // prepared reply journals itself; the caller journals this under its
+    // own rule, so neither ends silently.
+    withdrawn: impl Fn(&str),
 ) -> Response {
     if !granted {
-        return recorded_face_response(record, refuse, prepare);
+        return recorded_face_response(record, refuse, prepare, withdrawn);
     }
+    let withdraw = |error: irlume_common::Error| {
+        withdrawn(&format!(
+            "grant withdrawn at the completion boundary ({error})"
+        ));
+        boundary(error)
+    };
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     let response = prepare();
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     // A failed TPM operation never publishes a credential or clears history.
     // Prepared secret responses remain zeroizing owners on every refusal path.
@@ -2227,11 +2240,14 @@ fn bounded_face_response(
     }
     let recorded = record();
     if let Err(error) = active() {
-        return boundary(error);
+        return withdraw(error);
     }
     match recorded {
         Ok(()) => response,
-        Err(reason) => refuse(reason),
+        Err(reason) => {
+            withdrawn(&format!("refused by the retry accounting ({reason})"));
+            refuse(reason)
+        }
     }
 }
 
@@ -9470,6 +9486,14 @@ fn verify_reply(
         },
         retry_verify_refusal,
         |error| authentication_error(error, structured_errors),
+        |why| {
+            if journals_face_decisions(convenience) {
+                jout_info!(
+                    "irlumed: face auth '{user}': {}",
+                    journal_safe_up_to(why, 240)
+                );
+            }
+        },
     )
 }
 
@@ -12011,6 +12035,12 @@ fn unseal_reply(
             note_engine_error(&error);
             Response::Error(error.to_string())
         },
+        |why| {
+            jout_notice!(
+                "irlumed: UnsealPassword: '{user}': {}",
+                journal_safe_up_to(why, 240)
+            );
+        },
     )
 }
 
@@ -12429,6 +12459,7 @@ mod tests {
             let stage = Cell::new(0);
             let records = Cell::new(0);
             let preparations = Cell::new(0);
+            let withdrawn = std::cell::RefCell::new(Vec::new());
             let response = bounded_face_response(
                 true,
                 || {
@@ -12453,6 +12484,19 @@ mod tests {
                 },
                 retry_unseal_refusal,
                 |error| Response::Error(error.to_string()),
+                |why| withdrawn.borrow_mut().push(why.to_string()),
+            );
+            // A withdrawn grant is told to the caller to journal (#1135).
+            assert_eq!(
+                withdrawn.take(),
+                if stop_at == 3 {
+                    Vec::new()
+                } else {
+                    vec!["grant withdrawn at the completion boundary \
+                          (authentication window expired; use your password)"
+                        .to_string()]
+                },
+                "stage {stop_at}"
             );
             assert_eq!(
                 matches!(response, Response::PasswordUnsealed { .. }),

@@ -399,13 +399,17 @@ All notable changes to irlume are documented here. This project adheres to
   ends without a decision gets `irlumed: face auth '<user>': no decision:
   <error>` wherever its decision would be journaled (the convenience tier,
   or `IRLUME_LOG=debug`), as the first split capture after a replug showed
-  (#1063). Every other request that runs on the camera worker (enrollment,
-  scans, profiles, camera groups, split pairs, `ir-setup`, self-tests,
-  diagnostics, recovery, keyring sealing) gets one notice line,
+  (#1063). So does a decided attempt whose reply is not that decision: a
+  grant withdrawn at the completion boundary, or a refusal of the retry
+  accounting, which a credential release journals at notice level. Every
+  other request that runs on the camera worker (enrollment, scans,
+  profiles, camera groups, split pairs, `ir-setup`, self-tests,
+  diagnostics, recovery, keyring sealing) ends with one notice line,
   `irlumed: <Request> for '<user>' failed: <error>`, also after a line its
-  handler wrote, so every failed request ends with one such line; at most
-  once a minute per request and account, with repeats in the debug log. The face requests and `UnsealKeyring` keep
-  their own lines, and the text is made journal-safe.
+  handler wrote; at most once a minute per request and account, with
+  repeats in the debug log. The face requests and `UnsealKeyring` keep
+  their own lines, refusals answered before a request reaches the worker
+  are not journaled, and the text is made journal-safe.
 
 - `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
   strictly (#1081). It now judges these cases:

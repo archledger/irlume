@@ -213,7 +213,7 @@ fn diagnostic_node(name: &str) -> gpu::RenderNode {
 #[ignore = "hardware: explicit PM diagnostic settings, private output directory and current reference; no system sleep or PM writes"]
 fn gpu_pm_hw_lifetime_diagnostic() {
     use super::gpu_groundwork_tests::{
-        hw_cpu_cascade, hw_selection, recognizer_bytes, report_hw_identity,
+        hw_accepted_assignment, hw_cpu_cascade, hw_selection, recognizer_bytes, report_hw_identity,
     };
     use super::gpu_reliability_hardware_tests::read_reference;
     let (name, duration) = settings(
@@ -281,7 +281,11 @@ fn gpu_pm_hw_lifetime_diagnostic() {
             &bytes,
         )
         .unwrap();
-    assert_eq!(assignment, "GPU.0");
+    assert!(
+        hw_accepted_assignment(&platform.device, &assignment),
+        "OpenVINO assigned {assignment:?}, not the sole enumerated device {:?} or GPU",
+        platform.device
+    );
     let mut originals = Vec::new();
     for k in 0..4 {
         let input = super::super::npu_reference::chip(k);

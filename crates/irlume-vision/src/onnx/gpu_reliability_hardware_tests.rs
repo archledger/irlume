@@ -257,7 +257,7 @@ impl Observations for HardwareObservations<'_> {
 #[ignore = "hardware: explicit prior reference and bounded waits; nonzero system wait requires a freshly ready operator"]
 fn gpu_retained_hw_reliability_control() {
     use super::gpu_groundwork_tests::{
-        hw_cpu_cascade, hw_selection, recognizer_bytes, report_hw_identity,
+        hw_accepted_assignment, hw_cpu_cascade, hw_selection, recognizer_bytes, report_hw_identity,
     };
     use crate::npu::gpu;
     let reference_path = std::env::var_os("IRLUME_GPU_RELIABILITY_REFERENCE")
@@ -292,7 +292,11 @@ fn gpu_retained_hw_reliability_control() {
                 &bytes,
             )
             .unwrap();
-        assert_eq!(assignment, "GPU.0");
+        assert!(
+            hw_accepted_assignment(&platform.device, &assignment),
+            "OpenVINO assigned {assignment:?}, not the sole enumerated device {:?} or GPU",
+            platform.device
+        );
         assert_eq!(
             cpu.cpu_reference_digest().unwrap(),
             config.cpu_reference,

@@ -793,6 +793,27 @@ mod gpu_groundwork_tests {
         assert_eq!(pci, None);
     }
 
+    /// The hardware-lane mirror of the production placement contract
+    /// (`validate_gpu_assignment`): the compile must land on the platform's
+    /// sole enumerated device by name, or on the accepted generic `GPU` some
+    /// EXECUTION_DEVICES answers report. Hard-coding `GPU.0` aborted valid
+    /// reliability and diagnostic runs on systems whose only device
+    /// enumerates under a different index.
+    pub(super) fn hw_accepted_assignment(platform_device: &str, assignment: &str) -> bool {
+        assignment == platform_device || assignment == "GPU"
+    }
+
+    #[test]
+    fn hw_assignment_accepts_the_sole_device_or_generic_gpu() {
+        // The platform enumerated GPU.1 as its only device: the previous
+        // hard-coded `assert_eq!(assignment, "GPU.0")` aborted here.
+        assert!(hw_accepted_assignment("GPU.1", "GPU.1"));
+        assert!(hw_accepted_assignment("GPU.1", "GPU"));
+        assert!(!hw_accepted_assignment("GPU.1", "GPU.0"));
+        assert!(!hw_accepted_assignment("GPU.1", "CPU"));
+        assert!(!hw_accepted_assignment("GPU.1", "GPU.1 "));
+    }
+
     /// The shared hardware-lane setup: the validated provider selection and
     /// the real kernel sources.
     pub(super) fn hw_selection() -> crate::npu::RuntimeSelection {

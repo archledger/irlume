@@ -5,7 +5,7 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    parse_trace, TraceEventKind, TraceLimits, TraceRecord, TraceValidator,
+    parse_trace, TraceEventKind, TraceLimits, TraceRecord, TraceStage, TraceValidator,
     CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
     MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
@@ -19,6 +19,7 @@ use std::time::Duration;
 pub(crate) fn run(args: &[String]) -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("explain") => run_explain(args),
+        Some("analyze") => run_analyze(args),
         Some("record") | None | Some("--duration" | "--output") => run_record(args),
         Some(value) if value.starts_with("--duration=") || value.starts_with("--output=") => {
             run_record(args)
@@ -29,7 +30,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: irlume trace [record] [--duration 60s] [--output FILE.jsonl]\n       irlume trace explain FILE.jsonl [--output FILE.txt]"
+        "usage: irlume trace [record] [--duration 60s] [--output FILE.jsonl]\n       irlume trace explain FILE.jsonl [--output FILE.txt]\n       irlume trace analyze FILE.jsonl [--output FILE.txt]"
     );
     ExitCode::from(2)
 }
@@ -244,6 +245,75 @@ fn effective_uid() -> u32 {
     }
 }
 
+fn parse_analyze_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), &'static str> {
+    if args.get(1).map(String::as_str) != Some("analyze") {
+        return Err("invalid command");
+    }
+    let input = args.get(2).ok_or("a .jsonl trace path is required")?;
+    if input.starts_with('-') {
+        return Err("a .jsonl trace path is required");
+    }
+    let mut output = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" if output.is_none() => {
+                output = Some(PathBuf::from(
+                    args.get(index + 1).ok_or("--output requires a path")?,
+                ));
+                index += 2;
+            }
+            value if value.starts_with("--output=") && output.is_none() => {
+                output = Some(PathBuf::from(value.trim_start_matches("--output=")));
+                index += 1;
+            }
+            _ => return Err("usage: irlume trace analyze FILE.jsonl [--output FILE.txt]"),
+        }
+    }
+    if output.as_deref().is_some_and(|path| {
+        path.extension().and_then(|extension| extension.to_str()) != Some("txt")
+    }) {
+        return Err("--output must end in .txt");
+    }
+    Ok((PathBuf::from(input), output))
+}
+
+fn run_analyze(args: &[String]) -> ExitCode {
+    let (input, output) = match parse_analyze_args(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("irlume trace analyze: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let rendered = match analyze(&input) {
+        Ok(rendered) => rendered,
+        Err(message) => {
+            eprintln!("irlume trace analyze: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(output) = output else {
+        print!("{rendered}");
+        return ExitCode::SUCCESS;
+    };
+    let result = (|| {
+        let mut artifact = SecureArtifact::create(&output, MAX_TRACE_BYTES)?;
+        artifact.write_chunk(rendered.as_bytes())?;
+        artifact.commit()
+    })();
+    match result {
+        Ok(published) => {
+            println!("Trace analysis created: {}", published.final_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("irlume trace analyze: {}: {error}", output.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_explain(args: &[String]) -> ExitCode {
     let (input, output) = match parse_explain_args(args) {
         Ok(options) => options,
@@ -379,6 +449,165 @@ fn render_event(event: &TraceEventKind) -> String {
     // Every value is a closed enum, finite number, validated SafeLabel, or
     // exact contract. No daemon/user prose is accepted into this renderer.
     format!("{event:?}")
+}
+
+/// One stage interval: the record's timestamp is the stage END, so the
+/// interval is `[monotonic_us - elapsed_us, monotonic_us]`.
+struct StageInterval {
+    stage: String,
+    start_us: u64,
+    end_us: u64,
+}
+
+/// Merge sorted, possibly nested intervals into disjoint blocks, keeping the
+/// stages each block covers so gap attribution can name its borders.
+fn merge_intervals(mut intervals: Vec<StageInterval>) -> Vec<(u64, u64, Vec<String>)> {
+    intervals.sort_by_key(|interval| (interval.start_us, interval.end_us));
+    let mut merged: Vec<(u64, u64, Vec<String>)> = Vec::new();
+    for interval in intervals {
+        match merged.last_mut() {
+            Some((_, end, stages)) if interval.start_us <= *end => {
+                *end = (*end).max(interval.end_us);
+                stages.push(interval.stage);
+            }
+            _ => merged.push((interval.start_us, interval.end_us, vec![interval.stage])),
+        }
+    }
+    merged
+}
+
+fn render_analysis(records: &[TraceRecord]) -> String {
+    use std::fmt::Write as _;
+    let mut by_operation: BTreeMap<String, Vec<&TraceRecord>> = BTreeMap::new();
+    let mut dropped = 0_u64;
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        by_operation.entry(operation_id).or_default().push(record);
+        if let TraceEventKind::EventsDropped { count } = record.event {
+            dropped = dropped.saturating_add(count);
+        }
+    }
+    let mut output = String::new();
+    if let Some(record) = records.first() {
+        writeln!(
+            output,
+            "Irlume diagnostic trace schema {}",
+            record.trace_schema
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "Irlume diagnostic trace (empty)").unwrap();
+    }
+    writeln!(output, "Records: {}", records.len()).unwrap();
+    writeln!(output, "Events dropped before recording: {dropped}").unwrap();
+    for (operation_id, operation_records) in by_operation {
+        writeln!(output).unwrap();
+        writeln!(
+            output,
+            "Operation {operation_id} ({:?})",
+            operation_records[0].operation
+        )
+        .unwrap();
+        let span_us = operation_records
+            .last()
+            .zip(operation_records.first())
+            .map(|(last, first)| last.monotonic_us.saturating_sub(first.monotonic_us))
+            .unwrap_or(0);
+        let mut intervals = Vec::new();
+        for record in &operation_records {
+            if let TraceEventKind::StageTiming { stage, elapsed_us } = record.event {
+                intervals.push(StageInterval {
+                    stage: format!("{stage:?}"),
+                    start_us: record.monotonic_us.saturating_sub(elapsed_us),
+                    end_us: record.monotonic_us,
+                });
+            }
+        }
+        if intervals.is_empty() {
+            writeln!(output, "  no stage timings").unwrap();
+            continue;
+        }
+        let blocks = merge_intervals(intervals);
+        let union_us: u64 = blocks.iter().map(|(s, e, _)| e - s).sum();
+        let residual_us = span_us.saturating_sub(union_us);
+        writeln!(output, "  span_us={span_us}").unwrap();
+        writeln!(output, "  stage_union_us={union_us}").unwrap();
+        writeln!(output, "  residual_us={residual_us}").unwrap();
+        let sequential_union_us: u64 = blocks
+            .iter()
+            .filter(|(_, _, stages)| stages.iter().any(|s| s.starts_with("Sequential")))
+            .map(|(s, e, _)| e - s)
+            .sum();
+        writeln!(output, "  sequential_union_us={sequential_union_us}").unwrap();
+        writeln!(output, "  blocks:").unwrap();
+        for (start_us, end_us, stages) in &blocks {
+            writeln!(
+                output,
+                "    {start_us:>10}..{end_us:<10} {}",
+                stages.join("+")
+            )
+            .unwrap();
+        }
+        if blocks.len() > 1 {
+            writeln!(output, "  gaps:").unwrap();
+            for pair in blocks.windows(2) {
+                let gap_us = pair[1].0.saturating_sub(pair[0].1);
+                if gap_us > 0 {
+                    writeln!(
+                        output,
+                        "    gap_us={gap_us} after {} before {}",
+                        pair[0].2.last().unwrap(),
+                        pair[1].2.first().unwrap()
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        for record in &operation_records {
+            if let TraceEventKind::StageTiming {
+                stage: TraceStage::Finalization,
+                elapsed_us,
+            } = record.event
+            {
+                let start_us = record.monotonic_us.saturating_sub(elapsed_us);
+                let contained: Vec<String> = operation_records
+                    .iter()
+                    .filter_map(|other| match other.event {
+                        TraceEventKind::StageTiming { stage, elapsed_us } => {
+                            let other_start = other.monotonic_us.saturating_sub(elapsed_us);
+                            (other_start >= start_us
+                                && other.monotonic_us <= record.monotonic_us
+                                && stage != TraceStage::Finalization)
+                                .then(|| format!("{stage:?}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                writeln!(
+                    output,
+                    "  finalization_us={elapsed_us} contains={}",
+                    if contained.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        contained.join("+")
+                    }
+                )
+                .unwrap();
+            }
+        }
+    }
+    output
+}
+
+fn analyze(input: &Path) -> Result<String, String> {
+    let file =
+        std::fs::File::open(input).map_err(|error| format!("{}: {error}", input.display()))?;
+    let limits = TraceLimits::bounded(MAX_TRACE_DURATION_MS);
+    let parsed = parse_trace(BufReader::new(file), limits).map_err(|error| error.to_string())?;
+    Ok(render_analysis(parsed.records()))
 }
 
 #[cfg(test)]
@@ -737,8 +966,96 @@ mod tests {
     }
 
     /// `irlume trace explain` reads a schema 5 file with the sequential
-    /// capture phases and the grouped evaluation, and refuses the same
-    /// stages in a file labeled with an older schema.
+    /// The analyze projection reports the union/residual decomposition the
+    /// sequential-path timing attribution needs (#856): interval union so a
+    /// nested GroupedEvaluation cannot double count, residual gaps named by
+    /// their bordering stages, the sequential envelope, and each
+    /// Finalization paired with the stages it contains.
+    #[test]
+    fn analyze_pairs_finalization_and_reports_union_residual_and_gaps() {
+        use irlume_common::diagnostics::TraceStage;
+        let stage_record =
+            |sequence: u64, monotonic_us: u64, stage: TraceStage, elapsed_us: u64| {
+                let mut record = fixture_record(
+                    sequence,
+                    TraceEventKind::StageTiming { stage, elapsed_us },
+                    false,
+                );
+                record.monotonic_us = monotonic_us;
+                record
+            };
+        let mut records = vec![fixture_record(
+            0,
+            TraceEventKind::TraceStarted {
+                limits: TraceLimits::bounded(1_000),
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            false,
+        )];
+        // Interval plan (us): nesting GroupedEvaluation inside Finalization
+        // must not double count in the union, and the deliberate gaps must
+        // surface as residual attributed to their bordering stages.
+        records.extend([
+            stage_record(1, 100_000, TraceStage::CameraOpen, 98_000),
+            stage_record(2, 200_000, TraceStage::EnrollmentLoad, 38_000),
+            stage_record(3, 250_000, TraceStage::SequentialRgbStart, 2_000),
+            stage_record(4, 350_000, TraceStage::SequentialRgbSample, 90_000),
+            stage_record(5, 360_000, TraceStage::SequentialRgbSample, 10_000),
+            stage_record(6, 365_000, TraceStage::SequentialRgbRelease, 5_000),
+            stage_record(7, 480_000, TraceStage::SequentialIrStart, 100_000),
+            stage_record(8, 500_000, TraceStage::SequentialIrSample, 20_000),
+            stage_record(9, 506_000, TraceStage::SequentialIrRelease, 6_000),
+            stage_record(10, 540_000, TraceStage::GroupedEvaluation, 10_000),
+            stage_record(11, 560_000, TraceStage::Finalization, 30_000),
+        ]);
+        records.push(fixture_record(
+            12,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        records.last_mut().unwrap().monotonic_us = 570_000;
+        let dir = sandbox("analyze-v5");
+        let path = dir.join("trace.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        let rendered = analyze(&path).unwrap();
+        // Span covers TraceStarted (0) to the terminal Finished record.
+        assert!(rendered.contains("span_us=570000"), "{rendered}");
+        // Union of every stage interval; the nested GroupedEvaluation (10 ms
+        // inside the 30 ms Finalization) is counted once.
+        assert!(rendered.contains("stage_union_us=399000"), "{rendered}");
+        // Residual = span - union, including the leading and trailing edges.
+        assert!(rendered.contains("residual_us=171000"), "{rendered}");
+        // The sequential capture envelope: Rgb 2+105 us blocks and the IR
+        // block, gaps between them excluded.
+        assert!(
+            rendered.contains("sequential_union_us=233000"),
+            "{rendered}"
+        );
+        // Finalization pairing names the evaluation it contains.
+        assert!(
+            rendered.contains("finalization_us=30000 contains=GroupedEvaluation"),
+            "{rendered}"
+        );
+        // Gap attribution names the bordering stages.
+        assert!(
+            rendered.contains("gap_us=62000 between CameraOpen and EnrollmentLoad")
+                || rendered.contains("gap_us=62000 after CameraOpen"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reads a schema-5 trace that exercises every sequential capture phase
+    /// and the grouped evaluation, and refuses the same stages in a file
+    /// labeled with an older schema.
     #[test]
     fn explain_reads_schema_5_sequential_capture_stages_and_refuses_them_below() {
         use irlume_common::diagnostics::{TraceStage, V4_TRACE_SCHEMA_VERSION};

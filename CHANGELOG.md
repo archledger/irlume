@@ -708,6 +708,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlumed's background-requalification journal lines ("camera context
+  changed since the last qualification", "background requalification
+  failed") and the engine's proactive-degradation debug line no longer
+  print a literal backslash, a line break and indentation in the middle of
+  the message. A test now fails on any Rust source line in the workspace
+  that ends in an escaped backslash.
+
 - A face request the retry ceiling refuses before it starts is journaled
   (#1136): `irlumed: face auth '<user>': refused by the retry accounting
   (<reason>)`, or the same after `irlumed: UnsealPassword: '<user>':`, when

@@ -1910,10 +1910,8 @@ fn main() {
                             }
                             delivery.attempt = attempt.map(|attempt| (attempt, scope.clone()));
                             // Kept before the request moves into dispatch: a
-                            // reply that ends in an error gets one journal line
-                            // unless its handler already wrote one.
+                            // reply that ends in an error gets one journal line.
                             let failure_note = RequestFailureNote::for_request(&req);
-                            let noticed_before = irlume_common::journal_out::noticed_on_this_thread();
                             let capture_mode_before = capture_mode_changes();
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 dispatch_scoped_session_delivering(req, &peer, &mut engine, &scope, authorization, session.as_ref(), position.as_ref(), &mut delivery)
@@ -2009,7 +2007,6 @@ fn main() {
                             if let Some(note) = &failure_note {
                                 note.journal(
                                     &resp.response,
-                                    noticed_before,
                                     &mut failure_lines,
                                     std::time::Instant::now(),
                                 );
@@ -9271,18 +9268,17 @@ impl RequestFailureNote {
         })
     }
 
-    /// Journal the reply if it is a failure nothing on this thread already
-    /// reported at notice or above since `noticed_before`.
+    /// Journal the reply if it is a failure. Every failed request ends with
+    /// this one line, also after a line its handler wrote: whether an earlier
+    /// line reported this failure cannot be told from its priority, since a
+    /// handler also writes notices and warnings that report nothing failing
+    /// (an enrollment's one-time contention probe).
     fn journal(
         &self,
         response: &Response,
-        noticed_before: u64,
         limiter: &mut FailureLineLimiter,
         now: std::time::Instant,
     ) -> FailureJournal {
-        if irlume_common::journal_out::noticed_on_this_thread() != noticed_before {
-            return FailureJournal::HandlerSpoke;
-        }
         let Some(line) = request_failure_line(self.label, self.account.as_deref(), response) else {
             return FailureJournal::NotAFailure;
         };
@@ -9299,8 +9295,6 @@ impl RequestFailureNote {
 /// What [`RequestFailureNote::journal`] did with a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureJournal {
-    /// The handler already wrote a line a person sees.
-    HandlerSpoke,
     /// A success, or a failure that is routine by contract.
     NotAFailure,
     /// One notice line.
@@ -14769,10 +14763,12 @@ mod tests {
         );
     }
 
-    /// A handler that already wrote a notice-or-higher line on this thread
-    /// is not repeated; one that stayed silent gets the line.
+    /// Every failed request ends with its line, also after a line its
+    /// handler wrote: an earlier notice or warning need not report the failure
+    /// (review on #1135). Successes get none, and a repeat within the minute
+    /// is debug only.
     #[test]
-    fn a_failure_the_handler_reported_is_not_journaled_twice() {
+    fn a_failed_request_gets_its_line_after_its_handlers_own() {
         let note = RequestFailureNote::for_request(&Request::RenameProfile {
             user: "alice".into(),
             profile: "p".into(),
@@ -14782,24 +14778,17 @@ mod tests {
         let failed = Response::Error("profile 'q' already exists".into());
         let now = std::time::Instant::now();
         let mut limiter = FailureLineLimiter::default();
-        let before = irlume_common::journal_out::noticed_on_this_thread();
-        jout_notice!("irlumed: RenameProfile: the handler's own line");
+        jout_notice!("irlumed: RenameProfile: an unrelated notice before the failure");
         assert_eq!(
-            note.journal(&failed, before, &mut limiter, now),
-            FailureJournal::HandlerSpoke
-        );
-        let before = irlume_common::journal_out::noticed_on_this_thread();
-        assert_eq!(
-            note.journal(&Response::Ok("renamed".into()), before, &mut limiter, now),
+            note.journal(&Response::Ok("renamed".into()), &mut limiter, now),
             FailureJournal::NotAFailure
         );
         assert_eq!(
-            note.journal(&failed, before, &mut limiter, now),
+            note.journal(&failed, &mut limiter, now),
             FailureJournal::Journaled
         );
-        let before = irlume_common::journal_out::noticed_on_this_thread();
         assert_eq!(
-            note.journal(&failed, before, &mut limiter, now),
+            note.journal(&failed, &mut limiter, now),
             FailureJournal::Repeated
         );
     }

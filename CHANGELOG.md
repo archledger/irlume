@@ -402,9 +402,9 @@ All notable changes to irlume are documented here. This project adheres to
   (#1063). Every other request that runs on the camera worker (enrollment,
   scans, profiles, camera groups, split pairs, `ir-setup`, self-tests,
   diagnostics, recovery, keyring sealing) gets one notice line,
-  `irlumed: <Request> for '<user>' failed: <error>`, unless its handler
-  already wrote one, at most once a minute per request and account, with
-  repeats in the debug log. The face requests and `UnsealKeyring` keep
+  `irlumed: <Request> for '<user>' failed: <error>`, also after a line its
+  handler wrote, so every failed request ends with one such line; at most
+  once a minute per request and account, with repeats in the debug log. The face requests and `UnsealKeyring` keep
   their own lines, and the text is made journal-safe.
 
 - `irlume doctor`'s `pcr7-binding` check reads the firmware event log more

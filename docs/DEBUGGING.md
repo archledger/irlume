@@ -26,7 +26,7 @@ How to read the key lines:
 | `irlumed: UnsealPassword: OK for 'x' (score 0.8800), login password unsealed` | face matched AND the TPM released the sealed secret; the trailing words name which kind it was (`login password`, `KDE wallet key`, `GNOME keyring token`) |
 | `…face matched … but TPM unseal FAILED` | face was fine; PCR drift kept the keyring locked → `irlume diag`, then `sudo irlume reseal` |
 | `irlumed: face auth 'x': no decision: <error>` | an authentication ended without a decision: the camera, the window or the engine failed before one was reached. Journaled where decisions are (convenience tier, or `IRLUME_LOG=debug`) |
-| `irlumed: <Request> for 'x' failed: <error>` | any other request (an enrollment, a scan, a profile change, a split pair, `ir-setup`, a self-test, recovery) ended in an error its handler did not already report; at most one line per request and account a minute, repeats under `IRLUME_LOG=debug` |
+| `irlumed: <Request> for 'x' failed: <error>` | any other request (an enrollment, a scan, a profile change, a split pair, `ir-setup`, a self-test, recovery) ended in an error; every failed request ends with this line, after any line its handler wrote; at most one per request and account a minute, repeats under `IRLUME_LOG=debug` |
 | `audit … grantors=pam_irlume` | PAM's own record that the grant came from face, not password fallthrough |
 | `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password; correct on-demand behavior: typing never fires the camera |
 | `plasma-kwallet-pam` / `pam_gnome_keyring` lines | the unsealed secret reaching your wallet/keyring |

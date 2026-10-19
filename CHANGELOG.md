@@ -592,6 +592,12 @@ All notable changes to irlume are documented here. This project adheres to
   one startup settings snapshot, and `doctor` (`recognizer-selection`) and
   `status --json` (`recognizer.selection`) report it (#1053).
 
+- Both daemon AppArmor profiles grant scoped NPU cache, discovery, firmware,
+  device and library access, and share an optional local rule include for
+  administrator-selected provider prefixes. Native loading and certification
+  remain closed; enforcing NPU qualification is still pending (ADR-0022;
+  part of #1046).
+
 - NPU provider selection and reporting groundwork: an administrator can select
   an absolute C API file with `npu_library` or `IRLUME_NPU_LIBRARY`; automatic
   selection checks standard system and `/usr/local` roots, preferring

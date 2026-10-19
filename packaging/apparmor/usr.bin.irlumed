@@ -118,6 +118,31 @@ profile irlumed /usr/bin/irlumed flags=(attach_disconnected) {
   # detection on every AppArmor-enforcing install (#297 review).
   /usr/share/irlume/tflite/libtensorflowlite_c.so mr,
 
+  # ADR-0022 optional NPU recognizer. Loading admission and per-model
+  # certification still apply; these rules do not enable native loading.
+  # Cache creation, marker replacement and compiled-blob locking stay confined
+  # to the daemon's cache. The parent directories are metadata reads only.
+  /var/cache/ r,
+  /var/cache/irlume/ r,
+  /var/cache/irlume/npu/ rwk,
+  /var/cache/irlume/npu/** rwk,
+  # Class entries resolve under /sys/devices, already read-only below.
+  /sys/class/accel/ r,
+  /sys/class/accel/** r,
+  /sys/kernel/debug/accel/*/fw_version r,
+  /dev/accel/accel[0-9]* rw,
+  owner /proc/@{pid}/maps r,
+  # Cover every automatic C API search root, including /usr/local. Libraries
+  # may be installed beside the core or in its versioned plugin directory.
+  /usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/ r,
+  /usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/libopenvino*.so* mr,
+  /usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/openvino-*/ r,
+  /usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/openvino-*/libopenvino*.so* mr,
+  /usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/libze_*.so* mr,
+  # An administrator-selected prefix needs explicit local rules for its
+  # ancestors, selected alias and canonical target (docs/NPU.md).
+  include if exists <local/irlumed-npu>
+
   # Models: packaged location or a hand-installed repo checkout.
   /usr/share/irlume/models/*.onnx r,
   /usr/share/irlume/models/*.tflite r,

@@ -1405,8 +1405,12 @@ mod tests {
     fn the_metadata_node_is_journaled_as_camera_text() {
         let log = super::IlluminationLog::from_fd(-1, "/dev/video3\nirlumed: forged");
         assert_eq!(log.device, "/dev/video3 irlumed: forged");
-        // No descriptor and nothing streaming: skip the teardown entirely.
-        std::mem::forget(log);
+        // No descriptor and nothing streaming: teardown touches nothing
+        // (fd -1 skips close, no buffers were requested, no format was
+        // replaced), and dropping the log keeps LeakSanitizer green. The
+        // std::mem::forget this replaces leaked the stored device text and
+        // failed the AddressSanitizer lane from #1134 on.
+        drop(log);
     }
     #[cfg(feature = "capture-timing")]
     #[test]

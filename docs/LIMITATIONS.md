@@ -92,6 +92,21 @@ summary lives on the [README](../README.md); this is the detail.
   `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0` for irlumed (docs/SETUP.md). This
   has not yet been qualified on a T480. An IR camera that offers MJPG, alone
   or beside YUYV, is not supported.
+- **The NexiGo HelloCam N930W's IR stream runs close to the delivered-rate
+  floor.** Every capture checks that each stream delivers at least 97% of its
+  role's floor, 14.55 fps for IR, as evidence of a healthy link
+  (`crates/irlume-camera/src/rate_gate.rs`). Once settled, this camera's IR
+  side delivers 14.73 to 14.79 fps, about 1.2 to 1.7% above that: on minihost
+  ([startup flush measurement](research/2026-08-22-startup-flush-fleet-measurement.md))
+  and, as the IR side of a split pair, 14.76 fps on archhost (#1063). A
+  capture that dips below the floor refuses with `delivered rate below
+  floor` and falls back to the password; on the attended split rig one of
+  three enrollment attempts failed that way and the next capture passed.
+  `irlume camera diagnostics --json` shows the measured rate for each side.
+  The tolerance is not lowered for one camera: it is already fitted to this
+  one, a lower tolerance would also pass degraded links on every other
+  camera, and camera profiles carry no tuning fields in schema v1
+  ([ADR-0023](adr/0023-camera-profile-layer.md)).
 - **Not lab-certified.** Self-tested against ISO/IEC 30107-3, with no iBeta pass.
   Demographic tuning ([FAIRNESS.md](FAIRNESS.md)) is ongoing.
 - **Root on the live machine is the trust boundary.** The daemon holds decrypted

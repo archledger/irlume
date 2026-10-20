@@ -3068,6 +3068,19 @@ fn emit_capture_schedule(
     diagnostics.emit_share_safe(ShareSafeEventKind::CaptureScheduleSelected { schedule, source });
 }
 
+/// Re-announce the unchanged schedule at each grace-window attempt: the
+/// attempt loop runs several captures under one selection, and offline
+/// segment classification needs a marker per attempt so a self-heal
+/// fallback's boundary ends at the next attempt rather than at the
+/// operation's end (#1147).
+fn emit_attempt_schedule(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    emit_capture_schedule(selection, ir_available, diagnostics);
+}
+
 fn diagnostic_capture_schedule(
     selection: &CaptureModeSelection,
     ir_available: bool,
@@ -7338,6 +7351,7 @@ impl Engine {
             (None, resolved_cams)
         };
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
+        let ir_available = self.ir_available;
         if let Some(cameras) = grouped_cams {
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
@@ -7346,6 +7360,7 @@ impl Engine {
                     window,
                     &mut costliest_attempt,
                     |engine| {
+                        emit_attempt_schedule(&capture_mode, ir_available, diagnostics);
                         (
                             Self::run_camera_operation(&camera_operation, || {
                                 engine.authenticate_grouped_once(
@@ -7393,6 +7408,7 @@ impl Engine {
                         window,
                         &mut costliest_attempt,
                         |engine| {
+                            emit_attempt_schedule(&capture_mode, ir_available, diagnostics);
                             (
                                 Self::run_camera_operation(&camera_operation, || {
                                     engine.authenticate_grouped_rgb_only_once(
@@ -7518,6 +7534,7 @@ impl Engine {
             window,
             costliest_attempt,
             |engine| {
+                emit_attempt_schedule(capture_mode, engine.ir_available, diagnostics);
                 let mut held_pair_failed = false;
                 let mut deferred = None;
                 let result = Self::run_camera_operation(camera_operation, || {

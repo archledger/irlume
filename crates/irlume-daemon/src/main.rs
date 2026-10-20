@@ -1708,7 +1708,10 @@ fn main() {
                 for user in irlume_core::storage::list_users() {
                     match irlume_core::template_key::move_to_stronger_policy(&user) {
                         Ok(Some(gain)) => jout_notice!(
-                            "irlumed: moved the template key of '{user}' to {}",
+                            "irlumed: moved the template key of '{user}' to {}; a release \
+                             from before the DA-exempt storage key cannot open it after this \
+                             move; irlume recovery restore or a re-enrollment reseals it \
+                             (ADR-0034 section 5)",
                             gain.describe()
                         ),
                         Ok(None) => {}
@@ -30356,5 +30359,37 @@ mod split_management_tests {
         assert!(root.contains("5986:2113"), "root listing carries the facts");
         assert!(root.contains("/dev/video0"));
         drop(env);
+    }
+
+    #[test]
+    fn the_template_key_move_notice_names_the_downgrade_consequence() {
+        // A live 2026-10-19 incident (#1148): the move notice read as a
+        // benign improvement, so an operator running a newer irlumed once
+        // did not learn that the move ends downgrade compatibility for
+        // that account. The notice must name the consequence and the two
+        // restore paths.
+        let source = include_str!("main.rs");
+        let notice = source
+            .split("moved the template key of '{user}' to {}")
+            .nth(1)
+            .unwrap()
+            .split('"');
+        let text: String = notice
+            .take(3)
+            .collect::<String>()
+            // A rustfmt line continuation and its indentation are not part
+            // of the message.
+            .split_whitespace()
+            .filter(|word| *word != "\\")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("cannot open it after this move"),
+            "the move notice must state the one-way door: {text}"
+        );
+        assert!(
+            text.contains("recovery restore"),
+            "the move notice must name the restore paths: {text}"
+        );
     }
 }

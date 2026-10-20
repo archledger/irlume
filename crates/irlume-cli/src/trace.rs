@@ -691,14 +691,30 @@ fn render_analysis(records: &[TraceRecord]) -> String {
             )
         });
         if matches!(generic_class, GenericCaptureClass::Unknown) && !has_generic_captures {
-            // Nothing to classify: only Sequential* stages (or none).
-            generic_class = GenericCaptureClass::Excluded;
+            // Nothing to classify unless a capture route ran entirely before
+            // the subscription: with no schedule evidence and no capture
+            // record at all, Sequential* stages (or the absence of any
+            // capture-path stage) leave nothing ambiguous. But a
+            // CaptureSetup or Finalization record means a capture route ran
+            // and went unobserved - the envelope is unavailable, not zero.
+            let capture_route_ran = operation_records.iter().any(|record| {
+                matches!(
+                    record.event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                        ..
+                    }
+                )
+            });
+            if !capture_route_ran {
+                generic_class = GenericCaptureClass::Excluded;
+            }
         }
         match generic_class {
             GenericCaptureClass::Unknown => {
                 writeln!(
                     output,
-                    "  sequential_union_us=unavailable (schedule evidence predates recording)"
+                    "  sequential_union_us=unavailable (schedule or capture evidence predates recording)"
                 )
                 .unwrap();
             }
@@ -836,6 +852,29 @@ fn analyze(input: &Path) -> Result<String, String> {
                 "trace analyze requires schema {CURRENT_TRACE_SCHEMA_VERSION}; this trace is schema {}",
                 first.trace_schema
             ));
+        }
+    }
+    // One operation id names one logical operation, so a trace that reuses
+    // an id across operation classes would merge unrelated records under
+    // the first class's label and let either operation's completion satisfy
+    // the gates for the combined group.
+    let mut class_by_operation: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        let class = format!("{:?}", record.operation);
+        match class_by_operation.get(&operation_id) {
+            Some(seen) if *seen != class => {
+                return Err(format!(
+                    "operation id {operation_id} spans multiple operation classes; timing analysis refused"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                class_by_operation.insert(operation_id, class);
+            }
         }
     }
     // A monotonic clock produced these timestamps, so decreasing values
@@ -1861,6 +1900,109 @@ mod tests {
         std::fs::write(&backwards, bytes).unwrap();
         let error = analyze(&backwards).unwrap_err();
         assert!(error.contains("not monotonic"), "{error}");
+
+        // A capture route that ran entirely before the subscription: no
+        // schedule marker and no capture record, but CaptureSetup and
+        // Finalization say a capture route ran and went unobserved - the
+        // envelope is unavailable, not a confident zero.
+        let pre_sub = dir.join("pre-subscription.jsonl");
+        let pre_sub_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup,
+                    elapsed_us: 4_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 10_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 110_000, 120_000, 120_000];
+        let mut pre_sub_records = pre_sub_records;
+        for (record, time) in pre_sub_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        let mut bytes = Vec::new();
+        for record in &pre_sub_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&pre_sub, bytes).unwrap();
+        let rendered = analyze(&pre_sub).unwrap();
+        assert!(
+            rendered.contains(
+                "sequential_union_us=unavailable (schedule or capture evidence predates recording)"
+            ),
+            "{rendered}"
+        );
+
+        // One operation id reused across operation classes: the ids name
+        // different logical operations and must not be merged.
+        let reused = dir.join("reused-id.jsonl");
+        let mut reused_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        reused_records[1].operation = irlume_common::diagnostics::OperationClass::Status;
+        let times = [100_000_u64, 110_000, 120_000];
+        for (record, time) in reused_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        let mut bytes = Vec::new();
+        for record in &reused_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&reused, bytes).unwrap();
+        let error = analyze(&reused).unwrap_err();
+        assert!(
+            error.contains("spans multiple operation classes"),
+            "{error}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

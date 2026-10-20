@@ -5763,7 +5763,18 @@ impl Engine {
                     let captured = Self::run_camera_operation(operation, || {
                         irlume_camera::capture_ir_with_stats_and_control(&ir_dev, &ir_control)
                     });
-                    (captured, t.elapsed().as_millis())
+                    let elapsed = t.elapsed().as_millis();
+                    // Emitted inside the capture thread, at the IR side's
+                    // own endpoint: join() returns only when the main
+                    // thread reaches it, so an emission after the join
+                    // would timestamp IR at the later RGB endpoint whenever
+                    // IR finished first (#1147 review round 14).
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::IrCapture,
+                        elapsed,
+                    );
+                    (captured, elapsed)
                 });
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
@@ -5788,11 +5799,6 @@ impl Engine {
                         0,
                     )
                 });
-                emit_trace_stage_ms(
-                    diagnostics,
-                    irlume_common::diagnostics::TraceStage::IrCapture,
-                    ir_ms,
-                );
                 (rgb, rgb_ms, ir.map(Some), ir_ms)
             })
         };
@@ -18046,25 +18052,36 @@ mod engine_tests {
             .split("check_request_active")
             .next()
             .unwrap();
-        let before_join = scope_region
-            .split("let (ir, ir_ms) = ir_thread.join()")
-            .next()
-            .unwrap();
-        let after_join = scope_region
-            .split("let (ir, ir_ms) = ir_thread.join()")
+        // The IR closure's body contains an inner closure whose "});"
+        // comes first; the outer closure ends at the tuple return, so
+        // anchor past the inner call.
+        let ir_closure = scope_region
+            .split("run_camera_operation(operation, || {")
+            .nth(1)
+            .unwrap()
+            .split("});")
             .nth(1)
             .unwrap();
+        let after_closure = scope_region.split("(captured, elapsed)").nth(1).unwrap();
         assert!(
-            before_join.contains("emit_trace_stage_ms"),
-            "RGB must report at its own endpoint, before the IR join"
+            ir_closure.contains("emit_trace_stage_ms"),
+            "IR must report inside its capture thread, at its own endpoint"
         );
         assert!(
-            after_join
+            !after_closure
                 .split("check_request_active")
                 .next()
                 .unwrap()
-                .contains("emit_trace_stage_ms"),
-            "IR must report at the join, its endpoint, before the deadline check"
+                .contains("TraceStage::IrCapture"),
+            "no IR emission may wait for the join, which returns at the later side's endpoint"
+        );
+        let rgb_between = after_closure
+            .split("let (ir, ir_ms) = ir_thread.join()")
+            .next()
+            .unwrap();
+        assert!(
+            rgb_between.contains("emit_trace_stage_ms"),
+            "RGB must report at its own endpoint, before the IR join"
         );
     }
 

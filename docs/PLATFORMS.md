@@ -242,7 +242,8 @@ than assuming every desktop has the same prompt or cancellation behavior.
   read from the open camera, the session's frames, the stream's active
   emitter and the burst's own alternation must all qualify (amendments
   2026-10-13 and 2026-10-14); other bursts refuse. The ThinkPad T480 IR
-  camera (USB 5986:1141, #887) is the first such camera reported. That is
-  not yet qualified on a T480. Every other module in the record offers
-  grey.
+  camera (USB 5986:1141, #887) is the first such camera reported. Its emitter
+  write, read-back, optical D1 proof and restore now have reporter evidence,
+  with a face grant (ADR-0031, amendment 2026-10-20); broader qualification
+  remains open. Every other module in the record offers grey.
 - musl-based distros (Alpine): untested; the release binaries assume glibc.

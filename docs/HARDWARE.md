@@ -58,6 +58,20 @@ answers "broken, an unusable class, or configuration" in one round trip.
   - auth: true-dark grants via ir/dark path (0.944/0.954, FLIR p_fake <= 0.001, 2026-08-24)
   - suspend: 3x S3 cycles, daemon active zero-anomaly (2026-08-24)
 
+### ThinkPad T480 (community report, Ubuntu 26.04)
+
+- **Module:** Bison Integrated IR Camera (RGB sibling 5986:2113) (`5986:1141`)
+- **RGB:** `/dev/video2`: MJPG/YUYV advertised (5986:2113) (separately authorized split RGB side)
+- **IR:** `/dev/video0`: YUYV 340x340, descriptor-attested luma IR
+- **Capture mode:** split sequential: reporter capture-path evidence run; no concurrent qualification or general hardware qualification claimed
+- **IR emitter:** MS-XU unit 8 selector 0x06 (face authentication), interface 1 D1 payload 01 01 02 00 00 00 00 00 00: validated by maurerr (write, read-back, five D1-proven bursts, restoration), 2026-10-20. one write/restore cycle; GET_CUR before and after 01 01 01 00 00 00 00 00 00; no manual emitter override needed with the built-in entry; split authorization and experimental opt-in remain required
+- **Evidence (irlume source build 45365e4792f80a90ea9e7d2ea8a026b8c2a6a72d, /usr/local/bin/irlumed; kernel 7.0.0-38-generic):**
+  - source: https://github.com/archledger/irlume/issues/887#issuecomment-6283434388 (maurerr, run 2026-10-20T04:26:23Z)
+  - binary: running irlumed sha256 c7b957d9b4e1cb1873427ee1b3b9f4fa267031c37135fff83235e0de3670d793
+  - emitter: emitter-capture-evidence-test.sh: 6 passed, 0 failed; YUYV clipping ceiling 235; five D1 proofs, phase delta 40.9-41.7, no conflicting pairs or invalid sequence steps
+  - auth: face authentication granted in this run; dim-room RGB PAD refusals reported separately on #887 remain outside this emitter validation
+  - suspend: not tested in this run
+
 ### ThinkPad X13 Yoga Gen 4
 
 - **Module:** Chicony Integrated Camera (`04f2:b7bf`)
@@ -75,5 +89,6 @@ Read from source at generation time. These are the modules whose emitter payload
 
 - `3277:0059` MS-XU unit 14, selector 0x06 (face authentication) (Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.)
 - `3443:c803` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W; MS-XU is unit 4.)
+- `5986:1141` MS-XU unit 8, selector 0x06 (face authentication) (Bison Integrated IR Camera in the ThinkPad T480; MS-XU is unit 8.)
 
 <!-- generated: schema 1; inputs: docs/hardware/fleet-evidence.json + ir_emitter.rs known_control; regenerate with scripts/generate-hardware-matrix.py -->

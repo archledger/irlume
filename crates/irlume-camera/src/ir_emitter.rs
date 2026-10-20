@@ -466,11 +466,12 @@ impl From<f32> for SetupMeasurement {
 /// module it was validated against. The unit number is still checked against the
 /// descriptor before anything is written; see [`control_is_documented`].
 ///
-/// Both entries address Microsoft's Face Authentication control (0x06). The
+/// All entries address Microsoft's Face Authentication control (0x06). Each
 /// payload was validated on that hardware and is kept verbatim: it is not
 /// derived from a rule irlume knows, so it is not extrapolated to other cameras.
 fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
     const HELLO_FACE_AUTH: [u8; 9] = [1, 3, 2, 0, 0, 0, 0, 0, 0];
+    const T480_FACE_AUTH: [u8; 9] = [1, 1, 2, 0, 0, 0, 0, 0, 0];
     match (vid, pid) {
         // Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.
         (0x3277, 0x0059) => Some(EmitterControl {
@@ -490,6 +491,14 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
             payload: HELLO_FACE_AUTH.to_vec(),
+        }),
+        // Bison Integrated IR Camera in the ThinkPad T480; MS-XU is unit 8.
+        // Interface 1 D1 write/read-back, optical proof and restore recorded:
+        // https://github.com/archledger/irlume/issues/887#issuecomment-6283434388
+        (0x5986, 0x1141) => Some(EmitterControl {
+            unit: 8,
+            selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+            payload: T480_FACE_AUTH.to_vec(),
         }),
         // Anything else runs `irlume ir-setup`, or sets IRLUME_IR_EMITTER if the
         // vendor documents a control.
@@ -10770,7 +10779,7 @@ mod tests {
 
     #[test]
     fn known_control_table_is_keyed_on_usb_identity_not_a_name() {
-        // The two modules the payload was validated on.
+        // The two modules with the validated interface-3 payload.
         let asus = known_control(0x3277, 0x0059).expect("ASUS entry");
         assert_eq!(asus.unit, 14);
         assert_eq!(
@@ -10798,6 +10807,22 @@ mod tests {
         assert_eq!(known_control(0x046d, 0x085e), None); // Logitech Brio
         assert_eq!(known_control(0x3277, 0x0060), None); // same vendor, other product
         assert_eq!(known_control(0x0000, 0x0000), None);
+    }
+
+    #[test]
+    fn known_control_t480_uses_its_validated_interface_one_d1_payload() {
+        // #887's capture-path evidence records this exact unit, selector and
+        // payload. The ASUS/NexiGo payload addresses interface 3, not 1.
+        assert_eq!(
+            known_control(0x5986, 0x1141),
+            Some(EmitterControl {
+                unit: 8,
+                selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+                payload: vec![1, 1, 2, 0, 0, 0, 0, 0, 0],
+            })
+        );
+        assert_eq!(known_control(0x5986, 0x2113), None); // T480 RGB camera
+        assert_eq!(known_control(0x5986, 0x1142), None); // unvalidated sibling
     }
 
     #[test]

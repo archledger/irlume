@@ -722,6 +722,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume trace explain` bounds each record read before buffering it, using
+  the smaller of the line limit and the remaining total-byte budget
+  (ADR-0008). An oversized record is rejected without reading it in full,
+  even without a newline. Inputs exactly at the limits remain accepted.
+
 - irlumed's start-up notice for a template key moved onto the DA-exempt
   storage key now states the downgrade consequence and the restore paths:
   a release from before the DA-exempt storage key cannot open the moved

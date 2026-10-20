@@ -729,6 +729,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- CI virtual-camera setup checks that `videodev` loads before requiring a
+  module package. It tries the running kernel's core modules before the
+  older extra-module layout, so Azure 7.0's unavailable `-extra` package
+  no longer blocks an already usable driver (#1154). Module loading,
+  pinned loopback build, frame readiness and camera test gates stay required.
+
 - Diagnostic trace collection expires under producer contention and socket
   backpressure, idle full disconnects release the collector, and startup
   precedes producer publication. Queued delivery and terminal records share

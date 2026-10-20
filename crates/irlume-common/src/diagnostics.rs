@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+use std::io::BufRead as _;
 use std::num::NonZeroU32;
 
 pub const SUPPORT_SCHEMA_VERSION: u32 = 1;
@@ -1126,7 +1127,13 @@ pub fn parse_trace<R: std::io::BufRead>(
     let mut line = Vec::new();
     loop {
         line.clear();
-        let read = reader
+        // Bound allocation before reading, not only when validating the line.
+        // One extra byte distinguishes an exhausted budget from a clean EOF.
+        let read_limit = u64::try_from(MAX_TRACE_LINE_BYTES)
+            .unwrap_or(u64::MAX)
+            .min(limits.max_bytes.saturating_sub(validator.total_bytes))
+            .saturating_add(1);
+        let read = std::io::Read::take(&mut reader, read_limit)
             .read_until(b'\n', &mut line)
             .map_err(TraceParseError::Io)?;
         if read == 0 {
@@ -1916,5 +1923,80 @@ mod tests {
             parse_trace(std::io::Cursor::new(oversized), limits),
             Err(TraceParseError::Limit)
         ));
+    }
+
+    #[test]
+    fn trace_parser_bounds_each_read_before_rejecting_an_oversized_line() {
+        for terminated in [false, true] {
+            let mut input = vec![b'x'; 2 * 1024 * 1024];
+            if terminated {
+                input.push(b'\n');
+            }
+            let mut reader = std::io::Cursor::new(input);
+            assert!(matches!(
+                parse_trace(&mut reader, TraceLimits::bounded(1000)),
+                Err(TraceParseError::Limit)
+            ));
+            assert!(
+                reader.position() <= MAX_TRACE_LINE_BYTES as u64 + 1,
+                "oversized line consumed {} bytes before refusal",
+                reader.position()
+            );
+        }
+    }
+
+    #[test]
+    fn trace_parser_bounds_each_read_by_the_remaining_total_bytes() {
+        let limits = TraceLimits::bounded(1000);
+        let prefix = trace_jsonl(&[trace_record(
+            0,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            false,
+        )]);
+        for remaining in [0, 17] {
+            let mut input = prefix.clone();
+            input.extend(std::iter::repeat_n(b'x', 1024));
+            let mut reader = std::io::Cursor::new(input);
+            let limits = TraceLimits {
+                max_bytes: prefix.len() as u64 + remaining,
+                ..limits
+            };
+            assert!(matches!(
+                parse_trace(&mut reader, limits),
+                Err(TraceParseError::Limit)
+            ));
+            assert!(
+                reader.position() <= limits.max_bytes + 1,
+                "remaining budget {remaining} consumed {} bytes in total",
+                reader.position()
+            );
+        }
+    }
+
+    #[test]
+    fn trace_parser_accepts_exact_line_and_total_limits_with_or_without_final_newline() {
+        let limits = TraceLimits {
+            max_bytes: MAX_TRACE_LINE_BYTES as u64,
+            ..TraceLimits::bounded(1000)
+        };
+        let finished = trace_record(
+            0,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        );
+        for terminated in [false, true] {
+            let mut input = serde_json::to_vec(&finished).unwrap();
+            input.resize(MAX_TRACE_LINE_BYTES, b' ');
+            if terminated {
+                *input.last_mut().unwrap() = b'\n';
+            }
+            let parsed = parse_trace(std::io::Cursor::new(input), limits).unwrap();
+            assert_eq!(parsed.records(), std::slice::from_ref(&finished));
+        }
     }
 }

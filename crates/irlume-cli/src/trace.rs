@@ -838,6 +838,29 @@ fn analyze(input: &Path) -> Result<String, String> {
             ));
         }
     }
+    // A monotonic clock produced these timestamps, so decreasing values
+    // WITHIN one operation mean a malformed or corrupted trace; the
+    // interval reconstruction would treat them as valid endpoints and
+    // render a stage union exceeding the span with a silently zeroed
+    // residual. Interleaved operations each carry their own monotonic
+    // sequence, so file order alone is not the invariant.
+    let mut by_operation: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        by_operation
+            .entry(operation_id)
+            .or_default()
+            .push(record.monotonic_us);
+    }
+    if by_operation
+        .values()
+        .any(|times| times.windows(2).any(|pair| pair[1] < pair[0]))
+    {
+        return Err("trace timestamps are not monotonic; timing analysis refused".into());
+    }
     // Dropped events make every per-operation decomposition incomplete, so
     // refuse instead of rendering authoritative-looking numbers. The marker
     // count is attacker-influenced input: saturate rather than wrap, or
@@ -1786,6 +1809,58 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("sequential_union_us"), "{rendered}");
+
+        // Contiguous sequences with decreasing timestamps inside one
+        // operation: the interval reconstruction must refuse rather than
+        // render a union exceeding the span with a zeroed residual.
+        let backwards = dir.join("backwards.jsonl");
+        let mut backwards_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+        ];
+        let times = [200_000_u64, 100_000, 100_000];
+        for (record, time) in backwards_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        backwards_records.push(fixture_record(
+            3,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        backwards_records.last_mut().unwrap().monotonic_us = 100_000;
+        let mut bytes = Vec::new();
+        for record in &backwards_records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&backwards, bytes).unwrap();
+        let error = analyze(&backwards).unwrap_err();
+        assert!(error.contains("not monotonic"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

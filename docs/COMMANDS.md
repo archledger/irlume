@@ -105,6 +105,11 @@ one server-side delivery budget ending 15 seconds after observation expiry;
 timeouts can leave a recoverable partial instead of a final file (ADR-0008,
 lifetime amendment 2026-10-20).
 
+`trace analyze` reports `sequential_union_us=unavailable` when a generic
+RGB/IR capture's own segment has no schedule or fallback evidence. A later
+attempt's schedule does not classify earlier captures. Operations that never
+reach capture keep a zero sequential envelope (#1150).
+
 ## Split camera authorizations
 
 `irlume split --help` prints the full syntax without contacting the daemon.

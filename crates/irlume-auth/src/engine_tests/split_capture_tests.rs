@@ -69,6 +69,7 @@ fn split_capture_assessment_preserves_real_lease_provenance_at_short_skew() {
             (vec![face.clone()], Some(face)),
             PairAssessmentContext {
                 operation: &operation,
+                capture_mode: None,
                 sequential: true,
                 pair_sequential_retried: false,
                 rgb_hard_retried: false,
@@ -141,6 +142,7 @@ fn split_capture_assessor_rejects_stale_pair_before_inference() {
             (vec![], None),
             PairAssessmentContext {
                 operation: &operation,
+                capture_mode: None,
                 sequential: false,
                 pair_sequential_retried: false,
                 rgb_hard_retried: false,
@@ -171,6 +173,7 @@ fn split_capture_assessor_refuses_separated_frames_without_their_receipt() {
             (vec![], None),
             PairAssessmentContext {
                 operation: &operation,
+                capture_mode: None,
                 sequential: true,
                 pair_sequential_retried: false,
                 rgb_hard_retried: false,

@@ -383,6 +383,9 @@ enum PreparedPairAuthentication {
 
 struct PairAssessmentContext<'a> {
     operation: &'a irlume_camera::lease::CameraOperationSession,
+    // Retained ordinary selection for diagnostic re-announcements. Split
+    // captures have no ordinary selection and cannot run the self-heal.
+    capture_mode: Option<&'a CaptureModeSelection>,
     sequential: bool,
     pair_sequential_retried: bool,
     rgb_hard_retried: bool,
@@ -3659,6 +3662,59 @@ mod capture_mode_switch_tests {
     }
 
     #[test]
+    fn issue1150_self_heal_closing_marker_reuses_the_selected_schedule_source() {
+        // The recapture needs a segment boundary, not a new mode-selection
+        // claim. Exercise the canonical emitter and pin its production caller.
+        for (source, expected) in [
+            (
+                ENV_CAPTURE_MODE_SOURCE,
+                CaptureScheduleSource::EnvironmentOverride,
+            ),
+            (
+                STORED_CAPTURE_MODE_SOURCE,
+                CaptureScheduleSource::StoredQualification,
+            ),
+        ] {
+            let selection = CaptureModeSelection {
+                sequential: false,
+                source,
+                runtime_key: None,
+                runtime_contract: None,
+                qualification_state: QualificationState::QualifiedConcurrent,
+                qualification_reason: None,
+                authoritative_rate_shortfalls: None,
+                latest_attempt_rate_shortfalls: None,
+                operation_demoted: std::cell::Cell::new(false),
+            };
+            let sink = RecordingSink::default();
+
+            emit_capture_schedule(&selection, true, &sink);
+
+            assert_eq!(
+                sink.events(),
+                vec![ShareSafeEventKind::CaptureScheduleSelected {
+                    schedule: CaptureSchedule::Concurrent,
+                    source: expected,
+                }]
+            );
+        }
+        let source = include_str!("lib.rs");
+        let closing_marker = source
+            .split(concat!("// Close the self-heal ", "fallback's window"))
+            .nth(1)
+            .unwrap()
+            .split("diagnostics.emit_trace(")
+            .next()
+            .unwrap();
+        assert!(
+            closing_marker.contains("emit_capture_schedule("),
+            "self-heal must re-emit its retained selection through the canonical emitter"
+        );
+        assert!(closing_marker.contains("capture_mode"));
+        assert!(!closing_marker.contains("CaptureScheduleSource::RuntimeHealth"));
+    }
+
+    #[test]
     fn rate_shortfall_support_context_preserves_authoritative_and_latest_attempt() {
         use irlume_common::diagnostics::{
             CameraRoleLabel, DigestToken, RateShortfallEvidence, RateShortfallsByArm,
@@ -5581,6 +5637,7 @@ impl Engine {
                 detection,
                 PairAssessmentContext {
                     operation,
+                    capture_mode,
                     sequential: true,
                     pair_sequential_retried: false,
                     rgb_hard_retried: false,
@@ -6144,6 +6201,7 @@ impl Engine {
             (rgb_faces, rgb_top),
             PairAssessmentContext {
                 operation,
+                capture_mode: Some(capture_mode),
                 sequential,
                 pair_sequential_retried,
                 rgb_hard_retried,
@@ -6214,6 +6272,7 @@ impl Engine {
         self.check_request_active()?;
         let PairAssessmentContext {
             operation,
+            capture_mode,
             sequential,
             pair_sequential_retried,
             rgb_hard_retried,
@@ -6342,12 +6401,9 @@ impl Engine {
             // marker, every later capture in the same segment would ride
             // the fallback boundary into the sequential envelope
             // (#1147 review round 18).
-            diagnostics.emit_share_safe(
-                irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
-                    schedule: irlume_common::diagnostics::CaptureSchedule::Concurrent,
-                    source: irlume_common::diagnostics::CaptureScheduleSource::RuntimeHealth,
-                },
-            );
+            if let Some(selection) = capture_mode {
+                emit_capture_schedule(selection, self.ir_available, diagnostics);
+            }
         }
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {
             role: irlume_common::diagnostics::CameraRoleLabel::Rgb,

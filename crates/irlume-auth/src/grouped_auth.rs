@@ -509,6 +509,7 @@ impl Engine {
                             detected,
                             PairAssessmentContext {
                                 operation,
+                                capture_mode: Some(mode),
                                 sequential: true,
                                 pair_sequential_retried: false,
                                 rgb_hard_retried: false,
@@ -621,6 +622,7 @@ impl Engine {
                             detected,
                             PairAssessmentContext {
                                 operation,
+                                capture_mode: None,
                                 sequential: true,
                                 pair_sequential_retried: false,
                                 rgb_hard_retried: false,

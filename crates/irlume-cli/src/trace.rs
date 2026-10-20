@@ -718,25 +718,24 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                 }
             )
         });
-        if !any_evidence && !has_generic_captures && !capture_route_ran {
-            // No schedule evidence, no generic capture record, and no
-            // capture-path stage: nothing sequential to report.
-            segments.clear();
-        }
-        if !any_evidence && (has_generic_captures || capture_route_ran) {
+        let sequential = if !any_evidence && (has_generic_captures || capture_route_ran) {
             // Generic captures or a capture route without any schedule
             // evidence: the evidence predates the recording, and a zero
             // would read as a confident concurrent pair.
+            None
+        } else {
+            sequential_intervals(&operation_records, &segments)
+        };
+        if let Some(intervals) = sequential {
+            let sequential_blocks = merge_intervals(intervals);
+            let sequential_union = union_us(&sequential_blocks);
+            writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
+        } else {
             writeln!(
                 output,
                 "  sequential_union_us=unavailable (schedule or capture evidence predates recording)"
             )
             .unwrap();
-        } else {
-            let sequential_blocks =
-                merge_intervals(sequential_intervals(&operation_records, &segments));
-            let sequential_union = union_us(&sequential_blocks);
-            writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
         }
         writeln!(output, "  blocks:").unwrap();
         for block in &blocks {
@@ -849,35 +848,42 @@ impl SegmentRule {
 fn sequential_intervals(
     operation_records: &[&TraceRecord],
     segments: &[SegmentRule],
-) -> Vec<StageInterval> {
+) -> Option<Vec<StageInterval>> {
     // Both lists are sequence-ordered, so one forward pass assigns each
     // generic capture to the single segment containing it: no per-capture
     // scan of every segment (a bounded trace can alternate markers and
     // captures up to the event limit).
     let mut cursor = 0_usize;
-    operation_records
-        .iter()
-        .filter_map(|record| {
-            let (stage, elapsed_us) = match record.event {
-                TraceEventKind::StageTiming { stage, elapsed_us } => (stage, elapsed_us),
-                _ => return None,
-            };
-            while cursor + 1 < segments.len() && !segments[cursor].contains(record.sequence) {
-                cursor += 1;
+    let mut intervals = Vec::new();
+    for record in operation_records {
+        let (stage, elapsed_us) = match record.event {
+            TraceEventKind::StageTiming { stage, elapsed_us } => (stage, elapsed_us),
+            _ => continue,
+        };
+        while cursor + 1 < segments.len() && !segments[cursor].contains(record.sequence) {
+            cursor += 1;
+        }
+        let name = format!("{stage:?}");
+        let generic_covered = if matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture) {
+            let segment = segments.get(cursor)?;
+            // A later selection says nothing about the initial segment's
+            // captures. Every generic capture needs its own segment's evidence.
+            if !segment.has_evidence() {
+                return None;
             }
-            let name = format!("{stage:?}");
-            let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
-            let generic_covered = generic
-                && segments[cursor].contains(record.sequence)
-                && segments[cursor].covers(record.sequence);
-            let sequential_stage = name.starts_with("Sequential") || generic_covered;
-            sequential_stage.then_some(StageInterval {
+            segment.contains(record.sequence) && segment.covers(record.sequence)
+        } else {
+            false
+        };
+        if name.starts_with("Sequential") || generic_covered {
+            intervals.push(StageInterval {
                 stage: name,
                 start_us: record.monotonic_us.saturating_sub(elapsed_us),
                 end_us: record.monotonic_us,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Some(intervals)
 }
 
 fn analyze(input: &Path) -> Result<String, String> {
@@ -1925,6 +1931,125 @@ mod tests {
             "{rendered}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn issue1150_capture_less_operation_has_a_zero_sequential_envelope() {
+        let records = [
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::QueueWait,
+                    elapsed_us: 100,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::EngineAuthenticate,
+                    elapsed_us: 500,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Denied,
+                    },
+                },
+                false,
+            ),
+        ];
+
+        let rendered = render_analysis(&records);
+        assert!(rendered.contains("sequential_union_us=0\n"), "{rendered}");
+        assert!(!rendered.contains("unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn issue1150_later_schedule_does_not_classify_initial_unknown_captures() {
+        use irlume_common::diagnostics::CaptureScheduleSource;
+
+        for schedule in [CaptureSchedule::Concurrent, CaptureSchedule::Sequential] {
+            let records = [
+                fixture_record(
+                    0,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::RgbCapture,
+                        elapsed_us: 500,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    1,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::IrCapture,
+                        elapsed_us: 500,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    2,
+                    TraceEventKind::Shared {
+                        transition: ShareSafeEventKind::CaptureScheduleSelected {
+                            schedule,
+                            source: CaptureScheduleSource::StoredQualification,
+                        },
+                    },
+                    false,
+                ),
+                fixture_record(
+                    3,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::RgbCapture,
+                        elapsed_us: 500,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    4,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::IrCapture,
+                        elapsed_us: 500,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    5,
+                    TraceEventKind::Shared {
+                        transition: ShareSafeEventKind::OperationFinished {
+                            outcome: CategoricalOutcome::Completed,
+                        },
+                    },
+                    false,
+                ),
+            ];
+
+            let rendered = render_analysis(&records);
+            let envelope = rendered
+                .lines()
+                .find(|line| line.trim_start().starts_with("sequential_union_us="))
+                .unwrap();
+            assert!(
+                envelope.contains("=unavailable"),
+                "{schedule:?}: {rendered}"
+            );
+
+            // An empty initial sentinel is not uncertainty. Once those
+            // unclassified captures are absent, the known segment is numeric.
+            let known = render_analysis(&records[2..]);
+            let expected = if schedule == CaptureSchedule::Sequential {
+                1_000
+            } else {
+                0
+            };
+            assert!(
+                known.contains(&format!("sequential_union_us={expected}\n")),
+                "{schedule:?}: {known}"
+            );
+        }
     }
 
     #[test]

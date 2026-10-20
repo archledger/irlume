@@ -5761,6 +5761,24 @@ impl Engine {
                 (rgb, rgb_ms, ir.map(Some), ir_ms)
             })
         };
+        // The captures above have ended, so their timings are reported
+        // BEFORE the deadline check: a capture that crossed the
+        // authentication deadline still spent its wall time, and the
+        // operation can complete later with OperationFinished - a missing
+        // record there would leave the offline envelope silently omitting
+        // the capture (#1147 review round 8).
+        if !rgb_timing_emitted {
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
+        }
+        emit_trace_stage_ms(
+            diagnostics,
+            irlume_common::diagnostics::TraceStage::IrCapture,
+            ir_ms,
+        );
         self.check_request_active()?;
         for error in [rgb_res.as_ref().err(), ir_res.as_ref().err()]
             .into_iter()
@@ -5780,18 +5798,6 @@ impl Engine {
                 .into());
             }
         }
-        if !rgb_timing_emitted {
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RgbCapture,
-                rgb_ms,
-            );
-        }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::IrCapture,
-            ir_ms,
-        );
         let observed_runtime_violation =
             match (&rgb_res, &ir_res, capture_mode.runtime_contract.as_ref()) {
                 (Ok(rgb), Ok(Some((ir, _))), Some(contract)) => {
@@ -17990,6 +17996,29 @@ mod engine_tests {
         assert!(
             helper.contains("emit_trace_stage_ms"),
             "the IR capture helper must emit its stage timing"
+        );
+    }
+
+    #[test]
+    fn deadline_crossing_captures_report_before_the_deadline_check() {
+        // A capture that crossed the authentication deadline still spent
+        // its wall time and its stage has ended, so the timing is emitted
+        // BEFORE check_request_active: the operation can complete later
+        // with OperationFinished, and a missing record would leave the
+        // offline envelope silently omitting the capture (#1147 review
+        // round 8). Mutually verified: mutating the emission order out
+        // fails this pin.
+        let src = include_str!("lib.rs");
+        let region = src
+            .split("let (ir, ir_ms) = ir_thread.join()")
+            .nth(1)
+            .unwrap()
+            .split("check_request_active")
+            .next()
+            .unwrap();
+        assert!(
+            region.contains("emit_trace_stage_ms"),
+            "the capture timings must be emitted before the deadline check"
         );
     }
 }

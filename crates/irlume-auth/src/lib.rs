@@ -5900,10 +5900,14 @@ impl Engine {
                             Ok((frame, elapsed))
                         }
                         Err(error) => {
+                            // A failed capture still spent its wall time, and
+                            // the stage is reported when it ends whether or
+                            // not it succeeded.
+                            let elapsed = started.elapsed().as_millis();
                             emit_trace_stage_ms(
                                 diagnostics,
                                 irlume_common::diagnostics::TraceStage::RgbCapture,
-                                0,
+                                elapsed,
                             );
                             Err(error)
                         }
@@ -5925,10 +5929,11 @@ impl Engine {
                             Ok((frame, elapsed))
                         }
                         Err(error) => {
+                            let elapsed = started.elapsed().as_millis();
                             emit_trace_stage_ms(
                                 diagnostics,
                                 irlume_common::diagnostics::TraceStage::IrCapture,
-                                0,
+                                elapsed,
                             );
                             Err(error)
                         }

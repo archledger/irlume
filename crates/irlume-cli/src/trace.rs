@@ -673,7 +673,11 @@ fn render_analysis(records: &[TraceRecord]) -> String {
             }
         }
         if let Some(fallback_sequence) = first_fallback {
-            if matches!(generic_class, GenericCaptureClass::Unknown) {
+            // A fallback upgrades every schedule answer except an explicit
+            // Sequential one: a Concurrent operation that fell back retries
+            // sequentially after the marker, and an operation whose marker
+            // predates recording is unknown rather than concurrent.
+            if !matches!(generic_class, GenericCaptureClass::All) {
                 generic_class = GenericCaptureClass::AfterFallback(fallback_sequence);
             }
         }
@@ -1336,16 +1340,22 @@ mod tests {
             record.operation_id = OperationId::from_bytes([3; 16]);
             record
         };
+        // The production fallback shape: a Concurrent schedule was selected
+        // first, its pair failed, and the retry after the marker runs
+        // sequentially.
+        let mut concurrent_selected = schedule(21, 200_000, false);
+        concurrent_selected.operation_id = OperationId::from_bytes([3; 16]);
+        records.push(concurrent_selected);
         let (mut r, mut i) = (
             fallback_op(
-                21,
+                22,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::RgbCapture,
                     elapsed_us: 30_000,
                 },
             ),
             fallback_op(
-                22,
+                23,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::IrCapture,
                     elapsed_us: 25_000,
@@ -1357,7 +1367,7 @@ mod tests {
         records.push(r);
         records.push(i);
         let mut marker = fallback_op(
-            23,
+            24,
             TraceEventKind::Shared {
                 transition: ShareSafeEventKind::CaptureFallback {
                     reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
@@ -1368,14 +1378,14 @@ mod tests {
         records.push(marker);
         let (mut r, mut i) = (
             fallback_op(
-                24,
+                25,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::RgbCapture,
                     elapsed_us: 20_000,
                 },
             ),
             fallback_op(
-                25,
+                26,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::IrCapture,
                     elapsed_us: 15_000,
@@ -1387,7 +1397,7 @@ mod tests {
         records.push(r);
         records.push(i);
         let mut fallback_finished = fallback_op(
-            26,
+            27,
             TraceEventKind::Shared {
                 transition: ShareSafeEventKind::OperationFinished {
                     outcome: CategoricalOutcome::Completed,
@@ -1405,14 +1415,14 @@ mod tests {
         };
         let (mut r, mut i) = (
             unknown_op(
-                27,
+                28,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::RgbCapture,
                     elapsed_us: 40_000,
                 },
             ),
             unknown_op(
-                28,
+                29,
                 TraceEventKind::StageTiming {
                     stage: TraceStage::IrCapture,
                     elapsed_us: 30_000,
@@ -1424,7 +1434,7 @@ mod tests {
         records.push(r);
         records.push(i);
         let mut unknown_finished = unknown_op(
-            29,
+            30,
             TraceEventKind::Shared {
                 transition: ShareSafeEventKind::OperationFinished {
                     outcome: CategoricalOutcome::Completed,
@@ -1434,7 +1444,7 @@ mod tests {
         unknown_finished.monotonic_us = 385_000;
         records.push(unknown_finished);
         records.push(control(
-            30,
+            31,
             TraceEventKind::Finished {
                 outcome: CategoricalOutcome::Completed,
             },

@@ -30383,11 +30383,19 @@ mod split_management_tests {
         // that account. The notice must name the consequence and the two
         // restore paths.
         let source = include_str!("main.rs");
-        // Flatten rustfmt continuations so needles match the production
-        // message regardless of line wrapping; the test's own needles are
-        // part of the flattened text, so the assertions below use needles
-        // that only the production arms produce in combination.
-        let flat: String = source
+        // Extract the production match block before asserting, so the
+        // test's own literals can never satisfy a needle: the block runs
+        // from the move call to its Ok(None) arm, and nothing in it comes
+        // from this test. Continuations are flattened so needles match the
+        // message regardless of line wrapping.
+        let production = source
+            .split("move_to_stronger_policy(&user)")
+            .nth(1)
+            .unwrap()
+            .split("Ok(None) => {}")
+            .next()
+            .unwrap();
+        let flat: String = production
             .split_whitespace()
             .filter(|word| *word != "\\")
             .collect::<Vec<_>>()
@@ -30396,7 +30404,7 @@ mod split_management_tests {
             flat.contains(
                 "cannot open it after this move; irlume recovery restore or a re-enrollment"
             ),
-            "the DA-exempt move notice must state the one-way door and both restore paths"
+            "the DA-exempt move notice must state the one-way door and both restore paths: {flat}"
         );
         // The warning belongs only to moves that change storage keys: a
         // StrongerPolicy move stays on the original key, and an older
@@ -30410,11 +30418,11 @@ mod split_management_tests {
             .unwrap();
         assert!(
             !plain_arm.contains("cannot open it after this move"),
-            "the StrongerPolicy arm must not claim the downgrade door"
+            "the StrongerPolicy arm must not claim the downgrade door: {plain_arm}"
         );
         assert!(
             plain_arm.contains("moved the template key of '{user}' to {gained}"),
-            "the StrongerPolicy arm keeps its plain move notice"
+            "the StrongerPolicy arm keeps its plain move notice: {plain_arm}"
         )
     }
 }

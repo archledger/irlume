@@ -98,6 +98,13 @@ Use a private local directory instead. `support-report --json` still writes its
 share-safe document to stdout without creating a file (ADR-0008, amendment
 2026-10-20).
 
+Trace duration bounds collection, not when a slow reader consumes each line.
+The daemon admits one collecting trace and can drain an expired one while its
+replacement collects. Previously admitted records and terminal controls have
+one server-side delivery budget ending 15 seconds after observation expiry;
+timeouts can leave a recoverable partial instead of a final file (ADR-0008,
+lifetime amendment 2026-10-20).
+
 ## Split camera authorizations
 
 `irlume split --help` prints the full syntax without contacting the daemon.

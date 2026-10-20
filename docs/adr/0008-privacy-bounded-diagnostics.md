@@ -138,6 +138,11 @@ fails with a typed busy response rather than silently joining or replacing the
 first. `SO_PEERCRED` root authorization is enforced by the daemon; a client
 flag or output-file owner is never treated as authority.
 
+**Amended 2026-10-20:** "active" means still collecting new observations.
+An expired collector may still deliver previously admitted records while a
+replacement collects. The existing busy wire response is `Response::Error`,
+not a new dedicated response variant; see the lifetime amendment below.
+
 The daemon generates the opaque operation ID after accepting and classifying a
 request. It never trusts or reflects a caller-supplied correlation ID into the
 privileged event stream.
@@ -184,6 +189,10 @@ these additions before queue capacity, sequence and dropped-event accounting.
 The unchanged acceptance response reports bounds, while each trace record,
 including `trace_started`, identifies the negotiated version. An older daemon
 can ignore the optional request field and continue emitting schema 1.
+
+**Amended 2026-10-20:** current daemons and readers support schemas 1 through
+5; omission still selects schema 1. The lifetime correction below preserves
+that negotiation and introduces no wire field or variant.
 
 Exact match and liveness measurements are permitted only in the root-owned
 trace because they can provide iterative feedback to an attacker. The trace
@@ -313,3 +322,56 @@ them. They do not change the existing destination-directory trust assumptions.
 Use a qualified private local directory for sensitive traces. Inspect a
 share-safe support report before deliberately copying it elsewhere; privileged
 traces are not share-safe reports.
+
+## Amendment 2026-10-20: observation expiry and bounded trace delivery
+
+Collection and delivery have separate deadlines. One immutable monotonic
+origin starts when the subscriber is created, before acceptance is written.
+Its bounded requested duration sets the observation deadline. Acceptance delay,
+a stalled reader and producer contention do not extend that window.
+
+The subscriber checks observation expiry under its admission lock, including
+after handling a pending-drop marker. Each observation uses that admission
+instant for its trace-relative microsecond timestamp. Out-of-window events are
+not backpressure losses and do not increment the dropped-event count.
+Sequence-zero `TraceStarted` is queued before the subscriber becomes visible
+to producers. This control record has timestamp zero even if initialization
+was delayed past a 1 ms window; it contains no observation payload.
+
+At most one subscriber collects new observations. Once it expires or finishes,
+another may collect while the old connection drains. Finishing or dropping the
+old owner must not erase the replacement. Existing connection-slot and queue
+limits still bound transports; no unbounded retired-subscriber list is added.
+Transport teardown closes admission even if a paused producer still holds an
+upgraded reference. This closure does not fabricate a terminal record.
+
+Server delivery ends at the observation deadline plus one fixed 15-second
+grace. This reuses the ordinary socket allowance as a total budget rather than
+restarting it for each record or at drain entry. A caller's shorter per-write
+allowance is not widened. Acceptance, ordinary records, queued drain and final
+controls all use the same delivery end. These are server-side write bounds,
+not an absolute CLI command timer or a guarantee of when the peer reads bytes
+already buffered by the kernel.
+
+Blocking AF_UNIX sends can refresh their timeout while making internal chunk
+progress. Trace delivery therefore uses per-call nonblocking sends and
+deadline-bounded readiness waits, rechecking time after partial progress and
+interruptions. It does not change shared descriptor flags, process-wide signal
+policy, or authentication and recovery I/O helpers.
+
+An idle stream checks full hangup/error without consuming pending input at the
+existing 250 ms check cadence. A client that closes only its write side after
+sending its one request can still receive the trace. Scheduler delays are not
+claimed as hard real-time bounds.
+
+Expiry does not consume terminal ownership: the connection stops admission,
+drains already-sequenced records, then sends pending-drop and terminal controls
+once. On a delivery timeout or write failure it closes without skipping
+sequences or fabricating successful completion. A final partial line can remain
+in the CLI's recoverable partial; it is not a complete published trace.
+
+The duration, event, byte and schema limits, root peer-credential authorization,
+and non-blocking producer side channel remain unchanged. Validation uses
+synthetic socket pairs, including trickling and non-reading consumers,
+half-close/hangup distinctions, expiry races, replacement ownership and complete
+drain within grace; this is not a new hardware qualification.

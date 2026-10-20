@@ -21,6 +21,7 @@ use irlume_common::{jout_debug, jout_err, jout_info, jout_notice, jout_warn};
 use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use trace_stream::serve_trace;
 use zeroize::Zeroize;
 
 /// The one lock that serialises `environ` access across this binary's tests.
@@ -94,6 +95,9 @@ mod retry_throttle;
 mod role_classification;
 mod shared_unlock;
 mod token_delivery;
+#[cfg(test)]
+mod trace_lifecycle_tests;
+mod trace_stream;
 mod users;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
@@ -4919,74 +4923,6 @@ fn serve_peer_until(
             resp.respond(stream)
         }
     }
-}
-
-fn serve_trace(
-    mut stream: UnixStream,
-    diagnostic_state: &diagnostics::DiagnosticState,
-    peer_uid: u32,
-    duration_ms: u64,
-    trace_schema: Option<u32>,
-) -> std::io::Result<()> {
-    let subscription = match diagnostic_state.subscribe_trace(peer_uid, duration_ms, trace_schema) {
-        Ok(subscription) => subscription,
-        Err(diagnostics::TraceSubscribeError::NotRoot) => {
-            return respond(
-                stream,
-                &Response::Error(format!("trace record requires root (peer uid {peer_uid})")),
-            );
-        }
-        Err(diagnostics::TraceSubscribeError::Busy) => {
-            return respond(
-                stream,
-                &Response::Error("a diagnostic trace is already active".into()),
-            );
-        }
-        Err(diagnostics::TraceSubscribeError::UnsupportedSchema) => {
-            return respond(
-                stream,
-                &Response::Error("unsupported diagnostic trace schema".into()),
-            );
-        }
-    };
-    write_json_line(
-        &mut stream,
-        &Response::TraceAccepted {
-            limits: subscription.limits(),
-        },
-    )?;
-
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis(subscription.limits().duration_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let wait = remaining.min(std::time::Duration::from_millis(250));
-        match subscription.recv_timeout(wait) {
-            Ok(record) => write_json_line(&mut stream, &record)?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    // Stop producers first, then drain every record already assigned a
-    // sequence before appending the terminal records. This makes every file a
-    // contiguous, parser-valid prefix even when the channel was saturated.
-    let terminal = subscription.finish(irlume_common::diagnostics::CategoricalOutcome::Completed);
-    while let Ok(record) = subscription.recv_timeout(std::time::Duration::ZERO) {
-        write_json_line(&mut stream, &record)?;
-    }
-    for record in terminal {
-        write_json_line(&mut stream, &record)?;
-    }
-    stream.flush()
-}
-
-fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
-    serde_json::to_writer(&mut *stream, value).map_err(std::io::Error::other)?;
-    stream.write_all(b"\n")
 }
 
 /// One parsed request line off the wire (see [`read_request`]).
@@ -14169,7 +14105,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 28] = [
+        let sources: [(&str, &str); 30] = [
             ("main.rs", include_str!("main.rs")),
             (
                 "request_preparation_tests.rs",
@@ -14260,6 +14196,11 @@ mod tests {
                 include_str!("enrollment_session.rs"),
             ),
             ("diagnostics.rs", include_str!("diagnostics.rs")),
+            (
+                "trace_lifecycle_tests.rs",
+                include_str!("trace_lifecycle_tests.rs"),
+            ),
+            ("trace_stream.rs", include_str!("trace_stream.rs")),
             (
                 "operation_authorization.rs",
                 include_str!("operation_authorization.rs"),

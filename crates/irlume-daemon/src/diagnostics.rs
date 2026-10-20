@@ -57,7 +57,8 @@ struct TraceSubscriber {
     sender: SyncSender<TraceRecord>,
     inner: Mutex<TraceInner>,
     limits: TraceLimits,
-    started_us: u64,
+    started_at: Instant,
+    deadline: Instant,
     trace_schema: u32,
 }
 
@@ -335,16 +336,24 @@ impl DiagnosticState {
         ) {
             return Err(TraceSubscribeError::UnsupportedSchema);
         }
+        // Entropy acquisition must not hold the lock producers use to find
+        // their subscriber. Publish only after startup has been queued.
+        let operation_id = self.next_operation_id();
         let mut active = self
             .shared
             .trace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if active.as_ref().and_then(Weak::upgrade).is_some() {
+        if active
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|subscriber| subscriber.is_collecting())
+        {
             return Err(TraceSubscribeError::Busy);
         }
 
         let limits = TraceLimits::bounded(duration_ms);
+        let started_at = Instant::now();
         let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
         let subscriber = Arc::new(TraceSubscriber {
             sender,
@@ -355,21 +364,32 @@ impl DiagnosticState {
                 finished: false,
             }),
             limits,
-            started_us: monotonic_us(),
+            started_at,
+            deadline: started_at + Duration::from_millis(limits.duration_ms),
             trace_schema,
         });
-        *active = Some(Arc::downgrade(&subscriber));
-        drop(active);
-
-        let operation_id = self.next_operation_id();
-        subscriber.emit(
+        let mut inner = subscriber.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let startup_queued = subscriber.try_send_locked(
+            &mut inner,
             operation_id,
             OperationClass::Status,
             TraceEventKind::TraceStarted {
                 limits,
                 warning: TraceWarning::PrivilegedDiagnosticOracle,
             },
+            false,
+            started_at,
         );
+        // Capacity and limits are internal: the fresh production queue always
+        // has room for this bounded control record. It has no observation data
+        // and retains sequence/timestamp zero even if initialization is delayed.
+        assert!(
+            startup_queued,
+            "fresh trace queue must accept its startup record"
+        );
+        drop(inner);
+        *active = Some(Arc::downgrade(&subscriber));
+        drop(active);
         Ok(TraceSubscription {
             subscriber,
             receiver,
@@ -468,6 +488,11 @@ impl DiagnosticState {
 }
 
 impl TraceSubscriber {
+    fn is_collecting(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        !inner.finished && Instant::now() < self.deadline
+    }
+
     fn emit(&self, operation_id: OperationId, operation: OperationClass, kind: TraceEventKind) {
         // Vocabulary negotiation is not backpressure: omitted newer events
         // must not occupy capacity, flush drop markers, or consume sequence IDs.
@@ -478,7 +503,8 @@ impl TraceSubscriber {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.finished {
+        let admitted_at = Instant::now();
+        if inner.finished || admitted_at >= self.deadline {
             return;
         }
         if inner.pending_dropped > 0 {
@@ -489,13 +515,27 @@ impl TraceSubscriber {
                 operation,
                 TraceEventKind::EventsDropped { count: dropped },
                 false,
+                admitted_at,
             ) {
                 inner.pending_dropped = inner.pending_dropped.saturating_add(1);
                 return;
             }
             inner.pending_dropped = 0;
         }
-        if !self.try_send_locked(&mut inner, operation_id, operation, kind, false) {
+        // A drop marker's serialization can cross the observation boundary.
+        // Expiry is not backpressure loss and must not grow pending_dropped.
+        let admitted_at = Instant::now();
+        if admitted_at >= self.deadline {
+            return;
+        }
+        if !self.try_send_locked(
+            &mut inner,
+            operation_id,
+            operation,
+            kind,
+            false,
+            admitted_at,
+        ) {
             inner.pending_dropped = inner.pending_dropped.saturating_add(1);
         }
     }
@@ -507,6 +547,7 @@ impl TraceSubscriber {
         operation: OperationClass,
         event: TraceEventKind,
         terminal: bool,
+        admitted_at: Instant,
     ) -> bool {
         // Reserve a drop marker plus terminal marker, both written by the
         // owning connection after it has stopped accepting producer events.
@@ -519,6 +560,7 @@ impl TraceSubscriber {
             operation,
             event,
             terminal,
+            admitted_at,
         );
         let Ok(serialized) = serde_json::to_vec(&record) else {
             return false;
@@ -555,12 +597,19 @@ impl TraceSubscriber {
         operation: OperationClass,
         event: TraceEventKind,
         terminal: bool,
+        admitted_at: Instant,
     ) -> TraceRecord {
-        let monotonic_us = monotonic_us();
         TraceRecord {
             trace_schema: self.trace_schema,
             sequence,
-            monotonic_us: monotonic_us.saturating_sub(self.started_us),
+            // Use the same instant checked under the admission lock. A later
+            // clock read could date an admitted event outside its window.
+            monotonic_us: u64::try_from(
+                admitted_at
+                    .saturating_duration_since(self.started_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX),
             utc_unix_ms: utc_unix_ms(),
             operation_id,
             operation,
@@ -573,6 +622,10 @@ impl TraceSubscriber {
 impl TraceSubscription {
     pub(crate) fn limits(&self) -> TraceLimits {
         self.subscriber.limits
+    }
+
+    pub(crate) fn observation_deadline(&self) -> Instant {
+        self.subscriber.deadline
     }
 
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<TraceRecord, RecvTimeoutError> {
@@ -589,6 +642,7 @@ impl TraceSubscription {
             return Vec::new();
         }
         inner.finished = true;
+        let finished_at = Instant::now();
         let mut records = Vec::with_capacity(2);
         if inner.pending_dropped > 0
             && inner.next_sequence < self.subscriber.limits.max_events.saturating_sub(1)
@@ -601,6 +655,7 @@ impl TraceSubscription {
                     count: inner.pending_dropped,
                 },
                 false,
+                finished_at,
             ));
             inner.next_sequence = inner.next_sequence.saturating_add(1);
             inner.pending_dropped = 0;
@@ -611,20 +666,26 @@ impl TraceSubscription {
             OperationClass::Status,
             TraceEventKind::Finished { outcome },
             true,
+            finished_at,
         ));
         inner.next_sequence = inner.next_sequence.saturating_add(1);
         records
     }
 }
 
-/// Microsecond monotonic time for `TraceRecord::monotonic_us`: the field is
-/// microsecond-named, and offline interval reconstruction
-/// (`irlume trace analyze`) subtracts microsecond `elapsed_us` from it, so a
-/// millisecond clock quantizes stage starts to whole ticks and collapses
-/// sub-millisecond stages into overlaps.
-fn monotonic_us() -> u64 {
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    u64::try_from(START.get_or_init(Instant::now).elapsed().as_micros()).unwrap_or(u64::MAX)
+impl Drop for TraceSubscription {
+    fn drop(&mut self) {
+        // Transport ownership, not the last producer Arc, controls admission.
+        // Close it before receiver destruction, on every return/unwind path.
+        // Only finish creates terminal records; never clear the global Weak,
+        // which may already name a replacement collector.
+        let mut inner = self
+            .subscriber
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inner.finished = true;
+    }
 }
 
 fn utc_unix_ms() -> u64 {
@@ -1342,6 +1403,244 @@ mod tests {
         ));
         drop(subscription);
         assert!(state.subscribe_trace(0, 60_000, None).is_ok());
+    }
+
+    #[test]
+    fn trace_deadline_is_checked_after_a_waiting_producer_acquires_the_lock() {
+        let state = DiagnosticState::default();
+        let operation = state.begin(OperationClass::Status);
+        let subscription = state
+            .subscribe_trace(0, 20, Some(CURRENT_TRACE_SCHEMA_VERSION))
+            .unwrap();
+        let startup = subscription.recv_timeout(Duration::ZERO).unwrap();
+        let guard = subscription.subscriber.inner.lock().unwrap();
+        let (started, producer_started) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            operation.emit_trace(TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+                elapsed_us: 424_242,
+            });
+        });
+        producer_started
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        drop(guard);
+        producer.join().unwrap();
+        let mut records = vec![startup];
+        records.extend(subscription.receiver.try_iter());
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert!(subscription.finish(CategoricalOutcome::Failed).is_empty());
+        assert_eq!(records.iter().filter(|record| record.terminal).count(), 1);
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(
+            !records.iter().any(|record| matches!(
+                record.event,
+                TraceEventKind::StageTiming {
+                    elapsed_us: 424_242,
+                    ..
+                }
+            )),
+            "an event waiting across expiry was admitted: {records:?}"
+        );
+    }
+
+    #[test]
+    fn trace_deadline_startup_precedes_publication_to_concurrent_producers() {
+        let state = DiagnosticState::default();
+        let operation = state.begin(OperationClass::Status);
+        let entropy = state.shared.entropy.lock().unwrap();
+        let subscribing = state.clone();
+        let (started, started_receiver) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            subscribing
+                .subscribe_trace(0, 1_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+                .unwrap()
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let wait_until = Instant::now() + Duration::from_millis(100);
+        let mut published_before_initialization = false;
+        while Instant::now() < wait_until {
+            let visible = state
+                .shared
+                .trace
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some();
+            if visible {
+                published_before_initialization = true;
+                operation.emit_trace(TraceEventKind::StageTiming {
+                    stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+                    elapsed_us: 1,
+                });
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(entropy);
+        let subscription = producer.join().unwrap();
+        if !published_before_initialization {
+            operation.emit_trace(TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+                elapsed_us: 1,
+            });
+        }
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert!(
+            matches!(records[0].event, TraceEventKind::TraceStarted { .. }),
+            "startup was published after a producer record: {records:?}"
+        );
+        assert!(!published_before_initialization);
+    }
+
+    #[test]
+    fn trace_expired_owner_can_be_replaced_without_old_cleanup_erasing_the_new_owner() {
+        let state = DiagnosticState::default();
+        let operation = state.begin(OperationClass::Status);
+        let old = state
+            .subscribe_trace(0, 1, Some(CURRENT_TRACE_SCHEMA_VERSION))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let new = state
+            .subscribe_trace(0, 5_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+            .unwrap();
+        let old_terminal = old.finish(CategoricalOutcome::Completed);
+        assert_eq!(
+            old_terminal.iter().filter(|record| record.terminal).count(),
+            1
+        );
+        drop(old);
+        assert!(matches!(
+            state.subscribe_trace(0, 5_000, Some(CURRENT_TRACE_SCHEMA_VERSION)),
+            Err(TraceSubscribeError::Busy)
+        ));
+        operation.emit_trace(TraceEventKind::StageTiming {
+            stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+            elapsed_us: 7,
+        });
+        let mut records: Vec<_> = new.receiver.try_iter().collect();
+        records.extend(new.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            records[0].event,
+            TraceEventKind::TraceStarted { .. }
+        ));
+        assert!(matches!(
+            records[1].event,
+            TraceEventKind::StageTiming { elapsed_us: 7, .. }
+        ));
+        assert!(records[2].terminal);
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+    }
+
+    #[test]
+    fn trace_transport_drop_closes_collection_with_a_suspended_producer_arc() {
+        let state = DiagnosticState::default();
+        let subscription = state
+            .subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+            .unwrap();
+        let retained_producer = subscription.subscriber.clone();
+        let old_operation = subscription.operation_id;
+        // The producer has upgraded the global Weak but has not called emit.
+        // Transport teardown must close admission even while that Arc survives.
+        drop(subscription);
+        let closed_before_producer_resume = !retained_producer.is_collecting();
+        let replacement = state.subscribe_trace(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION))
+            .unwrap_or_else(|error| panic!("transport ended but replacement refused: {error:?}; closed_before_resume={closed_before_producer_resume}"));
+        assert!(closed_before_producer_resume);
+        retained_producer.emit(
+            old_operation,
+            OperationClass::Status,
+            TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+                elapsed_us: 424_242,
+            },
+        );
+        drop(retained_producer);
+        let mut records: Vec<_> = replacement.receiver.try_iter().collect();
+        records.extend(replacement.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            records[0].event,
+            TraceEventKind::TraceStarted { .. }
+        ));
+        assert!(records[1].terminal);
+    }
+
+    #[test]
+    fn trace_startup_control_survives_initialization_delayed_beyond_a_one_ms_window() {
+        let limits = TraceLimits::bounded(1);
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(1);
+        std::thread::sleep(Duration::from_millis(20));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let subscriber = Arc::new(TraceSubscriber {
+            sender,
+            inner: Mutex::new(TraceInner {
+                next_sequence: 0,
+                pending_dropped: 0,
+                emitted_bytes: 0,
+                finished: false,
+            }),
+            limits,
+            started_at,
+            deadline,
+            trace_schema: CURRENT_TRACE_SCHEMA_VERSION,
+        });
+        let operation_id = OperationId::from_bytes([42; 16]);
+        let mut inner = subscriber.inner.lock().unwrap();
+        assert!(subscriber.try_send_locked(
+            &mut inner,
+            operation_id,
+            OperationClass::Status,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle
+            },
+            false,
+            started_at,
+        ));
+        drop(inner);
+        subscriber.emit(
+            operation_id,
+            OperationClass::Status,
+            TraceEventKind::StageTiming {
+                stage: irlume_common::diagnostics::TraceStage::IdentityInference,
+                elapsed_us: 424_242,
+            },
+        );
+        let subscription = TraceSubscription {
+            subscriber,
+            receiver,
+            operation_id,
+        };
+        let mut records: Vec<_> = subscription.receiver.try_iter().collect();
+        records.extend(subscription.finish(CategoricalOutcome::Completed));
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            records[0].event,
+            TraceEventKind::TraceStarted { .. }
+        ));
+        assert_eq!(records[0].sequence, 0);
+        assert_eq!(records[0].monotonic_us, 0);
+        assert!(records[1].terminal);
+        assert_eq!(records[1].sequence, 1);
+        assert!(subscription
+            .finish(CategoricalOutcome::Completed)
+            .is_empty());
     }
 
     #[test]

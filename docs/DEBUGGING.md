@@ -96,6 +96,15 @@ storage is refused. Recording checks that destination before subscribing to the
 daemon. This does not change `support-report --json` on stdout (ADR-0008,
 amendment 2026-10-20).
 
+`--duration` bounds new observations on the daemon's monotonic clock. A slow
+reader cannot extend collection. Previously admitted records and final controls
+share a fixed server-side delivery budget ending 15 seconds after that window;
+shorter per-write timeouts still apply. Delivery failure leaves an incomplete
+partial, not a published complete trace. Bytes already buffered by the kernel
+may be read later. Full disconnect releases the collector; closing only the
+client's write side does not cancel its read side (ADR-0008 lifetime amendment
+2026-10-20).
+
 The recorder requests trace schema 5. A current daemon honors explicit schema
 1 through 5; a request without `trace_schema` retains schema 1 for older
 recorders. An older daemon ignores the optional request field and continues

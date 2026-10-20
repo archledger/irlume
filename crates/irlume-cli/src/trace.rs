@@ -5,9 +5,9 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    parse_trace, TraceEventKind, TraceLimits, TraceRecord, TraceValidator,
-    CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
-    MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
+    parse_trace, CaptureSchedule, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord,
+    TraceStage, TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS,
+    MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
 };
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
@@ -19,6 +19,7 @@ use std::time::Duration;
 pub(crate) fn run(args: &[String]) -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("explain") => run_explain(args),
+        Some("analyze") => run_analyze(args),
         Some("record") | None | Some("--duration" | "--output") => run_record(args),
         Some(value) if value.starts_with("--duration=") || value.starts_with("--output=") => {
             run_record(args)
@@ -29,7 +30,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: irlume trace [record] [--duration 60s] [--output FILE.jsonl]\n       irlume trace explain FILE.jsonl [--output FILE.txt]"
+        "usage: irlume trace [record] [--duration 60s] [--output FILE.jsonl]\n       irlume trace explain FILE.jsonl [--output FILE.txt]\n       irlume trace analyze FILE.jsonl [--output FILE.txt]"
     );
     ExitCode::from(2)
 }
@@ -244,6 +245,75 @@ fn effective_uid() -> u32 {
     }
 }
 
+fn parse_analyze_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), &'static str> {
+    if args.get(1).map(String::as_str) != Some("analyze") {
+        return Err("invalid command");
+    }
+    let input = args.get(2).ok_or("a .jsonl trace path is required")?;
+    if input.starts_with('-') {
+        return Err("a .jsonl trace path is required");
+    }
+    let mut output = None;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" if output.is_none() => {
+                output = Some(PathBuf::from(
+                    args.get(index + 1).ok_or("--output requires a path")?,
+                ));
+                index += 2;
+            }
+            value if value.starts_with("--output=") && output.is_none() => {
+                output = Some(PathBuf::from(value.trim_start_matches("--output=")));
+                index += 1;
+            }
+            _ => return Err("usage: irlume trace analyze FILE.jsonl [--output FILE.txt]"),
+        }
+    }
+    if output.as_deref().is_some_and(|path| {
+        path.extension().and_then(|extension| extension.to_str()) != Some("txt")
+    }) {
+        return Err("--output must end in .txt");
+    }
+    Ok((PathBuf::from(input), output))
+}
+
+fn run_analyze(args: &[String]) -> ExitCode {
+    let (input, output) = match parse_analyze_args(args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("irlume trace analyze: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let rendered = match analyze(&input) {
+        Ok(rendered) => rendered,
+        Err(message) => {
+            eprintln!("irlume trace analyze: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(output) = output else {
+        print!("{rendered}");
+        return ExitCode::SUCCESS;
+    };
+    let result = (|| {
+        let mut artifact = SecureArtifact::create(&output, MAX_TRACE_BYTES)?;
+        artifact.write_chunk(rendered.as_bytes())?;
+        artifact.commit()
+    })();
+    match result {
+        Ok(published) => {
+            println!("Trace analysis created: {}", published.final_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("irlume trace analyze: {}: {error}", output.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_explain(args: &[String]) -> ExitCode {
     let (input, output) = match parse_explain_args(args) {
         Ok(options) => options,
@@ -379,6 +449,525 @@ fn render_event(event: &TraceEventKind) -> String {
     // Every value is a closed enum, finite number, validated SafeLabel, or
     // exact contract. No daemon/user prose is accepted into this renderer.
     format!("{event:?}")
+}
+
+/// One stage interval: the record's timestamp is the stage END, so the
+/// interval is `[monotonic_us - elapsed_us, monotonic_us]`.
+struct StageInterval {
+    stage: String,
+    start_us: u64,
+    end_us: u64,
+}
+
+/// A merged block keeps the stages that form its boundaries: the interval
+/// with the earliest start and the interval whose end is the block's end,
+/// which is not necessarily the last one appended.
+struct MergedBlock {
+    start_us: u64,
+    end_us: u64,
+    start_stage: String,
+    end_stage: String,
+}
+
+fn merge_intervals(mut intervals: Vec<StageInterval>) -> Vec<MergedBlock> {
+    intervals.sort_by_key(|interval| (interval.start_us, interval.end_us));
+    let mut merged: Vec<MergedBlock> = Vec::new();
+    for interval in intervals {
+        match merged.last_mut() {
+            Some(block) if interval.start_us <= block.end_us => {
+                if interval.end_us > block.end_us {
+                    block.end_us = interval.end_us;
+                    block.end_stage = interval.stage;
+                }
+            }
+            _ => merged.push(MergedBlock {
+                start_us: interval.start_us,
+                end_us: interval.end_us,
+                start_stage: interval.stage.clone(),
+                end_stage: interval.stage,
+            }),
+        }
+    }
+    merged
+}
+
+fn union_us(blocks: &[MergedBlock]) -> u64 {
+    blocks
+        .iter()
+        .map(|block| block.end_us - block.start_us)
+        .sum()
+}
+
+fn render_analysis(records: &[TraceRecord]) -> String {
+    use std::fmt::Write as _;
+    let mut by_operation: BTreeMap<String, Vec<&TraceRecord>> = BTreeMap::new();
+    let mut dropped = 0_u64;
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        by_operation.entry(operation_id).or_default().push(record);
+        if let TraceEventKind::EventsDropped { count } = record.event {
+            dropped = dropped.saturating_add(count);
+        }
+    }
+    let mut output = String::new();
+    if let Some(record) = records.first() {
+        writeln!(
+            output,
+            "Irlume diagnostic trace schema {}",
+            record.trace_schema
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "Irlume diagnostic trace (empty)").unwrap();
+    }
+    writeln!(output, "Records: {}", records.len()).unwrap();
+    writeln!(output, "Events dropped before recording: {dropped}").unwrap();
+    for (operation_id, operation_records) in by_operation {
+        writeln!(output).unwrap();
+        writeln!(
+            output,
+            "Operation {operation_id} ({:?})",
+            operation_records[0].operation
+        )
+        .unwrap();
+        let mut intervals = Vec::new();
+        for record in &operation_records {
+            if let TraceEventKind::StageTiming { stage, elapsed_us } = record.event {
+                intervals.push(StageInterval {
+                    stage: format!("{stage:?}"),
+                    start_us: record.monotonic_us.saturating_sub(elapsed_us),
+                    end_us: record.monotonic_us,
+                });
+            }
+        }
+        if intervals.is_empty() {
+            // Every daemon trace also carries a control group (the stream's
+            // TraceStarted and terminal Finished) that records no stages and
+            // never receives OperationFinished; it is not a timed operation.
+            writeln!(output, "  no stage timings").unwrap();
+            continue;
+        }
+        // A trace whose recording deadline expired mid-operation ends with
+        // only the stream's global terminal record: the timed operation
+        // never got its OperationFinished transition, so its remaining
+        // stages went unobserved and full-looking envelope numbers would be
+        // fiction.
+        let completed = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished { .. },
+                }
+            )
+        });
+        if !completed {
+            writeln!(
+                output,
+                "  REFUSED: operation cut off before completion (no OperationFinished event)"
+            )
+            .unwrap();
+            continue;
+        }
+        // Finalization is reported at most once per operation (the release
+        // of the owned streaming sessions through the engine return), so a
+        // second record is structurally impossible; refusing it keeps the
+        // containment pairing a single linear scan instead of quadratic
+        // rescans on a bounded 50,000-event trace.
+        let finalization_count = operation_records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.event,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::Finalization,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if finalization_count > 1 {
+            writeln!(
+                output,
+                "  REFUSED: {finalization_count} Finalization records; at most one is possible per operation"
+            )
+            .unwrap();
+            continue;
+        }
+        // The span starts at the earliest reconstructed interval start when
+        // recording began mid-operation, so the union never exceeds it and
+        // the leading edge stays an explicit edge rather than vanishing.
+        let span_start_us = operation_records
+            .iter()
+            .map(|record| record.monotonic_us)
+            .chain(intervals.iter().map(|interval| interval.start_us))
+            .min()
+            .unwrap_or(0);
+        let span_end_us = operation_records
+            .last()
+            .map(|record| record.monotonic_us)
+            .unwrap_or(span_start_us);
+        let span_us = span_end_us.saturating_sub(span_start_us);
+        let blocks = merge_intervals(intervals);
+        let stage_union = union_us(&blocks);
+        let residual_us = span_us.saturating_sub(stage_union);
+        writeln!(output, "  span_us={span_us}").unwrap();
+        writeln!(output, "  stage_union_us={stage_union}").unwrap();
+        writeln!(output, "  residual_us={residual_us}").unwrap();
+        // The sequential envelope is the union of the sequential intervals
+        // alone: an end-to-end stage that spans the whole engine call must
+        // not absorb setup, evaluation or matching into this number. The
+        // grouped route reports its batch through the Sequential* stages,
+        // but the ordinary sequential branch, split-pair capture and the
+        // concurrent-failure fallback report plain RgbCapture/IrCapture:
+        // those intervals join the envelope only when the operation's own
+        // evidence shows a sequential schedule or a fallback to one, so a
+        // concurrent pair's simultaneous captures stay excluded.
+        // Which generic captures the sequential envelope covers:
+        // - a Sequential schedule covers them all;
+        // - a fallback covers only the retry emitted after the fallback
+        //   marker: the pair before it is the discarded concurrent attempt,
+        //   and a held-pair failure can emit the marker with no retry at all;
+        // - a Concurrent schedule (no fallback) excludes them;
+        // - generic captures with NO schedule or fallback evidence mean
+        //   recording began after the marker: the schedule is unknown, not
+        //   concurrent, so the projection is unavailable rather than zero.
+        // Classification walks the operation's segments: each
+        // CaptureScheduleSelected starts a fresh segment, so a fallback's
+        // sequential retry never swallows a later attempt that re-selected
+        // the concurrent schedule (a grace-window retry after a self-heal
+        // recapture is concurrent again, because the capture mode is not
+        // demoted). Within a segment, a fallback boundary still includes
+        // the retry that follows it.
+        let mut segments: Vec<SegmentRule> = vec![SegmentRule {
+            start_sequence: 0,
+            end_sequence: u64::MAX,
+            schedule: None,
+            fallback: None,
+        }];
+        for record in &operation_records {
+            match record.event {
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureScheduleSelected { schedule, .. },
+                } => {
+                    // A new selection closes the running segment at this
+                    // sequence; each segment keeps its own rule and its own
+                    // bounds, so a later Sequential selection cannot reach
+                    // back over an earlier concurrent segment's captures.
+                    let boundary = record.sequence;
+                    segments.last_mut().unwrap().end_sequence = boundary;
+                    segments.push(SegmentRule {
+                        start_sequence: boundary,
+                        end_sequence: u64::MAX,
+                        schedule: Some(schedule),
+                        fallback: None,
+                    });
+                }
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureFallback { .. },
+                } => {
+                    let segment = segments.last_mut().unwrap();
+                    if segment.fallback.is_none() {
+                        segment.fallback = Some(record.sequence);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let has_generic_captures = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture | TraceStage::IrCapture,
+                    ..
+                }
+            )
+        });
+        let any_evidence = segments.iter().any(SegmentRule::has_evidence);
+        let capture_route_ran = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                    ..
+                }
+            )
+        });
+        if !any_evidence && !has_generic_captures && !capture_route_ran {
+            // No schedule evidence, no generic capture record, and no
+            // capture-path stage: nothing sequential to report.
+            segments.clear();
+        }
+        if !any_evidence && (has_generic_captures || capture_route_ran) {
+            // Generic captures or a capture route without any schedule
+            // evidence: the evidence predates the recording, and a zero
+            // would read as a confident concurrent pair.
+            writeln!(
+                output,
+                "  sequential_union_us=unavailable (schedule or capture evidence predates recording)"
+            )
+            .unwrap();
+        } else {
+            let sequential_blocks =
+                merge_intervals(sequential_intervals(&operation_records, &segments));
+            let sequential_union = union_us(&sequential_blocks);
+            writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
+        }
+        writeln!(output, "  blocks:").unwrap();
+        for block in &blocks {
+            writeln!(
+                output,
+                "    {:>10}..{:<10} {}..{}",
+                block.start_us, block.end_us, block.start_stage, block.end_stage
+            )
+            .unwrap();
+        }
+        writeln!(output, "  gaps:").unwrap();
+        let leading_us = blocks[0].start_us.saturating_sub(span_start_us);
+        if leading_us > 0 {
+            writeln!(
+                output,
+                "    gap_us={leading_us} after operation-start before {}",
+                blocks[0].start_stage
+            )
+            .unwrap();
+        }
+        for pair in blocks.windows(2) {
+            let gap_us = pair[1].start_us.saturating_sub(pair[0].end_us);
+            if gap_us > 0 {
+                writeln!(
+                    output,
+                    "    gap_us={gap_us} after {} before {}",
+                    pair[0].end_stage, pair[1].start_stage
+                )
+                .unwrap();
+            }
+        }
+        let trailing_us = span_end_us.saturating_sub(blocks[blocks.len() - 1].end_us);
+        if trailing_us > 0 {
+            writeln!(
+                output,
+                "    gap_us={trailing_us} after {} before operation-end",
+                blocks[blocks.len() - 1].end_stage
+            )
+            .unwrap();
+        }
+        for record in &operation_records {
+            if let TraceEventKind::StageTiming {
+                stage: TraceStage::Finalization,
+                elapsed_us,
+            } = record.event
+            {
+                let start_us = record.monotonic_us.saturating_sub(elapsed_us);
+                let contained: Vec<String> = operation_records
+                    .iter()
+                    .filter_map(|other| match other.event {
+                        TraceEventKind::StageTiming { stage, elapsed_us } => {
+                            let other_start = other.monotonic_us.saturating_sub(elapsed_us);
+                            (other_start >= start_us
+                                && other.monotonic_us <= record.monotonic_us
+                                && stage != TraceStage::Finalization)
+                                .then(|| format!("{stage:?}"))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                writeln!(
+                    output,
+                    "  finalization_us={elapsed_us} contains={}",
+                    if contained.is_empty() {
+                        "-".to_owned()
+                    } else {
+                        contained.join("+")
+                    }
+                )
+                .unwrap();
+            }
+        }
+    }
+    output
+}
+
+/// One schedule segment's evidence window: every
+/// CaptureScheduleSelected opens a segment that runs until the next one;
+/// `fallback` is the sequence of its CaptureFallback marker, if any.
+struct SegmentRule {
+    start_sequence: u64,
+    end_sequence: u64,
+    schedule: Option<CaptureSchedule>,
+    fallback: Option<u64>,
+}
+
+impl SegmentRule {
+    /// Whether this segment contains the sequence at all.
+    fn contains(&self, sequence: u64) -> bool {
+        sequence >= self.start_sequence && sequence < self.end_sequence
+    }
+
+    /// Whether a generic capture at this sequence joins the sequential
+    /// envelope under this segment's rule.
+    fn covers(&self, sequence: u64) -> bool {
+        match self.schedule {
+            Some(CaptureSchedule::Sequential) => true,
+            Some(CaptureSchedule::Concurrent) | None => {
+                self.fallback.is_some_and(|boundary| sequence > boundary)
+            }
+        }
+    }
+
+    /// Whether the segment carries any evidence at all.
+    fn has_evidence(&self) -> bool {
+        self.schedule.is_some() || self.fallback.is_some()
+    }
+}
+
+fn sequential_intervals(
+    operation_records: &[&TraceRecord],
+    segments: &[SegmentRule],
+) -> Vec<StageInterval> {
+    // Both lists are sequence-ordered, so one forward pass assigns each
+    // generic capture to the single segment containing it: no per-capture
+    // scan of every segment (a bounded trace can alternate markers and
+    // captures up to the event limit).
+    let mut cursor = 0_usize;
+    operation_records
+        .iter()
+        .filter_map(|record| {
+            let (stage, elapsed_us) = match record.event {
+                TraceEventKind::StageTiming { stage, elapsed_us } => (stage, elapsed_us),
+                _ => return None,
+            };
+            while cursor + 1 < segments.len() && !segments[cursor].contains(record.sequence) {
+                cursor += 1;
+            }
+            let name = format!("{stage:?}");
+            let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
+            let generic_covered = generic
+                && segments[cursor].contains(record.sequence)
+                && segments[cursor].covers(record.sequence);
+            let sequential_stage = name.starts_with("Sequential") || generic_covered;
+            sequential_stage.then_some(StageInterval {
+                stage: name,
+                start_us: record.monotonic_us.saturating_sub(elapsed_us),
+                end_us: record.monotonic_us,
+            })
+        })
+        .collect()
+}
+
+fn analyze(input: &Path) -> Result<String, String> {
+    let file =
+        std::fs::File::open(input).map_err(|error| format!("{}: {error}", input.display()))?;
+    let limits = TraceLimits::bounded(MAX_TRACE_DURATION_MS);
+    let parsed = parse_trace(BufReader::new(file), limits).map_err(|error| error.to_string())?;
+    let records = parsed.records();
+    // The envelope projection is only defined for the schema that carries
+    // the sequential capture stages; an older trace without them would
+    // report a sequential envelope of zero that is indistinguishable from
+    // an operation that never used sequential capture.
+    if let Some(first) = records.first() {
+        if first.trace_schema < CURRENT_TRACE_SCHEMA_VERSION {
+            return Err(format!(
+                "trace analyze requires schema {CURRENT_TRACE_SCHEMA_VERSION}; this trace is schema {}",
+                first.trace_schema
+            ));
+        }
+    }
+    // One operation id names one logical operation, so a trace that reuses
+    // an id across operation classes would merge unrelated records under
+    // the first class's label and let either operation's completion satisfy
+    // the gates for the combined group.
+    let mut class_by_operation: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        let class = format!("{:?}", record.operation);
+        match class_by_operation.get(&operation_id) {
+            Some(seen) if *seen != class => {
+                return Err(format!(
+                    "operation id {operation_id} spans multiple operation classes; timing analysis refused"
+                ));
+            }
+            Some(_) => {}
+            None => {
+                class_by_operation.insert(operation_id, class);
+            }
+        }
+    }
+    // A completed operation ends at its completion: exactly one
+    // OperationFinished, and it is that id's final record. A trace that
+    // reuses an id within one class, or appends stages after a completion,
+    // would otherwise merge both logical operations into one
+    // authoritative-looking span.
+    let mut completions: BTreeMap<String, u64> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        let finished = matches!(
+            record.event,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished { .. },
+            }
+        );
+        if finished {
+            *completions.entry(operation_id).or_insert(0) += 1;
+        } else if completions.contains_key(&operation_id) {
+            return Err(format!(
+                "operation id {operation_id} has records after its completion; timing analysis refused"
+            ));
+        }
+    }
+    if let Some((operation_id, count)) = completions.iter().find(|(_, c)| **c > 1) {
+        return Err(format!(
+            "operation id {operation_id} has {count} completion events; timing analysis refused"
+        ));
+    }
+    // A monotonic clock produced these timestamps, so decreasing values
+    // WITHIN one operation mean a malformed or corrupted trace; the
+    // interval reconstruction would treat them as valid endpoints and
+    // render a stage union exceeding the span with a silently zeroed
+    // residual. Interleaved operations each carry their own monotonic
+    // sequence, so file order alone is not the invariant.
+    let mut by_operation: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        by_operation
+            .entry(operation_id)
+            .or_default()
+            .push(record.monotonic_us);
+    }
+    if by_operation
+        .values()
+        .any(|times| times.windows(2).any(|pair| pair[1] < pair[0]))
+    {
+        return Err("trace timestamps are not monotonic; timing analysis refused".into());
+    }
+    // Dropped events make every per-operation decomposition incomplete, so
+    // refuse instead of rendering authoritative-looking numbers. The marker
+    // count is attacker-influenced input: saturate rather than wrap, or
+    // u64::MAX followed by 1 would fold back under the refusal threshold.
+    let dropped: u64 = records
+        .iter()
+        .filter_map(|record| match record.event {
+            TraceEventKind::EventsDropped { count } => Some(count),
+            _ => None,
+        })
+        .fold(0_u64, u64::saturating_add);
+    if dropped > 0 {
+        return Err(format!(
+            "trace dropped {dropped} events before recording; timing analysis refused"
+        ));
+    }
+    Ok(render_analysis(records))
 }
 
 #[cfg(test)]
@@ -737,8 +1326,816 @@ mod tests {
     }
 
     /// `irlume trace explain` reads a schema 5 file with the sequential
-    /// capture phases and the grouped evaluation, and refuses the same
-    /// stages in a file labeled with an older schema.
+    /// The analyze projection reports the union/residual decomposition the
+    /// sequential-path timing attribution needs (#856): interval union so a
+    /// nested GroupedEvaluation cannot double count, residual gaps named by
+    /// their bordering stages, the sequential envelope, and each
+    /// Finalization paired with the stages it contains.
+    #[test]
+    fn analyze_pairs_finalization_and_reports_union_residual_and_gaps() {
+        use irlume_common::diagnostics::{
+            CaptureSchedule, CaptureScheduleSource, OperationId, TraceStage,
+        };
+        let stage_record =
+            |sequence: u64, monotonic_us: u64, stage: TraceStage, elapsed_us: u64| {
+                let mut record = fixture_record(
+                    sequence,
+                    TraceEventKind::StageTiming { stage, elapsed_us },
+                    false,
+                );
+                record.monotonic_us = monotonic_us;
+                record
+            };
+        // Production shape: a control operation carries the stream's
+        // TraceStarted and terminal Finished (no stages, never an
+        // OperationFinished), the timed work operation carries the schedule
+        // evidence, its stages and its completion, and a second timed
+        // operation runs the concurrent schedule.
+        let control = |sequence: u64, event: TraceEventKind, monotonic_us: u64, terminal: bool| {
+            let mut record = fixture_record(sequence, event, terminal);
+            record.monotonic_us = monotonic_us;
+            record.operation_id = OperationId::from_bytes([9; 16]);
+            record
+        };
+        let mut records = vec![control(
+            0,
+            TraceEventKind::TraceStarted {
+                limits: TraceLimits::bounded(1_000),
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            0,
+            false,
+        )];
+        let schedule = |sequence: u64, monotonic_us: u64, sequential: bool| {
+            let mut record = fixture_record(
+                sequence,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureScheduleSelected {
+                        schedule: if sequential {
+                            CaptureSchedule::Sequential
+                        } else {
+                            CaptureSchedule::Concurrent
+                        },
+                        source: CaptureScheduleSource::SequentialDefault,
+                    },
+                },
+                false,
+            );
+            record.monotonic_us = monotonic_us;
+            record
+        };
+        records.push(schedule(1, 5_000, true));
+        // Interval plan (us): nesting GroupedEvaluation inside Finalization
+        // must not double count in the union, and the deliberate gaps must
+        // surface as residual attributed to their bordering stages.
+        records.extend([
+            stage_record(2, 100_000, TraceStage::CameraOpen, 98_000),
+            // Generic sequential captures: plain RgbCapture/IrCapture stages
+            // under a sequential schedule join the envelope.
+            stage_record(3, 140_000, TraceStage::RgbCapture, 20_000),
+            stage_record(4, 160_000, TraceStage::IrCapture, 10_000),
+            stage_record(5, 200_000, TraceStage::EnrollmentLoad, 38_000),
+            stage_record(6, 250_000, TraceStage::SequentialRgbStart, 2_000),
+            stage_record(7, 350_000, TraceStage::SequentialRgbSample, 90_000),
+            stage_record(8, 360_000, TraceStage::SequentialRgbSample, 10_000),
+            stage_record(9, 365_000, TraceStage::SequentialRgbRelease, 5_000),
+            stage_record(10, 480_000, TraceStage::SequentialIrStart, 100_000),
+            stage_record(11, 500_000, TraceStage::SequentialIrSample, 20_000),
+            stage_record(12, 506_000, TraceStage::SequentialIrRelease, 6_000),
+            stage_record(13, 540_000, TraceStage::GroupedEvaluation, 10_000),
+            stage_record(14, 560_000, TraceStage::Finalization, 30_000),
+            // An end-to-end stage spanning nearly the whole operation: the
+            // sequential envelope must still exclude it, and the trailing
+            // edge gap must name it as the block's end stage, not the last
+            // sequential stage appended inside it.
+            stage_record(15, 565_000, TraceStage::EngineAuthenticate, 555_000),
+        ]);
+        let mut operation_finished = fixture_record(
+            16,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+            false,
+        );
+        operation_finished.monotonic_us = 568_000;
+        records.push(operation_finished);
+        // A concurrent-schedule operation: its RgbCapture/IrCapture stay out
+        // of the sequential envelope.
+        records.push(schedule(17, 9_000, false));
+        records.last_mut().unwrap().operation_id = OperationId::from_bytes([5; 16]);
+        for (sequence, monotonic_us, stage, elapsed_us) in [
+            (18_u64, 12_000_u64, TraceStage::RgbCapture, 2_000_u64),
+            (19, 14_000, TraceStage::IrCapture, 1_000),
+        ] {
+            let mut record = stage_record(sequence, monotonic_us, stage, elapsed_us);
+            record.operation_id = OperationId::from_bytes([5; 16]);
+            records.push(record);
+        }
+        let mut concurrent_finished = fixture_record(
+            20,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+            false,
+        );
+        concurrent_finished.monotonic_us = 15_000;
+        concurrent_finished.operation_id = OperationId::from_bytes([5; 16]);
+        records.push(concurrent_finished);
+        // A fallback operation: the concurrent attempt's captures precede
+        // the fallback marker, the sequential retry's follow it - only the
+        // retry joins the envelope.
+        let fallback_op = |sequence: u64, event: TraceEventKind| {
+            let mut record = fixture_record(sequence, event, false);
+            record.operation_id = OperationId::from_bytes([3; 16]);
+            record
+        };
+        // The production fallback shape: a Concurrent schedule was selected
+        // first, its pair failed, and the retry after the marker runs
+        // sequentially.
+        let mut concurrent_selected = schedule(21, 200_000, false);
+        concurrent_selected.operation_id = OperationId::from_bytes([3; 16]);
+        records.push(concurrent_selected);
+        let (mut r, mut i) = (
+            fallback_op(
+                22,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 30_000,
+                },
+            ),
+            fallback_op(
+                23,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 25_000,
+                },
+            ),
+        );
+        r.monotonic_us = 230_000;
+        i.monotonic_us = 235_000;
+        records.push(r);
+        records.push(i);
+        let mut marker = fallback_op(
+            24,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::CaptureFallback {
+                    reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                },
+            },
+        );
+        marker.monotonic_us = 236_000;
+        records.push(marker);
+        let (mut r, mut i) = (
+            fallback_op(
+                25,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 20_000,
+                },
+            ),
+            fallback_op(
+                26,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 15_000,
+                },
+            ),
+        );
+        r.monotonic_us = 260_000;
+        i.monotonic_us = 280_000;
+        records.push(r);
+        records.push(i);
+        let mut fallback_finished = fallback_op(
+            27,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+        );
+        fallback_finished.monotonic_us = 285_000;
+        records.push(fallback_finished);
+        // An unknown-schedule operation: generic captures with no schedule
+        // or fallback marker (recording began after the marker).
+        let unknown_op = |sequence: u64, event: TraceEventKind| {
+            let mut record = fixture_record(sequence, event, false);
+            record.operation_id = OperationId::from_bytes([1; 16]);
+            record
+        };
+        let (mut r, mut i) = (
+            unknown_op(
+                28,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 40_000,
+                },
+            ),
+            unknown_op(
+                29,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 30_000,
+                },
+            ),
+        );
+        r.monotonic_us = 340_000;
+        i.monotonic_us = 380_000;
+        records.push(r);
+        records.push(i);
+        let mut unknown_finished = unknown_op(
+            30,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+        );
+        unknown_finished.monotonic_us = 385_000;
+        records.push(unknown_finished);
+        records.push(control(
+            31,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            570_000,
+            true,
+        ));
+        let dir = sandbox("analyze-v5");
+        let path = dir.join("trace.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        let rendered = analyze(&path).unwrap();
+        // The work operation's span runs from the earliest reconstructed
+        // interval start (2_000) to its OperationFinished (568_000).
+        assert!(rendered.contains("span_us=566000"), "{rendered}");
+        // The EngineAuthenticate end-to-end interval merges everything into
+        // one block [2_000, 565_000]; the nested GroupedEvaluation still
+        // counts once inside it.
+        assert!(rendered.contains("stage_union_us=563000"), "{rendered}");
+        assert!(rendered.contains("residual_us=3000"), "{rendered}");
+        // The sequential envelope: the Sequential* intervals plus the plain
+        // RgbCapture/IrCapture the sequential schedule covers, never the
+        // end-to-end block that contains them.
+        assert!(
+            rendered.contains("sequential_union_us=263000"),
+            "{rendered}"
+        );
+        // The concurrent-schedule operation's captures stay excluded.
+        assert!(rendered.contains("sequential_union_us=0"), "{rendered}");
+        // The fallback operation's envelope covers only the retry after the
+        // fallback marker (20_000 + 15_000), not the discarded concurrent
+        // attempt before it (30_000 + 25_000).
+        assert!(rendered.contains("sequential_union_us=35000"), "{rendered}");
+        assert!(
+            !rendered.contains("sequential_union_us=55000"),
+            "{rendered}"
+        );
+        // The unknown-schedule operation reports an unavailable projection,
+        // not a zero that would read as a concurrent pair.
+        assert!(
+            rendered.contains("sequential_union_us=unavailable"),
+            "{rendered}"
+        );
+        // The control group records no stages and is never refused.
+        assert!(rendered.contains("no stage timings"), "{rendered}");
+        assert!(!rendered.contains("cut off"), "{rendered}");
+        // Finalization pairing names the evaluation it contains.
+        assert!(
+            rendered.contains("finalization_us=30000 contains=GroupedEvaluation"),
+            "{rendered}"
+        );
+        // Edge gaps are listed and attributed: the leading edge names the
+        // block's start stage, and the trailing edge names the stage whose
+        // end forms the block boundary (EngineAuthenticate, not the last
+        // sequential stage appended inside it).
+        // The concurrent operation's leading edge (schedule record at 9_000
+        // before its first capture interval at 10_000) is listed too.
+        assert!(
+            rendered.contains("gap_us=1000 after operation-start before RgbCapture"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("gap_us=3000 after EngineAuthenticate before operation-end"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn analyze_derives_partial_operation_spans_from_reconstructed_starts() {
+        use irlume_common::diagnostics::TraceStage;
+        // Recording began mid-operation: the first record is a stage whose
+        // interval started before it. The span must start at the
+        // reconstructed start so the union never exceeds the span.
+        let mut records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 50_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 10_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 115_000, 118_000, 120_000];
+        for (record, time) in records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        // The stream's terminal record belongs to the trace's control
+        // group, not this operation.
+        records.last_mut().unwrap().operation_id =
+            irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
+        let dir = sandbox("analyze-partial");
+        let path = dir.join("trace.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let rendered = analyze(&path).unwrap();
+        // Span from the reconstructed CameraOpen start (50_000) to the
+        // operation's completion (118_000); the stream terminal belongs to
+        // the control group. Union 60_000; both gaps listed.
+        assert!(rendered.contains("span_us=68000"), "{rendered}");
+        assert!(rendered.contains("stage_union_us=60000"), "{rendered}");
+        assert!(rendered.contains("residual_us=8000"), "{rendered}");
+        assert!(
+            rendered.contains("gap_us=5000 after CameraOpen before Finalization"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("gap_us=3000 after Finalization before operation-end"),
+            "{rendered}"
+        );
+        // A capture route ran (Finalization) without schedule evidence or
+        // capture records: the sequential envelope is unavailable, not 0.
+        assert!(
+            rendered.contains("sequential_union_us=unavailable"),
+            "{rendered}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn analyze_refuses_dropped_events_and_older_schemas() {
+        use irlume_common::diagnostics::{TraceStage, V4_TRACE_SCHEMA_VERSION};
+        // A legacy-schema trace whose stages all predate the sequential
+        // vocabulary parses cleanly, but the envelope projection refuses it:
+        // a zero sequential envelope would read as "no sequential capture".
+        let mut records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        for record in &mut records {
+            record.trace_schema = V4_TRACE_SCHEMA_VERSION;
+        }
+        // Every sub-fixture's stream terminal record belongs to the
+        // trace's control group, matching production traces.
+        let write = |path: &Path, records: &mut Vec<TraceRecord>| {
+            records.last_mut().unwrap().operation_id =
+                irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
+            let mut bytes = Vec::new();
+            for record in records.iter() {
+                serde_json::to_writer(&mut bytes, record).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
+        let dir = sandbox("analyze-refusals");
+        let older = dir.join("older.jsonl");
+        let mut bytes = Vec::new();
+        for record in &records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&older, bytes).unwrap();
+        let error = analyze(&older).unwrap_err();
+        assert!(error.contains("requires schema"), "{error}");
+
+        // Dropped events make every decomposition incomplete: refuse rather
+        // than render authoritative-looking numbers.
+        let dropped = dir.join("dropped.jsonl");
+        let mut dropped_records = vec![fixture_record(
+            0,
+            TraceEventKind::EventsDropped { count: 3 },
+            false,
+        )];
+        dropped_records.push(fixture_record(
+            1,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::CameraOpen,
+                elapsed_us: 1_000,
+            },
+            false,
+        ));
+        dropped_records.push(fixture_record(
+            2,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        write(&dropped, &mut dropped_records);
+        let error = analyze(&dropped).unwrap_err();
+        assert!(error.contains("dropped 3 events"), "{error}");
+
+        // Saturating accumulation: a maximal count followed by one more
+        // marker must still refuse rather than wrap back under the
+        // threshold in release builds.
+        let wrapping = dir.join("wrapping.jsonl");
+        let mut wrapping_records = vec![
+            fixture_record(0, TraceEventKind::EventsDropped { count: u64::MAX }, false),
+            fixture_record(1, TraceEventKind::EventsDropped { count: 1 }, false),
+        ];
+        wrapping_records.push(fixture_record(
+            2,
+            TraceEventKind::StageTiming {
+                stage: TraceStage::CameraOpen,
+                elapsed_us: 1_000,
+            },
+            false,
+        ));
+        wrapping_records.push(fixture_record(
+            3,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        write(&wrapping, &mut wrapping_records);
+        assert!(analyze(&wrapping).is_err(), "saturated sum must refuse");
+
+        // At most one Finalization per operation: a second is structurally
+        // impossible and the pairing stays linear, so the operation is
+        // refused instead of rescanned.
+        let doubled = dir.join("doubled.jsonl");
+        let mut doubled_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                4,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        write(&doubled, &mut doubled_records);
+        let rendered = analyze(&doubled).unwrap();
+        assert!(
+            rendered.contains("REFUSED: 2 Finalization records"),
+            "{rendered}"
+        );
+
+        // A trace whose deadline expired mid-operation: the stream terminal
+        // record is present, but the operation never finished, so its
+        // envelope numbers must be refused rather than rendered.
+        let cutoff = dir.join("cutoff.jsonl");
+        let mut cutoff_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::SequentialRgbSample,
+                    elapsed_us: 5_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        write(&cutoff, &mut cutoff_records);
+        let rendered = analyze(&cutoff).unwrap();
+        assert!(
+            rendered.contains("REFUSED: operation cut off before completion"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("sequential_union_us"), "{rendered}");
+
+        // Contiguous sequences with decreasing timestamps inside one
+        // operation: the interval reconstruction must refuse rather than
+        // render a union exceeding the span with a zeroed residual.
+        let backwards = dir.join("backwards.jsonl");
+        let mut backwards_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+        ];
+        let times = [200_000_u64, 100_000, 100_000];
+        for (record, time) in backwards_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        backwards_records.push(fixture_record(
+            3,
+            TraceEventKind::Finished {
+                outcome: CategoricalOutcome::Completed,
+            },
+            true,
+        ));
+        backwards_records.last_mut().unwrap().monotonic_us = 100_000;
+        write(&backwards, &mut backwards_records);
+        let error = analyze(&backwards).unwrap_err();
+        assert!(error.contains("not monotonic"), "{error}");
+
+        // A capture route that ran entirely before the subscription: no
+        // schedule marker and no capture record, but CaptureSetup and
+        // Finalization say a capture route ran and went unobserved - the
+        // envelope is unavailable, not a confident zero.
+        let pre_sub = dir.join("pre-subscription.jsonl");
+        let pre_sub_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup,
+                    elapsed_us: 4_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::Finalization,
+                    elapsed_us: 10_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 110_000, 120_000, 120_000];
+        let mut pre_sub_records = pre_sub_records;
+        for (record, time) in pre_sub_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&pre_sub, &mut pre_sub_records);
+        let rendered = analyze(&pre_sub).unwrap();
+        assert!(
+            rendered.contains(
+                "sequential_union_us=unavailable (schedule or capture evidence predates recording)"
+            ),
+            "{rendered}"
+        );
+
+        // One operation id reused across operation classes: the ids name
+        // different logical operations and must not be merged.
+        let reused = dir.join("reused-id.jsonl");
+        let mut reused_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        reused_records[1].operation = irlume_common::diagnostics::OperationClass::Status;
+        let times = [100_000_u64, 110_000, 120_000];
+        for (record, time) in reused_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&reused, &mut reused_records);
+        let error = analyze(&reused).unwrap_err();
+        assert!(
+            error.contains("spans multiple operation classes"),
+            "{error}"
+        );
+
+        // Same-class id reuse, and stages appended after a completion: the
+        // earlier completion must not license one merged span.
+        let trailing = dir.join("trailing.jsonl");
+        let mut trailing_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 2_000,
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 105_000, 110_000, 120_000];
+        for (record, time) in trailing_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&trailing, &mut trailing_records);
+        let error = analyze(&trailing).unwrap_err();
+        assert!(error.contains("records after its completion"), "{error}");
+
+        let twice = dir.join("twice-finished.jsonl");
+        let mut twice_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 105_000, 105_000, 120_000];
+        for (record, time) in twice_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&twice, &mut twice_records);
+        let error = analyze(&twice).unwrap_err();
+        assert!(error.contains("2 completion events"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reads a schema-5 trace that exercises every sequential capture phase
+    /// and the grouped evaluation, and refuses the same stages in a file
+    /// labeled with an older schema.
     #[test]
     fn explain_reads_schema_5_sequential_capture_stages_and_refuses_them_below() {
         use irlume_common::diagnostics::{TraceStage, V4_TRACE_SCHEMA_VERSION};

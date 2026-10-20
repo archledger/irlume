@@ -517,6 +517,30 @@ impl IdentityThresholds {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_ir_only_route_announces_its_sequential_schedule() {
+        // The IR-only experimental route is sequential by construction and
+        // reports IrCapture; without its own schedule marker the envelope
+        // analysis reads the capture as an unattributable half-pair and
+        // renders the sequential projection unavailable (#1147).
+        let src = include_str!("ir_assessment.rs");
+        let attempt = src
+            .split("fn authenticate_ir_target_attempt")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            attempt.contains("CaptureScheduleSelected"),
+            "the IR-only attempt announces its schedule"
+        );
+        assert!(
+            attempt.contains("CaptureSchedule::Sequential"),
+            "the IR-only route is sequential by construction"
+        );
+    }
     /// ADR-0030 §5: the typed IR failure keeps its cause through the
     /// coarse outcome kind.
     #[test]
@@ -2762,6 +2786,17 @@ impl Engine {
         operation: &lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
+        // The IR-only route captures one side by construction, so its
+        // schedule evidence is Sequential by default: without the marker, a
+        // schedule-aware reader cannot tell this dedicated route's
+        // IrCapture from a concurrent pair's half and renders the envelope
+        // unavailable (#1147 review round 13).
+        diagnostics.emit_share_safe(
+            irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
+                schedule: irlume_common::diagnostics::CaptureSchedule::Sequential,
+                source: irlume_common::diagnostics::CaptureScheduleSource::SequentialDefault,
+            },
+        );
         let control = self.capture_control();
         let deadline = self.authentication_deadline;
         let adapter = self.has_ir_adapter();

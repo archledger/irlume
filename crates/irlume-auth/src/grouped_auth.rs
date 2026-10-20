@@ -701,6 +701,14 @@ impl Engine {
         if frames.is_ok() {
             self.arm_finalization();
         }
+        // The whole sequential RGB batch is the capture: reported at its
+        // endpoint whether or not it succeeded, so the sequential envelope
+        // covers this no-IR route's production batch (#1147).
+        emit_trace_stage_ms(
+            diagnostics,
+            irlume_common::diagnostics::TraceStage::SequentialRgbSample,
+            started.elapsed().as_millis(),
+        );
         let frames = frames?;
         irlume_common::dlog!(
             "[assessment-stage] grouped-rgb-capture: samples={} elapsed={}ms",

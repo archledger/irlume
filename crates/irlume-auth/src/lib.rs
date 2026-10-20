@@ -3068,6 +3068,19 @@ fn emit_capture_schedule(
     diagnostics.emit_share_safe(ShareSafeEventKind::CaptureScheduleSelected { schedule, source });
 }
 
+/// Re-announce the unchanged schedule at each grace-window attempt: the
+/// attempt loop runs several captures under one selection, and offline
+/// segment classification needs a marker per attempt so a self-heal
+/// fallback's boundary ends at the next attempt rather than at the
+/// operation's end (#1147).
+fn emit_attempt_schedule(
+    selection: &CaptureModeSelection,
+    ir_available: bool,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) {
+    emit_capture_schedule(selection, ir_available, diagnostics);
+}
+
 fn diagnostic_capture_schedule(
     selection: &CaptureModeSelection,
     ir_available: bool,
@@ -4912,6 +4925,13 @@ impl Engine {
         )
         .map_err(lease_unavailable)?;
         self.emit_capture_setup(diagnostics);
+        // Announce the selection this one-shot path resolved without the
+        // sink: identify's trace carries rgb_capture/ir_capture stages, and
+        // without the marker a schedule-aware reader cannot tell a
+        // sequential pair from a concurrent one (found on the #856 BRIO
+        // acceptance trace). Every other capture route emits the same
+        // context after its selection.
+        emit_capture_context(&selection, self.ir_available, diagnostics);
         operation
             .run(|| {
                 if self.ir_available {
@@ -5194,10 +5214,23 @@ impl Engine {
     ) -> irlume_common::Result<Assessment> {
         self.check_request_active()?;
         let capture_started = std::time::Instant::now();
-        let rgb = irlume_camera::capture_rgb_denoised_with_control(
+        let rgb = match irlume_camera::capture_rgb_denoised_with_control(
             &self.rgb_dev,
             &self.capture_control(),
-        )?;
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                // A failed capture still spent its wall time; the timing is
+                // emitted before the error propagates (#1147 review
+                // round 18).
+                diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                    stage: irlume_common::diagnostics::TraceStage::RgbCapture,
+                    elapsed_us: u64::try_from(capture_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                });
+                return Err(error);
+            }
+        };
         if let Some(event) = irlume_camera::diagnostic_stream_evidence(&rgb) {
             diagnostics.emit_trace(event);
         }
@@ -5667,7 +5700,6 @@ impl Engine {
         // Sequential roles report their timing as each finishes, so a trace
         // consumer reconstructing the capture span adds them instead of
         // overlapping two stages that were emitted together at the end.
-        let mut rgb_timing_emitted = false;
         let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms) = if let Some((rgb_s, ir_s)) = held {
             if sequential {
                 // Held sessions exist only on the concurrent schedule
@@ -5686,7 +5718,15 @@ impl Engine {
                 |session| {
                     let t = std::time::Instant::now();
                     let capture = held_rgb_capture(session);
-                    rgb_ms = t.elapsed().as_millis();
+                    let elapsed = t.elapsed().as_millis();
+                    // Held or fresh, every capture side reports at its own
+                    // endpoint, whether or not it succeeded (#1147).
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        elapsed,
+                    );
+                    rgb_ms = elapsed;
                     capture
                 },
                 |session| {
@@ -5699,7 +5739,13 @@ impl Engine {
                             "IR capture thread panicked".into(),
                         ))
                     });
-                    ir_ms = t.elapsed().as_millis();
+                    let elapsed = t.elapsed().as_millis();
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::IrCapture,
+                        elapsed,
+                    );
+                    ir_ms = elapsed;
                     capture
                 },
             );
@@ -5708,14 +5754,13 @@ impl Engine {
             let t = std::time::Instant::now();
             let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
             let rgb_ms = t.elapsed().as_millis();
-            if rgb.is_ok() {
-                emit_trace_stage_ms(
-                    diagnostics,
-                    irlume_common::diagnostics::TraceStage::RgbCapture,
-                    rgb_ms,
-                );
-                rgb_timing_emitted = true;
-            }
+            // A failed capture still spent its wall time: report at its
+            // endpoint whether or not it succeeded (#1147).
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
             // Match the old short-circuit: don't fire the IR emitter after an
             // RGB fault (privacy switch, missing node); the shared retry below
             // surfaces the RGB error.
@@ -5727,7 +5772,13 @@ impl Engine {
                     &self.ir_dev,
                     &control,
                 );
-                (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
+                let ir_ms = t.elapsed().as_millis();
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    ir_ms,
+                );
+                (rgb, rgb_ms, ir.map(Some), ir_ms)
             }
         } else {
             std::thread::scope(|s| {
@@ -5738,11 +5789,34 @@ impl Engine {
                     let captured = Self::run_camera_operation(operation, || {
                         irlume_camera::capture_ir_with_stats_and_control(&ir_dev, &ir_control)
                     });
-                    (captured, t.elapsed().as_millis())
+                    let elapsed = t.elapsed().as_millis();
+                    // Emitted inside the capture thread, at the IR side's
+                    // own endpoint: join() returns only when the main
+                    // thread reaches it, so an emission after the join
+                    // would timestamp IR at the later RGB endpoint whenever
+                    // IR finished first (#1147 review round 14).
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::IrCapture,
+                        elapsed,
+                    );
+                    (captured, elapsed)
                 });
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
+                // Each side reports at its own endpoint: RGB here, on the
+                // main thread, the moment its capture ends - even while the
+                // IR thread is still running - and IR below, where the join
+                // returns at the IR capture's end. Batching both after the
+                // join gave the earlier side the later side's endpoint,
+                // inflating the intervals' overlap in offline analysis
+                // (#1147 review round 10).
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    rgb_ms,
+                );
                 let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                     (
                         Err(irlume_common::Error::Hardware(
@@ -5754,6 +5828,12 @@ impl Engine {
                 (rgb, rgb_ms, ir.map(Some), ir_ms)
             })
         };
+        // The deadline check follows the captures: a capture that crossed
+        // the authentication deadline still spent its wall time, and the
+        // operation can complete later with OperationFinished - a missing
+        // record there would leave the offline envelope silently omitting
+        // the capture (#1147 review round 8). The emissions above precede
+        // it at each capture's own endpoint.
         self.check_request_active()?;
         for error in [rgb_res.as_ref().err(), ir_res.as_ref().err()]
             .into_iter()
@@ -5773,18 +5853,6 @@ impl Engine {
                 .into());
             }
         }
-        if !rgb_timing_emitted {
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RgbCapture,
-                rgb_ms,
-            );
-        }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::IrCapture,
-            ir_ms,
-        );
         let observed_runtime_violation =
             match (&rgb_res, &ir_res, capture_mode.runtime_contract.as_ref()) {
                 (Ok(rgb), Ok(Some((ir, _))), Some(contract)) => {
@@ -5876,18 +5944,61 @@ impl Engine {
             );
             let (fresh_rgb, fresh_ir) = capture_pair_sequentially(
                 || {
+                    // Reported at the stage's real end boundary: interval
+                    // reconstruction offline subtracts elapsed_us from this
+                    // record's timestamp, so a deferred report after the IR
+                    // side would place the RGB stage beside the IR one.
                     let started = std::time::Instant::now();
-                    let frame =
-                        irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
-                    Ok((frame, started.elapsed().as_millis()))
+                    match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)
+                    {
+                        Ok(frame) => {
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                elapsed,
+                            );
+                            Ok((frame, elapsed))
+                        }
+                        Err(error) => {
+                            // A failed capture still spent its wall time, and
+                            // the stage is reported when it ends whether or
+                            // not it succeeded.
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                elapsed,
+                            );
+                            Err(error)
+                        }
+                    }
                 },
                 || {
                     let started = std::time::Instant::now();
-                    let frame = irlume_camera::capture_ir_sequential_with_stats_and_control(
+                    match irlume_camera::capture_ir_sequential_with_stats_and_control(
                         &self.ir_dev,
                         &control,
-                    )?;
-                    Ok((frame, started.elapsed().as_millis()))
+                    ) {
+                        Ok(frame) => {
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::IrCapture,
+                                elapsed,
+                            );
+                            Ok((frame, elapsed))
+                        }
+                        Err(error) => {
+                            let elapsed = started.elapsed().as_millis();
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::IrCapture,
+                                elapsed,
+                            );
+                            Err(error)
+                        }
+                    }
                 },
             );
             match fresh_rgb {
@@ -5916,18 +6027,10 @@ impl Engine {
             }
             pair_sequential_retried = true;
         }
-        if pair_sequential_retried {
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RgbCapture,
-                rgb_ms,
-            );
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::IrCapture,
-                ir_ms,
-            );
-        }
+        // The retried pair's RgbCapture and IrCapture timings were emitted
+        // inside their closures at each stage's real end boundary above; a
+        // batched report here would timestamp the RGB stage beside the IR
+        // one and misplace its reconstructed interval.
         // Proactive degradation (#586): a concurrent capture that SUCCEEDED
         // but carried provenance warning signs (sequence gaps, timestamp
         // discontinuity) is the leading indicator the next one will fail
@@ -5981,10 +6084,23 @@ impl Engine {
                 rgb_hard_retried = true;
                 // The retry is the capture that produced the assessed frame:
                 // it reports its own timing, and the detection line below
-                // carries it.
+                // carries it. A failed retry still spent its wall time, and
+                // the stage is reported when it ends whether or not it
+                // succeeded.
                 let t = std::time::Instant::now();
                 let frame =
-                    irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+                    match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)
+                    {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                t.elapsed().as_millis(),
+                            );
+                            return Err(error.into());
+                        }
+                    };
                 rgb_ms = t.elapsed().as_millis();
                 emit_trace_stage_ms(
                     diagnostics,
@@ -6003,13 +6119,15 @@ impl Engine {
         let timed_ir_capture = |diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink| {
             let t = std::time::Instant::now();
             let captured = irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control);
-            if captured.is_ok() {
-                emit_trace_stage_ms(
-                    diagnostics,
-                    irlume_common::diagnostics::TraceStage::IrCapture,
-                    t.elapsed().as_millis(),
-                );
-            }
+            // Reported when it ends whether or not it succeeded: a failed
+            // capture still spent its wall time, and the caller's `?`
+            // returns only after this emission.
+            let elapsed_ms = t.elapsed().as_millis();
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::IrCapture,
+                elapsed_ms,
+            );
             captured
         };
         let (ir, ir_stats) = match ir_res {
@@ -6174,7 +6292,37 @@ impl Engine {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
-            rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+            // The standalone recapture is sequential work inside a
+            // concurrent-schedule operation: a fallback marker after the
+            // pair lets offline analysis attribute this RgbCapture to the
+            // sequential envelope without folding the earlier concurrent
+            // pair into it (#1147). The concurrent pair produced no usable
+            // RGB face, which is the generic concurrent-capture failure.
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                    reason:
+                        irlume_common::diagnostics::RuntimeViolationLabel::ConcurrentCaptureFailure,
+                },
+            );
+            let heal_started = std::time::Instant::now();
+            // A failed recapture still spent its wall time; the timing is
+            // emitted before the error propagates (#1147 review round 15).
+            rgb = match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        heal_started.elapsed().as_millis(),
+                    );
+                    return Err(error.into());
+                }
+            };
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                heal_started.elapsed().as_millis(),
+            );
             rgb_faces = self.det.detect(&align::RgbView {
                 data: &rgb.data,
                 width: rgb.width,
@@ -6187,6 +6335,18 @@ impl Engine {
                 rgb.height,
                 rgb_faces.len(),
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+            );
+            // Close the self-heal fallback's window after its one
+            // recapture: the capture mode was never demoted, so the next
+            // scan or attempt is concurrent again. Without this closing
+            // marker, every later capture in the same segment would ride
+            // the fallback boundary into the sequential envelope
+            // (#1147 review round 18).
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
+                    schedule: irlume_common::diagnostics::CaptureSchedule::Concurrent,
+                    source: irlume_common::diagnostics::CaptureScheduleSource::RuntimeHealth,
+                },
             );
         }
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {
@@ -7216,6 +7376,7 @@ impl Engine {
             (None, resolved_cams)
         };
         let held_cams = cameras_for_held_pair(sequential, resolved_cams);
+        let ir_available = self.ir_available;
         if let Some(cameras) = grouped_cams {
             let mut costliest_attempt = std::time::Duration::ZERO;
             return self
@@ -7224,6 +7385,7 @@ impl Engine {
                     window,
                     &mut costliest_attempt,
                     |engine| {
+                        emit_attempt_schedule(&capture_mode, ir_available, diagnostics);
                         (
                             Self::run_camera_operation(&camera_operation, || {
                                 engine.authenticate_grouped_once(
@@ -7271,6 +7433,7 @@ impl Engine {
                         window,
                         &mut costliest_attempt,
                         |engine| {
+                            emit_attempt_schedule(&capture_mode, ir_available, diagnostics);
                             (
                                 Self::run_camera_operation(&camera_operation, || {
                                     engine.authenticate_grouped_rgb_only_once(
@@ -7396,6 +7559,7 @@ impl Engine {
             window,
             costliest_attempt,
             |engine| {
+                emit_attempt_schedule(capture_mode, engine.ir_available, diagnostics);
                 let mut held_pair_failed = false;
                 let mut deferred = None;
                 let result = Self::run_camera_operation(camera_operation, || {
@@ -17876,5 +18040,165 @@ mod engine_tests {
             }
             other => panic!("a panicked loader must fail closed: {other:?}"),
         }
+    }
+    #[test]
+    fn assess_prepared_announces_the_capture_schedule_it_runs() {
+        // The identify one-shot path selects a capture mode without the
+        // diagnostics sink, so its trace carried rgb_capture/ir_capture
+        // stages with no capture_schedule_selected marker - and the
+        // schedule-aware sequential envelope read 0 for a sequential pair
+        // (found on the #856 BRIO acceptance trace). Every other capture
+        // route announces its selection through emit_capture_context.
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("fn assess_prepared(")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("emit_capture_context("),
+            "assess_prepared must announce its capture-mode selection"
+        );
+    }
+
+    #[test]
+    fn failed_capture_retries_report_their_timing() {
+        // A failed single-side hard retry must still emit its stage timing:
+        // the operation completes through other paths, and a missing record
+        // misattributes the retry's wall time to residual gaps in the
+        // offline envelope (#1147 review round 7). Both the RGB retry's
+        // error arm and the IR capture helper report before returning.
+        let src = include_str!("lib.rs");
+        let retry = src
+            .split("rgb_hard_retried = true;")
+            .nth(1)
+            .unwrap()
+            .split("rgb_hard_retried,")
+            .next()
+            .unwrap();
+        let before_return = retry.split("return Err(error.into());").next().unwrap();
+        assert!(
+            before_return.contains("emit_trace_stage_ms"),
+            "the RGB retry must emit its timing before its error return"
+        );
+        let helper = src
+            .split("let timed_ir_capture =")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        assert!(
+            !helper.contains("is_ok"),
+            "the IR capture helper must report whether or not it succeeded"
+        );
+        assert!(
+            helper.contains("emit_trace_stage_ms"),
+            "the IR capture helper must emit its stage timing"
+        );
+    }
+
+    #[test]
+    fn deadline_crossing_captures_report_before_the_deadline_check() {
+        // A capture that crossed the authentication deadline still spent
+        // its wall time and its stage has ended, so the timing is emitted
+        // BEFORE check_request_active: the operation can complete later
+        // with OperationFinished, and a missing record would leave the
+        // offline envelope silently omitting the capture (#1147 review
+        // round 8). Mutually verified: mutating the emission order out
+        // fails this pin.
+        let src = include_str!("lib.rs");
+        // RGB reports between its own capture and the IR join; IR reports
+        // between the join (its endpoint) and the deadline check. Both
+        // precede check_request_active, and neither waits for the other
+        // side's endpoint.
+        let scope_region = src
+            .split("let ir_thread = s.spawn(move || {")
+            .nth(1)
+            .unwrap()
+            .split("std::thread::scope")
+            .next()
+            .unwrap()
+            .split("check_request_active")
+            .next()
+            .unwrap();
+        // The IR closure's body contains an inner closure whose "});"
+        // comes first; the outer closure ends at the tuple return, so
+        // anchor past the inner call.
+        let ir_closure = scope_region
+            .split("run_camera_operation(operation, || {")
+            .nth(1)
+            .unwrap()
+            .split("});")
+            .nth(1)
+            .unwrap();
+        let after_closure = scope_region.split("(captured, elapsed)").nth(1).unwrap();
+        assert!(
+            ir_closure.contains("emit_trace_stage_ms"),
+            "IR must report inside its capture thread, at its own endpoint"
+        );
+        assert!(
+            !after_closure
+                .split("check_request_active")
+                .next()
+                .unwrap()
+                .contains("TraceStage::IrCapture"),
+            "no IR emission may wait for the join, which returns at the later side's endpoint"
+        );
+        let rgb_between = after_closure
+            .split("let (ir, ir_ms) = ir_thread.join()")
+            .next()
+            .unwrap();
+        assert!(
+            rgb_between.contains("emit_trace_stage_ms"),
+            "RGB must report at its own endpoint, before the IR join"
+        );
+    }
+
+    #[test]
+    fn every_capture_branch_emits_both_sides() {
+        // The capture-path dispatch has three branches - held sessions,
+        // ordinary sequential, and concurrent - and each side of each
+        // branch reports its own StageTiming at its own endpoint, on
+        // success or failure (#1147 review round 11: the held branch and
+        // the sequential IR side once emitted nothing at all).
+        let src = include_str!("lib.rs");
+        let dispatch = src
+            .split("if let Some((rgb_s, ir_s)) = held")
+            .nth(1)
+            .unwrap()
+            .split("check_request_active")
+            .next()
+            .unwrap();
+        let held_arm = dispatch.split("} else if sequential {").next().unwrap();
+        assert_eq!(
+            held_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the held branch reports RGB and IR at their endpoints"
+        );
+        let sequential_arm = dispatch
+            .split("} else if sequential {")
+            .nth(1)
+            .unwrap()
+            .split("std::thread::scope")
+            .next()
+            .unwrap();
+        assert!(
+            !sequential_arm.contains("if rgb.is_ok()"),
+            "the sequential RGB report is not success-gated"
+        );
+        assert_eq!(
+            sequential_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the sequential branch reports RGB and IR at their endpoints"
+        );
+        let concurrent_arm = dispatch.split("std::thread::scope").nth(1).unwrap();
+        assert_eq!(
+            concurrent_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the concurrent branch reports RGB and IR at their endpoints"
+        );
     }
 }

@@ -7,6 +7,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume trace analyze FILE.jsonl [--output FILE.txt]` renders a trace's
+  timing envelope per operation for the sequential capture path (#856): the
+  interval union of every stage (a nested stage such as GroupedEvaluation
+  inside Finalization never double counts), the operation span with the
+  residual attributed to gaps named by their bordering stages, the
+  sequential-capture envelope, and each Finalization paired with the stages
+  it contains.
+
 - A hardware evidence run for the ThinkPad T480's built-in emitter table
   entry (#887, ADR-0031 section 4):
   `scripts/hardware/emitter-capture-evidence-test.sh` records, during one

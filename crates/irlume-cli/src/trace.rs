@@ -634,53 +634,38 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         // - generic captures with NO schedule or fallback evidence mean
         //   recording began after the marker: the schedule is unknown, not
         //   concurrent, so the projection is unavailable rather than zero.
-        enum GenericCaptureClass {
-            All,
-            AfterFallback(u64),
-            Excluded,
-            Unknown,
-        }
+        // Classification walks the operation's segments: each
+        // CaptureScheduleSelected starts a fresh segment, so a fallback's
+        // sequential retry never swallows a later attempt that re-selected
+        // the concurrent schedule (a grace-window retry after a self-heal
+        // recapture is concurrent again, because the capture mode is not
+        // demoted). Within a segment, a fallback boundary still includes
+        // the retry that follows it.
         let mut generic_class = GenericCaptureClass::Unknown;
-        let mut first_fallback: Option<u64> = None;
+        let mut segment_schedule: Option<CaptureSchedule> = None;
+        let mut segment_fallback: Option<u64> = None;
         for record in &operation_records {
             match record.event {
                 TraceEventKind::Shared {
-                    transition:
-                        ShareSafeEventKind::CaptureScheduleSelected {
-                            schedule: CaptureSchedule::Sequential,
-                            ..
-                        },
-                } => generic_class = GenericCaptureClass::All,
-                TraceEventKind::Shared {
-                    transition:
-                        ShareSafeEventKind::CaptureScheduleSelected {
-                            schedule: CaptureSchedule::Concurrent,
-                            ..
-                        },
+                    transition: ShareSafeEventKind::CaptureScheduleSelected { schedule, .. },
                 } => {
-                    if !matches!(generic_class, GenericCaptureClass::All) {
-                        generic_class = GenericCaptureClass::Excluded;
-                    }
+                    // Close the finished segment.
+                    generic_class =
+                        classify_segment(generic_class, segment_schedule, segment_fallback);
+                    segment_schedule = Some(schedule);
+                    segment_fallback = None;
                 }
                 TraceEventKind::Shared {
                     transition: ShareSafeEventKind::CaptureFallback { .. },
                 } => {
-                    if first_fallback.is_none() {
-                        first_fallback = Some(record.sequence);
+                    if segment_fallback.is_none() {
+                        segment_fallback = Some(record.sequence);
                     }
                 }
                 _ => {}
             }
         }
-        if let Some(fallback_sequence) = first_fallback {
-            // A fallback upgrades every schedule answer except an explicit
-            // Sequential one: a Concurrent operation that fell back retries
-            // sequentially after the marker, and an operation whose marker
-            // predates recording is unknown rather than concurrent.
-            if !matches!(generic_class, GenericCaptureClass::All) {
-                generic_class = GenericCaptureClass::AfterFallback(fallback_sequence);
-            }
-        }
+        generic_class = classify_segment(generic_class, segment_schedule, segment_fallback);
         let has_generic_captures = operation_records.iter().any(|record| {
             matches!(
                 record.event,
@@ -804,6 +789,48 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         }
     }
     output
+}
+
+/// How generic RgbCapture/IrCapture intervals join the sequential envelope.
+enum GenericCaptureClass {
+    All,
+    AfterFallback(u64),
+    Excluded,
+    Unknown,
+}
+
+/// Fold one schedule segment's evidence into the running classification.
+/// Each `CaptureScheduleSelected` starts a segment; its fallback marker
+/// (if any) marks sequential work after that boundary within it.
+fn classify_segment(
+    current: GenericCaptureClass,
+    schedule: Option<CaptureSchedule>,
+    fallback: Option<u64>,
+) -> GenericCaptureClass {
+    use GenericCaptureClass as G;
+    match schedule {
+        Some(CaptureSchedule::Sequential) => G::All,
+        Some(CaptureSchedule::Concurrent) => match fallback {
+            Some(boundary) => G::AfterFallback(boundary),
+            None => {
+                if matches!(current, G::All) {
+                    G::All
+                } else {
+                    G::Excluded
+                }
+            }
+        },
+        None => match fallback {
+            Some(boundary) => {
+                if matches!(current, G::Unknown) {
+                    G::AfterFallback(boundary)
+                } else {
+                    current
+                }
+            }
+            None => current,
+        },
+    }
 }
 
 fn sequential_intervals(

@@ -6279,7 +6279,19 @@ impl Engine {
                 },
             );
             let heal_started = std::time::Instant::now();
-            rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+            // A failed recapture still spent its wall time; the timing is
+            // emitted before the error propagates (#1147 review round 15).
+            rgb = match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        heal_started.elapsed().as_millis(),
+                    );
+                    return Err(error.into());
+                }
+            };
             emit_trace_stage_ms(
                 diagnostics,
                 irlume_common::diagnostics::TraceStage::RgbCapture,

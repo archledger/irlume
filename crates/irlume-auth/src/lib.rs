@@ -6023,10 +6023,23 @@ impl Engine {
                 rgb_hard_retried = true;
                 // The retry is the capture that produced the assessed frame:
                 // it reports its own timing, and the detection line below
-                // carries it.
+                // carries it. A failed retry still spent its wall time, and
+                // the stage is reported when it ends whether or not it
+                // succeeded.
                 let t = std::time::Instant::now();
                 let frame =
-                    irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+                    match irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)
+                    {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            emit_trace_stage_ms(
+                                diagnostics,
+                                irlume_common::diagnostics::TraceStage::RgbCapture,
+                                t.elapsed().as_millis(),
+                            );
+                            return Err(error.into());
+                        }
+                    };
                 rgb_ms = t.elapsed().as_millis();
                 emit_trace_stage_ms(
                     diagnostics,
@@ -6045,13 +6058,15 @@ impl Engine {
         let timed_ir_capture = |diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink| {
             let t = std::time::Instant::now();
             let captured = irlume_camera::capture_ir_with_stats_and_control(&self.ir_dev, &control);
-            if captured.is_ok() {
-                emit_trace_stage_ms(
-                    diagnostics,
-                    irlume_common::diagnostics::TraceStage::IrCapture,
-                    t.elapsed().as_millis(),
-                );
-            }
+            // Reported when it ends whether or not it succeeded: a failed
+            // capture still spent its wall time, and the caller's `?`
+            // returns only after this emission.
+            let elapsed_ms = t.elapsed().as_millis();
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::IrCapture,
+                elapsed_ms,
+            );
             captured
         };
         let (ir, ir_stats) = match ir_res {
@@ -17938,6 +17953,43 @@ mod engine_tests {
         assert!(
             body.contains("emit_capture_context("),
             "assess_prepared must announce its capture-mode selection"
+        );
+    }
+
+    #[test]
+    fn failed_capture_retries_report_their_timing() {
+        // A failed single-side hard retry must still emit its stage timing:
+        // the operation completes through other paths, and a missing record
+        // misattributes the retry's wall time to residual gaps in the
+        // offline envelope (#1147 review round 7). Both the RGB retry's
+        // error arm and the IR capture helper report before returning.
+        let src = include_str!("lib.rs");
+        let retry = src
+            .split("rgb_hard_retried = true;")
+            .nth(1)
+            .unwrap()
+            .split("rgb_hard_retried,")
+            .next()
+            .unwrap();
+        let before_return = retry.split("return Err(error.into());").next().unwrap();
+        assert!(
+            before_return.contains("emit_trace_stage_ms"),
+            "the RGB retry must emit its timing before its error return"
+        );
+        let helper = src
+            .split("let timed_ir_capture =")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        assert!(
+            !helper.contains("is_ok"),
+            "the IR capture helper must report whether or not it succeeded"
+        );
+        assert!(
+            helper.contains("emit_trace_stage_ms"),
+            "the IR capture helper must emit its stage timing"
         );
     }
 }

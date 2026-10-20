@@ -88,6 +88,14 @@ contain exact liveness and match measurements, but never frames, crops,
 landmarks, embeddings, credentials, account/profile names, or raw emitter
 payloads.
 
+Diagnostic output files require private storage. Known unqualified network
+filesystems (including NFS and SMB/CIFS) are refused before data is written;
+mode bits alone do not establish private access on such mounts. The opened file
+must remain creator-owned with mode 0600. Choose a private local directory if
+storage is refused. Recording checks that destination before subscribing to the
+daemon. This does not change `support-report --json` on stdout (ADR-0008,
+amendment 2026-10-20).
+
 The recorder requests trace schema 5. A current daemon honors explicit schema
 1 through 5; a request without `trace_schema` retains schema 1 for older
 recorders. An older daemon ignores the optional request field and continues

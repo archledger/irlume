@@ -12,6 +12,7 @@ use irlume_common::diagnostics::{
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -64,35 +65,26 @@ fn run_record(args: &[String]) -> ExitCode {
 }
 
 fn record(output: &Path, duration: Duration) -> Result<PathBuf, String> {
-    let requested_ms = u64::try_from(duration.as_millis()).unwrap_or(MAX_TRACE_DURATION_MS);
-    let timeout = duration.saturating_add(Duration::from_secs(30));
-    let mut stream = irlume_common::client::connect_stream(timeout)
-        .map_err(|error| format!("connect: {error}"))?;
-    let mut request = serde_json::to_vec(&Request::TraceSubscribe {
-        duration_ms: requested_ms,
-        trace_schema: Some(CURRENT_TRACE_SCHEMA_VERSION),
-    })
-    .map_err(|error| format!("encode request: {error}"))?;
-    request.push(b'\n');
-    stream
-        .write_all(&request)
-        .and_then(|()| stream.flush())
-        .map_err(|error| format!("send request: {error}"))?;
-
-    let mut reader = BufReader::new(stream);
-    let header = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES)?
-        .ok_or_else(|| "daemon closed before accepting the trace".to_owned())?;
-    let limits = match serde_json::from_slice::<Response>(&header)
-        .map_err(|error| format!("invalid daemon response: {error}"))?
-    {
-        Response::TraceAccepted { limits } => limits,
-        Response::Error(message) => return Err(message),
-        other => return Err(format!("unexpected daemon response: {other:?}")),
-    };
-    let mut validator =
-        TraceValidator::new(limits).map_err(|error| format!("invalid daemon limits: {error}"))?;
-    let mut artifact = SecureArtifact::create(output, limits.max_bytes)
+    // Refuse unsafe storage before taking the daemon's singleton trace slot.
+    // The validator below also enforces any smaller daemon-applied byte limit.
+    let mut artifact = SecureArtifact::create(output, MAX_TRACE_BYTES)
         .map_err(|error| format!("{}: {error}", output.display()))?;
+    let (mut reader, mut validator) = match subscribe(duration) {
+        Ok(subscription) => subscription,
+        Err(message) => {
+            // Setup writes only to the socket, never to this opened partial.
+            // Keep data-bearing partials after acceptance recoverable as before.
+            if let Err(error) = std::fs::remove_file(artifact.partial_path()) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "{message}; failed to remove empty partial at {}: {error}",
+                        artifact.partial_path().display()
+                    ));
+                }
+            }
+            return Err(message);
+        }
+    };
 
     loop {
         let line = match read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES) {
@@ -138,6 +130,37 @@ fn record(output: &Path, duration: Duration) -> Result<PathBuf, String> {
             return Ok(published.final_path);
         }
     }
+}
+
+fn subscribe(duration: Duration) -> Result<(BufReader<UnixStream>, TraceValidator), String> {
+    let requested_ms = u64::try_from(duration.as_millis()).unwrap_or(MAX_TRACE_DURATION_MS);
+    let timeout = duration.saturating_add(Duration::from_secs(30));
+    let mut stream = irlume_common::client::connect_stream(timeout)
+        .map_err(|error| format!("connect: {error}"))?;
+    let mut request = serde_json::to_vec(&Request::TraceSubscribe {
+        duration_ms: requested_ms,
+        trace_schema: Some(CURRENT_TRACE_SCHEMA_VERSION),
+    })
+    .map_err(|error| format!("encode request: {error}"))?;
+    request.push(b'\n');
+    stream
+        .write_all(&request)
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("send request: {error}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let header = read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES)?
+        .ok_or_else(|| "daemon closed before accepting the trace".to_owned())?;
+    let limits = match serde_json::from_slice::<Response>(&header)
+        .map_err(|error| format!("invalid daemon response: {error}"))?
+    {
+        Response::TraceAccepted { limits } => limits,
+        Response::Error(message) => return Err(message),
+        other => return Err(format!("unexpected daemon response: {other:?}")),
+    };
+    let validator =
+        TraceValidator::new(limits).map_err(|error| format!("invalid daemon limits: {error}"))?;
+    Ok((reader, validator))
 }
 
 fn read_bounded_line<R: std::io::BufRead>(
@@ -1082,6 +1105,238 @@ mod tests {
     }
 
     #[test]
+    fn subscription_setup_connection_failure_leaves_no_empty_partial() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("setup-unavailable");
+        let target = dir.join("capture.jsonl");
+        let unrelated = dir.join("untouched.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", dir.join("absent.sock"));
+        let result = record(&target, Duration::from_millis(10));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        assert!(result.unwrap_err().contains("connect:"));
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn subscription_setup_response_failures_leave_no_empty_partials() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut invalid_limits = TraceLimits::bounded(10);
+        invalid_limits.max_bytes = 0;
+        let cases = [
+            (
+                "busy",
+                serde_json::to_vec(&Response::Error(
+                    "a diagnostic trace is already active".into(),
+                ))
+                .unwrap(),
+                "already active",
+            ),
+            (
+                "refused",
+                serde_json::to_vec(&Response::Error("trace record requires root".into())).unwrap(),
+                "requires root",
+            ),
+            ("closed", Vec::new(), "closed before accepting"),
+            (
+                "malformed",
+                b"{invalid}".to_vec(),
+                "invalid daemon response",
+            ),
+            (
+                "invalid-limits",
+                serde_json::to_vec(&Response::TraceAccepted {
+                    limits: invalid_limits,
+                })
+                .unwrap(),
+                "invalid daemon limits",
+            ),
+        ];
+        let mut leftovers = Vec::new();
+        for (label, mut reply, expected_error) in cases {
+            let dir = sandbox(label);
+            let socket = dir.join("daemon.sock");
+            let target = dir.join("capture.jsonl");
+            let unrelated = dir.join("untouched.txt");
+            std::fs::write(&unrelated, b"keep").unwrap();
+            if !reply.is_empty() {
+                reply.push(b'\n');
+            }
+            let listener = UnixListener::bind(&socket).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Request>(&request).unwrap(),
+                    Request::TraceSubscribe { .. }
+                ));
+                stream.write_all(&reply).unwrap();
+            });
+            let previous = std::env::var_os("IRLUME_SOCKET");
+            std::env::set_var("IRLUME_SOCKET", &socket);
+            let result = record(&target, Duration::from_millis(10));
+            match previous {
+                Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+                None => std::env::remove_var("IRLUME_SOCKET"),
+            }
+            server.join().unwrap();
+            assert!(result.unwrap_err().contains(expected_error), "{label}");
+            assert!(!target.exists(), "{label}");
+            assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+            let partials: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().contains(".partial."))
+                .collect();
+            if !partials.is_empty() {
+                leftovers.push((label, partials));
+            }
+        }
+        assert!(
+            leftovers.is_empty(),
+            "setup failures left partials: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn subscription_setup_cleanup_failure_reports_the_original_error_and_partial_path() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("setup-cleanup-error");
+        let socket = dir.join("daemon.sock");
+        let target = dir.join("capture.jsonl");
+        let fixture_dir = dir.clone();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let partial = std::fs::read_dir(&fixture_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".partial.")
+                })
+                .unwrap();
+            // A directory makes unlink fail independently of the test UID.
+            std::fs::rename(&partial, fixture_dir.join("original-empty-partial")).unwrap();
+            std::fs::create_dir(&partial).unwrap();
+            std::fs::write(partial.join("untouched.txt"), b"keep").unwrap();
+            serde_json::to_writer(&mut stream, &Response::Error("fixture refusal".into())).unwrap();
+            stream.write_all(b"\n").unwrap();
+            partial
+        });
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let result = record(&target, Duration::from_millis(10));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        let partial = server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("fixture refusal"));
+        assert!(error.contains("failed to remove empty partial"));
+        assert!(error.contains(&partial.display().to_string()));
+        assert_eq!(
+            std::fs::read(partial.join("untouched.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn invalid_artifact_storage_is_refused_before_trace_subscription() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("storage-before-subscribe");
+        let socket = dir.join("daemon.sock");
+        let invalid_parent = dir.join("not-a-directory");
+        std::fs::write(&invalid_parent, b"synthetic").unwrap();
+        let target = invalid_parent.join("capture.jsonl");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (observed, observation) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let Request::TraceSubscribe { duration_ms, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("expected the controlled subscription fixture");
+            };
+            observed.send(()).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &Response::TraceAccepted {
+                    limits: TraceLimits::bounded(1000),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            duration_ms
+        });
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let result = record(&target, Duration::from_millis(1000));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        // Release the fixture if the recorder correctly made no connection.
+        // Zero identifies this cleanup request, not the recorder's 1000 ms.
+        let mut cleanup = if observation.try_recv().is_err() {
+            Some(std::os::unix::net::UnixStream::connect(&socket).unwrap())
+        } else {
+            None
+        };
+        if let Some(stream) = cleanup.as_mut() {
+            serde_json::to_writer(
+                &mut *stream,
+                &Request::TraceSubscribe {
+                    duration_ms: 0,
+                    trace_schema: None,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+        let observed_duration = server.join().unwrap();
+        assert!(result.unwrap_err().contains(&target.display().to_string()));
+        assert_eq!(
+            observed_duration, 0,
+            "recorder subscribed before checking storage"
+        );
+    }
+
+    #[test]
     fn complete_trace_is_published_mode_0600_and_parseable() {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
@@ -1126,6 +1381,48 @@ mod tests {
         let parsed =
             parse_trace(BufReader::new(std::fs::File::open(target).unwrap()), limits).unwrap();
         assert_eq!(parsed.records().len(), 2);
+    }
+
+    #[test]
+    fn a_smaller_daemon_byte_limit_is_enforced_before_persisting_records() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("negotiated-byte-limit");
+        let socket = dir.join("daemon.sock");
+        let target = dir.join("capture.jsonl");
+        let mut limits = TraceLimits::bounded(10);
+        limits.max_bytes = 128;
+        let started = fixture_record(
+            0,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            false,
+        );
+        assert!(serde_json::to_vec(&started).unwrap().len() > 128);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || serve_fixture(listener, limits, vec![started]));
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let result = record(&target, Duration::from_millis(10));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        server.join().unwrap();
+        assert!(result
+            .unwrap_err()
+            .contains("trace exceeds its bounded limits"));
+        assert!(!target.exists());
+        let partials: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".partial."))
+            .collect();
+        assert_eq!(partials.len(), 1);
+        assert_eq!(partials[0].metadata().unwrap().len(), 0);
     }
 
     #[test]

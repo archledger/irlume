@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// path until [`SecureArtifact::commit`] publishes it atomically.
 pub struct SecureArtifact {
     file: File,
+    owner_uid: libc::uid_t,
     final_path: PathBuf,
     partial_path: PathBuf,
     bytes: u64,
     limit: u64,
-    durability_warning: Option<String>,
 }
 
 /// The final state of a successfully published artifact.
@@ -32,15 +32,18 @@ pub struct PublishedArtifact {
 }
 
 impl SecureArtifact {
-    /// Create a fresh mode-0600 partial beside `final_path`.
+    /// Create a fresh, creator-owned mode-0600 partial beside `final_path`.
     ///
     /// The final path is intentionally checked only by [`Self::commit`], where
     /// the kernel can enforce no-replace publication atomically.
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "documented by the caller contract"
-    )]
+    /// # Errors
+    ///
+    /// Refuses known unqualified network filesystems, ownership or permissions
+    /// that do not meet the private-artifact contract, and filesystem errors.
     pub fn create(final_path: &Path, limit: u64) -> io::Result<Self> {
+        // SAFETY: geteuid takes no arguments and returns this thread's current
+        // effective uid without changing process state.
+        let owner_uid = unsafe { libc::geteuid() };
         let parent = artifact_parent(final_path);
         let name = final_path
             .file_name()
@@ -78,23 +81,26 @@ impl SecureArtifact {
             return Err(io::Error::last_os_error());
         }
 
-        let durability_warning = network_filesystem_warning(&file)?;
+        reject_unqualified_network_filesystem(&file)?;
+        verify_private_permissions(&file, owner_uid)?;
         Ok(Self {
             file,
+            owner_uid,
             final_path: final_path.to_owned(),
             partial_path,
             bytes: 0,
             limit,
-            durability_warning,
         })
     }
 
-    /// Append one chunk, refusing it in full when it would cross the limit.
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "documented by the caller contract"
-    )]
+    /// Append one chunk only while the opened artifact remains private.
+    ///
+    /// # Errors
+    ///
+    /// Refuses changed ownership or permissions, a chunk that would cross the
+    /// byte limit, and filesystem write errors.
     pub fn write_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
+        verify_private_permissions(&self.file, self.owner_uid)?;
         let chunk_len = u64::try_from(bytes.len())
             .map_err(|_| io::Error::new(io::ErrorKind::FileTooLarge, "artifact size overflow"))?;
         let next_len = self
@@ -119,20 +125,23 @@ impl SecureArtifact {
     }
 
     /// Sync and publish the artifact without replacing an existing path.
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "documented by the caller contract"
-    )]
+    ///
+    /// # Errors
+    ///
+    /// Refuses changed ownership or permissions, failed file synchronization,
+    /// and no-replace publication errors. Parent-sync failures remain warnings.
     pub fn commit(self) -> io::Result<PublishedArtifact> {
         let Self {
             file,
+            owner_uid,
             final_path,
             partial_path,
             bytes,
             limit: _,
-            mut durability_warning,
         } = self;
+        verify_private_permissions(&file, owner_uid)?;
         file.sync_all()?;
+        verify_private_permissions(&file, owner_uid)?;
         drop(file);
 
         if let Err(error) = rename_noreplace(&partial_path, &final_path) {
@@ -143,13 +152,9 @@ impl SecureArtifact {
         }
 
         let parent = artifact_parent(&final_path);
-        if let Err(error) = crate::fsync_dir(parent) {
-            let warning = format!("artifact is visible but parent sync failed: {error}");
-            durability_warning = Some(match durability_warning.take() {
-                Some(existing) => format!("{existing}; {warning}"),
-                None => warning,
-            });
-        }
+        let durability_warning = crate::fsync_dir(parent)
+            .err()
+            .map(|error| format!("artifact is visible but parent sync failed: {error}"));
 
         Ok(PublishedArtifact {
             final_path,
@@ -189,7 +194,22 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     }
 }
 
-fn network_filesystem_warning(file: &File) -> io::Result<Option<String>> {
+fn verify_private_permissions(file: &File, owner_uid: libc::uid_t) -> io::Result<()> {
+    // Query the opened inode, not a pathname that could name another file.
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != owner_uid
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "diagnostic artifact must remain a regular mode-0600 file owned by its creator",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unqualified_network_filesystem(file: &File) -> io::Result<()> {
     let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
     // SAFETY: `file` owns a live descriptor and `stats` points to enough writable
     // storage for one `statfs`. A zero return is checked before initialization.
@@ -199,22 +219,34 @@ fn network_filesystem_warning(file: &File) -> io::Result<Option<String>> {
     }
     // SAFETY: fstatfs returned zero, so it initialized the complete structure.
     let filesystem_type = unsafe { stats.assume_init() }.f_type as u64;
-    // Linux magic values from include/uapi/linux/magic.h. These filesystems may
-    // provide useful artifacts, but their crash-durability behavior has not
-    // been qualified for Irlume's local rename+fsync publication contract.
+    if is_known_network_filesystem(filesystem_type) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private diagnostic artifacts are not supported on unqualified network filesystems; choose a private local directory",
+        ));
+    }
+    Ok(())
+}
+
+fn is_known_network_filesystem(filesystem_type: u64) -> bool {
+    // Linux UAPI filesystem magic values are 32-bit constants. Normalize a
+    // sign-extended f_type as well as its native 64-bit representation.
+    let filesystem_type = filesystem_type & u64::from(u32::MAX);
+    // A successful chmod is not evidence of private access on these sinks:
+    // CIFS nounix/noperm can ignore it or bypass client permission checks.
     const NETWORK_FILESYSTEMS: &[u64] = &[
         0x0000_6969, // NFS
+        0x0000_517b, // legacy SMB
         0xff53_4d42, // CIFS
         0xfe53_4d42, // SMB2
         0x0000_564c, // NCP
         0x7375_7245, // Coda
-        0x5346_414f, // AFS
+        0x5346_414f, // legacy AFS
+        0x6b41_4653, // Linux AFS
         0x00c3_6400, // Ceph
         0x0102_1997, // 9P
     ];
-    Ok(NETWORK_FILESYSTEMS
-        .contains(&filesystem_type)
-        .then(|| "durable publication is not qualified on this network filesystem".to_owned()))
+    NETWORK_FILESYSTEMS.contains(&filesystem_type)
 }
 
 #[cfg(test)]
@@ -301,5 +333,93 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn a_shared_partial_is_refused_before_any_extra_bytes_are_written() {
+        let dir = sandbox("artifact-shared-write");
+        let target = dir.join("trace.jsonl");
+        let mut artifact = SecureArtifact::create(&target, 32).unwrap();
+        let partial = artifact.partial_path().to_owned();
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o660)).unwrap();
+
+        let error = artifact
+            .write_chunk(b"must-not-be-written")
+            .expect_err("a successful chmod must not substitute for private permissions");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(std::fs::read(&partial).unwrap().is_empty());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_shared_partial_is_never_published() {
+        let dir = sandbox("artifact-shared-commit");
+        let target = dir.join("trace.jsonl");
+        let mut artifact = SecureArtifact::create(&target, 32).unwrap();
+        artifact.write_chunk(b"recoverable").unwrap();
+        let partial = artifact.partial_path().to_owned();
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o660)).unwrap();
+
+        let error = artifact
+            .commit()
+            .expect_err("publication requires the partial to remain private");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"recoverable");
+    }
+
+    #[test]
+    fn an_owner_mismatch_refuses_writing_and_publication() {
+        let dir = sandbox("artifact-owner-mismatch");
+        let target = dir.join("trace.jsonl");
+        let mut artifact = SecureArtifact::create(&target, 32).unwrap();
+        let partial = artifact.partial_path().to_owned();
+        // Simulate a mismatch with the captured creator identity without
+        // changing real process credentials or requiring chown privileges.
+        artifact.owner_uid ^= 1;
+        assert_eq!(
+            artifact
+                .write_chunk(b"must-not-be-written")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            artifact.commit().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(!target.exists());
+        assert!(std::fs::read(partial).unwrap().is_empty());
+    }
+
+    #[test]
+    fn known_network_magic_values_are_refused_including_sign_extension() {
+        for magic in [
+            0x6969,
+            0xff53_4d42,
+            0xfe53_4d42,
+            0x564c,
+            0x7375_7245,
+            0x5346_414f,
+            0x00c3_6400,
+            0x0102_1997,
+            0xffff_ffff_ff53_4d42,
+            0xffff_ffff_fe53_4d42,
+        ] {
+            assert!(is_known_network_filesystem(magic), "{magic:x}");
+        }
+        for magic in [0xef53, 0x9123_683e, 0x0102_1994, 0x794c_7630] {
+            assert!(!is_known_network_filesystem(magic), "{magic:x}");
+        }
+    }
+
+    #[test]
+    fn linux_afs_is_refused_as_an_unqualified_network_filesystem() {
+        assert!(is_known_network_filesystem(0x6b41_4653));
+    }
+
+    #[test]
+    fn legacy_smb_is_refused_as_an_unqualified_network_filesystem() {
+        assert!(is_known_network_filesystem(0x517b));
     }
 }

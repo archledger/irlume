@@ -722,6 +722,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlumed's start-up notice for a template key moved onto the DA-exempt
+  storage key now states the downgrade consequence and the restore paths:
+  a release from before the DA-exempt storage key cannot open the moved
+  envelope, and `irlume recovery restore` or a re-enrollment reseals it
+  (ADR-0034 section 5). Previously the notice read as a benign
+  improvement, so an operator running a newer irlumed once - a diagnostic
+  run or a test install - did not learn the one-way door had closed until
+  the older daemon refused every load with TPM_RC_INTEGRITY (#1148). A
+  StrongerPolicy move stays on the same storage key and keeps the plain
+  notice: an older release can still open that envelope.
+
 - A split camera pair no longer refuses every batch with "split frame does
   not match its retained capture contract" when the RGB median is slow
   (#1144). The RGB session computed each sample's temporal median on its

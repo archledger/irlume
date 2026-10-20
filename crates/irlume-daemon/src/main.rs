@@ -1707,10 +1707,27 @@ fn main() {
             if startup_tpm_reachable() {
                 for user in irlume_core::storage::list_users() {
                     match irlume_core::template_key::move_to_stronger_policy(&user) {
-                        Ok(Some(gain)) => jout_notice!(
-                            "irlumed: moved the template key of '{user}' to {}",
-                            gain.describe()
-                        ),
+                        Ok(Some(gain)) => {
+                            let gained = gain.describe();
+                            if matches!(
+                                gain,
+                                irlume_core::tpm::MoveGain::StrongerPolicy
+                            ) {
+                                // Same kind of storage key: an older release
+                                // can still open the envelope, so no
+                                // downgrade warning belongs on this move.
+                                jout_notice!(
+                                    "irlumed: moved the template key of '{user}' to {gained}"
+                                );
+                            } else {
+                                jout_notice!(
+                                    "irlumed: moved the template key of '{user}' to {gained}; \
+                                     a release from before the DA-exempt storage key cannot \
+                                     open it after this move; irlume recovery restore or a \
+                                     re-enrollment reseals it (ADR-0034 section 5)"
+                                );
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => jout_warn!(
                             "irlumed: could not move the template key of '{user}' to a stronger \
@@ -30356,5 +30373,56 @@ mod split_management_tests {
         assert!(root.contains("5986:2113"), "root listing carries the facts");
         assert!(root.contains("/dev/video0"));
         drop(env);
+    }
+
+    #[test]
+    fn the_template_key_move_notice_names_the_downgrade_consequence() {
+        // A live 2026-10-19 incident (#1148): the move notice read as a
+        // benign improvement, so an operator running a newer irlumed once
+        // did not learn that the move ends downgrade compatibility for
+        // that account. The notice must name the consequence and the two
+        // restore paths.
+        let source = include_str!("main.rs");
+        // Extract the production match block before asserting, so the
+        // test's own literals can never satisfy a needle: the block runs
+        // from the move call to its Ok(None) arm, and nothing in it comes
+        // from this test. Continuations are flattened so needles match the
+        // message regardless of line wrapping.
+        let production = source
+            .split("move_to_stronger_policy(&user)")
+            .nth(1)
+            .unwrap()
+            .split("Ok(None) => {}")
+            .next()
+            .unwrap();
+        let flat: String = production
+            .split_whitespace()
+            .filter(|word| *word != "\\")
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(
+                "cannot open it after this move; irlume recovery restore or a re-enrollment"
+            ),
+            "the DA-exempt move notice must state the one-way door and both restore paths: {flat}"
+        );
+        // The warning belongs only to moves that change storage keys: a
+        // StrongerPolicy move stays on the original key, and an older
+        // release can still open that envelope.
+        let plain_arm = flat
+            .split("MoveGain::StrongerPolicy")
+            .nth(1)
+            .unwrap()
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(
+            !plain_arm.contains("cannot open it after this move"),
+            "the StrongerPolicy arm must not claim the downgrade door: {plain_arm}"
+        );
+        assert!(
+            plain_arm.contains("moved the template key of '{user}' to {gained}"),
+            "the StrongerPolicy arm keeps its plain move notice: {plain_arm}"
+        )
     }
 }

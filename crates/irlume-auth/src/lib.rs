@@ -6266,7 +6266,25 @@ impl Engine {
             irlume_common::dlog!(
                 "assess: RGB has no face but IR does; recapturing RGB alone (dim overlapped frame?)"
             );
+            // The standalone recapture is sequential work inside a
+            // concurrent-schedule operation: a fallback marker after the
+            // pair lets offline analysis attribute this RgbCapture to the
+            // sequential envelope without folding the earlier concurrent
+            // pair into it (#1147). The concurrent pair produced no usable
+            // RGB face, which is the generic concurrent-capture failure.
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureFallback {
+                    reason:
+                        irlume_common::diagnostics::RuntimeViolationLabel::ConcurrentCaptureFailure,
+                },
+            );
+            let heal_started = std::time::Instant::now();
             rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control)?;
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                heal_started.elapsed().as_millis(),
+            );
             rgb_faces = self.det.detect(&align::RgbView {
                 data: &rgb.data,
                 width: rgb.width,

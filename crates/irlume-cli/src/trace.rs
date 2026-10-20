@@ -877,6 +877,36 @@ fn analyze(input: &Path) -> Result<String, String> {
             }
         }
     }
+    // A completed operation ends at its completion: exactly one
+    // OperationFinished, and it is that id's final record. A trace that
+    // reuses an id within one class, or appends stages after a completion,
+    // would otherwise merge both logical operations into one
+    // authoritative-looking span.
+    let mut completions: BTreeMap<String, u64> = BTreeMap::new();
+    for record in records {
+        let operation_id = serde_json::to_string(&record.operation_id)
+            .unwrap_or_else(|_| "\"invalid\"".into())
+            .trim_matches('"')
+            .to_owned();
+        let finished = matches!(
+            record.event,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished { .. },
+            }
+        );
+        if finished {
+            *completions.entry(operation_id).or_insert(0) += 1;
+        } else if completions.contains_key(&operation_id) {
+            return Err(format!(
+                "operation id {operation_id} has records after its completion; timing analysis refused"
+            ));
+        }
+    }
+    if let Some((operation_id, count)) = completions.iter().find(|(_, c)| **c > 1) {
+        return Err(format!(
+            "operation id {operation_id} has {count} completion events; timing analysis refused"
+        ));
+    }
     // A monotonic clock produced these timestamps, so decreasing values
     // WITHIN one operation mean a malformed or corrupted trace; the
     // interval reconstruction would treat them as valid endpoints and
@@ -1623,6 +1653,10 @@ mod tests {
         for (record, time) in records.iter_mut().zip(times) {
             record.monotonic_us = time;
         }
+        // The stream's terminal record belongs to the trace's control
+        // group, not this operation.
+        records.last_mut().unwrap().operation_id =
+            irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
         let dir = sandbox("analyze-partial");
         let path = dir.join("trace.jsonl");
         let mut bytes = Vec::new();
@@ -1633,17 +1667,23 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let rendered = analyze(&path).unwrap();
         // Span from the reconstructed CameraOpen start (50_000) to the
-        // terminal record (120_000); union 55_000; the trailing 5_000 gap
-        // is listed instead of hiding inside a saturated zero residual.
-        assert!(rendered.contains("span_us=70000"), "{rendered}");
+        // operation's completion (118_000); the stream terminal belongs to
+        // the control group. Union 60_000; both gaps listed.
+        assert!(rendered.contains("span_us=68000"), "{rendered}");
         assert!(rendered.contains("stage_union_us=60000"), "{rendered}");
-        assert!(rendered.contains("residual_us=10000"), "{rendered}");
+        assert!(rendered.contains("residual_us=8000"), "{rendered}");
         assert!(
             rendered.contains("gap_us=5000 after CameraOpen before Finalization"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("gap_us=5000 after Finalization before operation-end"),
+            rendered.contains("gap_us=3000 after Finalization before operation-end"),
+            "{rendered}"
+        );
+        // A capture route ran (Finalization) without schedule evidence or
+        // capture records: the sequential envelope is unavailable, not 0.
+        assert!(
+            rendered.contains("sequential_union_us=unavailable"),
             "{rendered}"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -1675,6 +1715,18 @@ mod tests {
         for record in &mut records {
             record.trace_schema = V4_TRACE_SCHEMA_VERSION;
         }
+        // Every sub-fixture's stream terminal record belongs to the
+        // trace's control group, matching production traces.
+        let write = |path: &Path, records: &mut Vec<TraceRecord>| {
+            records.last_mut().unwrap().operation_id =
+                irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
+            let mut bytes = Vec::new();
+            for record in records.iter() {
+                serde_json::to_writer(&mut bytes, record).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
         let dir = sandbox("analyze-refusals");
         let older = dir.join("older.jsonl");
         let mut bytes = Vec::new();
@@ -1709,12 +1761,7 @@ mod tests {
             },
             true,
         ));
-        let mut bytes = Vec::new();
-        for record in &dropped_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&dropped, bytes).unwrap();
+        write(&dropped, &mut dropped_records);
         let error = analyze(&dropped).unwrap_err();
         assert!(error.contains("dropped 3 events"), "{error}");
 
@@ -1741,19 +1788,14 @@ mod tests {
             },
             true,
         ));
-        let mut bytes = Vec::new();
-        for record in &wrapping_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&wrapping, bytes).unwrap();
+        write(&wrapping, &mut wrapping_records);
         assert!(analyze(&wrapping).is_err(), "saturated sum must refuse");
 
         // At most one Finalization per operation: a second is structurally
         // impossible and the pairing stays linear, so the operation is
         // refused instead of rescanned.
         let doubled = dir.join("doubled.jsonl");
-        let doubled_records = vec![
+        let mut doubled_records = vec![
             fixture_record(
                 0,
                 TraceEventKind::StageTiming {
@@ -1795,12 +1837,7 @@ mod tests {
                 true,
             ),
         ];
-        let mut bytes = Vec::new();
-        for record in &doubled_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&doubled, bytes).unwrap();
+        write(&doubled, &mut doubled_records);
         let rendered = analyze(&doubled).unwrap();
         assert!(
             rendered.contains("REFUSED: 2 Finalization records"),
@@ -1811,7 +1848,7 @@ mod tests {
         // record is present, but the operation never finished, so its
         // envelope numbers must be refused rather than rendered.
         let cutoff = dir.join("cutoff.jsonl");
-        let cutoff_records = vec![
+        let mut cutoff_records = vec![
             fixture_record(
                 0,
                 TraceEventKind::StageTiming {
@@ -1836,12 +1873,7 @@ mod tests {
                 true,
             ),
         ];
-        let mut bytes = Vec::new();
-        for record in &cutoff_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&cutoff, bytes).unwrap();
+        write(&cutoff, &mut cutoff_records);
         let rendered = analyze(&cutoff).unwrap();
         assert!(
             rendered.contains("REFUSED: operation cut off before completion"),
@@ -1892,12 +1924,7 @@ mod tests {
             true,
         ));
         backwards_records.last_mut().unwrap().monotonic_us = 100_000;
-        let mut bytes = Vec::new();
-        for record in &backwards_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&backwards, bytes).unwrap();
+        write(&backwards, &mut backwards_records);
         let error = analyze(&backwards).unwrap_err();
         assert!(error.contains("not monotonic"), "{error}");
 
@@ -1945,12 +1972,7 @@ mod tests {
         for (record, time) in pre_sub_records.iter_mut().zip(times) {
             record.monotonic_us = time;
         }
-        let mut bytes = Vec::new();
-        for record in &pre_sub_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&pre_sub, bytes).unwrap();
+        write(&pre_sub, &mut pre_sub_records);
         let rendered = analyze(&pre_sub).unwrap();
         assert!(
             rendered.contains(
@@ -1992,17 +2014,101 @@ mod tests {
         for (record, time) in reused_records.iter_mut().zip(times) {
             record.monotonic_us = time;
         }
-        let mut bytes = Vec::new();
-        for record in &reused_records {
-            serde_json::to_writer(&mut bytes, record).unwrap();
-            bytes.push(b'\n');
-        }
-        std::fs::write(&reused, bytes).unwrap();
+        write(&reused, &mut reused_records);
         let error = analyze(&reused).unwrap_err();
         assert!(
             error.contains("spans multiple operation classes"),
             "{error}"
         );
+
+        // Same-class id reuse, and stages appended after a completion: the
+        // earlier completion must not license one merged span.
+        let trailing = dir.join("trailing.jsonl");
+        let mut trailing_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 2_000,
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 105_000, 110_000, 120_000];
+        for (record, time) in trailing_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&trailing, &mut trailing_records);
+        let error = analyze(&trailing).unwrap_err();
+        assert!(error.contains("records after its completion"), "{error}");
+
+        let twice = dir.join("twice-finished.jsonl");
+        let mut twice_records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CameraOpen,
+                    elapsed_us: 1_000,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::OperationFinished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+                true,
+            ),
+        ];
+        let times = [100_000_u64, 105_000, 105_000, 120_000];
+        for (record, time) in twice_records.iter_mut().zip(times) {
+            record.monotonic_us = time;
+        }
+        write(&twice, &mut twice_records);
+        let error = analyze(&twice).unwrap_err();
+        assert!(error.contains("2 completion events"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -729,6 +729,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Diagnostic trace collection expires under producer contention and socket
+  backpressure, idle full disconnects release the collector, and startup
+  precedes producer publication. Queued delivery and terminal records share
+  one fixed 15-second grace after observation expiry; trickling readers cannot
+  restart it. Write-half-closed readers and complete drain within grace stay
+  compatible (ADR-0008, lifetime amendment 2026-10-20).
+
 - Diagnostic report, trace and offline-export files require verified
   creator ownership and mode 0600 on the opened file; changed permissions
   refuse further writes or publication. Known unqualified network

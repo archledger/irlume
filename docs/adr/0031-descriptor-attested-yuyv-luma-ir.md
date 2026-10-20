@@ -14,9 +14,11 @@ also supplies its frames' active-IR evidence (Amendment 2026-10-14). Every
 other YUYV IR burst is still refused as exposure unmeasurable. Amended
 2026-10-17 (#1069): on an IR node closed to the seat user (the packaged udev
 rule, measured on the node itself per burst), that burst proof no longer
-needs the opt-in's confinement; `irlume doctor` reports the node's state. The reporter's T480 enrolled on
-the implementation (PR #1064); confirmed grants on it and qualification on
-more units remain open. Depends on ADR-0029 §1 and §9
+needs the opt-in's confinement; `irlume doctor` reports the node's state.
+Amended 2026-10-20: the reporter's T480 has confirmed grants and the recorded
+write/read-back/optical/restore evidence required for its built-in emitter
+entry (#887); broader qualification and more units remain open.
+Depends on ADR-0029 §1 and §9
 (camera-free classification; selection never opens a device it will not
 use). Changes nothing in ADR-0023 §3 (profiles still cannot classify),
 ADR-0024's pair authorization, ADR-0019 or the exposure refusal of #358 and
@@ -733,8 +735,9 @@ all:
   control, restoring the original when the stream ends. The built-in table
   (`known_control`) gains the T480 only once that write, its read-back, the
   optical result with D1 selected and the restore are recorded on the
-  hardware (#887). The read-only default proof serves an attested YUYV
-  camera whose control already defaults to D1.
+  hardware (#887; evidence accepted by Amendment 2026-10-20 below). The
+  read-only default proof serves an attested YUYV camera whose control
+  already defaults to D1.
 - **Records agree with the optics.** Besides not breaking D1 parity, every
   illumination record the camera does supply must name the optically
   bright frames lit. Records that alternate in the opposite phase refuse
@@ -902,3 +905,24 @@ check that pins the shipped rule to the table in every lane and its sort
 order against systemd's files, the doctor row tests (classified and
 unreadable buckets, per-device worst, wording), and the capture-path
 source pins updated for the new admission.
+
+## Amendment 2026-10-20: the T480 emitter entry has hardware evidence
+
+In [#887's capture-path run](https://github.com/archledger/irlume/issues/887#issuecomment-6283434388),
+maurerr recorded all four requirements of Amendment 2026-10-14 on the T480
+5986:1141, using build `45365e47` on kernel `7.0.0-38-generic`:
+
+- Unit 8 selector 6 accepted `01 01 02 00 00 00 00 00 00`, selecting D1 on
+  streaming interface 1, and GET_CUR returned those bytes.
+- All five ten-frame bursts proved D1, with phase deltas 40.9 to 41.7,
+  no conflicting pairs and no invalid sequence steps; each used ceiling 235.
+- The one write/restore cycle restored `01 01 01 00 00 00 00 00 00`;
+  the final GET_CUR matched the value before capture. The script reported
+  six checks passed and the face authentication granted.
+
+`known_control` therefore includes that exact USB identity, unit, selector
+and payload. It does not reuse the ASUS/NexiGo interface-3 payload. The
+descriptor check, stream guard and restoration remain unchanged. This
+removes the manual emitter override for this module; it does not authorize a
+split pair, remove its experimental opt-in, qualify concurrent capture or
+change PAD. The earlier dim-room RGB PAD refusals remain outside this entry.

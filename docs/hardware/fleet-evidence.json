@@ -66,6 +66,28 @@
       }
     },
     {
+      "host_label": "ThinkPad T480 (community report, Ubuntu 26.04)",
+      "module": "Bison Integrated IR Camera (RGB sibling 5986:2113)",
+      "usb": { "vid": "5986", "pid": "1141", "serial_note": "not used for the emitter table entry" },
+      "rgb": { "node": "video2", "format": "MJPG/YUYV advertised (5986:2113)", "role": "separately authorized split RGB side" },
+      "ir": { "node": "video0", "format": "YUYV 340x340, descriptor-attested luma IR" },
+      "capture_mode": "split sequential",
+      "capture_mode_source": "reporter capture-path evidence run; no concurrent qualification or general hardware qualification claimed",
+      "emitter": {
+        "control": "MS-XU unit 8 selector 0x06 (face authentication), interface 1 D1 payload 01 01 02 00 00 00 00 00 00",
+        "status": "validated by maurerr (write, read-back, five D1-proven bursts, restoration), 2026-10-20",
+        "notes": "one write/restore cycle; GET_CUR before and after 01 01 01 00 00 00 00 00 00; no manual emitter override needed with the built-in entry; split authorization and experimental opt-in remain required"
+      },
+      "evidence": {
+        "irlume": "source build 45365e4792f80a90ea9e7d2ea8a026b8c2a6a72d, /usr/local/bin/irlumed; kernel 7.0.0-38-generic",
+        "source": "https://github.com/archledger/irlume/issues/887#issuecomment-6283434388 (maurerr, run 2026-10-20T04:26:23Z)",
+        "binary": "running irlumed sha256 c7b957d9b4e1cb1873427ee1b3b9f4fa267031c37135fff83235e0de3670d793",
+        "emitter": "emitter-capture-evidence-test.sh: 6 passed, 0 failed; YUYV clipping ceiling 235; five D1 proofs, phase delta 40.9-41.7, no conflicting pairs or invalid sequence steps",
+        "auth": "face authentication granted in this run; dim-room RGB PAD refusals reported separately on #887 remain outside this emitter validation",
+        "suspend": "not tested in this run"
+      }
+    },
+    {
       "host_label": "ThinkPad X13 Yoga Gen 4",
       "module": "Chicony Integrated Camera",
       "usb": { "vid": "04f2", "pid": "b7bf", "serial_note": "-" },

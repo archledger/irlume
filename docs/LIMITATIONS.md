@@ -85,13 +85,14 @@ summary lives on the [README](../README.md); this is the detail.
   opt-in's confinement, and `irlume doctor` reports the node's state
   (ADR-0031 §4, amendment 2026-10-17, #1069). Every
   other YUYV burst refuses the same way as NV12. The emitter counts as active
-  when `irlume ir-setup` saved its control or the camera's own
-  face-authentication control reads its default alternating mode; neither
-  works on a T480, whose control defaults to general-purpose mode and whose
-  change `ir-setup` cannot measure, so a T480 owner sets
-  `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0` for irlumed (docs/SETUP.md). This
-  has not yet been qualified on a T480. An IR camera that offers MJPG, alone
-  or beside YUYV, is not supported.
+  when a built-in or saved control is held by the stream guard, or the
+  camera's own face-authentication control reads its default alternating
+  mode. The T480's `5986:1141` now has a built-in control validated by the
+  reporter's write/read-back/optical/restore run, with a face grant
+  (ADR-0031, amendment 2026-10-20, #887); no manual emitter override is needed.
+  Broader hardware qualification remains open, and the reporter's dim-room
+  RGB PAD refusals are unchanged. An IR camera that offers MJPG, alone or
+  beside YUYV, is not supported.
 - **The NexiGo HelloCam N930W measured here (`3443:c803`) streams IR close
   to the delivered-rate floor.** Every capture checks that each stream
   delivers at least 97% of its role's floor, 14.55 fps for IR, as evidence of

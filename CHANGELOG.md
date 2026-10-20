@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
+  control (unit 8, selector 6, D1 on interface 1), validated by maurerr's
+  capture-path write, read-back, optical proof and restore run (#887,
+  ADR-0031 section 4, amendment 2026-10-20). It no longer needs a manual
+  `IRLUME_IR_EMITTER` override. Split-pair authorization, the experimental
+  opt-in and all per-burst checks remain unchanged.
+
 - `irlume trace analyze FILE.jsonl [--output FILE.txt]` renders a trace's
   timing envelope per operation for the sequential capture path (#856): the
   interval union of every stage (a nested stage such as GroupedEvaluation

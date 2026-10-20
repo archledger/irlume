@@ -5692,7 +5692,15 @@ impl Engine {
                 |session| {
                     let t = std::time::Instant::now();
                     let capture = held_rgb_capture(session);
-                    rgb_ms = t.elapsed().as_millis();
+                    let elapsed = t.elapsed().as_millis();
+                    // Held or fresh, every capture side reports at its own
+                    // endpoint, whether or not it succeeded (#1147).
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::RgbCapture,
+                        elapsed,
+                    );
+                    rgb_ms = elapsed;
                     capture
                 },
                 |session| {
@@ -5705,7 +5713,13 @@ impl Engine {
                             "IR capture thread panicked".into(),
                         ))
                     });
-                    ir_ms = t.elapsed().as_millis();
+                    let elapsed = t.elapsed().as_millis();
+                    emit_trace_stage_ms(
+                        diagnostics,
+                        irlume_common::diagnostics::TraceStage::IrCapture,
+                        elapsed,
+                    );
+                    ir_ms = elapsed;
                     capture
                 },
             );
@@ -5714,13 +5728,13 @@ impl Engine {
             let t = std::time::Instant::now();
             let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
             let rgb_ms = t.elapsed().as_millis();
-            if rgb.is_ok() {
-                emit_trace_stage_ms(
-                    diagnostics,
-                    irlume_common::diagnostics::TraceStage::RgbCapture,
-                    rgb_ms,
-                );
-            }
+            // A failed capture still spent its wall time: report at its
+            // endpoint whether or not it succeeded (#1147).
+            emit_trace_stage_ms(
+                diagnostics,
+                irlume_common::diagnostics::TraceStage::RgbCapture,
+                rgb_ms,
+            );
             // Match the old short-circuit: don't fire the IR emitter after an
             // RGB fault (privacy switch, missing node); the shared retry below
             // surfaces the RGB error.
@@ -5732,7 +5746,13 @@ impl Engine {
                     &self.ir_dev,
                     &control,
                 );
-                (rgb, rgb_ms, ir.map(Some), t.elapsed().as_millis())
+                let ir_ms = t.elapsed().as_millis();
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    ir_ms,
+                );
+                (rgb, rgb_ms, ir.map(Some), ir_ms)
             }
         } else {
             std::thread::scope(|s| {
@@ -18045,6 +18065,51 @@ mod engine_tests {
                 .unwrap()
                 .contains("emit_trace_stage_ms"),
             "IR must report at the join, its endpoint, before the deadline check"
+        );
+    }
+
+    #[test]
+    fn every_capture_branch_emits_both_sides() {
+        // The capture-path dispatch has three branches - held sessions,
+        // ordinary sequential, and concurrent - and each side of each
+        // branch reports its own StageTiming at its own endpoint, on
+        // success or failure (#1147 review round 11: the held branch and
+        // the sequential IR side once emitted nothing at all).
+        let src = include_str!("lib.rs");
+        let dispatch = src
+            .split("if let Some((rgb_s, ir_s)) = held")
+            .nth(1)
+            .unwrap()
+            .split("check_request_active")
+            .next()
+            .unwrap();
+        let held_arm = dispatch.split("} else if sequential {").next().unwrap();
+        assert_eq!(
+            held_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the held branch reports RGB and IR at their endpoints"
+        );
+        let sequential_arm = dispatch
+            .split("} else if sequential {")
+            .nth(1)
+            .unwrap()
+            .split("std::thread::scope")
+            .next()
+            .unwrap();
+        assert!(
+            !sequential_arm.contains("if rgb.is_ok()"),
+            "the sequential RGB report is not success-gated"
+        );
+        assert_eq!(
+            sequential_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the sequential branch reports RGB and IR at their endpoints"
+        );
+        let concurrent_arm = dispatch.split("std::thread::scope").nth(1).unwrap();
+        assert_eq!(
+            concurrent_arm.matches("emit_trace_stage_ms").count(),
+            2,
+            "the concurrent branch reports RGB and IR at their endpoints"
         );
     }
 }

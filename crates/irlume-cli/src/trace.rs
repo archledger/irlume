@@ -625,23 +625,92 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         // those intervals join the envelope only when the operation's own
         // evidence shows a sequential schedule or a fallback to one, so a
         // concurrent pair's simultaneous captures stay excluded.
-        let sequential_schedule = operation_records.iter().any(|record| {
+        // Which generic captures the sequential envelope covers:
+        // - a Sequential schedule covers them all;
+        // - a fallback covers only the retry emitted after the fallback
+        //   marker: the pair before it is the discarded concurrent attempt,
+        //   and a held-pair failure can emit the marker with no retry at all;
+        // - a Concurrent schedule (no fallback) excludes them;
+        // - generic captures with NO schedule or fallback evidence mean
+        //   recording began after the marker: the schedule is unknown, not
+        //   concurrent, so the projection is unavailable rather than zero.
+        enum GenericCaptureClass {
+            All,
+            AfterFallback(u64),
+            Excluded,
+            Unknown,
+        }
+        let mut generic_class = GenericCaptureClass::Unknown;
+        let mut first_fallback: Option<u64> = None;
+        for record in &operation_records {
+            match record.event {
+                TraceEventKind::Shared {
+                    transition:
+                        ShareSafeEventKind::CaptureScheduleSelected {
+                            schedule: CaptureSchedule::Sequential,
+                            ..
+                        },
+                } => generic_class = GenericCaptureClass::All,
+                TraceEventKind::Shared {
+                    transition:
+                        ShareSafeEventKind::CaptureScheduleSelected {
+                            schedule: CaptureSchedule::Concurrent,
+                            ..
+                        },
+                } => {
+                    if !matches!(generic_class, GenericCaptureClass::All) {
+                        generic_class = GenericCaptureClass::Excluded;
+                    }
+                }
+                TraceEventKind::Shared {
+                    transition: ShareSafeEventKind::CaptureFallback { .. },
+                } => {
+                    if first_fallback.is_none() {
+                        first_fallback = Some(record.sequence);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(fallback_sequence) = first_fallback {
+            if matches!(generic_class, GenericCaptureClass::Unknown) {
+                generic_class = GenericCaptureClass::AfterFallback(fallback_sequence);
+            }
+        }
+        let has_generic_captures = operation_records.iter().any(|record| {
             matches!(
                 record.event,
-                TraceEventKind::Shared {
-                    transition: ShareSafeEventKind::CaptureScheduleSelected {
-                        schedule: CaptureSchedule::Sequential,
-                        ..
-                    } | ShareSafeEventKind::CaptureFallback { .. },
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture | TraceStage::IrCapture,
+                    ..
                 }
             )
         });
-        let sequential_blocks = merge_intervals(sequential_intervals(
-            &operation_records,
-            sequential_schedule,
-        ));
-        let sequential_union = union_us(&sequential_blocks);
-        writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
+        if matches!(generic_class, GenericCaptureClass::Unknown) && !has_generic_captures {
+            // Nothing to classify: only Sequential* stages (or none).
+            generic_class = GenericCaptureClass::Excluded;
+        }
+        match generic_class {
+            GenericCaptureClass::Unknown => {
+                writeln!(
+                    output,
+                    "  sequential_union_us=unavailable (schedule evidence predates recording)"
+                )
+                .unwrap();
+            }
+            class => {
+                let sequential_blocks = merge_intervals(sequential_intervals(
+                    &operation_records,
+                    matches!(class, GenericCaptureClass::All),
+                    match class {
+                        GenericCaptureClass::AfterFallback(sequence) => Some(sequence),
+                        _ => None,
+                    },
+                ));
+                let sequential_union = union_us(&sequential_blocks);
+                writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
+            }
+        }
         writeln!(output, "  blocks:").unwrap();
         for block in &blocks {
             writeln!(
@@ -719,16 +788,23 @@ fn render_analysis(records: &[TraceRecord]) -> String {
 
 fn sequential_intervals(
     operation_records: &[&TraceRecord],
-    sequential_schedule: bool,
+    all_generic: bool,
+    after_fallback_sequence: Option<u64>,
 ) -> Vec<StageInterval> {
     operation_records
         .iter()
         .filter_map(|record| match record.event {
             TraceEventKind::StageTiming { stage, elapsed_us } => {
                 let name = format!("{stage:?}");
-                let sequential_stage = name.starts_with("Sequential")
-                    || (sequential_schedule
-                        && matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture));
+                let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
+                let generic_covered = generic
+                    && (all_generic
+                        || after_fallback_sequence.is_some_and(|boundary| {
+                            // Only the retry after the fallback marker: the pair the
+                            // marker preceded was the discarded concurrent attempt.
+                            record.sequence > boundary
+                        }));
+                let sequential_stage = name.starts_with("Sequential") || generic_covered;
                 sequential_stage.then_some(StageInterval {
                     stage: name,
                     start_us: record.monotonic_us.saturating_sub(elapsed_us),
@@ -1252,8 +1328,113 @@ mod tests {
         concurrent_finished.monotonic_us = 15_000;
         concurrent_finished.operation_id = OperationId::from_bytes([5; 16]);
         records.push(concurrent_finished);
+        // A fallback operation: the concurrent attempt's captures precede
+        // the fallback marker, the sequential retry's follow it - only the
+        // retry joins the envelope.
+        let fallback_op = |sequence: u64, event: TraceEventKind| {
+            let mut record = fixture_record(sequence, event, false);
+            record.operation_id = OperationId::from_bytes([3; 16]);
+            record
+        };
+        let (mut r, mut i) = (
+            fallback_op(
+                21,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 30_000,
+                },
+            ),
+            fallback_op(
+                22,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 25_000,
+                },
+            ),
+        );
+        r.monotonic_us = 230_000;
+        i.monotonic_us = 235_000;
+        records.push(r);
+        records.push(i);
+        let mut marker = fallback_op(
+            23,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::CaptureFallback {
+                    reason: irlume_common::diagnostics::RuntimeViolationLabel::PairOpenFailure,
+                },
+            },
+        );
+        marker.monotonic_us = 236_000;
+        records.push(marker);
+        let (mut r, mut i) = (
+            fallback_op(
+                24,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 20_000,
+                },
+            ),
+            fallback_op(
+                25,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 15_000,
+                },
+            ),
+        );
+        r.monotonic_us = 260_000;
+        i.monotonic_us = 280_000;
+        records.push(r);
+        records.push(i);
+        let mut fallback_finished = fallback_op(
+            26,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+        );
+        fallback_finished.monotonic_us = 285_000;
+        records.push(fallback_finished);
+        // An unknown-schedule operation: generic captures with no schedule
+        // or fallback marker (recording began after the marker).
+        let unknown_op = |sequence: u64, event: TraceEventKind| {
+            let mut record = fixture_record(sequence, event, false);
+            record.operation_id = OperationId::from_bytes([1; 16]);
+            record
+        };
+        let (mut r, mut i) = (
+            unknown_op(
+                27,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RgbCapture,
+                    elapsed_us: 40_000,
+                },
+            ),
+            unknown_op(
+                28,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::IrCapture,
+                    elapsed_us: 30_000,
+                },
+            ),
+        );
+        r.monotonic_us = 340_000;
+        i.monotonic_us = 380_000;
+        records.push(r);
+        records.push(i);
+        let mut unknown_finished = unknown_op(
+            29,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished {
+                    outcome: CategoricalOutcome::Completed,
+                },
+            },
+        );
+        unknown_finished.monotonic_us = 385_000;
+        records.push(unknown_finished);
         records.push(control(
-            21,
+            30,
             TraceEventKind::Finished {
                 outcome: CategoricalOutcome::Completed,
             },
@@ -1287,6 +1468,20 @@ mod tests {
         );
         // The concurrent-schedule operation's captures stay excluded.
         assert!(rendered.contains("sequential_union_us=0"), "{rendered}");
+        // The fallback operation's envelope covers only the retry after the
+        // fallback marker (20_000 + 15_000), not the discarded concurrent
+        // attempt before it (30_000 + 25_000).
+        assert!(rendered.contains("sequential_union_us=35000"), "{rendered}");
+        assert!(
+            !rendered.contains("sequential_union_us=55000"),
+            "{rendered}"
+        );
+        // The unknown-schedule operation reports an unavailable projection,
+        // not a zero that would read as a concurrent pair.
+        assert!(
+            rendered.contains("sequential_union_us=unavailable"),
+            "{rendered}"
+        );
         // The control group records no stages and is never refused.
         assert!(rendered.contains("no stage timings"), "{rendered}");
         assert!(!rendered.contains("cut off"), "{rendered}");

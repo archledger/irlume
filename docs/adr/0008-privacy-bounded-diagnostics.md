@@ -99,6 +99,10 @@ file bearing the final `.txt` name. User-selected remote/network filesystems
 are accepted only with an explicit warning that durable-success semantics are
 not qualified there.
 
+**Amended 2026-10-20:** the network acceptance above is superseded by the
+private-artifact policy below. Known unqualified network destinations are
+refused, not accepted with a durability-only warning.
+
 `--probe` is a separate, explicit hardware action. It requires root, acquires
 the normal daemon-owned camera operation, and executes one bounded capture with
 the schedule the daemon would currently select, including its normal safety
@@ -279,3 +283,33 @@ an explicit `--probe` operation with its own authorization and warning.
   and active probing remain privileged.
 - This work does not change authentication policy, capture qualification,
   enrollment data, or emitter allowlists.
+
+## Amendment 2026-10-20: verify private artifact storage before writing
+
+A successful chmod is not proof that a filesystem established private access.
+A CIFS mount with Unix extensions disabled can report success while retaining
+mount-wide permissions; `noperm` can also bypass client-side permission checks.
+
+Private diagnostic artifacts therefore refuse known unqualified network
+filesystems (NFS, CIFS/SMB, NCP, Coda, AFS, Ceph and 9P) before returning a
+writable artifact. A future qualified network path requires separate privacy
+and durability evidence; this amendment adds no insecure-output override.
+
+On other destinations, the opened descriptor must report a regular file owned
+by the creating effective UID with exactly mode 0600. Check this at creation,
+before each write, and before and after file synchronization at publication.
+A mismatch refuses further writing or publication. Do not rely on a pathname's
+metadata to establish the opened file's permissions.
+
+The recorder checks output storage before subscribing to the daemon. Its
+validator still enforces any smaller daemon-applied byte limit. A rejected
+creation can leave an empty named partial, but no private payload or final file.
+Parent-directory sync failures remain explicit durability warnings after
+publication, not claims that crash durability was established.
+
+These checks do not certify every unknown filesystem's access-control behavior,
+nor protect against a trusted creator or administrator changing storage behind
+them. They do not change the existing destination-directory trust assumptions.
+Use a qualified private local directory for sensitive traces. Inspect a
+share-safe support report before deliberately copying it elsewhere; privileged
+traces are not share-safe reports.

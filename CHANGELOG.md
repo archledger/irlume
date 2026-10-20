@@ -722,6 +722,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Diagnostic report, trace and offline-export files require verified
+  creator ownership and mode 0600 on the opened file; changed permissions
+  refuse further writes or publication. Known unqualified network
+  destinations are refused before artifact data is written rather than
+  trusting successful chmod or a durability warning. The recorder checks
+  storage before subscribing (ADR-0008, amendment 2026-10-20).
+
 - `irlume trace explain` bounds each record read before buffering it, using
   the smaller of the line limit and the remaining total-byte budget
   (ADR-0008). An oversized record is rejected without reading it in full,

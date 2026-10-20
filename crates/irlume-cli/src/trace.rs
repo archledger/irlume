@@ -64,6 +64,10 @@ fn run_record(args: &[String]) -> ExitCode {
 }
 
 fn record(output: &Path, duration: Duration) -> Result<PathBuf, String> {
+    // Refuse unsafe storage before taking the daemon's singleton trace slot.
+    // The validator below also enforces any smaller daemon-applied byte limit.
+    let mut artifact = SecureArtifact::create(output, MAX_TRACE_BYTES)
+        .map_err(|error| format!("{}: {error}", output.display()))?;
     let requested_ms = u64::try_from(duration.as_millis()).unwrap_or(MAX_TRACE_DURATION_MS);
     let timeout = duration.saturating_add(Duration::from_secs(30));
     let mut stream = irlume_common::client::connect_stream(timeout)
@@ -91,8 +95,6 @@ fn record(output: &Path, duration: Duration) -> Result<PathBuf, String> {
     };
     let mut validator =
         TraceValidator::new(limits).map_err(|error| format!("invalid daemon limits: {error}"))?;
-    let mut artifact = SecureArtifact::create(output, limits.max_bytes)
-        .map_err(|error| format!("{}: {error}", output.display()))?;
 
     loop {
         let line = match read_bounded_line(&mut reader, MAX_TRACE_LINE_BYTES) {
@@ -1082,6 +1084,75 @@ mod tests {
     }
 
     #[test]
+    fn invalid_artifact_storage_is_refused_before_trace_subscription() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("storage-before-subscribe");
+        let socket = dir.join("daemon.sock");
+        let invalid_parent = dir.join("not-a-directory");
+        std::fs::write(&invalid_parent, b"synthetic").unwrap();
+        let target = invalid_parent.join("capture.jsonl");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (observed, observation) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let Request::TraceSubscribe { duration_ms, .. } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("expected the controlled subscription fixture");
+            };
+            observed.send(()).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &Response::TraceAccepted {
+                    limits: TraceLimits::bounded(1000),
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            duration_ms
+        });
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let result = record(&target, Duration::from_millis(1000));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        // Release the fixture if the recorder correctly made no connection.
+        // Zero identifies this cleanup request, not the recorder's 1000 ms.
+        let mut cleanup = if observation.try_recv().is_err() {
+            Some(std::os::unix::net::UnixStream::connect(&socket).unwrap())
+        } else {
+            None
+        };
+        if let Some(stream) = cleanup.as_mut() {
+            serde_json::to_writer(
+                &mut *stream,
+                &Request::TraceSubscribe {
+                    duration_ms: 0,
+                    trace_schema: None,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+        let observed_duration = server.join().unwrap();
+        assert!(result.unwrap_err().contains(&target.display().to_string()));
+        assert_eq!(
+            observed_duration, 0,
+            "recorder subscribed before checking storage"
+        );
+    }
+
+    #[test]
     fn complete_trace_is_published_mode_0600_and_parseable() {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
@@ -1126,6 +1197,48 @@ mod tests {
         let parsed =
             parse_trace(BufReader::new(std::fs::File::open(target).unwrap()), limits).unwrap();
         assert_eq!(parsed.records().len(), 2);
+    }
+
+    #[test]
+    fn a_smaller_daemon_byte_limit_is_enforced_before_persisting_records() {
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = sandbox("negotiated-byte-limit");
+        let socket = dir.join("daemon.sock");
+        let target = dir.join("capture.jsonl");
+        let mut limits = TraceLimits::bounded(10);
+        limits.max_bytes = 128;
+        let started = fixture_record(
+            0,
+            TraceEventKind::TraceStarted {
+                limits,
+                warning: TraceWarning::PrivilegedDiagnosticOracle,
+            },
+            false,
+        );
+        assert!(serde_json::to_vec(&started).unwrap().len() > 128);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || serve_fixture(listener, limits, vec![started]));
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let result = record(&target, Duration::from_millis(10));
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        server.join().unwrap();
+        assert!(result
+            .unwrap_err()
+            .contains("trace exceeds its bounded limits"));
+        assert!(!target.exists());
+        let partials: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".partial."))
+            .collect();
+        assert_eq!(partials.len(), 1);
+        assert_eq!(partials[0].metadata().unwrap().len(), 0);
     }
 
     #[test]

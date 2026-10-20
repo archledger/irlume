@@ -91,6 +91,13 @@ Conventions that apply everywhere:
 | `irlume update [--check]` | for install | update via the channel irlume was installed from (Copr/PPA: runs it; .deb/pkg/source: shows the steps); on a nightly lane ([ADR-0037](adr/0037-nightly-channel.md)) it upgrades through that lane whatever the latest release (the nightly Copr or PPA: runs it; `irlume-git`: shows the AUR steps) and says how to return to releases; `--check` only reports |
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, evict the persisted TPM storage root key, and irlume's DA-exempt storage key (ADR-0034 §3) at any owner handle, after a fully completed wipe (kept with `--keep-data` or an incomplete wipe; a key that irlume's template does not derive is never touched), through the TPM transport and original-key handle irlumed's unit sets (`IRLUME_TCTI`, `IRLUME_SRK_HANDLE`), which it reports, then report each storage key irlumed's record keeps (its original key, its DA-exempt key, a key that one superseded) that is still persisted, with its handle, TPM name and the manual `tpm2_evictcontrol` command, passing irlumed's `IRLUME_TCTI` with `-T` (ADR-0034, Phase 3 amendment), name the Bitwarden polkit leave-behind if present, then print the package-removal command |
 
+Diagnostic output files are private artifacts: the opened file must be a
+creator-owned regular file with mode 0600. Known unqualified network
+destinations, including NFS and SMB/CIFS, are refused before data is written.
+Use a private local directory instead. `support-report --json` still writes its
+share-safe document to stdout without creating a file (ADR-0008, amendment
+2026-10-20).
+
 ## Split camera authorizations
 
 `irlume split --help` prints the full syntax without contacting the daemon.

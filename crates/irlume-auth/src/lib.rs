@@ -5214,10 +5214,23 @@ impl Engine {
     ) -> irlume_common::Result<Assessment> {
         self.check_request_active()?;
         let capture_started = std::time::Instant::now();
-        let rgb = irlume_camera::capture_rgb_denoised_with_control(
+        let rgb = match irlume_camera::capture_rgb_denoised_with_control(
             &self.rgb_dev,
             &self.capture_control(),
-        )?;
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                // A failed capture still spent its wall time; the timing is
+                // emitted before the error propagates (#1147 review
+                // round 18).
+                diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+                    stage: irlume_common::diagnostics::TraceStage::RgbCapture,
+                    elapsed_us: u64::try_from(capture_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                });
+                return Err(error);
+            }
+        };
         if let Some(event) = irlume_camera::diagnostic_stream_evidence(&rgb) {
             diagnostics.emit_trace(event);
         }
@@ -6322,6 +6335,18 @@ impl Engine {
                 rgb.height,
                 rgb_faces.len(),
                 rgb_top.as_ref().map(|f| f.score).unwrap_or(0.0)
+            );
+            // Close the self-heal fallback's window after its one
+            // recapture: the capture mode was never demoted, so the next
+            // scan or attempt is concurrent again. Without this closing
+            // marker, every later capture in the same segment would ride
+            // the fallback boundary into the sequential envelope
+            // (#1147 review round 18).
+            diagnostics.emit_share_safe(
+                irlume_common::diagnostics::ShareSafeEventKind::CaptureScheduleSelected {
+                    schedule: irlume_common::diagnostics::CaptureSchedule::Concurrent,
+                    source: irlume_common::diagnostics::CaptureScheduleSource::RuntimeHealth,
+                },
             );
         }
         diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::DetectorCount {

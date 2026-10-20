@@ -642,6 +642,7 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         // demoted). Within a segment, a fallback boundary still includes
         // the retry that follows it.
         let mut segments: Vec<SegmentRule> = vec![SegmentRule {
+            start_sequence: 0,
             end_sequence: u64::MAX,
             schedule: None,
             fallback: None,
@@ -652,12 +653,13 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                     transition: ShareSafeEventKind::CaptureScheduleSelected { schedule, .. },
                 } => {
                     // A new selection closes the running segment at this
-                    // sequence; each segment keeps its own rule so a later
-                    // attempt's evidence cannot overwrite an earlier
-                    // fallback's coverage.
-                    let end = record.sequence;
-                    segments.last_mut().unwrap().end_sequence = end;
+                    // sequence; each segment keeps its own rule and its own
+                    // bounds, so a later Sequential selection cannot reach
+                    // back over an earlier concurrent segment's captures.
+                    let boundary = record.sequence;
+                    segments.last_mut().unwrap().end_sequence = boundary;
                     segments.push(SegmentRule {
+                        start_sequence: boundary,
                         end_sequence: u64::MAX,
                         schedule: Some(schedule),
                         fallback: None,
@@ -792,12 +794,18 @@ fn render_analysis(records: &[TraceRecord]) -> String {
 /// CaptureScheduleSelected opens a segment that runs until the next one;
 /// `fallback` is the sequence of its CaptureFallback marker, if any.
 struct SegmentRule {
+    start_sequence: u64,
     end_sequence: u64,
     schedule: Option<CaptureSchedule>,
     fallback: Option<u64>,
 }
 
 impl SegmentRule {
+    /// Whether this segment contains the sequence at all.
+    fn contains(&self, sequence: u64) -> bool {
+        sequence >= self.start_sequence && sequence < self.end_sequence
+    }
+
     /// Whether a generic capture at this sequence joins the sequential
     /// envelope under this segment's rule.
     fn covers(&self, sequence: u64) -> bool {
@@ -819,24 +827,32 @@ fn sequential_intervals(
     operation_records: &[&TraceRecord],
     segments: &[SegmentRule],
 ) -> Vec<StageInterval> {
+    // Both lists are sequence-ordered, so one forward pass assigns each
+    // generic capture to the single segment containing it: no per-capture
+    // scan of every segment (a bounded trace can alternate markers and
+    // captures up to the event limit).
+    let mut cursor = 0_usize;
     operation_records
         .iter()
-        .filter_map(|record| match record.event {
-            TraceEventKind::StageTiming { stage, elapsed_us } => {
-                let name = format!("{stage:?}");
-                let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
-                let generic_covered = generic
-                    && segments.iter().any(|segment| {
-                        record.sequence < segment.end_sequence && segment.covers(record.sequence)
-                    });
-                let sequential_stage = name.starts_with("Sequential") || generic_covered;
-                sequential_stage.then_some(StageInterval {
-                    stage: name,
-                    start_us: record.monotonic_us.saturating_sub(elapsed_us),
-                    end_us: record.monotonic_us,
-                })
+        .filter_map(|record| {
+            let (stage, elapsed_us) = match record.event {
+                TraceEventKind::StageTiming { stage, elapsed_us } => (stage, elapsed_us),
+                _ => return None,
+            };
+            while cursor + 1 < segments.len() && !segments[cursor].contains(record.sequence) {
+                cursor += 1;
             }
-            _ => None,
+            let name = format!("{stage:?}");
+            let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
+            let generic_covered = generic
+                && segments[cursor].contains(record.sequence)
+                && segments[cursor].covers(record.sequence);
+            let sequential_stage = name.starts_with("Sequential") || generic_covered;
+            sequential_stage.then_some(StageInterval {
+                stage: name,
+                start_us: record.monotonic_us.saturating_sub(elapsed_us),
+                end_us: record.monotonic_us,
+            })
         })
         .collect()
 }

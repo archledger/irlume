@@ -5674,7 +5674,6 @@ impl Engine {
         // Sequential roles report their timing as each finishes, so a trace
         // consumer reconstructing the capture span adds them instead of
         // overlapping two stages that were emitted together at the end.
-        let mut rgb_timing_emitted = false;
         let (mut rgb_res, mut rgb_ms, mut ir_res, mut ir_ms) = if let Some((rgb_s, ir_s)) = held {
             if sequential {
                 // Held sessions exist only on the concurrent schedule
@@ -5721,7 +5720,6 @@ impl Engine {
                     irlume_common::diagnostics::TraceStage::RgbCapture,
                     rgb_ms,
                 );
-                rgb_timing_emitted = true;
             }
             // Match the old short-circuit: don't fire the IR emitter after an
             // RGB fault (privacy switch, missing node); the shared retry below
@@ -5750,6 +5748,18 @@ impl Engine {
                 let t = std::time::Instant::now();
                 let rgb = irlume_camera::capture_rgb_denoised_with_control(&self.rgb_dev, &control);
                 let rgb_ms = t.elapsed().as_millis();
+                // Each side reports at its own endpoint: RGB here, on the
+                // main thread, the moment its capture ends - even while the
+                // IR thread is still running - and IR below, where the join
+                // returns at the IR capture's end. Batching both after the
+                // join gave the earlier side the later side's endpoint,
+                // inflating the intervals' overlap in offline analysis
+                // (#1147 review round 10).
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    rgb_ms,
+                );
                 let (ir, ir_ms) = ir_thread.join().unwrap_or_else(|_| {
                     (
                         Err(irlume_common::Error::Hardware(
@@ -5758,27 +5768,20 @@ impl Engine {
                         0,
                     )
                 });
+                emit_trace_stage_ms(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    ir_ms,
+                );
                 (rgb, rgb_ms, ir.map(Some), ir_ms)
             })
         };
-        // The captures above have ended, so their timings are reported
-        // BEFORE the deadline check: a capture that crossed the
-        // authentication deadline still spent its wall time, and the
+        // The deadline check follows the captures: a capture that crossed
+        // the authentication deadline still spent its wall time, and the
         // operation can complete later with OperationFinished - a missing
         // record there would leave the offline envelope silently omitting
-        // the capture (#1147 review round 8).
-        if !rgb_timing_emitted {
-            emit_trace_stage_ms(
-                diagnostics,
-                irlume_common::diagnostics::TraceStage::RgbCapture,
-                rgb_ms,
-            );
-        }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::IrCapture,
-            ir_ms,
-        );
+        // the capture (#1147 review round 8). The emissions above precede
+        // it at each capture's own endpoint.
         self.check_request_active()?;
         for error in [rgb_res.as_ref().err(), ir_res.as_ref().err()]
             .into_iter()
@@ -18009,16 +18012,39 @@ mod engine_tests {
         // round 8). Mutually verified: mutating the emission order out
         // fails this pin.
         let src = include_str!("lib.rs");
-        let region = src
-            .split("let (ir, ir_ms) = ir_thread.join()")
+        // RGB reports between its own capture and the IR join; IR reports
+        // between the join (its endpoint) and the deadline check. Both
+        // precede check_request_active, and neither waits for the other
+        // side's endpoint.
+        let scope_region = src
+            .split("let ir_thread = s.spawn(move || {")
             .nth(1)
+            .unwrap()
+            .split("std::thread::scope")
+            .next()
             .unwrap()
             .split("check_request_active")
             .next()
             .unwrap();
+        let before_join = scope_region
+            .split("let (ir, ir_ms) = ir_thread.join()")
+            .next()
+            .unwrap();
+        let after_join = scope_region
+            .split("let (ir, ir_ms) = ir_thread.join()")
+            .nth(1)
+            .unwrap();
         assert!(
-            region.contains("emit_trace_stage_ms"),
-            "the capture timings must be emitted before the deadline check"
+            before_join.contains("emit_trace_stage_ms"),
+            "RGB must report at its own endpoint, before the IR join"
+        );
+        assert!(
+            after_join
+                .split("check_request_active")
+                .next()
+                .unwrap()
+                .contains("emit_trace_stage_ms"),
+            "IR must report at the join, its endpoint, before the deadline check"
         );
     }
 }

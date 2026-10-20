@@ -727,7 +727,8 @@ All notable changes to irlume are documented here. This project adheres to
   refuse further writes or publication. Known unqualified network
   destinations are refused before artifact data is written rather than
   trusting successful chmod or a durability warning. The recorder checks
-  storage before subscribing (ADR-0008, amendment 2026-10-20).
+  storage before subscribing and removes its empty preflight partial if
+  subscription setup fails (ADR-0008, amendment 2026-10-20).
 
 - `irlume trace explain` bounds each record read before buffering it, using
   the smaller of the line limit and the remaining total-byte budget

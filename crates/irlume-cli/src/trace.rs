@@ -641,31 +641,39 @@ fn render_analysis(records: &[TraceRecord]) -> String {
         // recapture is concurrent again, because the capture mode is not
         // demoted). Within a segment, a fallback boundary still includes
         // the retry that follows it.
-        let mut generic_class = GenericCaptureClass::Unknown;
-        let mut segment_schedule: Option<CaptureSchedule> = None;
-        let mut segment_fallback: Option<u64> = None;
+        let mut segments: Vec<SegmentRule> = vec![SegmentRule {
+            end_sequence: u64::MAX,
+            schedule: None,
+            fallback: None,
+        }];
         for record in &operation_records {
             match record.event {
                 TraceEventKind::Shared {
                     transition: ShareSafeEventKind::CaptureScheduleSelected { schedule, .. },
                 } => {
-                    // Close the finished segment.
-                    generic_class =
-                        classify_segment(generic_class, segment_schedule, segment_fallback);
-                    segment_schedule = Some(schedule);
-                    segment_fallback = None;
+                    // A new selection closes the running segment at this
+                    // sequence; each segment keeps its own rule so a later
+                    // attempt's evidence cannot overwrite an earlier
+                    // fallback's coverage.
+                    let end = record.sequence;
+                    segments.last_mut().unwrap().end_sequence = end;
+                    segments.push(SegmentRule {
+                        end_sequence: u64::MAX,
+                        schedule: Some(schedule),
+                        fallback: None,
+                    });
                 }
                 TraceEventKind::Shared {
                     transition: ShareSafeEventKind::CaptureFallback { .. },
                 } => {
-                    if segment_fallback.is_none() {
-                        segment_fallback = Some(record.sequence);
+                    let segment = segments.last_mut().unwrap();
+                    if segment.fallback.is_none() {
+                        segment.fallback = Some(record.sequence);
                     }
                 }
                 _ => {}
             }
         }
-        generic_class = classify_segment(generic_class, segment_schedule, segment_fallback);
         let has_generic_captures = operation_records.iter().any(|record| {
             matches!(
                 record.event,
@@ -675,46 +683,35 @@ fn render_analysis(records: &[TraceRecord]) -> String {
                 }
             )
         });
-        if matches!(generic_class, GenericCaptureClass::Unknown) && !has_generic_captures {
-            // Nothing to classify unless a capture route ran entirely before
-            // the subscription: with no schedule evidence and no capture
-            // record at all, Sequential* stages (or the absence of any
-            // capture-path stage) leave nothing ambiguous. But a
-            // CaptureSetup or Finalization record means a capture route ran
-            // and went unobserved - the envelope is unavailable, not zero.
-            let capture_route_ran = operation_records.iter().any(|record| {
-                matches!(
-                    record.event,
-                    TraceEventKind::StageTiming {
-                        stage: TraceStage::CaptureSetup | TraceStage::Finalization,
-                        ..
-                    }
-                )
-            });
-            if !capture_route_ran {
-                generic_class = GenericCaptureClass::Excluded;
-            }
+        let any_evidence = segments.iter().any(SegmentRule::has_evidence);
+        let capture_route_ran = operation_records.iter().any(|record| {
+            matches!(
+                record.event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::CaptureSetup | TraceStage::Finalization,
+                    ..
+                }
+            )
+        });
+        if !any_evidence && !has_generic_captures && !capture_route_ran {
+            // No schedule evidence, no generic capture record, and no
+            // capture-path stage: nothing sequential to report.
+            segments.clear();
         }
-        match generic_class {
-            GenericCaptureClass::Unknown => {
-                writeln!(
-                    output,
-                    "  sequential_union_us=unavailable (schedule or capture evidence predates recording)"
-                )
-                .unwrap();
-            }
-            class => {
-                let sequential_blocks = merge_intervals(sequential_intervals(
-                    &operation_records,
-                    matches!(class, GenericCaptureClass::All),
-                    match class {
-                        GenericCaptureClass::AfterFallback(sequence) => Some(sequence),
-                        _ => None,
-                    },
-                ));
-                let sequential_union = union_us(&sequential_blocks);
-                writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
-            }
+        if !any_evidence && (has_generic_captures || capture_route_ran) {
+            // Generic captures or a capture route without any schedule
+            // evidence: the evidence predates the recording, and a zero
+            // would read as a confident concurrent pair.
+            writeln!(
+                output,
+                "  sequential_union_us=unavailable (schedule or capture evidence predates recording)"
+            )
+            .unwrap();
+        } else {
+            let sequential_blocks =
+                merge_intervals(sequential_intervals(&operation_records, &segments));
+            let sequential_union = union_us(&sequential_blocks);
+            writeln!(output, "  sequential_union_us={sequential_union}").unwrap();
         }
         writeln!(output, "  blocks:").unwrap();
         for block in &blocks {
@@ -791,52 +788,36 @@ fn render_analysis(records: &[TraceRecord]) -> String {
     output
 }
 
-/// How generic RgbCapture/IrCapture intervals join the sequential envelope.
-enum GenericCaptureClass {
-    All,
-    AfterFallback(u64),
-    Excluded,
-    Unknown,
-}
-
-/// Fold one schedule segment's evidence into the running classification.
-/// Each `CaptureScheduleSelected` starts a segment; its fallback marker
-/// (if any) marks sequential work after that boundary within it.
-fn classify_segment(
-    current: GenericCaptureClass,
+/// One schedule segment's evidence window: every
+/// CaptureScheduleSelected opens a segment that runs until the next one;
+/// `fallback` is the sequence of its CaptureFallback marker, if any.
+struct SegmentRule {
+    end_sequence: u64,
     schedule: Option<CaptureSchedule>,
     fallback: Option<u64>,
-) -> GenericCaptureClass {
-    use GenericCaptureClass as G;
-    match schedule {
-        Some(CaptureSchedule::Sequential) => G::All,
-        Some(CaptureSchedule::Concurrent) => match fallback {
-            Some(boundary) => G::AfterFallback(boundary),
-            None => {
-                if matches!(current, G::All) {
-                    G::All
-                } else {
-                    G::Excluded
-                }
+}
+
+impl SegmentRule {
+    /// Whether a generic capture at this sequence joins the sequential
+    /// envelope under this segment's rule.
+    fn covers(&self, sequence: u64) -> bool {
+        match self.schedule {
+            Some(CaptureSchedule::Sequential) => true,
+            Some(CaptureSchedule::Concurrent) | None => {
+                self.fallback.is_some_and(|boundary| sequence > boundary)
             }
-        },
-        None => match fallback {
-            Some(boundary) => {
-                if matches!(current, G::Unknown) {
-                    G::AfterFallback(boundary)
-                } else {
-                    current
-                }
-            }
-            None => current,
-        },
+        }
+    }
+
+    /// Whether the segment carries any evidence at all.
+    fn has_evidence(&self) -> bool {
+        self.schedule.is_some() || self.fallback.is_some()
     }
 }
 
 fn sequential_intervals(
     operation_records: &[&TraceRecord],
-    all_generic: bool,
-    after_fallback_sequence: Option<u64>,
+    segments: &[SegmentRule],
 ) -> Vec<StageInterval> {
     operation_records
         .iter()
@@ -845,12 +826,9 @@ fn sequential_intervals(
                 let name = format!("{stage:?}");
                 let generic = matches!(stage, TraceStage::RgbCapture | TraceStage::IrCapture);
                 let generic_covered = generic
-                    && (all_generic
-                        || after_fallback_sequence.is_some_and(|boundary| {
-                            // Only the retry after the fallback marker: the pair the
-                            // marker preceded was the discarded concurrent attempt.
-                            record.sequence > boundary
-                        }));
+                    && segments.iter().any(|segment| {
+                        record.sequence < segment.end_sequence && segment.covers(record.sequence)
+                    });
                 let sequential_stage = name.starts_with("Sequential") || generic_covered;
                 sequential_stage.then_some(StageInterval {
                     stage: name,

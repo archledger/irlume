@@ -111,6 +111,9 @@ jobs:
           python3 -B scripts/test-check-agents-md.py
           python3 -B scripts/check-agents-md.py
 
+      - name: Virtual-camera bootstrap contracts (fixtures, no hardware)
+        run: python3 -B scripts/ci/test-v4l2-bootstrap.py
+
       # Offline, with the runner's openssl: the refresh script's own tests,
       # then the shipped vendor CA certificates against their manifest
       # (ADR-0036 section 5).
@@ -390,7 +393,8 @@ jobs:
         run: |
           # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
           # kernel's V4L2 API and fails to load; build upstream at a pinned
-          # commit instead. videodev (its dependency) lives in modules-extra.
+          # commit instead. videodev may be in the core or extra modules
+          # package, depending on the running kernel's packaging.
           # PAM test prerequisites are installed in the initial dependency step,
           # independently of whether virtual camera nodes already exist.
           # video8/9 are fed by ffmpeg; video10 is a spare the camera streaming
@@ -399,11 +403,21 @@ jobs:
           # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
           # video); build-from-source only on a runner without them.
           if [ ! -e /dev/video8 ]; then
-          sudo apt-get install -y --no-install-recommends "linux-headers-$(uname -r)" "linux-modules-extra-$(uname -r)" ffmpeg
+          kernel="$(uname -r)"
+          sudo apt-get install -y --no-install-recommends "linux-headers-$kernel" ffmpeg
+          # A rolling image can have loadable modules whose old package name
+          # is no longer in APT. Require the actual capability, not -extra.
+          # Azure 7.0 supplies videodev in linux-modules, without -extra.
+          if ! sudo modprobe videodev; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-$kernel"
+            if ! sudo modprobe videodev; then
+              sudo apt-get install -y --no-install-recommends "linux-modules-extra-$kernel"
+              sudo modprobe videodev
+            fi
+          fi
           git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
           git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
           make -C /tmp/v4l2loopback -j"$(nproc)"
-          sudo modprobe videodev
           sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
           # Let udev finish applying its default (root:video 0660) perms BEFORE
           # our chmod, otherwise a late udev event overrides it and a test opens

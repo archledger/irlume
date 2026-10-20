@@ -540,6 +540,7 @@ impl Engine {
                 detections,
                 PairAssessmentContext {
                     operation,
+                    capture_mode: Some(mode),
                     sequential: false,
                     pair_sequential_retried: false,
                     rgb_hard_retried: false,

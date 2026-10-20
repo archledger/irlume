@@ -729,6 +729,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Diagnostic trace segment attribution (#1150): `trace analyze` reports an
+  unavailable sequential envelope if any generic capture's segment lacks
+  schedule or fallback evidence, even when a later attempt has a schedule.
+  Capture-less operations retain their sentinel and zero envelope. A
+  self-heal recapture's closing marker re-emits the retained selection's
+  source rather than naming runtime health unconditionally. Authentication
+  decisions and capture policy are unchanged.
+
 - CI virtual-camera setup checks that `videodev` loads before requiring a
   module package. It tries the running kernel's core modules before the
   older extra-module layout, so Azure 7.0's unavailable `-extra` package

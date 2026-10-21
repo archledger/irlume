@@ -611,6 +611,45 @@ mod provider_runtime_reporting_tests {
         }));
         assert!(value.get("selection").is_none());
     }
+
+    /// The selection words `status --json` passes through are exactly the
+    /// schema's `recognizer.selection` enum (#1053): contract 1 adds no enum
+    /// value, and a word the schema lists must not be dropped.
+    #[test]
+    fn passed_selection_words_are_the_schema_enum() {
+        let schema: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../schemas/machine-api-v1.schema.json"
+            ))
+            .expect("schemas/machine-api-v1.schema.json readable from the workspace"),
+        )
+        .unwrap();
+        let listed: Vec<&str> = schema
+            .pointer("/$defs/statusData/properties/recognizer/properties/selection/enum")
+            .and_then(|words| words.as_array())
+            .expect("the schema lists the selection words")
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect();
+        assert_eq!(listed, ["auto", "cpu", "npu", "gpu"]);
+        for word in listed.iter().copied().chain(["tpu", "AUTO", ""]) {
+            let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some("NPU discovery not reported; using CPU".into()),
+                platform: None,
+                runtime_available: None,
+                qualified: None,
+                selection: Some(word.into()),
+            }));
+            let expected = listed.contains(&word).then_some(word);
+            assert_eq!(
+                value.get("selection").and_then(|v| v.as_str()),
+                expected,
+                "{word:?}"
+            );
+        }
+    }
 }
 
 fn valid_status_args(args: &[String]) -> bool {

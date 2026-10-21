@@ -411,6 +411,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0013 restates the shipped ViT RGB PAD cue's LFW evidence with figures
+  that reproduce from the committed per-frame scores (ADR-0013 §4, amendment
+  2026-10-21, #1166). Taking each LFW identity's images in fives, 4 of 1,072
+  groups reach the 0.55 line, every group of one identity, and 131 reach
+  0.50; the earlier "0 of 531 sampled presentations" at 0.55 and "7.3% at
+  0.50" have no recorded images, grouping or code behind them. The
+  models/README.md ViT row and the threshold and vote comments cite the
+  amendment. The threshold, the five-frame vote and their tests are
+  unchanged.
+
 - docs/LIMITATIONS.md records that a dim room can make the shipped ViT RGB
   PAD cue refuse a genuine face (ADR-0013 §4, #1155). The cue denies when
   the median of the last five scores reaches 0.55. Single genuine frames

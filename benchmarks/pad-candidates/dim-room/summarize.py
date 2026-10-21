@@ -16,13 +16,20 @@ m96 scores: distribution, and the share of five-frame groups refused when a
 uniform shift is added to every frame score, both for the i.i.d. bootstrap and
 for each identity's images taken in fives in file order (different photos of
 one person, so correlated like the frames of one presentation, though not the
-same thing), with i.i.d. draws from those same frames for comparison.
+same thing), with i.i.d. draws from those same frames for comparison. Before
+that table, one line per deny line in LINES (cited by the ADR-0013 amendment
+of 2026-10-21): the share of images at or above it, in all and in the grouped
+images; the per-identity groups whose median reaches it, the identities they
+come from and how many of those have every group there; and the exact i.i.d.
+rate on the grouped images, the binomial probability that three or more of
+five independent draws reach it.
 
 Usage: summarize.py <scores.csv> [<scores.csv> ...] [--recorded CSV]
            [--draws N] [--seed N]
 """
 import argparse
 import csv
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -30,11 +37,20 @@ import numpy as np
 DENY_LINE = 0.55  # VIT_PAD_THRESHOLD
 VOTE_N = 5  # VIT_PAD_VOTE_N
 SHIFTS = [0.0, 0.02, 0.03, 0.05, 0.08, 0.10]
+LINES = [0.50, 0.52, 0.55, 0.60]
 
 
 def refused(p, draws, rng):
     picks = rng.choice(p, size=(draws, VOTE_N), replace=True)
     return float((np.median(picks, axis=1) >= DENY_LINE).mean())
+
+
+def iid_exact(p, line):
+    # The median of VOTE_N (odd) independent draws reaches the line exactly
+    # when more than half of them do.
+    q = float((p >= line).mean())
+    return sum(math.comb(VOTE_N, k) * q ** k * (1 - q) ** (VOTE_N - k)
+               for k in range(VOTE_N // 2 + 1, VOTE_N + 1))
 
 
 def recorded(path, draws, seed):
@@ -55,6 +71,20 @@ def recorded(path, draws, seed):
     ids = sum(1 for v in by_id.values() if len(v) >= VOTE_N)
     print(f"per-identity groups of {VOTE_N}: {len(groups)} from {len(sub)} frames of {ids} identities; "
           f"median >= 0.60: {int((groups >= 0.60).sum())}")
+    group_ids = [k for k, v in by_id.items() for _ in range(len(v) // VOTE_N)]
+    for line in LINES:
+        hit = groups >= line
+        per_id = defaultdict(list)
+        for g, h in zip(group_ids, hit, strict=True):
+            per_id[g].append(bool(h))
+        n_any = sum(any(v) for v in per_id.values())
+        n_all = sum(all(v) for v in per_id.values())
+        print(f"deny line {line:.2f}: images >= line "
+              f"{(p >= line).mean() * 100:.2f}% (all), "
+              f"{(sub >= line).mean() * 100:.2f}% (grouped); per-identity groups "
+              f"{int(hit.sum())}/{len(groups)} from {n_any}/{ids} identities "
+              f"({n_all} with every group); 5-median i.i.d. exact "
+              f"{iid_exact(sub, line) * 100:.3g}% (grouped images)")
     for shift in SHIFTS:
         hit = int(((groups + shift) >= DENY_LINE).sum())
         all_iid = refused(p + shift, draws, np.random.default_rng(seed))

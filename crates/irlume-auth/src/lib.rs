@@ -1260,17 +1260,20 @@ pub const AMBIENT_LIT_SHARE: f32 = 0.5;
 /// 5-frame-median voting: every login-distance banner presentation on BOTH
 /// cameras measured 0.594–0.656 (caught), every genuine presentation on
 /// both cameras across desk/dim/close/glasses measured 0.27–0.465 (margin
-/// 0.085), and 531 sampled LFW all-genuine presentations: 0 fire (0.50
-/// would fire 7.3% — rejected). Do NOT raise toward 0.60 (drops the NexiGo
-/// banner) or lower toward 0.50 (crosses the LFW tail and halves the
-/// genuine margin). Evidence: docs/research/2026-08-22-vit-live-
+/// 0.085). Offline on LFW stills, each identity's images taken in fives:
+/// 4 of 1,072 groups have a median at or above 0.55, every group of one
+/// identity, against 131 groups from 83 identities at 0.50 (ADR-0013
+/// amendment 2026-10-21). Do NOT raise toward 0.60 (drops the NexiGo
+/// banner) or lower toward 0.50 (reaches far more of the LFW tail and more
+/// than halves the genuine margin). Evidence: docs/research/2026-08-22-vit-live-
 /// qualification.md + the fleet run recorded in PR #516.
 pub const VIT_PAD_THRESHOLD: f32 = 0.55;
 
-/// ViT PAD vote window: the median of the last N scores decides. Voting is
-/// what collapsed the LFW genuine tail (0.29% frame-level ≥ 0.60 → 0/531
-/// 5-frame-median presentations), so single-frame firing would trade that
-/// measured genuine stability away.
+/// ViT PAD vote window: the median of the last N scores decides. On LFW
+/// stills, each identity's images taken in fives, 1.74% of the images but 4
+/// of the 1,072 group medians score at or above 0.55 (ADR-0013 amendment
+/// 2026-10-21), so single-frame firing would trade measured genuine
+/// stability away.
 pub const VIT_PAD_VOTE_N: usize = 5;
 
 /// Shipped IR PAD deny threshold (ADR-0013): the FLIR cue's measured
@@ -4817,8 +4820,8 @@ impl Engine {
     }
 
     /// Record one ViT PAD score and answer whether the 5-frame-median vote
-    /// DENIES. Median (not mean) per the qualification protocol: it is the
-    /// statistic that held genuine at 0/531 presentations on LFW. The ring
+    /// DENIES. Median (not mean) per the qualification protocol, which
+    /// measured presentation medians (ADR-0013 section 4). The ring
     /// keeps the last [`VIT_PAD_VOTE_N`] scores of THIS authentication only
     /// (`authenticate_for` clears it).
     fn vit_pad_votes_deny(&mut self, score: f32) -> bool {
@@ -14080,10 +14083,12 @@ mod pad_cue_tests {
     /// the window slides, and the threshold sits in the measured FLEET gap:
     /// genuine presentation-medians topped at 0.465 (dim-marginal, Zenbook)
     /// and every login-distance banner presentation on both fleet cameras
-    /// measured 0.594-0.656. These assertions pin BOTH sides: a raised
-    /// threshold drops the NexiGo banner (measured at 0.55-0.60 median), a
-    /// lowered one crosses the LFW presentation tail (1.3% fire at 0.52,
-    /// 7.3% at 0.50).
+    /// measured 0.594-0.656. These assertions pin both sides of that gap; a
+    /// raised threshold drops the NexiGo banner (measured at 0.55-0.60
+    /// median). The LFW tail is not pinned here, and the shipped line
+    /// already touches it: with each identity's LFW images taken in fives,
+    /// 4 of 1,072 groups reach 0.55, 24 reach 0.52 and 131 reach 0.50
+    /// (ADR-0013 amendment 2026-10-21).
     #[test]
     fn vit_vote_abstains_until_full_and_the_threshold_pins_the_measured_window() {
         // Worst measured genuine presentation (0.465): never a denial.

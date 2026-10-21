@@ -29,14 +29,18 @@ pub use crate::gpu::{settings_conf_value, switch_allows, Setting};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// How every model is compiled for the GPU (ADR-0033 section 2). The
-/// precision is named explicitly because OpenVINO GPUs accept several
-/// inference precisions and the precision changes the drift a
-/// certification judges; the certified configuration is `f16`, the GPU
-/// default on current drivers. An implementation claiming conformance
-/// compiles with exactly this.
+/// How every model is compiled for the GPU (ADR-0033 section 2, amended
+/// 2026-10-21). The precision is named explicitly because OpenVINO GPUs
+/// accept several inference precisions and the precision changes the
+/// drift a certification judges; the certified configuration is `f32`.
+/// The GPU plugin's own default is `f16`, which measured outside the
+/// ADR-0022 section 7 drift budget on both measured identities, while
+/// `f32` reproduced the CPU reference within 1e-6. An explicit precision
+/// hint also makes the plugin's execution mode irrelevant: OpenVINO only
+/// derives the precision from `EXECUTION_MODE_HINT` when no precision was
+/// set. An implementation claiming conformance compiles with exactly this.
 pub const COMPILE_CONFIGURATION: &str =
-    "batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16";
+    "batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32";
 
 /// The loaded GPU firmware builds, where the kernel exposes them (ADR-0033
 /// section 3): the GuC and HuC versions of the graphics microcontrollers,
@@ -1040,7 +1044,7 @@ const WARM_UP_ONNX: &[u8] = &[
 
 /// The inference precision of [`COMPILE_CONFIGURATION`].
 #[cfg(test)]
-const INFERENCE_PRECISION: &str = "f16";
+const INFERENCE_PRECISION: &str = "f32";
 
 /// The performance hint of [`COMPILE_CONFIGURATION`].
 #[cfg(test)]

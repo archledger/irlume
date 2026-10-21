@@ -56,6 +56,24 @@
   through the already-validated provider path, and the dGPU shows an
   order of magnitude more through a path this project has not audited.
   ADR-0033 scopes the first and leaves the second inert.
-- **Pending:** the UX5406S (Lunar Lake, Arc 140V) rerun of the same
-  harness, which feeds the `auto` ranking evidence; the minihost numbers
-  are a proxy from the weakest CPU and a 24-EU-class integrated GPU.
+- **UX5406S rerun (2026-10-10, recorded here 2026-10-21):** the same
+  harness extended with an OpenVINO NPU lane ran on the decision hardware
+  (Lunar Lake, Arc 140V integrated GPU, Intel AI Boost NPU on the 1.38.0
+  driver, Fedora 44 kernel 7.2.8, OpenVINO 2026.2.1 from the
+  intel-npu-stack 0.2.0 candidate packages, intel-compute-runtime
+  26.35.39758.11), two process runs of 300 and 500 timed calls over the
+  16 fixed synthetic inputs. Medians: ONNX Runtime CPU (production
+  configuration) 98.7 and 105.7 ms; OpenVINO CPU 82.5 and 90.5 ms;
+  OpenVINO GPU 5.81 and 5.51 ms (first compile 0.43 to 0.85 s, lane RSS
+  +217 to +375 MiB); OpenVINO NPU 3.59 and 3.59 ms (first compile 1.56 to
+  1.60 s, +553 to +560 MiB). Parity observations: OpenVINO CPU cosine
+  1.000000 against the ONNX Runtime outputs; both accelerators 0.999996 to
+  0.999998. The lanes compiled with the plugin's default properties (no
+  latency hint, no explicit precision), so this is a raw-inference ranking
+  only; the certified `f32` configuration (ADR-0033 amendment
+  2026-10-21) is measured separately. Archive:
+  `artifacts/irlume/2026-10-10-1053-gpu-benchmark/zenbook-three-way/`
+  (`REPORT.md`, `zenbench-run2.log` for the 300-call run,
+  `zenbench-run3.log` for the 500-call run, `gpu_benchmark.rs`). The
+  minihost numbers above remain a proxy from the weakest CPU and a
+  24-EU-class integrated GPU.

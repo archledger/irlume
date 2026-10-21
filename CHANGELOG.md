@@ -398,7 +398,8 @@ All notable changes to irlume are documented here. This project adheres to
   attributes must match), reads the GuC/HuC firmware of that same node,
   records the GPU plugin build, the loader family the plugin resolved
   (`libOpenCL` or `libze_loader`, from the mapped libraries), the fixed
-  compile configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`
+  compile configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`
+  (`f16` until the ADR-0033 amendment of 2026-10-21, see Changed)
   and the SHA-256 of every mapped native library under the ADR-0022
   one-open-file inode discipline. `GPU_DRIVER_VERSION` is never read:
   the property read kills the process on the measured 2026.2.1 builds,
@@ -410,6 +411,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The fixed GPU compile configuration names `f32` as the inference
+  precision (`batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`),
+  ADR-0033 amendment 2026-10-21. The plugin's `f16` default measured
+  outside the ADR-0022 section 7 drift budget on both measured identities
+  (UX5406S Arc 140V: recorded genuine IR lower shift 5/1474 and recorded
+  genuine RGB +1/339; ThinkPad Iris Xe: genuine LFW drift 0.00108, one
+  pair in 400 either way), while `f32` reproduced the CPU reference within
+  1e-6 with zero verdict differences on the same corpora, and on the
+  UX5406S passed the recorded-frame and corpora arms (13 of 13) with
+  drift at or below 7.5e-7. The `gpu_hw_*`
+  lanes and the cache control compile with the new configuration; every
+  `f16` identity leaves certification consideration. Loading admission
+  stays closed and `CERTIFIED` stays empty
+  (docs/research/2026-10-21-gpu-f32-precision.md, #1053).
 - docs/LIMITATIONS.md records that the NexiGo HelloCam N930W measured
   here (`3443:c803`) streams IR at 14.73 to 14.79 fps, about 1.2 to 1.7%
   above the 14.55 fps delivered-rate floor, so an occasional capture

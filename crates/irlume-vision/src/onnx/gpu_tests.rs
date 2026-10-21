@@ -169,7 +169,7 @@ mod gpu_groundwork_tests {
     fn gpu_compile_configuration_pins_the_adr0033_contract() {
         assert_eq!(
             gpu::COMPILE_CONFIGURATION,
-            "batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16"
+            "batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32"
         );
     }
 

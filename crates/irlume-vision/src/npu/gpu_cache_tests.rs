@@ -46,7 +46,7 @@ fn gpu_cache_valid_bypass_miss_and_hit_keep_owned_readbacks() {
         ("/owned/cache", CacheProvenance::Hit, "YES"),
     ] {
         assert_eq!(
-            observation(dir, expected, dir, dir, loaded, "LATENCY", "f16"),
+            observation(dir, expected, dir, dir, loaded, "LATENCY", "f32"),
             Ok(CacheObservation {
                 core_cache_dir: dir.into(),
                 compiled_cache_dir: dir.into(),
@@ -71,7 +71,7 @@ fn gpu_cache_bypass_refuses_import_or_nonempty_directory() {
             compiled,
             loaded,
             "LATENCY",
-            "f16"
+            "f32"
         )
         .is_err());
     }
@@ -93,7 +93,7 @@ fn gpu_cache_directory_requires_both_exact_readbacks() {
             compiled,
             "NO",
             "LATENCY",
-            "f16"
+            "f32"
         )
         .is_err());
     }
@@ -109,7 +109,7 @@ fn gpu_cache_required_hit_refuses_no_and_first_miss_refuses_yes() {
             "/owned/cache",
             flag,
             "LATENCY",
-            "f16"
+            "f32"
         )
         .is_err());
     }
@@ -118,7 +118,7 @@ fn gpu_cache_required_hit_refuses_no_and_first_miss_refuses_yes() {
 #[test]
 fn gpu_cache_unknown_getter_flag_never_counts_as_no() {
     for flag in ["", "no", "false", "0", "NO ", "NO YES"] {
-        assert!(observation("", CacheProvenance::Bypass, "", "", flag, "LATENCY", "f16").is_err());
+        assert!(observation("", CacheProvenance::Bypass, "", "", flag, "LATENCY", "f32").is_err());
     }
 }
 
@@ -138,7 +138,7 @@ fn gpu_cache_every_compiled_getter_error_refuses() {
                 "CACHE_DIR" => "",
                 "LOADED_FROM_CACHE" => "NO",
                 "PERFORMANCE_HINT" => "LATENCY",
-                "INFERENCE_PRECISION_HINT" => "f16",
+                "INFERENCE_PRECISION_HINT" => "f32",
                 other => panic!("unexpected property {other}"),
             }
             .into())
@@ -164,12 +164,12 @@ fn gpu_cache_core_getter_error_and_mismatch_refuse() {
 #[test]
 fn gpu_cache_compiled_fixed_configuration_must_match_exactly() {
     for (performance, precision) in [
-        ("THROUGHPUT", "f16"),
-        ("latency", "f16"),
-        ("LATENCY ", "f16"),
-        ("LATENCY", "f32"),
-        ("LATENCY", "F16"),
-        ("LATENCY", "f16 "),
+        ("THROUGHPUT", "f32"),
+        ("latency", "f32"),
+        ("LATENCY ", "f32"),
+        ("LATENCY", "f16"),
+        ("LATENCY", "F32"),
+        ("LATENCY", "f32 "),
     ] {
         assert!(observation(
             "",
@@ -191,7 +191,7 @@ fn gpu_cache_wrong_provenance_mode_refuses() {
         ("", CacheProvenance::Hit),
         ("/owned/cache", CacheProvenance::Bypass),
     ] {
-        assert!(observation(dir, expected, dir, dir, "NO", "LATENCY", "f16").is_err());
+        assert!(observation(dir, expected, dir, dir, "NO", "LATENCY", "f32").is_err());
     }
 }
 

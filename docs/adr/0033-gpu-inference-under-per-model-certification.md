@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed 2026-10-10.
+Proposed 2026-10-10. Amended 2026-10-11 (driver identity) and 2026-10-21
+(precision `f32`, ranking evidence, measured hosts).
 
 Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
 reopen GPU support during #1053. Section 15 asked for "evidence that
@@ -102,6 +103,8 @@ judges, so the fixed compile configuration names
 `f16` (the GPU default on current drivers), the value is an identity
 field, and a certification run records the precision it used, so an
 implementation claiming conformance compiles with the same one.
+(Amended 2026-10-21, below: the certified precision is `f32`; the f16
+default measured outside the drift budget on both measured identities.)
 
 ### 3. GPU platform identity extends the ADR-0022 identity
 
@@ -220,6 +223,79 @@ mapped-library manifest's content hashes instead, which section 3
 already makes a different identity on any driver or compute-runtime
 rebuild. A future runtime that answers the property safely may add it
 back as an explicit field; until then the manifest is the binding form.
+
+## Amendment 2026-10-21: the fixed precision is f32
+
+Section 2 named `f16` because it is the GPU plugin's configuration
+default (`ov::hint::inference_precision` defaults to `f16` in the 2026.2.1
+GPU plugin's option table, which accepts `f16`, `f32` and `dynamic`).
+Measuring that default under the ADR-0022 section 7 gates found its drift
+outside the budget on both identities measured so far, and `f32` inside it
+by three orders of magnitude:
+
+- UX5406S (Arc 140V, `xe`), identity `f8591769`, 2026-10-12, `f16`: the
+  recorded genuine IR arm's lower threshold shift moved 5 of 1,474 verdicts
+  (0.339 points) and the recorded genuine RGB arm added one rejection in
+  339 (0.295 points), both above the 0.2-point budget of section 7.5
+  ([the identity record](../research/2026-10-11-gpu-identity.md), phase 4
+  correction).
+- ThinkPad X13 Yoga Gen 4 (Iris Xe `8086:a7a1`, `i915`), identity `6aa45541`,
+  2026-10-13, `f16`: genuine LFW maximum absolute drift 0.00108 moved the
+  false-reject rate by one pair in 400 in both shift directions (0.25
+  points) while all 3,397 CPU/GPU verdicts agreed and no new grant
+  occurred; section 7.4 passed and section 7.5 failed.
+- The same ThinkPad, 2026-10-19, `f32` (identities `f592e9bc` and
+  `d689e37d`, the second after a kernel update): maximum absolute drift
+  6.6e-7 on genuine LFW and 3.1e-7 to 4.0e-7 on the eight other arms, zero
+  verdict differences in 3,397 comparisons, no new grant, every
+  shifted-threshold recount unchanged; three retained-process runs of 1,000
+  bit-exact calls with one proven system suspend, 41 of 41 cache-matrix
+  processes and 5 of 5 power-management stages. The section 7.6
+  runtime-suspend subset was not observed in that campaign (the harness
+  reported it inconclusive under a display session that kept the render
+  node open); on 2026-10-21, with the display blanked, the same identity
+  proved a runtime suspend and a system suspend in one retained process
+  with 1,000 of 1,000 calls bit-exact (the precision record).
+- UX5406S, identity `ec747155`, 2026-10-21, `f32`: all 13 measured arms
+  pass both gates (recorded genuine IR 1,474, IR attacks 138, recorded
+  genuine RGB 339, RGB attacks 209, 400 genuine and 400 impostor LFW
+  pairs, seven FairFace groups of 371), maximum absolute drift 7.5e-7,
+  zero verdict differences in 5,557 comparisons, no new grant; the two
+  arms that failed at `f16` on this host pass with no movement.
+
+The evidence is summarized in
+[the precision record](../research/2026-10-21-gpu-f32-precision.md) with
+the archive paths and digests.
+
+Decision: the fixed compile configuration is
+`batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`. The
+precision remains an identity field, so every `f16` identity and the
+evidence collected on it leave certification consideration; the `f16`
+reliability and cache evidence does not transfer. The ADR pins no
+execution mode: the 2026.2.1 GPU plugin derives a precision from
+`EXECUTION_MODE_HINT` only when the caller set no `inference_precision`
+(`apply_execution_hints` in the plugin's `execution_config.cpp`), so the
+explicit hint governs. Costs recorded for section 11: the `f32` compiled
+blob is about twice the `f16` blob (263,474,861 against 133,509,421 bytes
+on the ThinkPad); the corpora lane's wall time matched `f16` within two
+minutes there. Section 2's phrase "the GPU default on current drivers"
+described the plugin's configuration default, not a driver property.
+
+Two clarifications ride with this amendment. Section 6's pending ranking
+evidence exists: the UX5406S three-way measurement of 2026-10-10 (raw
+recognizer inference at the plugin's default compile properties, before
+the precision question) gave medians of 3.59 ms on the OpenVINO NPU lane,
+5.51 to 5.81 ms on the OpenVINO GPU lane and 98.7 to 105.7 ms on the
+production ONNX Runtime CPU lane ([the benchmark
+record](../research/2026-10-10-gpu-benchmarks.md)); it ranks raw
+inference only, and `auto` ranking among certified devices will rest on
+end-to-end evidence under the certified configuration. On measured hosts:
+the Phasing names the UX5406S as the decision hardware with minihost as
+the proxy; the ThinkPad X13 Yoga Gen 4 produced the reliability, cache and precision
+evidence above and is a second measured identity, not the decision
+hardware. The 2026.2.1 runtime measured on the UX5406S and in the
+2026-10-11 amendment is the intel-npu-stack 0.2.0 candidate package set;
+Fedora 44 itself ships OpenVINO 2025.1.0.
 
 ## Consequences
 

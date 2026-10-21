@@ -62,8 +62,13 @@ exactly one render node whose sysfs address and `vendor`/`device`
 attributes (`/sys/class/drm/renderD*/device`) match it; the firmware
 belongs to that node. The loader family the plugin resolved (`libOpenCL`
 or `libze_loader`, from `/proc/self/maps`) and the fixed compile
-configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f16`
-are identity fields. Every native library the enumeration mapped is
+configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`
+are identity fields. The precision is `f32` since the 2026-10-21 amendment
+of ADR-0033: the plugin's `f16` default drifted outside the ADR-0022
+section 7 budget on both measured identities, while `f32` reproduced the
+CPU reference within 1e-6 ([the precision
+record](research/2026-10-21-gpu-f32-precision.md)). Every native library
+the enumeration mapped is
 hashed through one open file whose inode is kept, under ADR-0022's
 inode discipline: the whole file-backed executable inventory (minus the
 process executable, as the NPU execution inventory excludes it) plus
@@ -88,6 +93,13 @@ the compile (the retirement trigger). Run them like the `npu_hw_*` lane:
 ulimit -c 0; cargo test -p irlume-vision --features npu --release \
   --lib -- --ignored gpu_hw_ --test-threads 1 --nocapture
 ```
+
+On a hybrid CPU, pin the process to performance cores (for example
+`taskset -c 0-3` on the UX5406S) or leave the affinity unrestricted: an
+affinity mask of two or more efficiency cores and no performance core
+aborts the 2026.2.1 GPU plugin's compile inside OpenVINO's stream
+executor configuration ([the precision
+record](research/2026-10-21-gpu-f32-precision.md)).
 
 `IRLUME_NPU_LIBRARY` selects a non-standard C API file, with
 `LD_LIBRARY_PATH` pointing the test process at that runtime root. Both
@@ -160,7 +172,7 @@ exactly these five fields (maximum 8192 bytes):
 
 Use digests from the same previously verified synthetic receipt; the control
 refuses a changed identity or baseline. It compiles with verified model-cache
-bypass, fixed batch1/LATENCY/f16 and explicit placement on the platform's sole
+bypass, fixed batch 1/LATENCY/f32 and explicit placement on the platform's sole
 enumerated device; the accepted assignment is that device's name (for example
 `GPU.0`) or the generic `GPU` some `EXECUTION_DEVICES` answers report. Do not
 derive a replacement reference from a failed run.

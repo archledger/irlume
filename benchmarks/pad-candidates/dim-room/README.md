@@ -20,8 +20,10 @@ involved and no image is committed, only per-frame scores.
 - `summarize.py <csv>... [--recorded <vit-lfw-scores.csv>]`: the tables in
   the research note, including the "5-median refused" i.i.d. bootstrap
   (20,000 draws, seed 1155) of the shipped decision (median of 5 at or above
-  0.55); `--recorded` adds the recorded LFW distribution and the uniform-shift
-  table (i.i.d. and per-identity groups of five).
+  0.55); `--recorded` adds the recorded LFW distribution, one line per deny
+  line (0.50, 0.52, 0.55 and 0.60, cited by the ADR-0013 amendment of
+  2026-10-21) and the uniform-shift table (i.i.d. and per-identity groups of
+  five).
 - `validate_harness.py <lfw-root>`: rescores 300 rows of
   [`docs/research/2026-08-21-vit-lfw-scores.csv`](../../../docs/research/2026-08-21-vit-lfw-scores.csv)
   and reports the per-frame deltas and both distributions, then counts the

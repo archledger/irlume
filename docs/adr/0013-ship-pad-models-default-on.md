@@ -80,6 +80,10 @@ records why that is sound and what it costs.
      0.27–0.465 (margin 0.085), and 0 of 531 sampled LFW all-genuine
      presentations fire (0.50 would fire 7.3% — rejected). The vote is part
      of the measurement (it is what holds the genuine side at zero).
+     (Amended 2026-10-21, below: no committed record shows which LFW
+     images, grouped how, produced the figures at 0.55 and 0.50; on the
+     committed scores, 4 of 1,072 per-identity groups of five LFW images,
+     every group of one identity, reach 0.55, and 131 reach 0.50.)
    - FLIR: 0.9 on lit-phase IR frames, the 2026-07-27 re-measured window
      (genuine max 0.702, attack floor 0.941).
 
@@ -125,3 +129,44 @@ records why that is sound and what it costs.
   `docs/pad-results/2026-07-17-third-party-pad-candidates.md`
 - FLIR at 197 identities: `docs/research/2026-08-21-flir-public-nir-revalidation.md`
 - The seven-cue survey: `docs/research/2026-08-22-screen-attack-pad-survey.md`
+
+## Amendment 2026-10-21: the LFW figures behind 0.55
+
+Section 4 and the `VIT_PAD_THRESHOLD` comment cite 0 of 531 sampled LFW
+all-genuine presentations firing at 0.55 and 7.3% firing at 0.50, and the
+vote test's comment added 1.3% at 0.52. All three first appear in the
+2026-08-22 threshold change of #516, and the two percentages give no count
+(#1166). The 531 comes from [the 2026-08-21
+evaluation](../research/2026-08-21-vit-liveness-pad-evaluation.md) (#515),
+which reports a "5-frame-median presentation simulation" on LFW with 0 of
+531 at or above 0.60, as #516 first did and as the `VIT_PAD_VOTE_N` and
+`vit_pad_votes_deny` comments still did. The per-frame scores behind that
+evaluation are committed; which images formed the 531 groups, how they
+were drawn and the code that drew them are not. None of these figures can
+be rerun, so they no longer support this decision.
+
+The reproducible figures come from the committed per-frame scores
+([`2026-08-21-vit-lfw-scores.csv`](../research/2026-08-21-vit-lfw-scores.csv),
+13,233 m96 scores of 5,749 identities), printed by `python3 summarize.py
+--recorded ../../../docs/research/2026-08-21-vit-lfw-scores.csv` run in
+`benchmarks/pad-candidates/dim-room/`. LFW holds still photographs, not
+camera presentations, so two reference cases stand in for the five-score
+median: each identity's images taken in fives in file order (1,072 groups
+from the 423 identities with five or more images, different photos of one
+person), and five scores drawn independently from those same 5,360
+images, computed exactly (the median of five reaches the line when three
+or more scores do). A camera presentation's frames covary in ways neither
+case captures, so its refusal rate need not fall between them.
+
+| Deny line | All images | Grouped images | Per-identity groups | Identities with such a group | Five independent draws, exact (3 significant figures) |
+|---|---|---|---|---|---|
+| 0.50 | 16.69% | 18.68% | 131 of 1,072 | 83 of 423 | 4.83% |
+| 0.52 | 7.36% | 7.69% | 24 of 1,072 | 19 of 423 | 0.403% |
+| 0.55 | 1.86% | 1.74% | 4 of 1,072 | 1 of 423 | 0.00509% |
+| 0.60 | 0.29% | 0.15% | 0 of 1,072 | 0 of 423 | 0.00000332% |
+
+The decision is unchanged: 0.55 with the five-score median, pinned by the
+same tests. At 0.55 the four groups are every group of one identity.
+Section 4 says the vote holds the genuine side at zero. On these
+reference cases it does not: 4 of the 1,072 group medians (0.37%) reach
+0.55, against 1.74% of the images in those groups.

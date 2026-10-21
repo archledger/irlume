@@ -160,13 +160,71 @@ and no movement under either threshold shift. The two arms that failed at
 f16 on this host (recorded genuine IR lower shift 5/1,474 and recorded
 genuine RGB +1/339) pass with no movement. The single FairFace Latino
 Hispanic accept is the same CPU baseline false accept the ThinkPad runs
-record. Still open on this identity: the retained-process control with
-proven runtime and system suspends (the UX5406S is the owner's daily
-machine, so its suspend arms wait for an idle session), the cache matrix
-of one seed, 20 bypassed compiles and 20 imports, the power-management
-diagnostic, and field-level identity dumps. Archive:
+record. The cache matrix of one seed, 20 bypassed compiles and 20
+imports passed the same day (41 of 41 processes); the suspend and
+power-management arms follow below. Archive:
 `artifacts/irlume/2026-10-21-1053-f32-witness/ux5406s-f32-campaign/`
 (lane logs, the measured-budget table, host facts, `SHA256SUMS`).
+
+### UX5406S suspend and power-management arms, 2026-10-21
+
+Run later the same day from a build of origin/main `5b275141` (the f32
+configuration on main; identity `ec747155` unchanged), as root under
+`systemd-run`, pinned to CPUs 0 to 3, with the panel blanked from the
+owner's Plasma session (`kscreen-doctor --dpms off`) so the render node
+could idle under the `xe` 1 s autosuspend delay:
+
+| Lane | Result |
+|---|---|
+| Power-management lifetime diagnostic (60 s stages, 301 samples each) | 5 of 5 stages; `a_cpu_only` 206 of 301 samples suspended; `b_platform_only`, `c_retained_request`, `d_request_dropped` and `e_platform_dropped_libraries_retained` 0 of 301, panel dark throughout |
+| Retained control, attended (runtime 120 s, system 120 s) | 1,000 of 1,000 bit-exact calls (400 before the runtime window, 300 after it, 300 after the resume); every boundary unchanged; runtime witness inconclusive (`missing event`, below); system suspend proven: `rtcwake -m mem -s 15` 20 s after `RELIABILITY_READY`, s2idle entry 13:38:55Z, exit 13:39:11Z, clock growth 10.94 s; `RELIABILITY_COVERAGE_READY=false` only because of the runtime arm; normal unit exit |
+| Suspend-resume recheck, same suspend | `bounded clock growth proved suspend; post-resume bits and mapped inventory unchanged` |
+
+The kernel froze user space in 0.004 s, suspended devices in 0.663 s and
+resumed them in 0.249 s; `/sys/power/suspend_stats` went from 0 to 1
+success with `last_hw_sleep` 8,969,440 µs, and the `pmc_core` SLP_S0
+residency grew by the same amount (substate S0i2.1), so the platform
+reached S0ix for about 9 s of the 16 s cycle. Neither process saw an
+OpenVINO error and the kernel log has no xe engine reset. A first attempt
+had failed in the kernel freezer, unrelated to the GPU: a language-server
+process indexing the home directory was mid-`stat` on a FUSE mount and
+stayed uninterruptible for the 20 s freeze timeout. FUSE mounts can block
+s2idle on this host; the retry waited for the FUSE queues to drain first.
+
+The runtime witness cannot be reached on this host with the model
+retained, by driver design. With the panel dark the Arc 140V suspends
+about 1 s after its last activity while no process has touched the
+compute runtime; as soon as a process enumerates the OpenCL platform the
+device stays `active` until that process exits, through context creation,
+context release and the OpenVINO platform drop with the libraries still
+mapped. A bare OpenCL probe reproduces it without OpenVINO (no OpenCL: 40
+of 50 samples suspended; after `clGetPlatformIDs` and `clGetDeviceIDs`
+alone, after a context is created and after it is released: 50 of 50
+active), and the GPU suspended again within seconds of the lane processes
+exiting (35 of 45 samples). The sources: kernel v7.2
+`drivers/gpu/drm/xe/xe_vm.c` takes `xe_pm_runtime_get_noresume()` for
+every VM created with `XE_VM_FLAG_LR_MODE` and releases it only when the
+VM is destroyed (lines 1684 to 1686 and 1998 to 1999 at v7.2; 1679 to
+1688 and 1995 to 1996 at v7.2.11), and intel/compute-runtime
+26.35.39758.11 `shared/source/os_interface/linux/xe/ioctl_helper_xe.cpp`
+(`getFlagsForVmCreate`) always sets `DRM_XE_VM_CREATE_FLAG_LR_MODE`,
+creating the VM at device discovery (`NEOReadDebugKeys=1 PrintXeLogs=1
+clinfo -l` logs `gemVmCreate f=0x2` on this host). The i915 ThinkPad has
+no such hold, which is why its runtime witness passed with the model
+retained. Two consequences: the ADR-0022 section 7.6 runtime subset needs
+a decision for xe identities (accept the system-suspend proof plus the
+documented hold, or define a witness that releases the compute-runtime
+process, which then tests a fresh platform and compile after D3hot), and
+a production daemon that keeps the GPU plugin loaded keeps an xe GPU in
+D0 for its lifetime (the device is a Root Complex Integrated Endpoint, so
+runtime suspend means D3hot and D3cold is never available). The only
+earlier lifetime diagnostic archived on the share (ThinkPad, 2026-10-13,
+identity `45a24201`) recorded 0 of 301 suspended samples in every stage
+including `a_cpu_only`, so it ran with the panel on; this is the first
+lifetime diagnostic with a real idle observation.
+Archive: `artifacts/irlume/2026-10-21-1053-ux5406s-pm/` (report, lane
+logs, stage JSONs, kernel log, receipts, source copies, research notes,
+`SHA256SUMS`).
 
 ## Observation: an efficiency-core-only CPU affinity aborts the GPU compile
 
@@ -222,10 +280,12 @@ rather than worked around in the compile configuration. Evidence:
 - Costs: about twice the compiled-blob size; no measurable wall-time cost
   on the corpora lane. Single-request latency under f32 remains to be
   measured on the decision hardware.
-- Still open after this record: on the decision hardware, the retained
-  control with proven suspends, the cache matrix and the power-management
-  diagnostic under f32, plus the ADR-0022 section 7.3 items no GPU run
-  has measured yet (IR recognition corpora, paired fusion, calibration
-  and profile selection, enrollments up to 90 scans, the decision
-  fingerprint over every arm). The ThinkPad runtime-suspend witness and
-  the f32 real-frames arms are closed above.
+- Still open after this record: on the decision hardware, the ADR-0022
+  section 7.6 runtime-suspend subset (unreachable with the model retained
+  on xe, see above; a decision for xe identities is pending), plus the
+  ADR-0022 section 7.3 items no GPU run has measured yet (IR recognition
+  corpora, paired fusion, calibration and profile selection, enrollments
+  up to 90 scans, the decision fingerprint over every arm). The ThinkPad
+  runtime-suspend witness, the f32 real-frames arms, the UX5406S cache
+  matrix, power-management diagnostic and system-suspend proof are closed
+  above.

@@ -201,6 +201,14 @@ historical counter totals suffice. Missing events yield explicitly inconclusive
 coverage even if all 1000 operational calls succeed; unavailable observations
 can refuse the run without attributing a GPU failure.
 
+On the `xe` driver the runtime witness is inconclusive by design while the
+model is retained: the Intel compute runtime creates its VM in long-running
+mode at device discovery and the kernel holds a runtime-PM reference for
+every such VM until the process exits, so the device never reads
+`suspended` while the OpenVINO GPU plugin is loaded (measured on the UX5406S
+on 2026-10-21, [the precision record](research/2026-10-21-gpu-f32-precision.md)).
+Prove the system arm there; `i915` hosts can prove both.
+
 Archive actual phase counts, witnesses, identity, source and binary hashes.
 `RELIABILITY_COVERAGE_READY=true` is conditional evidence after owned resources
 are dropped, with `NORMAL_PROCESS_EXIT=PENDING`. Accept it only together with

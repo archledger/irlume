@@ -435,7 +435,13 @@ All notable changes to irlume are documented here. This project adheres to
   pair in 400 either way), while `f32` reproduced the CPU reference within
   1e-6 with zero verdict differences on the same corpora, and on the
   UX5406S passed the recorded-frame and corpora arms (13 of 13) with
-  drift at or below 7.5e-7. The `gpu_hw_*`
+  drift at or below 7.5e-7, the cache matrix (41 of 41), the
+  power-management diagnostic and the retained-process control across a
+  real system suspend (1,000 of 1,000 bit-exact calls). The runtime-suspend
+  witness is inconclusive on the `xe` driver while the model is retained:
+  the compute runtime's long-running VM holds a kernel runtime-PM
+  reference for the process lifetime, so an ADR-0022 section 7.6 decision
+  for xe identities is pending (#1164). The `gpu_hw_*`
   lanes and the cache control compile with the new configuration; every
   `f16` identity leaves certification consideration. Loading admission
   stays closed and `CERTIFIED` stays empty

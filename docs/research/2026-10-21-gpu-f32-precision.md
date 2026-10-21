@@ -27,7 +27,7 @@ hex characters of the full values in those manifests.
   groups); the UX5406S additionally measured recorded genuine IR and RGB
   frames and presentation attacks (the real-frames lane).
 - Hosts: UX5406S (Lunar Lake, Arc 140V `8086:64a0`, `xe`, the decision
-  hardware) and ThinkPad T480 (Iris Xe `8086:a7a1`, `i915`, a second
+  hardware) and ThinkPad X13 Yoga Gen 4 (Iris Xe `8086:a7a1`, `i915`, a second
   measured identity). Each host's identity binds the plugin build, the
   render node, the GuC/HuC firmware, the compile configuration and every
   mapped native library, so a precision change is a new identity.
@@ -59,7 +59,7 @@ identity: it does not transfer to an f32 identity.
 
 ## f32
 
-ThinkPad T480, 2026-10-19. A measurement build of origin/main (`f97a9796`
+ThinkPad X13 Yoga Gen 4, 2026-10-19. A measurement build of origin/main (`f97a9796`
 for the probe, `07023313` for the campaign) with the compile
 configuration's precision changed to `f32`, installed beside the untouched
 f16 binaries under a root-owned prefix with a process-local ICD. Identity

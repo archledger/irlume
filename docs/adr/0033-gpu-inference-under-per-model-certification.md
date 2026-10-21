@@ -239,7 +239,7 @@ by three orders of magnitude:
   339 (0.295 points), both above the 0.2-point budget of section 7.5
   ([the identity record](../research/2026-10-11-gpu-identity.md), phase 4
   correction).
-- ThinkPad T480 (Iris Xe `8086:a7a1`, `i915`), identity `6aa45541`,
+- ThinkPad X13 Yoga Gen 4 (Iris Xe `8086:a7a1`, `i915`), identity `6aa45541`,
   2026-10-13, `f16`: genuine LFW maximum absolute drift 0.00108 moved the
   false-reject rate by one pair in 400 in both shift directions (0.25
   points) while all 3,397 CPU/GPU verdicts agreed and no new grant
@@ -291,7 +291,7 @@ record](../research/2026-10-10-gpu-benchmarks.md)); it ranks raw
 inference only, and `auto` ranking among certified devices will rest on
 end-to-end evidence under the certified configuration. On measured hosts:
 the Phasing names the UX5406S as the decision hardware with minihost as
-the proxy; the ThinkPad T480 produced the reliability, cache and precision
+the proxy; the ThinkPad X13 Yoga Gen 4 produced the reliability, cache and precision
 evidence above and is a second measured identity, not the decision
 hardware. The 2026.2.1 runtime measured on the UX5406S and in the
 2026-10-11 amendment is the intel-npu-stack 0.2.0 candidate package set;

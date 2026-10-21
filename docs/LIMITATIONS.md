@@ -51,6 +51,26 @@ summary lives on the [README](../README.md); this is the detail.
   430-sample field session it was reliable below ambient ~120 on the 0-255 IR
   scale and rejected 129 of 129 genuine samples above ~170. The rejection names
   the condition and the fix.
+- **A dim room can make the shipped RGB PAD cue refuse a genuine face.** The
+  ViT RGB cue (ADR-0013) is deny-only and denies when the median of the last
+  five scores reaches 0.55. Single genuine frames already reach that line (on
+  the m96 crop the recorded desk-light maximum is 0.551 and the LFW q99 is
+  0.565); the five-frame median suppresses most of that tail. Anything that
+  raises every frame's score erodes it quickly: on the recorded LFW scores of
+  the 423 identities with five or more photos, adding 0.05 to every frame puts
+  5% of five-frame groups at or over the line when the frames are drawn
+  independently and 12% when they are five photos of one person, and adding
+  0.08 puts 37% to 40% there. A reported T480 split-pair attempt in a dim room
+  was refused at a median of 0.578 while the cross-spectrum cues stayed live,
+  and granted with the light on (0.428 to 0.507). The refusal names the cue
+  and fails closed: add light on your face, or use your password. irlume does
+  not brighten the screen as a fill light, as Windows Hello's optional
+  low-light sign-in does (Microsoft has removed that setting for now and
+  schedules its return from November 2026). Offline, darkening the image
+  lowered the score and added grain raised it, by a median of 0.04 to 0.05 on
+  LFW but by 0.07 or more for 47 to 61 of 200 faces, the size of that unit's
+  dim-room shift; whether that is what happened on that unit stays open in
+  #1155 ([measurement](research/2026-10-21-vit-dim-room-cue-evaluation.md)).
 - **Legacy eye-policy state still blocks face authentication.** Clear stored
   `require_eyes_open=true` with `irlume profiles eyes-open off`. Head-gesture
   settings have been retired; see [migration notes](HEAD-GESTURE-REMOVAL.md).

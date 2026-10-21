@@ -411,6 +411,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- docs/LIMITATIONS.md records that a dim room can make the shipped ViT RGB
+  PAD cue refuse a genuine face (ADR-0013 §4, #1155). The cue denies when
+  the median of the last five scores reaches 0.55. Single genuine frames
+  already reach that line (desk-light maximum 0.551, LFW q99 0.565); the
+  five-frame median suppresses most of that tail, and ADR-0013 measures its
+  0.085 genuine margin on those presentation medians. A reported T480
+  split-pair attempt in a dim room was refused at a median of 0.578 while
+  the cross-spectrum cues stayed live, and granted with the light on. The
+  refusal names the cue and fails closed; the remedy is light on the face or
+  the password. The offline measurement is in
+  docs/research/2026-10-21-vit-dim-room-cue-evaluation.md with its harness
+  and scores in benchmarks/pad-candidates/dim-room/; the mechanism on that
+  unit stays open. Thanks to @maurerr for the report and the dim and lit
+  measurements.
+
 - The fixed GPU compile configuration names `f32` as the inference
   precision (`batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`),
   ADR-0033 amendment 2026-10-21. The plugin's `f16` default measured
@@ -425,6 +440,7 @@ All notable changes to irlume are documented here. This project adheres to
   `f16` identity leaves certification consideration. Loading admission
   stays closed and `CERTIFIED` stays empty
   (docs/research/2026-10-21-gpu-f32-precision.md, #1053).
+
 - docs/LIMITATIONS.md records that the NexiGo HelloCam N930W measured
   here (`3443:c803`) streams IR at 14.73 to 14.79 fps, about 1.2 to 1.7%
   above the 14.55 fps delivered-rate floor, so an occasional capture

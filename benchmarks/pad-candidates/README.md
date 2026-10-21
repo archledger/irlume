@@ -55,6 +55,11 @@ regenerate scores from your own captures.
 - `vit_live_session.py` / `vit_live_cap.sh`: the 2026-08-22 live-session
   capture + scoring harness (m96 crop, 5-frame-median voting, AE-settle
   drop), reusable as the replay baseline for the next RGB PAD candidate.
+- [`dim-room/`](dim-room/): the 2026-10-21 dim-room sensitivity harness for
+  the shipped ViT cue (#1155): darkening, grain, JPEG, blur, contrast and
+  photon-noise arms on LFW through the scorer contract, with the per-frame
+  scores and a check against the recorded 2026-08-21 LFW scores
+  (`docs/research/2026-10-21-vit-dim-room-cue-evaluation.md`).
 
 Python deps: `numpy`, `opencv-python` (>= 4.6 for `FaceDetectorYN`),
 `onnxruntime`. Detection uses irlume's shipped YuNet file.

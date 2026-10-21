@@ -38,6 +38,43 @@ class ContractTests(unittest.TestCase):
         original["data"]["undocumented"] = True
         self.assertTrue(validate(original))
 
+    def test_recognizer_selection_is_an_optional_closed_enum(self):
+        # Contract 1 permits added fields, not new enum values: a selection
+        # word the schema does not list must fail a consumer's permissive
+        # validator as well as the engine's strict one (#1053). The release
+        # captures predate the field, so the shapes the CLI writes for a
+        # non-root peer of a default build are added to them here.
+        status = fixture("status-daemon-running-0.15.0.json")
+        status["data"]["recognizer"] = {
+            "device": "cpu", "known": True,
+            "reason": "NPU discovery not reported; using CPU", "selection": "auto",
+        }
+        doctor = fixture("doctor-0.15.0.json")
+        doctor["data"]["checks"] += [
+            {"detail": "CPU: NPU discovery not reported; using CPU",
+             "id": "recognizer-device", "state": "info"},
+            {"detail": "auto; only a certified device can take the recognizer off CPU",
+             "id": "recognizer-selection", "state": "info"},
+        ]
+        for strict in [False, True]:
+            validate, note = CONFORMANCE.load_validator(
+                ROOT / "schemas/machine-api-v1.schema.json", strict=strict
+            )
+            self.assertIsNotNone(validate, note)
+            with self.subTest(strict=strict, document="doctor"):
+                self.assertEqual(validate(doctor), [])
+            for value in ["auto", "cpu", "npu", "gpu", "tpu", "AUTO", "", None, 0, []]:
+                with self.subTest(strict=strict, value=value):
+                    document = copy.deepcopy(status)
+                    document["data"]["recognizer"]["selection"] = value
+                    self.assertEqual(
+                        not validate(document), value in ["auto", "cpu", "npu", "gpu"]
+                    )
+            # Absent when the daemon did not report one.
+            document = copy.deepcopy(status)
+            del document["data"]["recognizer"]["selection"]
+            self.assertEqual(validate(document), [])
+
     def test_census_allows_only_documented_video_node_fields(self):
         document = fixture("camera-census.json")
         original = copy.deepcopy(document)

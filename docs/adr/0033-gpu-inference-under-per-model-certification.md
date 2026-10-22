@@ -152,6 +152,12 @@ input to those gates, not a pass of them. Enrollment, self-tests and
 every non-probe path stay on CPU. (Amended 2026-10-22, below: where the
 driver holds the device while a model is retained, a hold witness meets
 the runtime-suspend parts of ADR-0022 measurements 6 and 7.)
+(ADR-0022 amendment 2026-10-22, [certification corpora and decisions at full
+extent](0022-npu-inference-under-per-model-certification.md#amendment-2026-10-22-certification-corpora-and-decisions-at-full-extent):
+what these gates run over, which enrollment shapes an entry covers (those
+that both an impostor arm and an attack arm reach), how differences are
+recorded and who reads them, and the separate runs for ADR-0022 measurements
+6 and 7.)
 
 ### 6. `auto` ranks certification, never device class
 

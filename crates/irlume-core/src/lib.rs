@@ -4,12 +4,15 @@
 //! Matching, template storage, and TPM-bound secret release.
 //!
 //! Decision rule (NIST SP 800-63B-4 aligned): grant only if the liveness gate
-//! says Live AND the best cosine >= a FIXED threshold (0.55). That threshold
-//! clears FMR <= 1e-4 per demographic group on FairFace, but unconstrained
-//! real-world FAR is higher (2.0e-3 @ 0.55 on LFW); the mandatory password
-//! fallback bounds the residual. See the `RGB` threshold constant below for the
-//! measured numbers. Threshold is NOT ported from linhello (0.60): AuraFace's
-//! score scale differs; derive it from a genuine/impostor ROC on real data.
+//! says Live AND the best cosine >= a FIXED threshold (0.55). At 0.55 the
+//! FairFace within-group FMR is at or under 1e-4 for two of seven groups
+//! (Indian 9.5e-5, White 6.8e-5) and 1.4e-4 to 4.2e-4 for the other five
+//! (`docs/recognition-results/data/ff-*-aura.txt`); about 0.69 holds 1e-4 for
+//! every group (docs/FAIRNESS.md). LFW grouped by identity gives 2e-5 at 0.55;
+//! the mandatory password fallback bounds the residual. See the `RGB` threshold
+//! constant below for the measured numbers. Threshold is NOT ported from
+//! linhello (0.60): AuraFace's score scale differs; derive it from a
+//! genuine/impostor ROC on real data.
 //!
 //! Storage: never store a raw recoverable face image. Store L2-normalized
 //! embeddings (zeroized after use). The unlock SECRET (e.g. the login password
@@ -84,21 +87,36 @@ pub(crate) fn test_tmp_dir(name: &str) -> String {
     format!("/tmp/irlume-test-{name}-{identity}")
 }
 
-/// RGB (visible-light) match threshold. Measured FAR: real faces (LFW, 13,233
-/// images, 87M impostor pairs, same pipeline as production) give FAR 2.3e-3 @
-/// 0.50 and 2.0e-3 @ 0.55; synthetic (SFHQ, 112M pairs) 9.8e-5 @ 0.50 (cleaner
-/// than unconstrained real photos). **Set to 0.55** for demographic headroom:
-/// FairFace per-group analysis showed 0.50 only clears FMR≤1e-4 for the best
-/// group; ~0.55+ tightens every group (see docs/FAIRNESS.md), and because live
-/// genuine sits at min 0.71 / mean 0.85, so 0.55 keeps a wide accept margin (no
-/// added false-rejects). Unconstrained real-world FAR stays well above Windows
-/// Hello's stated 1e-5 bar; the mandatory password fallback bounds the residual.
+/// RGB (visible-light) match threshold. Measured FAR on real faces: LFW grouped
+/// by identity (13,233 images, 5,749 identities, 242,257 genuine and 87,307,271
+/// impostor pairs, same pipeline as production) gives 3e-5 @ 0.50 and 2e-5 @
+/// 0.55 (docs/recognition-results/data/lfw-aura.txt). The all-pairs rates,
+/// 2.3e-3 @ 0.50 (docs/VERIFY.md section 5) and about 2.0e-3 @ 0.55 from the
+/// counts above, include the genuine pairs among all 87,549,528: an upper
+/// bound, not an impostor rate. Synthetic SFHQ, first 15,000 images,
+/// 112,492,500 pairs: 4.71e-4 @ 0.50 and 1.43e-4 @ 0.55
+/// (docs/recognition-results/data/sfhq-aura.txt); the 9.8e-5 @ 0.50 given here
+/// before named no subset and could not be reproduced
+/// (docs/recognition-results/2026-08-05-buffalo-l.md). **Set to 0.55** for
+/// demographic headroom: on FairFace no group holds FMR≤1e-4 at 0.50 (White is
+/// closest at 1.05e-4) and ~0.69 holds it for every group (docs/FAIRNESS.md);
+/// at 0.55 two of seven groups do
+/// (`docs/recognition-results/data/ff-*-aura.txt`). The change to 0.55 (commit
+/// 11cf4a9e) judged from the live genuine floor that it adds no false-rejects;
+/// both live-capture sessions of the 2026-08-05 record
+/// (docs/recognition-results/2026-08-05-buffalo-l.md, "Instrument validation")
+/// carried an AuraFace anchor run that landed on that floor, which clears 0.55.
+/// Real-world FAR stays above Windows Hello's stated 1e-5 bar; the mandatory
+/// password fallback bounds the residual. Certification judges every value
+/// scaled from this base (ADR-0022 amendment 2026-10-22).
 /// Do NOT assume buffalo_l's 0.60; AuraFace scale differs.
 pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 
-/// IR-mode (dark) match threshold base, HIGHER than RGB because
-/// AuraFace-on-IR is less discriminative. Benchmarked on the FULL CBSR NIR
-/// dataset (real 850nm, 197 people, 3940 faces, 7.72M impostor pairs):
+/// IR-mode (dark) match threshold base, HIGHER than RGB because AuraFace-on-IR
+/// is less discriminative. Benchmarked on the FULL CBSR NIR dataset (real
+/// 850nm, 197 people, 3940 faces, 7.72M impostor pairs; the run of commit
+/// d1c8cca7, whose output is not in the repository, while the committed
+/// pairwise CBSR results use 6,000 pairs per arm):
 /// genuine mean 0.855, impostor MAX 0.900 (genuine/impostor OVERLAP), EER
 /// ≈0.8% @0.495. FAR/FRR: 0.55→ 1.3e-3/1.7%, 0.60→2.7e-4/3.0%, NIST FAR≤1e-4
 /// only @0.635 (FRR 4.6%). This base now serves the DIM-LIGHT IR FALLBACK
@@ -117,8 +135,10 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 /// Evidence stack for 0.635 (stage 2's pre-written decision rule: raise to
 /// 0.635 only if the live genuine 1st-percentile clears the effective bar by
 /// >= 0.02 — satisfied with 10x margin):
-/// - CBSR deployment-shaped OR-arm (best-of-N OR centroid, 197 ids / 347,508
-///   impostor pairs): 0.635 -> FAR 1.24e-4 / FRR 0.68% (0.60 -> 4.03e-4).
+/// - CBSR OR-arm of the sweep (best-of-N OR the raw centroid, 197 ids /
+///   347,508 impostor decisions): 0.635 -> FAR 1.24e-4 / FRR 0.68% (0.60 ->
+///   4.03e-4). Not a production decision: production forms no centroid
+///   without a fitted IR calibration (ADR-0022 amendment 2026-10-22).
 /// - Tufts cross-spectral calibrated arm: 0.635-class FAR ~4.9e-5.
 /// - LIVE dark session (2026-08-23, minihost NexiGo, true dark, 30 auths,
 ///   `docs/research/2026-08-22-securedark-v1.md`): genuine best-cosine min

@@ -355,6 +355,20 @@ mod tests {
         }
     }
 
+    // Pin the pre-refactor grid from 9954e65a. Its stream contains native-size
+    // counts and libm results; this baseline was checked on GNU/Linux x86_64
+    // with Rust 1.88 (Ubuntu 24.04 and Fedora 44) and stable 1.96 (Fedora 44).
+    // This preserves the existing grid, not complete certification coverage.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_existing_arm_grid_fingerprint_matches_the_recorded_reference() {
+        assert_eq!(
+            decision_fingerprint(),
+            "16edf23e552e480c8a92d99247078c676c989f576b3213e6afaa4cda6a12796d",
+            "preserve the existing arm grid when expanding the decision fingerprint"
+        );
+    }
+
     #[test]
     fn the_decision_fingerprint_is_stable_and_crosses_every_boundary() {
         assert_eq!(decision_fingerprint(), decision_fingerprint());

@@ -585,6 +585,23 @@
               "description": "The device selection that governs this placement (recognizer_device in settings.conf). Optional; absence means the daemon did not report one.",
               "type": "string",
               "enum": ["auto", "cpu", "npu", "gpu"]
+            },
+            "accelerator": {
+              "description": "The accelerator the recognizer's probes run on. Optional; absent on CPU and from older daemons. A GPU placement reports device cpu with its reason and accelerator gpu.",
+              "type": "string",
+              "enum": ["npu", "gpu"]
+            },
+            "gpu_platform": {
+              "description": "The GPU platform identity digest, when GPU discovery read one.",
+              "type": "string"
+            },
+            "gpu_runtime_available": {
+              "description": "Whether this engine discovered an accessible GPU runtime. Optional; absence means not attempted or reported (a loading-admission refusal attempts none), not false.",
+              "type": "boolean"
+            },
+            "gpu_qualified": {
+              "description": "Whether the recognizer passed its GPU qualification and placement checks. Optional; absence means unreported or no available GPU runtime.",
+              "type": "boolean"
             }
           }
         }

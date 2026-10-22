@@ -200,14 +200,27 @@ Optional `recognizer.selection` is the device selection governing the placement
 (`recognizer_device` in `settings.conf`): `auto`, `cpu`, `npu` or `gpu`. It is
 the administrator's configured target, not a placement claim: `auto` and `npu`
 still leave admission and certification to decide, `cpu` keeps every probe on
-the CPU reference, and `gpu` names a target no build admits yet. It is omitted
-when the daemon does not report one.
+the CPU reference, and `gpu` tries the GPU, which its loading admission (closed
+in every build so far) and certification still decide. It is omitted when the
+daemon does not report one.
+
+Optional `recognizer.accelerator` is `npu` or `gpu` when the recognizer's probes
+run on that accelerator, and absent on CPU or from older daemons. Contract 1
+adds no `device` value, so a GPU placement reports `device: "cpu"` with the
+fixed `reason` "the recognizer runs on the GPU (accelerator: gpu); CPU stays the
+reference" and `accelerator: "gpu"` (ADR-0033 phase 3). Optional
+`recognizer.gpu_platform`, `recognizer.gpu_runtime_available` and
+`recognizer.gpu_qualified` are the GPU counterparts of `platform`,
+`runtime_available` and `qualified`, with the same absence rules: a
+loading-admission refusal attempts no GPU discovery, so it reports none of
+them.
 
 These are engine facts, not a per-account guarantee. Matchable scans with
 missing or different CPU-producer tags, including legacy enrollments, require
 CPU probes even if the engine reports NPU placement. Non-root Health replies
 expose fixed CPU-fallback categories (discovery not reported, runtime unavailable,
-or recognizer unavailable). Only root peers receive bounded native error details;
+or recognizer unavailable, worded for the GPU when the GPU is selected), and a
+GPU placement's fixed reason. Only root peers receive bounded native error details;
 the privileged journal also retains detailed reasons. Reason text is diagnostic,
 not a stable value for clients to match.
 
@@ -297,11 +310,14 @@ reused for a different meaning. The registry as of this contract:
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
-| `recognizer-device` | the daemon's engine placement for authentication probes (ADR-0022): `NPU`, or `CPU:` with a peer-appropriate reason. Enrollment producer checks can still require CPU probes. `info`; `unknown` when the daemon did not answer or predates the report |
+| `recognizer-device` | the daemon's engine placement for authentication probes (ADR-0022, ADR-0033): `NPU`, `GPU`, or `CPU:` with a peer-appropriate reason. Enrollment producer checks can still require CPU probes. `info`; `unknown` when the daemon did not answer or predates the report |
 | `recognizer-selection` | the device selection governing that placement (`recognizer_device`): `auto`, `cpu`, `npu` or `gpu`, with what each still leaves to admission and certification. `info`; `unknown` when the daemon did not answer or predates the report |
 | `npu-platform` | the NPU platform identity digest the daemon read for the recognizer, or that none was read. `info`; `unknown` as for `recognizer-device` |
 | `npu-runtime` | the engine's runtime discovery observation. `info` for reported availability or failure; `unknown` for unreported discovery, loading-admission refusal, or an older/non-answering daemon |
 | `npu-qualification` | whether the recognizer is currently placed on NPU after qualification/placement checks. `info` for a reported fact; `unknown` when runtime availability is not `true` or qualification is unreported. Discovery alone never implies NPU authentication |
+| `gpu-platform` | the GPU platform identity digest the daemon read for the recognizer, or that none was read (ADR-0033). `info`; `unknown` as for `recognizer-device` |
+| `gpu-runtime` | the engine's GPU discovery observation. `info` for reported availability or failure; `unknown` for unreported discovery, loading-admission refusal, or an older/non-answering daemon |
+| `gpu-qualification` | whether the recognizer is currently placed on the GPU after qualification/placement checks. `info` for a reported fact; `unknown` when GPU runtime availability is not `true` or qualification is unreported |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |

@@ -25,7 +25,16 @@
 //! rebuild.
 
 use super::runtime::{self, RuntimeSelection};
+
+#[path = "gpu_certification.rs"]
+pub mod certification;
+#[path = "gpu_runtime_pm.rs"]
+mod runtime_pm;
+pub use runtime_pm::{GpuReason, RuntimeGuard};
+#[path = "gpu_context.rs"]
+mod context;
 pub use crate::gpu::{settings_conf_value, switch_allows, Setting};
+pub use context::Context;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -88,7 +97,6 @@ impl From<FirmwareError> for Firmware {
 struct FirmwareObservation {
     guc: String,
     huc: String,
-    #[cfg(test)]
     pci_slots: BTreeSet<String>,
 }
 
@@ -194,7 +202,6 @@ fn observe_firmware(debugfs: &Path) -> Result<FirmwareObservation, FirmwareError
         }
     }
     let mut per_node = Vec::new();
-    #[allow(unused_variables, reason = "only the test identity reads the slots")]
     for (node, pci_slots) in nodes {
         let ucs = uc_directories(&node)?;
         if ucs.is_empty() {
@@ -234,7 +241,6 @@ fn observe_firmware(debugfs: &Path) -> Result<FirmwareObservation, FirmwareError
         per_node.push(FirmwareObservation {
             guc: gucs.into_iter().next().ok_or(FirmwareError::Unreadable)?,
             huc: hucs.into_iter().next().ok_or(FirmwareError::Unreadable)?,
-            #[cfg(test)]
             pci_slots,
         });
     }
@@ -359,7 +365,6 @@ fn valid_version(version: &str, max_parts: usize) -> bool {
 /// addresses in sysfs (`0000:00:02.0`), built from one decimal/`0x` hex
 /// component group. Parsing never invents digits: each component must be a
 /// plain non-negative number within its width.
-#[cfg(test)]
 pub(crate) fn canonical_pci(
     domain: &str,
     bus: &str,
@@ -403,7 +408,6 @@ pub(crate) fn canonical_pci(
 /// 2026.2.1 as `{domain: 0 bus: 0 device: 0x2 function: 0}`, into the
 /// canonical sysfs PCI address of the device the plugin selected. Every
 /// label must appear in order with a plain value; nothing is guessed.
-#[cfg(test)]
 pub(crate) fn plugin_pci(info: &str) -> Option<String> {
     let body = info.trim().strip_prefix('{')?.strip_suffix('}')?;
     let mut tokens = body.split_whitespace();
@@ -428,7 +432,6 @@ pub(crate) fn plugin_pci(info: &str) -> Option<String> {
 /// The vendor id embedded in the GPU plugin's `DEVICE_ARCHITECTURE` report
 /// (`GPU: vendor=0x8086 arch=v12.4.0`), normalized to `0x`-prefixed
 /// lower-case hex.
-#[cfg(test)]
 pub(crate) fn architecture_vendor(architecture: &str) -> Option<String> {
     let vendor = architecture
         .split_whitespace()
@@ -466,7 +469,6 @@ pub struct RenderNode {
 /// When the DRM class directory, a render node's PCI symlink or its vendor
 /// and device attributes are unreadable or malformed, when no render node
 /// carries the plugin's address, or when more than one does.
-#[cfg(test)]
 pub(crate) fn render_node(
     sysfs_drm: &Path,
     pci: &str,
@@ -533,7 +535,6 @@ pub(crate) fn render_node(
 ///
 /// When neither loader family is mapped, or both are, or the mapped loader
 /// path cannot be found again for the manifest.
-#[cfg(test)]
 pub(crate) fn loader_stack(maps: &str) -> Result<(&'static str, String), String> {
     let mut mapped: Vec<&str> = Vec::new();
     for line in maps.lines() {
@@ -595,7 +596,6 @@ pub(crate) fn loader_stack(maps: &str) -> Result<(&'static str, String), String>
 ///
 /// When a required member is missing, a library cannot be opened or read,
 /// or a mapped library is not the file that was hashed.
-#[cfg(test)]
 pub(crate) fn gpu_libraries(
     maps_file: &Path,
     executable: &Path,
@@ -853,14 +853,12 @@ pub fn discover(_selection: &RuntimeSelection) -> Discovery {
 
 /// Where the admitted test-only GPU entries read platform facts. Defaults
 /// point at the real kernel trees; tests inject fixtures.
-#[cfg(test)]
 pub(crate) struct Sources<'a> {
     pub debugfs: &'a Path,
     pub sysfs_drm: &'a Path,
     pub maps: &'a Path,
 }
 
-#[cfg(test)]
 impl Default for Sources<'static> {
     fn default() -> Self {
         Self {
@@ -876,7 +874,6 @@ impl Default for Sources<'static> {
 /// returns at 2026.2.1; the PCI binding then resolves through sysfs and
 /// debugfs, and the mapped-library manifest through `maps`. Test-only,
 /// like the admitted discovery that reaches it.
-#[cfg(test)]
 fn identity(
     core: &openvino::Core,
     library: &runtime::ResolvedLibrary,
@@ -1046,7 +1043,6 @@ pub(crate) fn firmware_with_pci(debugfs: &Path, sysfs_pci: &Path) -> (Firmware, 
 /// compile configuration applied and read back (ADR-0033 section 2).
 /// Test-only, like the admitted discovery it builds on; production
 /// loading admission stays closed.
-#[cfg(test)]
 pub(crate) struct GpuPlatform {
     core: openvino::Core,
     identity: Identity,
@@ -1062,7 +1058,6 @@ pub(crate) struct GpuPlatform {
 /// (udev on the measured hosts), and the identity must name everything a
 /// later compile of a real model runs, so no compile can map bytes the
 /// manifest does not cover.
-#[cfg(test)]
 const WARM_UP_ONNX: &[u8] = &[
     0x08, 0x08, 0x12, 0x06, 0x69, 0x72, 0x6c, 0x75, 0x6d, 0x65, 0x3a, 0x3d, 0x0a, 0x13, 0x0a, 0x01,
     0x78, 0x12, 0x01, 0x79, 0x1a, 0x01, 0x6e, 0x22, 0x08, 0x49, 0x64, 0x65, 0x6e, 0x74, 0x69, 0x74,
@@ -1072,11 +1067,9 @@ const WARM_UP_ONNX: &[u8] = &[
 ];
 
 /// The inference precision of [`COMPILE_CONFIGURATION`].
-#[cfg(test)]
 const INFERENCE_PRECISION: &str = "f32";
 
 /// The performance hint of [`COMPILE_CONFIGURATION`].
-#[cfg(test)]
 const PERFORMANCE_HINT: &str = "LATENCY";
 
 /// Private evidence-harness proposal, not an upstream API or placement setting.
@@ -1088,8 +1081,14 @@ pub(crate) enum CacheMode<'a> {
 }
 
 /// The automatic OpenVINO model-cache outcome a strict compile must observe.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the evidence harness constructs the cache-hit and cache-miss provenances"
+    )
+)]
 pub(crate) enum CacheProvenance {
     Bypass,
     Miss,
@@ -1097,7 +1096,6 @@ pub(crate) enum CacheProvenance {
 }
 
 /// Recognizer readbacks only; no claim about driver caches or global coldness.
-#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CacheObservation {
     pub core_cache_dir: String,
@@ -1105,7 +1103,6 @@ pub(crate) struct CacheObservation {
     pub loaded_from_cache: bool,
 }
 
-#[cfg(test)]
 type CacheCompileResult = (Box<dyn super::Infer>, String, Option<CacheObservation>);
 
 #[cfg(test)]
@@ -1129,7 +1126,6 @@ fn cache_path(mode: CacheMode<'_>, expected: CacheProvenance) -> Result<&Path, S
 
 // Both compile entries use this gate. None never runs an observer, so legacy
 // compilation acquires no provenance getters or their refusal paths.
-#[cfg(test)]
 fn cache_observation_gate<T>(
     expected: Option<CacheProvenance>,
     observe: impl FnOnce(CacheProvenance) -> Result<T, String>,
@@ -1137,7 +1133,6 @@ fn cache_observation_gate<T>(
     expected.map(observe).transpose()
 }
 
-#[cfg(test)]
 fn require_cache_property(key: &str, read: &str, expected: &str) -> Result<(), String> {
     if read != expected {
         return Err(format!("{key} reads {read:?}, not {expected:?}"));
@@ -1145,7 +1140,6 @@ fn require_cache_property(key: &str, read: &str, expected: &str) -> Result<(), S
     Ok(())
 }
 
-#[cfg(test)]
 fn parse_loaded_from_cache(read: &str) -> Result<bool, String> {
     match read {
         "YES" => Ok(true),
@@ -1156,7 +1150,6 @@ fn parse_loaded_from_cache(read: &str) -> Result<bool, String> {
     }
 }
 
-#[cfg(test)]
 fn read_cache_observation(
     requested: &str,
     expected: CacheProvenance,
@@ -1188,7 +1181,6 @@ fn read_cache_observation(
     })
 }
 
-#[cfg(test)]
 fn validate_gpu_assignment(device: &str, assignment: &str) -> Result<String, String> {
     let assigned = assignment.trim();
     if assigned != device && assigned != "GPU" {
@@ -1199,7 +1191,6 @@ fn validate_gpu_assignment(device: &str, assignment: &str) -> Result<String, Str
 
 /// Why opening the GPU platform refused: typed so discovery reports the
 /// enumeration answers instead of parsing error prose.
-#[cfg(test)]
 pub(crate) enum OpenError {
     /// No GPU is exposed.
     Absent,
@@ -1210,14 +1201,12 @@ pub(crate) enum OpenError {
     Failed(String),
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
-#[cfg(test)]
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1228,14 +1217,108 @@ impl std::fmt::Display for OpenError {
     }
 }
 
-#[cfg(test)]
+/// Why a compile refused: an ineligible model is refused before OpenVINO
+/// compiles anything, so it leaves no cache output to discard.
+#[derive(Debug)]
+enum CompileError {
+    /// The model's inputs do not meet the fixed configuration.
+    Ineligible(String),
+    /// Anything else, with the reason.
+    Failed(String),
+}
+
+impl From<String> for CompileError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ineligible(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A reason the shared NPU machinery (markers, cache, discovery) gave for
+/// a GPU placement, worded for the GPU, so doctor and the journal never
+/// attribute a GPU refusal to the NPU.
+pub(crate) fn gpu_reason(reason: super::CpuReason) -> super::CpuReason {
+    use super::CpuReason;
+    CpuReason::Gpu(match reason {
+        CpuReason::Gpu(reason) => return CpuReason::Gpu(reason),
+        CpuReason::LoadingNotAdmitted => GpuReason::LoadingNotAdmitted,
+        CpuReason::RuntimeAbsent(why) => GpuReason::RuntimeAbsent(why),
+        CpuReason::IdentityUnreadable(why) => GpuReason::IdentityUnreadable(why),
+        CpuReason::NotCertified => GpuReason::NotCertified,
+        CpuReason::Ineligible(why) => GpuReason::Ineligible(why),
+        CpuReason::CompileFailed(why) => GpuReason::CompileFailed(why),
+        CpuReason::DidNotReturn => GpuReason::DidNotReturn,
+        CpuReason::Retired(why) => GpuReason::Retired(why),
+        CpuReason::ParityMismatch(why) => GpuReason::ParityMismatch(why),
+        // Selection outcomes are not GPU refusals.
+        other @ (CpuReason::Disabled
+        | CpuReason::CpuSelected
+        | CpuReason::GpuSelectedNotAdmitted
+        | CpuReason::GpuDisabled) => return other,
+    })
+}
+
 impl GpuPlatform {
-    /// Open the platform through the validated provider and apply
-    /// [`COMPILE_CONFIGURATION`], reading both properties back so a
-    /// fallback cannot pass for the certified configuration.
+    /// Open the platform for production placement: the loading admission
+    /// first, before anything is resolved or loaded (ADR-0033 section 4),
+    /// then [`Self::open_after_admission`] with the warm-up compile's cache
+    /// in `warm_dir`, a private directory the caller owns.
+    ///
+    /// # Errors
+    ///
+    /// The refusal that keeps the recognizer on CPU.
+    pub(crate) fn open(
+        selection: &RuntimeSelection,
+        sources: &Sources<'_>,
+        warm_dir: &Path,
+    ) -> Result<Self, super::CpuReason> {
+        runtime::admit_loading()
+            .map_err(|_| super::CpuReason::Gpu(GpuReason::LoadingNotAdmitted))?;
+        super::catch_binding(
+            || {
+                Self::open_after_admission(selection, sources, warm_dir).map_err(|error| {
+                    super::CpuReason::Gpu(match error {
+                        OpenError::Absent => GpuReason::Absent,
+                        OpenError::Multiple(devices) => GpuReason::MultipleGpus(devices),
+                        OpenError::Failed(why) => GpuReason::RuntimeAbsent(why),
+                    })
+                })
+            },
+            super::CpuReason::Gpu(GpuReason::RuntimeAbsent(
+                "the OpenVINO binding panicked while opening the GPU".into(),
+            )),
+        )
+    }
+
+    /// The admitted test-only entry for the hardware evidence harness:
+    /// [`Self::open_after_admission`] without the closed loading admission,
+    /// warming up in a temporary directory. Production never calls this.
+    #[cfg(test)]
     pub(crate) fn open_admitted(
         selection: &RuntimeSelection,
         sources: &Sources<'_>,
+    ) -> Result<Self, OpenError> {
+        let warm = tempfile::tempdir()
+            .map_err(|error| OpenError::Failed(format!("warm-up dir: {error}")))?;
+        Self::open_after_admission(selection, sources, warm.path())
+    }
+
+    /// Open the platform through the validated provider and apply
+    /// [`COMPILE_CONFIGURATION`], reading both properties back so a
+    /// fallback cannot pass for the certified configuration. Reached only
+    /// after the loading admission ([`Self::open`]) or through the
+    /// test-only [`Self::open_admitted`].
+    fn open_after_admission(
+        selection: &RuntimeSelection,
+        sources: &Sources<'_>,
+        warm_dir: &Path,
     ) -> Result<Self, OpenError> {
         let failed = |why: String| OpenError::Failed(why);
         let library = runtime::resolve_library(
@@ -1298,8 +1381,6 @@ impl GpuPlatform {
         // identity's inventory is taken: compiling loads driver libraries
         // the enumeration alone does not (udev on the measured hosts), and
         // the identity must name everything its own execution runs.
-        let warm_scratch =
-            tempfile::tempdir().map_err(|error| failed(format!("warm-up dir: {error}")))?;
         {
             use openvino::{DeviceType, RwPropertyKey};
             // The fixture's input is already a static float[1].
@@ -1310,8 +1391,7 @@ impl GpuPlatform {
             core.set_property(
                 &device,
                 &RwPropertyKey::CacheDir,
-                warm_scratch
-                    .path()
+                warm_dir
                     .to_str()
                     .ok_or_else(|| failed("the warm-up cache path is not UTF-8".into()))?,
             )
@@ -1362,6 +1442,7 @@ impl GpuPlatform {
     /// the execution device. Re-reads the memory map afterwards so a
     /// library swapped in during the compile is a refusal, not a silent
     /// identity change (the compile-time arm of retirement).
+    #[cfg(test)]
     pub(crate) fn compile(
         &mut self,
         cache_dir: &Path,
@@ -1369,6 +1450,67 @@ impl GpuPlatform {
     ) -> Result<(Box<dyn super::Infer>, String), String> {
         self.compile_inner(cache_dir, model, None)
             .map(|(model, assignment, _)| (model, assignment))
+            .map_err(|error| error.to_string())
+    }
+
+    /// Compile `model` for production placement under the marker of
+    /// `cache` (ADR-0022 sections 10 and 11, through ADR-0033 section 1):
+    /// a compile that did not return earlier in this boot is not repeated,
+    /// a failed or unverified compile discards its blobs, and every
+    /// inference of the result is bracketed by the same marker and checked
+    /// against the hashed inventory.
+    ///
+    /// # Errors
+    ///
+    /// The GPU reason that keeps the model on CPU.
+    pub(crate) fn compile_certified(
+        &mut self,
+        cache: &super::Cache,
+        model: &[u8],
+        model_sha256: &str,
+    ) -> Result<Box<dyn super::Infer>, super::CpuReason> {
+        use super::CpuReason;
+        let marker = cache.marker_file(model_sha256);
+        let blobs = cache.blobs();
+        let inner = super::run_guarded(&marker, || {
+            let outcome = super::catch_binding(
+                || {
+                    self.compile_inner(&blobs, model, None)
+                        .map(|(model, _, _)| model)
+                        .map_err(|error| {
+                            CpuReason::Gpu(match error {
+                                CompileError::Ineligible(why) => GpuReason::Ineligible(why),
+                                CompileError::Failed(why) => GpuReason::CompileFailed(why),
+                            })
+                        })
+                },
+                CpuReason::Gpu(GpuReason::CompileFailed(
+                    "the OpenVINO binding panicked while compiling".into(),
+                )),
+            );
+            match outcome {
+                Ok(inner) => (Ok(inner), true),
+                // Refused before OpenVINO compiled anything.
+                Err(reason @ CpuReason::Gpu(GpuReason::Ineligible(_))) => (Err(reason), true),
+                Err(reason) => match super::discard_blobs(&blobs) {
+                    Ok(()) => (Err(reason), true),
+                    Err(error) => (
+                        Err(CpuReason::Gpu(GpuReason::CompileFailed(format!(
+                            "{reason}; its cache output could not be removed ({error}), so its \
+                             marker stays for this boot"
+                        )))),
+                        false,
+                    ),
+                },
+            }
+        })
+        .map_err(gpu_reason)?;
+        Ok(Box::new(super::Marked {
+            inner,
+            marker,
+            maps: self.maps.clone(),
+            libraries: self.libraries.clone(),
+        }))
     }
 
     /// Strict recognizer model-cache evidence after the separate identity
@@ -1377,6 +1519,7 @@ impl GpuPlatform {
     /// # Errors
     /// Refuses invalid mode/path, any compile/identity error, failed readback,
     /// or cache/configuration readbacks that do not establish `expected`.
+    #[cfg(test)]
     pub(crate) fn compile_with_cache_observation(
         &mut self,
         cache: CacheMode<'_>,
@@ -1384,7 +1527,9 @@ impl GpuPlatform {
         model: &[u8],
     ) -> Result<(Box<dyn super::Infer>, String, CacheObservation), String> {
         let path = cache_path(cache, expected)?;
-        let (model, assignment, observation) = self.compile_inner(path, model, Some(expected))?;
+        let (model, assignment, observation) = self
+            .compile_inner(path, model, Some(expected))
+            .map_err(|error| error.to_string())?;
         let observation = observation.ok_or_else(|| "cache observation missing".to_owned())?;
         Ok((model, assignment, observation))
     }
@@ -1394,7 +1539,7 @@ impl GpuPlatform {
         cache_dir: &Path,
         model: &[u8],
         expected: Option<CacheProvenance>,
-    ) -> Result<CacheCompileResult, String> {
+    ) -> Result<CacheCompileResult, CompileError> {
         use openvino::{DeviceType, PartialShape, PropertyKey, RwPropertyKey};
         let failed = |what: &str, error: &dyn std::fmt::Display| format!("{what}: {error}");
         let mut read = self
@@ -1405,22 +1550,26 @@ impl GpuPlatform {
             .get_inputs_len()
             .map_err(|error| failed("inputs", &error))?;
         if inputs != 1 {
-            return Err(format!("the model has {inputs} inputs"));
+            return Err(CompileError::Ineligible(format!(
+                "the model has {inputs} inputs"
+            )));
         }
         let partial = read
             .get_input_by_index(0)
             .and_then(|input| input.get_partial_shape())
             .map_err(|error| failed("input shape", &error))?;
         if partial.get_rank().is_dynamic() {
-            return Err("the input rank is dynamic".into());
+            return Err(CompileError::Ineligible("the input rank is dynamic".into()));
         }
         let dimensions = partial
             .get_dimensions()
             .iter()
             .map(|dimension| (!dimension.is_dynamic()).then(|| dimension.get_min()))
             .collect::<Vec<_>>();
-        let input_shape =
-            super::fixed_batch_shape(&dimensions).map_err(|reason| reason.to_string())?;
+        let input_shape = super::fixed_batch_shape(&dimensions).map_err(|reason| match reason {
+            super::CpuReason::Ineligible(why) => CompileError::Ineligible(why),
+            other => CompileError::Failed(other.to_string()),
+        })?;
         if partial.is_dynamic() {
             let fixed = PartialShape::new_static(input_shape.len() as i64, &input_shape)
                 .map_err(|error| failed("fixed shape", &error))?;
@@ -1477,7 +1626,6 @@ impl GpuPlatform {
 
 /// A GPU-compiled model: one `f32` input in, its first `f32` output back,
 /// mirroring the NPU model so the harness treats both alike.
-#[cfg(test)]
 struct GpuModel {
     // Owns the compiled model the request runs; dropped after it.
     _compiled: openvino::CompiledModel,
@@ -1485,9 +1633,17 @@ struct GpuModel {
     input_shape: Vec<i64>,
 }
 
-#[cfg(test)]
 impl super::Infer for GpuModel {
     fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
+        // The binding panics on some failures; a panic is an inference
+        // error that retires the model, not a daemon crash.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.infer_unguarded(input)))
+            .unwrap_or_else(|_| Err("the OpenVINO binding panicked during inference".into()))
+    }
+}
+
+impl GpuModel {
+    fn infer_unguarded(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
         use openvino::{ElementType, Shape, Tensor};
         let failed = |what: &str, error: &dyn std::fmt::Display| format!("{what}: {error}");
         let shape = Shape::new(&self.input_shape).map_err(|error| failed("shape", &error))?;

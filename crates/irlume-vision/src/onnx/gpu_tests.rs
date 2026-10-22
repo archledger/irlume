@@ -1294,6 +1294,82 @@ mod gpu_groundwork_tests {
         );
     }
 
+    /// Ignored: the production GPU path of ADR-0033 phase 3 on real
+    /// hardware, run as root like the identity lane. The real inventory
+    /// must classify under the certification key; the production compile
+    /// runs under its marker into a daemon-style cache, every inference goes
+    /// through the marker and the inventory check, the outputs repeat their
+    /// bits and track the CPU reference, both markers are cleared, and the
+    /// runtime-suspend guard arms on the bound PCI device and stays quiet
+    /// across inferences. Evidence for #1161, not a certification.
+    #[test]
+    #[ignore = "hardware: needs the validated OpenVINO provider, an Intel GPU and the recognizer weights"]
+    fn gpu_production_hw_compile_markers_and_runtime_guard() {
+        use super::super::npu_reference;
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = recognizer_bytes();
+        let sha = irlume_common::sha256_hex(&bytes);
+        let (mut cpu, _cascade) = hw_cpu_cascade();
+        let mut platform =
+            gpu::GpuPlatform::open_admitted(&hw_selection(), &gpu::Sources::default())
+                .expect("the GPU platform opens with the fixed configuration");
+        let identity = platform.identity().clone();
+        report_hw_identity("production compile", &identity);
+        let key = identity
+            .certification_key()
+            .expect("every mapped library is on a reviewed list");
+        println!(
+            "PRODUCTION numerics_key {} support_digest {}",
+            key.numerics_key, key.support_digest
+        );
+        let boot = crate::npu::boot_id().unwrap();
+        let cache = crate::npu::Cache::prepare(scratch.path(), &identity, &boot).unwrap();
+        let started = std::time::Instant::now();
+        let mut model = platform
+            .compile_certified(&cache, &bytes, &sha)
+            .expect("the production compile");
+        println!("PRODUCTION compile {:?}", started.elapsed());
+        assert_eq!(cache.marker(&sha), crate::npu::Marker::Absent);
+        let raw = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        let guard = gpu::RuntimeGuard::arm(
+            std::path::Path::new("/sys/class/drm"),
+            &identity.render_node,
+        )
+        .expect("the guard arms on the bound PCI device");
+        let mut bits = Vec::new();
+        for k in 0..3 {
+            let chip = npu_reference::chip(k);
+            let reference = cpu
+                .embed_preprocessed(&chip)
+                .expect("the CPU reference answers");
+            let answer = model.infer(&chip).expect("the production model answers");
+            let repeat = model.infer(&chip).expect("the production model repeats");
+            assert_eq!(raw(&answer), raw(&repeat), "input {k} did not repeat");
+            let norm: f32 = answer.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let cosine: f32 = answer
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a * b / norm)
+                .sum();
+            println!("PRODUCTION input {k}: cosine {cosine:.7}");
+            assert!(cosine > 0.999, "input {k}: {cosine}");
+            bits.extend(raw(&answer));
+            assert_eq!(guard.check(), Ok(()), "the guard after input {k}");
+        }
+        assert_eq!(cache.marker(&sha), crate::npu::Marker::Absent);
+        println!(
+            "PRODUCTION gpu_reference_digest {} cpu_reference_digest {}",
+            irlume_common::sha256_hex(&bits),
+            cpu.cpu_reference_digest().unwrap()
+        );
+        assert!(platform.still_loaded_as_hashed().is_ok());
+    }
+
     fn cache_control_request<'a>(
         mode: &str,
         directory: Option<&'a Path>,

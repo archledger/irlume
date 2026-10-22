@@ -373,6 +373,9 @@ pub enum CpuReason {
     Retired(String),
     /// The startup parity check against the CPU session failed.
     ParityMismatch(String),
+    /// The recognizer was selected for the GPU and is not on it
+    /// (ADR-0033); the reason names the GPU.
+    Gpu(gpu::GpuReason),
 }
 
 impl fmt::Display for CpuReason {
@@ -399,6 +402,7 @@ impl fmt::Display for CpuReason {
             ),
             Self::Retired(why) => write!(f, "NPU retired after an inference error: {why}"),
             Self::ParityMismatch(why) => write!(f, "NPU output differs from CPU: {why}"),
+            Self::Gpu(reason) => reason.fmt(f),
         }
     }
 }
@@ -408,6 +412,8 @@ impl fmt::Display for CpuReason {
 pub enum Device {
     /// On the NPU.
     Npu,
+    /// On the GPU (ADR-0033).
+    Gpu,
     /// On its CPU session, and why.
     Cpu(CpuReason),
 }
@@ -434,6 +440,18 @@ enum State {
         entry: Option<&'static Certification>,
         /// [`suspended`] when the entry's digests were last reproduced;
         /// `None` until the first check.
+        checked_at: Option<Duration>,
+    },
+    Gpu {
+        model: Box<dyn Infer>,
+        entry: Option<&'static gpu::certification::Certification>,
+        /// The live support digest differs from the entry's: the engine
+        /// build must reproduce the extended reference set (ADR-0033
+        /// amendment of 2026-10-22).
+        extended_required: bool,
+        /// Armed for an entry certified through the driver hold.
+        guard: Option<gpu::RuntimeGuard>,
+        /// As for the NPU.
         checked_at: Option<Duration>,
     },
 }
@@ -472,11 +490,47 @@ impl Slot {
         }
     }
 
+    /// A model compiled for the GPU without a certified entry: the
+    /// hardware tests' placements only.
+    #[cfg(test)]
+    pub(crate) fn gpu(model: Box<dyn Infer>) -> Self {
+        Self {
+            state: State::Gpu {
+                model,
+                entry: None,
+                extended_required: false,
+                guard: None,
+                checked_at: None,
+            },
+        }
+    }
+
+    /// A model compiled for the GPU under `matched`, whose CPU reference
+    /// and GPU reference digests (and the extended set when the support
+    /// set differs) must be reproduced before it answers; `guard` is armed
+    /// for an entry certified through the driver hold (ADR-0033 section 5
+    /// and its amendments of 2026-10-22).
+    pub(crate) fn gpu_certified(
+        model: Box<dyn Infer>,
+        matched: gpu::certification::Matched<'static>,
+        guard: Option<gpu::RuntimeGuard>,
+    ) -> Self {
+        Self {
+            state: State::Gpu {
+                model,
+                entry: Some(matched.entry),
+                extended_required: matched.extended_required,
+                guard,
+                checked_at: None,
+            },
+        }
+    }
+
     /// Record that the entry's digests were reproduced by a check that
     /// started at `baseline`, a [`Bound::AtMost`] reading taken before its
     /// first inference, so a suspend during or after the check is seen.
     pub(crate) fn note_checked(&mut self, baseline: Option<Duration>) {
-        if let State::Npu { checked_at, .. } = &mut self.state {
+        if let State::Npu { checked_at, .. } | State::Gpu { checked_at, .. } = &mut self.state {
             *checked_at = baseline;
         }
     }
@@ -485,13 +539,18 @@ impl Slot {
     /// again before it answers: the system has suspended since the last
     /// check, or the clocks cannot be read (ADR-0022 §8).
     pub(crate) fn resumed_since_check(&self) -> bool {
-        let State::Npu {
-            entry: Some(_),
-            checked_at,
-            ..
-        } = &self.state
-        else {
-            return false;
+        let checked_at = match &self.state {
+            State::Npu {
+                entry: Some(_),
+                checked_at,
+                ..
+            }
+            | State::Gpu {
+                entry: Some(_),
+                checked_at,
+                ..
+            } => checked_at,
+            _ => return false,
         };
         match (checked_at, suspended(Bound::AtLeast)) {
             (Some(then), Some(now)) => now > *then + RESUME_GRANULARITY,
@@ -502,7 +561,7 @@ impl Slot {
     /// Forget the last check, as a system resume would, for tests.
     #[cfg(test)]
     pub(crate) fn forget_check(&mut self) {
-        if let State::Npu { checked_at, .. } = &mut self.state {
+        if let State::Npu { checked_at, .. } | State::Gpu { checked_at, .. } = &mut self.state {
             *checked_at = None;
         }
     }
@@ -511,7 +570,20 @@ impl Slot {
     pub fn certification(&self) -> Option<&'static Certification> {
         match &self.state {
             State::Npu { entry, .. } => *entry,
-            State::Cpu(_) => None,
+            State::Gpu { .. } | State::Cpu(_) => None,
+        }
+    }
+
+    /// The GPU entry the model is on the GPU under, if any, and whether the
+    /// extended reference set is required.
+    pub fn gpu_certification(&self) -> Option<(&'static gpu::certification::Certification, bool)> {
+        match &self.state {
+            State::Gpu {
+                entry: Some(entry),
+                extended_required,
+                ..
+            } => Some((entry, *extended_required)),
+            _ => None,
         }
     }
 
@@ -520,6 +592,28 @@ impl Slot {
         match &self.state {
             State::Cpu(reason) => Device::Cpu(reason.clone()),
             State::Npu { .. } => Device::Npu,
+            State::Gpu { .. } => Device::Gpu,
+        }
+    }
+
+    /// Check the runtime-suspend guard of a GPU entry certified through the
+    /// driver hold, and retire the model to CPU when the device
+    /// runtime-suspended or the guard cannot read it. `false` means the
+    /// model is no longer on the accelerator.
+    pub(crate) fn check_runtime_guard(&mut self) -> bool {
+        let outcome = match &self.state {
+            State::Gpu {
+                guard: Some(guard), ..
+            } => guard.check(),
+            State::Cpu(_) => return false,
+            _ => return true,
+        };
+        match outcome {
+            Ok(()) => true,
+            Err(reason) => {
+                self.state = State::Cpu(CpuReason::Gpu(reason));
+                false
+            }
         }
     }
 
@@ -533,8 +627,10 @@ impl Slot {
         input: &[f32],
         decode: impl FnOnce(&[f32]) -> irlume_common::Result<T>,
     ) -> Option<T> {
-        let State::Npu { model, .. } = &mut self.state else {
-            return None;
+        let (model, gpu) = match &mut self.state {
+            State::Npu { model, .. } => (model, false),
+            State::Gpu { model, .. } => (model, true),
+            State::Cpu(_) => return None,
         };
         let outcome = model
             .infer(input)
@@ -542,7 +638,11 @@ impl Slot {
         match outcome {
             Ok(value) => Some(value),
             Err(why) => {
-                self.state = State::Cpu(CpuReason::Retired(why));
+                self.state = State::Cpu(if gpu {
+                    CpuReason::Gpu(gpu::GpuReason::Retired(why))
+                } else {
+                    CpuReason::Retired(why)
+                });
                 None
             }
         }
@@ -706,8 +806,8 @@ impl Cache {
     /// # Errors
     ///
     /// When a directory cannot be created, restricted to 0700 or listed.
-    pub fn prepare(base: &Path, identity: &Identity, boot_id: &str) -> io::Result<Self> {
-        let digest = identity.digest();
+    pub fn prepare(base: &Path, identity: &impl PlatformDigest, boot_id: &str) -> io::Result<Self> {
+        let digest = identity.platform_digest();
         private_dir(base)?;
         for entry in fs::read_dir(base)? {
             let entry = entry?;
@@ -761,6 +861,33 @@ impl Cache {
     pub fn marker(&self, model_sha256: &str) -> Marker {
         self.marker_file(model_sha256).state()
     }
+}
+
+/// An exact platform identity whose digest names its cache directory and
+/// markers: the NPU's [`Identity`] and the GPU's [`gpu::Identity`].
+pub trait PlatformDigest: Clone {
+    /// The exact identity digest.
+    fn platform_digest(&self) -> String;
+}
+
+impl PlatformDigest for Identity {
+    fn platform_digest(&self) -> String {
+        self.digest()
+    }
+}
+
+impl PlatformDigest for gpu::Identity {
+    fn platform_digest(&self) -> String {
+        self.digest()
+    }
+}
+
+/// An admission refusal observed no runtime, for either accelerator.
+fn is_admission_refusal(reason: &CpuReason) -> bool {
+    matches!(
+        reason,
+        CpuReason::LoadingNotAdmitted | CpuReason::Gpu(gpu::GpuReason::LoadingNotAdmitted)
+    )
 }
 
 /// A boot ID as the kernel writes it (a UUID), or as the tests name one.
@@ -1770,10 +1897,10 @@ impl Context {
 
 /// Run the real marker/cache state machine around a discovery boundary. The
 /// generic payload lets filesystem regressions exercise it without native code.
-fn prepare_runtime<P>(
+fn prepare_runtime<P, I: PlatformDigest>(
     cache_base: &Path,
-    observation: &mut Option<Result<Identity, CpuReason>>,
-    discover: impl FnOnce() -> Result<(P, Identity), CpuReason>,
+    observation: &mut Option<Result<I, CpuReason>>,
+    discover: impl FnOnce() -> Result<(P, I), CpuReason>,
 ) -> Result<(P, Cache), CpuReason> {
     *observation = None;
     let state = (|| {
@@ -1794,7 +1921,7 @@ fn prepare_runtime<P>(
             // Record the observation at its boundary, before marker cleanup
             // or cache preparation can fail. Admission refusal observed no
             // runtime; a discovery failure did attempt it.
-            if !matches!(result, Err(CpuReason::LoadingNotAdmitted)) {
+            if !result.as_ref().is_err_and(is_admission_refusal) {
                 *observation = Some(
                     result
                         .as_ref()
@@ -3071,13 +3198,15 @@ mod tests {
         let mut observation = None;
         let failed = CpuReason::RuntimeAbsent("no runtime".into());
         assert!(
-            prepare_runtime::<()>(directory.path(), &mut observation, || Err(failed.clone()))
-                .is_err()
+            prepare_runtime::<(), Identity>(directory.path(), &mut observation, || Err(
+                failed.clone()
+            ))
+            .is_err()
         );
         assert_eq!(observation, Some(Err(failed)));
         observation = None;
         assert!(
-            prepare_runtime::<()>(directory.path(), &mut observation, || Err(
+            prepare_runtime::<(), Identity>(directory.path(), &mut observation, || Err(
                 CpuReason::LoadingNotAdmitted
             ))
             .is_err()

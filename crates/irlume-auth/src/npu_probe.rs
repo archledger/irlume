@@ -66,7 +66,7 @@ impl Engine {
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
     ) -> bool {
-        let refusal = if !self.recognizer_on_npu() {
+        let refusal = if !self.recognizer_on_accelerator() {
             Some("the recognizer is on CPU")
         } else if self.ir_adapter.is_some() || self.ir_adapter_required {
             Some("an IR adapter is configured")
@@ -80,7 +80,10 @@ impl Engine {
             }
         };
         match refusal {
-            None => irlume_common::dlog!("npu: this authentication's probes run on the NPU"),
+            None => irlume_common::dlog!(
+                "npu: this authentication's probes run on the {}",
+                self.accelerator_name()
+            ),
             Some(why) => {
                 irlume_common::dlog!("npu: this authentication's probes run on CPU: {why}")
             }
@@ -95,14 +98,34 @@ impl Engine {
         self.ir_adapter.is_none() && !self.ir_adapter_required
     }
 
+    /// Whether the recognizer is placed on an accelerator, the NPU or the
+    /// GPU: the producer and IR-adapter rules of ADR-0022 §2 admit probes on
+    /// either alike (ADR-0033 section 1).
     #[cfg(feature = "npu")]
-    fn recognizer_on_npu(&self) -> bool {
-        self.emb.npu_device() == irlume_vision::npu::Device::Npu
+    fn recognizer_on_accelerator(&self) -> bool {
+        matches!(
+            self.emb.npu_device(),
+            irlume_vision::npu::Device::Npu | irlume_vision::npu::Device::Gpu
+        )
     }
 
     #[cfg(not(feature = "npu"))]
-    fn recognizer_on_npu(&self) -> bool {
+    fn recognizer_on_accelerator(&self) -> bool {
         false
+    }
+
+    #[cfg(feature = "npu")]
+    fn accelerator_name(&self) -> &'static str {
+        if self.emb.npu_device() == irlume_vision::npu::Device::Gpu {
+            "GPU"
+        } else {
+            "NPU"
+        }
+    }
+
+    #[cfg(not(feature = "npu"))]
+    fn accelerator_name(&self) -> &'static str {
+        "CPU"
     }
 
     /// The wired thresholds that consume the recognizer's output, by
@@ -139,28 +162,49 @@ impl Engine {
     /// was placed for (ADR-0022 §13).
     pub fn recognizer_placement(&self) -> irlume_common::RecognizerPlacement {
         #[cfg(feature = "npu")]
-        let (device, reason) = match self.emb.npu_device() {
+        let (device, accelerator, reason) = match self.emb.npu_device() {
             _ if self.ir_adapter.is_some() || self.ir_adapter_required => (
                 "cpu",
+                None,
                 Some("an IR adapter is configured, which keeps the recognizer on CPU".to_owned()),
             ),
-            irlume_vision::npu::Device::Npu => ("npu", None),
+            irlume_vision::npu::Device::Npu => ("npu", Some("npu"), None),
+            // The legacy field keeps the values released clients know; the
+            // precise placement travels in `accelerator` (daemon AGENTS.md,
+            // wire compatibility).
+            irlume_vision::npu::Device::Gpu => (
+                "cpu",
+                Some("gpu"),
+                Some(irlume_common::RECOGNIZER_ON_GPU_REASON.to_owned()),
+            ),
             // The reason can carry runtime or driver error text: one bounded
             // line before it reaches the journal, Health or doctor.
             irlume_vision::npu::Device::Cpu(reason) => (
                 "cpu",
+                None,
                 Some(irlume_common::single_line(&reason.to_string(), 300)),
             ),
         };
         #[cfg(not(feature = "npu"))]
-        let (device, reason) = ("cpu", Some("not built with NPU support".to_owned()));
+        let (device, accelerator, reason) = (
+            "cpu",
+            None::<&str>,
+            Some("not built with NPU support".to_owned()),
+        );
         #[cfg(feature = "npu")]
-        let runtime_available = self.npu_runtime_available;
+        let (runtime_available, gpu_runtime_available, gpu_platform) = (
+            self.npu_runtime_available,
+            self.gpu_runtime_available,
+            self.gpu_platform.clone(),
+        );
         #[cfg(not(feature = "npu"))]
-        let runtime_available = None;
+        let (runtime_available, gpu_runtime_available, gpu_platform) = (None, None, None);
         let qualified = runtime_available
             .filter(|available| *available)
-            .map(|_| device == "npu");
+            .map(|_| accelerator == Some("npu"));
+        let gpu_qualified = gpu_runtime_available
+            .filter(|available| *available)
+            .map(|_| accelerator == Some("gpu"));
         irlume_common::RecognizerPlacement {
             device: device.into(),
             reason,
@@ -170,6 +214,10 @@ impl Engine {
             // The daemon stamps the governing device selection after the
             // engine reports; the engine itself never reads settings.
             selection: None,
+            accelerator: accelerator.map(str::to_owned),
+            gpu_platform,
+            gpu_runtime_available,
+            gpu_qualified,
         }
     }
 
@@ -236,6 +284,63 @@ impl Engine {
             .ok()
             .map(irlume_vision::npu::Identity::digest);
         self.emb.place_on_npu(weights, npu)?;
+        let _ = self.embed_producer();
+        Ok(())
+    }
+}
+
+#[cfg(feature = "npu")]
+impl Engine {
+    /// Open the GPU runtime for this engine's recognizer under
+    /// `cache_base`, as the same CPU consumer the NPU context gets
+    /// (ADR-0033 section 5). The loading admission comes first: while it
+    /// refuses, nothing is loaded or written and the context carries that
+    /// refusal.
+    pub fn open_gpu_context_with_runtime(
+        &self,
+        cache_base: &std::path::Path,
+        selection: &irlume_vision::npu::RuntimeSelection,
+    ) -> irlume_vision::npu::gpu::Context {
+        let runtime = irlume_vision::onnx_runtime_version().unwrap_or_default();
+        let thresholds = self.npu_thresholds();
+        let fingerprint = super::decision_fingerprint();
+        irlume_vision::npu::gpu::Context::open_with_runtime(
+            cache_base,
+            &irlume_vision::npu::Consumer {
+                onnx_runtime: &runtime,
+                thresholds: &thresholds,
+                decision_fingerprint: &fingerprint,
+            },
+            selection,
+        )
+    }
+
+    /// [`Self::place_recognizer_on_npu`] for the GPU: on the GPU when an
+    /// entry certifies this platform's numerics key and consumer and it
+    /// compiles and passes its engine-build checks, on CPU with the GPU
+    /// reason otherwise (ADR-0033 phase 3).
+    ///
+    /// # Errors
+    ///
+    /// When `weights` are not the loaded recognizer's, or its CPU session
+    /// fails the parity check's reference inputs; the recognizer then stays
+    /// on CPU and the engine stays usable.
+    pub fn place_recognizer_on_gpu(
+        &mut self,
+        weights: &irlume_common::HashedModel,
+        gpu: &mut irlume_vision::npu::gpu::Context,
+    ) -> irlume_common::Result<()> {
+        if format!("embed:{}", weights.sha256()) != self.embed_space {
+            return Err(irlume_common::Error::Policy(
+                "the GPU recognizer must be the loaded recognizer".into(),
+            ));
+        }
+        self.gpu_runtime_available = gpu.runtime_available();
+        self.gpu_platform = gpu
+            .identity()
+            .ok()
+            .map(irlume_vision::npu::gpu::Identity::digest);
+        self.emb.place_on_gpu(weights, gpu)?;
         let _ = self.embed_producer();
         Ok(())
     }

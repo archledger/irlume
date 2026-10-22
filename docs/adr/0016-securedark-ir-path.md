@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-22
+**Amended:** 2026-10-22, Tufts evidence attribution (below).
 **Implementation:** Stage 1 with this PR (scene gate + dark threshold). Later
 stages are evidence-gated and listed under Open Measurements.
 
@@ -62,6 +63,9 @@ the dim-light fallback (RGB-verified, more evidence) keeps its
 0.60-effective bar while the pure-dark bar sits above it, so the arm with
 less evidence is never the looser one. The user-supplied-adapter arm keeps
 its own validated 0.40 (already FAR ~1e-4 on its benchmark).
+
+The Tufts figure in this historical decision is corrected by the
+[2026-10-22 amendment](#amendment-2026-10-22-tufts-evidence-attribution).
 
 **What the threshold deliberately does NOT claim:** stopping the life-size
 print species. ADR-0002 measured the enrolled user's vinyl banner at IR
@@ -147,3 +151,38 @@ lit-room IR-only attacks; the species defenses are the PAD stack.
   are part of the user-present measurement before release.
 - This PR touches the same dark-path block as PR #518's pairing-budget
   change; whichever merges second rebases.
+
+## Amendment 2026-10-22: Tufts evidence attribution
+
+The `~4.9e-5` Tufts FAR cited above does not describe the shipped ridge
+parameter, `RIDGE_LAMBDA = 0.5`, at a flat threshold of 0.635. The archived
+[`results-securedark-sweep.json`](../../benchmarks/results-securedark-sweep.json)
+records these separate arms for 109 retained subjects:
+
+| Lambda | Fit pairs k | Arm | Flat threshold | False accepts / impostor comparisons | FAR |
+|---|---|---|---|---|---|
+| 0.5 (shipped) | 3 | best-of-N | 0.635 | 19 / 311,364 | 6.10e-5 |
+| 0.5 (shipped) | 5 | best-of-N | 0.635 | 19 / 287,820 | 6.60e-5 |
+| 0.5 (shipped) | 3 | calibrated centroid | 0.635 | 20 / 311,364 | 6.42e-5 |
+| 0.5 (shipped) | 5 | calibrated centroid | 0.635 | 21 / 287,820 | 7.30e-5 |
+| 1.0 (not shipped) | 5 | best-of-N | 0.635 | 14 / 287,820 | 4.86e-5 |
+| No calibration (control) | 5 | best-of-N | 0.60 | 14 / 287,820 | 4.86e-5 |
+
+The last row is the `4.9e-5` control reported in the original research note
+at 0.60. The lambda-1.0 row rounds to the same figure at 0.635, but neither
+row supports attributing it to the shipped lambda-0.5 arm at 0.635.
+
+The sweep's [`tufts_arm`](../../benchmarks/securedark_sweep.py) fits on the
+first k prepared RGB/NIR pairs and scores impostors through the enrolled
+subject's calibration. It applies each threshold directly, and records
+best-of-N and centroid separately. Production scales its thresholds by the
+enrollment size and can grant through either arm; their joint false-accept
+rate cannot be recovered from these separate aggregate counts. The sweep
+therefore does not establish the full production decision's FAR. It also
+does not satisfy the full-extent GPU certification required by the
+[ADR-0022 amendment of 2026-10-22](0022-npu-inference-under-per-model-certification.md#amendment-2026-10-22-certification-corpora-and-decisions-at-full-extent).
+
+This corrects the evidence attribution only. The 0.635 dark threshold,
+ridge parameter, grant rules and other security checks are unchanged. The
+historical CBSR and live-session evidence remain as recorded; this
+amendment reports no new inference or hardware run.

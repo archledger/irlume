@@ -436,6 +436,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Correct the Tufts evidence behind the dark recognition threshold
+  (ADR-0016, amendment 2026-10-22, #1164): the shipped lambda-0.5
+  best-of-N arms measured FAR 6.10e-5 and 6.60e-5 at a flat 0.635, not
+  the previously attributed 4.9e-5. The record distinguishes the control,
+  separate centroid arms and the full scaled production decision. No
+  threshold, calibration parameter or authentication behavior changes.
+
 - ADR-0022 fixes what a certification runs over (amendment 2026-10-22,
   #1164). LFW runs every ordered within-identity and cross-identity pair
   (484,514 and 174,614,542) on the original images as packaged on Hugging

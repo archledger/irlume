@@ -139,7 +139,10 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 ///   347,508 impostor decisions): 0.635 -> FAR 1.24e-4 / FRR 0.68% (0.60 ->
 ///   4.03e-4). Not a production decision: production forms no centroid
 ///   without a fitted IR calibration (ADR-0022 amendment 2026-10-22).
-/// - Tufts cross-spectral calibrated arm: 0.635-class FAR ~4.9e-5.
+/// - Tufts cross-spectral sweep at shipped ridge lambda 0.5: best-of-N FAR
+///   6.10e-5 (k=3) / 6.60e-5 (k=5) at flat 0.635. These separate-arm rates
+///   do not measure the full scaled production decision; the former ~4.9e-5
+///   attribution is corrected in ADR-0016's 2026-10-22 amendment.
 /// - LIVE dark session (2026-08-23, minihost NexiGo, true dark, 30 auths,
 ///   `docs/research/2026-08-22-securedark-v1.md`): genuine best-cosine min
 ///   0.884 (n=23 grants) vs the 0.635-scaled bar 0.685 — margin 0.199.

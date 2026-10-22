@@ -207,7 +207,11 @@ mode at device discovery and the kernel holds a runtime-PM reference for
 every such VM until the process exits, so the device never reads
 `suspended` while the OpenVINO GPU plugin is loaded (measured on the UX5406S
 on 2026-10-21, [the precision record](research/2026-10-21-gpu-f32-precision.md)).
-Prove the system arm there; `i915` hosts can prove both.
+Prove the system arm there and archive the hold witness of the ADR-0033
+amendment of 2026-10-22: the lifetime diagnostic below with the display off,
+the retained control's runtime window with the device `active`, and the
+device suspending again after the process exits. `i915` hosts prove both
+arms.
 
 Archive actual phase counts, witnesses, identity, source and binary hashes.
 `RELIABILITY_COVERAGE_READY=true` is conditional evidence after owned resources

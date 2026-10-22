@@ -411,6 +411,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0033 records how a GPU meets the ADR-0022 section 7 runtime-suspend
+  arm when its driver holds it awake while a model is retained (amendment
+  2026-10-22, #1164). On `xe` the compute runtime's long-running VM keeps a
+  kernel runtime-PM reference until the process exits, so the arm cannot
+  occur; a hold witness takes its place (the lifetime diagnostic with the
+  display off, the retained control's runtime window with the device
+  active, the device suspending again after the process exits). The GPU
+  session stays in irlumed, so a GPU placement on such a host keeps the GPU
+  out of runtime suspend; system suspend is unaffected. A certification
+  resting on the hold retires the GPU to CPU if the device's
+  runtime-suspended counter ever grows with the model retained. Loading
+  admission stays closed and `CERTIFIED` stays empty.
+
 - ADR-0013 restates the shipped ViT RGB PAD cue's LFW evidence with figures
   that reproduce from the committed per-frame scores (ADR-0013 §4, amendment
   2026-10-21, #1166). Taking each LFW identity's images in fives, 4 of 1,072
@@ -450,8 +463,8 @@ All notable changes to irlume are documented here. This project adheres to
   real system suspend (1,000 of 1,000 bit-exact calls). The runtime-suspend
   witness is inconclusive on the `xe` driver while the model is retained:
   the compute runtime's long-running VM holds a kernel runtime-PM
-  reference for the process lifetime, so an ADR-0022 section 7.6 decision
-  for xe identities is pending (#1164). The `gpu_hw_*`
+  reference for the process lifetime; the ADR-0033 amendment of
+  2026-10-22 records how xe identities meet that arm (#1164). The `gpu_hw_*`
   lanes and the cache control compile with the new configuration; every
   `f16` identity leaves certification consideration. Loading admission
   stays closed and `CERTIFIED` stays empty

@@ -2162,6 +2162,7 @@ mod pipeline {
         pub(crate) fn embed(&mut self, aligned: Vec<u8>) -> Result<Vec<f32>, IrFailure> {
             self.engine
                 .emb
+                .on_cpu()
                 .embed(&aligned)
                 .map(|raw| raw.to_vec())
                 .map_err(|_| IrFailure::InferenceFailed)
@@ -2529,9 +2530,6 @@ impl Engine {
             Ok(resolution) => resolution,
             Err(refusal) => return Ok(readiness_refusal(refusal.readiness)),
         };
-        // The same NPU admission as the dual-sensor path (ADR-0022 §2); the
-        // request's scope clears it.
-        self.npu_probe = self.npu_probe_admitted(&enrollment);
         self.authenticate_ir_resolution(
             window,
             diagnostics,

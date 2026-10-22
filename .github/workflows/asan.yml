@@ -37,6 +37,7 @@ on:
       - ".github/lsan-suppressions.txt"
       - "scripts/ci-bubblewrap.sh"
       - "scripts/fetch-ort.sh"
+      - "scripts/ci/prefer-ubuntu-archive.py"
   schedule:
     - cron: "40 4 * * 3" # Wednesdays 04:40 UTC, clear of the other scheduled jobs
   workflow_dispatch:
@@ -74,6 +75,9 @@ jobs:
         with:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
+
+      - name: Prefer the Ubuntu archive for package downloads
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
 
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

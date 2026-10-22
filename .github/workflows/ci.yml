@@ -557,6 +557,9 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
+      - name: Prefer the Ubuntu archive for package downloads
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
+
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -638,6 +641,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Prefer the Ubuntu archive for package downloads
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
 
       # Every unit in packaging/systemd must be shipped by every packaging lane,
       # and every lane must agree on the version. Both failures have shipped
@@ -862,6 +868,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Prefer the Ubuntu archive for package downloads
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
 
       - name: Install system build dependencies
         run: |

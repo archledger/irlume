@@ -411,6 +411,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0033 narrows what a GPU certification entry keys on (amendment
+  2026-10-22, #1164): the OpenVINO libraries, the Intel compute runtime's
+  drivers and gmmlib, and the kernel compiler toolchain (IGC,
+  opencl-clang, clang, LLVM, the SPIR-V translator) instead of every
+  mapped library. Every other library stays hashed, inode-checked and on a
+  reviewed list, an unknown one refuses GPU placement, and when they
+  differ from the certified set the engine build reproduces an extended
+  reference digest, each input twice, before the GPU answers. On Fedora 44
+  the daemon's exact set would have moved on 13 dates in 92 days, the keyed
+  set on 6 (docs/research/2026-10-22-gpu-certification-key.md). The NPU keeps its
+  binding. Loading admission stays closed and `CERTIFIED` stays empty.
+
 - The GPU platform identity no longer hashes the memory size the plugin
   reports (`GPU_DEVICE_TOTAL_MEM_SIZE`), and every GPU hardware lane prints
   each identity field after the digest (#1164, ADR-0033 section 3). The

@@ -4,7 +4,8 @@
 
 Proposed 2026-10-10. Amended 2026-10-11 (driver identity), 2026-10-21
 (precision `f32`, ranking evidence, measured hosts) and 2026-10-22 (the
-runtime-suspend arm where the driver holds the device).
+runtime-suspend arm where the driver holds the device; the certification
+key binds the numerics set).
 
 Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
 reopen GPU support during #1053. Section 15 asked for "evidence that
@@ -122,7 +123,9 @@ a firmware build that cannot be read makes the identity unreadable and
 placement refuses, and the firmware is a field because a driver version
 does not imply it. A driver or compute-runtime update is a different
 identity; a kernel release is not a field, for the same reason as
-ADR-0022.
+ADR-0022. (Amended 2026-10-22, below: every mapped library stays hashed
+and in the exact identity, while the certification key binds the
+numerics set, and a changed support set runs an extended canary.)
 
 ### 4. Loading admission stays closed until the GPU conformance profile exists
 
@@ -369,6 +372,75 @@ leaves service. Phase 3 (#1161) carries the counter guard and the
 witness field of the entry, phase 5 (#1162) the read access to the bound
 device's power attributes.
 
+## Amendment 2026-10-22: the certification key binds the numerics set
+
+Section 3 binds the SHA-256 of every library the process maps once the
+GPU is enumerated, and an entry matches only that exact set. On the
+UX5406S the measured identity binds 37 libraries from about 25 Fedora
+packages, most of them with no part in the recognizer's arithmetic
+(glibc, libstdc++, zlib, zstd, xz, libxml2, ncurses, libedit, libffi,
+tbb, pugixml). Fedora 44 shipped stable updates to those packages on 9
+dates between 2026-07-22 and 2026-10-22, and the production daemon's own
+dependencies (systemd, OpenSSL) add 4 more, so an exact-set entry would
+match a routinely updated host for about a week at a time, and every
+re-certification is a campaign of over an hour on the decision hardware
+plus attended suspend steps and a release ([the certification-key
+record](../research/2026-10-22-gpu-certification-key.md)).
+
+On the fixed configuration the recognizer is a static graph (batch 1,
+fixed shapes) that the GPU plugin compiles at engine build: host code
+shapes the compiled program (graph transformations and constant folding
+in OpenVINO, OpenCL C kernel compilation through the compute runtime,
+opencl-clang, clang, LLVM, the SPIR-V translator and IGC), and at
+inference the host only dispatches it. The section 8 canary checks that
+compiled program's exact output bits on every engine build, so a host
+library that changes the program changes those bits and the GPU stays on
+CPU. Fedora's IGC and opencl-clang link the system LLVM, clang and
+SPIR-V translator libraries (`libLLVM.so.22.1`, `libclang-cpp.so.22.1`,
+`libLLVMSPIRVLib.so.22.1`), so those take part in kernel code generation
+and a system LLVM update alone can change it.
+
+Decision:
+
+1. The mapped libraries split into two reviewed lists. The numerics set
+   is the OpenVINO libraries, the Intel compute runtime's drivers and
+   memory library (the OpenCL and Level Zero drivers, gmmlib) and the
+   kernel compiler toolchain (IGC, opencl-clang, clang, LLVM, the SPIR-V
+   translator). The support set is every other library the measured
+   inventories map: the C and C++ runtimes, threading, compression, XML,
+   terminal and FFI libraries, lld, SPIRV-Tools, the OpenCL and Level Zero
+   loaders, irlume's CPU-side runtimes and the daemon's own dependencies.
+   A mapped library on neither list refuses placement, and doctor names
+   it, until a review classifies it: the inventory and inode discipline
+   of section 3 is unchanged, and every mapping still has to be a hashed,
+   inode-checked file.
+2. The certification key binds the device, firmware and configuration
+   fields of section 3 and the content of the numerics set by library
+   name, independent of the installation prefix as in the ADR-0022
+   provider-portability amendment. The exact identity of section 3, with
+   every library, still names caches, markers and diagnostics.
+3. The entry also records the support set's content digest and the GPU
+   output digest of an extended reference set (more fixed inputs than
+   the section 8 three, each run twice). When the live support digest
+   differs from the entry's, the engine build reproduces the extended
+   digest before the recognizer answers from the GPU, which also repeats
+   each input; any other bits keep it on CPU and doctor says why.
+
+What this changes: a support-library update keeps the certification as
+long as the compiled program reproduces the certified bits on the
+section 8 inputs and the extended set, instead of requiring that exact
+library bytes passed the campaign. What it leaves uncovered: behaviour
+that depends on input values those reference inputs never reach, and a
+nondeterminism a support library would introduce at inference after the
+build-time checks passed; the repeated extended inputs narrow the second
+and neither is a known mechanism for the classified libraries. Updates
+to the numerics set still need a new certification. With gmmlib in the
+numerics set, the same 92 days give 6 re-binding dates instead of 13.
+This amendment covers the GPU; the NPU keeps the ADR-0022 binding. Phase
+3 (#1161) carries the lists, the key, the support digest, the extended
+set and the refusal; the production daemon's inventory under the real
+unit completes the support list before any entry.
+
 ## Consequences
 
 - ADR-0022 section 15 no longer reserves the GPU; the maintainer's
@@ -432,3 +504,8 @@ device's power attributes.
   engine build retires the GPU to CPU and that answer is computed on
   CPU, while a system suspend with the counter unchanged keeps only the
   section 8 recheck (phase 3, fake power attributes).
+- Certification key (amendment 2026-10-22): a changed support library
+  keeps the key and a changed numerics library changes it; a mapped
+  library on neither list refuses placement with its name; a live support
+  digest that differs from the entry's runs the extended reference set,
+  whose mismatch keeps the GPU on CPU (phase 3, fixture inventories).

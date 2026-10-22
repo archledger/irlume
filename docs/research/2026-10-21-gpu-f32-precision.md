@@ -217,7 +217,9 @@ documented hold, or define a witness that releases the compute-runtime
 process, which then tests a fresh platform and compile after D3hot), and
 a production daemon that keeps the GPU plugin loaded keeps an xe GPU in
 D0 for its lifetime (the device is a Root Complex Integrated Endpoint, so
-runtime suspend means D3hot and D3cold is never available). The only
+runtime suspend means D3hot and D3cold is never available). Both were
+decided on 2026-10-22 in the ADR-0033 amendment of that date: the GPU
+session stays in irlumed, and a hold witness meets the runtime arm on xe. The only
 earlier lifetime diagnostic archived on the share (ThinkPad, 2026-10-13,
 identity `45a24201`) recorded 0 of 301 suspended samples in every stage
 including `a_cpu_only`, so it ran with the panel on; this is the first
@@ -282,7 +284,8 @@ rather than worked around in the compile configuration. Evidence:
   measured on the decision hardware.
 - Still open after this record: on the decision hardware, the ADR-0022
   section 7.6 runtime-suspend subset (unreachable with the model retained
-  on xe, see above; a decision for xe identities is pending), plus the
+  on xe, see above; met by the hold witness of the ADR-0033 amendment of
+  2026-10-22), plus the
   ADR-0022 section 7.3 items no GPU run has measured yet (IR recognition
   corpora, paired fusion, calibration and profile selection, enrollments
   up to 90 scans, the decision fingerprint over every arm). The ThinkPad

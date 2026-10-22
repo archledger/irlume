@@ -2,8 +2,9 @@
 
 ## Status
 
-Proposed 2026-10-10. Amended 2026-10-11 (driver identity) and 2026-10-21
-(precision `f32`, ranking evidence, measured hosts).
+Proposed 2026-10-10. Amended 2026-10-11 (driver identity), 2026-10-21
+(precision `f32`, ranking evidence, measured hosts) and 2026-10-22 (the
+runtime-suspend arm where the driver holds the device).
 
 Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
 reopen GPU support during #1053. Section 15 asked for "evidence that
@@ -145,7 +146,9 @@ impostors than the CPU reference is not disqualified by that alone. The
 drift bounds per arm, with the compile configuration pinned as an
 identity field, are unchanged. The measured 0.9995 cosine band is an
 input to those gates, not a pass of them. Enrollment, self-tests and
-every non-probe path stay on CPU.
+every non-probe path stay on CPU. (Amended 2026-10-22, below: where the
+driver holds the device while a model is retained, a hold witness meets
+the runtime-suspend parts of ADR-0022 measurements 6 and 7.)
 
 ### 6. `auto` ranks certification, never device class
 
@@ -297,6 +300,75 @@ hardware. The 2026.2.1 runtime measured on the UX5406S and in the
 2026-10-11 amendment is the intel-npu-stack 0.2.0 candidate package set;
 Fedora 44 itself ships OpenVINO 2025.1.0.
 
+## Amendment 2026-10-22: the runtime-suspend arm where the driver holds the device
+
+ADR-0022 section 7 asks for output bits that repeat "after the NPU has
+runtime-suspended" (measurement 6) and for crash-free calls "some after
+runtime suspends" (measurement 7); section 1 carries both to the GPU. On
+the `xe` driver neither event can happen while a compiled model is
+retained. The Intel compute runtime creates its VM in long-running mode
+when it enumerates the device (`getFlagsForVmCreate` sets
+`DRM_XE_VM_CREATE_FLAG_LR_MODE` unconditionally in intel-compute-runtime
+26.35.39758.11 and 26.35.39758.17), and the kernel takes a runtime-PM
+reference for every such VM that it drops only when the VM is destroyed,
+at process exit (`drivers/gpu/drm/xe/xe_vm.c` at v7.2, unchanged on
+mainline after v7.3, where the source comment calls the reference
+necessary for long-running workloads). Measured on the UX5406S, identity
+`ec747155`, 2026-10-21, with the panel dark: the GPU runtime-suspended in
+the lifetime diagnostic's CPU-only stage (206 of 301 samples) and in none
+of the four stages that held a compute context, the stage with the
+platform dropped and the libraries still mapped included (0 of 301
+each). The retained control's 120 s runtime window read `active`
+throughout with the suspended-time counter unchanged, and the GPU
+suspended again about a second after the retained process exited (35 of
+45 samples). The retained control therefore reports the runtime arm as a
+missing event (`RELIABILITY_COVERAGE_READY=false`) by driver design, not
+by a fault ([the precision record](../research/2026-10-21-gpu-f32-precision.md)).
+
+Decision, on the maintainer's choice of 2026-10-22:
+
+1. The GPU session stays in irlumed on every host, as the NPU session
+   does; no helper process exits on idle to let the GPU sleep. A GPU
+   placement on a host whose driver holds the device therefore keeps the
+   GPU out of runtime suspend for the daemon's lifetime. System suspend
+   is unaffected: the UX5406S proved one with the model retained and
+   1,000 of 1,000 calls bit-exact. The idle power the hold costs while
+   the display is off and the system awake was not measured; platform
+   S0ix residency did not grow in any stage of the dark-panel diagnostic,
+   the CPU-only stage included, so the hold cost no S0ix residency there.
+2. On such an identity the runtime parts of measurements 6 and 7 are met
+   by a hold witness instead of a runtime event. The evidence for the
+   identity being certified shows, with the display off: the lifetime
+   diagnostic with the GPU runtime-suspending in the CPU-only stage and
+   in none of the stages that hold a compute context; the retained
+   control with the GPU `active` and `power/control` at `auto` for its
+   whole runtime window, a proven system suspend, every call bit-exact
+   and every boundary unchanged; and the GPU runtime-suspending again
+   once the retained process has exited. Each run archives the kernel
+   release. An identity whose runtime event is observable proves it as
+   before (the ThinkPad X13 Yoga Gen 4 on `i915` proved a runtime and a
+   system suspend in one retained process on 2026-10-21); the hold
+   witness applies only where the diagnostic shows the hold.
+3. A kernel release is not an identity field (section 3), so a later
+   kernel could release the hold under a certified identity. The
+   certification entry therefore records which runtime witness it rests
+   on. For an entry resting on the hold, the daemon reads the bound
+   device's `power/runtime_suspended_time` after the engine build and
+   with each GPU answer. Growth means a runtime suspend happened with
+   the model retained, which that certification never measured: the
+   recognizer retires the GPU to CPU, that answer is computed on CPU, and
+   doctor names re-certification as the remedy. A system suspend does not
+   grow that counter (on the UX5406S it stayed at 173,292 ms across the
+   proven suspend) and keeps the section 8 recheck.
+
+This states how the runtime arm is witnessed where the driver rules the
+event out; no gate is relaxed. The transition the arm guards against
+cannot occur while the model is retained on such an identity, the
+transition that can occur is proven, and if the first ever occurs the GPU
+leaves service. Phase 3 (#1161) carries the counter guard and the
+witness field of the entry, phase 5 (#1162) the read access to the bound
+device's power attributes.
+
 ## Consequences
 
 - ADR-0022 section 15 no longer reserves the GPU; the maintainer's
@@ -355,3 +427,8 @@ Fedora 44 itself ships OpenVINO 2025.1.0.
   admits nothing (phase 3 tests beside the `npu` switch tests).
 - The certification table stays empty unless every gate of section 5
   passes on the named identity.
+- For an entry resting on the hold witness (amendment 2026-10-22),
+  growth of the bound device's `power/runtime_suspended_time` after the
+  engine build retires the GPU to CPU and that answer is computed on
+  CPU, while a system suspend with the counter unchanged keeps only the
+  section 8 recheck (phase 3, fake power attributes).

@@ -931,6 +931,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The required CI job removes the known slow Azure APT mirror before
+  installing packages, retaining the runner's HTTPS Ubuntu archive and
+  security fallbacks (#1184). A missing expected fallback is an early
+  error. Package signature checks, virtual-camera setup and all test
+  gates remain unchanged.
+
 - Diagnostic trace segment attribution (#1150): `trace analyze` reports an
   unavailable sequential envelope if any generic capture's segment lacks
   schedule or fallback evidence, even when a later attempt has a schedule.

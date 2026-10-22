@@ -411,6 +411,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The GPU platform identity no longer hashes the memory size the plugin
+  reports (`GPU_DEVICE_TOTAL_MEM_SIZE`), and every GPU hardware lane prints
+  each identity field after the digest (#1164, ADR-0033 section 3). The
+  plugin answers that size with `CL_DEVICE_GLOBAL_MEM_SIZE`, which the
+  compute runtime derives on integrated GPUs from the boot's memory, so it
+  moved between boots of the UX5406S with every library and firmware
+  unchanged (four values from 30,629,322,752 to 30,629,355,520 bytes) and
+  moved the digest with it; ADR-0033 section 3 never named it. The
+  UX5406S evidence of 2026-10-21 (`ec747155`) belongs to identity
+  `1f570994` under the new definition, shown by recomputing the old digest
+  from the new field dump. Every GPU identity digest changes once.
+  Loading admission stays closed and `CERTIFIED` stays empty.
+
 - ADR-0013 restates the shipped ViT RGB PAD cue's banner evidence
   (ADR-0013 §4, amendment 2026-10-22, #1169). The 0.594 to 0.656 range is
   the Zenbook qualification's two banner presentation medians, 0.594 close

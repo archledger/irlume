@@ -77,6 +77,16 @@ foreign ICD libraries (a Mesa Rusticl ICD ran in the measured
 processes). `GPU_DRIVER_VERSION` is never read: reading it through the
 C API kills the process on the measured 2026.2.1 builds, so driver
 identity comes from the hashed mapped-library manifest.
+`GPU_DEVICE_TOTAL_MEM_SIZE` is reported but not hashed: the plugin answers
+it with `CL_DEVICE_GLOBAL_MEM_SIZE`, which the compute runtime derives on
+integrated GPUs from the boot's physical pages and GTT size, so it moves
+between boots of one platform (on the UX5406S `ec747155` under the earlier
+definition, which hashed it, is `1f570994` under this one; the
+[precision record](research/2026-10-21-gpu-f32-precision.md) has the
+recomputation). Every lane prints `<lane> identity field name=value` lines
+after its digest, one per hashed field and one per library, then the
+unhashed memory size; archive them with the run so a changed digest can be
+traced to the field that moved.
 
 This observation cannot key certification; the loading-admission and
 certification gates decide. The ignored `gpu_hw_*` tests collect the

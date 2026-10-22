@@ -32,6 +32,9 @@ arm's whole extent under a hiding digest, validated there as root before
 they leave, and items 6 and 7 run separately through the production compile.
 It admits no profile and adds no entry.
 
+Amended 2026-10-22 by the [experimental IR-only CPU-reference
+rule](#amendment-2026-10-22-experimental-ir-only-probes-stay-on-cpu).
+
 ## Context
 
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
@@ -193,6 +196,9 @@ When an IR adapter is configured (`IRLUME_IR_ADAPTER`; none ships since
 ADR-0004), the recognizer stays on CPU: an adapter is user-supplied, transforms
 the raw IR embedding before its own threshold, and is part of no certification.
 
+The experimental IR-only route also stays on the CPU reference, regardless
+of the recognizer's placement; see the [2026-10-22 amendment](#amendment-2026-10-22-experimental-ir-only-probes-stay-on-cpu).
+
 ### 3. A per-model certification table in the source
 
 Device selection is per model and decided by a table compiled into
@@ -219,6 +225,9 @@ certified again or removed in the same change. There is no `AUTO`, `HETERO` or
 `MULTI` device, and no selection by device availability or speed. An
 entry is added only by a reviewed change that cites its certification evidence
 (section 7).
+
+An entry does not admit the experimental IR-only route to the accelerator;
+that route has no separate certified decision coverage.
 
 Amended 2026-10-10 by ADR-0033: the "no GPU" clause of this prohibition
 is superseded there; the GPU is eligible under this table's regime, one
@@ -610,6 +619,10 @@ execution-provider (CUDA, TensorRT) lane inert.
   detectors, the ONNX mesh fallback and TFLite models never do.
 - Enrollment: with the recognizer on the NPU, enrollment scans come from the
   CPU session.
+- Experimental IR-only: its inference explicitly uses the CPU view even
+  with a placed recognizer, and the route never sets probe admission. The
+  source guard checks all production modules and catches multiline direct
+  embedding calls outside the two admitted probe helpers.
 - Identity: an unreadable firmware build resolves every model to CPU.
 - Kill switch: `IRLUME_NPU=0`, `npu=0`, an empty, malformed or non-UTF-8
   value and an unreadable `settings.conf` disable the NPU; absent and
@@ -1267,6 +1280,35 @@ witness of ADR-0033's runtime-suspend amendment of 2026-10-22, ran in
 `irlume-vision`'s unit-test binary through test-only compile paths, which
 have neither the marker nor the inventory check. They are inputs, and they
 are repeated before any entry, whatever the certification key shows.
+
+## Amendment 2026-10-22: experimental IR-only probes stay on CPU
+
+The experimental IR-only pipeline in `ir_assessment.rs` embeds through
+`IrInference::embed`. It used the placed recognizer directly, without the
+ordinary probe helpers' CPU-reference fallback, and set a probe-admission
+flag that its direct call did not consult. The existing source guard read
+only `lib.rs` and did not detect the multiline call in that module.
+
+This route now explicitly calls the recognizer's CPU view and does not set
+probe admission. The ordinary dual-sensor probe helpers retain their
+existing admission and certification checks. This restriction applies to
+both NPU and GPU placement; a matching recognizer entry alone does not
+certify the experimental route's composed decisions. Admitting that route
+later requires its own decision-fingerprint coverage and the corresponding
+CPU-template/accelerator-probe evidence under section 7.
+
+The source guard now visits production Rust modules below `irlume-auth/src`,
+excluding dedicated test files and support modules, and normalizes
+whitespace so a multiline call cannot evade it. Inline test modules are
+also checked as a conservative superset. Only the two existing probe
+helpers may call the placed recognizer's embedding methods. A separate
+regression requires the experimental inference to use the CPU view and
+forbids its unused admission assignment.
+
+Both certification tables remain empty and loading admission remains closed.
+No threshold, camera selection, IR-only opt-in, liveness check, grant rule
+or password fallback changes. This pins the CPU behavior that the empty tables already
+give this route; it does not qualify an accelerator.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

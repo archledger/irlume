@@ -436,6 +436,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Keep experimental IR-only recognition probes on the CPU reference even
+  when a recognizer is placed on an accelerator (ADR-0022, amendment
+  2026-10-22 "experimental IR-only probes stay on CPU", #1164). That route
+  does not have certified accelerator decision coverage. Its unused probe
+  admission is removed, and the source guard covers multiline embedding
+  calls across the authentication modules. Thresholds and grant rules stay
+  unchanged; accelerator loading and certification remain closed.
+
 - Correct the Tufts evidence behind the dark recognition threshold
   (ADR-0016, amendment 2026-10-22, #1164): the shipped lambda-0.5
   best-of-N arms measured FAR 6.10e-5 and 6.60e-5 at a flat 0.635, not

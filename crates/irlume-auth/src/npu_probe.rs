@@ -456,6 +456,65 @@ mod tests {
     /// view, so no path but an admitted authentication reaches the NPU.
     #[test]
     fn production_embeds_only_through_the_probe_helpers_or_the_cpu_view() {
+        fn check_sources(dir: &std::path::Path, checked: &mut Vec<std::path::PathBuf>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                if name == "engine_tests"
+                    || name.starts_with("test_support")
+                    || name.ends_with("_tests.rs")
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    check_sources(&path, checked);
+                    continue;
+                }
+                if path.extension().and_then(|s| s.to_str()) != Some("rs") || name == "npu_probe.rs"
+                {
+                    continue;
+                }
+                // Include inline test modules too: this is a conservative
+                // superset of production code, not a Rust parser that might
+                // silently discard a production item after a test module.
+                let source: String = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                for call in [".emb.embed(", ".emb.embed_tta(", ".emb.embed_with_norm("] {
+                    assert!(
+                        !source.contains(call),
+                        "{} calls {call} directly",
+                        path.display()
+                    );
+                }
+                checked.push(path);
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = Vec::new();
+        check_sources(&src, &mut checked);
+        assert!(checked.contains(&src.join("lib.rs")));
+        assert!(checked.contains(&src.join("ir_assessment.rs")));
+        // Only these two admitted helpers may use the placed recognizer.
+        let helpers: String = include_str!("npu_probe.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(helpers.matches("self.emb.embed_tta(chip)").count(), 1);
+        assert_eq!(helpers.matches("self.emb.embed(chip)").count(), 1);
+        assert_eq!(helpers.matches(".emb.embed_tta(").count(), 1);
+        assert_eq!(helpers.matches(".emb.embed(").count(), 1);
+        assert_eq!(helpers.matches(".emb.embed_with_norm(").count(), 0);
         let source = include_str!("lib.rs")
             .split("\nmod tests {")
             .next()
@@ -468,12 +527,27 @@ mod tests {
         // Only the admission sets the flag, and the request scope clears it.
         assert_eq!(source.matches("self.npu_probe = ").count(), 1);
         assert!(source.contains("self.npu_probe = self.npu_probe_admitted(&enr);"));
-        // ir_assessment.rs has a test module before its production code,
-        // so the whole file is searched; its tests do not set the flag.
+        // The experimental IR-only route always uses the CPU reference.
         let ir_only = include_str!("ir_assessment.rs");
-        assert_eq!(ir_only.matches("self.npu_probe = ").count(), 1);
-        assert!(ir_only.contains("self.npu_probe = self.npu_probe_admitted(&enrollment);"));
+        assert_eq!(ir_only.matches("self.npu_probe = ").count(), 0);
         assert!(include_str!("authentication_window.rs").contains("self.engine.npu_probe = false;"));
+    }
+
+    /// The experimental IR-only route has no certified accelerator decision.
+    #[test]
+    fn ir_only_embeddings_use_the_cpu_reference() {
+        let source: String = include_str!("ir_assessment.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            source.contains("self.engine.emb.on_cpu().embed(&aligned)"),
+            "IR-only inference must use the CPU reference even when the recognizer is placed"
+        );
+        assert!(
+            !source.contains("self.npu_probe="),
+            "the IR-only route must not admit accelerator probes"
+        );
     }
 
     /// Every enrollment path that embeds a scan stamps its producer.

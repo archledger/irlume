@@ -91,6 +91,12 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
+      - name: Prefer the Ubuntu archive for package downloads
+        # The image's Azure mirror can keep sending data too slowly to trip
+        # its read timeout (actions/runner-images#14823). Keep the existing
+        # HTTPS archive/security fallbacks, package signatures and test gates.
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
+
       - name: Install system build dependencies
         run: |
           # Self-hosted Arch runner: the toolchain deps are preinstalled
@@ -113,6 +119,9 @@ jobs:
 
       - name: Virtual-camera bootstrap contracts (fixtures, no hardware)
         run: python3 -B scripts/ci/test-v4l2-bootstrap.py
+
+      - name: Hosted APT mirror contracts (fixtures, no network)
+        run: python3 -B scripts/ci/test-prefer-ubuntu-archive.py
 
       # Offline, with the runner's openssl: the refresh script's own tests,
       # then the shipped vendor CA certificates against their manifest

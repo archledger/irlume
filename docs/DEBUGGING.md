@@ -149,7 +149,23 @@ succeeded, and every started session reports its release unless a capture
 panicked. `grouped_evaluation` is the evaluation of the collected samples
 (detection, liveness and PAD for each, identity for the final admissible one),
 reported once per group whatever its result, on the pair and the RGB-only
-grouped routes. The batch releases its sessions before it returns, so on a
+grouped routes. On the grouped sequential pair route (not the split or the
+eager one) the RGB face detection and the ViT RGB PAD score of each sample run
+while the IR session captures, since they depend on the RGB frame alone: their `detection` and
+`liveness` records lie inside the IR phase, the last of them possibly just after
+it for the call in flight when the phase ends (the union counts that time once),
+and `grouped_evaluation` then holds the IR detection, a `liveness` record per
+sample for the liveness gates, the IR PAD cue and the ViT answer it was handed,
+and identity. A sample the worker scored and the evaluation reached therefore
+has two `liveness` records, the evaluation's without the ViT time. That work stops when the IR phase ends,
+after the call in flight; a sample it did not reach is computed inside
+`grouped_evaluation` as before, and so is the rescue detector and its ViT score
+for an RGB frame the face detector found empty. Some of the worker's records
+can be for samples the evaluation then does not use (a refusal earlier in the
+group, or a verdict that is not live). The `[assessment-stage] grouped-capture`
+debug line reports the batch's time and, as `after-ir-release`, how much of it
+followed the IR release. The
+batch releases its sessions before it returns, so on a
 grouped route `finalization` contains the last group's `grouped_evaluation`,
 and the rest of it is the final matching, camera handle close and lease
 release. The eager sequential route still reports one `rgb_capture` and one

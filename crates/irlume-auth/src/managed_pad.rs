@@ -546,6 +546,7 @@ impl Engine {
                     rgb_hard_retried: false,
                     held_sessions: true,
                     ir_ms: Some(ir_ms),
+                    rgb_pad_score: None,
                     diagnostics,
                 },
             )?;

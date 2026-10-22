@@ -210,7 +210,8 @@ mod sequential_batch;
 mod split_capture;
 pub use sequential_batch::{
     capture_rgb_denoised_batch_with_control, capture_sequential_batch_observed,
-    capture_sequential_batch_with_control, capture_sequential_batch_with_progress, RgbBatchRequest,
+    capture_sequential_batch_overlapped, capture_sequential_batch_with_control,
+    capture_sequential_batch_with_progress, OverlapStop, OverlappedBatch, RgbBatchRequest,
     SequentialBatchPhase, SequentialBatchRequest,
 };
 pub use split_capture::{

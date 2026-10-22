@@ -3,8 +3,7 @@
 
 use super::*;
 use crate::sequential_batch::{
-    capture_batch_with, capture_rgb_batch_controlled_with, capture_rgb_batch_with,
-    RgbBatchRequest,
+    capture_rgb_batch_controlled_with, capture_rgb_batch_with, OverlapStop, RgbBatchRequest,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -102,6 +101,20 @@ impl BatchFixture {
         fault: &str,
         observed: bool,
     ) -> irlume_common::Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+        self.run_overlapped(fault, observed, None::<fn(&[Frame], &OverlapStop<'_>)>, |_, _| {})
+            .map(|(pairs, _)| pairs)
+    }
+
+    /// [`Self::run_with`] with an overlap worker; `on_ir_capture` runs on the
+    /// calling thread at the start of each IR capture, given its index and
+    /// the event log.
+    fn run_overlapped<W: Send>(
+        &mut self,
+        fault: &str,
+        observed: bool,
+        overlap: Option<impl FnOnce(&[Frame], &OverlapStop<'_>) -> W + Send>,
+        on_ir_capture: impl Fn(usize, &RefCell<Vec<String>>),
+    ) -> irlume_common::Result<crate::sequential_batch::OverlappedBatch<W>> {
         let events = &self.events;
         let observe = |phase: SequentialBatchPhase, _elapsed: Duration| {
             if observed {
@@ -127,7 +140,8 @@ impl BatchFixture {
             })
         };
         let validation_checkpoints = Cell::new(0);
-        capture_batch_with(
+        let ir_captures = Cell::new(0);
+        crate::sequential_batch::capture_batch_overlapped_with(
             self.request,
             &runtime_gate_contract(),
             (
@@ -147,6 +161,8 @@ impl BatchFixture {
             (
                 || open("ir"),
                 |_: &mut Owner<'_>| {
+                    on_ir_capture(ir_captures.get(), events);
+                    ir_captures.set(ir_captures.get() + 1);
                     events.borrow_mut().push("ir capture".into());
                     if fault == "ir capture error" && self.ir.len() == 3 {
                         return Err(Error::Hardware("scripted capture failure".into()));
@@ -172,6 +188,7 @@ impl BatchFixture {
                 }
                 now.get()
             },
+            &CaptureControl::with_progress(no_progress()),
             || {
                 events.borrow_mut().push("lease check".into());
                 if fault == "lease deadline" {
@@ -184,6 +201,7 @@ impl BatchFixture {
                 }
             },
             &observe,
+            overlap,
         )
     }
 }
@@ -207,6 +225,156 @@ fn batch_preserves_order_stats_and_releases_both_sessions_before_return() {
         assert!(rgb_close < ir_open);
         assert_eq!(&events[events.len() - 2..], ["ir close", "lease check"]);
     }
+}
+
+/// How long a test waits for a signal from the other thread before failing
+/// instead of hanging.
+const OVERLAP_WAIT: Duration = Duration::from_secs(10);
+
+/// The overlap worker reads the released RGB samples in capture order, runs
+/// while the IR session captures (the IR phase waits for the worker's start
+/// signal, and the worker waits for the second IR capture), finds the stop
+/// still down there (the third IR capture waits for its reading), and its
+/// result comes back with the unchanged batch.
+#[test]
+fn overlap_reads_the_released_rgb_samples_while_ir_captures() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    let mut fixture = BatchFixture::new(5);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let ir_captures = AtomicUsize::new(0);
+    let ir_captures_ref = &ir_captures;
+    let overlap = move |rgb: &[Frame], stop: &OverlapStop<'_>| {
+        started_tx.send(()).unwrap();
+        let waited = Instant::now();
+        while ir_captures_ref.load(Ordering::Acquire) < 2 {
+            assert!(waited.elapsed() < OVERLAP_WAIT, "the IR phase never ran");
+            std::thread::yield_now();
+        }
+        stop_tx.send(stop.requested()).unwrap();
+        rgb.iter().map(|frame| frame.data[0]).collect::<Vec<_>>()
+    };
+    let (pairs, overlapped) = fixture
+        .run_overlapped("", false, Some(overlap), |index, events| {
+            if index == 0 {
+                started_rx.recv_timeout(OVERLAP_WAIT).expect("the worker started");
+                events.borrow_mut().push("overlap started".into());
+            }
+            if index == 2 {
+                let raised = stop_rx.recv_timeout(OVERLAP_WAIT).expect("the worker read the stop");
+                events.borrow_mut().push(format!("stop raised mid-phase: {raised}"));
+            }
+            ir_captures.fetch_add(1, Ordering::Release);
+        })
+        .expect("valid batch");
+    assert_eq!(overlapped, Some(vec![0, 1, 2, 3, 4]));
+    assert!(
+        fixture.events.borrow().iter().any(|e| e == "stop raised mid-phase: false"),
+        "the stop stays down while IR captures"
+    );
+    assert_eq!(pairs.len(), 5);
+    for (n, (r, i, _)) in pairs.iter().enumerate() {
+        assert_eq!((r.data[0], i.data[0]), (n as u8, (10 + n) as u8));
+    }
+    let events = fixture.events.borrow();
+    let position = |name: &str| events.iter().position(|e| e == name).unwrap();
+    assert!(position("rgb close") < position("ir open"));
+    assert!(position("ir open") < position("overlap started"));
+    assert!(position("overlap started") < position("ir close"));
+}
+
+/// A healthy IR phase also raises the stop flag when it ends, so the batch
+/// waits only for the worker's unit in flight; what the worker returns comes
+/// back with the batch.
+#[test]
+fn a_healthy_ir_phase_raises_the_stop_when_it_ends() {
+    let mut fixture = BatchFixture::new(5);
+    let overlap = |_: &[Frame], stop: &OverlapStop<'_>| {
+        let waited = Instant::now();
+        while !stop.requested() {
+            assert!(waited.elapsed() < OVERLAP_WAIT, "the stop flag never rose");
+            std::thread::yield_now();
+        }
+        "stopped"
+    };
+    let (pairs, overlapped) = fixture
+        .run_overlapped("", false, Some(overlap), |_, _| {})
+        .expect("valid batch");
+    assert_eq!(pairs.len(), 5);
+    assert_eq!(overlapped, Some("stopped"));
+}
+
+/// A failed IR phase raises the stop flag and still joins the worker before
+/// the error returns; the worker's result is discarded with the batch.
+#[test]
+fn a_failed_ir_phase_stops_and_joins_the_overlap() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut fixture = BatchFixture::new(5);
+    let finished = AtomicBool::new(false);
+    let finished_ref = &finished;
+    let overlap = move |_: &[Frame], stop: &OverlapStop<'_>| {
+        let waited = Instant::now();
+        while !stop.requested() {
+            assert!(waited.elapsed() < OVERLAP_WAIT, "the stop flag never rose");
+            std::thread::yield_now();
+        }
+        finished_ref.store(true, Ordering::Release);
+    };
+    let result = fixture.run_overlapped("ir capture error", false, Some(overlap), |_, _| {});
+    assert!(matches!(result, Err(Error::Hardware(_))));
+    assert!(finished.load(Ordering::Acquire), "the worker joined before return");
+    assert!(fixture.events.borrow().iter().any(|e| e == "ir close"));
+}
+
+/// A panicking worker resumes its panic only after the IR phase has run to
+/// its end and reported its release, so no stream outlives the batch.
+#[test]
+fn an_overlap_panic_resumes_after_the_ir_session_is_released() {
+    let mut fixture = BatchFixture::new(5);
+    let overlap = |_: &[Frame], _: &OverlapStop<'_>| -> () { panic!("scripted overlap panic") };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.run_overlapped("", true, Some(overlap), |_, _| {})
+    }));
+    let Err(payload) = result else {
+        panic!("the worker's panic resumes");
+    };
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("scripted overlap panic")
+    );
+    let events = fixture.events.borrow();
+    assert_eq!(events.iter().filter(|e| *e == "ir capture").count(), 5, "{events:?}");
+    let position = |name: &str| events.iter().position(|e| e == name);
+    let (closed, released) = (position("ir close"), position("IrRelease"));
+    assert!(closed.is_some() && released.is_some(), "{events:?}");
+    assert!(closed < released, "{events:?}");
+    assert!(position("lease check").is_none(), "{events:?}");
+}
+
+/// An unwinding IR phase raises the stop flag, and the scope joins the
+/// worker before the panic continues.
+#[test]
+fn an_unwinding_ir_phase_stops_and_joins_the_overlap() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut fixture = BatchFixture::new(5);
+    let finished = AtomicBool::new(false);
+    let finished_ref = &finished;
+    let overlap = move |_: &[Frame], stop: &OverlapStop<'_>| {
+        let waited = Instant::now();
+        while !stop.requested() {
+            assert!(waited.elapsed() < OVERLAP_WAIT, "the stop flag never rose");
+            std::thread::yield_now();
+        }
+        finished_ref.store(true, Ordering::Release);
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.run_overlapped("ir panic", false, Some(overlap), |_, _| {})
+    }));
+    assert!(result.is_err(), "the IR panic continues");
+    assert!(finished.load(Ordering::Acquire), "the worker joined first");
 }
 
 /// Each phase covers exactly its own calls: the start ends when the opener

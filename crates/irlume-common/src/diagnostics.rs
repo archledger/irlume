@@ -732,7 +732,13 @@ diagnostic_enum!(TraceWarning {
 // evaluation of its collected samples (detection, liveness and PAD per
 // sample, identity for the final admissible one), reported once per group
 // whatever its result; it follows the batch, so it lies inside
-// `Finalization`. No phase carries a score or a frame.
+// `Finalization`. On the grouped sequential pair route an overlap worker
+// runs each sample's RGB detection and ViT PAD score during
+// the IR phase (the call in flight when it ends may finish just after it),
+// reported there as `Detection` and `Liveness`; the evaluation still reports
+// its own `Liveness` per sample (the gates and the IR PAD, without the ViT it
+// was handed), and computes whatever the worker did not reach. No phase
+// carries a score or a frame.
 diagnostic_enum!(TraceStage {
     CameraOpen,
     StreamArm,

@@ -397,6 +397,10 @@ struct PairAssessmentContext<'a> {
     rgb_hard_retried: bool,
     held_sessions: bool,
     ir_ms: Option<u128>,
+    /// The ViT RGB PAD answer the grouped route computed for this sample's
+    /// top RGB face while the IR session captured; used only for that same
+    /// unreplaced frame and that exact box.
+    rgb_pad_score: Option<grouped_auth::RgbPadScore>,
     diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
 }
 
@@ -2193,6 +2197,36 @@ enum PadEvidence {
     InferenceFailed,
     Pending,
     Score(f32),
+}
+
+/// The ViT RGB PAD evidence of one assessed pair: a score only for a frame
+/// the verdict still calls Live, from `precomputed` when the grouped route's
+/// overlap worker made the same call on this unreplaced frame for this exact
+/// box (the same call on the same inputs), else from `score`, which is `None`
+/// when no ViT session is loaded.
+fn vit_pad_evidence(
+    verdict: Verdict,
+    rgb_top: Option<&Detection>,
+    score: Option<impl FnOnce(&[f32; 4]) -> Result<f32, String>>,
+    precomputed: Option<grouped_auth::RgbPadScore>,
+    frame_replaced: bool,
+) -> PadEvidence {
+    match (verdict, rgb_top, score) {
+        (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
+        (Verdict::Live, Some(face), Some(score)) => {
+            match grouped_auth::rgb_pad_answer(precomputed, frame_replaced, &face.bbox, || {
+                score(&face.bbox)
+            }) {
+                Ok(p) if p.is_finite() => PadEvidence::Score(p),
+                Ok(_) => PadEvidence::InferenceFailed,
+                Err(e) => {
+                    irlume_common::dlog!("pad-vit: inference failed ({e})");
+                    PadEvidence::InferenceFailed
+                }
+            }
+        }
+        _ => PadEvidence::NotApplicable,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5658,6 +5692,7 @@ impl Engine {
                     rgb_hard_retried: false,
                     held_sessions: false,
                     ir_ms: None,
+                    rgb_pad_score: None,
                     diagnostics,
                 },
             )?;
@@ -6222,6 +6257,7 @@ impl Engine {
                 rgb_hard_retried,
                 held_sessions,
                 ir_ms: Some(ir_ms),
+                rgb_pad_score: None,
                 diagnostics,
             },
         )?;
@@ -6260,6 +6296,33 @@ impl Engine {
             elapsed_us: u64::try_from(rgb_detection_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
         });
+        self.finish_rgb_detection(rgb, rgb_ms, rgb_faces)
+    }
+
+    /// [`Self::detect_rgb_assessment`] for a frame whose detector answer was
+    /// computed while the IR session captured (`grouped_auth::RgbHalf`): the
+    /// same checks, error, log lines and rescue at the same points, without
+    /// running the detector again. Its `Detection` timing was reported when
+    /// the detector ran.
+    fn adopt_rgb_detection(
+        &mut self,
+        rgb: &align::RgbView<'_>,
+        rgb_faces: irlume_common::Result<Vec<Detection>>,
+    ) -> irlume_common::Result<(Vec<Detection>, Option<Detection>)> {
+        self.check_request_active()?;
+        let rgb_faces = rgb_faces?;
+        self.check_request_active()?;
+        self.finish_rgb_detection(rgb, None, rgb_faces)
+    }
+
+    /// The part of an RGB detection after the detector answered: the top
+    /// face, its log line, the rescue when there is none.
+    fn finish_rgb_detection(
+        &mut self,
+        rgb: &align::RgbView<'_>,
+        rgb_ms: Option<u128>,
+        rgb_faces: Vec<Detection>,
+    ) -> irlume_common::Result<(Vec<Detection>, Option<Detection>)> {
         let mut rgb_top = top_detection(&rgb_faces).cloned();
         let capture_timing =
             rgb_ms.map_or_else(|| "from grouped capture".into(), |ms| format!("in {ms}ms"));
@@ -6293,8 +6356,12 @@ impl Engine {
             rgb_hard_retried,
             held_sessions,
             ir_ms,
+            rgb_pad_score,
             diagnostics,
         } = context;
+        // Whether the self-heal below replaced the RGB frame the grouped
+        // route's overlap worker scored.
+        let mut rgb_recaptured = false;
         let (mut rgb, ir, ir_stats, split_pair) = match capture {
             PairCapture::Split(captured) => {
                 let (rgb, ir, stats) = captured.into_parts(operation)?;
@@ -6397,6 +6464,7 @@ impl Engine {
                 irlume_common::diagnostics::TraceStage::RgbCapture,
                 heal_started.elapsed().as_millis(),
             );
+            rgb_recaptured = true;
             rgb_faces = self.det.detect(&align::RgbView {
                 data: &rgb.data,
                 width: rgb.width,
@@ -6665,34 +6733,34 @@ impl Engine {
         };
         let (verdict, reason, deny_cause) =
             settle_ir_pad(verdict, reason, deny_cause, shipped_ir_fake);
-        // Shipped ViT RGB PAD cue (ADR-0013, default-on): score the RGB face
-        // only on frames the (already post-IR-PAD) verdict still calls Live —
-        // deny-only cues never need to run on frames that already deny, and
-        // the 268ms N100 inference is not free (the plan: consent-watch-
-        // pipelined, Live frames only).
+        // Shipped ViT RGB PAD cue (ADR-0013, default-on): only frames the
+        // (already post-IR-PAD) verdict still calls Live take a score, since
+        // deny-only cues never need to run on frames that already deny. On
+        // the grouped sequential route the overlap worker scores the top face
+        // of each sample it reaches while IR captures; only a Live frame
+        // consumes that score, and anything it did not reach (or a rescue
+        // box) is scored here.
         self.check_request_active()?;
-        let rgb_pad = match (verdict, rgb_top.as_ref(), self.vit_pad.as_mut()) {
-            (Verdict::Live, Some(_), None) => PadEvidence::Unavailable,
-            (Verdict::Live, Some(f), Some(pad)) => {
+        let rgb_pad = vit_pad_evidence(
+            verdict,
+            rgb_top.as_ref(),
+            self.vit_pad.as_mut().map(|pad| {
                 // Fresh view against the FINAL RGB frame: the self-heal
                 // above may have recaptured it after the view built for
                 // detection.
-                let view = align::RgbView {
-                    data: &rgb.data,
-                    width: rgb.width,
-                    height: rgb.height,
-                };
-                match pad.p_spoof(&view, &f.bbox) {
-                    Ok(p) if p.is_finite() => PadEvidence::Score(p),
-                    Ok(_) => PadEvidence::InferenceFailed,
-                    Err(e) => {
-                        irlume_common::dlog!("pad-vit: inference failed ({e})");
-                        PadEvidence::InferenceFailed
-                    }
+                let rgb = &rgb;
+                move |bbox: &[f32; 4]| {
+                    let view = align::RgbView {
+                        data: &rgb.data,
+                        width: rgb.width,
+                        height: rgb.height,
+                    };
+                    pad.p_spoof(&view, bbox).map_err(|e| e.to_string())
                 }
-            }
-            _ => PadEvidence::NotApplicable,
-        };
+            }),
+            rgb_pad_score,
+            rgb_recaptured,
+        );
         self.check_request_active()?;
         let (verdict, reason, deny_cause) =
             self.settle_rgb_pad(verdict, reason, deny_cause, rgb_pad);

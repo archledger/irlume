@@ -436,6 +436,26 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- On the grouped sequential route each sample's RGB face detection and ViT
+  RGB PAD score now run while the IR session captures, instead of after both
+  sessions are released (#1174). They depend on the RGB frame alone. The
+  evaluation uses them where it made the same calls, only for the same frame
+  and the bit-identical face box, and computes whatever that work had not
+  reached when the IR phase ended, so every check, vote and log line keeps
+  its order on the same inputs. Only timing moves: near the authentication
+  deadline an attempt can reach a decision the serial order would have
+  expired, or expire while the call in flight finishes where it would have
+  been refused or granted, and an expiry draws a retry strike where an
+  uncertain or faceless refusal does not. Identity still runs only for the final
+  admissible sample after both streams are released, RGB is still released
+  before IR starts, and no stream is held longer. In a trace the worker's
+  `detection` and `liveness` records lie inside the IR phase (the last
+  possibly just after it), so a sample the evaluation reaches after the
+  worker scored it has two `liveness` records. On the BRIO a warm grant
+  spent 275 instead of 746 ms in the evaluation after both releases (#1173
+  alone; 1385 ms before it) while the IR phase took as long as before
+  (docs/research/2026-10-22-grouped-rgb-overlap.md).
+
 - The ViT RGB PAD cue and the recognizer run with one intra-op thread per
   physical core the daemon may use, between two and sixteen, instead of two
   (#1173). Where cores have SMT siblings, every thread beyond the caller's

@@ -35,6 +35,9 @@ It admits no profile and adds no entry.
 Amended 2026-10-22 by the [experimental IR-only CPU-reference
 rule](#amendment-2026-10-22-experimental-ir-only-probes-stay-on-cpu).
 
+Amended 2026-10-22 by the [measurement-only build contract](#amendment-2026-10-22-measurement-only-evidence-builds).
+It specifies future evidence tooling, not an available loading exception.
+
 ## Context
 
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
@@ -623,6 +626,11 @@ execution-provider (CUDA, TensorRT) lane inert.
   with a placed recognizer, and the route never sets probe admission. The
   source guard checks all production modules and catches multiline direct
   embedding calls outside the two admitted probe helpers.
+- Evidence builds: global and dependency-only measurement cfg injection
+  refuse every affected shipped artifact; normal builds still compile.
+  Alternate ORT providers, an unadmitted measurement launch, a reused or
+  aliased production cache, and a purported cache import that recompiled
+  all refuse before supporting certification evidence (amendment below).
 - Identity: an unreadable firmware build resolves every model to CPU.
 - Kill switch: `IRLUME_NPU=0`, `npu=0`, an empty, malformed or non-UTF-8
   value and an unreadable `settings.conf` disable the NPU; absent and
@@ -758,6 +766,9 @@ Opening the gate requires a separately reviewed implementation and conformance
 evidence for the installation and launch arrangement. Enforcing AppArmor
 validation and any required rules remain future work. This amendment admits
 no profile, enables no package feature and adds no certification entry.
+
+The [measurement-only build contract](#amendment-2026-10-22-measurement-only-evidence-builds)
+below does not open this production admission.
 
 ### Separate exact and portable identities
 
@@ -1309,6 +1320,130 @@ Both certification tables remain empty and loading admission remains closed.
 No threshold, camera selection, IR-only opt-in, liveness check, grant rule
 or password fallback changes. This pins the CPU behavior that the empty tables already
 give this route; it does not qualify an accelerator.
+
+## Amendment 2026-10-22: measurement-only evidence builds
+
+The full-extent runs need the production preprocessing, probe, compile and
+guard paths. The existing `#[cfg(test)]` hardware helpers do not supply
+that proof. This amendment specifies a separate, non-shippable evidence
+build, initially for the GPU recognizer. It implements nothing by itself:
+the guards, measurement-launch admission and evidence interfaces must be
+reviewed and tested before any such run. Ordinary loading admission stays
+closed, both certification tables stay empty, and no threshold changes.
+
+### Build boundary
+
+The build is selected by the rustc configuration `irlume_hw_evidence`,
+never a Cargo feature or a runtime setting. Registering an expected cfg
+name with `--check-cfg` does not enable it. The build must be refused at
+all seven shipped Rust roots: `irlume-cli`, `irlume-daemon`,
+`irlume-gkr-unlock`, `irlume-kwallet-init`, `irlume-password-verify`,
+`irlume-pam` and `irlume-pam-view`.
+
+Each root has a direct cfg compile error. `irlume-vision` also exports its
+build's cfg state as a constant; every shipped consumer of that crate
+rejects a true value at compile time even when the consumer's own cfg is
+absent. CLI and daemon additionally refuse at their first runtime action.
+Tests enumerate the shipped artifacts and dependency closure, exercise
+both global and dependency-only injection, and require normal builds to
+compile. Package and release definitions must never select this cfg.
+
+These are mistake-prevention guards for the reviewed source and toolchain,
+not protection against a builder who edits the guards or compiler. A
+measurement build is never installed as an authentication component.
+
+### Reference isolation
+
+An evidence build rejects the ORT execution-provider features `cuda`,
+`openvino`, `coreml` and `tensorrt` at compile time. The separate `npu`
+feature, which supplies the direct OpenVINO runtime, is allowed. Any
+presence of `IRLUME_TEST_ALLOW_UNCERTIFIED_EP` refuses the run before a
+model session is built. Every ORT session used for detection, reference
+inference or enrollment uses the exact-default CPU provider, without
+inherited environment providers. The LiteRT path and delegates must match
+the CPU baseline; measurement introduces no accelerator delegate.
+The existing `on_cpu()` view alone does not establish that condition: it
+bypasses the placed accelerator slot but uses the existing ORT session.
+
+Negative tests combine the evidence cfg with each forbidden feature and
+with the escape variable. A reference run must not silently become an
+accelerator run, even if its outputs happen to agree.
+
+### Measurement-launch admission
+
+Bypassing the ordinary deployment admission requires a distinct,
+default-closed measurement-launch admission. A reviewed host-specific
+profile and runner must exist before any real provider is loaded. The cfg,
+a trusted C API file and post-load hashes are not substitutes for it.
+
+A trusted launcher, itself started under a trusted loader configuration,
+checks the profile before executing a fresh measurement process. The
+profile fixes the binary/build identity, explicit environment allowlist,
+complete native dependency/plugin closure (including ORT, LiteRT,
+OpenVINO and drivers), configuration and trusted native search locations.
+It covers loader configuration such as RPATH,
+RUNPATH, the loader cache and preload files; inherited loader overrides
+are refused. Any OpenCL or driver settings used by the run come from the
+reviewed profile, not the caller's environment. Unknown or writable native
+dependencies and incomplete profiles refuse before initialization or
+warm-up, including when the run needs privilege.
+
+Each process keeps one provider for its entire lifetime; changing it
+requires a new process.
+
+The context accepts a validated launch capability, not a self-asserted
+environment marker. Post-load and per-inference inventory checks remain
+mandatory. A compromised launcher, hostile root or modified toolchain is
+outside this assurance; direct execution with an arbitrary inherited
+environment is unsupported and must refuse. The runner has no PAM or
+daemon-authentication interface and does not access installed enrollment,
+keyring or TPM state; its launch profile restricts those resources.
+
+The evidence record names its measurement profile. Success under that
+profile does not establish the installed daemon's launch or confinement
+contract and cannot open the production admission. That remains the
+separate work of ADR-0033 section 4 and #1162.
+
+### Cache and production path
+
+The runner creates a fresh, empty, owner-only 0700 cache on an approved
+local filesystem and retains ownership across its child processes. The
+evidence API requires that owned cache capability, not an arbitrary path.
+It refuses pre-existing contents, symlink components and production cache
+paths or aliases before any cache preparation or cleanup. Cleanup may
+remove only the runner's own tree.
+
+The candidate uses every production certification field and the production
+parity, marker, compile, inventory, runtime-guard and retirement paths.
+It is not inserted in `CERTIFIED` and never matches a production lookup.
+Opening this evidence path does not add an NPU counterpart or authorize
+another model or decision route.
+
+A second process must prove cache import through the same guarded compile
+wrapper. It reads back the requested cache, `LOADED_FROM_CACHE` and fixed
+compile properties; a second successful compile, short duration or blob
+file alone is not proof of import. Empty, corrupt, ignored or unobservable
+caches cannot pass the import arm. The implementation must expose strict
+cache observation through the production guarded wrapper rather than use
+the existing unguarded test entry.
+
+### Evidence conditions
+
+Start/end records come from the same retained compiled model and require
+unchanged identity, configuration and mapped inventory. CPU reference,
+template and initialization/parity calls are named phases, separate from
+the measured accelerator probes. Counter deltas bracket each probe with
+no concurrent model calls; this does not change its internal thread pool.
+Any measured probe answered by CPU, retirement, resume discard or resume
+recheck makes an item 3-5 run unusable. Those runs also refuse a suspend.
+The separate item 6-7 runs retain their existing suspend, recheck and cache
+requirements; the no-suspend rule is not applied to them.
+
+The full-extent, per-arm and private-record rules of the earlier amendment
+remain binding. Raw output and difference lists for private arms stay
+owner-only; only the permitted aggregate record may leave after its local
+validator passes. No model or device is certified merely because this
+build compiled or a measurement process exited successfully.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

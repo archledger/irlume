@@ -436,6 +436,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Specify a non-shippable measurement-build boundary for GPU certification
+  (ADR-0022 and ADR-0033, amendments 2026-10-22, #1164). The planned build
+  requires compile-time artifact guards, an isolated CPU reference, a
+  separate pre-native launch admission, an owned temporary cache and strict
+  production-path evidence. This documentation adds no loading permission,
+  certification entry, package feature or authentication behavior.
+
 - Keep experimental IR-only recognition probes on the CPU reference even
   when a recognizer is placed on an accelerator (ADR-0022, amendment
   2026-10-22 "experimental IR-only probes stay on CPU", #1164). That route

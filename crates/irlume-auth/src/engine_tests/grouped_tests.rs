@@ -1573,3 +1573,509 @@ fn grouped_evaluation_is_one_stage_after_its_samples_on_every_result() {
     assert!(failed.is_err());
     assert_eq!(sink.stages(), expected(2));
 }
+
+/// A synthetic face for the RGB-half tests: a box keyed by `n`, so each
+/// view's answer is recognizable.
+fn half_face(n: usize) -> Detection {
+    let x = 4.0 + n as f32;
+    Detection {
+        bbox: [x, 4.0, x + 20.0, 24.0],
+        score: 0.9,
+        landmarks: [(10.0, 10.0); 5],
+    }
+}
+
+/// Five 2x2 views whose first byte names their index.
+fn half_frames() -> Vec<Vec<u8>> {
+    (0..5u8).map(|n| vec![n; 2 * 2 * 3]).collect()
+}
+
+/// The views of `frames`, each with a capture window 33 ms after the last.
+fn half_views(
+    frames: &[Vec<u8>],
+    base: Instant,
+) -> impl ExactSizeIterator<Item = (align::RgbView<'_>, irlume_camera::CaptureWindow)> {
+    frames.iter().enumerate().map(move |(n, data)| {
+        let view = align::RgbView {
+            data,
+            width: 2,
+            height: 2,
+        };
+        (view, half_window(base, n))
+    })
+}
+
+fn half_window(base: Instant, n: usize) -> irlume_camera::CaptureWindow {
+    irlume_camera::CaptureWindow::at(base + Duration::from_millis(33 * n as u64))
+}
+
+/// The overlap worker computes each sample's detector answer in capture
+/// order and the ViT answer only for a view whose detector found a face,
+/// for exactly that top box, stamps each half with its own frame's window,
+/// and reports each call's timing before the next call starts.
+#[test]
+fn rgb_halves_cover_every_sample_in_order_and_score_only_found_faces() {
+    use crate::grouped_auth::precompute_rgb_halves;
+    use irlume_common::diagnostics::TraceStage;
+    let frames = half_frames();
+    let base = Instant::now();
+    let sink = StageSink::default();
+    let scored = std::cell::RefCell::new(Vec::new());
+    // The records already reported when each call starts.
+    let reported = std::cell::RefCell::new(Vec::new());
+    let halves = precompute_rgb_halves(
+        half_views(&frames, base),
+        |view| {
+            reported.borrow_mut().push(sink.stages().len());
+            let n = usize::from(view.data[0]);
+            Ok(if n == 2 { vec![] } else { vec![half_face(n)] })
+        },
+        Some(|view: &align::RgbView<'_>, bbox: &[f32; 4]| {
+            reported.borrow_mut().push(sink.stages().len());
+            let n = usize::from(view.data[0]);
+            assert_eq!(*bbox, half_face(n).bbox, "the top box of this view");
+            scored.borrow_mut().push(n);
+            Ok(n as f32 / 10.0)
+        }),
+        &|| false,
+        &sink,
+    );
+    assert_eq!(*scored.borrow(), [0, 1, 3, 4]);
+    // Detect 0, score 0, detect 1, score 1, detect 2, detect 3, score 3,
+    // detect 4, score 4: each call finds every earlier call reported.
+    assert_eq!(*reported.borrow(), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(halves.len(), 5);
+    for (n, half) in halves.into_iter().enumerate() {
+        let half = half.expect("every sample reached");
+        assert_eq!(
+            half.captured,
+            half_window(base, n),
+            "its own frame's window"
+        );
+        assert_eq!(half.faces.unwrap().len(), usize::from(n != 2));
+        match half.vit {
+            Some(score) => {
+                assert_ne!(n, 2);
+                assert_eq!(score.bbox, half_face(n).bbox);
+                assert_eq!(score.answer, Ok(n as f32 / 10.0));
+            }
+            None => assert_eq!(n, 2, "only the faceless view goes unscored"),
+        }
+    }
+    use TraceStage::{Detection as D, Liveness as L};
+    assert_eq!(sink.stages(), [D, L, D, L, D, D, L, D, L]);
+}
+
+/// A stop between samples leaves the rest to the evaluation, and a stop
+/// between the detector and the ViT keeps the detector's answer unscored.
+#[test]
+fn rgb_halves_stop_when_asked_and_leave_the_rest_to_the_evaluation() {
+    use crate::grouped_auth::precompute_rgb_halves;
+    let frames = half_frames();
+    let checks = Cell::new(0);
+    // Checks run before each detection and before each score: the fourth
+    // check is the one before the second sample's score.
+    let halves = precompute_rgb_halves(
+        half_views(&frames, Instant::now()),
+        |view| Ok(vec![half_face(usize::from(view.data[0]))]),
+        Some(|_: &align::RgbView<'_>, _: &[f32; 4]| Ok(0.1)),
+        &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 4
+        },
+        &(),
+    );
+    assert_eq!(halves.len(), 5);
+    let first = halves[0].as_ref().expect("first sample reached");
+    assert!(first.vit.is_some());
+    let second = halves[1].as_ref().expect("second sample detected");
+    assert!(second.faces.is_ok() && second.vit.is_none());
+    assert!(halves[2..].iter().all(Option::is_none));
+}
+
+/// A detector error ends the worker at that sample: the evaluation meets
+/// the same error there, as it would have met it calling the detector.
+#[test]
+fn rgb_halves_end_at_a_detector_error() {
+    use crate::grouped_auth::precompute_rgb_halves;
+    use irlume_common::diagnostics::TraceStage;
+    let frames = half_frames();
+    let sink = StageSink::default();
+    let halves = precompute_rgb_halves(
+        half_views(&frames, Instant::now()),
+        |view| match view.data[0] {
+            1 => Err(irlume_common::Error::Hardware(
+                "scripted detector failure".into(),
+            )),
+            n => Ok(vec![half_face(usize::from(n))]),
+        },
+        None::<fn(&align::RgbView<'_>, &[f32; 4]) -> irlume_common::Result<f32>>,
+        &|| false,
+        &sink,
+    );
+    assert!(halves[0].as_ref().unwrap().faces.is_ok());
+    assert!(matches!(
+        halves[1].as_ref().unwrap().faces,
+        Err(irlume_common::Error::Hardware(_))
+    ));
+    assert!(halves[2..].iter().all(Option::is_none));
+    // No ViT session: nothing scored; the failed call reports no timing.
+    assert!(halves[0].as_ref().unwrap().vit.is_none());
+    assert_eq!(sink.stages(), [TraceStage::Detection]);
+}
+
+/// A precomputed ViT answer stands in only for the unreplaced frame and the
+/// bit-identical box; anything else runs the model.
+#[test]
+fn rgb_pad_answer_uses_a_precomputed_score_only_for_the_same_frame_and_box() {
+    use crate::grouped_auth::{rgb_pad_answer, RgbPadScore};
+    let bbox = [4.0, 0.0, 24.0, 20.0];
+    let score = |bbox, answer| Some(RgbPadScore { bbox, answer });
+    let computed = || Ok(0.75);
+    assert_eq!(
+        rgb_pad_answer(score(bbox, Ok(0.25)), false, &bbox, computed),
+        Ok(0.25)
+    );
+    assert_eq!(
+        rgb_pad_answer(score(bbox, Err("scripted".into())), false, &bbox, computed),
+        Err("scripted".into())
+    );
+    assert_eq!(rgb_pad_answer(None, false, &bbox, computed), Ok(0.75));
+    assert_eq!(
+        rgb_pad_answer(score(bbox, Ok(0.25)), true, &bbox, computed),
+        Ok(0.75)
+    );
+    // Equal as numbers but not as bits, and one ulp apart: both recompute.
+    let signed_zero = [4.0, -0.0, 24.0, 20.0];
+    assert_eq!(
+        rgb_pad_answer(score(signed_zero, Ok(0.25)), false, &bbox, computed),
+        Ok(0.75)
+    );
+    let ulp = [f32::from_bits(4.0f32.to_bits() + 1), 0.0, 24.0, 20.0];
+    assert_eq!(
+        rgb_pad_answer(score(ulp, Ok(0.25)), false, &bbox, computed),
+        Ok(0.75)
+    );
+}
+
+/// Adopting a detector answer computed during the IR phase gives what the
+/// direct detection gives on the same frame (here a faceless one; that both
+/// end in the same rescue tail is pinned by
+/// `the_grouped_route_wires_each_half_to_its_own_sample`), keeps exactly the
+/// faces it is handed, and keeps the direct path's error, cancellation and
+/// deadline points, a request signal coming before the detector's error.
+#[test]
+fn adopted_rgb_detection_answers_like_the_direct_detector() {
+    let _guard = env_guard();
+    let mut s = shared();
+    let e = &mut s.engine;
+    let (width, height) = (320u32, 240u32);
+    let data: Vec<u8> = (0..width * height * 3).map(|i| (i % 251) as u8).collect();
+    let view = align::RgbView {
+        data: &data,
+        width,
+        height,
+    };
+    let summary = |(faces, top): (Vec<Detection>, Option<Detection>)| {
+        let boxes = |d: &Detection| (d.bbox.map(f32::to_bits), d.score.to_bits());
+        (
+            faces.iter().map(boxes).collect::<Vec<_>>(),
+            top.as_ref().map(boxes),
+        )
+    };
+    let direct = summary(e.detect_rgb_assessment_view(&view, None, &()).unwrap());
+    let faces = e.det.detect(&view);
+    let adopted = summary(e.adopt_rgb_detection(&view, faces).unwrap());
+    assert_eq!(direct, adopted);
+    // A face the worker found is the one the evaluation goes on with.
+    let face = Detection {
+        bbox: [80.0, 40.0, 240.0, 200.0],
+        score: 0.9,
+        landmarks: [(160.0, 120.0); 5],
+    };
+    let found = summary(
+        e.adopt_rgb_detection(&view, Ok(vec![face.clone()]))
+            .unwrap(),
+    );
+    assert_eq!(found, summary((vec![face.clone()], Some(face))));
+    let failure = e.adopt_rgb_detection(
+        &view,
+        Err(irlume_common::Error::Hardware(
+            "scripted detector failure".into(),
+        )),
+    );
+    assert!(matches!(failure, Err(irlume_common::Error::Hardware(_))));
+    // The shared engine's request signals are restored even if an assertion
+    // fails, so later tests never see a cancelled or expired engine.
+    let prior = (
+        e.request_cancelled.take(),
+        e.authentication_deadline.take(),
+        e.last_attempt_situation.take(),
+    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.request_cancelled = Some(std::sync::Arc::new(|| true));
+        let failed = || {
+            Err(irlume_common::Error::Hardware(
+                "scripted detector failure".into(),
+            ))
+        };
+        let cancelled = e.adopt_rgb_detection(&view, Ok(vec![]));
+        assert!(matches!(cancelled, Err(irlume_common::Error::Preempted(_))));
+        let cancelled = e.adopt_rgb_detection(&view, failed());
+        assert!(matches!(cancelled, Err(irlume_common::Error::Preempted(_))));
+        e.request_cancelled = None;
+        e.authentication_deadline = Some(Instant::now());
+        let expired = e.adopt_rgb_detection(&view, failed());
+        assert!(matches!(
+            expired,
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        let expired = e.adopt_rgb_detection(&view, Ok(vec![]));
+        assert!(matches!(
+            expired,
+            Err(irlume_common::Error::DeadlineExpired)
+        ));
+        assert_eq!(e.last_attempt_situation, Some(AttemptSituation::TimedOut));
+    }));
+    (
+        e.request_cancelled,
+        e.authentication_deadline,
+        e.last_attempt_situation,
+    ) = prior;
+    e.vit_scores.clear();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A precomputed RGB half is consumed only for the frame whose window it
+/// carries, so a half paired with any other sample falls back to the direct
+/// calls.
+#[test]
+fn rgb_halves_stand_in_only_for_their_own_frame() {
+    use crate::grouped_auth::{half_for_frame, RgbHalf};
+    let base = Instant::now();
+    let window = irlume_camera::CaptureWindow::at(base);
+    let other = irlume_camera::CaptureWindow::at(base + Duration::from_millis(33));
+    let half = |captured| {
+        Some(RgbHalf {
+            captured,
+            faces: Ok(vec![]),
+            vit: None,
+        })
+    };
+    assert!(half_for_frame(half(window), window).is_some());
+    assert!(half_for_frame(half(other), window).is_none());
+    assert!(half_for_frame(None, window).is_none());
+}
+
+/// The overlap worker's ViT answer is the very call the evaluation would
+/// make: a real session scored from a scoped thread gives the same bits as
+/// the same call on the evaluating thread, for every sample.
+#[test]
+fn rgb_half_vit_answer_matches_the_direct_call_across_threads() {
+    use crate::grouped_auth::precompute_rgb_halves;
+    let _guard = env_guard();
+    drop(shared());
+    let mut pad =
+        irlume_vision::PadVit::load_from_file(&model_path("liveness_vit.onnx")).expect("vit pad");
+    let (width, height) = (640u32, 480u32);
+    let frames: Vec<Vec<u8>> = (0..5usize)
+        .map(|k| {
+            (0..(width * height * 3) as usize)
+                .map(|i| ((i * (5 + k) + i / 11 + k * 31) % 256) as u8)
+                .collect()
+        })
+        .collect();
+    let base = Instant::now();
+    let views = || {
+        frames.iter().enumerate().map(move |(n, data)| {
+            let view = align::RgbView {
+                data,
+                width,
+                height,
+            };
+            (view, half_window(base, n))
+        })
+    };
+    let face = Detection {
+        bbox: [200.0, 120.0, 440.0, 360.0],
+        score: 0.9,
+        landmarks: [(300.0, 200.0); 5],
+    };
+    let halves = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                precompute_rgb_halves(
+                    views(),
+                    |_| Ok(vec![face.clone()]),
+                    Some(|view: &align::RgbView<'_>, bbox: &[f32; 4]| pad.p_spoof(view, bbox)),
+                    &|| false,
+                    &(),
+                )
+            })
+            .join()
+            .expect("worker")
+    });
+    for ((view, _), half) in views().zip(halves) {
+        let worker = half
+            .expect("reached")
+            .vit
+            .expect("scored")
+            .answer
+            .expect("score");
+        let direct = pad.p_spoof(&view, &face.bbox).expect("score");
+        assert_eq!(worker.to_bits(), direct.to_bits());
+    }
+}
+
+/// The ViT site takes a precomputed answer only for a Live frame, the
+/// unreplaced frame and the bit-identical box, and runs the model otherwise;
+/// a frame the verdict does not call Live runs nothing.
+#[test]
+fn vit_pad_evidence_consumes_a_precomputed_answer_only_where_the_model_would_run() {
+    use crate::grouped_auth::RgbPadScore;
+    use irlume_liveness::Verdict;
+    let face = half_face(3);
+    let precomputed = |answer| {
+        Some(RgbPadScore {
+            bbox: face.bbox,
+            answer,
+        })
+    };
+    let never = Some(|_: &[f32; 4]| -> Result<f32, String> { panic!("the model must not run") });
+    let model = Some(|bbox: &[f32; 4]| -> Result<f32, String> {
+        assert_eq!(*bbox, face.bbox, "the model scores the top face");
+        Ok(0.75)
+    });
+    assert_eq!(
+        crate::vit_pad_evidence(
+            Verdict::Live,
+            Some(&face),
+            never,
+            precomputed(Ok(0.25)),
+            false
+        ),
+        PadEvidence::Score(0.25)
+    );
+    assert_eq!(
+        crate::vit_pad_evidence(
+            Verdict::Live,
+            Some(&face),
+            model,
+            precomputed(Ok(0.25)),
+            true
+        ),
+        PadEvidence::Score(0.75),
+        "a replaced frame runs the model"
+    );
+    let other = RgbPadScore {
+        bbox: half_face(4).bbox,
+        answer: Ok(0.25),
+    };
+    assert_eq!(
+        crate::vit_pad_evidence(Verdict::Live, Some(&face), model, Some(other), false),
+        PadEvidence::Score(0.75),
+        "another box runs the model"
+    );
+    assert_eq!(
+        crate::vit_pad_evidence(Verdict::Live, Some(&face), model, None, false),
+        PadEvidence::Score(0.75)
+    );
+    assert_eq!(
+        crate::vit_pad_evidence(
+            Verdict::Live,
+            Some(&face),
+            never,
+            precomputed(Ok(f32::NAN)),
+            false
+        ),
+        PadEvidence::InferenceFailed
+    );
+    assert_eq!(
+        crate::vit_pad_evidence(
+            Verdict::Live,
+            Some(&face),
+            never,
+            precomputed(Err("scripted".into())),
+            false
+        ),
+        PadEvidence::InferenceFailed
+    );
+    for verdict in [Verdict::Spoof, Verdict::Uncertain] {
+        assert_eq!(
+            crate::vit_pad_evidence(verdict, Some(&face), never, precomputed(Ok(0.25)), false),
+            PadEvidence::NotApplicable,
+            "{verdict:?} consumes no score"
+        );
+    }
+    assert_eq!(
+        crate::vit_pad_evidence(Verdict::Live, None, never, precomputed(Ok(0.25)), false),
+        PadEvidence::NotApplicable
+    );
+    let unloaded = None::<fn(&[f32; 4]) -> Result<f32, String>>;
+    assert_eq!(
+        crate::vit_pad_evidence(
+            Verdict::Live,
+            Some(&face),
+            unloaded,
+            precomputed(Ok(0.25)),
+            false
+        ),
+        PadEvidence::Unavailable,
+        "no ViT session reads as unavailable, whatever was precomputed"
+    );
+}
+
+/// The grouped route's wiring, which only a camera reaches: the worker's
+/// halves pair with their own samples, a half stands in only for its frame,
+/// the ViT answer reaches the ViT site, the worker stops with the batch, and
+/// an adopted detection ends in the direct path's rescue tail.
+#[test]
+fn the_grouped_route_wires_each_half_to_its_own_sample() {
+    let grouped = include_str!("../grouped_auth.rs");
+    let attempt = grouped
+        .split("pub(super) fn authenticate_grouped_once(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    pub(super) fn ").next())
+        .expect("authenticate_grouped_once");
+    for wiring in [
+        "rgb_half.precompute(frames, &|| stop.requested(), diagnostics)",
+        ".chain(std::iter::repeat_with(|| None))",
+        "match half_for_frame(half, rgb.captured) {",
+        "(engine.adopt_rgb_detection(&view, faces)?, vit)",
+        "None => (engine.detect_rgb_assessment(&rgb, None, diagnostics)?, None),",
+        "                                rgb_pad_score,\n",
+    ] {
+        assert!(attempt.contains(wiring), "missing: {wiring}");
+    }
+    assert_eq!(attempt.matches(".zip(").count(), 1, "one pairing of halves");
+    let models = grouped
+        .split("pub(super) fn precompute(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n}").next())
+        .expect("RgbHalfModels::precompute");
+    for stop in [
+        "stop()",
+        "cancelled.as_ref().is_some_and(|cancelled| cancelled())",
+        "deadline.is_some_and(|deadline| Instant::now() >= deadline)",
+        "(view, frame.captured)",
+    ] {
+        assert!(models.contains(stop), "missing: {stop}");
+    }
+    let lib = include_str!("../lib.rs");
+    let adopt = lib
+        .split("fn adopt_rgb_detection(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("adopt_rgb_detection");
+    assert!(adopt
+        .trim_end()
+        .ends_with("self.finish_rgb_detection(rgb, None, rgb_faces)"));
+    let site = lib
+        .split("let rgb_pad = vit_pad_evidence(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n        );\n").next())
+        .expect("the ViT site");
+    assert!(site.contains("rgb_pad_score,\n            rgb_recaptured,"));
+}

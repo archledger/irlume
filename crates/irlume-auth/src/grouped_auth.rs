@@ -168,6 +168,163 @@ pub(super) fn in_grouped_evaluation<T>(
     evaluate()
 }
 
+/// The ViT RGB PAD answer for one RGB face, computed while the IR session
+/// captured; [`Engine::assess_captured_pair`] uses it in place of the same
+/// call for the same unreplaced frame and the bit-identical box.
+pub(super) struct RgbPadScore {
+    pub(super) bbox: [f32; 4],
+    pub(super) answer: Result<f32, String>,
+}
+
+/// The RGB half of one grouped sample, computed during the IR phase: the
+/// detector's answer and, when it found a face, the ViT answer for its top
+/// face. The evaluation consumes it at the points it would have made these
+/// calls, so every check, log line and vote keeps its order, and so does
+/// every outcome unless a deadline falls in the wait for the worker's call
+/// in flight (`authenticate_grouped_once`); the rescue detector and the
+/// decision itself still run there.
+pub(super) struct RgbHalf {
+    /// The capture window of the frame it was computed from, carried with
+    /// that frame through the worker; the evaluation consumes the half only
+    /// for that frame ([`half_for_frame`]).
+    pub(super) captured: irlume_camera::CaptureWindow,
+    pub(super) faces: irlume_common::Result<Vec<Detection>>,
+    pub(super) vit: Option<RgbPadScore>,
+}
+
+/// `half` when it was computed for the frame captured in `captured`, so a
+/// half can never stand in for another frame's calls.
+pub(super) fn half_for_frame(
+    half: Option<RgbHalf>,
+    captured: irlume_camera::CaptureWindow,
+) -> Option<RgbHalf> {
+    half.filter(|half| half.captured == captured)
+}
+
+/// What the RGB-half worker borrows from the engine for the IR phase: the
+/// detector and the ViT session (the IR phase uses neither), and side-effect
+/// free reads of the request's cancellation and window.
+pub(super) struct RgbHalfModels<'a> {
+    pub(super) det: &'a mut Detector,
+    pub(super) vit: Option<&'a mut irlume_vision::PadVit>,
+    pub(super) cancelled: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(super) deadline: Option<Instant>,
+}
+
+impl RgbHalfModels<'_> {
+    /// The RGB half of each frame, for the IR phase's overlap worker;
+    /// `stop` is the batch's [`irlume_camera::OverlapStop`].
+    pub(super) fn precompute(
+        self,
+        frames: &[irlume_camera::Frame],
+        stop: &dyn Fn() -> bool,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> Vec<Option<RgbHalf>> {
+        let RgbHalfModels {
+            det,
+            vit,
+            cancelled,
+            deadline,
+        } = self;
+        let should_stop = || {
+            stop()
+                || cancelled.as_ref().is_some_and(|cancelled| cancelled())
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        };
+        precompute_rgb_halves(
+            frames.iter().map(|frame| {
+                let view = align::RgbView {
+                    data: &frame.data,
+                    width: frame.width,
+                    height: frame.height,
+                };
+                (view, frame.captured)
+            }),
+            |view| det.detect(view),
+            vit.map(|pad| {
+                move |view: &align::RgbView<'_>, bbox: &[f32; 4]| pad.p_spoof(view, bbox)
+            }),
+            &should_stop,
+            diagnostics,
+        )
+    }
+}
+
+/// The RGB half of each view in order, each stamped with its own frame's
+/// capture window, until `should_stop` answers true or the detector errs; a
+/// view not reached is `None`, and the evaluation then computes that sample
+/// itself. Timings are reported as the work happens, so they lie inside the
+/// IR phase. The model calls are injectable for the behavioral tests.
+pub(super) fn precompute_rgb_halves<'v>(
+    views: impl ExactSizeIterator<Item = (align::RgbView<'v>, irlume_camera::CaptureWindow)>,
+    mut detect: impl FnMut(&align::RgbView<'_>) -> irlume_common::Result<Vec<Detection>>,
+    mut score: Option<impl FnMut(&align::RgbView<'_>, &[f32; 4]) -> irlume_common::Result<f32>>,
+    should_stop: &dyn Fn() -> bool,
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+) -> Vec<Option<RgbHalf>> {
+    use irlume_common::diagnostics::{TraceEventKind, TraceStage};
+    let count = views.len();
+    let mut halves = Vec::with_capacity(count);
+    for (view, captured) in views {
+        if should_stop() {
+            break;
+        }
+        let started = Instant::now();
+        let faces = detect(&view);
+        if faces.is_ok() {
+            diagnostics.emit_trace(TraceEventKind::StageTiming {
+                stage: TraceStage::Detection,
+                elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            });
+        }
+        let top = faces
+            .as_ref()
+            .ok()
+            .and_then(|faces| top_detection(faces))
+            .map(|face| face.bbox);
+        let mut vit = None;
+        if let (Some(bbox), Some(score)) = (top, score.as_mut()) {
+            if !should_stop() {
+                let started = Instant::now();
+                let answer = score(&view, &bbox).map_err(|e| e.to_string());
+                diagnostics.emit_trace(TraceEventKind::StageTiming {
+                    stage: TraceStage::Liveness,
+                    elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                });
+                vit = Some(RgbPadScore { bbox, answer });
+            }
+        }
+        let failed = faces.is_err();
+        halves.push(Some(RgbHalf {
+            captured,
+            faces,
+            vit,
+        }));
+        if failed {
+            break;
+        }
+    }
+    halves.resize_with(count, || None);
+    halves
+}
+
+/// The ViT answer for the face at `bbox`: the one `precomputed` carries
+/// when it was computed for this unreplaced frame and this exact box (bit
+/// for bit), otherwise `compute`'s.
+pub(super) fn rgb_pad_answer(
+    precomputed: Option<RgbPadScore>,
+    frame_replaced: bool,
+    bbox: &[f32; 4],
+    compute: impl FnOnce() -> Result<f32, String>,
+) -> Result<f32, String> {
+    match precomputed
+        .filter(|score| !frame_replaced && score.bbox.map(f32::to_bits) == bbox.map(f32::to_bits))
+    {
+        Some(score) => score.answer,
+        None => compute(),
+    }
+}
+
 fn expired() -> Outcome {
     Outcome::deny(
         OutcomeKind::DeadlineExpired,
@@ -474,7 +631,32 @@ impl Engine {
         let control = self.capture_control();
         self.emit_capture_setup(diagnostics);
         let started = Instant::now();
-        let samples = irlume_camera::capture_sequential_batch_observed(
+        // When the IR session was released: the batch returns only after the
+        // worker's call in flight, which the capture marker reports apart.
+        let ir_released = std::cell::Cell::new(None);
+        // The RGB half of every sample depends on its RGB frame alone, so it
+        // runs while the IR session captures; the detector and the ViT
+        // session are the worker's until the batch returns. When the IR phase
+        // ends the worker finishes only its call in flight and the evaluation
+        // does the rest, so the decision's inputs are those of the serial
+        // order and only its timing differs, near a deadline in either
+        // direction: the evaluation is shorter, so an attempt the serial
+        // order would have expired can reach its grant or refusal, and the
+        // call in flight is waited for. That call can be one the serial order
+        // never makes (the worker scores the top RGB face of every sample it
+        // reaches, the serial order only a Live sample's), so an attempt the
+        // serial order would have decided can expire instead, which strikes:
+        // one it would have refused without a retry strike (an uncertain or
+        // IR-faceless sample) or granted (the final sample on the dark IR-only
+        // route after such samples). Either way it is a password-fallback
+        // denial or a grant on complete evidence.
+        let rgb_half = RgbHalfModels {
+            det: &mut self.det,
+            vit: self.vit_pad.as_mut(),
+            cancelled: self.request_cancelled.clone(),
+            deadline: self.authentication_deadline,
+        };
+        let batch = irlume_camera::capture_sequential_batch_overlapped(
             &cameras.0,
             &cameras.1,
             contract,
@@ -484,25 +666,54 @@ impl Engine {
                 deadline,
             },
             &control,
-            &|phase, elapsed| emit_batch_phase(diagnostics, phase, elapsed),
+            &|phase, elapsed| {
+                if phase == irlume_camera::SequentialBatchPhase::IrRelease {
+                    ir_released.set(Some(Instant::now()));
+                }
+                emit_batch_phase(diagnostics, phase, elapsed);
+            },
+            move |frames, stop| rgb_half.precompute(frames, &|| stop.requested(), diagnostics),
         );
+        let returned = Instant::now();
         // A completed batch opened and released both streams; a failed one
         // may have opened none.
-        if samples.is_ok() {
+        if batch.is_ok() {
             self.arm_finalization();
         }
-        let samples = samples?;
+        let (samples, halves) = batch?;
         irlume_common::dlog!(
-            "[assessment-stage] grouped-capture: pairs={} elapsed={}ms",
+            "[assessment-stage] grouped-capture: pairs={} elapsed={}ms after-ir-release={}ms",
             samples.len(),
-            started.elapsed().as_millis()
+            returned.duration_since(started).as_millis(),
+            ir_released.get().map_or(0, |released: Instant| returned
+                .saturating_duration_since(released)
+                .as_millis())
         );
+        let samples: Vec<_> = samples
+            .into_iter()
+            .zip(
+                halves
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(std::iter::repeat_with(|| None)),
+            )
+            .collect();
         let prepared = in_grouped_evaluation(diagnostics, || {
             self.evaluate_grouped_samples_with(
                 samples,
                 deadline,
-                |engine, (rgb, ir, stats)| {
-                    let detected = engine.detect_rgb_assessment(&rgb, None, diagnostics)?;
+                |engine, ((rgb, ir, stats), half)| {
+                    let (detected, rgb_pad_score) = match half_for_frame(half, rgb.captured) {
+                        Some(RgbHalf { faces, vit, .. }) => {
+                            let view = align::RgbView {
+                                data: &rgb.data,
+                                width: rgb.width,
+                                height: rgb.height,
+                            };
+                            (engine.adopt_rgb_detection(&view, faces)?, vit)
+                        }
+                        None => (engine.detect_rgb_assessment(&rgb, None, diagnostics)?, None),
+                    };
                     engine
                         .assess_captured_pair(
                             PairCapture::Ordinary(rgb, ir, stats),
@@ -515,6 +726,7 @@ impl Engine {
                                 rgb_hard_retried: false,
                                 held_sessions: false,
                                 ir_ms: None,
+                                rgb_pad_score,
                                 diagnostics,
                             },
                         )
@@ -628,6 +840,7 @@ impl Engine {
                                 rgb_hard_retried: false,
                                 held_sessions: false,
                                 ir_ms: None,
+                                rgb_pad_score: None,
                                 diagnostics,
                             },
                         )

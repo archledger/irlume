@@ -75,6 +75,7 @@ fn split_capture_assessment_preserves_real_lease_provenance_at_short_skew() {
                 rgb_hard_retried: false,
                 held_sessions: false,
                 ir_ms: None,
+                rgb_pad_score: None,
                 diagnostics: &(),
             },
         )
@@ -148,6 +149,7 @@ fn split_capture_assessor_rejects_stale_pair_before_inference() {
                 rgb_hard_retried: false,
                 held_sessions: false,
                 ir_ms: None,
+                rgb_pad_score: None,
                 diagnostics: &(),
             },
         )
@@ -179,6 +181,7 @@ fn split_capture_assessor_refuses_separated_frames_without_their_receipt() {
                 rgb_hard_retried: false,
                 held_sessions: false,
                 ir_ms: None,
+                rgb_pad_score: None,
                 diagnostics: &()
             }
         )
@@ -318,4 +321,85 @@ fn split_capture_diagnostic_state_does_not_survive_error_or_unwind() {
     assert!(error_state_clean);
     assert!(panic.is_err());
     assert!(panic_state_clean);
+}
+
+/// The overlap worker's production adapter stamps each RGB half with the
+/// capture window of the very camera frame it was computed from.
+#[test]
+fn rgb_halves_from_camera_frames_carry_their_own_windows() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let engine = &mut shared.engine;
+    let (_guard, request) = fixture();
+    let operation =
+        acquire_split_camera_operation(&request, CameraOperationKind::Diagnostics, Duration::ZERO)
+            .unwrap();
+    let base = Instant::now();
+    let frames: Vec<irlume_camera::Frame> = (0..3u64)
+        .map(|n| {
+            let at = base + Duration::from_millis(100 * n);
+            let capture = capture_uniform_split_pair_at(
+                &operation,
+                NO_RGB,
+                NO_IR,
+                at,
+                at + Duration::from_millis(10),
+            )
+            .unwrap();
+            capture.into_parts(&operation).unwrap().0
+        })
+        .collect();
+    assert!(frames.windows(2).all(|w| w[0].captured != w[1].captured));
+    let halves = crate::grouped_auth::RgbHalfModels {
+        det: &mut engine.det,
+        vit: None,
+        cancelled: None,
+        deadline: None,
+    }
+    .precompute(&frames, &|| false, &());
+    assert_eq!(halves.len(), frames.len());
+    for (half, frame) in halves.iter().zip(&frames) {
+        assert_eq!(half.as_ref().expect("reached").captured, frame.captured);
+    }
+}
+
+/// The worker adapter stops for the batch's stop, a cancelled request and an
+/// expired window alike, before computing anything.
+#[test]
+fn rgb_halves_from_camera_frames_stop_for_the_batch_cancellation_and_the_deadline() {
+    let _env = env_guard();
+    let mut shared = shared();
+    let engine = &mut shared.engine;
+    let (_guard, request) = fixture();
+    let operation =
+        acquire_split_camera_operation(&request, CameraOperationKind::Diagnostics, Duration::ZERO)
+            .unwrap();
+    let frames: Vec<irlume_camera::Frame> = (0..2)
+        .map(|_| {
+            capture_uniform_split_pair(&operation, NO_RGB, NO_IR)
+                .unwrap()
+                .into_parts(&operation)
+                .unwrap()
+                .0
+        })
+        .collect();
+    let cancelled: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(|| true);
+    for (label, stop, cancelled, deadline) in [
+        ("batch stop", true, None, None),
+        ("cancelled", false, Some(cancelled), None),
+        ("expired", false, None, Some(Instant::now())),
+    ] {
+        let halves = crate::grouped_auth::RgbHalfModels {
+            det: &mut engine.det,
+            vit: None,
+            cancelled,
+            deadline,
+        }
+        .precompute(&frames, &|| stop, &());
+        assert_eq!(halves.len(), frames.len(), "{label}");
+        assert!(
+            halves.iter().all(Option::is_none),
+            "{label}: nothing computed"
+        );
+    }
 }

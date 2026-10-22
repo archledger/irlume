@@ -5,6 +5,7 @@ use super::{
     CaptureControl, Frame, IrCamera, IrCaptureStats, Progress, RgbCamera, RuntimePairContract,
 };
 use irlume_common::{Error, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bounds for one all-or-nothing sequential capture batch.
@@ -118,7 +119,83 @@ pub fn capture_sequential_batch_observed(
     control: &CaptureControl,
     observe: &dyn Fn(SequentialBatchPhase, Duration),
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
-    capture_batch_controlled_with(
+    production_batch(
+        rgb,
+        ir,
+        contract,
+        request,
+        control,
+        observe,
+        None::<NoOverlap>,
+    )
+    .map(|(pairs, _)| pairs)
+}
+
+/// What an overlap worker of [`capture_sequential_batch_overlapped`] asks
+/// between units of its work: whether the IR phase it overlaps has ended,
+/// so the batch waits at most for the unit in flight and the caller does
+/// whatever the worker did not reach.
+pub struct OverlapStop<'a>(&'a AtomicBool);
+
+impl OverlapStop<'_> {
+    /// True once the overlapped IR phase has ended, with or without its
+    /// samples, or is unwinding.
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// The pairs of an overlapped batch and its worker's result, `None` when the
+/// worker never ran (see [`capture_sequential_batch_overlapped`]).
+pub type OverlappedBatch<W> = (Vec<(Frame, Frame, IrCaptureStats)>, Option<W>);
+
+/// [`capture_sequential_batch_observed`] that also runs `overlap` over the
+/// RGB samples while the IR session captures, so work that depends only on
+/// RGB leaves the critical path.
+///
+/// `overlap` starts on a scoped thread after the RGB session is released and
+/// receives the RGB samples in capture order; the IR session runs on the
+/// calling thread as it does without overlap, and the RGB samples are
+/// immutable while both run. When the IR phase ends, with its samples or
+/// not, [`OverlapStop`] rises, so the worker hands back what it finished
+/// and the batch waits at most for the unit in flight; the caller does the
+/// rest itself, as it would without overlap. The worker joins before
+/// validation on every path, failure and unwinding included, so neither its
+/// borrows nor its thread outlive this call. A panicking worker resumes its
+/// panic here after the IR session has been released. The result carries
+/// `None` when the system refused the thread, in which case nothing ran.
+/// Capture, ordering, cleanup and validation are those of
+/// [`capture_sequential_batch_observed`].
+///
+/// # Errors
+/// The errors of [`capture_sequential_batch_with_control`].
+///
+/// # Panics
+/// Resumes a panic of `overlap` once the IR session has been released.
+pub fn capture_sequential_batch_overlapped<W: Send>(
+    rgb: &RgbCamera,
+    ir: &IrCamera,
+    contract: &RuntimePairContract,
+    request: SequentialBatchRequest,
+    control: &CaptureControl,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
+    overlap: impl FnOnce(&[Frame], &OverlapStop<'_>) -> W + Send,
+) -> Result<OverlappedBatch<W>> {
+    production_batch(rgb, ir, contract, request, control, observe, Some(overlap))
+}
+
+/// The production camera boundaries of a sequential batch, with or without
+/// an overlap worker.
+fn production_batch<W: Send>(
+    rgb: &RgbCamera,
+    ir: &IrCamera,
+    contract: &RuntimePairContract,
+    request: SequentialBatchRequest,
+    control: &CaptureControl,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
+    overlap: Option<impl FnOnce(&[Frame], &OverlapStop<'_>) -> W + Send>,
+) -> Result<OverlappedBatch<W>> {
+    capture_batch_overlapped_with(
         request,
         contract,
         (
@@ -138,6 +215,7 @@ pub fn capture_sequential_batch_observed(
                 .map_err(|error| Error::Hardware(error.to_string()))
         },
         observe,
+        overlap,
     )
 }
 
@@ -251,33 +329,6 @@ pub(super) fn capture_rgb_batch_controlled_with<R>(
 }
 
 #[cfg(test)]
-pub(super) fn capture_batch_with<R, I>(
-    request: SequentialBatchRequest,
-    contract: &RuntimePairContract,
-    rgb: (
-        impl FnOnce() -> Result<R>,
-        impl FnMut(&mut R) -> Result<Frame>,
-    ),
-    ir: (
-        impl FnOnce() -> Result<I>,
-        impl FnMut(&mut I) -> Result<(Frame, IrCaptureStats)>,
-    ),
-    now: impl Fn() -> Instant,
-    live: impl FnOnce() -> Result<()>,
-    observe: &dyn Fn(SequentialBatchPhase, Duration),
-) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
-    capture_batch_controlled_with(
-        request,
-        contract,
-        rgb,
-        ir,
-        now,
-        &CaptureControl::with_progress(super::no_progress()),
-        live,
-        observe,
-    )
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "the camera boundaries stay injectable for the scripted batch tests"
@@ -298,6 +349,44 @@ pub(super) fn capture_batch_controlled_with<R, I>(
     live: impl FnOnce() -> Result<()>,
     observe: &dyn Fn(SequentialBatchPhase, Duration),
 ) -> Result<Vec<(Frame, Frame, IrCaptureStats)>> {
+    capture_batch_overlapped_with(
+        request,
+        contract,
+        rgb,
+        ir,
+        now,
+        control,
+        live,
+        observe,
+        None::<NoOverlap>,
+    )
+    .map(|(pairs, _)| pairs)
+}
+
+/// The overlap of a batch that runs none: no thread is started.
+type NoOverlap = fn(&[Frame], &OverlapStop<'_>);
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the camera boundaries stay injectable for the scripted batch tests"
+)]
+pub(super) fn capture_batch_overlapped_with<R, I, W: Send>(
+    request: SequentialBatchRequest,
+    contract: &RuntimePairContract,
+    rgb: (
+        impl FnOnce() -> Result<R>,
+        impl FnMut(&mut R) -> Result<Frame>,
+    ),
+    ir: (
+        impl FnOnce() -> Result<I>,
+        impl FnMut(&mut I) -> Result<(Frame, IrCaptureStats)>,
+    ),
+    now: impl Fn() -> Instant,
+    control: &CaptureControl,
+    live: impl FnOnce() -> Result<()>,
+    observe: &dyn Fn(SequentialBatchPhase, Duration),
+    overlap: Option<impl FnOnce(&[Frame], &OverlapStop<'_>) -> W + Send>,
+) -> Result<OverlappedBatch<W>> {
     if !(1..=5).contains(&request.pairs) {
         return Err(Error::Hardware(
             "sequential batch requires one through five pairs".into(),
@@ -312,10 +401,18 @@ pub(super) fn capture_batch_controlled_with<R, I>(
         }
     };
     // Each phase owns its stream, including all error/unwind paths. The first
-    // owner is dropped before the second opener can run; neither survives into
-    // validation or downstream inference.
+    // owner is dropped before the second opener can run, and the second
+    // before validation. An overlap worker reads only the released RGB
+    // frames: it starts after the RGB owner is gone and joins before
+    // validation, so it changes no stream's lifetime, though its inference
+    // runs while the IR stream is live.
     let rgb = collect_phase(request.pairs, rgb, &checkpoint, RGB_PHASES, observe)?;
-    let ir = collect_phase(request.pairs, ir, &checkpoint, IR_PHASES, observe)?;
+    let ir_phase = || collect_phase(request.pairs, ir, &checkpoint, IR_PHASES, observe);
+    let (ir, overlapped) = match overlap {
+        Some(work) => overlap_ir_phase(&rgb, work, ir_phase),
+        None => (ir_phase(), None),
+    };
+    let ir = ir?;
     checkpoint()?;
     if rgb
         .last()
@@ -355,7 +452,51 @@ pub(super) fn capture_batch_controlled_with<R, I>(
     checkpoint()?;
     live()?;
     checkpoint()?;
-    Ok(pairs)
+    Ok((pairs, overlapped))
+}
+
+/// Run `ir_phase` on the calling thread while `work` reads `rgb` on a scoped
+/// thread; see [`capture_sequential_batch_overlapped`] for the contract.
+fn overlap_ir_phase<T, W: Send>(
+    rgb: &[Frame],
+    work: impl FnOnce(&[Frame], &OverlapStop<'_>) -> W + Send,
+    ir_phase: impl FnOnce() -> Result<T>,
+) -> (Result<T>, Option<W>) {
+    /// Raises the stop flag when dropped: when the IR phase returns, and on
+    /// unwinding, where the scope then joins the worker before the panic
+    /// continues.
+    struct RaiseOnDrop<'a>(&'a AtomicBool);
+    impl Drop for RaiseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("irlume-rgb-overlap".into())
+            .spawn_scoped(scope, || work(rgb, &OverlapStop(&stop)));
+        if let Err(error) = &worker {
+            // The system refused the thread: nothing runs beside the IR
+            // phase, and the caller does the work after the batch as it would
+            // without overlap.
+            irlume_common::dlog!(
+                "sequential batch: the RGB overlap thread did not start ({error}); \
+                 the RGB half is left to the evaluation"
+            );
+        }
+        let raise = RaiseOnDrop(&stop);
+        let ir = ir_phase();
+        drop(raise);
+        let overlapped = match worker {
+            Ok(handle) => match handle.join() {
+                Ok(done) => Some(done),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+            Err(_) => None,
+        };
+        (ir, overlapped)
+    })
 }
 
 pub(crate) fn collect_phase<S, T>(

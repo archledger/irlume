@@ -7,6 +7,9 @@ Proposed 2026-10-10. Amended 2026-10-11 (driver identity), 2026-10-21
 runtime-suspend arm where the driver holds the device; the certification
 key binds the numerics set).
 
+Amended 2026-10-22 by the [measurement-only build boundary](#amendment-2026-10-22-measurement-only-evidence-builds),
+which specifies future tooling and admits no production loading profile.
+
 Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
 reopen GPU support during #1053. Section 15 asked for "evidence that
 CPU-only users face unacceptable latency"; the #1053 Phase 2 measurements
@@ -136,6 +139,9 @@ conformance evidence ADR-0022's 2026-10-09 amendment demands for the
 NPU, extended to that inventory. No setting bypasses it; until then a
 `gpu` selection keeps the recognizer on CPU with the selection's reason
 reported, exactly as #1054 ships today.
+
+The measurement-only exception specified below needs its own reviewed
+launch admission; it cannot open this production gate.
 
 ### 5. Certification gates are unchanged and binding
 
@@ -515,3 +521,32 @@ unit completes the support list before any entry.
   library on neither list refuses placement with its name; a live support
   digest that differs from the entry's runs the extended reference set,
   whose mismatch keeps the GPU on CPU (phase 3, fixture inventories).
+
+## Amendment 2026-10-22: measurement-only evidence builds
+
+The [ADR-0022 measurement-only build contract](0022-npu-inference-under-per-model-certification.md#amendment-2026-10-22-measurement-only-evidence-builds)
+applies to the GPU certification campaign. This is a specification for
+future tooling; no evidence entry, loading permission or certification is
+created by this amendment.
+
+The initial evidence path may bypass the ordinary admission and table
+lookup only after the distinct measurement-launch admission succeeds.
+It keeps the single-GPU rule, fixed `f32` configuration, complete identity
+and numerics/support inventory checks, CPU reference parity and guarded
+production compile. A driver-hold candidate also keeps its bound runtime
+counter guard. Missing or changed evidence retires or refuses the run;
+the candidate is never a production table entry.
+
+The CPU reference cannot use an escaped ORT provider. The measurement
+build's feature and environment rejection rules apply even if such a
+provider is available on the machine. Its isolated cache must prove a
+second-process import, not merely a successful recompile. The private data
+and record restrictions remain those of ADR-0022's full-extent amendment.
+
+Acceptance requires real compiler tests for the shipped-artifact guards,
+negative reference-provider and launch-profile cases, cache-hit/miss and
+alias cases through the guarded wrapper, and probe-counter/suspend cases.
+Toy compiler tests or the earlier unit-test-only hardware runs do not
+meet these implementation and measurement requirements. Ordinary GPU
+loading, installation and enforcing-profile validation remain section 4
+and #1162; this evidence profile is not their conformance proof.

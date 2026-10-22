@@ -427,6 +427,73 @@ mod gpu_groundwork_tests {
         assert_ne!(identity.digest(), different.digest());
     }
 
+    /// The reported memory size moves between boots of one platform with
+    /// every library unchanged, so it stays out of the digest; the field
+    /// dump still prints it, marked as unbound.
+    #[test]
+    fn gpu_identity_digest_ignores_the_boot_dependent_memory_size() {
+        let identity = fixture_identity("Intel(R) fixture GPU");
+        let mut rebooted = fixture_identity("Intel(R) fixture GPU");
+        rebooted.total_memory = "7125336064".into();
+        assert_eq!(identity.digest(), rebooted.digest());
+        assert!(rebooted
+            .field_dump()
+            .ends_with("total_memory (not bound)=7125336064\n"));
+    }
+
+    /// The dump prints every digest field once per line, the library
+    /// manifest one line per library, so changing any bound field changes
+    /// both the digest and the dump.
+    #[test]
+    fn gpu_identity_field_dump_lists_every_bound_field() {
+        let mut identity = fixture_identity("Intel(R) fixture GPU");
+        identity.libraries = "/fixture/libopenvino_c.so.2621 00\n/fixture/libigdrcl.so 11\n".into();
+        let dump = identity.field_dump();
+        let names: Vec<_> = dump.lines().map(|l| l.split('=').next().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "selected_library",
+                "canonical_library",
+                "runtime_version",
+                "runtime_build",
+                "gpu_plugin",
+                "full_name",
+                "capabilities",
+                "architecture",
+                "execution_units",
+                "device_id",
+                "device_pci",
+                "render_node.name",
+                "render_node.pci",
+                "render_node.vendor",
+                "render_node.device",
+                "loader",
+                "configuration",
+                "libraries",
+                "libraries",
+                "firmware",
+                "total_memory (not bound)",
+            ]
+        );
+        assert!(dump.contains("libraries=/fixture/libigdrcl.so 11\n"));
+        assert!(dump.contains("firmware=loaded guc=70.72.1 huc="));
+        let mutations: [fn(&mut Identity); 6] = [
+            |i| i.execution_units = "32".into(),
+            |i| i.device_id = "0x64a0".into(),
+            |i| i.render_node.device = "0x64a0".into(),
+            |i| i.configuration = "batch=1".into(),
+            |i| i.runtime_version = "2026.4".into(),
+            |i| i.firmware = Firmware::Unreadable,
+        ];
+        for mutate in mutations {
+            let mut changed = identity.clone();
+            mutate(&mut changed);
+            assert_ne!(identity.digest(), changed.digest());
+            assert_ne!(dump, changed.field_dump());
+        }
+    }
+
     fn loaded_xe() -> Firmware {
         Firmware::Loaded {
             guc: "70.72.1".into(),
@@ -980,6 +1047,10 @@ mod gpu_groundwork_tests {
             "{lane} identity digest {} (configuration {}), {} mapped libraries; CPU mesh {EVIDENCE_MESH_MODEL}",
             identity.digest(), identity.configuration, identity.libraries.lines().count()
         );
+        // Every field, so an archived run explains a changed digest.
+        for line in identity.field_dump().lines() {
+            println!("{lane} identity field {line}");
+        }
     }
 
     #[test]

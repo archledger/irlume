@@ -700,6 +700,14 @@ pub(crate) fn gpu_libraries(
 /// already a different identity through the library manifest. No digest
 /// here places a model: loading admission stays closed and `CERTIFIED`
 /// stays empty until the ADR-0033 section 5 gates pass on this identity.
+///
+/// `GPU_DEVICE_TOTAL_MEM_SIZE` is reported but not bound. The 2026.2.1
+/// plugin answers it with `CL_DEVICE_GLOBAL_MEM_SIZE`, which the compute
+/// runtime derives on integrated GPUs from the boot's physical pages and
+/// GTT size, so it moves by pages from one boot to the next with every
+/// library unchanged (four UX5406S values from 30,629,322,752 to
+/// 30,629,355,520 bytes between 2026-10-12 and 2026-10-22), and ADR-0033
+/// section 3 does not name it.
 #[derive(Clone, Debug)]
 pub struct Identity {
     /// The selected OpenVINO C API alias.
@@ -720,7 +728,8 @@ pub struct Identity {
     pub architecture: String,
     /// `GPU_EXECUTION_UNITS_COUNT`.
     pub execution_units: String,
-    /// `GPU_DEVICE_TOTAL_MEM_SIZE`, bytes.
+    /// `GPU_DEVICE_TOTAL_MEM_SIZE`, bytes. Reported, not in the digest:
+    /// it moves between boots (see above).
     pub total_memory: String,
     /// `GPU_DEVICE_ID`, the PCI device id the plugin reported (`0x46d1`).
     pub device_id: String,
@@ -742,31 +751,33 @@ pub struct Identity {
 }
 
 impl Identity {
-    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+    /// Every field the digest binds, in digest order, with the name the
+    /// field dump prints.
+    fn fields(&self) -> Vec<(&'static str, std::borrow::Cow<'_, str>)> {
         [
-            self.selected_library.as_str(),
-            self.canonical_library.as_str(),
-            self.runtime_version.as_str(),
-            self.runtime_build.as_str(),
-            self.gpu_plugin.as_str(),
-            self.full_name.as_str(),
-            self.capabilities.as_str(),
-            self.architecture.as_str(),
-            self.execution_units.as_str(),
-            self.total_memory.as_str(),
-            self.device_id.as_str(),
-            self.device_pci.as_str(),
-            self.render_node.name.as_str(),
-            self.render_node.pci.as_str(),
-            self.render_node.vendor.as_str(),
-            self.render_node.device.as_str(),
+            ("selected_library", self.selected_library.as_str()),
+            ("canonical_library", self.canonical_library.as_str()),
+            ("runtime_version", self.runtime_version.as_str()),
+            ("runtime_build", self.runtime_build.as_str()),
+            ("gpu_plugin", self.gpu_plugin.as_str()),
+            ("full_name", self.full_name.as_str()),
+            ("capabilities", self.capabilities.as_str()),
+            ("architecture", self.architecture.as_str()),
+            ("execution_units", self.execution_units.as_str()),
+            ("device_id", self.device_id.as_str()),
+            ("device_pci", self.device_pci.as_str()),
+            ("render_node.name", self.render_node.name.as_str()),
+            ("render_node.pci", self.render_node.pci.as_str()),
+            ("render_node.vendor", self.render_node.vendor.as_str()),
+            ("render_node.device", self.render_node.device.as_str()),
+            ("loader", self.loader.as_str()),
+            ("configuration", self.configuration.as_str()),
+            ("libraries", self.libraries.as_str()),
         ]
         .into_iter()
-        .map(std::borrow::Cow::Borrowed)
-        .chain([
-            std::borrow::Cow::Borrowed(self.loader.as_str()),
-            std::borrow::Cow::Borrowed(self.configuration.as_str()),
-            std::borrow::Cow::Borrowed(self.libraries.as_str()),
+        .map(|(name, value)| (name, std::borrow::Cow::Borrowed(value)))
+        .chain([(
+            "firmware",
             // The firmware observation joins the digest through its
             // rendered form so every variant is bound.
             std::borrow::Cow::Owned(match &self.firmware {
@@ -774,7 +785,7 @@ impl Identity {
                 Firmware::Malformed(why) => format!("malformed {why}"),
                 Firmware::Unreadable => "unreadable".to_owned(),
             }),
-        ])
+        )])
         .collect()
     }
 
@@ -785,11 +796,29 @@ impl Identity {
     /// section 5 gates pass.
     pub fn digest(&self) -> String {
         let mut encoded = Vec::new();
-        for field in self.fields() {
+        for (_, field) in self.fields() {
             encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
             encoded.extend_from_slice(field.as_bytes());
         }
         irlume_common::sha256_hex(&encoded)
+    }
+
+    /// One `name=value` line per digest field, in digest order (the
+    /// library manifest one line per library as `libraries=path sha256`),
+    /// then the reported memory size marked as unbound. Archived with
+    /// every hardware run, so two digests can be compared field by field.
+    pub fn field_dump(&self) -> String {
+        let mut dump = String::new();
+        for (name, value) in self.fields() {
+            if value.is_empty() {
+                dump.push_str(&format!("{name}=\n"));
+            }
+            for line in value.lines() {
+                dump.push_str(&format!("{name}={line}\n"));
+            }
+        }
+        dump.push_str(&format!("total_memory (not bound)={}\n", self.total_memory));
+        dump
     }
 }
 

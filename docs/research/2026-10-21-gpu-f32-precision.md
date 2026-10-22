@@ -134,6 +134,14 @@ The f32 configuration ran on the UX5406S from a measurement build of
 origin/main `5728309b` with this change (37 mapped libraries, identity
 `ec747155`, kernel 7.2.11, the intel-npu-stack 2026.2.1 packages,
 intel-compute-runtime 26.35.39758.11, process pinned to CPUs 0 to 3).
+(Identity definition change, 2026-10-22: the memory size the plugin
+reports moves between boots, so the digest no longer hashes it. The
+identity lane rerun on 2026-10-22 after a reboot printed `1f570994` with
+every field dumped; recomputing the earlier definition from that dump with
+the 2026-10-21 memory size, 30,629,322,752 bytes, gives `ec747155`
+exactly, so every other field is unchanged and the evidence below belongs
+to identity `1f570994`. With that boot's own size, 30,629,335,040 bytes,
+the earlier definition gives `e1910f69`.)
 The identity lane, the compile-parity and retirement-trigger lane and the
 cache control in bypass mode passed first; the real-frames and
 recognition-corpora lanes then measured 13 arms in 3,291 s:

@@ -254,10 +254,226 @@ mod onnx {
     };
     use ort::value::Tensor;
 
-    /// Intra-op threads per ONNX session. Keep two threads for model latency;
-    /// disable idle spinning separately in `build` so resident sessions do
-    /// not spend CPU time waiting for their next inference.
+    /// Intra-op threads per ONNX session of the small models (detection,
+    /// rescue, mesh, IR PAD, adapter). Keep two threads for model latency;
+    /// disable idle spinning separately in `build_session` so resident
+    /// sessions do not spend CPU time waiting for their next inference.
     const ORT_INTRA_THREADS: usize = 2;
+
+    /// The largest heavy-model pool: the largest the bit-identity gate
+    /// (`heavy_models_answer_bit_identically_at_every_pool`) compares, so no
+    /// host runs a pool whose outputs were never checked. No host with more
+    /// than ten cores was measured.
+    pub(crate) const HEAVY_THREADS_MAX: usize = 16;
+
+    /// The longest `session.intra_op_thread_affinities` value every supported
+    /// ONNX Runtime accepts: a config value may hold 4096 bytes up to 1.24.2
+    /// and 8192 from 1.24.3 (`config_options.h`), and 1.24 is the oldest
+    /// runtime irlume loads.
+    const ORT_CONFIG_VALUE_MAX: usize = 4096;
+
+    /// The intra-op pool of one ONNX session: its thread count and, when
+    /// set, the value of ONNX Runtime's `session.intra_op_thread_affinities`
+    /// (one entry per pool thread beyond the caller's, 1-based CPU ids).
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct IntraPool {
+        threads: usize,
+        affinity: Option<String>,
+    }
+
+    impl IntraPool {
+        /// A pool of `threads`, confined by `affinity` when given.
+        #[cfg(test)]
+        pub(crate) fn new(threads: usize, affinity: Option<&str>) -> Self {
+            Self {
+                threads,
+                affinity: affinity.map(str::to_owned),
+            }
+        }
+    }
+
+    /// The pool of the small models.
+    const SMALL_POOL: IntraPool = IntraPool {
+        threads: ORT_INTRA_THREADS,
+        affinity: None,
+    };
+
+    /// The heavy models' pool, read from the building thread's CPU affinity
+    /// and the CPU topology each time a heavy session is built, so a session
+    /// never carries a placement older than its thread's mask.
+    ///
+    /// Two threads (#508) cost these models about half their speed, and the
+    /// contention #508 avoided came from consent-watch capture threads that
+    /// no longer exist. One thread per physical core is the count ONNX
+    /// Runtime's own default picks, but that default pins each thread to a
+    /// core from the whole machine's core list, ignoring the process
+    /// affinity and cgroup cpusets, and pinning measured slower on a hybrid
+    /// i5-1335U. Left unpinned on a Ryzen 7 5700G, eight threads measured
+    /// slower than six, consistent with threads stacking on SMT siblings, so
+    /// where a core holds two or more allowed CPUs every pool thread beyond
+    /// the caller's may use only the first allowed CPU of each core and the
+    /// scheduler still places them; elsewhere the threads stay unpinned.
+    /// Outputs are bit-identical at every pool tried
+    /// (docs/research/2026-10-22-heavy-model-pools.md).
+    pub(crate) fn heavy_pool() -> IntraPool {
+        let cores = live_cores();
+        // A cgroup CPU quota (`CPUQuota=`) bounds this below the mask.
+        let available = std::thread::available_parallelism()
+            .map_or(ORT_INTRA_THREADS, std::num::NonZeroUsize::get);
+        let pool = heavy_pool_for(cores.as_deref(), available);
+        irlume_common::dlog!(
+            "onnx: heavy session uses {} intra-op threads, {} (physical cores {:?}, \
+             available CPUs {available})",
+            pool.threads,
+            if pool.affinity.is_some() {
+                "one CPU per core"
+            } else {
+                "unpinned"
+            },
+            cores.as_ref().map(Vec::len)
+        );
+        pool
+    }
+
+    /// The calling thread's allowed CPUs grouped by physical core, from its
+    /// affinity mask and each CPU's sysfs topology; `None` when either
+    /// cannot be read.
+    fn live_cores() -> Option<Vec<Vec<usize>>> {
+        physical_cores(&thread_cpus()?, |cpu| {
+            let topology = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+            std::fs::read_to_string(format!("{topology}/core_cpus_list"))
+                .or_else(|_| std::fs::read_to_string(format!("{topology}/thread_siblings_list")))
+                .ok()
+        })
+    }
+
+    /// The CPUs the calling thread may run on, which its pool threads
+    /// inherit: `sched_getaffinity`, which reads no file and so needs no
+    /// AppArmor rule, else the process's `Cpus_allowed_list` when the
+    /// kernel's mask outgrows a `cpu_set_t` (more than 1024 CPUs).
+    pub(crate) fn thread_cpus() -> Option<Vec<usize>> {
+        // SAFETY: `cpu_set_t` is a plain bit array, for which all zero bits
+        // is a valid (empty) set.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `set` is a live, writable `cpu_set_t` of exactly the size
+        // passed, and pid 0 names the calling thread.
+        let read =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+        if read == 0 {
+            let cpus: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| {
+                    // SAFETY: `cpu` is below `CPU_SETSIZE`, the bit count of
+                    // `set`, so the lookup stays inside it.
+                    unsafe { libc::CPU_ISSET(cpu, &set) }
+                })
+                .collect();
+            if !cpus.is_empty() {
+                return Some(cpus);
+            }
+        }
+        allowed_cpus(&std::fs::read_to_string("/proc/self/status").ok()?)
+    }
+
+    /// The heavy-model pool for `cores` (each the allowed CPUs sharing one
+    /// physical core, lowest first) and `available` scheduler CPUs: one
+    /// thread per core, bounded by `available` (a cgroup quota can be
+    /// smaller) and [`HEAVY_THREADS_MAX`], never below the small-model
+    /// count. Where some core holds two or more allowed CPUs and the pool
+    /// fits the cores, every thread beyond the caller's may use only the
+    /// first CPU of each core, unless that affinity outgrows what every
+    /// supported runtime accepts (past about 80 cores with interleaved
+    /// sibling numbering). An unreadable topology keeps the small pool.
+    fn heavy_pool_for(cores: Option<&[Vec<usize>]>, available: usize) -> IntraPool {
+        let Some(cores) = cores.filter(|cores| !cores.is_empty()) else {
+            return SMALL_POOL;
+        };
+        let threads = cores
+            .len()
+            .min(available)
+            .clamp(ORT_INTRA_THREADS, HEAVY_THREADS_MAX);
+        let siblings = cores.iter().any(|core| core.len() > 1);
+        let affinity = (siblings && threads <= cores.len())
+            .then(|| vec![first_cpus(cores); threads - 1].join(";"))
+            .filter(|affinity| affinity.len() <= ORT_CONFIG_VALUE_MAX);
+        IntraPool { threads, affinity }
+    }
+
+    /// The first CPU of every core, 1-based as ONNX Runtime counts them: one
+    /// `first-last` interval when they run consecutively, else a comma list
+    /// (a thread's entry is one or the other, `thread_utils.cc`).
+    fn first_cpus(cores: &[Vec<usize>]) -> String {
+        let firsts: Vec<usize> = cores.iter().map(|core| core[0] + 1).collect();
+        match firsts.as_slice() {
+            [first, .., last] if firsts.windows(2).all(|pair| pair[1] == pair[0] + 1) => {
+                format!("{first}-{last}")
+            }
+            _ => firsts
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+
+    /// The CPUs of a kernel CPU list such as `0-3,8,10-11`, in order.
+    fn cpu_list(list: &str) -> Option<Vec<usize>> {
+        let mut cpus = Vec::new();
+        for range in list.trim().split(',') {
+            let (first, last): (usize, usize) = match range.split_once('-') {
+                Some((first, last)) => (first.parse().ok()?, last.parse().ok()?),
+                None => {
+                    let cpu = range.parse().ok()?;
+                    (cpu, cpu)
+                }
+            };
+            if first > last || last - first > 4096 {
+                return None;
+            }
+            cpus.extend(first..=last);
+        }
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
+    /// The CPUs in `Cpus_allowed_list` of a `/proc/<pid>/status` text: the
+    /// process affinity, which systemd's `CPUAffinity=`, cpusets and
+    /// `taskset` set.
+    fn allowed_cpus(status: &str) -> Option<Vec<usize>> {
+        cpu_list(
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?,
+        )
+    }
+
+    /// The allowed CPUs grouped by physical core, each group lowest first and
+    /// the groups by their lowest CPU: SMT siblings share one
+    /// `core_cpus_list`. A CPU without a readable list is skipped: an offline
+    /// CPU has no topology directory, and while `sched_getaffinity` names
+    /// only active CPUs, the `Cpus_allowed_list` fallback also names offline
+    /// ones (`nosmt`, VMs with more possible than present CPUs). `None` when
+    /// no CPU's list is readable.
+    fn physical_cores(
+        allowed: &[usize],
+        siblings: impl Fn(usize) -> Option<String>,
+    ) -> Option<Vec<Vec<usize>>> {
+        let mut cores: std::collections::BTreeMap<Vec<usize>, Vec<usize>> = Default::default();
+        for &cpu in allowed {
+            let Some(core) = siblings(cpu).as_deref().and_then(cpu_list) else {
+                continue;
+            };
+            cores.entry(core).or_default().push(cpu);
+        }
+        let mut cores: Vec<Vec<usize>> = cores
+            .into_values()
+            .map(|mut cpus| {
+                cpus.sort_unstable();
+                cpus.dedup();
+                cpus
+            })
+            .collect();
+        cores.sort_unstable();
+        (!cores.is_empty()).then_some(cores)
+    }
 
     fn err<E: std::fmt::Display>(e: E) -> irlume_common::Error {
         irlume_common::Error::Hardware(format!("onnx: {e}"))
@@ -581,7 +797,38 @@ mod onnx {
         }
     }
 
-    fn build(model: &[u8]) -> irlume_common::Result<Session> {
+    /// [`build_session`] at `pool`, else at the small models' pool: a heavy
+    /// pool is a speed choice and must never take face authentication down,
+    /// and the outputs are the same at either. A pool the runtime cannot set
+    /// up (an affinity it refuses, threads a task limit will not start)
+    /// loads as every model did before (#508); a failure the small pool
+    /// shares returns the first error, without a warning.
+    fn build(model: &[u8], pool: &IntraPool) -> irlume_common::Result<Session> {
+        build_or_small_pool(pool, |pool| build_session(model, pool))
+    }
+
+    /// The fallback of [`build`] over any session constructor.
+    fn build_or_small_pool<T>(
+        pool: &IntraPool,
+        mut build: impl FnMut(&IntraPool) -> irlume_common::Result<T>,
+    ) -> irlume_common::Result<T> {
+        match build(pool) {
+            Err(error) if *pool != SMALL_POOL => match build(&SMALL_POOL) {
+                Ok(session) => {
+                    irlume_common::jout_warn!(
+                        "irlume: an ONNX session failed to build with {} intra-op threads \
+                         ({error}); it runs on {ORT_INTRA_THREADS}",
+                        pool.threads
+                    );
+                    Ok(session)
+                }
+                Err(_) => Err(error),
+            },
+            result => result,
+        }
+    }
+
+    fn build_session(model: &[u8], pool: &IntraPool) -> irlume_common::Result<Session> {
         ensure_ort_resolvable()?;
         #[allow(unused_mut)]
         let mut b = Session::builder().map_err(err)?;
@@ -702,10 +949,15 @@ mod onnx {
             b = pin_default_cpu_ep(b)?;
         }
         // Each resident model has its own pool. Let idle workers block while
-        // another model runs, retaining two threads for each active inference.
-        b.with_intra_threads(ORT_INTRA_THREADS)
-            .map_err(err)?
-            .with_intra_op_spinning(false)
+        // another model runs, retaining the pool's threads for each active
+        // inference.
+        let mut b = b.with_intra_threads(pool.threads).map_err(err)?;
+        if let Some(affinity) = &pool.affinity {
+            b = b
+                .with_config_entry("session.intra_op_thread_affinities", affinity)
+                .map_err(err)?;
+        }
+        b.with_intra_op_spinning(false)
             .map_err(err)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(err)?
@@ -730,7 +982,22 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &heavy_pool())?,
+                #[cfg(feature = "npu")]
+                npu: crate::npu::Slot::default(),
+            })
+        }
+
+        /// [`Self::load_from_memory`] with an explicit pool and without the
+        /// small-pool fallback, for the gate that the pool never changes an
+        /// output bit.
+        #[cfg(test)]
+        pub(crate) fn load_with_pool(
+            model: &[u8],
+            pool: &IntraPool,
+        ) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build_session(model, pool)?,
                 #[cfg(feature = "npu")]
                 npu: crate::npu::Slot::default(),
             })
@@ -752,7 +1019,7 @@ mod onnx {
             npu: &mut crate::npu::Context,
         ) -> irlume_common::Result<Self> {
             let mut embedder = Self {
-                session: build(model.bytes())?,
+                session: build(model.bytes(), &heavy_pool())?,
                 npu: crate::npu::Slot::default(),
             };
             embedder.place_on_npu(model, npu)?;
@@ -1239,7 +1506,7 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &SMALL_POOL)?,
             })
         }
 
@@ -1277,6 +1544,309 @@ mod onnx {
     }
 
     #[cfg(test)]
+    mod heavy_pool_tests {
+        use super::*;
+
+        #[test]
+        fn cpu_lists_and_the_status_affinity_line_parse_in_order() {
+            let status = "Name:\tirlumed\nCpus_allowed:\tffff\nCpus_allowed_list:\t0-3,8,10-11\n";
+            assert_eq!(allowed_cpus(status), Some(vec![0, 1, 2, 3, 8, 10, 11]));
+            assert_eq!(allowed_cpus("Cpus_allowed_list:\t5\n"), Some(vec![5]));
+            assert_eq!(cpu_list("0,8\n"), Some(vec![0, 8]));
+            assert_eq!(cpu_list("2-3"), Some(vec![2, 3]));
+            for broken in [
+                "Name:\tirlumed\n",
+                "Cpus_allowed_list:\t\n",
+                "Cpus_allowed_list:\t3-1\n",
+                "Cpus_allowed_list:\t0-x\n",
+                "Cpus_allowed_list:\t0-99999\n",
+            ] {
+                assert_eq!(allowed_cpus(broken), None, "{broken:?}");
+            }
+        }
+
+        /// A 5700G (eight cores, siblings n and n+8), a 1335U (two P-cores
+        /// with siblings, eight E-cores without) and an N100 (four cores).
+        fn smt(cpu: usize) -> Option<String> {
+            Some(format!("{},{}\n", cpu % 8, cpu % 8 + 8))
+        }
+
+        fn hybrid(cpu: usize) -> Option<String> {
+            Some(match cpu {
+                0 | 1 => "0-1\n".to_owned(),
+                2 | 3 => "2-3\n".to_owned(),
+                _ => format!("{cpu}\n"),
+            })
+        }
+
+        #[test]
+        fn physical_cores_group_the_allowed_siblings() {
+            let all: Vec<usize> = (0..16).collect();
+            let cores = physical_cores(&all, smt).unwrap();
+            assert_eq!(cores.len(), 8);
+            assert_eq!(cores[0], [0, 8]);
+            assert_eq!(cores[7], [7, 15]);
+            let cores = physical_cores(&(0..12).collect::<Vec<_>>(), hybrid).unwrap();
+            assert_eq!(cores.len(), 10);
+            assert_eq!(
+                (&cores[0], &cores[1], &cores[2]),
+                (&vec![0, 1], &vec![2, 3], &vec![4])
+            );
+            // One allowed thread of each SMT core still names every core once,
+            // holding only the allowed CPU.
+            let cores = physical_cores(&[8, 1, 2, 3], smt).unwrap();
+            assert_eq!(cores, [vec![1], vec![2], vec![3], vec![8]]);
+            // An offline CPU (no topology) is skipped, not fatal; nothing
+            // readable at all is unknown topology.
+            assert_eq!(
+                physical_cores(&[0, 1], |cpu| (cpu == 0).then(|| "0".into())),
+                Some(vec![vec![0]])
+            );
+            assert_eq!(physical_cores(&[0], |_| Some("x".into())), None);
+            assert_eq!(physical_cores(&[0, 1], |_| None), None);
+            assert_eq!(physical_cores(&[], smt), None);
+        }
+
+        #[test]
+        fn smt_cores_confine_the_pool_to_one_cpu_per_core() {
+            let cores = physical_cores(&(0..16).collect::<Vec<_>>(), smt).unwrap();
+            let pool = heavy_pool_for(Some(&cores), 16);
+            assert_eq!(pool.threads, 8);
+            assert_eq!(
+                pool.affinity.as_deref(),
+                Some(["1-8"; 7].join(";").as_str())
+            );
+            // A hybrid part with some SMT cores: every core's first CPU.
+            let cores = physical_cores(&(0..12).collect::<Vec<_>>(), hybrid).unwrap();
+            let pool = heavy_pool_for(Some(&cores), 12);
+            assert_eq!(pool.threads, 10);
+            assert_eq!(
+                pool.affinity.as_deref(),
+                Some(["1,3,5,6,7,8,9,10,11,12"; 9].join(";").as_str())
+            );
+            // A cgroup quota bounds the threads, not the CPUs they may use.
+            let pool = heavy_pool_for(Some(&cores), 3);
+            assert_eq!(pool.threads, 3);
+            assert_eq!(
+                pool.affinity.as_deref(),
+                Some(["1,3,5,6,7,8,9,10,11,12"; 2].join(";").as_str())
+            );
+        }
+
+        #[test]
+        fn cores_without_siblings_and_unknown_topology_stay_unpinned() {
+            let n100: Vec<Vec<usize>> = (0..4).map(|cpu| vec![cpu]).collect();
+            assert_eq!(
+                heavy_pool_for(Some(&n100), 4),
+                IntraPool {
+                    threads: 4,
+                    affinity: None
+                }
+            );
+            // An affinity holding one thread per SMT core has no siblings left.
+            let cores = physical_cores(&(0..8).collect::<Vec<_>>(), smt).unwrap();
+            assert_eq!(heavy_pool_for(Some(&cores), 8).affinity, None);
+            // The floor of two on one SMT core would not fit one CPU per core.
+            assert_eq!(heavy_pool_for(Some(&[vec![0, 1]]), 2).affinity, None);
+            assert_eq!(
+                heavy_pool_for(Some(&[vec![0]]), 1).threads,
+                ORT_INTRA_THREADS
+            );
+            assert_eq!(heavy_pool_for(None, 16), SMALL_POOL);
+            assert_eq!(heavy_pool_for(Some(&[]), 16), SMALL_POOL);
+        }
+
+        /// Past sixteen cores the pool stops at the largest size the
+        /// bit-identity gate checks, and an affinity longer than the oldest
+        /// supported runtime accepts is left out rather than refused.
+        #[test]
+        fn large_hosts_cap_the_pool_and_bound_the_affinity() {
+            // Siblings n and n + cores (AMD, most Intel desktops): one interval.
+            let split: Vec<Vec<usize>> = (0..64).map(|core| vec![core, core + 64]).collect();
+            let pool = heavy_pool_for(Some(&split), 128);
+            assert_eq!(pool.threads, HEAVY_THREADS_MAX);
+            assert_eq!(
+                pool.affinity.as_deref(),
+                Some(["1-64"; 15].join(";").as_str())
+            );
+            // Siblings 2k and 2k + 1: a comma list, which grows with the cores.
+            let interleaved = |cores: usize| -> Vec<Vec<usize>> {
+                (0..cores).map(|k| vec![2 * k, 2 * k + 1]).collect()
+            };
+            let pool = heavy_pool_for(Some(&interleaved(64)), 128);
+            assert_eq!(pool.threads, HEAVY_THREADS_MAX);
+            let affinity = pool.affinity.expect("64 interleaved cores fit");
+            assert_eq!(affinity.split(';').count(), 15);
+            assert!(affinity.starts_with("1,3,5,") && affinity.ends_with(",125,127"));
+            let longest = heavy_pool_for(Some(&interleaved(82)), 164).affinity;
+            assert!(longest.is_some_and(|affinity| affinity.len() <= ORT_CONFIG_VALUE_MAX));
+            let pool = heavy_pool_for(Some(&interleaved(83)), 166);
+            assert_eq!(
+                pool,
+                IntraPool {
+                    threads: HEAVY_THREADS_MAX,
+                    affinity: None
+                }
+            );
+            // Without siblings the cap alone applies.
+            let flat: Vec<Vec<usize>> = (0..24).map(|cpu| vec![cpu]).collect();
+            assert_eq!(heavy_pool_for(Some(&flat), 24).threads, HEAVY_THREADS_MAX);
+        }
+
+        /// The live reads behind `heavy_pool` work on this host: a mistyped
+        /// path or a misread mask would leave every host on two threads
+        /// while the other tests pass.
+        #[test]
+        fn this_hosts_affinity_and_topology_read() {
+            // sched_getaffinity answers the thread's mask limited to active
+            // CPUs; the status line prints the mask itself, which can still
+            // name offline CPUs, so compare it limited to the online ones.
+            let status =
+                std::fs::read_to_string("/proc/thread-self/status").expect("this thread's status");
+            let mask = allowed_cpus(&status).expect("this thread's Cpus_allowed_list");
+            let expected: Vec<usize> =
+                match std::fs::read_to_string("/sys/devices/system/cpu/online") {
+                    Ok(online) => {
+                        let online = cpu_list(&online).expect("the online CPU list");
+                        mask.into_iter()
+                            .filter(|cpu| online.contains(cpu))
+                            .collect()
+                    }
+                    Err(_) => mask,
+                };
+            assert_eq!(thread_cpus(), Some(expected), "sched_getaffinity's mask");
+            if std::path::Path::new("/sys/devices/system/cpu/cpu0/topology").exists() {
+                let cpus = thread_cpus().unwrap();
+                let cores = live_cores().expect("this host's CPU topology");
+                let mut grouped: Vec<usize> = cores.concat();
+                grouped.sort_unstable();
+                assert_eq!(grouped, cpus, "every allowed CPU sits in exactly one core");
+            }
+        }
+
+        /// The mask is the building thread's own, not the process leader's:
+        /// a thread confined to one CPU reads that CPU alone.
+        #[test]
+        fn a_confined_thread_reads_its_own_mask() {
+            let cpu = thread_cpus().expect("this thread's CPU affinity")[0];
+            let confined = std::thread::spawn(move || {
+                // SAFETY: as in `thread_cpus`, an all-zero `cpu_set_t` is
+                // the empty set.
+                let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                // SAFETY: `cpu` comes from this process's mask, so it is
+                // below `CPU_SETSIZE`, and `set` is a live `cpu_set_t`.
+                unsafe { libc::CPU_SET(cpu, &mut set) };
+                // SAFETY: `set` is a live `cpu_set_t` of exactly the size
+                // passed, and pid 0 names this spawned thread alone.
+                let set_rc = unsafe {
+                    libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+                };
+                assert_eq!(set_rc, 0, "confine the spawned thread");
+                (thread_cpus(), heavy_pool())
+            })
+            .join()
+            .expect("the confined thread");
+            assert_eq!(confined.0, Some(vec![cpu]));
+            assert_eq!(confined.1, SMALL_POOL);
+        }
+
+        /// A pool that fails to build loads at the small models' pool, and
+        /// a failure the small pool shares keeps its first error.
+        #[test]
+        fn a_pool_that_fails_to_build_loads_at_the_small_pool() {
+            let heavy = IntraPool::new(8, Some("1-8;1-8;1-8;1-8;1-8;1-8;1-8"));
+            let mut tried = Vec::new();
+            let loaded = build_or_small_pool(&heavy, |pool| {
+                tried.push(pool.clone());
+                match pool.threads {
+                    8 => Err(irlume_common::Error::Hardware("no threads".into())),
+                    threads => Ok(threads),
+                }
+            });
+            assert_eq!(loaded.ok(), Some(ORT_INTRA_THREADS));
+            assert_eq!(tried, [heavy.clone(), SMALL_POOL]);
+            // A two-core SMT host's pool differs from the small one only in
+            // its affinity, and falls back all the same.
+            let two_cores = heavy_pool_for(Some(&[vec![0, 2], vec![1, 3]]), 4);
+            assert_eq!(two_cores, IntraPool::new(2, Some("1-2")));
+            let mut tried = Vec::new();
+            let loaded = build_or_small_pool(&two_cores, |pool| {
+                tried.push(pool.clone());
+                if pool.affinity.is_some() {
+                    Err(irlume_common::Error::Hardware("refused".into()))
+                } else {
+                    Ok(pool.threads)
+                }
+            });
+            assert_eq!(loaded.ok(), Some(ORT_INTRA_THREADS));
+            assert_eq!(tried, [two_cores, SMALL_POOL]);
+            let mut tried = 0;
+            let failed = build_or_small_pool(&heavy, |pool| {
+                tried += 1;
+                Err::<(), _>(irlume_common::Error::Hardware(format!(
+                    "{} threads",
+                    pool.threads
+                )))
+            });
+            assert_eq!(
+                failed.err().map(|error| error.to_string()),
+                Some("hardware: 8 threads".to_owned())
+            );
+            assert_eq!(tried, 2);
+            // The small pool itself has nothing to fall back to.
+            let mut tried = 0;
+            let failed = build_or_small_pool(&SMALL_POOL, |_| {
+                tried += 1;
+                Err::<(), _>(irlume_common::Error::Hardware("model".into()))
+            });
+            assert!(failed.is_err());
+            assert_eq!(tried, 1);
+        }
+
+        /// An affinity ONNX Runtime refuses loads at the small pool instead
+        /// of failing the model load.
+        #[test]
+        fn a_refused_affinity_loads_at_the_small_pool() {
+            let path = format!(
+                "{}/../../models/face_detection_yunet_2023mar.onnx",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let model = std::fs::read(&path).expect("models/face_detection_yunet_2023mar.onnx");
+            let refused = IntraPool::new(3, Some("x;y"));
+            assert!(
+                build_session(&model, &refused).is_err(),
+                "the runtime refuses it"
+            );
+            assert!(build(&model, &refused).is_ok(), "the small pool loads");
+        }
+
+        /// The ViT and the recognizer load on the per-host pool, every other
+        /// model on two threads, and a session takes its pool's threads and
+        /// affinity. No output shows any of this, so the source is checked.
+        #[test]
+        fn only_the_vit_and_the_recognizer_build_on_the_heavy_pool() {
+            let source = include_str!("lib.rs");
+            let block = |header: &str| {
+                let start = source.find(header).expect(header);
+                let end = source[start..].find("\n    }\n").expect("impl end");
+                &source[start..start + end]
+            };
+            // Split so this test's own text never matches.
+            let heavy = concat!("&heavy", "_pool())?");
+            assert_eq!(block("\n    impl Embedder {\n").matches(heavy).count(), 2);
+            assert_eq!(block("\n    impl PadVit {\n").matches(heavy).count(), 1);
+            assert_eq!(source.matches(heavy).count(), 3, "no other model");
+            let session = source
+                .split("fn build_session(model: &[u8], pool: &IntraPool)")
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .expect("session build");
+            assert!(session.contains(".with_intra_threads(pool.threads)"));
+            assert!(session.contains("(\"session.intra_op_thread_affinities\", affinity)"));
+        }
+    }
+
+    #[cfg(test)]
     mod adapter_contract_tests {
         use super::*;
 
@@ -1290,7 +1860,7 @@ mod onnx {
         fn execution_providers_stay_escape_gated_and_strict() {
             let source = include_str!("lib.rs");
             let build = source
-                .split("fn build(model: &[u8])")
+                .split("fn build_session(model: &[u8], pool: &IntraPool)")
                 .nth(1)
                 .and_then(|rest| rest.split("\n    fn ").next())
                 .expect("session build");
@@ -1545,7 +2115,7 @@ mod onnx {
                 )?;
                 return Self::from_tflite_session(session);
             }
-            let session = build(model)?;
+            let session = build(model, &SMALL_POOL)?;
             // NHWC [1, side, side, 3]: take the declared H when static.
             let input = session
                 .inputs()
@@ -1802,7 +2372,7 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &SMALL_POOL)?,
                 input_scratch: Vec::new(),
             })
         }
@@ -1952,7 +2522,7 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &SMALL_POOL)?,
                 anchors: blaze_anchors(),
             })
         }
@@ -2133,7 +2703,22 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &heavy_pool())?,
+                #[cfg(feature = "npu")]
+                npu: crate::npu::Slot::default(),
+            })
+        }
+
+        /// [`Self::load_from_memory`] with an explicit pool and without the
+        /// small-pool fallback, for the gate that the pool never changes an
+        /// output bit.
+        #[cfg(test)]
+        pub(crate) fn load_with_pool(
+            model: &[u8],
+            pool: &IntraPool,
+        ) -> irlume_common::Result<Self> {
+            Ok(Self {
+                session: build_session(model, pool)?,
                 #[cfg(feature = "npu")]
                 npu: crate::npu::Slot::default(),
             })
@@ -2852,7 +3437,7 @@ mod onnx {
         #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
-                session: build(model)?,
+                session: build(model, &SMALL_POOL)?,
                 #[cfg(feature = "npu")]
                 npu: crate::npu::Slot::default(),
             })
@@ -3628,6 +4213,84 @@ mod model_tests {
             assert!(
                 (moved - p).abs() > 2.0 * TOL,
                 "{name}: a one-pixel crop shift moved p_spoof only {p} -> {moved}"
+            );
+        }
+    }
+
+    /// The ViT PAD cue and the recognizer run with a per-host pool
+    /// (`heavy_pool`), so the pool must never move an output bit: templates
+    /// enrolled under one pool are matched against probes under another
+    /// after an upgrade or a CPU change, and the five-score PAD median is
+    /// compared against a fixed threshold. The 2026-10-22 measurements found
+    /// every pool tried bit-identical on Zen 3, Gracemont, Raptor Lake and
+    /// Lunar Lake; this gate holds every CI runner to it at every pool size
+    /// production can pick (2 to `HEAVY_THREADS_MAX`, whatever the runner's
+    /// own count), at the pool this host uses, and with an explicit CPU
+    /// affinity in both of the runtime's notations, built without the
+    /// small-pool fallback, so the affinity path runs on every host, SMT or
+    /// not.
+    #[test]
+    fn heavy_models_answer_bit_identically_at_every_pool() {
+        use crate::onnx::{heavy_pool, thread_cpus, IntraPool, HEAVY_THREADS_MAX};
+        ort_init();
+        let vit = std::fs::read(model_path("liveness_vit.onnx")).expect("vit pad weights");
+        let recognizer = std::fs::read(model_path("glintr100.onnx")).expect("recognizer weights");
+        let frames = ["face_roi_300x260", "clipped_roi_521x463"]
+            .map(crate::onnx::pad_vit_input_tests::fixture_frame);
+        let chips = [chip(PINNED_EMBEDDING_INPUT_SEED), chip(1)];
+        let outputs = |pool: &IntraPool| -> Vec<u32> {
+            let mut pad = PadVit::load_with_pool(&vit, pool).expect("vit pad");
+            let mut bits: Vec<u32> = frames
+                .iter()
+                .map(|(data, width, height, bbox)| {
+                    let view = align::RgbView {
+                        data,
+                        width: *width,
+                        height: *height,
+                    };
+                    pad.p_spoof(&view, bbox).expect("score").to_bits()
+                })
+                .collect();
+            drop(pad);
+            let mut embedder = Embedder::load_with_pool(&recognizer, pool).expect("embedder");
+            // The digest enrollment records as its templates' producer
+            // (ADR-0022 §2), on its own reference inputs.
+            bits.extend(
+                embedder
+                    .cpu_reference_digest()
+                    .expect("reference digest")
+                    .bytes()
+                    .map(u32::from),
+            );
+            for chip in &chips {
+                bits.extend(embedder.embed(chip).expect("embed").map(f32::to_bits));
+                bits.extend(
+                    embedder
+                        .embed_tta(chip)
+                        .expect("embed tta")
+                        .map(f32::to_bits),
+                );
+            }
+            bits
+        };
+        let reference = outputs(&IntraPool::new(2, None));
+        // ONNX Runtime's affinity ids count from 1; the first CPU this thread
+        // may use, as an interval for one extra thread and a list for the
+        // other.
+        let first = thread_cpus().expect("this thread's CPU affinity")[0] + 1;
+        let pinned = format!("{first}-{first};{first}");
+        let pools = (3..=HEAVY_THREADS_MAX)
+            .map(|threads| IntraPool::new(threads, None))
+            .chain([IntraPool::new(3, Some(&pinned)), heavy_pool()]);
+        for pool in pools {
+            let got = outputs(&pool);
+            let differing = got.iter().zip(&reference).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing,
+                0,
+                "{differing} of {} output values differ between 2 threads and {pool:?}; \
+                 a pool must not change what the models answer",
+                reference.len()
             );
         }
     }

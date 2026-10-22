@@ -192,7 +192,7 @@ mod npu_enrollment_tests {
         let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut embedder = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::certified(
                 Box::new(SuspendsDuring {
                     suspend: suspend.clone(),
@@ -256,7 +256,7 @@ mod npu_enrollment_tests {
         let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
         let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let mut embedder = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::certified(
                 Box::new(SuspendsDuring {
                     suspend: suspend.clone(),
@@ -308,7 +308,7 @@ mod npu_enrollment_tests {
         let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
         let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
         let mut embedder = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::npu(Box::new(FailsSecond { calls: 0 })),
         };
         let n = align::OUT_SIZE as usize;
@@ -338,7 +338,7 @@ mod npu_enrollment_tests {
         let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
         let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut embedder = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::certified(
                 Box::new(Changing {
                     changed: changed.clone(),
@@ -403,7 +403,7 @@ mod npu_enrollment_tests {
         let bytes = std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)");
         let mut reference = Embedder::load_from_memory(&bytes).unwrap();
         let mut placed = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::npu(Box::new(Constant)),
         };
         let n = align::OUT_SIZE as usize;
@@ -445,7 +445,7 @@ mod npu_enrollment_tests {
             ),
         ] {
             let mut checked = Embedder {
-                session: build(&bytes).unwrap(),
+                session: build(&bytes, &heavy_pool()).unwrap(),
                 npu: crate::npu::Slot::certified(
                     Box::new(Constant),
                     test_entry(&bytes, cpu_digest, npu_digest),
@@ -464,7 +464,7 @@ mod npu_enrollment_tests {
         }
         // Both reproduced: the model answers from the NPU.
         let mut passing = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::certified(
                 Box::new(Constant),
                 test_entry(&bytes, cpu_digest, constant_digest()),
@@ -535,7 +535,7 @@ mod npu_enrollment_tests {
         guard: Option<crate::npu::gpu::RuntimeGuard>,
     ) -> Embedder {
         Embedder {
-            session: build(bytes).unwrap(),
+            session: build(bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::gpu_certified(
                 model,
                 crate::npu::gpu::certification::Matched {
@@ -677,7 +677,7 @@ mod npu_enrollment_tests {
         let bytes = glint();
         let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
         let mut embedder = Embedder {
-            session: build(&bytes).unwrap(),
+            session: build(&bytes, &heavy_pool()).unwrap(),
             npu: crate::npu::Slot::gpu(Box::new(FailsSecond { calls: 0 })),
         };
         let n = align::OUT_SIZE as usize;
@@ -1091,7 +1091,7 @@ mod npu_hardware {
         let (slot, glint_cold) = placed(&mut platform, &cache, &glint);
         let rss_npu_glint = rss_mib();
         let mut npu = Embedder {
-            session: build(glint.bytes()).unwrap(),
+            session: build(glint.bytes(), &heavy_pool()).unwrap(),
             npu: slot,
         };
         eprintln!(
@@ -1124,7 +1124,7 @@ mod npu_hardware {
                 evidence: "hardware test",
             }));
         let mut certified = Embedder {
-            session: build(glint.bytes()).unwrap(),
+            session: build(glint.bytes(), &heavy_pool()).unwrap(),
             npu: Slot::certified(
                 platform
                     .compile(&cache, glint.bytes(), glint.sha256())
@@ -1212,7 +1212,7 @@ mod npu_hardware {
         let vit_cpu_build = t.elapsed();
         let (slot, vit_cold) = placed(&mut platform, &cache, &vit);
         let mut npu_vit = PadVit {
-            session: build(vit.bytes()).unwrap(),
+            session: build(vit.bytes(), &heavy_pool()).unwrap(),
             npu: slot,
         };
         let (a_vit, b_vit) = (
@@ -1230,7 +1230,7 @@ mod npu_hardware {
         let mut cpu_flir = PadIr::load_from_memory(flir.bytes()).unwrap();
         let (slot, flir_cold) = placed(&mut platform, &cache, &flir);
         let mut npu_flir = PadIr {
-            session: build(flir.bytes()).unwrap(),
+            session: build(flir.bytes(), &SMALL_POOL).unwrap(),
             npu: slot,
         };
         let (a_flir, b_flir) = (
@@ -1343,7 +1343,7 @@ mod npu_hardware {
         for name in ["glintr100.onnx", "liveness_vit.onnx"] {
             let weights = model(name);
             let before = rss_mib();
-            let cpu = build(weights.bytes()).unwrap();
+            let cpu = build(weights.bytes(), &heavy_pool()).unwrap();
             let with_cpu = rss_mib();
             let parts_before = rss_parts();
             let (npu, cold) = placed(&mut platform, &cache, &weights);
@@ -1412,7 +1412,7 @@ mod npu_hardware {
             match platform.compile(&cache, glint.bytes(), glint.sha256()) {
                 Ok(model) => {
                     let mut npu = Embedder {
-                        session: build(glint.bytes()).unwrap(),
+                        session: build(glint.bytes(), &heavy_pool()).unwrap(),
                         npu: Slot::npu(model),
                     };
                     let (out, _) = npu.embed_preprocessed_with_norm(&chip).unwrap();
@@ -1484,7 +1484,7 @@ mod npu_hardware {
         .unwrap();
         let glint = model("glintr100.onnx");
         let mut npu = Embedder {
-            session: build(glint.bytes()).unwrap(),
+            session: build(glint.bytes(), &heavy_pool()).unwrap(),
             npu: placed(&mut platform, &cache, &glint).0,
         };
         eprintln!("mapped after compile: {:#?}", mapped());
@@ -1532,19 +1532,19 @@ mod npu_hardware {
         let glint = model("glintr100.onnx");
         let mut cpu_emb = Embedder::load_from_memory(glint.bytes()).unwrap();
         let mut npu_emb = Embedder {
-            session: build(glint.bytes()).unwrap(),
+            session: build(glint.bytes(), &heavy_pool()).unwrap(),
             npu: placed(&mut platform, &cache, &glint).0,
         };
         let flir = model("flir.onnx");
         let mut cpu_flir = PadIr::load_from_memory(flir.bytes()).unwrap();
         let mut npu_flir = PadIr {
-            session: build(flir.bytes()).unwrap(),
+            session: build(flir.bytes(), &SMALL_POOL).unwrap(),
             npu: placed(&mut platform, &cache, &flir).0,
         };
         let vit = model("liveness_vit.onnx");
         let mut cpu_vit = PadVit::load_from_memory(vit.bytes()).unwrap();
         let mut npu_vit = PadVit {
-            session: build(vit.bytes()).unwrap(),
+            session: build(vit.bytes(), &heavy_pool()).unwrap(),
             npu: placed(&mut platform, &cache, &vit).0,
         };
 

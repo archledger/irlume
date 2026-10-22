@@ -598,6 +598,9 @@ APPARMOR_RUNTIME_RULES=(
   "/sys/fs/btrfs/ r,"
   "/sys/fs/btrfs/*/devices/ r,"
   "/sys/fs/btrfs/*/devices/* r,"
+  # The heavy ONNX pools stay within the unit's CPU quota (#1173).
+  "/sys/fs/cgroup/{,**/}cgroup.controllers r,"
+  "/sys/fs/cgroup/{,**/}cpu.max r,"
   # ONNX Runtime falls back to PCI enumeration during hardware discovery.
   "/sys/bus/pci/devices/ r,"
   # ADR-0022: optional NPU cache, identity reads and provider loading. The

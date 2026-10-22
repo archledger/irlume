@@ -436,6 +436,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The ViT RGB PAD cue and the recognizer run with one intra-op thread per
+  physical core the daemon may use, between two and sixteen, instead of two
+  (#1173). Where cores have SMT siblings, every thread beyond the caller's
+  may use only the first CPU of each core; elsewhere the pool is unpinned.
+  One grouped evaluation's model work (five ViT runs, three recognizer runs)
+  took a median of 561 instead of 1228 ms on a Ryzen 7 5700G, 613 instead of
+  1090 ms on an i5-1335U, 2026 instead of 3077 ms on an N100 and 847 instead
+  of 1733 ms on a Core Ultra 7 258V, with the same output bits on all of them
+  (docs/research/2026-10-22-heavy-model-pools.md); on the BRIO a warm grant
+  spent 746 instead of 1385 ms in the grouped evaluation. A new test holds
+  both models bit-identical at every pool size production can pick on every
+  CI runner. The pool reads its CPU mask without opening a file, and the
+  AppArmor profiles let the daemon read its unit's `cpu.max`, so a
+  `CPUQuota=` bounds the pool under confinement too. A pool that fails to
+  build loads at two threads with a warning, and the smaller models keep two
+  threads.
+
 - ADR-0033 narrows what a GPU certification entry keys on (amendment
   2026-10-22, #1164): the OpenVINO libraries, the Intel compute runtime's
   drivers and gmmlib, and the kernel compiler toolchain (IGC,

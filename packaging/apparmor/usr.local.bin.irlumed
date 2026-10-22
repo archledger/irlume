@@ -189,6 +189,15 @@ profile irlumed /usr/local/bin/irlumed {
   /sys/fs/btrfs/*/devices/ r,
   /sys/fs/btrfs/*/devices/* r,
 
+  # The ViT PAD and recognizer intra-op pools (#1173) stay within the unit's
+  # CPU quota: Rust's available_parallelism reads /proc/self/cgroup (granted
+  # below), stats the unit's cgroup.controllers and reads cpu.max at the unit
+  # and each parent (cgroup v2, the default on every supported release). The
+  # regex crate behind the TPM's TCTI parsing already asks once per process.
+  # The CPU topology the pools follow resolves under /sys/devices.
+  /sys/fs/cgroup/{,**/}cgroup.controllers r,
+  /sys/fs/cgroup/{,**/}cpu.max r,
+
   # IPC socket (thin PAM module and CLI connect here; SO_PEERCRED authz).
   /run/irlume.sock rw,
 

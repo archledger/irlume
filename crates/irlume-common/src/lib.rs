@@ -1620,11 +1620,20 @@ pub const RECOGNIZER_GPU_DISABLED_REASON: &str = "GPU use is disabled by the gpu
 /// build admits GPU placement (`recognizer_device=gpu`). Shared as above.
 pub const RECOGNIZER_GPU_NOT_ADMITTED_REASON: &str =
     "GPU is selected for the recognizer (recognizer_device=gpu); no build admits GPU placement yet";
+/// The `reason` that accompanies `device: "cpu"` when the recognizer
+/// actually runs on the GPU: the legacy `device` field keeps the values
+/// released clients know (`npu`, `cpu`), and the precise placement travels
+/// in [`RecognizerPlacement::accelerator`] (ADR-0033 phase 3).
+pub const RECOGNIZER_ON_GPU_REASON: &str =
+    "the recognizer runs on the GPU (accelerator: gpu); CPU stays the reference";
 
-/// Where the recognizer computes authentication probes (ADR-0022 §13).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where the recognizer computes authentication probes (ADR-0022 §13,
+/// ADR-0033 phase 3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecognizerPlacement {
-    /// `"npu"` or `"cpu"`.
+    /// `"npu"` or `"cpu"`: the values every released client knows. A GPU
+    /// placement reports `"cpu"` with [`RECOGNIZER_ON_GPU_REASON`] here and
+    /// the precise value in [`Self::accelerator`].
     pub device: String,
     /// On CPU, why: not built with NPU support, disabled, not certified for
     /// this platform and reference, no NPU runtime, identity unreadable,
@@ -1649,6 +1658,22 @@ pub struct RecognizerPlacement {
     /// `None` when the daemon does not report one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
+    /// The accelerator the recognizer's probes run on, `"npu"` or `"gpu"`;
+    /// `None` on CPU and from a daemon that predates GPU reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator: Option<String>,
+    /// The GPU platform identity digest, when GPU discovery read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_platform: Option<String>,
+    /// Whether this engine discovered an accessible GPU runtime. `None`
+    /// means GPU discovery was not attempted or reported (an admission
+    /// refusal attempts none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_runtime_available: Option<bool>,
+    /// Whether the recognizer passed its GPU qualification and placement
+    /// checks. `None` means no usable GPU runtime was reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_qualified: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1671,6 +1696,7 @@ mod recognizer_runtime_wire_tests {
             runtime_available: Some(true),
             qualified: Some(false),
             selection: Some("auto".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&placement).unwrap();
         let legacy: LegacyPlacement = serde_json::from_str(&json).unwrap();
@@ -1685,6 +1711,47 @@ mod recognizer_runtime_wire_tests {
         assert_eq!(new.selection, None);
     }
 
+    /// A GPU placement keeps the legacy `device` to the values released
+    /// clients know, and a daemon older than GPU reporting decodes with
+    /// every GPU field absent.
+    #[test]
+    fn gpu_placement_travels_in_new_optional_fields() {
+        let placement = RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some(RECOGNIZER_ON_GPU_REASON.into()),
+            accelerator: Some("gpu".into()),
+            gpu_platform: Some("digest".into()),
+            gpu_runtime_available: Some(true),
+            gpu_qualified: Some(true),
+            selection: Some("gpu".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&placement).unwrap();
+        let legacy: LegacyPlacement = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.device, "cpu");
+        let back: RecognizerPlacement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, placement);
+        let old: RecognizerPlacement =
+            serde_json::from_str(r#"{"device":"npu","platform":"identity"}"#).unwrap();
+        assert_eq!(old.accelerator, None);
+        assert_eq!(old.gpu_platform, None);
+        assert_eq!(old.gpu_runtime_available, None);
+        assert_eq!(old.gpu_qualified, None);
+        let cpu = serde_json::to_value(RecognizerPlacement {
+            device: "cpu".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        for absent in [
+            "accelerator",
+            "gpu_platform",
+            "gpu_runtime_available",
+            "gpu_qualified",
+        ] {
+            assert!(cpu.get(absent).is_none(), "{absent}");
+        }
+    }
+
     #[test]
     fn unreported_runtime_facts_are_omitted_not_invented_as_false() {
         let placement = RecognizerPlacement {
@@ -1694,6 +1761,7 @@ mod recognizer_runtime_wire_tests {
             runtime_available: None,
             qualified: None,
             selection: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(placement).unwrap();
         assert!(json.get("runtime_available").is_none());

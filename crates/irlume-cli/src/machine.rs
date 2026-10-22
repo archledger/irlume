@@ -534,7 +534,25 @@ pub fn status(args: &[String]) -> ExitCode {
 fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> serde_json::Value {
     match placement {
         Some(placement) => {
-            let mut value = json!({ "known": true, "device": placement.device });
+            let mut value = json!({ "known": true });
+            // Contract 1 permits added fields, not new enum values: only the
+            // device values it names reach `status --json`, and a GPU
+            // placement travels in `accelerator` (MACHINE-API.md).
+            if matches!(placement.device.as_str(), "npu" | "cpu") {
+                value["device"] = json!(placement.device);
+            }
+            if matches!(placement.accelerator.as_deref(), Some("npu" | "gpu")) {
+                value["accelerator"] = json!(placement.accelerator);
+            }
+            if let Some(platform) = placement.gpu_platform {
+                value["gpu_platform"] = json!(platform);
+            }
+            if let Some(available) = placement.gpu_runtime_available {
+                value["gpu_runtime_available"] = json!(available);
+            }
+            if let Some(qualified) = placement.gpu_qualified {
+                value["gpu_qualified"] = json!(qualified);
+            }
             if let Some(reason) = placement.reason {
                 value["reason"] = json!(reason);
             }
@@ -575,11 +593,40 @@ mod provider_runtime_reporting_tests {
             runtime_available: Some(true),
             qualified: Some(false),
             selection: Some("gpu".into()),
+            ..Default::default()
         }));
         assert_eq!(value["device"], "cpu");
         assert_eq!(value["runtime_available"], true);
         assert_eq!(value["qualified"], false);
         assert_eq!(value["selection"], "gpu");
+    }
+
+    #[test]
+    fn a_gpu_placement_keeps_contract_values_and_reports_the_accelerator() {
+        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+            device: "cpu".into(),
+            reason: Some(irlume_common::RECOGNIZER_ON_GPU_REASON.into()),
+            selection: Some("gpu".into()),
+            accelerator: Some("gpu".into()),
+            gpu_platform: Some("cd34".into()),
+            gpu_runtime_available: Some(true),
+            gpu_qualified: Some(true),
+            ..Default::default()
+        }));
+        assert_eq!(value["device"], "cpu");
+        assert_eq!(value["accelerator"], "gpu");
+        assert_eq!(value["gpu_platform"], "cd34");
+        assert_eq!(value["gpu_runtime_available"], true);
+        assert_eq!(value["gpu_qualified"], true);
+        // A value contract 1 does not name never reaches the output.
+        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+            device: "gpu".into(),
+            accelerator: Some("tpu".into()),
+            ..Default::default()
+        }));
+        assert_eq!(value["known"], true);
+        assert!(value.get("device").is_none());
+        assert!(value.get("accelerator").is_none());
     }
 
     #[test]
@@ -591,10 +638,19 @@ mod provider_runtime_reporting_tests {
             runtime_available: None,
             qualified: None,
             selection: None,
+            ..Default::default()
         }));
         assert!(value.get("runtime_available").is_none());
         assert!(value.get("qualified").is_none());
         assert!(value.get("selection").is_none());
+        for absent in [
+            "accelerator",
+            "gpu_platform",
+            "gpu_runtime_available",
+            "gpu_qualified",
+        ] {
+            assert!(value.get(absent).is_none(), "{absent}");
+        }
     }
 
     #[test]
@@ -608,6 +664,7 @@ mod provider_runtime_reporting_tests {
             runtime_available: None,
             qualified: None,
             selection: Some("tpu".into()),
+            ..Default::default()
         }));
         assert!(value.get("selection").is_none());
     }
@@ -641,6 +698,7 @@ mod provider_runtime_reporting_tests {
                 runtime_available: None,
                 qualified: None,
                 selection: Some(word.into()),
+                ..Default::default()
             }));
             let expected = listed.contains(&word).then_some(word);
             assert_eq!(

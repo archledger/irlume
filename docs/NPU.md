@@ -25,8 +25,13 @@ gate:
   compile; the placement reason names the selection.
 - `npu` attempts NPU placement under the same admission and certification
   gates; the separate `npu`/`IRLUME_NPU` kill switch still wins.
-- `gpu` is accepted and reported, but no build admits GPU placement yet; the
-  recognizer stays on CPU with that reason.
+- `gpu` attempts GPU placement (ADR-0033 phase 3) under its own loading
+  admission and certification gates; the `gpu`/`IRLUME_GPU` kill switch still
+  wins. The GPU loading admission is closed in every build so far, so the
+  recognizer stays on CPU with "the GPU loading profile has not been
+  admitted", and nothing is resolved, loaded or written. Builds without the
+  `npu` feature keep the fixed GPU-selected reason. `auto` stays NPU-only
+  until ranking evidence places it (phase 6).
 
 An IR adapter keeps the recognizer on CPU whatever the selection (ADR-0022
 §2). An empty, unknown, duplicated or non-UTF-8 value, or an unreadable
@@ -403,6 +408,25 @@ live CPU/NPU reference checks remain binding under
 does not prove native dependency closure or replace loading admission. Real
 installation relocation and model certification still need their own evidence.
 
+### GPU certification key and placement
+
+A GPU entry keys on the numerics set (ADR-0033 amendment of 2026-10-22,
+`irlume-gpu-numerics-v1`): the device, firmware and configuration fields of
+the identity and the content of the OpenVINO libraries, the compute runtime's
+OpenCL and Level Zero drivers and gmmlib, IGC, opencl-clang, clang, LLVM and
+the SPIR-V translator, by library name. Every other mapped library must be on
+the reviewed support list (`crates/irlume-vision/src/npu/gpu_certification.rs`);
+an unlisted one refuses GPU placement and doctor names it. The support set's
+digest is recorded in the entry, and when the live one differs the engine
+build runs an extended reference set (sixteen more fixed inputs, each twice,
+bit-identical) before the GPU answers. An entry certified through the driver
+hold also arms a guard on the bound PCI device's
+`power/runtime_suspended_time`: growth with the model retained retires the
+GPU to CPU for the rest of the process and names re-certification. The exact
+identity digest still names the GPU cache, which lives in `gpu/` under the
+NPU cache directory, and the markers. The GPU loading admission refuses
+before any of this runs in every build so far.
+
 ## Read the status
 
 `irlume doctor` and `irlume status --json` report separate engine facts:
@@ -414,6 +438,10 @@ installation relocation and model certification still need their own evidence.
 | `recognizer-device` | `recognizer.device` | Current engine placement: `cpu` or `npu` |
 | `recognizer-selection` | `recognizer.selection` | The governing device selection (`recognizer_device`): `auto`, `cpu`, `npu` or `gpu` |
 | `npu-platform` | `recognizer.platform` | Exact platform identity digest, when discovery obtained one |
+| `gpu-runtime` | `recognizer.gpu_runtime_available` | As `npu-runtime`, for GPU discovery |
+| `gpu-qualification` | `recognizer.gpu_qualified` | As `npu-qualification`, for GPU placement |
+| `gpu-platform` | `recognizer.gpu_platform` | Exact GPU identity digest, when GPU discovery obtained one |
+| `recognizer-device` (`GPU`) | `recognizer.accelerator` | `npu` or `gpu` when the probes run on that accelerator. A GPU placement keeps `recognizer.device` at `cpu`, which every released client knows, with a fixed reason |
 
 A loading-admission refusal reports no runtime observation. So does a failure
 in cache or marker preparation before discovery runs. Successful discovery
@@ -429,7 +457,8 @@ also keeps the recognizer on CPU.
 
 Apart from the fixed public selection/switch reasons above, non-root Health
 replies use fixed CPU-fallback categories: discovery not reported, runtime
-unavailable, or recognizer unavailable. Native error details
+unavailable, or recognizer unavailable, named for the GPU when the GPU is
+selected. Native error details
 are available only to root peers; the privileged journal also retains bounded
 detailed reasons. Consumers should use the fields, not parse reason text. See
 [Machine API](MACHINE-API.md) for the reporting contract.

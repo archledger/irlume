@@ -6618,9 +6618,12 @@ fn doctor_run(
             recognizer: Some(placement),
             ..
         }) => {
-            let line = match &placement.reason {
-                None => "NPU".to_owned(),
-                Some(reason) => format!("CPU: {reason}"),
+            // `accelerator` is precise; the legacy `device` reads "cpu" for
+            // a GPU placement so released clients keep working.
+            let line = match (placement.accelerator.as_deref(), &placement.reason) {
+                (Some("gpu"), _) => "GPU".to_owned(),
+                (_, None) => "NPU".to_owned(),
+                (_, Some(reason)) => format!("CPU: {reason}"),
             };
             dout!(report, "[doctor] recognizer: {line}");
             report.check_detail("recognizer-device", State::Info, line);
@@ -6659,6 +6662,46 @@ fn doctor_run(
                 .unwrap_or_else(|| "no NPU platform identity was read".to_owned());
             dout!(report, "[doctor] NPU platform: {platform}");
             report.check_detail("npu-platform", State::Info, platform);
+            // The GPU rows (ADR-0033 phase 3), from optional fields an older
+            // daemon never sends: absent reads as unknown, never as false.
+            let (gpu_runtime_state, gpu_runtime_line) = match placement.gpu_runtime_available {
+                Some(true) => (
+                    State::Info,
+                    "available to this engine; GPU discovery succeeded",
+                ),
+                Some(false) => (
+                    State::Info,
+                    "unavailable to this engine; see the recognizer reason",
+                ),
+                None => (
+                    State::Unknown,
+                    "GPU discovery was not attempted or reported",
+                ),
+            };
+            dout!(report, "[doctor] GPU runtime: {gpu_runtime_line}");
+            report.check_detail("gpu-runtime", gpu_runtime_state, gpu_runtime_line);
+            let (gpu_qualification_state, gpu_qualification_line) = match placement.gpu_qualified {
+                Some(true) => (State::Info, "qualified for this engine's GPU placement"),
+                Some(false) => (
+                    State::Info,
+                    "not qualified for current placement; CPU reference active",
+                ),
+                None => (State::Unknown, "no GPU qualification was reported"),
+            };
+            dout!(
+                report,
+                "[doctor] GPU qualification: {gpu_qualification_line}"
+            );
+            report.check_detail(
+                "gpu-qualification",
+                gpu_qualification_state,
+                gpu_qualification_line,
+            );
+            let gpu_platform = placement
+                .gpu_platform
+                .unwrap_or_else(|| "no GPU platform identity was read".to_owned());
+            dout!(report, "[doctor] GPU platform: {gpu_platform}");
+            report.check_detail("gpu-platform", State::Info, gpu_platform);
         }
         Ok(irlume_common::Response::Health { .. }) => {
             report.check_detail(
@@ -6670,6 +6713,9 @@ fn doctor_run(
             report.check("npu-platform", State::Unknown);
             report.check("npu-runtime", State::Unknown);
             report.check("npu-qualification", State::Unknown);
+            report.check("gpu-platform", State::Unknown);
+            report.check("gpu-runtime", State::Unknown);
+            report.check("gpu-qualification", State::Unknown);
         }
         _ => {
             report.check_detail(
@@ -6681,6 +6727,9 @@ fn doctor_run(
             report.check("npu-platform", State::Unknown);
             report.check("npu-runtime", State::Unknown);
             report.check("npu-qualification", State::Unknown);
+            report.check("gpu-platform", State::Unknown);
+            report.check("gpu-runtime", State::Unknown);
+            report.check("gpu-qualification", State::Unknown);
         }
     }
     // --- companion factors / data-at-rest ----------------------------------

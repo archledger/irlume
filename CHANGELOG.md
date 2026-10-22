@@ -7,6 +7,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The GPU recognizer target behind the closed loading admission (ADR-0033
+  phase 3, #1161). A `recognizer_device=gpu` selection with the GPU switch
+  on now opens a GPU context instead of skipping: the loading admission
+  comes first, and while it refuses (every build so far) nothing is
+  resolved, loaded or written and the recognizer stays on CPU with "the GPU
+  loading profile has not been admitted". Behind the admission sit the
+  production GPU platform (the single-GPU rule, the fixed configuration
+  read back, a warm-up compile in a private directory, the full identity),
+  a compile under the same marker, blob discard, binding-panic guard and
+  per-inference inventory checks as the NPU, and a GPU certification table,
+  empty, keyed on the numerics set of the ADR-0033 amendment of 2026-10-22
+  with a reviewed support list that refuses unlisted libraries. The engine
+  build requires the CPU and GPU reference digests, the extended reference
+  set when the support set differs from the certified one, and for an entry
+  certified through the driver hold a guard that retires the GPU if the
+  device's runtime-suspended time grows with the model retained. Reporting
+  stays within contract 1: `recognizer.device` keeps `npu` and `cpu`, a GPU
+  placement reads `device: "cpu"` with a fixed reason and the new optional
+  `recognizer.accelerator: "gpu"`, with `gpu_platform`,
+  `gpu_runtime_available` and `gpu_qualified` beside it; `irlume doctor`
+  gains `gpu-runtime`, `gpu-qualification` and `gpu-platform` rows and
+  prints `GPU` for a GPU placement; non-root Health replies get GPU-worded
+  fallback categories. `auto` stays NPU-only (phase 6). `CERTIFIED` stays
+  empty and CPU authentication stays authoritative.
+
 - The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
   control (unit 8, selector 6, D1 on interface 1), validated by maurerr's
   capture-path write, read-back, optical proof and restore run (#887,

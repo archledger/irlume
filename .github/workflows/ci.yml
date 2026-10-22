@@ -206,11 +206,11 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps
           cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
           cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
-          cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference identity_arms
+          cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms
           # Synthetic published state and sandboxed config only; these exact
           # tests need neither model loading nor the token-delivery CLI helper.
           # Require every name so a renamed or ignored regression fails CI.
-          ./scripts/run-tests-guarded.sh --min 7 \
+          ./scripts/run-tests-guarded.sh --min 8 \
             --require tests::npu_settings_snapshot_survives_atomic_replacement \
             --require tests::administrator_provider_selection_reads_machine_config_and_environment_only \
             --require tests::recognizer_device_selection_reads_machine_config_and_environment_only \
@@ -218,6 +218,7 @@ jobs:
             --require tests::recognizer_gpu_switch_reads_machine_config_and_environment_only \
             --require tests::health_reports_the_published_engine_bits \
             --require tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
+            --require tests::health_projects_gpu_placement_and_reasons_for_non_root \
             -- cargo test --locked -p irlume-daemon --features npu --bin irlumed -- --exact \
             tests::npu_settings_snapshot_survives_atomic_replacement \
             tests::administrator_provider_selection_reads_machine_config_and_environment_only \
@@ -225,7 +226,8 @@ jobs:
             tests::recognizer_device_selection_skips_or_attempts_npu_placement \
             tests::recognizer_gpu_switch_reads_machine_config_and_environment_only \
             tests::health_reports_the_published_engine_bits \
-            tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail
+            tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
+            tests::health_projects_gpu_placement_and_reasons_for_non_root
 
       # Optional ONNX Runtime execution providers are compile-time APIs. The
       # default CPU build cannot catch an upstream rename in one of these paths

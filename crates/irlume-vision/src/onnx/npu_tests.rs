@@ -485,6 +485,394 @@ mod npu_enrollment_tests {
         assert_eq!(passing.npu_device(), crate::npu::Device::Npu);
         assert_eq!(placed.npu_device(), crate::npu::Device::Npu);
     }
+
+    // GPU engine placement (ADR-0033 phase 3 and the amendments of
+    // 2026-10-22): the same CPU fallbacks as the NPU, with the extended
+    // reference set and the runtime-suspend guard of a driver-hold entry.
+
+    fn glint() -> Vec<u8> {
+        let path = format!("{}/../../models/glintr100.onnx", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read(&path).expect("models/glintr100.onnx (scripts/fetch-models.sh)")
+    }
+
+    fn constant_extended_digest() -> String {
+        let bits: Vec<u8> = npu_reference::EXTENDED
+            .flat_map(|_| vec![1.0f32; 2 * EMBED_DIM])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        irlume_common::sha256_hex(&bits)
+    }
+
+    fn gpu_entry(
+        cpu_reference_digest: String,
+        gpu_reference_digest: String,
+        extended_reference_digest: String,
+        runtime_witness: crate::npu::gpu::certification::RuntimeWitness,
+    ) -> &'static crate::npu::gpu::certification::Certification {
+        Box::leak(Box::new(crate::npu::gpu::certification::Certification {
+            model_sha256: "test",
+            role: crate::npu::Role::Recognizer,
+            numerics_key: "test",
+            identity_digest: "test",
+            onnx_runtime: "test",
+            thresholds: &[],
+            decision_fingerprint: "test",
+            fingerprint: &[],
+            cpu_reference_digest: Box::leak(cpu_reference_digest.into_boxed_str()),
+            gpu_reference_digest: Box::leak(gpu_reference_digest.into_boxed_str()),
+            support_digest: "test",
+            extended_reference_digest: Box::leak(extended_reference_digest.into_boxed_str()),
+            runtime_witness,
+            evidence: "test",
+        }))
+    }
+
+    fn gpu_embedder(
+        bytes: &[u8],
+        model: Box<dyn crate::npu::Infer>,
+        entry: &'static crate::npu::gpu::certification::Certification,
+        extended_required: bool,
+        guard: Option<crate::npu::gpu::RuntimeGuard>,
+    ) -> Embedder {
+        Embedder {
+            session: build(bytes).unwrap(),
+            npu: crate::npu::Slot::gpu_certified(
+                model,
+                crate::npu::gpu::certification::Matched {
+                    entry,
+                    extended_required,
+                },
+                guard,
+            ),
+        }
+    }
+
+    fn gpu_reason(embedder: &Embedder) -> Option<crate::npu::gpu::GpuReason> {
+        match embedder.npu_device() {
+            crate::npu::Device::Cpu(crate::npu::CpuReason::Gpu(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// A fake sysfs tree with the render node bound to a PCI device whose
+    /// runtime-suspended counter the test controls.
+    struct PowerFixture {
+        _dir: tempfile::TempDir,
+        drm: std::path::PathBuf,
+        counter: std::path::PathBuf,
+    }
+
+    fn power_fixture() -> (PowerFixture, crate::npu::gpu::RuntimeGuard) {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("devices/0000:00:02.0");
+        std::fs::create_dir_all(device.join("power")).unwrap();
+        std::fs::write(device.join("vendor"), "0x8086\n").unwrap();
+        std::fs::write(device.join("device"), "0x64a0\n").unwrap();
+        let counter = device.join("power/runtime_suspended_time");
+        std::fs::write(&counter, "173292\n").unwrap();
+        let drm = dir.path().join("drm");
+        std::fs::create_dir_all(drm.join("renderD128")).unwrap();
+        std::os::unix::fs::symlink(&device, drm.join("renderD128/device")).unwrap();
+        let node = crate::npu::gpu::RenderNode {
+            name: "renderD128".into(),
+            pci: "0000:00:02.0".into(),
+            vendor: "0x8086".into(),
+            device: "0x64a0".into(),
+        };
+        let guard = crate::npu::gpu::RuntimeGuard::arm(&drm, &node).unwrap();
+        (
+            PowerFixture {
+                _dir: dir,
+                drm,
+                counter,
+            },
+            guard,
+        )
+    }
+
+    /// A GPU that passes its checks answers; a system suspend during an
+    /// inference sends that call to CPU and rechecks the GPU digest, and
+    /// other bits after the resume retire it with a GPU-worded reason.
+    #[test]
+    fn a_gpu_inference_that_spans_a_suspend_is_not_used() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entry = gpu_entry(
+            cpu.cpu_reference_digest().unwrap(),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
+        );
+        let mut embedder = gpu_embedder(
+            &bytes,
+            Box::new(SuspendsDuring {
+                suspend: suspend.clone(),
+                changed: changed.clone(),
+            }),
+            entry,
+            false,
+            None,
+        );
+        embedder.check_gpu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let chip = npu_reference::chip(1);
+        let (expected, _) = cpu.embed_preprocessed_with_norm(&chip).unwrap();
+        let from_cpu = |answer: &Embedding| {
+            answer
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        suspend.store(true, SeqCst);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(
+            from_cpu(&answer),
+            "the output that spanned a suspend was used"
+        );
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(!from_cpu(&answer), "the next call answers from the GPU");
+        suspend.store(true, SeqCst);
+        changed.store(true, SeqCst);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(from_cpu(&answer));
+        assert!(
+            matches!(
+                gpu_reason(&embedder),
+                Some(crate::npu::gpu::GpuReason::ParityMismatch(ref why))
+                    if why.starts_with("after a system resume")
+            ),
+            "{:?}",
+            embedder.npu_device()
+        );
+        if let crate::npu::Device::Cpu(reason) = embedder.npu_device() {
+            assert!(!reason.to_string().contains("NPU"), "{reason}");
+        }
+    }
+
+    /// A CPU reference that does not reproduce keeps the model off the GPU.
+    #[test]
+    fn a_gpu_whose_cpu_reference_differs_stays_on_cpu() {
+        let bytes = glint();
+        let entry = gpu_entry(
+            "0".repeat(64),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
+        );
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), entry, false, None);
+        embedder.check_gpu_parity().unwrap();
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::ParityMismatch(ref why)) if why.starts_with("CPU reference digest")
+        ));
+    }
+
+    /// A TTA embedding is whole on one device on the GPU too.
+    #[test]
+    fn a_gpu_tta_embedding_is_never_mixed() {
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let mut embedder = Embedder {
+            session: build(&bytes).unwrap(),
+            npu: crate::npu::Slot::gpu(Box::new(FailsSecond { calls: 0 })),
+        };
+        let n = align::OUT_SIZE as usize;
+        let chip: Vec<u8> = (0..n * n * 3).map(|i| (i * 17 % 253) as u8).collect();
+        let answer = embedder.embed_tta(&chip).unwrap();
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::Retired(_))
+        ));
+        let expected = cpu.embed_tta(&chip).unwrap();
+        assert!(
+            answer
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "both halves came from CPU"
+        );
+    }
+
+    /// A changed support set runs the extended reference set: the
+    /// certified digest keeps the GPU, any other keeps the CPU.
+    #[test]
+    fn a_changed_support_digest_runs_the_extended_set_and_its_mismatch_keeps_cpu() {
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let reference = cpu.cpu_reference_digest().unwrap();
+        let witness = crate::npu::gpu::certification::RuntimeWitness::ObservedRuntimeSuspend;
+        let good = gpu_entry(
+            reference.clone(),
+            constant_digest(),
+            constant_extended_digest(),
+            witness,
+        );
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), good, true, None);
+        embedder.check_gpu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let bad = gpu_entry(
+            reference.clone(),
+            constant_digest(),
+            "0".repeat(64),
+            witness,
+        );
+        // Without a support change the extended set is not run.
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), bad, false, None);
+        embedder.check_gpu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), bad, true, None);
+        embedder.check_gpu_parity().unwrap();
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::ExtendedParityMismatch(_))
+        ));
+    }
+
+    /// A GPU whose outputs alternate passes no extended set: each input
+    /// must repeat its bits.
+    #[test]
+    fn the_extended_set_requires_each_input_to_repeat() {
+        struct AlternatesAfterCanary {
+            calls: usize,
+        }
+        impl crate::npu::Infer for AlternatesAfterCanary {
+            fn infer(&mut self, _input: &[f32]) -> Result<Vec<f32>, String> {
+                self.calls += 1;
+                // The three canary inputs answer as Constant; then every
+                // second call differs.
+                let odd = self.calls > 3 && self.calls.is_multiple_of(2);
+                Ok(vec![if odd { 2.0 } else { 1.0 }; EMBED_DIM])
+            }
+        }
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let entry = gpu_entry(
+            cpu.cpu_reference_digest().unwrap(),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
+        );
+        let mut embedder = gpu_embedder(
+            &bytes,
+            Box::new(AlternatesAfterCanary { calls: 0 }),
+            entry,
+            true,
+            None,
+        );
+        embedder.check_gpu_parity().unwrap();
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::ExtendedParityMismatch(ref why)) if why.contains("did not repeat")
+        ));
+    }
+
+    /// Under a driver-hold entry, growth of the device's runtime-suspended
+    /// time retires the GPU and that call answers on CPU; a system suspend,
+    /// which leaves the counter alone, only rechecks the digest.
+    #[test]
+    fn a_runtime_suspend_under_a_hold_entry_retires_the_gpu_and_answers_on_cpu() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let (fixture, guard) = power_fixture();
+        let suspend = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entry = gpu_entry(
+            cpu.cpu_reference_digest().unwrap(),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::DriverHold,
+        );
+        let mut embedder = gpu_embedder(
+            &bytes,
+            Box::new(SuspendsDuring {
+                suspend: suspend.clone(),
+                changed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            entry,
+            false,
+            Some(guard),
+        );
+        embedder.check_gpu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let chip = npu_reference::chip(1);
+        let (expected, _) = cpu.embed_preprocessed_with_norm(&chip).unwrap();
+        let from_cpu = |answer: &Embedding| {
+            answer
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        // A system suspend: the counter is unchanged, the digest rechecks,
+        // and the model stays on the GPU.
+        suspend.store(true, SeqCst);
+        embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(!from_cpu(&answer));
+        // A runtime suspend with the model retained.
+        std::fs::write(&fixture.counter, "174566\n").unwrap();
+        let (answer, _) = embedder.embed_preprocessed_with_norm(&chip).unwrap();
+        assert!(
+            from_cpu(&answer),
+            "the call after the runtime suspend answers on CPU"
+        );
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::RuntimeSuspended(_))
+        ));
+        let _ = &fixture.drm;
+    }
+
+    /// An entry that observed its runtime suspend arms no guard: the
+    /// counter is never read.
+    #[test]
+    fn an_observed_witness_entry_never_reads_the_counter() {
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let entry = gpu_entry(
+            cpu.cpu_reference_digest().unwrap(),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
+        );
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), entry, false, None);
+        embedder.check_gpu_parity().unwrap();
+        for _ in 0..3 {
+            embedder
+                .embed_preprocessed_with_norm(&npu_reference::chip(1))
+                .unwrap();
+        }
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+    }
+
+    /// An unreadable counter under a driver-hold entry retires the GPU.
+    #[test]
+    fn an_unreadable_counter_retires_the_gpu() {
+        let bytes = glint();
+        let mut cpu = Embedder::load_from_memory(&bytes).unwrap();
+        let (fixture, guard) = power_fixture();
+        let entry = gpu_entry(
+            cpu.cpu_reference_digest().unwrap(),
+            constant_digest(),
+            constant_extended_digest(),
+            crate::npu::gpu::certification::RuntimeWitness::DriverHold,
+        );
+        let mut embedder = gpu_embedder(&bytes, Box::new(Constant), entry, false, Some(guard));
+        embedder.check_gpu_parity().unwrap();
+        assert_eq!(embedder.npu_device(), crate::npu::Device::Gpu);
+        std::fs::remove_file(&fixture.counter).unwrap();
+        embedder
+            .embed_preprocessed_with_norm(&npu_reference::chip(1))
+            .unwrap();
+        assert!(matches!(
+            gpu_reason(&embedder),
+            Some(crate::npu::gpu::GpuReason::RuntimeCounter(_))
+        ));
+    }
 }
 
 mod npu_reference_tests {

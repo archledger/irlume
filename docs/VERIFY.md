@@ -119,14 +119,20 @@ life-size glossy-vinyl breach documented in the
 
 **Claim:** the real-face False Accept Rate in [`FAIRNESS.md`](FAIRNESS.md).
 
-Download LFW (Labeled Faces in the Wild), for example the
-[Kaggle `jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset),
-the source used here. Any copy with the standard `Person_Name_NNNN.jpg`
-filenames works; the figure is stable to the variant. Then run the impostor
-benchmark against the bundled recognizer:
+Download LFW (Labeled Faces in the Wild). The all-pairs figure below was
+measured on the [Kaggle
+`jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset),
+whose images are the deep-funneled alignment; any copy with the standard
+`Person_Name_NNNN.jpg` filenames runs. No committed run compares copies for
+this figure, and the deep-funneled copy scores differently from the original
+images for the ViT PAD cue ([the dim-room
+record](research/2026-10-21-vit-dim-room-cue-evaluation.md)), so
+certification runs both ([ADR-0022 amendment
+2026-10-22](adr/0022-npu-inference-under-per-model-certification.md#amendment-2026-10-22-certification-corpora-and-decisions-at-full-extent)).
+Then run the all-pairs benchmark against the bundled recognizer:
 
 ```sh
-IRLUME_DEV=1 irlume irbench --lfw --impostor-only --dir <lfw-image-dir> \
+IRLUME_DEV=1 irlume irbench --impostor-only --dir <lfw-image-dir> \
   --det /usr/share/irlume/models/face_detection_yunet_2023mar.onnx \
   --model /usr/share/irlume/models/glintr100.onnx
 ```
@@ -141,6 +147,16 @@ an amount this measurement does not establish. `irbench` now refuses
 hour on a CPU; `--max-images N` bounds it for a quick look, at the cost of a
 noisier estimate. `FAIRNESS.md` has the full protocol and the per-group
 FairFace table.
+
+The impostor rate itself comes from the identity-grouped mode, on the copy
+behind the threshold: the original, non-aligned images as packaged on
+Hugging Face
+([`marcelohaps/lfw`](https://huggingface.co/datasets/marcelohaps/lfw) at
+`12a61458`, its `train/images` directory). `irbench --lfw --max-persons
+999999` with that `--dir` and the same `--det` and `--model`, without
+`--impostor-only`, separates genuine from impostor pairs and gives 2e-5 at
+0.55 over 87,307,271 impostor pairs
+([`lfw-aura.txt`](recognition-results/data/lfw-aura.txt)).
 
 ## 6. The model-accuracy numbers · benchmarks/
 

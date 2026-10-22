@@ -436,6 +436,49 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0022 fixes what a certification runs over (amendment 2026-10-22,
+  #1164). LFW runs every ordered within-identity and cross-identity pair
+  (484,514 and 174,614,542) on the original images as packaged on Hugging
+  Face, the copy behind 0.55, and on the deep-funneled Kaggle copy that the
+  published all-pairs upper bound cites. FairFace runs every ordered
+  within-group pair (17,556,198) of its 0.25 validation copy, the
+  threshold's own. CBSR, Tufts and the supplementary Oulu-CASIA run every
+  ordered pair from their Kaggle mirrors, the maintainer's chosen copies,
+  with the owners' terms quoted. Recorded data is the 73 sessions of a fixed
+  private manifest: the maintainer's genuine and attack sessions, one other
+  consenting household member's genuine session and a no-face control. Six
+  recordings that earlier decisions rest on are not in it and are re-recorded
+  before any entry. Decision arms cover single identities, households of two
+  and three and the two splits behind 0.635, in two orders fixed by each
+  copy. Fusion runs recorded pairs as recorded and every combination of
+  corpus RGB and IR comparisons at every point of a brightness grid spanning
+  the production weights, counted by searches over sorted scores. Enrolled
+  users' arms run every one-profile shape of up to 30 scans against named
+  zero-effort populations, the household member's frames included; the
+  attack sessions also run against household enrollments of two and three
+  profiles and at every threshold value; and an enrollment shape keeps its
+  probes on CPU unless both an impostor arm and an attack arm reach it.
+  Every production threshold value is generated from the code. Arms that
+  consume recorded data or a CBSR, Tufts or Oulu-CASIA score span their
+  whole extent under ids from a fixed list and leave the measuring machine
+  only as counts, drift, outcome, summed flip totals, a within-drift flag
+  and the digest of a local list that opens with a per-run random value,
+  once a validator run there as root has passed the record; that list and
+  the run's console output stay with the maintainer, and such an arm with a
+  difference above a drift of 1e-5 is refused. Items 6 and 7 run separately,
+  through the production compile. The irlume-core comments now give LFW's
+  identity-grouped impostor rate (2e-5 at 0.55), label the 2.0e-3 all-pairs
+  figure an upper bound, replace the SFHQ figure that could not be
+  reproduced (9.8e-5 at 0.50) with the committed re-run (4.71e-4 at 0.50,
+  1.43e-4 at 0.55), no longer say 0.55 holds 1e-4 in every FairFace group,
+  cite the 2026-08-05 record's anchor runs for the live floor instead of
+  restating it, and no longer call the CBSR OR-arm deployment-shaped.
+  docs/VERIFY.md names the copy behind each LFW figure and drops the `--lfw`
+  flag that `irbench` refuses with `--impostor-only`, and
+  benchmarks/README.md names the Tufts copy
+  (docs/research/2026-10-22-certification-extent.md). No threshold or code
+  path changes; `CERTIFIED` stays empty.
+
 - On the grouped sequential route each sample's RGB face detection and ViT
   RGB PAD score now run while the IR session captures, instead of after both
   sessions are released (#1174). They depend on the RGB frame alone. The

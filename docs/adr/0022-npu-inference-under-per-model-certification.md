@@ -18,6 +18,20 @@ below. Native loading is closed and the certification table is empty. The
 earlier design and measurement history below does not admit a loading profile
 or certify a model for authentication.
 
+Amended 2026-10-22 by the [full-extent
+record](#amendment-2026-10-22-certification-corpora-and-decisions-at-full-extent)
+below: section 7 item 3's corpora run at full extent and in both directions
+from named copies (both LFW copies, FairFace 0.25, CBSR, Tufts and the
+supplementary Oulu-CASIA), with single-identity, household, fusion,
+enrolled-user and attack arms, every production threshold value and the
+sessions of a fixed private manifest; an enrollment shape that an impostor
+arm and an attack arm do not both reach keeps its probes on CPU. Item 8's
+record keeps comparisons of recorded data, and of corpora whose terms
+restrict sharing, on the measuring machine except as aggregates over each
+arm's whole extent under a hiding digest, validated there as root before
+they leave, and items 6 and 7 run separately through the production compile.
+It admits no profile and adds no entry.
+
 ## Context
 
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
@@ -320,6 +334,14 @@ A table entry requires all of:
    enrollment fits it, so the calibrated probe, the calibrated templates and
    the calibrated-centroid arm are all exercised, and rules 4 and 5 compare the
    final grant decisions, not only pairs.
+   (Amended 2026-10-22, below: the copy and extent of each corpus; the
+   recorded sessions of a fixed private manifest, the run manifest derived
+   from it before each run, and named re-recordings of six recordings it
+   lacks; the decision, household, fusion and enrolled-user arms with their
+   zero-effort impostor populations; the attack arms on one-profile and
+   household enrollments; the brightness grid; every production threshold
+   value; the exclusions; and the enrollment shapes that keep their probes
+   on CPU.)
 4. **No new grant for an impostor or an attack; error rates no worse.** No
    impostor comparison that the CPU denies may be granted on the NPU, at any
    threshold, fusion floor or production-shaped decision, whatever the
@@ -342,13 +364,30 @@ A table entry requires all of:
    compiled model: repeated, interleaved with other inputs, after the NPU has
    runtime-suspended, and after a system suspend and resume of the certified
    machine.
+   (Amended 2026-10-22, below: a run separate from items 3 to 5, through the
+   production compile, that records every system suspend and counts every
+   resume recheck, each of which must pass.)
 7. **Crash-free.** 20 cold compiles in separate processes with the cache
    bypassed, 20 warm loads from the cache, and 1,000 inferences, some after
    runtime suspends and some after system suspends, without a crash or an
    error.
+   (Amended 2026-10-22, below: compiles and warm loads go through the
+   production compile into a cache the run owns, emptied for each cold
+   compile with the driver stack's compiler cache off; every other run
+   records its driver-cache setting.)
 8. **Recorded.** The evidence (identity, model digest, run counts, deltas,
    margins, verdict tables, no biometric data) is archived and cited by the
    change that adds the entry.
+   (Amended 2026-10-22, below: the difference record. A private arm, one
+   that consumes recorded data or a CBSR, Tufts or Oulu-CASIA score, spans
+   its whole extent under an id from a fixed list and is archived only as
+   its counts, drift, outcome, flip totals in each direction, a within-drift
+   flag and the digest of its local list, which opens with a random value
+   drawn for the run. That list, with every difference at any drift and the
+   verdict tables, and the run's console output stay on the measuring
+   machine for the maintainer alone; the record leaves it only after its
+   validator, run there as root, has passed it; and such an arm with a
+   difference above a drift of 1e-5 is refused.)
 
 ### 8. Compilation happens at startup, not in an attempt
 
@@ -600,6 +639,53 @@ execution-provider (CUDA, TensorRT) lane inert.
   thresholds, votes and PAD availability rules as on CPU; certification
   compares final grant decisions on production-shaped enrollments of 1 to 90
   scans.
+- Threshold set (amendment 2026-10-22): the generated set equals every
+  threshold the identity arms can return without an IR adapter, for every
+  template and profile count, and a changed scaling constant, cap or fusion
+  floor changes the set and the decision fingerprint.
+- Decision arms (amendment 2026-10-22): the planners reproduce the
+  enumerated counts of the extent record from file names for LFW, CBSR and
+  Tufts, the household enrollments of the attack arms included (149,515 of
+  shape (k, k) and, without the household member, 15,840 of shape (k, 0),
+  per maintainer camera and order), take the first n alignable images in the
+  arm's order, leave out each probe the CPU reference cannot align, derive
+  the shuffle from the file-list digest, and give the same RGB verdict in
+  the filled and the balanced layout.
+- Shapes (amendment 2026-10-22): probes stay on CPU for every enrollment
+  outside the admit list, whose shapes both an impostor arm and an attack
+  arm reach (one profile with n_ir <= n_rgb <= 30, or two or three profiles
+  of equal (k, k) or (k, 0) with k <= 30; each profile with three or more IR
+  scans holding a calibration fitted from exactly its current pairs, every
+  other profile none). A test covers each refusal: four profiles, 31
+  matchable scans, profiles of unequal shape, IR on part of the scans of
+  several profiles, a profile of three or more IR scans without calibration,
+  and a calibration not fitted from the current pairs.
+- Fusion arm (amendment 2026-10-22): the grid holds both knees of each ramp
+  and the recorded endpoints between them; recorded pairs fuse as recorded;
+  at every grid point the closed-form counting agrees with the production
+  `fuse` on a dense grid of cosines and weights and on every candidate; the
+  range-wide counts equal those at the two extreme grid points; the shift
+  moves both input cosines before the verdict is recomposed; in the
+  sequential posture neither fusion nor the RGB-primary arm grants.
+- Difference record (amendment 2026-10-22): the validator refuses a line
+  outside the grammar, a path or a name, and treats an arm as public only
+  when every source digest the arm names is an LFW or FairFace copy on its
+  list. On any other arm it refuses an id that is not on the compiled list
+  of private arm ids, a second line for one id, and, at any drift, a
+  difference line, a per-threshold count or budget line, a nearest-score
+  line and any field beyond the arm's id and class, counts, drift, outcome,
+  summed flip totals, within-drift flag and list digest; it refuses a
+  missing list digest, a pass with the flag unset, a pass of an impostor,
+  attack or negative arm with a new grant, and an arm that measured nothing
+  (other than the no-face control), or has a flip while its drift is above
+  1e-5, but is not marked refused. The writer of a private arm is built only
+  from the arm's whole plan, never from one shape or one measured budget.
+  The local check refuses a list that does not open with its random value.
+  For a public arm the validator refuses a margin above the drift and
+  difference lines that do not equal the flip counts. A run with a private
+  arm prints only the harness result line, the local check's line and the
+  validator's line, and its record leaves the root-only directory only after
+  the validator, run there as root, has passed it.
 - Wire: new status fields decode with a frozen copy of the pre-change client
   types, and a pre-change daemon's status decodes in the new client.
 - Hardware (`#[ignore]`, Lunar Lake): the identity reads back; every
@@ -713,6 +799,474 @@ content/inode changes, executable-key exclusion, pre-native refusal,
 discovery/cache transitions and root/non-root Health projection. These checks
 do not admit a native profile, establish real installation relocation, validate
 enforcing AppArmor or certify a model.
+
+## Amendment 2026-10-22: certification corpora and decisions at full extent
+
+Section 7 item 3 names the corpora and the decision shapes a certification
+runs. It does not say how much of each corpus runs, at which threshold
+values items 4 and 5 apply, or how item 4's list of differing verdicts
+reaches the record of item 8. A bounded subset can leave an arm with nothing
+near its threshold. On the UX5406S on 2026-10-22, the 3,000 impostor pairs
+of the LFW 10-fold protocol held no CPU accept at 0.55, and their nearest
+CPU score sat 0.2087 below it, so that arm could not have shown a new grant
+at any drift under 0.2. That run (identity `1f570994`, f32) also embedded
+its accelerator probes through test-side copies of the preprocessing and
+judged 0.55 only, so it is an input to certification, not a pass of it ([the
+extent record](../research/2026-10-22-certification-extent.md)).
+
+This amendment fixes the extent before any certification run. Items 4 and 5
+keep their rules; this amendment fixes what they run over and which
+enrollment shapes an entry covers. It amends item 8's record for recorded
+data of people and for corpora whose terms restrict sharing, and it sets the
+conditions of the separate runs for items 6 and 7. It admits no loading
+profile, enables no package feature and adds no certification entry.
+
+### What set the thresholds
+
+`RGB_MATCH_THRESHOLD` moved to 0.55 on 2026-06-28 (commit `11cf4a9e`) on two
+measurements. One is LFW grouped by identity over every pair: 5,749
+identities, 242,257 genuine and 87,307,271 impostor unordered pairs, and a
+false-accept rate of 3e-5 at 0.50 and 2e-5 at 0.55. It ran on archhost over
+the original, non-aligned LFW images as packaged on Hugging Face
+(`marcelohaps/lfw` at `12a61458`), cloned there 25 minutes before commit
+`1bf31564` recorded the first run, and the committed
+[`lfw-aura.txt`](../recognition-results/data/lfw-aura.txt) is byte for byte
+that host's 2026-08-04 re-run over the same clone. The other is FairFace
+over every pair within each demographic group
+([FAIRNESS.md](../FAIRNESS.md)), on the validation split of its 0.25
+configuration (`HuggingFaceM4/FairFace` at `54d573cd`): each committed group
+result is byte for byte that host's 2026-08-04 output over a tree whose
+files equal that copy's, and every group reproduced the June rate to the
+printed digit.
+
+The SFHQ figure that the comment of `11cf4a9e` also cites, 9.8e-5 at 0.50,
+named no subset; the committed re-run gives 4.71e-4 at 0.50 and 1.43e-4 at
+0.55 ([`sfhq-aura.txt`](../recognition-results/data/sfhq-aura.txt)), and
+item 3 does not name SFHQ. The 2.3e-3 at 0.50 of [VERIFY.md](../VERIFY.md)
+section 5 pairs every image of the deep-funneled Kaggle copy
+(`jessicali9530/lfw-dataset`) with every other, genuine pairs included, and
+the 2.0e-3 at 0.55 that commit `565d193c` put beside it in the `irlume-core`
+comment matches the all-pairs rate that the identity-grouped run's counts
+imply. They are an upper bound, not an impostor rate.
+
+Both LFW copies are therefore gating families. The original images are the
+threshold's own extent; the deep-funneled copy gates because the published
+upper bound cites it. FairFace runs its 0.25 validation copy, the
+threshold's own, and no other configuration gates.
+
+The false-reject side of 0.55 rests on live genuine sessions of the
+maintainer: the live floor that commit `11cf4a9e` cites, and the
+`calcapture` sessions of 2026-08-05 on archhost's Logitech Brio and the
+Zenbook's built-in camera, whose anchor runs landed on that floor ([the
+2026-08-05 record](../recognition-results/2026-08-05-buffalo-l.md), lines
+34-36; [`MANIFEST.json`](../recognition-results/data/MANIFEST.json)
+`frr_leg`). The sessions' aggregates live in
+[`floor-aggregates.json`](../recognition-results/data/floor-aggregates.json).
+Their raw records hold CPU embeddings, not frames, as do the self-captured
+pairs of ADR-0004's validation bed, so neither can be replayed through an
+accelerator. The genuine side of certification is carried by the recorded
+frames below and their named re-recordings, not by these files, and the
+household member's older captures in that bed are not used.
+
+`IR_DARK_MATCH_THRESHOLD` 0.635 rests on the CBSR split of
+`benchmarks/securedark_sweep.py` (the first 11 sorted frames enroll, the
+other 9 probe), the Tufts calibrated arm and the live dark session of
+2026-08-23 (ADR-0016). The pairwise CBSR run that the `IR_MATCH_THRESHOLD`
+comment cites (7.72M impostor pairs) has no output in the repository; the
+committed pairwise CBSR results use 6,000 pairs per arm.
+
+### Copies
+
+Each corpus runs from one named copy, recorded by its source, revision,
+derivation and a digest of its sorted per-file SHA-256 list:
+
+| Family | Copy | Images | Archived |
+|---|---|---|---|
+| LFW, original | Hugging Face `marcelohaps/lfw` at `12a61458` | 13,233 | per comparison |
+| LFW, deep-funneled | Kaggle `jessicali9530/lfw-dataset` | 13,233 | per comparison |
+| FairFace | Hugging Face `HuggingFaceM4/FairFace` 0.25 validation at `54d573cd`, JPEG quality 95 | 10,954 | per comparison |
+| CBSR NIR | Kaggle `gpreda/cbsr-nir-face-dataset` | 3,940 | aggregates |
+| Tufts TD_RGB_A and TD_NIR_A | Kaggle `wahabarabo/tufts-faces` | 3,234 pairs | aggregates |
+| Oulu-CASIA NIR-VIS | Kaggle `aryanbaibaswata/oulu-casia` | 64,912 | aggregates |
+
+The Kaggle mirrors of CBSR, Tufts and Oulu-CASIA are the certification
+copies by the maintainer's decision of 2026-10-22, as the LFW threshold copy
+is itself a re-post. Their owners' terms are quoted in the record and put to
+the maintainer, not accepted on the maintainer's behalf: CASIA's release
+agreement forbids distributing or publishing its database "either entirely
+or partly", the Tufts terms forbid giving research associates and colleagues
+access and distributing it to anyone who has not agreed to them, and no
+published terms were found for Oulu-CASIA. Their images, and every
+comparison and decision that consumes one of their scores, stay on the
+measuring machine, and their arms are archived only as aggregates (The
+record, below).
+
+### Corpora
+
+Every comparison is an accelerator probe against a CPU template, as item 3
+says. The CPU score of a pair is symmetric, but a comparison of an
+accelerator probe with a CPU template is not, so every pair runs in both
+directions. A sample or a cap is a development run, not certification
+evidence. The record gives every count by file name.
+
+- **LFW.** Every ordered within-identity pair and every ordered
+  cross-identity pair of each copy: 484,514 and 174,614,542. An identity is
+  the file name without its trailing `_NNNN` index, the `irbench --lfw`
+  rule. The 6,000 pairs of the 10-fold protocol are a reported sub-arm.
+- **FairFace.** Every ordered pair within each group, 17,556,198 in all.
+  Each group is its own arm and no pair crosses groups. The consecutive
+  pairs of each sorted group are a reported sub-arm.
+- **CBSR NIR.** Every ordered pair: 74,860 genuine and 15,444,800 impostor
+  comparisons.
+- **Tufts.** Every ordered pair within each modality: 96,162 genuine and
+  10,359,360 impostor comparisons each, over 110 subjects. An identity is
+  the subject directory, and an RGB image pairs with the NIR image of the
+  same set, subject and file suffix, which gives 3,234 pairs.
+- **Oulu-CASIA NIR-VIS.** A supplementary arm: it set no threshold and item
+  3 does not name it. It runs because it is the only public corpus with NIR
+  and visible images of the same subjects under three recorded lightings
+  (dark, weak and strong). Every ordered pair within each modality and
+  lighting runs, and items 4 and 5 apply to it as to every arm.
+
+### Recorded sessions
+
+A private manifest on the measuring machine fixes the recorded data. Its
+SHA-256 is
+`3236ea19bda75b5afcb66afb4d72ea4c67c7f0ab2299c7daa0547a98938c84a9`, and it
+lists 73 sessions:
+
+| Category | Camera | Sessions |
+|---|---|---|
+| Genuine, the maintainer | Zenbook built-in, IR bursts and RGB | 39 |
+| Genuine, the maintainer | NexiGo | 10 |
+| Genuine, the maintainer | Zenbook RGB webcam | 3 |
+| Genuine, one other consenting household member | Zenbook RGB webcam | 1 |
+| Presentation attacks, all showing the maintainer's face | Zenbook | 8 |
+| Presentation attacks, all showing the maintainer's face | NexiGo | 11 |
+| No-face control | Zenbook | 1 |
+
+An arm runs every frame of every session the manifest lists in its category.
+The manifest records which sessions and categories make up the extent.
+Before any run, local code derives from it a run manifest, which stays
+beside it on the measuring machine. The run manifest keeps every row of the
+manifest and adds each session's camera, its modality read from the decoded
+channel count (not a directory name) and the SHA-256 of its file list. The
+record of each run names the run manifest by its SHA-256. A file under the
+manifest's root that no row covers, or a changed file-list digest, refuses
+the run. A session of anyone who has not consented is neither listed in the
+manifest nor kept under its root.
+
+The manifest holds the attack recordings of the 2026-07-17 PAD candidate
+evaluation ([its record](../pad-results/2026-07-17-third-party-pad-candidates.md)):
+the live banner runs, four on the NexiGo and three on the Zenbook as that
+session's log records, its phone attacks and its offline banner corpus. It
+also holds the seven NexiGo attack bursts that the 2026-08-21 FLIR
+revalidation cites, in whose 252 frames no face is detectable in IR.
+
+It does not hold six recordings that earlier decisions rest on: the IR
+liveness self-test of 2026-06-30 behind ADR-0013's breach figure, the
+re-measurement of 2026-07-27 at the FLIR threshold of 0.9, the #516 fleet
+banner runs, the 2026-08-12 flrgb live session and the 2026-08-22 ViT live
+corpus behind the ViT cue's evaluation (ADR-0013), and the live dark session
+of 2026-08-23 behind 0.635 (ADR-0016). Their frames were not found on any
+host or archive searched on 2026-10-22, and the #516 runs kept one score per
+call. Each is re-recorded under its original protocol in the maintainer's
+approved attended session, and a later manifest names each re-recording as
+the replacement of its session; no entry is added before then.
+
+### Decision arms
+
+Items 4 and 5 also compare final grant decisions, computed by the production
+identity arms (the lit arms of `identity_arms.rs`, the dark arms of
+`ir_assessment.rs`) over enrollments built by the production scan path, with
+the producer stamped and the IR calibration refit as enrollment refits it.
+Each probe is embedded by the production probe helpers under the probe rule
+of section 2, in a measuring process that a later amendment defines; no
+setting reaches it. The gates are held passing, so the recognizer decides
+alone.
+
+An enrollment of n templates takes the first n images of an identity that
+the CPU reference can align, in the arm's order, as the sweep behind 0.635
+takes its first 11 embedded frames. An identity enters a size only with an
+alignable image left to probe, and a probe the CPU reference cannot align is
+left out of every decision it would have made. Each decision arm records the
+enrollments and decisions it enumerated, excluded and measured. Every
+decision arm on a corpus, except the two replayed splits, runs in two
+orders: sorted relative paths, and a shuffle that sorts each identity's
+images by the SHA-256 of the copy's file-list digest in lowercase
+hexadecimal, a tab and the image's relative path. The shuffle follows from
+the copy; nothing is chosen at run time.
+
+- **Single identities.** For LFW every n from 1 to the smaller of 90 and the
+  identity's alignable images less one; for CBSR and Tufts up to 30. The
+  identity's other images are genuine probes, and every image of every other
+  identity is an impostor probe. Above 30 templates an LFW identity's scans
+  fill several profiles, which no enrollment does, since a face never owns
+  two profiles; the arm reaches the RGB thresholds for 31 to 90 templates
+  that households reach, and the filled and the balanced layout both run.
+- **Households.** Two or three identities, each its own profile holding its
+  first k images, the same k for every member, for every k up to 30 at which
+  each member keeps a probe. Every member's other images are genuine probes,
+  since any enrolled face unlocks the account, and every image of every
+  identity outside the household is an impostor probe. LFW households are
+  drawn from the identities with at least 31 alignable images, CBSR and
+  Tufts households from every identity.
+- **Replayed splits.** CBSR has no RGB, so no calibration is fitted, and the
+  production dark decision there is best-of-n at the scaled
+  `IR_DARK_MATCH_THRESHOLD` with no centroid. The split behind 0.635 runs as
+  it was measured, within one session as the sweep states, and the release's
+  own gallery and probe split runs as distributed. The sweep's raw-centroid
+  OR (false-accept rate 1.24e-4 at 0.635) is not a production decision and
+  is reported for continuity only.
+- **Tufts, calibrated.** Tufts enrollments hold paired scans. From k = 3,
+  the smallest fit, the production fit at the shipped ridge lambda runs over
+  each profile's k pairs; the calibrated probe is scored against the
+  calibrated templates and the calibrated centroid at the scaled thresholds,
+  and impostor probes are calibrated with the victim's map, as production
+  calibrates any probe.
+
+Every CBSR and Tufts arm also runs at the dim-light fallback bar. For a
+decision arm, the d of item 5 is the arm's largest absolute drift over every
+score its decisions consume: raw RGB, raw IR, calibrated IR and
+calibrated-centroid cosines. The shift moves every CPU input score of the
+arm by d, in each direction, before the CPU decision is recomputed. For a
+best-of-n arm this equals moving its scaled threshold.
+
+### Fusion
+
+The fusion arm runs the production fusion verdict, floors included, in four
+classes: genuine with genuine, which is the genuine class; impostor with
+impostor; and the two mixed classes, which are negative arms. Recorded RGB
+and IR pairs are fused as recorded: the Tufts pairs and the maintainer's
+paired frames. Beside them the arm fuses every combination of a corpus RGB
+comparison (each LFW copy and FairFace) with a corpus IR comparison (CBSR
+and Tufts NIR), each pairing of sources its own arm, and every combination
+of an Oulu-CASIA visible and NIR comparison of the same lighting. At the
+decision level the best scores of single-identity decisions of the same n
+combine, and decision arms on paired data, the Tufts arms and the enrolled
+users' arms, run the full lit decision, fusion included, at every grid
+point. Both postures run; in the sequential posture neither fusion nor the
+RGB-primary arm may grant on either device.
+
+The brightness weights come from a grid. Per modality it holds the two knees
+of the weight ramp in `irlume-core` (60 and 130 for RGB, 35 and 110 for IR)
+and the lowest and highest production face-box luma over the recorded
+frames, rounded outward to whole units, where they lie between the knees.
+Every pair of an RGB and an IR value is a grid point, weighted by the
+production ramps, so the grid spans every weight pair production can give
+and the recorded range inside it. Brightness is an input of the attempt, as
+the image is, and the grid samples it as the corpora sample faces: items 4
+and 5 apply at every grid point. The fused score moves monotonically with
+the ratio of the two weights, so a combination accepted at some ratio in the
+range is accepted at one of the two extreme grid points, and a genuine
+combination rejected at some ratio is rejected at one of them; the arm also
+counts its rates over the whole range from those two points.
+
+The arm's d is its largest drift over the RGB and IR scores it combines, and
+the shift of item 5 moves both input cosines by d before the fused verdict
+is recomposed. The comparison-level combinations (9.6e15 for the corpus
+pairings, 4.1e16 for Oulu-CASIA) are counted exactly by searches over sorted
+scores, and only those within the drift of a boundary go one by one through
+the production `fuse` (the record).
+
+### Enrolled users' arms
+
+Recorded data runs through the full lit and dark decisions: the RGB arm,
+fusion, the dim-light fallback, the calibrated centroid and the dark arms. A
+face never owns two profiles, since enrollment folds a matching face into
+its profile, so each person's enrollments hold one profile. Per camera, an
+enrollment of shape (n_rgb, n_ir) takes that person's first n_rgb frames the
+CPU reference can align, in the manifest's order, keeps the paired IR frame
+of the first n_ir of them, and fits the calibration as enrollment fits it.
+The maintainer's enrollments take every shape with n_ir <= n_rgb <= 30 that
+the camera's recorded modalities allow, the household member's every n_rgb
+up to 30 without IR. Every other genuine frame of that person and camera is
+a genuine probe. Each arm names its zero-effort impostor population, scored
+against the same enrollment at every shape:
+
+- RGB arm: every alignable image of both LFW copies and FairFace; the
+  household member's frames against every maintainer enrollment (same camera
+  for the Zenbook enrollments); and the maintainer's RGB frames against
+  every enrollment of the household member.
+- Fallback, calibrated, centroid and dark arms: every alignable CBSR and
+  Tufts NIR image, calibrated with the enrolled person's map wherever the
+  shape has one.
+- Fusion: the person's own recorded pairs as the genuine class, and every
+  combination of the RGB and NIR impostor decisions above, with the two
+  mixed classes, at every grid point in both postures.
+- Attacks: each attack session against every enrollment of the maintainer
+  from the camera that recorded it, at every shape, and against the
+  household enrollments built from them (below).
+- No-face control: a negative arm against every enrollment the attack arms
+  build from its camera. It is the one arm that may measure nothing, since
+  the CPU-only pass may exclude all of its frames; any frame it keeps is
+  held to the negative-arm rule.
+
+Production scales the RGB, fallback and dark thresholds by the enrollment's
+scan count over every profile, and the centroid bars by its profile count,
+so an attack on an account of two or three profiles of k scans is decided at
+the values for 2k or 3k templates and at the two- and three-profile centroid
+bars. A household enrollment puts the attack frames there: it joins a
+maintainer enrollment of shape (k, k) or (k, 0) to one or two companion
+profiles of the same shape, each fitted as enrollment fits it. The
+companions of (k, k) are the Tufts subjects that the Tufts households of
+that k draw from; those of (k, 0) are the identities of the LFW households
+and the household member. Every companion and every pair of companions
+joins, the corpus companions' images in both orders. Each attack frame is
+also compared with every template of the maintainer's enrollments from its
+camera, an RGB frame at every RGB value and an IR frame at every fallback
+and dark value, and with the calibrated centroid of each of those
+enrollments at every centroid bar for 1 to 3 profiles.
+
+### Shapes an entry covers
+
+An enrollment shape is admitted only where both an impostor arm and an
+attack arm of this amendment reach it:
+
+- one profile of any (n_rgb, n_ir) with n_ir <= n_rgb <= 30, reached by the
+  enrolled users' arms and the corpora's single-identity arms, and by the
+  attack arms on the maintainer's enrollments;
+- two or three profiles of equal shape (k, k) or (k, 0) with k <= 30,
+  reached by the Tufts and LFW households, and by the attack arms on
+  household enrollments;
+- in either case, every profile with three or more IR scans holding a
+  calibration fitted from exactly its current pairs, and every other profile
+  none.
+
+Every other enrollment keeps its probes on the CPU. That covers more than 3
+profiles, more than 30 matchable scans in a profile, profiles that differ in
+their numbers of RGB or IR scans (such as a profile with IR beside one
+without), several profiles whose scans carry IR only in part, a profile with
+three or more IR scans and no calibration, and a stored calibration not
+fitted from the profile's current pairs.
+
+### Thresholds
+
+Items 4 and 5 apply at every threshold value production can use for the
+comparison or decision. The values are generated from the code rather than
+listed: the RGB, dim-light fallback and dark bases, each scaled for every
+template count, which also gives the calibrated-centroid bars for 1 to 3
+profiles; and the fusion floors `FUSION_PROB_THRESHOLD` and
+`FUSION_MIN_PER_MODALITY_PROB`. A configured IR adapter keeps the probes on
+CPU, so the adapted base is not in the set. Under today's constants each
+base gives 90 values for 1 to 90 templates, 270 distinct in all, and 102 up
+to the cap, which binds from 102 templates. RGB comparisons run at the 102
+RGB values and IR comparisons at the 204 fallback and dark values, although
+no admitted shape reaches the values above 90 templates; each decision runs
+at the value its own shape uses. A test requires the generated set to equal
+every threshold the identity arms can return without an adapter.
+
+At this extent f32 rounding alone may break the no-new-grant rule. Such a
+failure is the answer, not a reason to relax the rule. The fusion floors are
+the likeliest place: the RGB floor is a cosine of about 0.245, which between
+0.1% and 1% of LFW's impostor comparisons exceed, and every RGB comparison
+near it meets every IR comparison.
+
+### Exclusions, labels and limits
+
+A comparison is left out only when the CPU reference's detection cascade
+finds no usable aligned face in one of its images. That CPU-only pass runs
+before any accelerator probe and fixes the list, and each arm records what
+it enumerated, excluded and measured. In the runs of items 3 to 5 some
+errors fail the run instead of shrinking it: a decode error, a detector
+runtime error, an accelerator answer replaced by a CPU one (a fallback, a
+retirement, the runtime guard or a resume discard), and any resume recheck.
+
+Labels are fixed before scoring. A FairFace pair the CPU accepts stays a CPU
+false accept, and the manifest's categories are the labels of the recorded
+sessions.
+
+Items 4 and 5 stay per arm, per corpus copy and per demographic group, with
+the inclusive integer limits of the measurement code, and no arm joins
+another's denominator. Below 500 genuine comparisons, no net extra rejection
+and no shift movement is allowed. A negative arm with no CPU false accept
+allows no shift movement below 100,000 comparisons.
+
+### The record
+
+Item 4's list and item 8's deltas, margins and verdict tables form one
+difference record in a fixed line grammar. The identity is archived without
+paths, as library basenames with their digests. The archived record stays on
+the project share, and the change that adds an entry cites it by digest; git
+carries per-arm aggregates only.
+
+An arm is public only when every source of the scores it consumes, probe and
+template alike, is an LFW or FairFace copy named above by its file-list
+digest, and the validator holds that digest. For a public arm the archived
+record holds, per threshold value and grid point, the enumerated, excluded
+and measured counts and every budget field; per differing verdict, the arm,
+the threshold value or grid point, the file-list ordinals of the comparison,
+both accept flags, both margins and the arm's drift; and per copy its
+source, revision, derivation and file-list digest. A margin is the smallest
+equal shift of the verdict's input cosines that flips that device's verdict;
+for a verdict on one cosine it is the distance to the threshold. Every grant
+in these arms only grows with each of its cosines, so where verdicts differ
+each margin is at most the drift, and the validator refuses a larger one.
+
+Every other arm is private, whatever its writer called it: an arm that
+consumes recorded data of the maintainer or the household member, as probe
+or as template, or any CBSR, Tufts or Oulu-CASIA score. Recorded data of
+people is biometric data under item 8, and those three corpora's terms
+restrict sharing.
+
+A private arm spans every shape, threshold value and grid point of one
+pairwise or decision arm, for one person and camera, or one corpus copy or
+pairing of copies, and one class; each impostor population, modality,
+lighting and demographic group is an arm of its own. Its id comes from a
+fixed list compiled into the validator, and no id names a shape, a template
+or profile count, a threshold value or a grid point. The validator refuses a
+private arm whose id is not on that list or appears twice in one record, and
+the code that writes a private arm cannot build it from one shape or from
+one threshold value's measurement.
+
+A private arm leaves the measuring machine only as its enumerated, excluded
+and measured counts, its drift, its outcome, its differing verdicts in each
+direction summed over its whole extent, one flag saying whether every margin
+lay within the drift, and the SHA-256 of its local difference list. That
+list opens with a 256-bit random value drawn for that run and kept only in
+that list, so its digest discloses nothing of its content. Nothing per
+shape, threshold value or comparison of a private arm is archived, at any
+drift: the validator refuses a difference line, a per-threshold count or
+budget line and a nearest-score line on any private arm, and a pass of an
+impostor, attack or negative private arm with any new grant.
+
+The local difference list holds every differing verdict of a private arm at
+any drift, with its ordinals, both accept flags and both margins, and the
+arm's verdict tables per shape, threshold value and grid point. Item 4's
+list and item 8's verdict tables for these arms are met there, and the
+maintainer reviews them in place. The list stays on the measuring machine in
+a root-owned file of mode 0600 in a 0700 directory and never enters git, the
+share or a cloud drive. Everything else the measuring process writes during
+a run with a private arm, its standard output and error included, stays with
+the list under the same rule, except the archived record, which leaves that
+directory only after the validator, run there as root, has passed it. Local
+code checks the list against the archived record, refuses a list without its
+random opening value, and prints only the result. No agent, model service,
+CI job or remote reviewer reads the list or that output, and no part of
+either is pasted into an issue, pull request, chat, ledger or shared file.
+
+A private arm that measured nothing, other than the no-face control, or that
+has any differing verdict while its drift is above 1e-5, is recorded as
+refused and supports no entry. The validator refuses the whole record if it
+contains any line outside the grammar, any path, or any token naming a
+person, the host or a session.
+
+### Items 6 and 7
+
+The runs of items 3 to 5 contain no suspend and no resume recheck. The runs
+of items 6 and 7 are separate. They expect system suspends and record each
+one; they count every resume recheck and resume discard, and every recheck
+must pass; and every compile and warm load goes through the production
+compile, with its marker and per-inference inventory check, into a cache the
+run owns. The production compile has no way to bypass its cache, so each of
+item 7's cold compiles starts from an emptied run cache instead, with any
+compiler cache of the driver stack turned off. Every other run, warm loads
+included, records the driver-cache setting it ran under, and an entry holds
+only under that setting. The 2026-10-21 runs for items 6 and 7, and the hold
+witness of ADR-0033's runtime-suspend amendment of 2026-10-22, ran in
+`irlume-vision`'s unit-test binary through test-only compile paths, which
+have neither the marker nor the inventory check. They are inputs, and they
+are repeated before any entry, whatever the certification key shows.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

@@ -35,16 +35,19 @@ Kaggle API, not just visited.
 | LFW | 13k in-the-wild RGB faces, 6000-pair verification protocol | UMass Amherst | [Kaggle `jessicali9530/lfw-dataset`](https://www.kaggle.com/datasets/jessicali9530/lfw-dataset), 112 MiB | research use, free download |
 | CBSR NIR | CASIA near-infrared faces (OTCBVS benchmark dataset 07) | CASIA (Chinese Academy of Sciences) | [Kaggle `gpreda/cbsr-nir-face-dataset`](https://www.kaggle.com/datasets/gpreda/cbsr-nir-face-dataset), 352 MiB of `.bmp` | research/education only |
 | Oulu-CASIA NIR | near-infrared faces, multiple illuminations and expressions | University of Oulu with CASIA | [Kaggle `aryanbaibaswata/oulu-casia`](https://www.kaggle.com/datasets/aryanbaibaswata/oulu-casia), 1.2 GiB, `Oulu_CASIA_NIR_VIS/NI/<light>/<subject>/` | research only |
-| Tufts Face | paired RGB + NIR, many subjects | Tufts University | request form at [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/) | research use |
+| Tufts Face | paired RGB + NIR (TD_RGB_A and TD_NIR_A, Sets 1-4), 110 subjects | Tufts University | [Kaggle `wahabarabo/tufts-faces`](https://www.kaggle.com/datasets/wahabarabo/tufts-faces), a third-party mirror (3,234 pairs); the lab's release agreement is at [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/) | non-commercial research and education only, no access for colleagues, no redistribution ([terms](../docs/research/2026-10-22-certification-extent.md#3-copies-and-their-terms)) |
 
 Two details that matter if you reproduce a number:
 
 - **The LFW copy is `lfw-deepfunneled`**, the deep-funneled alignment, not raw
   LFW. Alignment variant moves verification accuracy, so a figure produced from
   the raw or funneled release is not directly comparable to one here.
-- **There is a Kaggle entry named `kpvisionlab/tufts-face-database`, and it is
-  not the dataset.** It holds one file of 1551 bytes. The images come from the
-  Tufts request form; do not send anyone to that Kaggle ref expecting data.
+- **The Kaggle entry `kpvisionlab/tufts-face-database` is the Tufts lab's own
+  page, and it does not hold these images.** It carries the lab's terms, which
+  [the certification extent record](../docs/research/2026-10-22-certification-extent.md#3-copies-and-their-terms)
+  quotes. The images the scripts and the certification read are the
+  third-party `wahabarabo/tufts-faces` mirror; the lab's own route is its
+  release agreement at [tdface.ece.tufts.edu](http://tdface.ece.tufts.edu/).
 
 Earlier revisions of this table cited the canonical pages as the source for LFW,
 CBSR and Oulu, which implied the data was fetched there. It was not.

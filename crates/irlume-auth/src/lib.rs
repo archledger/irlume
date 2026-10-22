@@ -1252,20 +1252,22 @@ pub struct AddScanOutcome {
 /// share near 1, and the next dark identify was denied every time.
 pub const AMBIENT_LIT_SHARE: f32 = 0.5;
 
-/// Shipped ViT RGB PAD deny threshold (ADR-0013). MEASURED operating point
-/// across the FLEET, not one camera: the 2026-08-22 qualification set 0.60
-/// from the Zenbook window (genuine frames ≤ 0.551, banner floor 0.604), but
-/// fleet validation measured the NexiGo banner at presentation-medians
-/// 0.55–0.60 — 0.60 misses that camera's banner entirely. At 0.55 with
-/// 5-frame-median voting: every login-distance banner presentation on BOTH
-/// cameras measured 0.594–0.656 (caught), every genuine presentation on
-/// both cameras across desk/dim/close/glasses measured 0.27–0.465 (margin
-/// 0.085). Offline on LFW stills, each identity's images taken in fives:
-/// 4 of 1,072 groups have a median at or above 0.55, every group of one
-/// identity, against 131 groups from 83 identities at 0.50 (ADR-0013
-/// amendment 2026-10-21). Do NOT raise toward 0.60 (drops the NexiGo
-/// banner) or lower toward 0.50 (reaches far more of the LFW tail and more
-/// than halves the genuine margin). Evidence: docs/research/2026-08-22-vit-live-
+/// Shipped ViT RGB PAD deny threshold (ADR-0013), set from two cameras: 0.60
+/// came from the 2026-08-21 offline window on the Zenbook (genuine frames
+/// ≤ 0.551, attack floor 0.604) and the 2026-08-22 qualification ran at it,
+/// but the PR #516 fleet run scored the NexiGo banner at 0.576-0.607 at login
+/// distance and 0.516-0.603 close, one score per assessment call (no NexiGo
+/// median was recorded), which set 0.55. At 0.55 with 5-frame-median voting:
+/// the Zenbook qualification's banner medians are 0.656 at login distance and
+/// 0.594 close, and every five-frame window of both reaches the line; the
+/// genuine medians there (desk/dim/close/glasses) are 0.368-0.465 (margin
+/// 0.085), and the fleet's genuine per-call scores on four hosts 0.27-0.428
+/// (ADR-0013 amendment 2026-10-22). Offline on LFW stills, each identity's
+/// images taken in fives: 4 of 1,072 groups have a median at or above 0.55,
+/// every group of one identity, against 131 groups from 83 identities at
+/// 0.50 (ADR-0013 amendment 2026-10-21). Do NOT raise toward 0.60 (the
+/// NexiGo banner scored 0.516-0.607) or lower toward 0.50 (reaches far more
+/// of the LFW tail and more than halves the genuine margin). Evidence: docs/research/2026-08-22-vit-live-
 /// qualification.md + the fleet run recorded in PR #516.
 pub const VIT_PAD_THRESHOLD: f32 = 0.55;
 
@@ -14080,15 +14082,17 @@ mod pad_cue_tests {
     }
 
     /// The ViT PAD vote (ADR-0013): abstains until N scores, median decides,
-    /// the window slides, and the threshold sits in the measured FLEET gap:
-    /// genuine presentation-medians topped at 0.465 (dim-marginal, Zenbook)
-    /// and every login-distance banner presentation on both fleet cameras
-    /// measured 0.594-0.656. These assertions pin both sides of that gap; a
-    /// raised threshold drops the NexiGo banner (measured at 0.55-0.60
-    /// median). The LFW tail is not pinned here, and the shipped line
-    /// already touches it: with each identity's LFW images taken in fives,
-    /// 4 of 1,072 groups reach 0.55, 24 reach 0.52 and 131 reach 0.50
-    /// (ADR-0013 amendment 2026-10-21).
+    /// the window slides, and the threshold sits in the measured gap between
+    /// presentation medians: genuine topped at 0.465 (dim-marginal, Zenbook)
+    /// and the lowest banner median on record is 0.594 (banner close,
+    /// Zenbook; 0.656 at login distance). These assertions pin both sides of
+    /// that gap. A raised threshold also passes more of the NexiGo banner,
+    /// scored in PR #516 only once per assessment call, 0.576-0.607 at login
+    /// distance and 0.516-0.603 close (ADR-0013 amendment 2026-10-22). The LFW tail
+    /// is not pinned here, and the shipped line already touches it: with
+    /// each identity's LFW images taken in fives, 4 of 1,072 groups reach
+    /// 0.55, 24 reach 0.52 and 131 reach 0.50 (ADR-0013 amendment
+    /// 2026-10-21).
     #[test]
     fn vit_vote_abstains_until_full_and_the_threshold_pins_the_measured_window() {
         // Worst measured genuine presentation (0.465): never a denial.
@@ -14097,8 +14101,8 @@ mod pad_cue_tests {
             genuine.push(0.465);
             assert!(!vit_vote_denies(&genuine), "genuine frame {i} denied");
         }
-        // Lowest measured login-distance banner median (0.594): every full
-        // window denies.
+        // Lowest banner presentation median on record (0.594, banner close,
+        // Zenbook): every full window denies.
         let mut banner = Vec::new();
         for i in 0..VIT_PAD_VOTE_N {
             banner.push(0.594);
@@ -14134,19 +14138,19 @@ mod pad_cue_tests {
     #[test]
     fn vit_threshold_sits_between_the_measured_genuine_max_and_attack_floor() {
         // Behavioral pin (not a const assert): a window of the worst measured
-        // genuine presentation median (0.465, fleet, dim-marginal) must never
-        // deny, and a window of the lowest measured login-distance banner
-        // median (0.594, fleet) must always deny. Moving VIT_PAD_THRESHOLD
-        // across either boundary fails this.
+        // genuine presentation median (0.465, Zenbook, dim-marginal) must
+        // never deny, and a window of the lowest banner presentation median
+        // on record (0.594, Zenbook, banner close) must always deny. Moving
+        // VIT_PAD_THRESHOLD across either boundary fails this.
         let genuine = vec![0.465; VIT_PAD_VOTE_N];
         assert!(
             !vit_vote_denies(&genuine),
-            "threshold crosses the fleet genuine presentation max (0.465): false denials"
+            "threshold crosses the highest genuine presentation median (0.465): false denials"
         );
         let banner = vec![0.594; VIT_PAD_VOTE_N];
         assert!(
             vit_vote_denies(&banner),
-            "threshold crosses the fleet banner presentation min (0.594): dropped detections"
+            "threshold crosses the lowest banner presentation median (0.594): dropped detections"
         );
         assert_eq!(
             VIT_PAD_VOTE_N, 5,

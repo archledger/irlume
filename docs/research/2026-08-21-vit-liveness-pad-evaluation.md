@@ -79,6 +79,13 @@ genuine tail. Contrast mn3 (99.75% spoof-saturated on lit indoor live) and
 flxc (35% of LFW ≥ 0.5): this model reads ordinary imagery as genuinely
 real with a thin, votable tail.
 
+> **Note (2026-10-22):** the identity-median and 0/531 figures above do
+> not reproduce from the committed scores; see ADR-0013, amendments
+> [2026-10-21](../adr/0013-ship-pad-models-default-on.md#amendment-2026-10-21-the-lfw-figures-behind-055)
+> (0/531) and
+> [2026-10-22](../adr/0013-ship-pad-models-default-on.md#amendment-2026-10-22-the-banner-figures-behind-055)
+> (identity median).
+
 Latency (FP32, CPU): archhost 5700G **59 ms**/infer; minihost N100
 (the fleet floor, dual-cam login box) **268 ms**/infer (probe script,
 n=30, warm). FLIR is 1.2 ms — this is 50–200× heavier.

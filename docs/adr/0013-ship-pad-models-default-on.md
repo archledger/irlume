@@ -84,6 +84,10 @@ records why that is sound and what it costs.
      images, grouped how, produced the figures at 0.55 and 0.50; on the
      committed scores, 4 of 1,072 per-identity groups of five LFW images,
      every group of one identity, reach 0.55, and 131 reach 0.50.)
+     (Amended 2026-10-22, below: 0.594 and 0.656 are the Zenbook
+     qualification's banner medians, close and at login distance; the
+     NexiGo banner was recorded only as one score per assessment call, so
+     no NexiGo presentation median is on record.)
    - FLIR: 0.9 on lit-phase IR frames, the 2026-07-27 re-measured window
      (genuine max 0.702, attack floor 0.941).
 
@@ -170,3 +174,63 @@ same tests. At 0.55 the four groups are every group of one identity.
 Section 4 says the vote holds the genuine side at zero. On these
 reference cases it does not: 4 of the 1,072 group medians (0.37%) reach
 0.55, against 1.74% of the images in those groups.
+
+## Amendment 2026-10-22: the banner figures behind 0.55
+
+Section 4, the `VIT_PAD_THRESHOLD` comment, the two vote tests and the
+models/README.md ViT row say every login-distance banner presentation on
+both cameras measured 0.594 to 0.656. Section 4, the threshold comment and
+the first vote test also say the NexiGo banner measured presentation
+medians of 0.55 to 0.60 (#1169). The records give these figures:
+
+| Camera | Record | Banner presentation | Statistic | P(spoof) |
+|---|---|---|---|---|
+| Zenbook | [2026-08-22 qualification](../research/2026-08-22-vit-live-qualification.md), A1 | flat, login distance | median of 48 frame scores | 0.656 |
+| Zenbook | 2026-08-22 qualification, A2 | close | median of 48 frame scores | 0.594 |
+| Zenbook | #516 fleet run | distance not recorded | one score per call | 0.653 to 0.742 |
+| NexiGo | #516 fleet run | login distance | one score per call | 0.576 to 0.607 |
+| NexiGo | #516 fleet run | close | one score per call | 0.516 to 0.603 |
+
+So 0.594 to 0.656 spans the qualification's two banner presentations on
+one camera, and 0.594 is the close one. #516 ran its fleet validation
+through `assess_probe`, which calls `Engine::assess` once per probe
+iteration (six by default). Each call scores the ViT once, on the
+per-pixel median of a five-frame RGB burst. At every #516 commit the only
+ViT value the code logs is that score (`pad-vit: p_spoof`, or
+`pad-vit(rgb-only): p_spoof` on the RGB-only tier the run used); the
+vote's deny line carries the threshold, not the median, and the probe
+prints only the verdict and its reason. From 715dc399 on, each call also
+clears the vote ring first, so the vote cannot fill inside the probe.
+Every #516 figure is therefore one score per call, and no five-score
+median was recorded on either camera in that run. The NexiGo
+"presentation-medians 0.55-0.60" rest on those scores.
+
+The committed qualification scores
+([`2026-08-22-vit-live-session-scores.csv`](../research/2026-08-22-vit-live-session-scores.csv),
+`p_spoof_m96`) reproduce both medians, and every five-frame window of
+both banner presentations has a median at or above 0.55: 44 of 44 each,
+lowest window medians 0.582 (close) and 0.583 (login distance). On the
+NexiGo the lowest login-distance score was 0.576, 0.026 above the line,
+and close-range scores went as low as 0.516, below it; no five-score
+median of either presentation was recorded. The genuine side of section
+4 mixes the same two statistics: 0.368 to 0.465 are the qualification's
+desk, glasses, dim and close medians, 0.27 to 0.428 the #516 per-call
+scores on four hosts, and the 0.085 margin is taken from the 0.465
+median. None of the qualification's 143 genuine five-frame windows
+reaches 0.55 (highest window median 0.502).
+
+The decision is unchanged: 0.55 with the five-score median. The vote
+tests keep 0.594 as their banner pin, now named as the Zenbook
+banner-close median. It is the lowest banner presentation median on
+record and the same statistic as the genuine pin (0.465, the Zenbook
+dim-marginal median). The NexiGo figures are per-call scores and cannot
+stand in for a presentation median; a NexiGo banner pin needs that
+camera's presentation medians, recorded with their scores.
+
+The 2026-08-21 evaluation also reports "Identity-median ≥ 0.60:
+7/2,280". On its committed per-frame scores (13,233 images of 5,749
+identities), 26 identity medians reach 0.60, every one of an identity
+with a single image, and none of the 1,680 identities with two or more
+images; no count of identities by number of images gives 2,280. The
+dated evaluation keeps the figure with a pointer here; this decision
+does not rest on it.

@@ -102,25 +102,35 @@ class MirrorSelectionTests(unittest.TestCase):
             self.assertFalse(missing.exists())
 
     def test_workflow_selects_the_mirror_before_installing_packages(self):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-        job = workflow["jobs"]["check"]
-        self.assertEqual(job["runs-on"], "ubuntu-24.04")
-        self.assertNotIn("continue-on-error", job)
-        steps = job["steps"]
-        policy_steps = [
-            i for i, step in enumerate(steps)
-            if "sudo python3 scripts/ci/prefer-ubuntu-archive.py" in step.get("run", "")
-        ]
-        self.assertEqual(len(policy_steps), 1, "one mandatory mirror-selection step")
-        policy = policy_steps[0]
-        self.assertNotIn("if", steps[policy])
-        self.assertNotIn("continue-on-error", steps[policy])
-        apt_steps = [i for i, step in enumerate(steps) if "apt-get" in step.get("run", "")]
-        self.assertTrue(apt_steps)
-        self.assertLess(policy, min(apt_steps))
+        ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
+        apt_jobs = 0
+        for filename in ("ci.yml", "asan.yml"):
+            workflow = yaml.load((ROOT / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
+            if filename == "asan.yml":
+                self.assertIn("scripts/ci/prefer-ubuntu-archive.py", workflow["on"]["push"]["paths"])
+            for name, job in workflow["jobs"].items():
+                steps = job.get("steps", [])
+                apt_steps = [i for i, step in enumerate(steps) if "apt-get" in step.get("run", "")]
+                if not apt_steps:
+                    continue
+                apt_jobs += 1
+                with self.subTest(workflow=filename, job=name):
+                    self.assertEqual(job["runs-on"], "ubuntu-24.04")
+                    self.assertNotIn("if", job)
+                    self.assertNotIn("continue-on-error", job)
+                    policy_steps = [
+                        i for i, step in enumerate(steps)
+                        if "sudo python3 scripts/ci/prefer-ubuntu-archive.py" in step.get("run", "")
+                    ]
+                    self.assertEqual(len(policy_steps), 1, "one mandatory mirror-selection step per APT job")
+                    policy = policy_steps[0]
+                    self.assertNotIn("if", steps[policy])
+                    self.assertNotIn("continue-on-error", steps[policy])
+                    self.assertLess(policy, min(apt_steps))
+        self.assertGreater(apt_jobs, 0, "the APT job scan must not become vacuous")
         self.assertTrue(any(
             "python3 -B scripts/ci/test-prefer-ubuntu-archive.py" in step.get("run", "")
-            for step in steps
+            for step in ci["jobs"]["check"]["steps"]
         ), "the offline contract tests must run in CI")
 
 

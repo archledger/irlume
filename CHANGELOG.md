@@ -931,6 +931,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Apply the mirror policy to every APT-using job in the CI and sanitizer
+  workflows, including stable Rust, unit-policy checks, fuzzing and ASan
+  (#1184). The regression discovers those jobs and requires mirror selection
+  before their first package command. Fuzz durations, job timeouts and test
+  gates are unchanged.
+
 - The required CI job removes the known slow Azure APT mirror before
   installing packages, retaining the runner's HTTPS Ubuntu archive and
   security fallbacks (#1184). A missing expected fallback is an early

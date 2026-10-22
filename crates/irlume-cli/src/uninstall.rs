@@ -3572,28 +3572,46 @@ mod tests {
     // the failure fixture is deterministic.
     #[test]
     fn a_keyring_directory_or_link_root_owns_counts_for_the_login_guards() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // A user namespace can report the real root owner's unmapped UID as
+        // the overflow UID. Match the fixture's observed owner, not its UID
+        // in the initial namespace.
+        let root_uid = std::fs::metadata("/").unwrap().uid();
+        let other_uid = if root_uid == 0 { 1 } else { 0 };
         let base = std::env::temp_dir().join(format!("irlume-root-owned-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let alice = test_account(&base, "alice");
         let tree_path = home_state_path(&alice.home);
         std::fs::create_dir_all(&tree_path).unwrap();
         let tree = verified(resolve_home_tree(&alice));
-        assert_eq!(tree.keeps_store_of(0), Ok(false), "no keyring directory");
+        assert_eq!(
+            tree.keeps_store_of(root_uid),
+            Ok(false),
+            "no keyring directory"
+        );
         std::os::unix::fs::symlink("/", tree_path.join("keyring")).unwrap();
         assert_eq!(
-            tree.keeps_store_of(0),
+            tree.keeps_store_of(root_uid),
             Ok(true),
             "a link to a root-owned directory is followed to it"
+        );
+        assert_eq!(
+            tree.keeps_store_of(other_uid),
+            Ok(false),
+            "a link to a directory owned by a different UID does not count"
         );
         std::fs::remove_file(tree_path.join("keyring")).unwrap();
         std::fs::create_dir(tree_path.join("keyring")).unwrap();
         assert_eq!(tree.keeps_store_of(alice.uid), Ok(true), "its owner's");
-        if !is_root() {
+        if alice.uid != root_uid {
             assert_eq!(
-                tree.keeps_store_of(0),
+                tree.keeps_store_of(root_uid),
                 Ok(false),
                 "a directory this user owns"
             );
+        }
+        if !is_root() {
             // Inside a tree this process cannot search, the answer is unknown.
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&tree_path, std::fs::Permissions::from_mode(0o000)).unwrap();

@@ -411,6 +411,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0013 restates the shipped ViT RGB PAD cue's banner evidence
+  (ADR-0013 §4, amendment 2026-10-22, #1169). The 0.594 to 0.656 range is
+  the Zenbook qualification's two banner presentation medians, 0.594 close
+  and 0.656 at login distance, not login-distance medians on two cameras.
+  The NexiGo banner was recorded in #516 only as one score per assessment
+  call, 0.576 to 0.607 at login distance and 0.516 to 0.603 close, with no
+  five-score median. The threshold and vote test comments and the
+  models/README.md ViT row now say so, and the 2026-08-21 evaluation's
+  identity-median figure, which does not reproduce from its committed
+  scores, points to the amendment. The threshold, the five-frame vote and
+  the tests' pinned values are unchanged.
+
 - ADR-0033 records how a GPU meets the ADR-0022 section 7 runtime-suspend
   arm when its driver holds it awake while a model is retained (amendment
   2026-10-22, #1164). On `xe` the compute runtime's long-running VM keeps a

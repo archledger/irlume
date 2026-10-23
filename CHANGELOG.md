@@ -436,6 +436,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Version the decision fingerprint to bind bounded threshold coverage and
+  composed RGB/IR decisions, including arm priority, exact boundaries and
+  calibration provenance (ADR-0022, amendment 2026-10-23, #1164). Invalid
+  coverage keeps the recognizer on CPU. This changes no authentication
+  threshold, loading admission or certification entry.
+
 - Specify a non-shippable measurement-build boundary for GPU certification
   (ADR-0022 and ADR-0033, amendments 2026-10-22, #1164). The planned build
   requires compile-time artifact guards, an isolated CPU reference, a

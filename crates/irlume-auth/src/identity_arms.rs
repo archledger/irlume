@@ -14,6 +14,8 @@ use super::rgb_primary_grant_admissible;
 use irlume_core::fusion::{self, Fusion};
 use irlume_vision::align;
 pub(super) mod fingerprint;
+mod thresholds;
+mod witnesses;
 pub use fingerprint::decision_fingerprint;
 
 /// The identity arm whose comparison consumes the threshold.
@@ -828,7 +830,7 @@ mod tests {
     #[test]
     fn the_existing_arm_grid_fingerprint_matches_the_recorded_reference() {
         assert_eq!(
-            decision_fingerprint(),
+            fingerprint::arm_grid_fingerprint(),
             "16edf23e552e480c8a92d99247078c676c989f576b3213e6afaa4cda6a12796d",
             "preserve the existing arm grid when expanding the decision fingerprint"
         );

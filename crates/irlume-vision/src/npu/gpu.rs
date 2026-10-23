@@ -28,6 +28,8 @@ use super::runtime::{self, RuntimeSelection};
 
 #[path = "gpu_certification.rs"]
 pub mod certification;
+#[path = "gpu_launch.rs"]
+pub mod launch;
 #[path = "gpu_runtime_pm.rs"]
 mod runtime_pm;
 pub use runtime_pm::{GpuReason, RuntimeGuard};

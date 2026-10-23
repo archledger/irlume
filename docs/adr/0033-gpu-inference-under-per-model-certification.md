@@ -143,6 +143,23 @@ reported, exactly as #1054 ships today.
 The measurement-only exception specified below needs its own reviewed
 launch admission; it cannot open this production gate.
 
+#### Candidate-input checker, 2026-10-23
+
+The first offline foundation validates a supplied candidate child
+environment under `gpu-candidate-inputs-v1`. That minimal description
+requires exactly `NEO_CACHE_PERSISTENT=0`, permits optional `LANG=C` and
+`LC_ALL=C`, and rejects every other variable, including an empty override.
+Duplicate names, invalid raw names or values, unsupported versions and
+oversized inputs refuse with fixed categories that contain no input value.
+
+This checker does not read or change the process environment, inspect
+files, establish cache behavior, load a provider or verify confinement.
+Its private-field checked result contains only the policy ID and declared
+cache-off intent. It is neither a launch profile nor an admission token;
+no production caller uses it to open loading. The installation/native
+closure, launcher provenance, affinity and enforcing-host evidence above
+remain required. Both certification tables remain empty.
+
 ### 5. Certification gates are unchanged and binding
 
 A GPU certification must reproduce, on the target GPU identity and the

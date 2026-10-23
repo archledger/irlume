@@ -79,6 +79,7 @@ python3 scripts/test-evidence-build-boundary.py --self-test
 python3 scripts/test-evidence-build-boundary.py --check
 python3 scripts/test-reference-isolation.py --self-test
 python3 scripts/test-reference-isolation.py --check
+bash scripts/test-gpu-launch-inputs.sh
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \

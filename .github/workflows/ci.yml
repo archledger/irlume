@@ -239,6 +239,9 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: GPU launch candidate inputs (no native loading)
+        run: bash scripts/test-gpu-launch-inputs.sh
+
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)

@@ -1459,6 +1459,22 @@ profile does not establish the installed daemon's launch or confinement
 contract and cannot open the production admission. That remains the
 separate work of ADR-0033 section 4 and #1162.
 
+#### Description-checking foundation, 2026-10-23
+
+An evidence-only checker now compares a bounded in-memory description with
+supplied file and environment observations. It checks required roles,
+canonical digest text, exact path and environment equality, duplicate
+records, declared trust assessments and conflicting digests for a shared
+resolved endpoint. It performs no filesystem, environment or native calls.
+
+The result borrows the supplied inputs and exposes descriptive metadata
+only. It does not establish that an observation is authentic, that the
+native closure is complete or that filesystem facts remain unchanged.
+It cannot authorize a launch or construct a production admission. Required
+CI runs its named unit tests and both external-import doctests with matching
+evidence cfgs. The trusted observer, launcher and capability above remain
+unimplemented by this foundation.
+
 ### Cache and production path
 
 The runner creates a fresh, empty, owner-only 0700 cache on an approved

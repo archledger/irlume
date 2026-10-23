@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A non-authorizing measurement-profile description checker in evidence
+  builds (ADR-0022, Measurement-launch admission, #1164). It checks supplied
+  inventories, file observations and exact environment entries for internal
+  consistency. It does not observe the host, establish a complete native
+  closure or grant launch permission.
+
 - A pure recognizer-ranking recommendation API (ADR-0033 section 6, #1163).
   It evaluates supplied candidate assertions and exact workload-bound order
   evidence without choosing a default device-class preference. It does not

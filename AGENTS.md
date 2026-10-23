@@ -81,6 +81,7 @@ python3 scripts/test-reference-isolation.py --self-test
 python3 scripts/test-reference-isolation.py --check
 bash scripts/test-gpu-launch-inputs.sh
 bash scripts/test-recognizer-ranking.sh
+bash scripts/test-measurement-profile.sh
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \

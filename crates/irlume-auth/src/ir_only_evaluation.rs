@@ -244,10 +244,8 @@ fn identity_category(matched: IrMatch, profiles: usize, adapter: bool) -> Identi
             acceptance: None,
         };
     }
-    let (best, centroid) =
-        ir_assessment::IdentityThresholds::new(matched.n_templates, profiles, adapter)
-            .arms(&matched);
-    let acceptance = match (best, centroid) {
+    let verdict = identity_arms::dark_verdict(&matched, profiles, adapter);
+    let acceptance = match (verdict.best, verdict.centroid) {
         (true, true) => Some(IdentityAcceptance::Both),
         (true, false) => Some(IdentityAcceptance::BestTemplate),
         (false, true) => Some(IdentityAcceptance::Centroid),

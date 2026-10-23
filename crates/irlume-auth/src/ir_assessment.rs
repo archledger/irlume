@@ -3,6 +3,7 @@
 
 //! Private IR evidence shared by diagnostic and authentication consumers.
 
+pub(super) use super::identity_arms::IdentityThresholds;
 use super::*;
 
 pub(super) struct IrAssessment {
@@ -481,38 +482,6 @@ pub(super) fn refusal_outcome(failure: IrFailure) -> Outcome {
         ),
     };
     Outcome::deny_because(kind, cause, reason)
-}
-
-pub(super) struct IdentityThresholds {
-    pub(super) best: f32,
-    pub(super) centroid: f32,
-}
-
-impl IdentityThresholds {
-    pub(super) fn new(templates: usize, profiles: usize, adapter: bool) -> Self {
-        let base = if adapter {
-            irlume_core::IR_ADAPTED_MATCH_THRESHOLD
-        } else {
-            irlume_core::IR_DARK_MATCH_THRESHOLD
-        };
-        Self {
-            best: irlume_core::scaled_threshold(base, templates),
-            centroid: irlume_core::scaled_threshold(base, profiles),
-        }
-    }
-
-    pub(super) fn arms(&self, matched: &IrMatch) -> (bool, bool) {
-        if matched.n_templates == 0 {
-            return (false, false);
-        }
-        (
-            matched.best.is_finite() && matched.best >= self.best,
-            matched
-                .centroid
-                .as_ref()
-                .is_some_and(|(score, _)| score.is_finite() && *score >= self.centroid),
-        )
-    }
 }
 
 #[cfg(test)]

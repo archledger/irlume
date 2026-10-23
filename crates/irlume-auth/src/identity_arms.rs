@@ -10,11 +10,171 @@
 //! these arms and stay in the engine: they decide whether an attempt may be
 //! scored at all, not what a score means.
 
-use super::{
-    ir_assessment::IdentityThresholds, ir_match_in, rgb_primary_grant_admissible, IrMatch,
-};
+use super::rgb_primary_grant_admissible;
 use irlume_core::fusion::{self, Fusion};
+use irlume_vision::align;
 use sha2::{Digest, Sha256};
+
+/// Calibration-aware IR match result (see [`ir_match_in`]).
+pub(super) struct IrMatch {
+    pub(super) best: f32,
+    pub(super) best_who: String,
+    pub(super) n_templates: usize,
+    /// Best per-profile calibrated-centroid score, only from profiles with a
+    /// fitted calibration under a raw pipeline: (score, profile name).
+    pub(super) centroid: Option<(f32, String)>,
+}
+
+pub(super) struct IdentityThresholds {
+    pub(super) best: f32,
+    pub(super) centroid: f32,
+}
+
+impl IdentityThresholds {
+    pub(super) fn new(templates: usize, profiles: usize, adapter: bool) -> Self {
+        let base = if adapter {
+            irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+        } else {
+            irlume_core::IR_DARK_MATCH_THRESHOLD
+        };
+        Self {
+            best: irlume_core::scaled_threshold(base, templates),
+            centroid: irlume_core::scaled_threshold(base, profiles),
+        }
+    }
+
+    pub(super) fn arms(&self, matched: &IrMatch) -> (bool, bool) {
+        if matched.n_templates == 0 {
+            return (false, false);
+        }
+        (
+            matched.best.is_finite() && matched.best >= self.best,
+            matched
+                .centroid
+                .as_ref()
+                .is_some_and(|(score, _)| score.is_finite() && *score >= self.centroid),
+        )
+    }
+}
+
+/// IR matching across profiles, calibration-aware. Per profile: when a
+/// fitted calibration exists (and no global adapter is loaded), both the
+/// probe and that profile's templates are calibrated before scoring, and the
+/// calibrated template CENTROID is scored too, the mean-template protocol
+/// the 2026-07-15 prototype validated at the BASE threshold (a single mean
+/// template carries no best-of-N FAR inflation).
+pub(super) fn ir_match_in(
+    space: &str,
+    embed_space: &str,
+    adapter_loaded: bool,
+    enr: &irlume_core::storage::Enrollment,
+    probe: &[f32],
+) -> IrMatch {
+    let mut m = IrMatch {
+        best: f32::NEG_INFINITY,
+        best_who: String::new(),
+        n_templates: 0,
+        centroid: None,
+    };
+    // Older custom adapters could store arbitrary vector magnitudes.
+    // Normalize both sides in memory; a corrected new probe alone
+    // would still let an oversized historical template inflate its dot product.
+    let adapted_probe = adapter_loaded
+        .then(|| align::normalize_embedding(probe))
+        .flatten();
+    let scoring_probe = if adapter_loaded {
+        adapted_probe.as_deref()
+    } else {
+        Some(probe)
+    };
+    for p in &enr.profiles {
+        let tmpls: Vec<std::borrow::Cow<'_, [f32]>> = p
+            .scans
+            .iter()
+            .filter_map(|s| {
+                // The RECOGNIZER produces the raw IR embedding, so a template
+                // from another recognizer is in a foreign space regardless of
+                // its adapter tag. This matcher feeds fusion, IR fallback, the
+                // calibrated centroid, and dark IR-only auth — all of them
+                // grant, so all of them get the same filter RGB matching has.
+                if !irlume_core::storage::recognizer_space_matches(
+                    s.embed_space.as_deref(),
+                    embed_space,
+                ) {
+                    return None;
+                }
+                let ir = s.ir.as_ref()?;
+                if ir.len() != probe.len() {
+                    return None;
+                }
+                // Before tagging, both raw and adapted IR shipped. An absent
+                // tag cannot establish either space, even at the same width.
+                if s.ir_space.as_deref() != Some(space) {
+                    return None;
+                }
+                if adapter_loaded {
+                    align::normalize_embedding(ir).map(std::borrow::Cow::Owned)
+                } else {
+                    Some(std::borrow::Cow::Borrowed(ir.as_slice()))
+                }
+            })
+            .collect();
+        if tmpls.is_empty() {
+            continue;
+        }
+        m.n_templates += tmpls.len();
+        // Diagnostic preflight uses a zero probe to count eligible templates.
+        // Retain that count, but invalid adapted probes never produce scores.
+        let Some(probe) = scoring_probe else {
+            continue;
+        };
+        // The calibration for THIS recognizer: a profile can hold scans (and
+        // calibrations) from several, and applying one model's calibration to
+        // another's templates puts uninterpretable numbers into the matcher
+        // (#288).
+        let calib = if adapter_loaded {
+            None
+        } else {
+            p.calib_for(embed_space)
+        };
+        let cprobe = calib.and_then(|c| c.apply(probe));
+        if let (Some(c), Some(cprobe)) = (calib, &cprobe) {
+            let mut centroid = vec![0.0f32; probe.len()];
+            let mut used = 0usize;
+            for t in &tmpls {
+                let Some(ct) = c.apply(t) else { continue };
+                let s = align::cosine(cprobe, &ct);
+                if s > m.best {
+                    m.best = s;
+                    m.best_who = p.name.clone();
+                }
+                for (a, b) in centroid.iter_mut().zip(&ct) {
+                    *a += b;
+                }
+                used += 1;
+            }
+            if used > 0 {
+                let norm = centroid.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-9;
+                for v in centroid.iter_mut() {
+                    *v /= norm;
+                }
+                let cs = align::cosine(cprobe, &centroid);
+                if m.centroid.as_ref().is_none_or(|(s, _)| cs > *s) {
+                    m.centroid = Some((cs, p.name.clone()));
+                }
+            }
+        } else {
+            for t in &tmpls {
+                let s = align::cosine(probe, t);
+                if s > m.best {
+                    m.best = s;
+                    m.best_who = p.name.clone();
+                }
+            }
+        }
+    }
+    m
+}
 
 /// Best RGB match over labeled templates: (score, profile name). `>` keeps
 /// the first template on a tie.

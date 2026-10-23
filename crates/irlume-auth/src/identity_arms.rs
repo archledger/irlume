@@ -338,6 +338,131 @@ pub(super) fn lit_ir_arms(
     }
 }
 
+/// Fixed identity inputs borrowed from one engine.
+pub(super) struct DecisionContext<'a> {
+    pub(super) embed_space: &'a str,
+    pub(super) ir_space: &'a str,
+    pub(super) adapter: bool,
+    pub(super) rgb_base: f32,
+}
+
+/// A lit attempt's identity inputs after its caller's gates passed.
+pub(super) struct LitProbe<'a> {
+    pub(super) rgb: &'a [f32],
+    pub(super) ir: Option<&'a [f32]>,
+    pub(super) rgb_brightness: f32,
+    pub(super) ir_brightness: f32,
+    pub(super) sequential: bool,
+}
+
+pub(super) struct RgbDecision {
+    pub(super) score: f32,
+    pub(super) who: String,
+    pub(super) templates: usize,
+    pub(super) threshold: f32,
+    pub(super) grants: bool,
+    pub(super) deferred: bool,
+}
+
+pub(super) struct LitIrDecision {
+    pub(super) matched: IrMatch,
+    pub(super) arms: IrArms,
+    pub(super) fusion_deferred: bool,
+}
+
+pub(super) struct LitVerdict {
+    pub(super) rgb: RgbDecision,
+    pub(super) ir: Option<LitIrDecision>,
+}
+
+/// A selected lit grant whose profile is borrowed from this verdict.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LitGrant<'a> {
+    Rgb { score: f32, who: &'a str },
+    Fusion { score: f32, who: &'a str },
+    Fallback { score: f32, who: &'a str },
+    Centroid { score: f32, who: &'a str },
+}
+
+impl LitVerdict {
+    pub(super) fn grant(&self) -> Option<LitGrant<'_>> {
+        if self.rgb.grants {
+            return Some(LitGrant::Rgb {
+                score: self.rgb.score,
+                who: &self.rgb.who,
+            });
+        }
+        let ir = self.ir.as_ref()?;
+        Some(match ir.arms.grant? {
+            IrArm::Fusion => LitGrant::Fusion {
+                score: ir.arms.fusion.prob,
+                who: if ir.matched.best >= self.rgb.score {
+                    &ir.matched.best_who
+                } else {
+                    &self.rgb.who
+                },
+            },
+            IrArm::Fallback => LitGrant::Fallback {
+                score: ir.matched.best,
+                who: &ir.matched.best_who,
+            },
+            IrArm::Centroid => {
+                let (score, who) = ir.matched.centroid.as_ref()?;
+                LitGrant::Centroid { score: *score, who }
+            }
+        })
+    }
+}
+
+/// Run RGB first; only an ungranted RGB stage can reach IR matching.
+pub(super) fn lit_verdict(
+    context: &DecisionContext<'_>,
+    enrollment: &irlume_core::storage::Enrollment,
+    probe: &LitProbe<'_>,
+) -> LitVerdict {
+    let scans = enrollment.rgb_scans_in(context.embed_space);
+    let (score, who) = best_rgb(probe.rgb, &scans);
+    let (threshold, grants) = rgb_arm(score, context.rgb_base, scans.len(), probe.sequential);
+    let rgb = RgbDecision {
+        score,
+        who,
+        templates: scans.len(),
+        threshold,
+        grants,
+        deferred: probe.sequential && score >= threshold,
+    };
+    if grants {
+        return LitVerdict { rgb, ir: None };
+    }
+    let ir = probe.ir.and_then(|ir_probe| {
+        let matched = ir_match_in(
+            context.ir_space,
+            context.embed_space,
+            context.adapter,
+            enrollment,
+            ir_probe,
+        );
+        if matched.n_templates == 0 {
+            return None;
+        }
+        let arms = lit_ir_arms(
+            score,
+            probe.rgb_brightness,
+            &matched,
+            probe.ir_brightness,
+            probe.sequential,
+            context.adapter,
+            enrollment.profiles.len(),
+        );
+        Some(LitIrDecision {
+            matched,
+            fusion_deferred: arms.fusion.grant && probe.sequential,
+            arms,
+        })
+    });
+    LitVerdict { rgb, ir }
+}
+
 /// How often each arm granted and denied over the fingerprint's grid, so a
 /// test can show the grid crosses every boundary.
 #[derive(Debug, Default)]
@@ -566,6 +691,10 @@ pub fn decision_fingerprint() -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+#[path = "identity_arms/lit_tests.rs"]
+mod lit_tests;
 
 #[cfg(test)]
 mod tests {

@@ -4605,6 +4605,15 @@ impl Engine {
         prof.set_calib_for(&self.embed_space, fitted);
     }
 
+    fn decision_context(&self) -> identity_arms::DecisionContext<'_> {
+        identity_arms::DecisionContext {
+            embed_space: &self.embed_space,
+            ir_space: &self.ir_space,
+            adapter: self.ir_adapter.is_some(),
+            rgb_base: self.rgb_threshold,
+        }
+    }
+
     /// Method wrapper over [`ir_match_in`], bound to the engine's space and
     /// adapter state.
     fn ir_match(&self, enr: &irlume_core::storage::Enrollment, probe: &[f32]) -> IrMatch {
@@ -8139,17 +8148,22 @@ impl Engine {
             // The decisions are identity_arms' pure functions (the decision
             // fingerprint of ADR-0022 §3 runs the same code); this block
             // traces them in the order they are reached.
-            let scans = enr.rgb_scans_in(&self.embed_space);
-            let (score, who) = identity_arms::best_rgb(&probe, &scans);
-            let (thr, rgb_grants) = identity_arms::rgb_arm(
-                score,
-                self.rgb_threshold,
-                scans.len(),
-                a.sequential_posture(),
+            let verdict = identity_arms::lit_verdict(
+                &self.decision_context(),
+                enr,
+                &identity_arms::LitProbe {
+                    rgb: &probe,
+                    ir: a.ir_embedding.as_deref(),
+                    rgb_brightness: a.signals.rgb_face_brightness,
+                    ir_brightness: a.ir_brightness,
+                    sequential: a.sequential_posture(),
+                },
             );
+            let selected = verdict.grant();
+            let (score, thr, who) = (verdict.rgb.score, verdict.rgb.threshold, &verdict.rgb.who);
             irlume_common::dlog!(
                 "match(rgb): best {score:.3} vs thr {thr:.3} ({} scans, best profile '{who}')",
-                scans.len()
+                verdict.rgb.templates
             );
             emit_trace_match(
                 diagnostics,
@@ -8158,10 +8172,10 @@ impl Engine {
                 thr,
                 score >= thr,
             );
-            if rgb_grants {
+            if let Some(identity_arms::LitGrant::Rgb { score, who }) = selected {
                 return Ok(Outcome::grant(score, format!("match: {who} (rgb)")));
             }
-            if a.sequential_posture() && score >= thr {
+            if verdict.rgb.deferred {
                 irlume_common::dlog!(
                     "match(rgb): {score:.3} >= thr {thr:.3} DEFERRED (sequential-schedule pair; \
                      IR-identity arms only, ADR-0014)"
@@ -8179,81 +8193,84 @@ impl Engine {
             // fused grant. On a temporally split capture that reopens the
             // swap window; such pairs grant only through the IR-fallback and
             // centroid arms below, which carry identity thresholds.
-            // IR score-space compatibility is checked by ir_match below. That
+            // IR score-space compatibility is checked by the verdict's matcher. That
             // compatibility does not establish probability calibration for these
             // legacy sigmoid coefficients, including with a third-party recognizer.
-            if let Some(ir_probe) = a.ir_embedding.as_ref() {
-                let m = self.ir_match(enr, ir_probe);
-                if m.n_templates > 0 {
-                    let (ir_score, ir_who) = (m.best, m.best_who.clone());
-                    // (a) brightness-weighted score fusion, (b) pure IR
-                    // fallback, (c) calibrated centroid (ADR-0004).
-                    let arms = identity_arms::lit_ir_arms(
-                        score,
-                        a.signals.rgb_face_brightness,
-                        &m,
-                        a.ir_brightness,
-                        a.sequential_posture(),
-                        self.ir_adapter.is_some(),
-                        enr.profiles.len(),
-                    );
-                    let f = arms.fusion;
-                    irlume_common::dlog!("match(fusion): p={:.3} grant={} (rgb {score:.3} bright {:.0} / ir {ir_score:.3} bright {:.0})",
+            if let Some(ir) = &verdict.ir {
+                let m = &ir.matched;
+                let ir_score = m.best;
+                // (a) brightness-weighted score fusion, (b) pure IR
+                // fallback, (c) calibrated centroid (ADR-0004).
+                let arms = &ir.arms;
+                let f = arms.fusion;
+                irlume_common::dlog!("match(fusion): p={:.3} grant={} (rgb {score:.3} bright {:.0} / ir {ir_score:.3} bright {:.0})",
                         f.prob, f.grant, a.signals.rgb_face_brightness, a.ir_brightness);
-                    emit_trace_match(
-                        diagnostics,
-                        irlume_common::diagnostics::TraceMetric::FusionProbability,
-                        f.prob,
-                        irlume_core::fusion::FUSION_PROB_THRESHOLD,
-                        f.grant,
-                    );
-                    if arms.grant == Some(identity_arms::IrArm::Fusion) {
-                        let who = if ir_score >= score { ir_who } else { who };
-                        return Ok(
-                    Outcome::grant(f.prob,
-                            format!("match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})", f.prob)));
-                    }
-                    if f.grant && a.sequential_posture() {
-                        irlume_common::dlog!(
-                            "fusion p={:.3} DEFERRED (sequential-schedule pair: the fusion \
-                             IR floor is a presence bar, not an identity bar; ADR-0014)",
+                emit_trace_match(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceMetric::FusionProbability,
+                    f.prob,
+                    irlume_core::fusion::FUSION_PROB_THRESHOLD,
+                    f.grant,
+                );
+                if let Some(identity_arms::LitGrant::Fusion {
+                    score: grant_score,
+                    who,
+                }) = selected
+                {
+                    return Ok(Outcome::grant(
+                        grant_score,
+                        format!(
+                            "match: {who} (rgb+ir fusion p={:.2}; rgb {score:.2}/ir {ir_score:.2})",
                             f.prob
-                        );
-                    }
-                    let ir_thr = arms.fallback_threshold;
+                        ),
+                    ));
+                }
+                if ir.fusion_deferred {
                     irlume_common::dlog!(
-                        "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
-                        self.ir_adapter.is_some()
+                        "fusion p={:.3} DEFERRED (sequential-schedule pair: the fusion \
+                             IR floor is a presence bar, not an identity bar; ADR-0014)",
+                        f.prob
                     );
+                }
+                let ir_thr = arms.fallback_threshold;
+                irlume_common::dlog!(
+                    "match(ir-fallback): {ir_score:.3} vs thr {ir_thr:.3} (adapter={})",
+                    self.ir_adapter.is_some()
+                );
+                emit_trace_match(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceMetric::MatchCosine,
+                    ir_score,
+                    ir_thr,
+                    ir_score >= ir_thr,
+                );
+                if let Some(identity_arms::LitGrant::Fallback {
+                    score: grant_score,
+                    who,
+                }) = selected
+                {
+                    return Ok(Outcome::grant(
+                        grant_score,
+                        format!("match: {who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})"),
+                    ));
+                }
+                if let (Some((cs, _)), Some(cthr)) = (&m.centroid, arms.centroid_threshold) {
+                    irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
                     emit_trace_match(
                         diagnostics,
                         irlume_common::diagnostics::TraceMetric::MatchCosine,
-                        ir_score,
-                        ir_thr,
-                        ir_score >= ir_thr,
+                        *cs,
+                        cthr,
+                        *cs >= cthr,
                     );
-                    if arms.grant == Some(identity_arms::IrArm::Fallback) {
-                        return Ok(Outcome::grant(
-                            ir_score,
-                            format!(
-                                "match: {ir_who} (ir-fallback, dim light; rgb {score:.2}<{thr:.2})"
-                            ),
-                        ));
-                    }
-                    if let (Some((cs, cwho)), Some(cthr)) = (&m.centroid, arms.centroid_threshold) {
-                        irlume_common::dlog!("match(ir-centroid): {cs:.3} vs thr {cthr:.3}");
-                        emit_trace_match(
-                            diagnostics,
-                            irlume_common::diagnostics::TraceMetric::MatchCosine,
-                            *cs,
-                            cthr,
-                            *cs >= cthr,
-                        );
-                        if arms.grant == Some(identity_arms::IrArm::Centroid) {
-                            return Ok(
-                    Outcome::grant(*cs,
-                                format!("match: {cwho} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
-                        }
+                    if let Some(identity_arms::LitGrant::Centroid {
+                        score: grant_score,
+                        who,
+                    }) = selected
+                    {
+                        return Ok(
+                    Outcome::grant(grant_score,
+                                format!("match: {who} (calibrated centroid, dim light; rgb {score:.2}<{thr:.2})")));
                     }
                 }
             }
@@ -8263,7 +8280,7 @@ impl Engine {
             return Ok(Outcome::deny_live(
                 OutcomeKind::BelowThreshold,
                 score,
-                if a.sequential_posture() && score >= thr {
+                if verdict.rgb.deferred {
                     format!(
                         "rgb {score:.2} matched but the sequentially captured pair \
                          requires an IR-verified match; fusion+ir missed"
@@ -12265,27 +12282,41 @@ mod tests {
             .split("\nmod tests {")
             .next()
             .unwrap();
-        // The arms are identity_arms' pure functions: the engine hands them
-        // the posture, and they apply it.
-        let rgb_arm_call = source
-            .split("identity_arms::rgb_arm(")
+        // The engine supplies the posture once; both stages must forward it.
+        let verdict_call = source
+            .split("identity_arms::lit_verdict(")
+            .nth(1)
+            .and_then(|rest| rest.split(");").next())
+            .expect("the lit verdict is called");
+        let verdict_call: String = verdict_call
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            verdict_call.contains("sequential:a.sequential_posture()"),
+            "the lit verdict must receive the complete posture"
+        );
+        let arms = include_str!("identity_arms.rs");
+        let verdict = arms
+            .split("pub(super) fn lit_verdict(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the lit verdict exists");
+        let rgb_arm_call = verdict
+            .split("rgb_arm(")
             .nth(1)
             .and_then(|rest| rest.split(");").next())
             .expect("the RGB-primary arm is called");
-        assert!(
-            rgb_arm_call.contains("a.sequential_posture()"),
-            "the RGB-primary arm must read the posture"
-        );
-        let ir_arms_call = source
-            .split("identity_arms::lit_ir_arms(")
+        assert!(rgb_arm_call.contains("probe.sequential"));
+        let ir_arms_call = verdict
+            .split("lit_ir_arms(")
             .nth(1)
             .and_then(|rest| rest.split(");").next())
             .expect("the IR arms are called");
         assert!(
-            ir_arms_call.contains("a.sequential_posture()"),
+            ir_arms_call.contains("probe.sequential"),
             "both fusion gates must read the posture"
         );
-        let arms = include_str!("identity_arms.rs");
         assert!(arms.contains("rgb_primary_grant_admissible(score, threshold, sequential)"));
         assert!(arms.contains("fusion.grant && !sequential"));
     }

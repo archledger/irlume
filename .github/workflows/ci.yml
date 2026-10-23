@@ -215,7 +215,7 @@ jobs:
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps
           cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
           cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
-          cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms
+          cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization
           # Synthetic published state and sandboxed config only; these exact
           # tests need neither model loading nor the token-delivery CLI helper.
           # Require every name so a renamed or ignored regression fails CI.

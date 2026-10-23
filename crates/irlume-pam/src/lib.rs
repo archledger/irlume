@@ -37,6 +37,15 @@
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
 //! log a failure; the password is always the floor).
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+#[cfg(irlume_hw_evidence)]
+compile_error!("irlume evidence build refused: irlume-pam/direct");
+const _: () = assert!(
+    !(cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD),
+    "irlume evidence build refused: irlume-pam/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 use irlume_common::pam_service::ServiceKind;
 use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};

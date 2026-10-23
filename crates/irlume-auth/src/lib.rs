@@ -8,6 +8,21 @@
 //! and run the liveness gate on the cross-spectrum signals → on Live, match the
 //! embedding against the user's enrolled templates at the fixed threshold.
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+/// Whether this library or a dependency contains non-shippable evidence code.
+pub const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence)
+    || irlume_camera::HARDWARE_EVIDENCE_BUILD
+    || irlume_common::HARDWARE_EVIDENCE_BUILD
+    || irlume_core::HARDWARE_EVIDENCE_BUILD
+    || irlume_liveness::HARDWARE_EVIDENCE_BUILD
+    || irlume_vision::HARDWARE_EVIDENCE_BUILD;
+#[cfg(not(irlume_hw_evidence))]
+const _: () = assert!(
+    !HARDWARE_EVIDENCE_BUILD,
+    "irlume evidence build refused: irlume-auth/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 mod ir_assessment;
 pub use ir_assessment::{IrOnlyPreflight, IrOnlyRefusal};
 mod request_preparation;

@@ -192,6 +192,24 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
+      - name: Non-shippable evidence build boundary
+        timeout-minutes: 15
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          cargo fetch --locked
+          python3 scripts/test-evidence-build-boundary.py --self-test
+          python3 scripts/test-evidence-build-boundary.py --check
+
+      - name: Upload evidence-build compiler receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-build-compiler-receipts
+          path: ${{ runner.temp }}/irlume-evidence-build-*
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: clippy (warnings are errors)
         run: cargo clippy --locked --all-targets -- -D warnings
 

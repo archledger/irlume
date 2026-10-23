@@ -16,6 +16,20 @@
 //! flushes) run on their own threads. The serialization guarantee lives at
 //! the worker, not the process.
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+#[cfg(irlume_hw_evidence)]
+compile_error!("irlume evidence build refused: irlume-daemon/direct");
+const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence)
+    || irlume_auth::HARDWARE_EVIDENCE_BUILD
+    || irlume_common::HARDWARE_EVIDENCE_BUILD
+    || irlume_core::HARDWARE_EVIDENCE_BUILD
+    || irlume_liveness::HARDWARE_EVIDENCE_BUILD;
+const _: () = assert!(
+    !HARDWARE_EVIDENCE_BUILD,
+    "irlume evidence build refused: irlume-daemon/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 use irlume_common::pam_service::ServiceKind;
 use irlume_common::{jout_debug, jout_err, jout_info, jout_notice, jout_warn};
 use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
@@ -1226,6 +1240,7 @@ fn startup_tpm_reachable() -> bool {
 }
 
 fn main() {
+    irlume_common::build_mode::refuse_evidence_startup(HARDWARE_EVIDENCE_BUILD);
     // Before any model, template or request is touched: no core dumps
     // (`disable_core_dumps`). A daemon that stays dumpable does not start:
     // face authentication is then unavailable and the password still works.

@@ -46,6 +46,15 @@
 //!
 //! 2 is a usage error.
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+#[cfg(irlume_hw_evidence)]
+compile_error!("irlume evidence build refused: irlume-gkr-unlock/direct");
+const _: () = assert!(
+    !(cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD),
+    "irlume evidence build refused: irlume-gkr-unlock/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 mod bus;
 mod detach;
 mod waiter;

@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A pure recognizer-ranking recommendation API (ADR-0033 section 6, #1163).
+  It evaluates supplied candidate assertions and exact workload-bound order
+  evidence without choosing a default device-class preference. It does not
+  verify eligibility or change discovery, loading, actual placement or
+  reporting.
+
 - A pure checker for minimal GPU launch-candidate inputs (ADR-0033
   section 4, #1162). It requires explicit NEO cache-off intent, rejects
   unsupported environment entries and reports fixed, value-redacted errors.

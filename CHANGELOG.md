@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A pure checker for minimal GPU launch-candidate inputs (ADR-0033
+  section 4, #1162). It requires explicit NEO cache-off intent, rejects
+  unsupported environment entries and reports fixed, value-redacted errors.
+  A checked candidate does not authorize loading; production admission
+  remains closed.
+
 - CPU-reference isolation for non-shippable evidence builds (ADR-0022,
   Reference isolation, #1164). These builds reject ORT provider features,
   including features enabled through another dependency, and refuse any

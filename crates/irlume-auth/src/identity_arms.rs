@@ -13,7 +13,8 @@
 use super::rgb_primary_grant_admissible;
 use irlume_core::fusion::{self, Fusion};
 use irlume_vision::align;
-use sha2::{Digest, Sha256};
+pub(super) mod fingerprint;
+pub use fingerprint::decision_fingerprint;
 
 /// The identity arm whose comparison consumes the threshold.
 #[derive(Clone, Copy, Debug)]
@@ -666,30 +667,6 @@ pub(super) fn decision_grid(out: &mut dyn FnMut(&[u8]), coverage: &mut Coverage)
             }
         }
     }
-}
-
-/// The recognition decision's fingerprint (ADR-0022 §3): the SHA-256 of
-/// everything the production decision code returns over a fixed synthetic
-/// grid: RGB matching, the IR matcher with and without a fitted
-/// calibration, the RGB-primary, fusion, IR-fallback and calibrated-centroid
-/// arms, the dark path's arms, and the Platt scaling, brightness weighting
-/// and template-count scaling inside them. A change to any of it changes
-/// the fingerprint, and a certification entry bound to the old one no
-/// longer applies.
-pub fn decision_fingerprint() -> String {
-    let mut hasher = Sha256::new();
-    decision_grid(
-        &mut |bytes: &[u8]| {
-            hasher.update((bytes.len() as u32).to_le_bytes());
-            hasher.update(bytes);
-        },
-        &mut Coverage::default(),
-    );
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 #[cfg(test)]

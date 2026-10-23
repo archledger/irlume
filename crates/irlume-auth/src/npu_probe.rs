@@ -11,6 +11,21 @@
 
 use super::Engine;
 
+#[cfg(feature = "npu")]
+fn with_decision_fingerprint<T>(
+    fingerprint: Result<
+        super::identity_arms::fingerprint::DecisionFingerprint,
+        super::identity_arms::fingerprint::FingerprintError,
+    >,
+    refused: T,
+    open: impl FnOnce(&str) -> T,
+) -> T {
+    match fingerprint {
+        Ok(fingerprint) => open(fingerprint.as_ref()),
+        Err(_) => refused,
+    }
+}
+
 impl Engine {
     /// The RGB embedding of an aligned chip, through test-time augmentation:
     /// on the NPU inside an authentication that admitted it, otherwise on the
@@ -236,6 +251,8 @@ impl Engine {
 
     /// Open an administrator-selected provider runtime for this CPU consumer.
     /// Discovery does not bypass the recognizer's qualification or parity.
+    /// Invalid decision-fingerprint construction returns a not-certified
+    /// context without calling the runtime opener.
     #[cfg(feature = "npu")]
     pub fn open_npu_context_with_runtime(
         &self,
@@ -244,15 +261,20 @@ impl Engine {
     ) -> irlume_vision::npu::Context {
         let runtime = irlume_vision::onnx_runtime_version().unwrap_or_default();
         let thresholds = self.npu_thresholds();
-        let fingerprint = super::decision_fingerprint();
-        irlume_vision::npu::Context::open_with_runtime(
-            cache_base,
-            &irlume_vision::npu::Consumer {
-                onnx_runtime: &runtime,
-                thresholds: &thresholds,
-                decision_fingerprint: &fingerprint,
+        with_decision_fingerprint(
+            super::identity_arms::fingerprint::try_decision_fingerprint(),
+            irlume_vision::npu::Context::not_selected(irlume_vision::npu::CpuReason::NotCertified),
+            |fingerprint| {
+                irlume_vision::npu::Context::open_with_runtime(
+                    cache_base,
+                    &irlume_vision::npu::Consumer {
+                        onnx_runtime: &runtime,
+                        thresholds: &thresholds,
+                        decision_fingerprint: fingerprint,
+                    },
+                    selection,
+                )
             },
-            selection,
         )
     }
 
@@ -296,6 +318,8 @@ impl Engine {
     /// (ADR-0033 section 5). The loading admission comes first: while it
     /// refuses, nothing is loaded or written and the context carries that
     /// refusal.
+    /// An invalid decision fingerprint instead returns a not-certified
+    /// context before runtime discovery or cache preparation.
     pub fn open_gpu_context_with_runtime(
         &self,
         cache_base: &std::path::Path,
@@ -303,15 +327,22 @@ impl Engine {
     ) -> irlume_vision::npu::gpu::Context {
         let runtime = irlume_vision::onnx_runtime_version().unwrap_or_default();
         let thresholds = self.npu_thresholds();
-        let fingerprint = super::decision_fingerprint();
-        irlume_vision::npu::gpu::Context::open_with_runtime(
-            cache_base,
-            &irlume_vision::npu::Consumer {
-                onnx_runtime: &runtime,
-                thresholds: &thresholds,
-                decision_fingerprint: &fingerprint,
+        with_decision_fingerprint(
+            super::identity_arms::fingerprint::try_decision_fingerprint(),
+            irlume_vision::npu::gpu::Context::not_selected(irlume_vision::npu::CpuReason::Gpu(
+                irlume_vision::npu::gpu::GpuReason::NotCertified,
+            )),
+            |fingerprint| {
+                irlume_vision::npu::gpu::Context::open_with_runtime(
+                    cache_base,
+                    &irlume_vision::npu::Consumer {
+                        onnx_runtime: &runtime,
+                        thresholds: &thresholds,
+                        decision_fingerprint: fingerprint,
+                    },
+                    selection,
+                )
             },
-            selection,
         )
     }
 
@@ -370,6 +401,75 @@ fn every_scan_from(
 mod tests {
     use super::every_scan_from;
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan};
+
+    #[test]
+    fn accelerator_contexts_use_checked_decision_fingerprints() {
+        let source = include_str!("npu_probe.rs")
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap();
+        for name in [
+            "open_npu_context_with_runtime",
+            "open_gpu_context_with_runtime",
+        ] {
+            let marker = format!("pub fn {name}(");
+            let body = source
+                .split(&marker)
+                .nth(1)
+                .unwrap()
+                .split("\n    }")
+                .next()
+                .unwrap();
+            assert!(body.contains("with_decision_fingerprint("), "{name}");
+            assert!(
+                body.contains("fingerprint::try_decision_fingerprint()"),
+                "{name}"
+            );
+            assert!(body.contains("NotCertified"), "{name}");
+            assert!(!body.contains("super::decision_fingerprint()"), "{name}");
+            assert!(
+                !body.contains(".unwrap()") && !body.contains(".expect("),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "npu")]
+    #[test]
+    fn invalid_decision_fingerprint_refuses_before_either_context_opens() {
+        use crate::identity_arms::fingerprint::FingerprintError;
+        use irlume_vision::npu::{gpu::GpuReason, Context, CpuReason};
+
+        let npu = super::with_decision_fingerprint(
+            Err(FingerprintError::InvalidDigest),
+            Context::not_selected(CpuReason::NotCertified),
+            |_| panic!("invalid fingerprint reached NPU discovery/cache/open"),
+        );
+        assert!(matches!(npu.identity(), Err(CpuReason::NotCertified)));
+        assert_eq!(npu.runtime_available(), None);
+        let gpu = super::with_decision_fingerprint(
+            Err(FingerprintError::InvalidDigest),
+            irlume_vision::npu::gpu::Context::not_selected(CpuReason::Gpu(GpuReason::NotCertified)),
+            |_| panic!("invalid fingerprint reached GPU discovery/cache/open"),
+        );
+        assert!(matches!(
+            gpu.identity(),
+            Err(CpuReason::Gpu(GpuReason::NotCertified))
+        ));
+        assert_eq!(gpu.runtime_available(), None);
+    }
+
+    #[cfg(feature = "npu")]
+    #[test]
+    fn checked_decision_fingerprint_reaches_the_opener_unchanged() {
+        let fingerprint = crate::identity_arms::fingerprint::try_decision_fingerprint().unwrap();
+        let expected = fingerprint.as_ref().to_owned();
+        let opened = super::with_decision_fingerprint(Ok(fingerprint), false, |value| {
+            assert_eq!(value, expected);
+            true
+        });
+        assert!(opened);
+    }
 
     fn scan(producer: Option<&str>) -> FaceScan {
         scan_in("embed:test", producer)

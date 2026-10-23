@@ -33,6 +33,7 @@ pub mod pam_lock_handoff;
 pub mod pam_service;
 pub mod platform;
 pub mod process;
+pub mod recognizer_ranking;
 pub mod secureboot;
 pub mod split_key;
 pub mod split_publish;

@@ -190,6 +190,21 @@ Ranking among several certified devices is set by measured evidence on
 the decision hardware (the UX5406S rerun of the measurement record is
 pending), not by device class or vendor.
 
+#### Pure recommendation foundation, 2026-10-23
+
+A shared pure API now evaluates caller-asserted candidate facts and an
+exact workload-bound order. It compares opaque keys byte for byte without
+defining a certification-key format or verifying their authenticity.
+Switches filter recommendations, explicit selection never substitutes the
+other accelerator, and missing or contradictory evidence recommends CPU.
+Either accelerator, or CPU itself, may lead a supplied valid order.
+
+The result is a hypothetical recommendation, not eligibility, permission or
+actual placement. There is no production caller, native collector or new
+wire field in this foundation. Collector-order guarantees, genuine
+eligibility production, end-to-end ranking evidence and resolved-device
+reporting remain required before changing `auto` behavior.
+
 ### 7. Execution-provider GPUs stay inert
 
 The CUDA, OpenVINO-EP, TensorRT and CoreML execution-provider features

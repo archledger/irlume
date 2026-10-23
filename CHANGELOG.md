@@ -436,6 +436,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Update ctutils to 0.4.4 in the application and fuzz lockfiles.
+
 - Version the decision fingerprint to bind bounded threshold coverage and
   composed RGB/IR decisions, including arm priority, exact boundaries and
   calibration provenance (ADR-0022, amendment 2026-10-23, #1164). Invalid

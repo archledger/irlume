@@ -437,26 +437,30 @@ mod tests {
     #[cfg(feature = "npu")]
     #[test]
     fn invalid_decision_fingerprint_refuses_before_either_context_opens() {
-        use crate::identity_arms::fingerprint::FingerprintError;
+        use crate::identity_arms::fingerprint::test_errors;
         use irlume_vision::npu::{gpu::GpuReason, Context, CpuReason};
 
-        let npu = super::with_decision_fingerprint(
-            Err(FingerprintError::InvalidDigest),
-            Context::not_selected(CpuReason::NotCertified),
-            |_| panic!("invalid fingerprint reached NPU discovery/cache/open"),
-        );
-        assert!(matches!(npu.identity(), Err(CpuReason::NotCertified)));
-        assert_eq!(npu.runtime_available(), None);
-        let gpu = super::with_decision_fingerprint(
-            Err(FingerprintError::InvalidDigest),
-            irlume_vision::npu::gpu::Context::not_selected(CpuReason::Gpu(GpuReason::NotCertified)),
-            |_| panic!("invalid fingerprint reached GPU discovery/cache/open"),
-        );
-        assert!(matches!(
-            gpu.identity(),
-            Err(CpuReason::Gpu(GpuReason::NotCertified))
-        ));
-        assert_eq!(gpu.runtime_available(), None);
+        for error in test_errors() {
+            let npu = super::with_decision_fingerprint(
+                Err(error),
+                Context::not_selected(CpuReason::NotCertified),
+                |_| panic!("invalid fingerprint reached NPU discovery/cache/open"),
+            );
+            assert!(matches!(npu.identity(), Err(CpuReason::NotCertified)));
+            assert_eq!(npu.runtime_available(), None);
+            let gpu = super::with_decision_fingerprint(
+                Err(error),
+                irlume_vision::npu::gpu::Context::not_selected(CpuReason::Gpu(
+                    GpuReason::NotCertified,
+                )),
+                |_| panic!("invalid fingerprint reached GPU discovery/cache/open"),
+            );
+            assert!(matches!(
+                gpu.identity(),
+                Err(CpuReason::Gpu(GpuReason::NotCertified))
+            ));
+            assert_eq!(gpu.runtime_available(), None);
+        }
     }
 
     #[cfg(feature = "npu")]

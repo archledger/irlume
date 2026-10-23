@@ -38,6 +38,8 @@ rule](#amendment-2026-10-22-experimental-ir-only-probes-stay-on-cpu).
 Amended 2026-10-22 by the [measurement-only build contract](#amendment-2026-10-22-measurement-only-evidence-builds).
 It specifies future evidence tooling, not an available loading exception.
 
+Amended 2026-10-23 by the [bounded decision fingerprint](#amendment-2026-10-23-bounded-decision-fingerprint).
+
 ## Context
 
 Irlume runs six ONNX models through ONNX Runtime on CPU: the YuNet detector
@@ -1444,6 +1446,91 @@ remain binding. Raw output and difference lists for private arms stay
 owner-only; only the permitted aggregate record may leave after its local
 validator passes. No model or device is certified merely because this
 build compiled or a measurement process exited successfully.
+
+## Amendment 2026-10-23: bounded decision fingerprint
+
+The decision fingerprint uses the versioned domain
+`irlume-decision-fingerprint/2`. It binds threshold coverage and composed
+decisions in addition to the original arm grid. It remains a reference for
+fixed synthetic inputs, not a substitute for the full-extent qualification
+in this ADR. Both certification tables stay empty and native loading stays
+closed. Authentication thresholds, grant policy and password fallback do
+not change.
+
+### Threshold coverage
+
+The generator calls the existing production threshold helper. It finds
+the first exact capped bump using `scaled_threshold(0.0, count)`, without
+changing the scaling expression. A dense search stops at count 4,096.
+Unsupported scale values, an unreachable cap or a cap beyond the supported
+count budget fail construction; there is no truncated success.
+
+Two domains retain role, adapter state, count and exact value bits:
+
+- Enrollment-sized inputs cover template counts 0 through 90 and centroid
+  profile counts 0 through 3. Adapter centroids are omitted because the
+  production matcher does not construct them.
+- Complete inputs cover every count through saturation for all five roles,
+  including defensive adapter-centroid inputs. Saturation is currently 102.
+
+The domains contain 463 and 927 records respectively. Each separately
+projects sorted, bit-deduplicated RGB and IR cosine values, excluding
+adapter records and count zero. Their current sizes are RGB90/IR180 and
+RGB102/IR204. Fusion's probability threshold and per-modality floor remain
+separate from the cosine projections. Checked size arithmetic precedes
+allocation and every append checks the 65,536-record budget.
+
+### Composed decisions
+
+The 527 fixed witnesses call the production matchers, lit and dark
+selectors, and fusion function. They cover inclusive comparison boundaries,
+competing successful arms, distinct winner names, fusion and calibrated
+profile ties, both
+sequential deferrals, absent or incompatible IR, malformed calibration,
+and mixed tagged/untagged calibration provenance. Production-width vectors
+exercise repeated cosine accumulation across multiple eight-element chunks.
+
+Construction checks actual returned score bits and required outcomes before
+accepting each record. Per-family counts and ordered IDs detect omitted
+cases; each append checks a 1,024-record budget. Input vectors, template
+tags, calibration factors and relevant enrollment shapes are encoded with
+the outputs so different same-verdict refusal cases cannot substitute for
+one another. No model, file, camera or user enrollment is read by this
+builder. The independent 4,610-case engine characterization remains intact.
+
+### Stream and failure contract
+
+The outer SHA-256 transcript starts with a `domain` frame and then five
+named SHA-256 section digests, in order:
+
+1. `legacy-arm-grid-sha256`, computed from the original stream unchanged;
+2. `threshold-constants-sha256`, binding bases, scaling and fusion constants,
+   enrollment limits and generation budgets;
+3. `enrollment-thresholds-sha256`, with its records and projections;
+4. `complete-thresholds-sha256`, with its records and projections;
+5. `composed-witnesses-sha256`, with ordered family/ordinal IDs and framed
+   input/output records.
+
+Every outer frame carries its name length, name bytes, payload length and
+payload bytes. New lengths, ordinals and counts are unsigned 64-bit
+little-endian integers, booleans and enum tags are single bytes, and f32
+values use their exact bits in little-endian order. Strings carry a length
+before their bytes. The legacy section retains its original 32-bit lengths
+and native-size count fields; its separate preservation test remains.
+
+Explicit byte order does not make the mathematical results portable.
+Rust 1.88 documents [unspecified precision for
+`f32::log2`](https://doc.rust-lang.org/1.88.0/std/primitive.f32.html#method.log2),
+among other functions in the decision path. Exact reference checks must
+run on the claimed build environments; no cross-platform equality follows
+from the format alone.
+
+Construction returns a checked digest only after every section succeeds.
+Both runtime context openers consume that checked result and return
+CPU/NotCertified on failure without invoking the provider opener. The
+source-compatible public `decision_fingerprint() -> String` returns an
+empty string on failure and is not used for native admission. No result is
+cached. A changed digest invalidates certification bound to an older one.
 
 [intel-npu-stack]: https://github.com/archledger/intel-npu-stack
 [intel-npu-stack#20]: https://github.com/archledger/intel-npu-stack/issues/20

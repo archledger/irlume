@@ -19,6 +19,18 @@
 //! or a random release token) is SEALED IN THE TPM, gated by PCR policy, and
 //! released only on a successful live+match, not the template itself.
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+/// Whether this library or a dependency contains non-shippable evidence code.
+pub const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence)
+    || irlume_common::HARDWARE_EVIDENCE_BUILD
+    || irlume_vision::HARDWARE_EVIDENCE_BUILD;
+#[cfg(not(irlume_hw_evidence))]
+const _: () = assert!(
+    !HARDWARE_EVIDENCE_BUILD,
+    "irlume evidence build refused: irlume-core/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 pub mod account;
 pub mod biopolicy;
 pub mod calib;

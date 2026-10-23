@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Build-boundary guards for measurement-only evidence tooling (ADR-0022,
+  amendment 2026-10-22, #1164). All seven shipped Rust artifacts reject the
+  evidence cfg, and normal consumers reject marked library dependencies.
+  CLI and daemon startup also refuse an evidence-marked build before other
+  work. This adds no measurement runtime, loading permission or certification.
+
 - The GPU recognizer target behind the closed loading admission (ADR-0033
   phase 3, #1161). A `recognizer_device=gpu` selection with the GPU switch
   on now opens a GPU context instead of skipping: the loading admission

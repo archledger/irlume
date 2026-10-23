@@ -17,6 +17,17 @@
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+/// Whether this library or a dependency contains non-shippable evidence code.
+pub const HARDWARE_EVIDENCE_BUILD: bool =
+    cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD;
+#[cfg(not(irlume_hw_evidence))]
+const _: () = assert!(
+    !HARDWARE_EVIDENCE_BUILD,
+    "irlume evidence build refused: irlume-vision/dependency"
+);
+// END HARDWARE EVIDENCE BOUNDARY
+
 pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;

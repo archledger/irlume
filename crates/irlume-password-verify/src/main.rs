@@ -3,6 +3,11 @@
 //! Private, non-setuid local-password verifier. Linux-PAM ABI follows
 //! security/pam_appl.h and pam_conv(3). The root daemon bounds its lifetime,
 //! supplies a cleared environment, and owns stdin/stdout/stderr pipes.
+// BEGIN HARDWARE EVIDENCE BOUNDARY
+#[cfg(irlume_hw_evidence)]
+compile_error!("irlume evidence build refused: irlume-password-verify/direct");
+// END HARDWARE EVIDENCE BOUNDARY
+
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;

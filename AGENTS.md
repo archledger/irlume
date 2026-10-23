@@ -71,6 +71,9 @@ matching rows below.
 
 ```sh
 cargo fmt --all --check
+cargo fetch --locked
+python3 scripts/test-evidence-build-boundary.py --self-test
+python3 scripts/test-evidence-build-boundary.py --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --all-targets -- -D warnings
 cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples

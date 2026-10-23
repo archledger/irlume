@@ -1354,6 +1354,26 @@ These are mistake-prevention guards for the reviewed source and toolchain,
 not protection against a builder who edits the guards or compiler. A
 measurement build is never installed as an authentication component.
 
+#### Build-boundary implementation, 2026-10-23
+
+The build-boundary guards are implemented separately from reference isolation
+and launch admission. Each internal Rust library reports its own evidence
+cfg OR its direct internal dependencies' markers; an ordinary library
+rejects an evidence dependency. Each shipped root has a direct cfg refusal,
+and each shipped library consumer also rejects the aggregate dependency
+marker. This includes markers originating in auth, core or liveness rather
+than only in vision. The CLI and daemon call the terminating refusal routine
+as their first startup action. A marked start exits with status 1; its fixed
+stderr diagnostic is best-effort and cannot make the routine wait indefinitely.
+
+The compiler regression matrix checks normal and marked library builds,
+all seven root-only refusals, reverse mixed builds, individual consumer
+guards and an unmasked auth/liveness edge. Cargo metadata pins both target
+membership and normal dependency edges; a restricted source check verifies
+every marker's terms and active startup wiring. Compiler receipts record
+which units were marked and the intended refusal diagnostics. These guards
+do not provide a launch capability or make an evidence runtime available.
+
 ### Reference isolation
 
 An evidence build rejects the ORT execution-provider features `cuda`,

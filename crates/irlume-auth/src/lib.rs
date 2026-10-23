@@ -4544,7 +4544,12 @@ impl Engine {
     /// inflation. The ONE place both RGB match paths get their bar, so the
     /// threshold cannot reach one path and miss the other.
     fn rgb_grant_threshold(&self, n_templates: usize) -> f32 {
-        irlume_core::scaled_threshold(self.rgb_threshold, n_templates)
+        identity_arms::arm_threshold(
+            identity_arms::ThresholdArm::Rgb {
+                base: self.rgb_threshold,
+            },
+            n_templates,
+        )
     }
 
     /// Dimensionality of the IR embeddings this engine emits. The recognizer

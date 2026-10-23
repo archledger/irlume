@@ -7,14 +7,19 @@
 //! A checked description verifies only the declared/observed facts and their
 //! consistency. It proves neither their authenticity nor completeness of the
 //! native dependency/plugin closure, and gives no permission to load or launch.
-//! No environment, filesystem, native runtime or installed state is inspected.
-//! There is no serialized format or production admission path here.
+//! The pure checker inspects no environment, filesystem or runtime. The
+//! evidence-only fixture observer reads explicitly supplied file handles and
+//! checks their fixture paths; it does not acquire files or inspect an installed
+//! runtime. There is no serialized format or production admission path here.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 mod validate;
 pub use validate::check_description;
+
+#[cfg(feature = "npu")]
+pub mod observe;
 
 #[cfg(test)]
 mod tests;

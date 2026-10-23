@@ -30,6 +30,8 @@ pub mod gpu;
 mod identity;
 mod maps;
 mod runtime;
+#[cfg(irlume_hw_evidence)]
+pub(crate) use runtime::{fixture_trusted_metadata, fixture_trusted_path};
 pub use runtime::{library_setting, LibrarySetting, RuntimeSelection};
 
 /// The original reviewed OpenVINO C API soname (2026.2.0), retained for

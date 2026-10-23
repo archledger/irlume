@@ -61,6 +61,9 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   packaged copy present, else the system loader, is used; if that fails to
   load, engine-backed tests and the `irlume-auth` examples fail at once with a
   load error.
+- The evidence reference tests require ONNX Runtime 1.28.1 and the pinned
+  LiteRT library in `IRLUME_TFLITE_LIB`. The CI step downloads and verifies
+  that library into its temporary directory; it does not install it.
 
 ## Gate commands
 
@@ -74,6 +77,14 @@ cargo fmt --all --check
 cargo fetch --locked
 python3 scripts/test-evidence-build-boundary.py --self-test
 python3 scripts/test-evidence-build-boundary.py --check
+python3 scripts/test-reference-isolation.py --self-test
+python3 scripts/test-reference-isolation.py --check
+RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
+  --require escape_presence_precedes_ort_work \
+  --require escape_presence_precedes_tflite_work \
+  --require exact_cpu_selection_refuses_missing_ambiguous_and_failed_devices \
+  --require pinned_native_reference_executes_only_on_default_cpu \
+  -- cargo test --locked -p irlume-vision --features npu --lib reference_isolation_
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --all-targets -- -D warnings
 cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples

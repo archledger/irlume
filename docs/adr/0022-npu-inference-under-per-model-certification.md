@@ -1391,6 +1391,39 @@ Negative tests combine the evidence cfg with each forbidden feature and
 with the escape variable. A reference run must not silently become an
 accelerator run, even if its outputs happen to agree.
 
+#### Reference-isolation implementation, 2026-10-23
+
+Evidence builds of `irlume-vision` require `onnx`, which also enables the
+LiteRT baseline. Builds without that reference refuse instead of omitting
+its guard. Ordinary minimal builds remain supported. The four local ORT
+provider features have a direct compile error. A separate module also
+checks the pinned `ort` crate's feature-gated public provider exports, so
+direct `ort/<feature>` selection and normal-dependency feature unification
+cannot bypass the refusal. The compiler matrix tests all three routes.
+
+This export check depends on `ort` 2.0.0-rc.13 and is not a general Cargo
+feature-query interface. Independent `ort-sys` feature flags do not expose
+an ORT provider or select a native runtime in this `load-dynamic` build:
+its `disable-linking` build script returns before native build selection.
+The complete resolved graph and native closure still belong to the
+measurement-launch profile below.
+
+The escape-presence check precedes runtime cache returns, the diagnostic
+probe and both model constructors, including an injected LiteRT runtime.
+Evidence builds compile out the ordinary provider-registration branches
+and the `PreferCPU` fallback. They require exactly one device with EP name
+`CPUExecutionProvider`, EP vendor `Microsoft` and hardware type `CPU`.
+Missing, duplicate or failed registration refuses; it never selects a
+different CPU-type provider. Ordinary fallback and escape behavior remain
+unchanged, as do the thread, optimization and XNNPACK options.
+
+Required tests cover cold and populated caches, empty and non-UTF8 escape
+values, registration failures, and the device handles passed through the
+ORT API. A synthetic Add graph runs against pinned ONNX Runtime 1.28.1;
+its profile must contain an executed node and report only the default CPU
+provider. These tests use no biometric inputs. No measurement entry point,
+launch capability, accelerator loading permission or certification is added.
+
 ### Measurement-launch admission
 
 Bypassing the ordinary deployment admission requires a distinct,

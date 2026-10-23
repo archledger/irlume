@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- CPU-reference isolation for non-shippable evidence builds (ADR-0022,
+  Reference isolation, #1164). These builds reject ORT provider features,
+  including features enabled through another dependency, and refuse any
+  presence of the uncertified-provider escape. ORT sessions require one
+  exact default CPU provider; ordinary builds keep their existing behavior.
+  This adds no measurement runner, native loading permission or certification.
+
 - Build-boundary guards for measurement-only evidence tooling (ADR-0022,
   amendment 2026-10-22, #1164). All seven shipped Rust artifacts reject the
   evidence cfg, and normal consumers reject marked library dependencies.

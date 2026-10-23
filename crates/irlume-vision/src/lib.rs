@@ -31,6 +31,9 @@ const _: () = assert!(
 #[cfg(irlume_hw_evidence)]
 mod reference_isolation;
 
+#[cfg(irlume_hw_evidence)]
+pub mod measurement_profile;
+
 pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;

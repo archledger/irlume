@@ -245,6 +245,9 @@ jobs:
       - name: Recognizer ranking policy (no native loading)
         run: bash scripts/test-recognizer-ranking.sh
 
+      - name: Measurement profile descriptions (no native loading)
+        run: bash scripts/test-measurement-profile.sh
+
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)

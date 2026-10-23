@@ -200,13 +200,39 @@ jobs:
           cargo fetch --locked
           python3 scripts/test-evidence-build-boundary.py --self-test
           python3 scripts/test-evidence-build-boundary.py --check
+          python3 scripts/test-reference-isolation.py --self-test
+          python3 scripts/test-reference-isolation.py --check
+
+      - name: CPU reference isolation runtime checks (no accelerator)
+        timeout-minutes: 10
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          runtime_dir="$(mktemp -d)"
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz \
+            --output "$runtime_dir/tflite.tgz"
+          printf '%s  %s\n' \
+            dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311 \
+            "$runtime_dir/tflite.tgz" | sha256sum --check --strict
+          tar -xzf "$runtime_dir/tflite.tgz" -C "$runtime_dir" --strip-components=2 \
+            libtensorflowlite_c-v2.19.0-linux-x64/lib/libtensorflowlite_c.so
+          export IRLUME_TFLITE_LIB="$runtime_dir/libtensorflowlite_c.so"
+          RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
+            --require escape_presence_precedes_ort_work \
+            --require escape_presence_precedes_tflite_work \
+            --require exact_cpu_selection_refuses_missing_ambiguous_and_failed_devices \
+            --require pinned_native_reference_executes_only_on_default_cpu \
+            -- cargo test --locked -p irlume-vision --features npu --lib reference_isolation_
 
       - name: Upload evidence-build compiler receipts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: evidence-build-compiler-receipts
-          path: ${{ runner.temp }}/irlume-evidence-build-*
+          path: |
+            ${{ runner.temp }}/irlume-evidence-build-*
+            ${{ runner.temp }}/irlume-reference-isolation-*
           if-no-files-found: ignore
           retention-days: 3
 

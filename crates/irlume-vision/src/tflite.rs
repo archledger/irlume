@@ -27,7 +27,12 @@ use std::sync::OnceLock;
 
 use edgefirst_tflite::{Delegate, Interpreter, Library, Model, TensorType};
 
+static LIB: OnceLock<Library> = OnceLock::new();
+
 mod model_buffer;
+
+#[cfg(all(test, irlume_hw_evidence))]
+mod reference_isolation_tests;
 
 #[cfg(all(test, target_os = "linux", feature = "onnx"))]
 mod buffer_runtime_tests;
@@ -52,6 +57,10 @@ pub const PACKAGED_TFLITE_LIBS: &[&str] = &[
 /// surface needs to say so usefully.
 #[derive(Debug, thiserror::Error)]
 pub enum TfliteUnavailable {
+    /// A non-shippable reference build inherited an execution-provider escape.
+    #[cfg(irlume_hw_evidence)]
+    #[error("{reason}")]
+    ReferenceIsolation { reason: &'static str },
     /// The override was set to something this module refuses to hand to the
     /// dynamic loader. Distinct from a load failure: the fix is the value,
     /// not the library.
@@ -129,7 +138,9 @@ pub fn tflite_lib_candidates(
 /// handful of explicit paths are cheap.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn tflite_runtime() -> Result<&'static Library, TfliteUnavailable> {
-    static LIB: OnceLock<Library> = OnceLock::new();
+    #[cfg(irlume_hw_evidence)]
+    crate::reference_isolation::require_clean_environment()
+        .map_err(|reason| TfliteUnavailable::ReferenceIsolation { reason })?;
     if let Some(lib) = LIB.get() {
         return Ok(lib);
     }
@@ -232,6 +243,8 @@ impl TfliteSession {
         threads: i32,
         runtime: impl FnOnce() -> irlume_common::Result<&'static Library>,
     ) -> irlume_common::Result<Self> {
+        #[cfg(irlume_hw_evidence)]
+        crate::reference_isolation::require_clean_environment().map_err(err_str)?;
         let actual = model.sha256();
         if actual != expected_sha256 {
             return Err(err_str(format!(

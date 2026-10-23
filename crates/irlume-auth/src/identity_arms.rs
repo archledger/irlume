@@ -15,6 +15,41 @@ use irlume_core::fusion::{self, Fusion};
 use irlume_vision::align;
 use sha2::{Digest, Sha256};
 
+/// The identity arm whose comparison consumes the threshold.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ThresholdArm {
+    Rgb { base: f32 },
+    LitFallback { adapter: bool },
+    LitCentroid { adapter: bool },
+    DarkBest { adapter: bool },
+    DarkCentroid { adapter: bool },
+}
+
+/// Compute the existing threshold without changing its expression order.
+/// `count` is the compared template count for RGB/best-match arms and the
+/// enrollment profile count for centroid arms.
+pub(super) fn arm_threshold(arm: ThresholdArm, count: usize) -> f32 {
+    match arm {
+        ThresholdArm::Rgb { base } => irlume_core::scaled_threshold(base, count),
+        ThresholdArm::LitFallback { adapter } | ThresholdArm::LitCentroid { adapter } => {
+            let base = if adapter {
+                irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+            } else {
+                irlume_core::IR_MATCH_THRESHOLD
+            };
+            irlume_core::scaled_threshold(base, count) + irlume_core::IR_FALLBACK_MARGIN
+        }
+        ThresholdArm::DarkBest { adapter } | ThresholdArm::DarkCentroid { adapter } => {
+            let base = if adapter {
+                irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+            } else {
+                irlume_core::IR_DARK_MATCH_THRESHOLD
+            };
+            irlume_core::scaled_threshold(base, count)
+        }
+    }
+}
+
 /// Calibration-aware IR match result (see [`ir_match_in`]).
 pub(super) struct IrMatch {
     pub(super) best: f32,
@@ -32,14 +67,9 @@ pub(super) struct IdentityThresholds {
 
 impl IdentityThresholds {
     pub(super) fn new(templates: usize, profiles: usize, adapter: bool) -> Self {
-        let base = if adapter {
-            irlume_core::IR_ADAPTED_MATCH_THRESHOLD
-        } else {
-            irlume_core::IR_DARK_MATCH_THRESHOLD
-        };
         Self {
-            best: irlume_core::scaled_threshold(base, templates),
-            centroid: irlume_core::scaled_threshold(base, profiles),
+            best: arm_threshold(ThresholdArm::DarkBest { adapter }, templates),
+            centroid: arm_threshold(ThresholdArm::DarkCentroid { adapter }, profiles),
         }
     }
 
@@ -195,7 +225,7 @@ pub(super) fn best_rgb(probe: &[f32], scans: &[(&str, &str, &[f32])]) -> (f32, S
 /// `base`, and whether `score` grants on it. A sequential-schedule pair
 /// never grants on RGB alone (ADR-0014).
 pub(super) fn rgb_arm(score: f32, base: f32, templates: usize, sequential: bool) -> (f32, bool) {
-    let threshold = irlume_core::scaled_threshold(base, templates);
+    let threshold = arm_threshold(ThresholdArm::Rgb { base }, templates);
     (
         threshold,
         rgb_primary_grant_admissible(score, threshold, sequential),
@@ -240,17 +270,12 @@ pub(super) fn lit_ir_arms(
         fusion::ir_genuine_prob(ir_score),
         fusion::ir_quality_weight(true, ir_brightness),
     );
-    let base = if adapter {
-        irlume_core::IR_ADAPTED_MATCH_THRESHOLD
-    } else {
-        irlume_core::IR_MATCH_THRESHOLD
-    };
     let fallback_threshold =
-        irlume_core::scaled_threshold(base, matched.n_templates) + irlume_core::IR_FALLBACK_MARGIN;
+        arm_threshold(ThresholdArm::LitFallback { adapter }, matched.n_templates);
     let centroid_threshold = matched
         .centroid
         .as_ref()
-        .map(|_| irlume_core::scaled_threshold(base, profiles) + irlume_core::IR_FALLBACK_MARGIN);
+        .map(|_| arm_threshold(ThresholdArm::LitCentroid { adapter }, profiles));
     let grant = if fusion.grant && !sequential {
         Some(IrArm::Fusion)
     } else if ir_score >= fallback_threshold {
@@ -505,6 +530,72 @@ pub fn decision_fingerprint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threshold_roles_preserve_the_existing_expression_bits() {
+        let counts = (0usize..=256)
+            .chain((0..usize::BITS).map(|shift| 1usize << shift))
+            .chain([usize::MAX]);
+        for count in counts {
+            for base in [
+                -1.0,
+                -0.0,
+                0.0,
+                0.55,
+                1.0,
+                f32::from_bits(1),
+                f32::from_bits(0x7fc1_2345),
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+            ] {
+                let expected = irlume_core::scaled_threshold(base, count);
+                assert_eq!(
+                    arm_threshold(ThresholdArm::Rgb { base }, count).to_bits(),
+                    expected.to_bits(),
+                    "RGB count={count}, base={:08x}",
+                    base.to_bits()
+                );
+            }
+            for adapter in [false, true] {
+                let lit_base = if adapter {
+                    irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+                } else {
+                    irlume_core::IR_MATCH_THRESHOLD
+                };
+                let dark_base = if adapter {
+                    irlume_core::IR_ADAPTED_MATCH_THRESHOLD
+                } else {
+                    irlume_core::IR_DARK_MATCH_THRESHOLD
+                };
+                for (arm, expected) in [
+                    (
+                        ThresholdArm::LitFallback { adapter },
+                        irlume_core::scaled_threshold(lit_base, count)
+                            + irlume_core::IR_FALLBACK_MARGIN,
+                    ),
+                    (
+                        ThresholdArm::LitCentroid { adapter },
+                        irlume_core::scaled_threshold(lit_base, count)
+                            + irlume_core::IR_FALLBACK_MARGIN,
+                    ),
+                    (
+                        ThresholdArm::DarkBest { adapter },
+                        irlume_core::scaled_threshold(dark_base, count),
+                    ),
+                    (
+                        ThresholdArm::DarkCentroid { adapter },
+                        irlume_core::scaled_threshold(dark_base, count),
+                    ),
+                ] {
+                    assert_eq!(
+                        arm_threshold(arm, count).to_bits(),
+                        expected.to_bits(),
+                        "{arm:?}, count={count}"
+                    );
+                }
+            }
+        }
+    }
 
     fn matched(best: f32, n_templates: usize, centroid: Option<f32>) -> IrMatch {
         IrMatch {

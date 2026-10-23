@@ -8397,14 +8397,10 @@ impl Engine {
             }
             // SecureDark's stricter raw base and adapter base are shared with
             // explicit IR evidence; gates and scene routing remain independent.
-            let thresholds = ir_assessment::IdentityThresholds::new(
-                m.n_templates,
-                enr.profiles.len(),
-                self.ir_adapter.is_some(),
-            );
-            let (best_matches, centroid_matches) = thresholds.arms(&m);
-            let ir_thr = thresholds.best;
-            let (score, who) = (m.best, m.best_who.clone());
+            let verdict =
+                identity_arms::dark_verdict(&m, enr.profiles.len(), self.ir_adapter.is_some());
+            let ir_thr = verdict.thresholds.best;
+            let score = m.best;
             irlume_common::dlog!(
                 "match(ir/dark): best {score:.3} vs thr {ir_thr:.3} ({} scans, adapter={}, calib_centroid={:?})",
                 m.n_templates,
@@ -8416,28 +8412,28 @@ impl Engine {
                 irlume_common::diagnostics::TraceMetric::MatchCosine,
                 score,
                 ir_thr,
-                best_matches,
+                verdict.best,
             );
             // Grant on best-of-N at the scaled threshold, or on the
             // calibrated centroid at the base threshold (no best-of-N FAR
             // inflation; the prototype-validated mean-template protocol).
-            if best_matches {
+            if let Some(identity_arms::DarkGrant::Best { score, who }) = verdict.grant {
                 return Ok(Outcome::grant(score, format!("match: {who} (ir/dark)")));
             }
-            if let Some((cs, cwho)) = &m.centroid {
-                let cthr = thresholds.centroid;
+            if let Some((cs, _)) = &m.centroid {
+                let cthr = verdict.thresholds.centroid;
                 irlume_common::dlog!("match(ir/dark centroid): {cs:.3} vs thr {cthr:.3}");
                 emit_trace_match(
                     diagnostics,
                     irlume_common::diagnostics::TraceMetric::MatchCosine,
                     *cs,
                     cthr,
-                    centroid_matches,
+                    verdict.centroid,
                 );
-                if centroid_matches {
+                if let Some(identity_arms::DarkGrant::Centroid { score, who }) = verdict.grant {
                     return Ok(Outcome::grant(
-                        *cs,
-                        format!("match: {cwho} (ir/dark, calibrated centroid)"),
+                        score,
+                        format!("match: {who} (ir/dark, calibrated centroid)"),
                     ));
                 }
             }

@@ -87,6 +87,46 @@ impl IdentityThresholds {
     }
 }
 
+/// The selected dark-path grant and data from the match that produced it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DarkGrant<'a> {
+    Best { score: f32, who: &'a str },
+    Centroid { score: f32, who: &'a str },
+}
+
+/// Dark identity results, including both arm flags for trace and reporting.
+pub(super) struct DarkVerdict<'a> {
+    pub(super) thresholds: IdentityThresholds,
+    pub(super) best: bool,
+    pub(super) centroid: bool,
+    pub(super) grant: Option<DarkGrant<'a>>,
+}
+
+/// Select best before centroid without performing liveness or PAD checks.
+pub(super) fn dark_verdict(matched: &IrMatch, profiles: usize, adapter: bool) -> DarkVerdict<'_> {
+    let thresholds = IdentityThresholds::new(matched.n_templates, profiles, adapter);
+    let (best, centroid) = thresholds.arms(matched);
+    let grant = if best {
+        Some(DarkGrant::Best {
+            score: matched.best,
+            who: &matched.best_who,
+        })
+    } else if centroid {
+        matched
+            .centroid
+            .as_ref()
+            .map(|(score, who)| DarkGrant::Centroid { score: *score, who })
+    } else {
+        None
+    };
+    DarkVerdict {
+        thresholds,
+        best,
+        centroid,
+        grant,
+    }
+}
+
 /// IR matching across profiles, calibration-aware. Per profile: when a
 /// fitted calibration exists (and no global adapter is loaded), both the
 /// probe and that profile's templates are calibrated before scoring, and the
@@ -530,6 +570,74 @@ pub fn decision_fingerprint() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_verdict_preserves_priority_flags_and_identity_data() {
+        for adapter in [false, true] {
+            for templates in [0, 1, 30, 90, usize::MAX] {
+                for profiles in [0, 1, 3, 90] {
+                    let thresholds = IdentityThresholds::new(templates, profiles, adapter);
+                    for best in [
+                        f32::NEG_INFINITY,
+                        -0.0,
+                        thresholds.best.next_down(),
+                        thresholds.best,
+                        thresholds.best.next_up(),
+                        f32::INFINITY,
+                        f32::NAN,
+                    ] {
+                        for centroid in [
+                            None,
+                            Some(f32::NEG_INFINITY),
+                            Some(thresholds.centroid.next_down()),
+                            Some(thresholds.centroid),
+                            Some(thresholds.centroid.next_up()),
+                            Some(f32::INFINITY),
+                            Some(f32::NAN),
+                        ] {
+                            let matched = IrMatch {
+                                best,
+                                best_who: "best-profile".into(),
+                                n_templates: templates,
+                                centroid: centroid.map(|score| (score, "centroid-profile".into())),
+                            };
+                            let best_passes =
+                                templates > 0 && best.is_finite() && best >= thresholds.best;
+                            let centroid_passes = templates > 0
+                                && centroid.is_some_and(|score| {
+                                    score.is_finite() && score >= thresholds.centroid
+                                });
+                            let expected = if best_passes {
+                                Some((0, best.to_bits(), "best-profile"))
+                            } else if centroid_passes {
+                                centroid.map(|score| (1, score.to_bits(), "centroid-profile"))
+                            } else {
+                                None
+                            };
+                            let verdict = dark_verdict(&matched, profiles, adapter);
+                            assert_eq!(
+                                verdict.thresholds.best.to_bits(),
+                                thresholds.best.to_bits()
+                            );
+                            assert_eq!(
+                                verdict.thresholds.centroid.to_bits(),
+                                thresholds.centroid.to_bits()
+                            );
+                            assert_eq!(
+                                (verdict.best, verdict.centroid),
+                                (best_passes, centroid_passes)
+                            );
+                            let actual = verdict.grant.map(|grant| match grant {
+                                DarkGrant::Best { score, who } => (0, score.to_bits(), who),
+                                DarkGrant::Centroid { score, who } => (1, score.to_bits(), who),
+                            });
+                            assert_eq!(actual, expected, "adapter={adapter} templates={templates} profiles={profiles} best={best:?} centroid={centroid:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn threshold_roles_preserve_the_existing_expression_bits() {

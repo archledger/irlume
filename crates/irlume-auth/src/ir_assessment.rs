@@ -3,6 +3,7 @@
 
 //! Private IR evidence shared by diagnostic and authentication consumers.
 
+#[cfg(test)]
 pub(super) use super::identity_arms::IdentityThresholds;
 use super::*;
 
@@ -394,22 +395,17 @@ pub(super) fn assessed_outcome(
     if matched.n_templates == 0 {
         return refusal_outcome(IrFailure::IncompatibleEnrollment);
     }
-    let (best, centroid) =
-        IdentityThresholds::new(matched.n_templates, enrollment.profiles.len(), adapter)
-            .arms(matched);
-    if best {
-        return Outcome::grant(
-            matched.best,
-            format!("match: {} (experimental IR-only)", matched.best_who),
-        );
-    }
-    if centroid {
-        if let Some((score, who)) = &matched.centroid {
+    match identity_arms::dark_verdict(matched, enrollment.profiles.len(), adapter).grant {
+        Some(identity_arms::DarkGrant::Best { score, who }) => {
+            return Outcome::grant(score, format!("match: {who} (experimental IR-only)"));
+        }
+        Some(identity_arms::DarkGrant::Centroid { score, who }) => {
             return Outcome::grant(
-                *score,
+                score,
                 format!("match: {who} (experimental IR-only centroid)"),
             );
         }
+        None => {}
     }
     Outcome::deny_live(
         OutcomeKind::BelowThreshold,
@@ -1648,6 +1644,56 @@ mod tests {
         assert!(readiness_refusal(Ready::SecondaryUnvalidated)
             .reason
             .contains("not yet validated"));
+    }
+
+    #[test]
+    fn production_ir_outcome_preserves_selected_score_name_and_precedence() {
+        let enrollment = irlume_core::storage::Enrollment::new("synthetic");
+        let cases: [(f32, f32, &str, f32); 2] = [
+            (
+                0.2,
+                0.9,
+                "match: centroid-profile (experimental IR-only centroid)",
+                0.9,
+            ),
+            (
+                0.95,
+                0.99,
+                "match: best-profile (experimental IR-only)",
+                0.95,
+            ),
+        ];
+        for adapter in [false, true] {
+            for (best, centroid, reason, score) in cases {
+                let assessment = IrAssessment {
+                    matched: IrMatch {
+                        best,
+                        best_who: "best-profile".into(),
+                        n_templates: 2,
+                        centroid: Some((centroid, "centroid-profile".into())),
+                    },
+                    signals: Signals {
+                        ir_face: Some(irlume_liveness::FaceBox {
+                            cx: 0.5,
+                            cy: 0.5,
+                            score: 0.99,
+                        }),
+                        ir_face_brightness: 100.0,
+                        ir_center_edge_ratio: 1.5,
+                        ir_ceiling_known: true,
+                        ir_saturated_frac: Some(0.0),
+                        ..Default::default()
+                    },
+                    pad: PadEvidence::Score(0.1),
+                };
+                let outcome = assessed_outcome(&assessment, &enrollment, adapter);
+                assert!(outcome.granted && outcome.live);
+                assert_eq!(outcome.kind, OutcomeKind::Granted);
+                assert_eq!(outcome.cause, None);
+                assert_eq!(outcome.score.to_bits(), score.to_bits());
+                assert_eq!(outcome.reason, reason);
+            }
+        }
     }
 
     #[test]

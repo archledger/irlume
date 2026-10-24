@@ -715,6 +715,69 @@ fn a_dangling_user_flag_never_reaches_the_daemon() {
 // ---------------------------------------------------------- daemon-backed cmds
 
 #[test]
+fn doctor_json_keeps_system_probe_output_private() {
+    for (exit, enabled_exit, expected_state) in [(0, 0, "pass"), (1, 0, "warn"), (1, 1, "warn")] {
+        let sb = Sandbox::new(&format!("doctor-quiet-probes-{exit}-{enabled_exit}"));
+        let pam = sb.path("pam");
+        let vendor = sb.path("vendor-pam");
+        std::fs::create_dir_all(&pam).unwrap();
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(pam.join("sudo"), "auth sufficient pam_fprintd.so\n").unwrap();
+        std::fs::write(pam.join("gdm-password"), "auth sufficient pam_irlume.so\n").unwrap();
+        let calls = sb.path("systemctl-calls");
+        sb.fake_tool(
+            "systemctl",
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\n\
+                 printf 'probe stdout\\n'\n\
+                 printf 'probe stderr\\n' >&2\n\
+                 [ \"$1\" = is-enabled ] && exit {enabled_exit}\nexit {exit}",
+                calls.display()
+            ),
+        );
+        sb.fake_tool("authselect", "exit 0");
+        sb.fake_tool("fprintd-verify", "exit 1");
+        sb.fake_tool("fprintd-list", "exit 1");
+        let mut command = support::isolated_root_command(
+            &sb.root,
+            BIN,
+            &["doctor", "--json"],
+            &["systemctl", "authselect", "fprintd-verify", "fprintd-list"],
+            &[],
+            &[(&pam, "/etc/pam.d"), (&vendor, "/usr/lib/pam.d")],
+        );
+        let (code, out, err) = run(&mut command);
+        assert_eq!(code, 0, "{out} {err}");
+        assert!(err.is_empty(), "probe output escaped: {err}");
+        let document: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let check = document["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "pam-regeneration-guard")
+            .unwrap();
+        assert_eq!(check["state"], expected_state, "{check}");
+        let calls = std::fs::read_to_string(calls).unwrap();
+        let called = |expected| calls.lines().any(|line| line == expected);
+        assert!(called("is-active --quiet sshd"), "{calls}");
+        assert!(called("is-active --quiet irlume-reconcile.path"), "{calls}");
+        if exit != 0 {
+            assert!(called("is-enabled --quiet sshd"), "{calls}");
+            assert_eq!(
+                called("is-active --quiet ssh"),
+                enabled_exit != 0,
+                "{calls}"
+            );
+            assert_eq!(
+                called("is-enabled --quiet ssh"),
+                enabled_exit != 0,
+                "{calls}"
+            );
+        }
+    }
+}
+
+#[test]
 fn enroll_fails_cleanly_without_a_daemon() {
     let sb = Sandbox::new("enroll");
     let (code, _, err) = run(&mut sb.cmd(&[

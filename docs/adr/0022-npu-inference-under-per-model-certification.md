@@ -1475,6 +1475,30 @@ CI runs its named unit tests and both external-import doctests with matching
 evidence cfgs. The trusted observer, launcher and capability above remain
 unimplemented by this foundation.
 
+#### Fixture file observations
+
+Evidence builds with the `npu` feature can observe explicitly supplied file
+handles in an owned local fixture directory. The observer retains each
+handle and the exact buffer it hashes. It compares descriptor metadata with
+both the original path and the resolved endpoint before and after reading,
+then rechecks the batch and compares aliases. It reads no process environment
+and performs no installation discovery, native loading or process launch.
+
+Default budgets are 64 MiB per file, 256 MiB retained per batch and 8,192 read
+attempts. Hard ceilings are 256 MiB, 1 GiB and 65,536 attempts, respectively;
+at most 256 files and 64 KiB per read are allowed. Read attempts include
+interruptions and EOF probes. Each alias buffer counts toward retained bytes.
+Required CI checks the observer, its non-authorizing interface and the
+existing runtime path policy using synthetic fixtures.
+
+The observer assumes responsive local fixture files without concurrent
+writers. An open handle does not freeze content; repeated metadata checks
+are not an atomic snapshot or race-free acquisition. Read-count limits do
+not bound blocking I/O time, and fallible reservations do not guarantee
+recovery from every allocation failure. Production acquisition, immutable
+runtime generations, complete native dependency checks and trusted launch
+remain separate requirements.
+
 ### Cache and production path
 
 The runner creates a fresh, empty, owner-only 0700 cache on an approved

@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Descriptor-backed measurement observations for explicitly supplied local
+  fixture files (ADR-0022, Fixture file observations, #1164). Evidence builds
+  retain the hashed bytes and file handles, check original and resolved
+  paths, and refuse observed changes or inconsistent aliases. This does not
+  establish immutable files, complete native dependencies or launch permission.
+
 - A non-authorizing measurement-profile description checker in evidence
   builds (ADR-0022, Measurement-launch admission, #1164). It checks supplied
   inventories, file observations and exact environment entries for internal

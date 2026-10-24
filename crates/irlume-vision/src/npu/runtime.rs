@@ -128,6 +128,10 @@ fn trusted_metadata(owner: u32, mode: u32, expected: u32) -> bool {
 }
 
 fn trusted_path(path: &Path, trust: &Trust) -> Result<(), CpuReason> {
+    walk_trusted_path(path, trust).map(|_| ())
+}
+
+fn walk_trusted_path(path: &Path, trust: &Trust) -> Result<PathBuf, CpuReason> {
     let refuse = || {
         CpuReason::IdentityUnreadable(
         "the NPU runtime must be in an administrator-owned installation without group/other writes".into(),
@@ -187,7 +191,30 @@ fn trusted_path(path: &Path, trust: &Trust) -> Result<(), CpuReason> {
             resolved = next;
         }
     }
-    Ok(())
+    Ok(resolved)
+}
+
+/// Observe an explicit fixture path using the production traversal policy.
+/// This neither acquires a file nor grants native loading permission.
+#[cfg(irlume_hw_evidence)]
+pub(crate) fn fixture_trusted_path(
+    path: &Path,
+    boundary: &Path,
+    owner: u32,
+) -> Result<PathBuf, CpuReason> {
+    walk_trusted_path(
+        path,
+        &Trust {
+            owner,
+            boundary: boundary.to_path_buf(),
+        },
+    )
+}
+
+/// Apply the same ownership/write predicate to an already-open fixture file.
+#[cfg(irlume_hw_evidence)]
+pub(crate) fn fixture_trusted_metadata(owner: u32, mode: u32, expected: u32) -> bool {
+    trusted_metadata(owner, mode, expected)
 }
 
 fn reviewed_name(path: &Path) -> bool {

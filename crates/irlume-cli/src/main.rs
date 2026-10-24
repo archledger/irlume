@@ -364,7 +364,9 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
     if add_camera {
         return enroll_add_camera(&user, name, scans, choice, split_choice);
     }
-    eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
+    if !is_root() {
+        eprintln!("[enroll] approve the system authentication dialog before capture; each additional scan request needs approval");
+    }
     if reset {
         eprintln!("[enroll] --reset: replacing '{user}'s enrollment after successful capture (preserves the template key and recovery setup)");
     }
@@ -569,7 +571,9 @@ fn enroll_add_camera(
     } else {
         "the CURRENT camera pair"
     };
-    eprintln!("[add-camera] approve the system authentication dialog before capture");
+    if !is_root() {
+        eprintln!("[add-camera] approve the system authentication dialog before capture");
+    }
     eprintln!(
         "[add-camera] '{user}': capturing this face on {target}; stay in \
          frame, look at the camera…"
@@ -807,7 +811,9 @@ fn profiles(sub: Option<&str>, args: &[String]) -> std::process::ExitCode {
                     Ok(s) => s,
                     Err(code) => return code,
                 };
-                eprintln!("[profiles] approve the system authentication dialog before capture");
+                if !is_root() {
+                    eprintln!("[profiles] approve the system authentication dialog before capture");
+                }
                 match scans {
                     Some(n) if n > 1 => eprintln!(
                         "[profiles] adding {n} scans to '{p}'; stay in frame, vary your pose slightly…"

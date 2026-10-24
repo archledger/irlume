@@ -7285,6 +7285,8 @@ fn report_pam_regeneration_guard(report: &mut crate::doctor_report::Report) {
     };
     let watcher_active = std::process::Command::new("systemctl")
         .args(["is-active", "--quiet", "irlume-reconcile.path"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false);

@@ -125,7 +125,7 @@ jobs:
             bash -euc '
               pacman-key --init
               pacman -Syu --noconfirm --needed \
-                base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap
+                base-devel git rust clang pam tpm2-tss curl ca-certificates bubblewrap pax-utils python-pyelftools python-jsonschema
               # Permission and permanent-credential-drop tests model a login
               # account. UID 0 bypasses DAC and is deliberately refused as a
               # wallet target. Namespace-root CLI fixtures still run via bwrap.

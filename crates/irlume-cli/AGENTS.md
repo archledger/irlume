@@ -135,7 +135,10 @@ where older pages break them.
   reads the next test's `IRLUME_SOCKET`.
 - Other env tests hold `crate::testenv::ENV_LOCK`. Black-box tests
   (`tests/cli.rs`: `Sandbox`, `serve`) run the binary directly under the
-  sandbox environment overrides; only those built on
+  sandbox environment overrides. Tests built on
   `support::isolated_root_command` need `/usr/bin/bwrap`: `isolated_root_cmd`
   for fixed-path root probes, and tests that bind fixture directories at fixed
-  paths such as `/etc/pam.d` (its `binds`). The rest run on a host without it.
+  paths such as `/etc/pam.d` (its `binds`). The selection-provenance test also
+  needs bubblewrap, a C compiler, pax-utils `lddtree` and Python `jsonschema`;
+  its host entry starts the empty-root runner before executing the CLI.
+  Other tests run on a host without bubblewrap.

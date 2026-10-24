@@ -48,8 +48,11 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
 - The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
   directories at system paths, and the daemon's shared-greeter
   runtime-directory and software-TPM eyes-open tests exec `/usr/bin/bwrap` (Ubuntu 24.04:
-  `bash scripts/ci-bubblewrap.sh --check`); the CLI's other black-box tests
-  do not. Without pamtester and pam_wrapper most PAM end-to-end tests pass
+  `bash scripts/ci-bubblewrap.sh --check`). The selection-provenance CLI test
+  also needs bubblewrap, a C compiler, pax-utils `lddtree` and Python
+  `jsonschema`; it starts an empty-root sandbox before running the CLI.
+  Other CLI black-box tests do not. Without pamtester and pam_wrapper most
+  PAM end-to-end tests pass
   vacuously and the COSMIC ones fail; `IRLUME_REQUIRE_PAM_TOOLS=1`, set in CI,
   makes them all fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
 - There is no `rust-toolchain` file. Outside Nix, run fmt, clippy and doc as
@@ -83,6 +86,7 @@ bash scripts/test-gpu-launch-inputs.sh
 bash scripts/test-recognizer-ranking.sh
 bash scripts/test-measurement-profile.sh
 bash scripts/test-measurement-observations.sh
+bash scripts/test-selection-provenance.sh
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \
@@ -102,7 +106,7 @@ cargo build --release --locked
 | When you touch | Also run |
 |---|---|
 | `irlume-vision` features, any dependency bump | `for f in cuda openvino coreml tensorrt; do cargo check -p irlume-vision --features "$f" --locked; done; cargo check -p irlume-vision --all-features --locked`; for the `npu` feature (ADR-0022) also `cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-vision --features npu --lib` and `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps`; with the `npu` features of `irlume-auth` and `irlume-daemon` also `cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings`, `cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization` and the guarded daemon provider-selection/Health command in the "Optional NPU inference checks (no NPU)" step of `ci.yml` (eight exact test names, each required, floor 8; synthetic state/config, no CLI helper needed) |
-| `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && python3 scripts/machine-api-conformance.py --irlume "${CARGO_TARGET_DIR:-target}/release/irlume" --strict` (needs python3 `jsonschema`) |
+| `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback) |
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs`, `crates/irlume-cli/src/uninstall.rs` | `bash scripts/check-packaging-parity.sh` (needs `desktop-file-validate`); for `packaging/apparmor/` also `apparmor_parser -QK <profile>`; for maintainer scripts also `python3 scripts/test-package-service-hooks.py` and `python3 scripts/test-ppa-service-hooks.py` (CI runs it in an Ubuntu container) |
 | systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `packaging/systemd/irlume-reconcile.service`) |

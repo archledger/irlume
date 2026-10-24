@@ -34,6 +34,7 @@ pub mod pam_service;
 pub mod platform;
 pub mod process;
 pub mod recognizer_ranking;
+pub mod recognizer_selection;
 pub mod secureboot;
 pub mod split_key;
 pub mod split_publish;
@@ -1665,6 +1666,10 @@ pub struct RecognizerPlacement {
     /// `None` when the daemon does not report one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
+    /// The source and parsing issue of the governing selection. Missing means
+    /// unreported, not a default selection. No raw configured value is carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_provenance: Option<recognizer_selection::RecognizerSelectionProvenance>,
     /// The accelerator the recognizer's probes run on, `"npu"` or `"gpu"`;
     /// `None` on CPU and from a daemon that predates GPU reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]

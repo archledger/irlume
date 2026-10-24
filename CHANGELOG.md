@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Selection-source and parsing-issue reporting in Health, `status --json`
+  and doctor (ADR-0033 section 6, #1163). Missing provenance remains unreported;
+  rejected raw settings are not exposed. Selection and accelerator placement
+  behavior are unchanged.
+
 - Descriptor-backed measurement observations for explicitly supplied local
   fixture files (ADR-0022, Fixture file observations, #1164). Evidence builds
   retain the hashed bytes and file handles, check original and resolved

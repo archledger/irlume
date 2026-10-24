@@ -105,7 +105,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor python3-yaml
+              build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor python3-yaml pax-utils python3-pyelftools python3-jsonschema
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi
@@ -251,6 +251,9 @@ jobs:
       - name: Measurement file observations (local fixtures only)
         run: bash scripts/test-measurement-observations.sh
 
+      - name: Selection provenance (unit and isolated CLI)
+        run: bash scripts/test-selection-provenance.sh
+
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)
@@ -345,8 +348,7 @@ jobs:
             python3 -c "import jsonschema"
           fi
           python3 scripts/test-machine-api-conformance.py
-          python3 scripts/machine-api-conformance.py \
-            --irlume "${CARGO_TARGET_DIR:-target}/release/irlume" --strict
+          bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"
 
       # The TPM-gated tests run against a software TPM: same TSS stack, no
       # hardware. IRLUME_TCTI is the production env override; swtpm state is
@@ -633,7 +635,7 @@ jobs:
           if command -v apt-get >/dev/null; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon bubblewrap apparmor
+              build-essential pkg-config clang libclang-dev libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon bubblewrap apparmor pax-utils python3-pyelftools python3-jsonschema
           else
             for t in cc pkg-config clang; do command -v "$t" >/dev/null || { echo "::error::$t missing on the runner"; exit 1; }; done
           fi

@@ -160,6 +160,28 @@ no production caller uses it to open loading. The installation/native
 closure, launcher provenance, affinity and enforcing-host evidence above
 remain required. Both certification tables remain empty.
 
+#### Supplied-byte ELF metadata
+
+The default-off `native-metadata` feature extracts metadata from supplied
+ELF64 little-endian x86-64 executable/shared-object bytes. It uses program
+headers, including for sectionless files; section tables cannot override
+the dynamic segment. Interpreter and effective string values borrow the
+input buffer. Unknown tags, duplicate string references and entries after
+the first `DT_NULL` remain visible; trailing entries never become effective.
+
+The parser rejects malformed ranges, unsupported layouts, conflicting
+string-table definitions and any competing LOAD mapping that intersects
+the string table. Limits are 256 MiB of input, 128 program headers, 4,096
+dynamic entries, 256 string references, 4,096 bytes per string and 1 MiB of
+referenced string bytes. Unit tests exercise minimal and NPU-combined
+builds; a separate fuzz target checks deterministic results and output bounds.
+
+Successful extraction establishes neither file provenance nor loading
+support. The parser does no filesystem access, dependency resolution,
+hashing, native loading or device discovery. Its output cannot authorize
+a launch or produce a certification. Complete dependency resolution and
+trusted launch admission remain required by section 4.
+
 ### 5. Certification gates are unchanged and binding
 
 A GPU certification must reproduce, on the target GPU identity and the

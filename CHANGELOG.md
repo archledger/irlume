@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Bounded ELF metadata inspection behind the default-off `native-metadata`
+  feature (ADR-0033, Supplied-byte ELF metadata, #1162). It reads supplied
+  program-header bytes, preserves raw loading metadata and rejects ambiguous
+  string-table mappings. It does not resolve dependencies or permit loading.
+
 - Selection-source and parsing-issue reporting in Health, `status --json`
   and doctor (ADR-0033 section 6, #1163). Missing provenance remains unreported;
   rejected raw settings are not exposed. Selection and accelerator placement

@@ -1019,6 +1019,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `doctor --json` keeps read-only systemctl probe output out of its JSON
+  and stderr, including when the system bus is unavailable. SSH-service
+  detection and the PAM-regeneration guard still use the probe exit status.
+
 - Apply the mirror policy to every APT-using job in the CI and sanitizer
   workflows, including stable Rust, unit-policy checks, fuzzing and ASan
   (#1184). The regression discovers those jobs and requires mirror selection

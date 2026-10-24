@@ -87,6 +87,7 @@ bash scripts/test-recognizer-ranking.sh
 bash scripts/test-measurement-profile.sh
 bash scripts/test-measurement-observations.sh
 bash scripts/test-selection-provenance.sh
+bash scripts/test-native-metadata.sh
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \

@@ -254,6 +254,9 @@ jobs:
       - name: Selection provenance (unit and isolated CLI)
         run: bash scripts/test-selection-provenance.sh
 
+      - name: Native ELF metadata (supplied bytes only)
+        run: bash scripts/test-native-metadata.sh
+
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)
@@ -989,13 +992,13 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log, and EK-certificate parsers
+      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log, EK-certificate and ELF-metadata parsers
         working-directory: fuzz
         run: |
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
-          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate native_metadata; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true

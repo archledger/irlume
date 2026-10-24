@@ -1499,6 +1499,34 @@ recovery from every allocation failure. Production acquisition, immutable
 runtime generations, complete native dependency checks and trusted launch
 remain separate requirements.
 
+#### Constrained fixture acquisition
+
+The evidence-only acquisition wrapper accepts a supplied directory handle
+and a nonempty batch of relative fixture paths. It opens each leaf beneath
+that handle using `openat2`, `OPENAT2_REGULAR`, no-follow and no-crossing
+resolution flags. The required regular-file flag is part of Linux 7.2's
+64-bit `open_how.flags` ABI. Unsupported platforms or kernels refuse; the
+wrapper never substitutes ordinary open or weakens flags on retry.
+
+It validates original root path and descriptor stamps at every checkpoint,
+checks regular-file ownership/mode, and passes the acquired handles to the
+existing observer. The default batch open-attempt budget is 1,024, with a
+hard ceiling of 8,192; interruptions and rename-related retries count.
+Existing file-count, retained-byte and read-call budgets remain separate.
+
+The caller must control a responsive local fixture directory without
+concurrent writers. Observed identity/stamp mismatches refuse; transient
+namespace changes are not guaranteed detectable. A retained directory,
+root ownership and repeated checks do not establish immutable contents or
+exclude previously opened writers. Production generation publication and
+retention remain separate requirements.
+
+Portable CI checks the policy and failure paths. A separate named kernel
+test must exercise the real Rust wrapper and observer on supported kernels
+after the final material change. It fails on missing support rather than
+counting a skipped syscall as positive evidence. This adds no production
+minimum kernel requirement, discovery, launcher or loading admission.
+
 ### Cache and production path
 
 The runner creates a fresh, empty, owner-only 0700 cache on an approved

@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Constrained acquisition of regular measurement fixture files through a
+  supplied directory handle (ADR-0022, Constrained fixture acquisition,
+  #1164). Evidence builds keep full `openat2` restrictions and refuse
+  unsupported kernels, observed identity changes and unsafe file types.
+  The result remains descriptive and grants no native-loading permission.
+
 - Bounded ELF metadata inspection behind the default-off `native-metadata`
   feature (ADR-0033, Supplied-byte ELF metadata, #1162). It reads supplied
   program-header bytes, preserves raw loading metadata and rejects ambiguous

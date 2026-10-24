@@ -21,6 +21,9 @@ pub use validate::check_description;
 #[cfg(feature = "npu")]
 pub mod observe;
 
+#[cfg(all(feature = "npu", target_os = "linux", target_arch = "x86_64"))]
+pub mod acquire;
+
 #[cfg(test)]
 mod tests;
 

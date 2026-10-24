@@ -116,6 +116,12 @@ impl ObservedFile {
     pub fn observation(&self) -> &FileObservation {
         &self.observation
     }
+
+    pub(super) fn current_stamp(&self) -> io::Result<FileStamp> {
+        self.file
+            .metadata()
+            .map(|metadata| FileStamp::from(&metadata))
+    }
 }
 
 impl fmt::Debug for ObservedFile {
@@ -234,10 +240,7 @@ fn observe_with(
     limits: ObservationLimits,
     io: &mut impl ObservationIo,
 ) -> Result<ObservedFixtureFiles, ObservationError> {
-    if limits.per_file_bytes > HARD_FILE_BYTES
-        || limits.total_bytes > HARD_TOTAL_BYTES
-        || limits.read_calls > HARD_READ_CALLS
-    {
+    if !valid_limits(limits) {
         return Err(ObservationError::InvalidLimits);
     }
     if inputs.len() > MAX_FILES {
@@ -265,11 +268,7 @@ fn observe_with(
         if !metadata.is_file() {
             return Err(ObservationError::NotRegular { file: index });
         }
-        if !crate::npu::fixture_trusted_metadata(
-            metadata.uid(),
-            metadata.mode(),
-            scope.expected_uid,
-        ) {
+        if !trusted_metadata(&metadata, scope.expected_uid) {
             return Err(ObservationError::UntrustedFile { file: index });
         }
         let stamp = FileStamp::from(&metadata);
@@ -349,12 +348,22 @@ fn observe_with(
     Ok(ObservedFixtureFiles { files })
 }
 
-fn valid_path(path: &Path) -> bool {
+pub(super) fn valid_path(path: &Path) -> bool {
     // Parent components remain meaningful after a resolved directory symlink;
     // the shared walker, not lexical normalization, checks their boundary.
     path.to_str().is_some_and(|text| {
         path.is_absolute() && text.len() <= MAX_TEXT_BYTES && !text.contains('\0')
     })
+}
+
+pub(super) fn valid_limits(limits: ObservationLimits) -> bool {
+    limits.per_file_bytes <= HARD_FILE_BYTES
+        && limits.total_bytes <= HARD_TOTAL_BYTES
+        && limits.read_calls <= HARD_READ_CALLS
+}
+
+pub(super) fn trusted_metadata(metadata: &Metadata, owner: u32) -> bool {
+    crate::npu::fixture_trusted_metadata(metadata.uid(), metadata.mode(), owner)
 }
 
 fn endpoint(
@@ -417,7 +426,7 @@ fn read_once(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileStamp {
+pub(super) struct FileStamp {
     dev: u64,
     ino: u64,
     size: u64,

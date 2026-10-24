@@ -42,6 +42,8 @@ pub mod gpu;
 pub mod light;
 pub mod moire;
 #[cfg(feature = "native-metadata")]
+pub mod native_generation;
+#[cfg(feature = "native-metadata")]
 pub mod native_metadata;
 #[cfg(feature = "npu")]
 pub mod npu;

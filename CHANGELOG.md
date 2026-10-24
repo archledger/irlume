@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Declared fixture dependency graphs built from the exact hashed ELF buffers
+  (ADR-0033, Declared fixture graph, #1162). The checker enforces bounded
+  roots, aliases, interpreter bindings and active metadata under an explicit
+  fixture policy. It does not prove loader behavior or permit native loading.
+
 - Constrained acquisition of regular measurement fixture files through a
   supplied directory handle (ADR-0022, Constrained fixture acquisition,
   #1164). Evidence builds keep full `openat2` restrictions and refuse

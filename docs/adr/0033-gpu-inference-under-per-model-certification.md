@@ -182,6 +182,36 @@ hashing, native loading or device discovery. Its output cannot authorize
 a launch or produce a certification. Complete dependency resolution and
 trusted launch admission remain required by section 4.
 
+#### Declared fixture graph
+
+The `native-metadata` feature also checks `declared-fixture-graph-v1` graphs.
+It matches arbitrary node IDs to supplied buffers, verifies canonical
+SHA-256 text against those bytes, and parses those same buffers. The
+description supplies generic roots, not presumed ORT, driver or plugin roles.
+
+This fixture policy uses one logical `lib/` namespace and an optional
+`bin/` executable with an explicit, exact `PT_INTERP` binding. Aliases and
+SONAMEs have one owner; NEEDED ordering and repeated edges are preserved.
+Active metadata follows an explicit tag/flag policy. RPATH refuses;
+RUNPATH accepts only `$ORIGIN` for libraries or `$ORIGIN/../lib` for the
+bound executable, selecting the declared directory rather than host paths.
+Ineffective entries after `DT_NULL` remain subject to parser structure and
+resource bounds but do not become active loading policy.
+
+Limits are 256 nodes/roots, 256 aliases, 4,096 edges including interpreter
+edges, 256 MiB per supplied buffer and 1 GiB total supplied bytes. Parser
+limits remain separate. Checked graphs borrow their own description and
+input buffers. The evidence/NPU adapter maps observer indices to IDs and
+uses retained observer bytes without reopening files. That mapping is an
+explicit remapping of labels, not proof that physical paths equal logical
+paths.
+
+Graph success establishes declared edge coverage only. It does not validate
+relocations or ABI behavior, discover omitted dynamic roots, emulate glibc,
+authenticate a generation or authorize a launch. It changes no certification,
+runtime identity or cache key. Production profile roles, acquisition,
+immutable-generation lifetime and trusted bootstrap remain separate work.
+
 ### 5. Certification gates are unchanged and binding
 
 A GPU certification must reproduce, on the target GPU identity and the

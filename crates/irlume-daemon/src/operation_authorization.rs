@@ -323,11 +323,14 @@ pub(super) fn authorize_for_test(
     authorize_using(req, peer, stream, |_, _, _| Ok(()))
 }
 
-fn method(owner: &str, name: &str) -> Result<Message, String> {
-    Message::new_method_call(owner, OBJECT, INTERFACE, name).map_err(|_| REFUSED.into())
+fn method(name: &str) -> Result<Message, String> {
+    // AppArmor checks the message destination, not every name the peer owns.
+    // Address the allowed well-known name; check() still pins reply senders to
+    // the unique authority owner resolved before this request.
+    Message::new_method_call(AUTHORITY, OBJECT, INTERFACE, name).map_err(|_| REFUSED.into())
 }
 
-fn approval_message(owner: &str, subject: &Subject, req: &Request) -> Result<Message, String> {
+fn approval_message(subject: &Subject, req: &Request) -> Result<Message, String> {
     let mut properties = PropMap::new();
     properties.insert("pid".into(), Variant(Box::new(subject.pid)));
     properties.insert("uid".into(), Variant(Box::new(subject.uid as i32)));
@@ -342,7 +345,7 @@ fn approval_message(owner: &str, subject: &Subject, req: &Request) -> Result<Mes
     );
     // One private bus connection per request makes this cancellation ID unique
     // for its caller without exposing a token to the socket client.
-    Ok(method(owner, "CheckAuthorization")?
+    Ok(method("CheckAuthorization")?
         .append3(("unix-process", properties), action, details)
         .append2(1u32, "enrollment"))
 }
@@ -412,7 +415,7 @@ fn check(
     }
     let owner = authority_owner(channel, deadline)?;
     let serial = channel
-        .send(approval_message(&owner, subject, req)?)
+        .send(approval_message(subject, req)?)
         .map_err(|_| REFUSED)?;
     let outcome = loop {
         if gone() || Instant::now() >= deadline {
@@ -431,8 +434,9 @@ fn check(
     };
     if outcome.is_err() {
         // Best effort, bounded cancellation on the SAME caller connection.
-        // Dropping the channel also drops this caller's pending request.
-        if let Ok(cancel) = method(&owner, "CancelCheckAuthorization") {
+        // If the authority changed owners, its successor may receive this;
+        // polkit cancels its authentication session when our private caller disconnects.
+        if let Ok(cancel) = method("CancelCheckAuthorization") {
             let _ = channel.send_with_reply_and_block(
                 cancel.append1("enrollment"),
                 Duration::from_millis(250),
@@ -513,7 +517,7 @@ mod tests {
             );
             assert!(!required(&req, &root), "root retains administration");
             let subject = Subject::capture(&caller).unwrap();
-            let message = approval_message(":1.42", &subject, &req).unwrap();
+            let message = approval_message(&subject, &req).unwrap();
             type Args = (
                 (String, PropMap),
                 String,
@@ -609,7 +613,7 @@ mod tests {
                 "erase the recovery passphrase",
             ),
         ] {
-            let message = approval_message(":1.42", &subject, &req).unwrap();
+            let message = approval_message(&subject, &req).unwrap();
             type Args = (
                 (String, PropMap),
                 String,
@@ -736,7 +740,7 @@ mod tests {
                 improve,
             };
             let subject = Subject::capture(&peer).unwrap();
-            let message = approval_message(":1.42", &subject, &req).unwrap();
+            let message = approval_message(&subject, &req).unwrap();
             type Args = (
                 (String, PropMap),
                 String,
@@ -996,13 +1000,48 @@ mod tests {
     }
 
     #[test]
+    fn polkit_messages_match_shipped_apparmor_destinations() {
+        let subject = Subject::capture(&peer()).unwrap();
+        let req = Request::Enroll {
+            user: "alice".into(),
+            profile: None,
+            scans: None,
+            reset: false,
+        };
+        for message in [
+            approval_message(&subject, &req).unwrap(),
+            method("CancelCheckAuthorization").unwrap(),
+        ] {
+            assert_eq!(message.destination().as_deref(), Some(AUTHORITY));
+            assert_eq!(message.path().as_deref(), Some(OBJECT));
+            assert_eq!(message.interface().as_deref(), Some(INTERFACE));
+        }
+        for profile in [
+            include_str!("../../../packaging/apparmor/usr.bin.irlumed"),
+            include_str!("../../../packaging/apparmor/usr.local.bin.irlumed"),
+        ] {
+            let compact: String = profile.split_whitespace().collect();
+            assert!(compact.contains(&format!(
+                "dbus(send)bus=systempath={OBJECT}interface={INTERFACE}\
+                 member={{CheckAuthorization,CancelCheckAuthorization}}peer=(name={AUTHORITY}),"
+            )));
+        }
+    }
+
+    #[test]
     fn real_dbus_exchange_checks_subject_action_denial_and_cancellation() {
         let _passwd = crate::tests::passwd_lock();
-        for (mode, kind) in ["allow", "deny", "malformed", "cancel", "forged"]
-            .into_iter()
-            .flat_map(|mode| {
-                ["enroll", "recovery", "profile", "recognizer"].map(|kind| (mode, kind))
-            })
+        for (mode, kind) in [
+            "allow",
+            "deny",
+            "malformed",
+            "cancel",
+            "forged",
+            "wrong-serial",
+            "handoff",
+        ]
+        .into_iter()
+        .flat_map(|mode| ["enroll", "recovery", "profile", "recognizer"].map(|kind| (mode, kind)))
         {
             let (_bus, address) = bus();
             let server = dbus::blocking::Connection::new_address(&address).unwrap();
@@ -1045,15 +1084,22 @@ mod tests {
             let worker = std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(3);
                 let mut checked = false;
+                let mut caller = None;
                 while Instant::now() < deadline {
-                    server
+                    let receiver = if mode == "handoff" && checked {
+                        &intruder
+                    } else {
+                        &server
+                    };
+                    receiver
                         .channel()
                         .read_write(Some(Duration::from_millis(10)))
                         .unwrap();
-                    let Some(message) = server.channel().pop_message() else {
+                    let Some(message) = receiver.channel().pop_message() else {
                         continue;
                     };
                     if message.member().as_ref().map(|m| m.as_ref()) == Some("CheckAuthorization") {
+                        assert_eq!(message.destination().as_deref(), Some(AUTHORITY));
                         type Args = (
                             (String, PropMap),
                             String,
@@ -1073,23 +1119,49 @@ mod tests {
                         assert_eq!(details["operation"], expected_operation);
                         assert_eq!(details.len(), 3);
                         assert_eq!(cancellation, "enrollment");
+                        caller = message.sender().map(|sender| sender.to_string());
                         checked = true;
-                        if mode == "forged" {
+                        if mode == "handoff" {
+                            server.release_name(AUTHORITY).unwrap();
                             intruder
+                                .request_name(AUTHORITY, false, true, false)
+                                .unwrap();
+                        }
+                        if matches!(mode, "forged" | "wrong-serial" | "handoff") {
+                            let forger = if mode == "wrong-serial" {
+                                &server
+                            } else {
+                                &intruder
+                            };
+                            let mut wrong_call = message.duplicate().unwrap();
+                            wrong_call.set_serial(if mode == "wrong-serial" {
+                                message.get_serial().unwrap().checked_add(1).unwrap()
+                            } else {
+                                message.get_serial().unwrap()
+                            });
+                            forger
                                 .channel()
-                                .send(message.method_return().append1((
+                                .send(wrong_call.method_return().append1((
                                     true,
                                     false,
                                     HashMap::<String, String>::new(),
                                 )))
                                 .unwrap();
-                            intruder
+                            // A bus round trip on the same connection ensures
+                            // the forged reply is queued before the real denial.
+                            let barrier = Message::new_method_call(
+                                "org.freedesktop.DBus",
+                                "/org/freedesktop/DBus",
+                                "org.freedesktop.DBus",
+                                "GetId",
+                            )
+                            .unwrap();
+                            forger
                                 .channel()
-                                .read_write(Some(Duration::from_millis(20)))
+                                .send_with_reply_and_block(barrier, Duration::from_secs(1))
                                 .unwrap();
-                            std::thread::sleep(Duration::from_millis(30));
                         }
-                        if mode == "cancel" {
+                        if matches!(mode, "cancel" | "handoff") {
                             continue;
                         }
                         let reply = if mode == "malformed" {
@@ -1113,9 +1185,11 @@ mod tests {
                         == Some("CancelCheckAuthorization")
                     {
                         assert!(checked);
+                        assert_eq!(message.destination().as_deref(), Some(AUTHORITY));
+                        assert_eq!(message.sender().as_deref(), caller.as_deref());
                         assert_eq!(message.read1::<String>().unwrap(), "enrollment");
-                        server.channel().send(message.method_return()).unwrap();
-                        server
+                        receiver.channel().send(message.method_return()).unwrap();
+                        receiver
                             .channel()
                             .read_write(Some(Duration::from_millis(10)))
                             .unwrap();

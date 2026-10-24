@@ -1019,6 +1019,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Enrollment, scan addition, profile removal and recovery management address
+  polkit by the well-known name allowed by the shipped AppArmor profiles
+  (#1207). Reply-sender, request and process checks remain unchanged. Root
+  capture commands no longer ask for a system authentication dialog they
+  do not request.
+
 - `doctor --json` keeps read-only systemctl probe output out of its JSON
   and stderr, including when the system bus is unavailable. SSH-service
   detection and the PAM-regeneration guard still use the probe exit status.

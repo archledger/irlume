@@ -37,6 +37,32 @@ How to read the key lines:
 | `irlume-gkr-unlock[pid]: …` | a GNOME keyring token on its way to gnome-keyring. Most of these lines do not contain the word irlume, so `irlume logs` leaves them out; read them with `journalctl -t irlume-gkr-unlock` (below) |
 | `pam_irlume(<svc>:session): GNOME keyring token hand-off failed: …` | the session line could not hand the GNOME keyring token to `irlume-gkr-unlock`, or the helper reported a failure, so a token-armed login keyring stays locked; the end of the line says how, for example `exited with code 1`, and for a failure the waiter saw, its own `irlume-gkr-unlock` line (below) gives the reason |
 
+### Enrollment approval on AppArmor
+
+If enrollment or recovery setup shows no authentication dialog and reports
+`operation requires OS authorization`, check the system journal as well as
+the installed polkit action and desktop authentication agent:
+
+```sh
+sudo journalctl -b --grep='apparmor="DENIED".*(CheckAuthorization|CancelCheckAuthorization)'
+```
+
+If the system keeps these records only in its audit log, inspect
+`/var/log/audit/audit.log` as an administrator instead.
+
+Version 0.15.0 sends these calls to polkit's unique bus name, which does not
+match the well-known name allowed by the shipped AppArmor profile (#1207).
+A denial naming `label="irlumed"`, one of these methods and a unique
+destination such as `name=":1.8"` identifies that confinement failure.
+Use a build containing the #1207 fix; do not disable
+AppArmor or broaden its D-Bus rule.
+
+Until then, an administrator can use `sudo irlume enroll --user USER` and
+`sudo irlume recovery setup --user USER` for the intended account. Root skips
+the per-request polkit approval, so success through sudo does not test the
+non-root approval path. These commands capture enrollment or change recovery
+state; run them only when those changes are intended.
+
 ### GNOME keyring token: `irlume-gkr-unlock`
 
 On an account armed with a GNOME keyring token, the login's session line

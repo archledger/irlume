@@ -1019,6 +1019,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Enrollment, scan addition, profile removal and recovery management address
+  polkit by the well-known name allowed by the shipped AppArmor profiles
+  (#1207). Reply-sender, request and process checks remain unchanged. Root
+  capture commands no longer ask for a system authentication dialog they
+  do not request.
+
 - Apply the mirror policy to every APT-using job in the CI and sanitizer
   workflows, including stable Rust, unit-policy checks, fuzzing and ASan
   (#1184). The regression discovers those jobs and requires mirror selection

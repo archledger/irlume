@@ -730,6 +730,39 @@ fn enroll_fails_cleanly_without_a_daemon() {
 }
 
 #[test]
+fn enrollment_approval_notice_is_only_shown_to_non_root_callers() {
+    let sb = Sandbox::new("enrollment-approval-notice");
+    for args in [
+        vec!["enroll", "--user", "tester"],
+        vec!["enroll", "--user", "tester", "--add-camera"],
+        vec![
+            "profiles",
+            "add-scan",
+            "--user",
+            "tester",
+            "--profile",
+            "Work",
+        ],
+    ] {
+        let (code, _, err) = run(&mut sb.cmd(&args));
+        assert_eq!(code, 1, "{err}");
+        assert_eq!(
+            err.contains("approve the system authentication dialog"),
+            !is_root(),
+            "{args:?}: {err}"
+        );
+
+        let (code, _, err) = run(&mut sb.isolated_root_cmd(&args, &[]));
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("irlumed is not running"), "{err}");
+        assert!(
+            !err.contains("approve the system authentication dialog"),
+            "root does not request polkit approval: {args:?}: {err}"
+        );
+    }
+}
+
+#[test]
 fn keyring_usage_and_daemon_failures() {
     let sb = Sandbox::new("keyring");
     sb.fake_tester_home_without_keyring();

@@ -586,6 +586,21 @@
               "type": "string",
               "enum": ["auto", "cpu", "npu", "gpu"]
             },
+            "selection_provenance": {
+              "description": "Source and parsing issue of the successfully published governing selection, not placement or eligibility. Absent means unreported; unknown members are not defaults.",
+              "type": "object",
+              "required": ["source", "issue"],
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "enum": ["default", "settings", "environment", "unknown"]
+                },
+                "issue": {
+                  "type": "string",
+                  "enum": ["none", "invalid_value", "duplicate_key", "unreadable_settings", "unknown"]
+                }
+              }
+            },
             "accelerator": {
               "description": "The accelerator the recognizer's probes run on. Optional; absent on CPU and from older daemons. A GPU placement reports device cpu with its reason and accelerator gpu.",
               "type": "string",

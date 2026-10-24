@@ -229,6 +229,31 @@ are campaign tools that need a provisioned host and stay manual; the
 `_provisioned_nv` pcrlock test needs no host provisioning because it defines
 the NV index itself, the same way `systemd-pcrlock make-policy` does.
 
+## Isolated CLI checks
+
+The selection-provenance integration test runs the compiled CLI against a
+mock Health server in an empty-root namespace. Its ordinary `cargo test`
+entry starts that namespace automatically. It needs bubblewrap, a C
+compiler, Python `jsonschema` and the Python `lddtree` from pax-utils.
+Ubuntu CI installs `pax-utils`, `python3-pyelftools` and `python3-jsonschema`.
+Missing tools or failed namespace setup fail the test; there is no host
+execution fallback.
+
+Use `bash scripts/test-selection-provenance.sh` for the named unit and
+integration checks. Run the generic machine API checks with
+`bash scripts/test-machine-api-isolated.sh target/release/irlume` after
+building the release binary. The latter keeps the fixture/schema checks
+outside the namespace and isolates every invocation of the compiled CLI.
+Read-only commands such as doctor and camera census can open devices, so a
+dead daemon socket alone is not an isolation boundary.
+
+The namespace exposes individual ELF dependency files, private device and
+process trees, synthetic account records and temporary state. It exposes
+no host sysfs, camera/TPM/render devices, service buses or installed
+authentication state. `IRLUME_TEST_LDDTREE` and
+`IRLUME_TEST_ELFTOOLS_WHEEL` may select reviewed local test-tool copies;
+they are consumed only by the test runner, not by the CLI or daemon.
+
 ## Sandbox environment overrides
 
 Every path a privileged component touches can be redirected, so tests and a

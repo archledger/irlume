@@ -229,6 +229,7 @@ impl Engine {
             // The daemon stamps the governing device selection after the
             // engine reports; the engine itself never reads settings.
             selection: None,
+            selection_provenance: None,
             accelerator: accelerator.map(str::to_owned),
             gpu_platform,
             gpu_runtime_available,

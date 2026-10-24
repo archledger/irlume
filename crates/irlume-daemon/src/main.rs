@@ -107,6 +107,8 @@ mod position_session;
 mod retry_recovery;
 mod retry_throttle;
 mod role_classification;
+#[cfg(test)]
+mod selection_provenance_tests;
 mod shared_unlock;
 mod token_delivery;
 #[cfg(test)]
@@ -502,6 +504,11 @@ mod npu_placement {
 /// build admits `gpu` placement yet, and a selection that cannot be honored
 /// keeps the recognizer on CPU with the reason reported (#1053).
 mod recognizer_selection {
+    use irlume_common::recognizer_selection::{
+        RecognizerSelectionIssue as Issue, RecognizerSelectionProvenance as Provenance,
+        RecognizerSelectionSource as Source,
+    };
+
     /// One selected device target.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Selection {
@@ -596,6 +603,7 @@ mod recognizer_selection {
         selection: Selection,
         warning: Option<&'static str>,
         gpu_allows: bool,
+        provenance: Provenance,
     }
 
     impl Plan {
@@ -609,6 +617,10 @@ mod recognizer_selection {
 
         pub(super) fn gpu_allows(&self) -> bool {
             self.gpu_allows
+        }
+
+        pub(super) fn provenance(&self) -> Provenance {
+            self.provenance
         }
 
         /// `IRLUME_RECOGNIZER_DEVICE` wins over the file when it holds a
@@ -626,6 +638,10 @@ mod recognizer_selection {
                         selection,
                         warning: None,
                         gpu_allows,
+                        provenance: Provenance {
+                            source: Source::Environment,
+                            issue: Issue::None,
+                        },
                     },
                     None => Self {
                         selection: Selection::Auto,
@@ -633,6 +649,10 @@ mod recognizer_selection {
                         warning: Some(
                             "IRLUME_RECOGNIZER_DEVICE is not one of auto, cpu, npu or gpu",
                         ),
+                        provenance: Provenance {
+                            source: Source::Environment,
+                            issue: Issue::InvalidValue,
+                        },
                     },
                 };
             }
@@ -646,12 +666,20 @@ mod recognizer_selection {
                     selection: Selection::Auto,
                     warning: None,
                     gpu_allows,
+                    provenance: Provenance {
+                        source: Source::Default,
+                        issue: Issue::None,
+                    },
                 },
                 Setting::Value(raw) => match Selection::parse(raw) {
                     Some(selection) => Self {
                         selection,
                         warning: None,
                         gpu_allows,
+                        provenance: Provenance {
+                            source: Source::Settings,
+                            issue: Issue::None,
+                        },
                     },
                     None => Self {
                         selection: Selection::Auto,
@@ -660,17 +688,29 @@ mod recognizer_selection {
                             "recognizer_device in settings.conf is not one of auto, cpu, npu \
                              or gpu",
                         ),
+                        provenance: Provenance {
+                            source: Source::Settings,
+                            issue: Issue::InvalidValue,
+                        },
                     },
                 },
                 Setting::Unreadable => Self {
                     selection: Selection::Auto,
                     warning: Some("settings.conf is unreadable or not UTF-8"),
                     gpu_allows,
+                    provenance: Provenance {
+                        source: Source::Settings,
+                        issue: Issue::UnreadableSettings,
+                    },
                 },
                 Setting::Duplicate => Self {
                     selection: Selection::Auto,
                     warning: Some("recognizer_device is set more than once in settings.conf"),
                     gpu_allows,
+                    provenance: Provenance {
+                        source: Source::Settings,
+                        issue: Issue::DuplicateKey,
+                    },
                 },
             }
         }
@@ -689,16 +729,11 @@ mod recognizer_selection {
             .unwrap_or_else(|e| e.into_inner()) = Some(plan);
     }
 
-    /// Read the published selection, if an engine build ran.
-    pub(super) fn current() -> Option<String> {
-        current_plan().map(|plan| plan.selection().as_str().to_owned())
-    }
-
     pub(super) fn current_plan() -> Option<Plan> {
         *CURRENT.get()?.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    #[cfg(all(test, not(feature = "npu")))]
+    #[cfg(test)]
     pub(super) fn preserve_publication() -> impl Drop {
         struct Restore(Option<Plan>);
         impl Drop for Restore {
@@ -5588,22 +5623,37 @@ fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
 /// its shared reason text at publish time. With the `npu` feature the
 /// placement context already carries the exact reason; nothing is stamped.
 #[cfg(not(feature = "npu"))]
-fn stamp_selected_cpu_reason(placement: &mut irlume_common::RecognizerPlacement) {
-    if let Some(reason) =
-        recognizer_selection::current_plan().and_then(recognizer_selection::selected_cpu_reason)
-    {
+fn stamp_selected_cpu_reason(
+    placement: &mut irlume_common::RecognizerPlacement,
+    plan: Option<recognizer_selection::Plan>,
+) {
+    if let Some(reason) = plan.and_then(recognizer_selection::selected_cpu_reason) {
         placement.reason = Some(reason.to_owned());
     }
 }
 
 #[cfg(feature = "npu")]
-fn stamp_selected_cpu_reason(_: &mut irlume_common::RecognizerPlacement) {}
+fn stamp_selected_cpu_reason(
+    _: &mut irlume_common::RecognizerPlacement,
+    _: Option<recognizer_selection::Plan>,
+) {
+}
+
+/// Attach intent metadata and any selection-specific reason from one Plan.
+/// Status publication never rereads the environment or machine settings.
+fn stamp_recognizer_selection(
+    placement: &mut irlume_common::RecognizerPlacement,
+    plan: Option<recognizer_selection::Plan>,
+) {
+    placement.selection = plan.map(|plan| plan.selection().as_str().to_owned());
+    placement.selection_provenance = plan.map(|plan| plan.provenance());
+    stamp_selected_cpu_reason(placement, plan);
+}
 
 /// Publish where the recognizer runs now, journaling a move off the NPU.
 fn publish_recognizer_placement(engine: &irlume_auth::Engine) {
     let mut placement = engine.recognizer_placement();
-    placement.selection = recognizer_selection::current();
-    stamp_selected_cpu_reason(&mut placement);
+    stamp_recognizer_selection(&mut placement, recognizer_selection::current_plan());
     let mut bits = engine_bits().lock().unwrap_or_else(|e| e.into_inner());
     if bits.recognizer.as_ref() == Some(&placement) {
         return;
@@ -5650,8 +5700,7 @@ fn publish_engine_bits(
     // All fields come from this engine. A second discovery could select a
     // different pair after hotplug and open devices merely to publish status.
     let mut recognizer = engine.recognizer_placement();
-    recognizer.selection = recognizer_selection::current();
-    stamp_selected_cpu_reason(&mut recognizer);
+    stamp_recognizer_selection(&mut recognizer, recognizer_selection::current_plan());
     let mut bits = EngineBits {
         mesh: engine.has_mesh(),
         adapter: engine.has_ir_adapter(),
@@ -14166,8 +14215,12 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 30] = [
+        let sources: [(&str, &str); 31] = [
             ("main.rs", include_str!("main.rs")),
+            (
+                "selection_provenance_tests.rs",
+                include_str!("selection_provenance_tests.rs"),
+            ),
             (
                 "request_preparation_tests.rs",
                 include_str!("request_preparation_tests.rs"),
@@ -21109,12 +21162,13 @@ mod tests {
                     reason: None,
                     runtime_available: None,
                     qualified: None,
-                    selection: recognizer_selection::current(),
+                    selection: None,
                     ..Default::default()
                 };
-                stamp_selected_cpu_reason(&mut placement);
+                stamp_recognizer_selection(&mut placement, recognizer_selection::current_plan());
                 assert_eq!(placement.selection.as_deref(), Some("gpu"));
                 assert_eq!(placement.reason.as_deref(), Some(expected));
+                assert_eq!(placement.selection_provenance, Some(plan.provenance()));
             }
             // A failed construction must not publish the replacement plan.
             let config = EngineBuildConfig {
@@ -21131,6 +21185,7 @@ mod tests {
             };
             assert!(build_engine_from_config(&config, None).is_err());
             let retained = recognizer_selection::current_plan().unwrap();
+            assert_eq!(retained.provenance(), plan.provenance());
             assert_eq!(
                 recognizer_selection::selected_cpu_reason(retained),
                 Some(expected)

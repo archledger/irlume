@@ -204,6 +204,31 @@ the CPU reference, and `gpu` tries the GPU, which its loading admission (closed
 in every build so far) and certification still decide. It is omitted when the
 daemon does not report one.
 
+Optional `recognizer.selection_provenance` describes the source and parsing
+result of that governing selection, not a ranking result or actual execution:
+
+```json
+"selection_provenance": { "source": "environment", "issue": "invalid_value" }
+```
+
+`source` is `default`, `settings`, `environment` or `unknown`. `default` means
+the daemon observed no authoritative selection value; `settings` includes a
+refused or unreadable settings snapshot; a present environment value remains
+authoritative even when invalid. `issue` is `none`, `invalid_value`,
+`duplicate_key`, `unreadable_settings` or `unknown`. `none` explicitly reports
+no parsing issue. Invalid values still resolve to `auto` under the existing
+selection policy. No rejected raw value is carried.
+
+An absent or null outer field means provenance was not reported. Missing object
+members and future string values decode as `unknown`, never as `default` or
+`none`; wrong JSON types remain decoding errors. The CLI emits both members
+when it reports the object. The metadata belongs to the successfully published
+engine: a failed rebuild keeps the previous metadata, while retirement changes
+actual execution, not selection provenance. Doctor includes the same metadata
+in its existing `recognizer-selection` row without changing its severity just
+because an older daemon omits it. Existing `device` and `accelerator` semantics
+are unchanged, and this field does not imply a resolver ran.
+
 Optional `recognizer.accelerator` is `npu` or `gpu` when the recognizer's probes
 run on that accelerator, and absent on CPU or from older daemons. Contract 1
 adds no `device` value, so a GPU placement reports `device: "cpu"` with the

@@ -531,7 +531,9 @@ pub fn status(args: &[String]) -> ExitCode {
 /// Where the daemon's recognizer computes authentication probes
 /// (ADR-0022 §13). Unknown is not CPU: without the daemon's answer the
 /// device is absent rather than guessed.
-fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> serde_json::Value {
+pub(super) fn recognizer_json(
+    placement: Option<irlume_common::RecognizerPlacement>,
+) -> serde_json::Value {
     match placement {
         Some(placement) => {
             let mut value = json!({ "known": true });
@@ -573,6 +575,9 @@ fn recognizer_json(placement: Option<irlume_common::RecognizerPlacement>) -> ser
                 Some("auto" | "cpu" | "npu" | "gpu")
             ) {
                 value["selection"] = json!(placement.selection);
+            }
+            if let Some(provenance) = placement.selection_provenance {
+                value["selection_provenance"] = json!(provenance);
             }
             value
         }

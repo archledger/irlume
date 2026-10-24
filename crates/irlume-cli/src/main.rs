@@ -56,6 +56,8 @@ mod recovery;
 mod retry;
 mod seal_storage;
 mod secrets;
+#[cfg(test)]
+mod selection_provenance_tests;
 mod sensor_policy;
 mod split;
 mod strays;
@@ -6081,6 +6083,35 @@ fn recognizer_selection_row(selection: Option<&str>) -> (crate::doctor_report::S
     }
 }
 
+/// Extend the existing selection row without changing its severity. All new
+/// text comes from closed enums; a rejected raw setting is never displayed.
+fn recognizer_selection_report(
+    selection: Option<&str>,
+    provenance: Option<&irlume_common::recognizer_selection::RecognizerSelectionProvenance>,
+) -> (crate::doctor_report::State, String) {
+    use irlume_common::recognizer_selection::{
+        RecognizerSelectionIssue as Issue, RecognizerSelectionSource as Source,
+    };
+    let (state, line) = recognizer_selection_row(selection);
+    let Some(provenance) = provenance else {
+        return (state, format!("{line}; source not reported"));
+    };
+    let source = match provenance.source {
+        Source::Default => "default",
+        Source::Settings => "settings",
+        Source::Environment => "environment",
+        Source::Unknown => "unknown",
+    };
+    let issue = match provenance.issue {
+        Issue::None => "none",
+        Issue::InvalidValue => "invalid value",
+        Issue::DuplicateKey => "duplicate key",
+        Issue::UnreadableSettings => "unreadable settings",
+        Issue::Unknown => "unknown",
+    };
+    (state, format!("{line}; source: {source}; issue: {issue}"))
+}
+
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -6645,8 +6676,10 @@ fn doctor_run(
             };
             dout!(report, "[doctor] recognizer: {line}");
             report.check_detail("recognizer-device", State::Info, line);
-            let (selection_state, selection_line) =
-                recognizer_selection_row(placement.selection.as_deref());
+            let (selection_state, selection_line) = recognizer_selection_report(
+                placement.selection.as_deref(),
+                placement.selection_provenance.as_ref(),
+            );
             dout!(report, "[doctor] recognizer selection: {selection_line}");
             report.check_detail("recognizer-selection", selection_state, selection_line);
             let (runtime_state, runtime_line) = match placement.runtime_available {

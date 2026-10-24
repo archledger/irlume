@@ -90,6 +90,10 @@ bash scripts/test-measurement-acquisition.sh
 bash scripts/test-selection-provenance.sh
 bash scripts/test-native-metadata.sh
 bash scripts/test-native-generation.sh
+python3 scripts/test-measurement-fixture-boundary.py --self-test
+python3 scripts/test-measurement-fixture-boundary.py --check
+bash scripts/test-measurement-fixture-bootstrap.sh
+bash scripts/test-measurement-fixture-bootstrap.sh --kernel
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \
@@ -108,6 +112,7 @@ cargo build --release --locked
 
 | When you touch | Also run |
 |---|---|
+| The private measurement fixture examples or their controller | The `--kernel` bootstrap gate above requires Rust 1.88.0's `x86_64-unknown-linux-musl` target, bubblewrap, a C compiler and the isolated CLI runner's test tools. It executes only synthetic static fixtures in a private namespace; unsupported setup must fail without host fallback. |
 | `crates/irlume-vision/src/measurement_profile/acquire.rs`, `crates/irlume-vision/src/measurement_profile/acquire_tests.rs` | `bash scripts/test-measurement-acquisition.sh --kernel` on the supported Linux x86-64 measurement hosts after the final material change. It requires real full-flag `openat2` support; portable CI does not qualify the kernel. |
 | `irlume-vision` features, any dependency bump | `for f in cuda openvino coreml tensorrt; do cargo check -p irlume-vision --features "$f" --locked; done; cargo check -p irlume-vision --all-features --locked`; for the `npu` feature (ADR-0022) also `cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-vision --features npu --lib` and `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps`; with the `npu` features of `irlume-auth` and `irlume-daemon` also `cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings`, `cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization` and the guarded daemon provider-selection/Health command in the "Optional NPU inference checks (no NPU)" step of `ci.yml` (eight exact test names, each required, floor 8; synthetic state/config, no CLI helper needed) |
 | `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback) |

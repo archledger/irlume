@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A private static fixture bootstrap test for verification before fixture
+  startup (ADR-0022, Static fixture startup experiment, #1164). It checks
+  sealed executable bytes, fixed descriptor and environment rules, and
+  isolated process cleanup. It cannot launch a provider or grant loading
+  admission; normal builds contain refusal stubs only.
+
 - Declared fixture dependency graphs built from the exact hashed ELF buffers
   (ADR-0033, Declared fixture graph, #1162). The checker enforces bounded
   roots, aliases, interpreter bindings and active metadata under an explicit

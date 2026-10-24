@@ -1541,6 +1541,12 @@ All notable changes to irlume are documented here. This project adheres to
   comments and valid bracketed controls, and CRLF line endings outside
   comments, remain refused (#931).
 
+### Security
+
+- Update `crypto-bigint` to 0.7.6 and its `ctutils` dependency to 0.4.5 in
+  both lockfiles for [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
+  The application interfaces and minimum supported Rust version are unchanged.
+
 ## [0.15.0] - 2026-09-29
 
 ### Added

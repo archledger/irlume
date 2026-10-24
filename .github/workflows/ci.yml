@@ -163,6 +163,7 @@ jobs:
           # name the toolchain explicitly (it is a required input then).
           toolchain: "1.88.0"
           components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -262,6 +263,14 @@ jobs:
 
       - name: Declared fixture graph (no loader)
         run: bash scripts/test-native-generation.sh
+
+      - name: Private static fixture bootstrap (no provider or host fallback)
+        timeout-minutes: 10
+        run: |
+          python3 scripts/test-measurement-fixture-boundary.py --self-test
+          python3 scripts/test-measurement-fixture-boundary.py --check
+          bash scripts/test-measurement-fixture-bootstrap.sh
+          bash scripts/test-measurement-fixture-bootstrap.sh --kernel
 
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.

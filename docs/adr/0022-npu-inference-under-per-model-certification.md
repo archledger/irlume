@@ -1527,6 +1527,39 @@ after the final material change. It fails on missing support rather than
 counting a skipped syscall as positive evidence. This adds no production
 minimum kernel requirement, discovery, launcher or loading admission.
 
+#### Static fixture startup experiment
+
+Two private examples test a pre-fixture-startup boundary. A selected static
+bootstrap and its trusted Rust/musl startup run first. The bootstrap copies
+one bounded synthetic image, seals it against writing, resizing and execute
+mode changes, hashes and checks that sealed object, then uses `execveat` on
+the same close-on-exec descriptor. A pinned fixture's constructor and main
+emit fixed markers. This does not claim that no code runs before the
+bootstrap's main, or that static linking establishes a trusted issuer.
+
+The dedicated test lane compiles the private sources with Rust 1.88.0 and
+the musl target, using only the root-lockfile-selected libc and sha2 build
+artifacts. It does not compile or qualify the common library for musl, alter
+common's production API, or add a public launcher. Explicit rustc/Clippy
+settings retain the workspace lint policy. Fresh transaction receipts bind
+source, compiler, dependency features, fixture pins and output hashes.
+
+The static-only controller runs unprivileged in a new empty-root namespace.
+The bootstrap accepts only the `PWD=/` entry that bubblewrap sets after
+clearing the environment, and verifies the actual working directory. The
+fixture receives an empty environment. Both check namespace PID 1,
+NoNewPrivs and zero effective, permitted and ambient capabilities. Tests
+cover descriptor cleanup, bounded pipes, sealing and rejected inputs,
+and kill/reap plus EOF after timeout, cancellation or descendant exit.
+
+Ordinary builds and non-musl targets contain refusal stubs without fixture
+constructors. GNU stubs are tested separately through the existing isolated
+CLI runner; this does not permit DSOs in the active static controller.
+The fixture examples remain outside shipped targets and install recipes.
+Static bytes, descriptions and marker results grant no production loading
+permission. Generation publication, retention, process-bound handoff,
+provider confinement and hardware qualification remain separate gates.
+
 ### Cache and production path
 
 The runner creates a fresh, empty, owner-only 0700 cache on an approved

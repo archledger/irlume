@@ -101,3 +101,10 @@ path = "fuzz_targets/native_metadata.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "native_generation"
+path = "fuzz_targets/native_generation.rs"
+test = false
+doc = false
+bench = false

@@ -278,6 +278,8 @@ jobs:
           bash scripts/test-measurement-fixture-bootstrap.sh --kernel
           bash scripts/test-measurement-generation.sh
           bash scripts/test-measurement-generation.sh --kernel
+          bash scripts/test-measurement-namespace.sh
+          bash scripts/test-measurement-namespace.sh --build
 
       - name: Retain generation fixture receipts
         if: always()

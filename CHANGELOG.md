@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A private kernel namespace observation probe (ADR-0022, Kernel namespace
+  observation, #1164). It uses `listns` to check for the initial user
+  namespace without trusting procfs or UID 0. Explicit kernel tests cover
+  nested namespaces, fake procfs and a wrong-owner false-positive control;
+  ordinary builds refuse. This grants no native-loading permission.
+
 - A private CPU-only generation publication and retention experiment
   (ADR-0022, Generation publication and retention experiment, #1164).
   Isolated consumers reopen complete read-only generations after replacement

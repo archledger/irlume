@@ -17,16 +17,11 @@
 # Deliberately hosted-runner only. Nothing here touches the self-hosted runner.
 name: Workflow audit
 
-# Push-trigger only. Both jobs below use GitHub-hosted runners, as the note
-# three lines above says; an earlier version of this line claimed self-hosted
-# and contradicted it.
+# Every branch push gets exact-commit audit evidence for nightly selection,
+# including source-only commits. Both jobs use GitHub-hosted runners.
 on:
   push:
     branches: ["**"]
-    paths:
-      - ".github/workflows/**"
-      - ".github/actions/**"
-      - ".github/zizmor.yml"
   # Weekly, because the online audits (archived or deleted actions, known-bad
   # refs) can start failing on a workflow nobody has edited.
   schedule:

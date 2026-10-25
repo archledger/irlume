@@ -255,6 +255,9 @@ jobs:
       - name: Fixture acquisition policy (portable, no kernel-support claim)
         run: bash scripts/test-measurement-acquisition.sh
 
+      - name: Sealed fixture copies (portable, no launch authority)
+        run: bash scripts/test-measurement-sealing.sh
+
       - name: Selection provenance (unit and isolated CLI)
         run: bash scripts/test-selection-provenance.sh
 

@@ -129,6 +129,16 @@ remaining hardware gate accurately.
 
 ## Nightly coverage prerequisites
 
+Both nightly jobs first import `elftools` and `jsonschema`, then run
+`test-isolated-cli.py` before downloads, builds or hardware work. Provision
+bubblewrap, a C compiler, pax-utils `lddtree`, and both Python modules in the
+runner's service environment. Installing `lddtree` alone is insufficient:
+`isolated-cli.py` runs it with its own Python interpreter, which must import
+`elftools`. On NixOS, give the runner a `python3.withPackages` environment with
+`pyelftools` and `jsonschema`, plus `pax-utils` on its service PATH. The check
+exercises an empty-root sandbox with synthetic programs only; it neither
+installs tools nor falls back to running the CLI on the host.
+
 The coverage job prepares its own `cargo-llvm-cov` **0.9.1** using
 `setup-coverage-tools.sh` before model fetch or loopback-camera producers start.
 It builds with `cargo install --locked` into a unique directory under

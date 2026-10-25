@@ -41,6 +41,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The workspace's provenance test requires these tools even though it
+      # does not access hardware. Verify the real sandbox before a long build.
+      - name: Verify isolated CLI test prerequisites
+        run: |
+          python3 -c 'import elftools, jsonschema'
+          python3 scripts/ci/test-isolated-cli.py
+
       # No actions/cache here: on a self-hosted runner the fetched models/
       # (gitignored, so a clean checkout leaves them) persist in the runner work
       # directory between runs, so fetch-models.sh is a no-op after the first
@@ -343,6 +350,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Verify isolated CLI test prerequisites
+        run: |
+          python3 -c 'import elftools, jsonschema'
+          python3 scripts/ci/test-isolated-cli.py
 
       - name: Set up pinned coverage tools (system Rust)
         run: bash scripts/ci/setup-coverage-tools.sh

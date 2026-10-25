@@ -17,7 +17,7 @@ import tomllib
 
 LIMIT = 1024 * 1024
 TARGET = "x86_64-unknown-linux-musl"
-VERSIONS = {"libc": "0.2.190", "sha2": "0.11.0"}
+VERSIONS = {"libc": "0.2.191", "sha2": "0.11.1"}
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "crates/irlume-common/examples"
 FLAGS = ["--edition=2021", "--target", TARGET, "--cfg", "irlume_hw_evidence",
@@ -98,8 +98,9 @@ class Build:
         env = dict(self.environment, CARGO_TARGET_DIR=str(output),
                    RUSTFLAGS=" ".join(FLAGS[FLAGS.index("-Ctarget-feature=+crt-static"):]))
         command = [self.cargo, "+1.88.0", "build", "--offline", "--locked", "--release",
-                   "--target", TARGET, "-p", "libc@0.2.190", "-p", "sha2@0.11.0",
-                   "--message-format=json"]
+                   "--target", TARGET, "--message-format=json"]
+        for name, version in VERSIONS.items():
+            command.extend(["-p", f"{name}@{version}"])
         built = self.command("dependencies", command, env=env)
         rows = [json.loads(line) for line in built.stdout.splitlines()]
         self.artifacts = select_artifacts(rows, output)

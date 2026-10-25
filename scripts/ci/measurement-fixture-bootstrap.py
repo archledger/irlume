@@ -309,7 +309,18 @@ def run(executable, source, *, timeout=3.0, sync_fd=None, seccomp_fd=None, resul
                                stdout=subprocess.PIPE if result_fd is None else result_fd,
                                stderr=subprocess.PIPE if diagnostic_fd is None else diagnostic_fd,
                                env={}, close_fds=True, pass_fds=pass_fds,
-                               start_new_session=True)
+                                start_new_session=True)
+    result = _collect(process, timeout=timeout, cancel=cancel, on_chunk=on_chunk,
+                      eof_complete=result_fd is None and diagnostic_fd is None)
+    return dict(result, bootstrap_sha256=identity, command=command)
+
+
+def _collect(process, *, timeout, cancel=None, on_chunk=None, eof_complete=True):
+    """Collect an owned process group with the existing bounds and cleanup.
+
+    Callers select and validate their explicit execution policy before Popen.
+    This helper does not select a program or provide an execution fallback.
+    """
     # Ownership begins immediately after Popen, before any setup that can fail.
     try:
         _OWNED[process.pid] = process
@@ -347,9 +358,8 @@ def run(executable, source, *, timeout=3.0, sync_fd=None, seccomp_fd=None, resul
     finally:
         _finish(process)
     return {"status": process.returncode, "timed_out": timed_out,
-            "eof": result_fd is None and diagnostic_fd is None,
+            "eof": eof_complete,
             "eof_streams": [name for name, stream in (("stdout", process.stdout), ("stderr", process.stderr))
                             if stream is not None],
             "stdout": bytes(collected.get(process.stdout, b"")),
-            "stderr": bytes(collected.get(process.stderr, b"")),
-            "bootstrap_sha256": identity, "command": command}
+            "stderr": bytes(collected.get(process.stderr, b""))}

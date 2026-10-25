@@ -278,6 +278,8 @@ jobs:
           bash scripts/test-measurement-fixture-bootstrap.sh --kernel
           bash scripts/test-measurement-generation.sh
           bash scripts/test-measurement-generation.sh --kernel
+          bash scripts/test-measurement-namespace.sh
+          bash scripts/test-measurement-namespace.sh --build
 
       - name: Retain generation fixture receipts
         if: always()
@@ -288,6 +290,9 @@ jobs:
             ${{ runner.temp }}/irlume-generation/**/*.json
             ${{ runner.temp }}/irlume-generation/**/*.log
             !${{ runner.temp }}/irlume-generation/**/dependencies/**
+            ~/.cache/irlume-namespace-probe/**/*.json
+            ~/.cache/irlume-namespace-probe/**/*.log
+            !~/.cache/irlume-namespace-probe/**/dependencies/**
           if-no-files-found: ignore
           retention-days: 3
 

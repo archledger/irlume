@@ -97,6 +97,8 @@ bash scripts/test-measurement-fixture-bootstrap.sh
 bash scripts/test-measurement-fixture-bootstrap.sh --kernel
 bash scripts/test-measurement-generation.sh
 bash scripts/test-measurement-generation.sh --kernel
+bash scripts/test-measurement-namespace.sh
+bash scripts/test-measurement-namespace.sh --build
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \
@@ -116,6 +118,7 @@ cargo build --release --locked
 | When you touch | Also run |
 |---|---|
 | The private measurement fixture examples or their controller | The `--kernel` bootstrap gate above requires Rust 1.88.0's `x86_64-unknown-linux-musl` target, bubblewrap, a C compiler and the isolated CLI runner's test tools. It executes only synthetic static fixtures in a private namespace; unsupported setup must fail without host fallback. |
+| The private namespace probe or its controller | Also run `bash scripts/test-measurement-namespace.sh --kernel` from a trusted non-root initial user/PID namespace on a qualified Linux x86-64 `listns` host. This explicitly observes host, user-only and user+PID contexts; it never falls back to the host after failed isolation. The CI `--build` gate tests compilation, pure logic and inactive stubs, not kernel namespace support. |
 | `crates/irlume-vision/src/measurement_profile/acquire.rs`, `crates/irlume-vision/src/measurement_profile/acquire_tests.rs` | `bash scripts/test-measurement-acquisition.sh --kernel` on the supported Linux x86-64 measurement hosts after the final material change. It requires real full-flag `openat2` support; portable CI does not qualify the kernel. |
 | `crates/irlume-vision/src/measurement_profile/seal.rs`, `crates/irlume-vision/src/measurement_profile/seal_tests.rs` | `bash scripts/test-measurement-sealing.sh --kernel` after the final material change on a supported Linux x86-64 host. It requires actual no-exec-mode memfd creation and all named seals; portable fault tests do not qualify kernel support. |
 | `irlume-vision` features, any dependency bump | `for f in cuda openvino coreml tensorrt; do cargo check -p irlume-vision --features "$f" --locked; done; cargo check -p irlume-vision --all-features --locked`; for the `npu` feature (ADR-0022) also `cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-vision --features npu --lib` and `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps`; with the `npu` features of `irlume-auth` and `irlume-daemon` also `cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings`, `cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization` and the guarded daemon provider-selection/Health command in the "Optional NPU inference checks (no NPU)" step of `ci.yml` (eight exact test names, each required, floor 8; synthetic state/config, no CLI helper needed) |

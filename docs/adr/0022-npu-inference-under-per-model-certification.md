@@ -1634,6 +1634,56 @@ This experiment proves only the declared synthetic tree's lifetime under
 trusted fixture actors. It adds no real dependency closure, production
 generation service, native-loading permission or certification entry.
 
+#### Kernel namespace observation, 2026-10-25
+
+A fourth private example observes the calling task's user namespace with
+`listns`, without reading procfs, accepting a namespace descriptor or
+treating UID 0 as proof. The request uses `LISTNS_CURRENT_USER`, filters PID
+namespaces, starts after ID 3 and provides one output slot. Only a successful
+count of one with the initial PID namespace ID 4 is a positive observation.
+The kernel resolves the current user namespace and enumerates its owned
+namespaces; the initial PID namespace belongs to the initial user namespace.
+
+The request layout and IDs follow the
+[Linux v7.2 namespace UAPI](https://github.com/torvalds/linux/blob/v7.2/include/uapi/linux/nsfs.h),
+with syscall 470 from its
+[x86-64 table](https://github.com/torvalds/linux/blob/v7.2/arch/x86/entry/syscalls/syscall_64.tbl).
+The proof depends on the
+[current-owner enumeration](https://github.com/torvalds/linux/blob/v7.2/kernel/nstree.c),
+[initial PID namespace ownership](https://github.com/torvalds/linux/blob/v7.2/kernel/pid.c)
+and [namespace ID mapping](https://github.com/torvalds/linux/blob/v7.2/include/linux/ns/ns_common_types.h).
+A successful zero or another valid ID means the initial witness was not
+observed; visibility permissions can prevent observing it. Errors remain
+errors, including `ENOSYS` and an empty owner tree's
+`ENOENT`; malformed results refuse. No procfs or older-kernel fallback exists.
+
+The controller uses the existing pinned static builder and bounded process
+collector, with explicit host, user-only, user+PID and fake-proc contexts.
+The host positive runs without root escalation. The user-only control
+creates no other namespace, so its entire owner tree is empty; owning a
+different namespace type can instead yield a successful zero. The user+PID
+and fake-proc controls require a successful non-initial result. A wrong-owner
+control shows that requesting owner ID 3 instead of the current owner can
+produce a false positive in a user-only namespace. Invalid flags exercise a
+real syscall failure. Build receipts and per-context results are retained.
+
+`bash scripts/test-measurement-namespace.sh` checks the result protocol.
+CI also runs `--build` for compilation, pure Rust tests and refusal stubs;
+it does not require `listns` support. The explicit `--kernel` gate requires
+a trusted non-root task in the initial user and PID namespaces on a Linux
+x86-64 host with the required kernel behavior. Failed isolation never runs
+the host positive as a fallback. Injected errors do not qualify an older
+kernel. Ordinary and non-musl builds remain refusal stubs.
+
+The observation applies only to the calling task when the kernel samples
+its current user namespace. It cannot be cached across namespace changes
+or treated as another thread's identity. A positive establishes neither
+the current PID namespace nor capabilities. It assumes trusted code and real
+syscall results: a hostile tracer, syscall mediator or modified binary is
+outside this experiment's proof. Trusted startup, root credentials,
+process-bound handoff and complete native dependency closure remain
+separate requirements. The result grants no native-loading permission.
+
 ### Cache and production path
 
 The runner creates a fresh, empty, owner-only 0700 cache on an approved

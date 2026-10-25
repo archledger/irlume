@@ -123,6 +123,11 @@ jobs:
       - name: Hosted APT mirror contracts (fixtures, no network)
         run: python3 -B scripts/ci/test-prefer-ubuntu-archive.py
 
+      # Selection and immutable-output regressions stay offline. The runner
+      # already has PyYAML and jsonschema from the dependency step above.
+      - name: Nightly source snapshot contracts (fixtures, no network)
+        run: python3 -B scripts/ci/test-nightly-snapshot.py
+
       # Offline, with the runner's openssl: the refresh script's own tests,
       # then the shipped vendor CA certificates against their manifest
       # (ADR-0036 section 5).

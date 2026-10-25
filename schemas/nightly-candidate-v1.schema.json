@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/archledger/irlume/main/schemas/nightly-candidate-v1.schema.json",
+  "title": "Nightly source candidate, not a release or installation authorization",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "repository", "ref", "commit", "tree", "slot", "observed_at", "inputs", "checks", "candidate_id", "policy_version", "policy_sha256", "evidence_origin", "input_scope"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "kind": {"const": "nightly-candidate"},
+    "repository": {"const": "archledger/irlume"},
+    "ref": {"const": "refs/heads/main"},
+    "commit": {"$ref": "#/$defs/sha1"},
+    "tree": {"$ref": "#/$defs/sha1"},
+    "slot": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "observed_at": {"$ref": "#/$defs/time"},
+    "candidate_id": {"type": "string", "pattern": "^nightly-[0-9]{8}-g[0-9a-f]{12}$"},
+    "policy_sha256": {"$ref": "#/$defs/sha256"},
+    "policy_version": {"type": "integer", "const": 1},
+    "evidence_origin": {"enum": ["fixture", "github-api"]},
+    "input_scope": {"const": "source-declarations-not-build-closure"},
+    "inputs": {
+      "type": "array", "minItems": 1, "maxItems": 100,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["path", "blob", "sha256"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1, "maxLength": 200},
+          "blob": {"$ref": "#/$defs/sha1"},
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "checks": {
+      "type": "array", "minItems": 9, "maxItems": 9,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "workflow", "commit", "app_id", "workflow_id", "run_id", "attempt", "job_id", "status", "conclusion", "completed_at"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "maxLength": 200},
+          "workflow": {"enum": ["ci.yml", "dco.yml", "workflow-audit.yml"]},
+          "commit": {"$ref": "#/$defs/sha1"},
+          "app_id": {"type": "integer", "const": 15368},
+          "workflow_id": {"type": "integer", "minimum": 1},
+          "run_id": {"type": "integer", "minimum": 1},
+          "attempt": {"type": "integer", "minimum": 1},
+          "job_id": {"type": "integer", "minimum": 1},
+          "status": {"const": "completed"},
+          "conclusion": {"const": "success"},
+          "completed_at": {"$ref": "#/$defs/time"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?Z$"}
+  }
+}

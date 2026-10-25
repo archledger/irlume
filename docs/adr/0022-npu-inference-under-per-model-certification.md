@@ -1527,6 +1527,28 @@ after the final material change. It fails on missing support rather than
 counting a skipped syscall as positive evidence. This adds no production
 minimum kernel requirement, discovery, launcher or loading admission.
 
+#### Sealed fixture copies, 2026-10-25
+
+An evidence-only Linux x86-64 helper consumes the fixture observer and copies
+its already-hashed buffers into fresh memfds. It does not reread source
+paths. It seals writes, growth, shrinkage and execute-mode changes, verifies
+the seals and close-on-exec, and compares every sealed byte with the observed
+buffer. A successful batch retains only sealed copies and the original
+descriptive observations; errors drop partial copies and the consumed inputs.
+
+The copies have mode 0400 and explicitly request `MFD_NOEXEC_SEAL`. This
+prevents direct execution and execute-bit changes, not executable mappings
+or interpreter-mediated use. No descriptor or launch capability is exposed.
+These objects are not a mounted generation or a complete dependency closure,
+and cannot satisfy measurement-launch admission.
+
+Limits remain 256 files, 256 MiB per file and 1 GiB of content per batch.
+One 65,536-call batch budget counts writes, reads, interruptions and EOF
+probes. Source allocations coexist with copies during construction; these
+limits are not total-memory or elapsed-time guarantees. Portable failure
+tests and a separate required-on-supported-host kernel test cover the helper.
+The kernel test refuses missing support rather than counting it as a pass.
+
 #### Static fixture startup experiment
 
 Two private examples test a pre-fixture-startup boundary. A selected static

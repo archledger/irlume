@@ -24,6 +24,9 @@ pub mod observe;
 #[cfg(all(feature = "npu", target_os = "linux", target_arch = "x86_64"))]
 pub mod acquire;
 
+#[cfg(all(feature = "npu", target_os = "linux", target_arch = "x86_64"))]
+pub mod seal;
+
 #[cfg(test)]
 mod tests;
 

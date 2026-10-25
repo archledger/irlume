@@ -17,8 +17,8 @@ use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-const HARD_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const HARD_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const HARD_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(super) const HARD_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const HARD_READ_CALLS: u32 = 65536;
 const READ_BYTES: usize = 64 * 1024;
 

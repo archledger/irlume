@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Sealed copies of observed measurement fixture bytes (ADR-0022, Sealed
+  fixture copies, #1164). Evidence builds verify write and size seals,
+  execute-mode restrictions, close-on-exec and exact byte readback under
+  bounded I/O. The copies expose no descriptor or native-loading authority.
+
 - A private static fixture bootstrap test for verification before fixture
   startup (ADR-0022, Static fixture startup experiment, #1164). It checks
   sealed executable bytes, fixed descriptor and environment rules, and

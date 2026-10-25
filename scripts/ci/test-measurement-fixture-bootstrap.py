@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 import sys
@@ -65,6 +66,15 @@ class HeaderTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_fixture_dependency_pins_exist_in_workspace_lock(self):
+        packages = tomllib.loads((bootstrap.ROOT / "Cargo.lock").read_text())["package"]
+        for name, version in bootstrap.VERSIONS.items():
+            with self.subTest(dependency=name):
+                versions = {package["version"] for package in packages if package["name"] == name
+                            and package.get("source") == "registry+https://github.com/rust-lang/crates.io-index"}
+                self.assertIn(version, versions,
+                              "update the fixture dependency pins with the workspace lockfile")
+
     def test_open_sentinel_slot_is_refused_without_closing_it(self):
         with open(os.devnull, "rb") as occupied:
             with self.assertRaisesRegex(RuntimeError, "already occupied"):
@@ -429,7 +439,7 @@ if __name__ == "__main__":
         print("Fixture build transaction:", KERNEL_OUTPUT, flush=True)
     suite = load_tests(unittest.defaultTestLoader, None, None)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    complete = (result.testsRun >= (19 if kernel else 5) and not result.skipped
+    complete = (result.testsRun >= (20 if kernel else 6) and not result.skipped
                 and not result.expectedFailures and not result.unexpectedSuccesses)
     if not complete:
         print("fixture test-count/status guard refused incomplete coverage", file=sys.stderr)

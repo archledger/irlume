@@ -269,11 +269,27 @@ jobs:
 
       - name: Private static fixture bootstrap (no provider or host fallback)
         timeout-minutes: 10
+        env:
+          IRLUME_GENERATION_OUTPUT: ${{ runner.temp }}/irlume-generation
         run: |
           python3 scripts/test-measurement-fixture-boundary.py --self-test
           python3 scripts/test-measurement-fixture-boundary.py --check
           bash scripts/test-measurement-fixture-bootstrap.sh
           bash scripts/test-measurement-fixture-bootstrap.sh --kernel
+          bash scripts/test-measurement-generation.sh
+          bash scripts/test-measurement-generation.sh --kernel
+
+      - name: Retain generation fixture receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generation-fixture-receipts
+          path: |
+            ${{ runner.temp }}/irlume-generation/**/*.json
+            ${{ runner.temp }}/irlume-generation/**/*.log
+            !${{ runner.temp }}/irlume-generation/**/dependencies/**
+          if-no-files-found: ignore
+          retention-days: 3
 
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.

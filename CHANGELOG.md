@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A private CPU-only generation publication and retention experiment
+  (ADR-0022, Generation publication and retention experiment, #1164).
+  Isolated consumers reopen complete read-only generations after replacement
+  and publisher exit. Kernel tests cover partial publication, cancellation,
+  late-byte corruption and independent filesystem/mount protections; normal
+  builds remain refusal stubs. This grants no native-loading permission.
+
 - Sealed copies of observed measurement fixture bytes (ADR-0022, Sealed
   fixture copies, #1164). Evidence builds verify write and size seals,
   execute-mode restrictions, close-on-exec and exact byte readback under

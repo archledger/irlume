@@ -95,6 +95,8 @@ python3 scripts/test-measurement-fixture-boundary.py --self-test
 python3 scripts/test-measurement-fixture-boundary.py --check
 bash scripts/test-measurement-fixture-bootstrap.sh
 bash scripts/test-measurement-fixture-bootstrap.sh --kernel
+bash scripts/test-measurement-generation.sh
+bash scripts/test-measurement-generation.sh --kernel
 RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
   --require escape_presence_precedes_ort_work \
   --require escape_presence_precedes_tflite_work \

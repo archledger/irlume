@@ -30,6 +30,19 @@ def capture_guard():
 
 
 class CaptureContractTests(unittest.TestCase):
+    def test_both_jobs_verify_isolation_before_expensive_or_hardware_work(self):
+        workflow = (ROOT / '.github/workflows/hardware-suite.yml').read_text()
+        hardware, coverage = workflow.split('\n  coverage:', 1)
+        for job in [hardware, coverage]:
+            with self.subTest(job=job[:30]):
+                imports = job.index("python3 -c 'import elftools, jsonschema'")
+                tests = job.index('python3 scripts/ci/test-isolated-cli.py')
+                fetch = job.index('run: bash scripts/fetch-models.sh')
+                self.assertLess(imports, tests)
+                self.assertLess(tests, fetch)
+        self.assertLess(coverage.index('python3 scripts/ci/test-isolated-cli.py'),
+                        coverage.index('bash scripts/ci/setup-coverage-tools.sh'))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='nightly coverage contract ')
         self.addCleanup(self.tmp.cleanup)

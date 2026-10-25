@@ -10,7 +10,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-NAMES = ("measurement_fixture_bootstrap", "measurement_entry_probe")
+NAMES = ("measurement_fixture_bootstrap", "measurement_entry_probe", "measurement_generation_fixture")
 
 
 def check(metadata, sources):
@@ -31,7 +31,7 @@ def check(metadata, sources):
                 raise ValueError("private fixture target role or location changed")
             found.append(target["name"])
     if sorted(found) != sorted(NAMES):
-        raise ValueError("expected exactly two private fixture examples")
+        raise ValueError("expected exactly three private fixture examples")
     for path, text in sources.items():
         if any(name in text for name in NAMES):
             raise ValueError(f"private fixture referenced by shipping source: {path}")
@@ -59,7 +59,7 @@ def check_repository():
         except UnicodeDecodeError:
             continue
     check(metadata, sources)
-    print(f"fixture-boundary: two private examples, {len(sources)} shipping/source inputs checked")
+    print(f"fixture-boundary: three private examples, {len(sources)} shipping/source inputs checked")
 
 
 class BoundaryTests(unittest.TestCase):
@@ -102,6 +102,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_install_references_or_example_wildcards_refuse(self):
         for text in ["install measurement_fixture_bootstrap /usr/bin/",
+                     "install measurement_generation_fixture /usr/bin/",
                      "cp target/release/examples/* $out/bin/", "cargo build --examples"]:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 check(self.fixture(), {"packaging/install.sh": text})

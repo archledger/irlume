@@ -1579,8 +1579,60 @@ constructors. GNU stubs are tested separately through the existing isolated
 CLI runner; this does not permit DSOs in the active static controller.
 The fixture examples remain outside shipped targets and install recipes.
 Static bytes, descriptions and marker results grant no production loading
-permission. Generation publication, retention, process-bound handoff,
+permission. Production generation publication, retention, process-bound handoff,
 provider confinement and hardware qualification remain separate gates.
+
+#### Generation publication and retention experiment, 2026-10-25
+
+A third private example tests whole-tree publication and late pathname reads
+with fixed public bytes. It uses the same pinned static build transaction.
+The active controller accepts only a static executable and runs it in fresh
+user, mount, PID, network and IPC namespaces with an empty root. Setup retains
+only namespace-local mount, chroot and capability-drop privileges. These
+trusted fixture roles do not authenticate a caller or establish launch
+authority. Ordinary and non-musl builds remain refusal stubs.
+
+The publisher constructs two generations. Each contains three regular files
+on a fresh root tmpfs and a nested `/objects` tmpfs. Each file is at most
+4,096 bytes, and each tmpfs has a 2 MiB size limit. Sealed synthetic memfd
+bytes are copied into new private files and compared before handles close;
+memfds cannot be directly bind-mounted. The published files are not sealed
+inodes. Their protection depends on the trusted publisher, read-only
+filesystems and mounts, and consumers without capabilities or writer aliases.
+
+Before publication, both superblocks become read-only. Recursive mount
+attributes add read-only, no-execute, no-device and no-setuid restrictions.
+`statx` with `STATX_MNT_ID_UNIQUE` and `statmount` independently verify
+`SB_RDONLY` and the mount attributes, which `statvfs` alone cannot separate.
+Recursive `open_tree` clones the complete tree; `move_mount` publishes it at
+`/current`. The test checks these interfaces on the running kernel and
+refuses missing support. Their layouts and syscall numbers follow the
+[Linux v6.8 mount UAPI](https://github.com/torvalds/linux/blob/v6.8/include/uapi/linux/mount.h)
+and [x86-64 syscall table](https://github.com/torvalds/linux/blob/v6.8/arch/x86/entry/syscalls/syscall_64.tbl).
+This imposes no new production kernel requirement.
+
+Consumer A completes its private mount namespace, root pivot, old-root
+detachment, descriptor closure and capability removal before B construction
+begins. Consumer B then takes its own root. After the publisher exits or is
+killed and reaped, both consumers reopen their original paths and compare
+all three files against independent generation-specific expectations. No
+source buffers, validation file handles or detached-tree handles keep those
+reads alive. A deliberately inherited descriptor at slot 300 must be closed.
+
+Partial-B cases check the publisher's `/current` separately: it must contain
+complete A before publication or complete B afterward. They release only A
+after the publisher is reaped. Cancellation produces no late-read success.
+Negative controls cover late-byte corruption, nonrecursive cloning, an
+unfrozen nested superblock, a missing mount-readonly attribute, a leaked
+descriptor and a reachable old root. The outer controller bounds collection
+to 20 seconds and performs bounded group cleanup with reaping and pipe EOF.
+
+Portable tests check the result protocol and receipt retention. The explicit
+kernel gate exercises the mount operations, retains its build manifest and
+per-case results on both success and failure, and CI uploads those receipts.
+This experiment proves only the declared synthetic tree's lifetime under
+trusted fixture actors. It adds no real dependency closure, production
+generation service, native-loading permission or certification entry.
 
 ### Cache and production path
 

@@ -290,6 +290,9 @@ jobs:
             ${{ runner.temp }}/irlume-generation/**/*.json
             ${{ runner.temp }}/irlume-generation/**/*.log
             !${{ runner.temp }}/irlume-generation/**/dependencies/**
+            ~/.cache/irlume-namespace-probe/**/*.json
+            ~/.cache/irlume-namespace-probe/**/*.log
+            !~/.cache/irlume-namespace-probe/**/dependencies/**
           if-no-files-found: ignore
           retention-days: 3
 

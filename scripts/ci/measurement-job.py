@@ -1402,6 +1402,8 @@ class BuildSession:
                 "cargo_configs": self.config_inputs.hashes,
             },
         )
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("aggregate build deadline after receipt")
 
     def failed(self, error):
         if self.output is not None:
@@ -1493,3 +1495,6 @@ def build_task3(output, *, _context=None, _factory=None):
         raise
     else:
         context.close()
+        # The output is consumed; an overrun must not retry receipt I/O or close.
+        if time.monotonic() >= context.deadline:
+            raise TimeoutError("aggregate build deadline after close")

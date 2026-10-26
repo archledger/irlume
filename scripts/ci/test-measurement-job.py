@@ -495,6 +495,108 @@ class FilesystemTests(unittest.TestCase):
 
 
 class Task3BuildTests(unittest.TestCase):
+    def terminal_io_build(self, stage, finished, *, primary=None, secondary=None):
+        now, closed, receipts = [0], [False], {}
+        session = job.BuildSession("/private/build")
+        session.deadline = 900
+        session.pins = mock.Mock(hashes={})
+        session.dependency_inputs = mock.Mock(hashes={})
+        session.config_inputs = mock.Mock(hashes={})
+
+        def save(label, row):
+            self.assertFalse(closed[0], "receipt write after close")
+            receipts[label] = row
+            if label == "finished" and stage == "receipt":
+                now[0] = finished
+                if primary is not None:
+                    raise primary
+
+        def close():
+            self.assertFalse(closed[0], "output closed twice")
+            closed[0] = True
+            if stage == "close":
+                now[0] = finished
+                if primary is not None:
+                    raise primary
+            if secondary is not None:
+                raise secondary
+
+        output = mock.Mock()
+        output.save.side_effect = save
+        output.close.side_effect = close
+        session.output = output
+        session.start = mock.Mock()
+        session.compile_native = mock.Mock()
+        session.run_safe = mock.Mock()
+        builder = mock.Mock()
+        builder.record = {
+            "controls": {
+                name: {"status": 1, "expected": list(messages)}
+                for name, messages in job.EXPECTED_CONTROLS.items()
+            }
+        }
+        builder.bootstrap = SimpleNamespace(FLAGS=(), LINTS=())
+        return session, builder, output, receipts, now
+
+    def test_c15_build_terminal_io_deadlines_include_receipt_and_close(self):
+        for stage in ("receipt", "close"):
+            for finished in (899, 900, 901):
+                session, builder, output, receipts, now = self.terminal_io_build(
+                    stage, finished
+                )
+                with (
+                    self.subTest(stage=stage, finished=finished),
+                    mock.patch.object(
+                        job.time, "monotonic", side_effect=lambda now=now: now[0]
+                    ),
+                ):
+                    if finished < 900:
+                        job.build_task3(
+                            "/private/build",
+                            _context=lambda _, session=session: session,
+                            _factory=lambda _, builder=builder: builder,
+                        )
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            job.build_task3(
+                                "/private/build",
+                                _context=lambda _, session=session: session,
+                                _factory=lambda _, builder=builder: builder,
+                            )
+                    output.close.assert_called_once()
+                    self.assertIsNone(session.output)
+                    self.assertIn("finished", receipts)
+                    self.assertEqual(
+                        "failed" in receipts, stage == "receipt" and finished >= 900
+                    )
+
+    def test_c15_build_terminal_io_preserves_primary_errors_and_single_close(self):
+        for stage in ("receipt", "close"):
+            primary = KeyboardInterrupt("terminal I/O interrupted")
+            session, builder, output, receipts, now = self.terminal_io_build(
+                stage, 901, primary=primary, secondary=OSError("cleanup failed")
+            )
+            with (
+                self.subTest(stage=stage),
+                mock.patch.object(
+                    job.time, "monotonic", side_effect=lambda now=now: now[0]
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                job.build_task3(
+                    "/private/build",
+                    _context=lambda _, session=session: session,
+                    _factory=lambda _, builder=builder: builder,
+                )
+            self.assertIs(raised.exception, primary)
+            output.close.assert_called_once()
+            self.assertIsNone(session.output)
+            self.assertEqual("failed" in receipts, stage == "receipt")
+            if stage == "receipt":
+                self.assertTrue(
+                    any("cleanup failed" in note for note in primary.__notes__)
+                )
+
     def test_c15_started_receipt_precedes_constructor_and_failure_is_retained(self):
         calls = []
         context = SimpleNamespace(
@@ -1713,6 +1815,8 @@ PORTABLE_TESTS = {
         "test_input_timeout_refuses_before_read",
     ],
     Task3BuildTests: [
+        "test_c15_build_terminal_io_deadlines_include_receipt_and_close",
+        "test_c15_build_terminal_io_preserves_primary_errors_and_single_close",
         "test_c15_started_receipt_precedes_constructor_and_failure_is_retained",
         "test_c16_frozen_pins_cannot_refresh_changed_inputs",
         "test_c17_exact_suite_no_vacuous_or_skipped_success",

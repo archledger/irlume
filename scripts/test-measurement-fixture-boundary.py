@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 NAMES = ("measurement_fixture_bootstrap", "measurement_entry_probe", "measurement_generation_fixture",
-         "measurement_namespace_probe")
+          "measurement_namespace_probe", "measurement_job_fixture")
 
 
 def check(metadata, sources):
@@ -32,7 +32,7 @@ def check(metadata, sources):
                 raise ValueError("private fixture target role or location changed")
             found.append(target["name"])
     if sorted(found) != sorted(NAMES):
-        raise ValueError("expected exactly four private fixture examples")
+        raise ValueError("expected exactly five private fixture examples")
     for path, text in sources.items():
         if any(name in text for name in NAMES):
             raise ValueError(f"private fixture referenced by shipping source: {path}")
@@ -60,7 +60,7 @@ def check_repository():
         except UnicodeDecodeError:
             continue
     check(metadata, sources)
-    print(f"fixture-boundary: four private examples, {len(sources)} shipping/source inputs checked")
+    print(f"fixture-boundary: five private examples, {len(sources)} shipping/source inputs checked")
 
 
 class BoundaryTests(unittest.TestCase):
@@ -71,47 +71,56 @@ class BoundaryTests(unittest.TestCase):
             for name in NAMES]}]}
 
     def test_private_examples_are_accepted(self):
+        self.assertEqual(NAMES, (
+            "measurement_fixture_bootstrap", "measurement_entry_probe",
+            "measurement_generation_fixture", "measurement_namespace_probe",
+            "measurement_job_fixture"))
         check(self.fixture(), {"packaging/example.spec": "install irlume /usr/bin",
                                "scripts/install-host.sh": "cargo build --example tflite_runtime_probe\n"
                                'PROBE="$ROOT/target/release/examples/tflite_runtime_probe"'})
 
     def test_binary_reclassification_refuses(self):
-        data = self.fixture()
-        data["packages"][0]["targets"][0]["kind"] = ["bin"]
-        with self.assertRaises(ValueError):
-            check(data, {})
+        for index, name in enumerate(NAMES):
+            for kind in (["bin"], ["lib"], ["test"], ["example", "bin"]):
+                data = self.fixture()
+                data["packages"][0]["targets"][index]["kind"] = kind
+                with self.subTest(name=name, kind=kind), self.assertRaises(ValueError):
+                    check(data, {})
 
     def test_missing_duplicate_or_moved_example_refuses(self):
         base = self.fixture()
-        cases = [copy.deepcopy(base) for _ in range(3)]
-        cases[0]["packages"][0]["targets"].pop()
-        cases[1]["packages"][0]["targets"].append(copy.deepcopy(base["packages"][0]["targets"][0]))
-        cases[2]["packages"][0]["targets"][0]["src_path"] = str(ROOT / "crates/irlume-common/src/main.rs")
-        for data in cases:
-            with self.subTest(data=data), self.assertRaises(ValueError):
-                check(data, {})
+        for index, name in enumerate(NAMES):
+            cases = [copy.deepcopy(base) for _ in range(3)]
+            cases[0]["packages"][0]["targets"].pop(index)
+            cases[1]["packages"][0]["targets"].append(copy.deepcopy(base["packages"][0]["targets"][index]))
+            cases[2]["packages"][0]["targets"][index]["src_path"] = str(ROOT / "crates/irlume-common/src/main.rs")
+            for variant, data in enumerate(cases):
+                with self.subTest(name=name, variant=variant), self.assertRaises(ValueError):
+                    check(data, {})
 
     def test_foreign_package_or_renamed_target_refuses(self):
-        for field, value in [("package", "irlume-cli"), ("target", "hidden_alias")]:
-            data = self.fixture()
-            if field == "package":
-                data["packages"][0]["name"] = value
-            else:
-                data["packages"][0]["targets"][0]["name"] = value
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                check(data, {})
+        for index, name in enumerate(NAMES):
+            for field, value in [("package", "irlume-cli"), ("target", "hidden_alias")]:
+                data = self.fixture()
+                if field == "package":
+                    data["packages"][0]["name"] = value
+                else:
+                    data["packages"][0]["targets"][index]["name"] = value
+                with self.subTest(name=name, field=field), self.assertRaises(ValueError):
+                    check(data, {})
 
     def test_install_references_or_example_wildcards_refuse(self):
-        for text in ["install measurement_fixture_bootstrap /usr/bin/",
-                     "install measurement_generation_fixture /usr/bin/",
-                     "install measurement_namespace_probe /usr/bin/",
-                     "cp target/release/examples/* $out/bin/", "cargo build --examples"]:
+        for text in [*(f"install {name} /usr/bin/" for name in NAMES),
+                     "cp target/release/examples/* $out/bin/", "cargo build --examples",
+                     "cp target/release/examples/. $out/bin/"]:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 check(self.fixture(), {"packaging/install.sh": text})
 
     def test_production_source_reference_refuses(self):
-        with self.assertRaises(ValueError):
-            check(self.fixture(), {"crates/irlume-common/src/lib.rs": 'mod measurement_entry_probe;'})
+        for name in NAMES:
+            for text in [f"mod {name};", f'#[path = "../examples/{name}.rs"] mod private;']:
+                with self.subTest(name=name, text=text), self.assertRaises(ValueError):
+                    check(self.fixture(), {"crates/irlume-common/src/lib.rs": text})
 
 
 if __name__ == "__main__":

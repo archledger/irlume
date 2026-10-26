@@ -301,6 +301,30 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+      - name: Contained-job portable contracts
+        timeout-minutes: 10
+        env:
+          IRLUME_JOB_OUTPUT: ${{ runner.temp }}/irlume-job-portable
+        run: bash scripts/test-measurement-job.sh
+
+      - name: Contained-job static build (no native execution)
+        timeout-minutes: 20
+        env:
+          IRLUME_JOB_OUTPUT: ${{ runner.temp }}/irlume-job-build
+        run: bash scripts/test-measurement-job.sh --build
+
+      - name: Retain contained-job receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: contained-job-receipts
+          path: |
+            ${{ runner.temp }}/irlume-job-portable/*.json
+            ${{ runner.temp }}/irlume-job-build/*.json
+          if-no-files-found: ignore
+          include-hidden-files: false
+          retention-days: 3
+
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)

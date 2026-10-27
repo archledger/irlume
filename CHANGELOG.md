@@ -1043,6 +1043,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Secure the single systemd activation listener against exec inheritance and
+  refuse startup if securing it fails (#1213). AppArmor policy is unchanged.
+
 - Enrollment, scan addition, profile removal and recovery management address
   polkit by the well-known name allowed by the shipped AppArmor profiles
   (#1207). Reply-sender, request and process checks remain unchanged. Root

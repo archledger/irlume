@@ -1066,10 +1066,14 @@ jobs:
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
+          python3 test-generate-native-metadata-seeds.py
           for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate native_metadata native_generation; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true
+            if [ "$t" = native_metadata ]; then
+              python3 generate-native-metadata-seeds.py "corpus/$t"
+            fi
             cargo fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096
             echo "::endgroup::"
           done

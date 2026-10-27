@@ -1047,6 +1047,12 @@ All notable changes to irlume are documented here. This project adheres to
   loading fails, while keeping installation non-fatal and service ordering
   unchanged.
 
+- Add `attach_disconnected` to the local-bin AppArmor profile so the daemon
+  can write replies through the systemd socket-activation listener, which
+  binds outside the daemon's mount namespace (#1213). Matches the usr-bin
+  profile's existing flag; residual disconnected-name exposures (Kerberos
+  ticket read, nameservice pipe rw) documented in the profile comment.
+
 - Debian package upgrades preserve reconciliation timer enablement and stopped
   state when switching from a package lane without the migration marker.
   Fresh installs and upgrades from before 0.7.0 still arm the timer.

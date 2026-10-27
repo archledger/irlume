@@ -10,10 +10,12 @@
 # UnsealPassword) produced ZERO would-be-denials, then ran clean under enforce.
 # A policy gap here degrades face auth to the password (irlume never locks out),
 # so enforce is fail-safe; still soak new hardware/derivatives in complain
-# before trusting enforce there (drop in `flags=(complain)` below to do so).
+# before trusting enforce there (add `, complain` to the flags below to do so;
+# do NOT replace the flags entirely, see the attach_disconnected comment).
 #
 # Reload:  apparmor_parser -r /etc/apparmor.d/usr.local.bin.irlumed
-# Complain (per-box soak):  add `flags=(complain)` to the profile line + reload.
+# Complain (per-box soak):  add `, complain` to the flags below + reload;
+# do NOT replace the flags entirely (see the attach_disconnected comment).
 
 # AppArmor ABI: pin the OLDEST parser we support, not the newest.
 #
@@ -31,7 +33,26 @@
 abi <abi/3.0>,
 include <tunables/global>
 
-profile irlumed /usr/local/bin/irlumed {
+# attach_disconnected: systemd socket activation hands the daemon a listener
+# bound outside its mount namespace (PrivateTmp/ProtectSystem create one), so
+# the saved pathname is disconnected and every reply write fails without this
+# flag (#1213). The usr-bin profile has carried it since it shipped.
+#
+# The flag also mediates OTHER disconnected names against this profile's
+# existing rules. The expanded policy's only /tmp grants are three
+# nameservice-abstraction entries: the winbind and Likewise pipes grant rw
+# and the Kerberos ticket cache grants r. A disconnected fd to a real-/tmp
+# object matching any of these patterns would be allowed. The krb5cc* read
+# and the pipe rw grants are both identified exposures; the tested
+# unprivileged-sender construction path was blocked on the tested Ubuntu
+# 24.04 guest, but this depends on each host's user-namespace policy and
+# does not exclude other descriptor-delivery paths. These exposures match
+# the already-shipped usr-bin behavior and are accepted here as documented
+# residuals requiring an already-compromised daemon.
+#
+# Complain-mode soaks: use flags=(attach_disconnected, complain) to keep this
+# flag while testing; replacing the flags entirely changes what is tested.
+profile irlumed /usr/local/bin/irlumed flags=(attach_disconnected) {
   include <abstractions/base>
   # uid→name lookups for SO_PEERCRED authz (/etc/nsswitch.conf, passwd, group).
   include <abstractions/nameservice>

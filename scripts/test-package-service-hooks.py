@@ -379,6 +379,44 @@ class PackageServiceHookTests(unittest.TestCase):
                     self.assert_unit(state, "irlume-reconcile.timer", "disabled", False)
                     self.assert_unit(state, "irlume-reconcile.path", others, False)
 
+    def test_debian_modern_upgrade_without_marker_preserves_timer_state(self):
+        # Native packages have the timer but do not write the universal
+        # package's migration marker. Its absence must not undo an admin choice.
+        for old in ("0.7.0", "0.7.0-1", "0.15.0~nightly-1", "1:0.6.1-1"):
+            for enabled, active in (("disabled", False), ("disabled", True),
+                                    ("enabled", False), ("enabled", True),
+                                    ("enabled-runtime", False), ("masked", False),
+                                    ("masked-runtime", False)):
+                with self.subTest(old=old, enabled=enabled, active=active):
+                    state = self.run_hook("debian", ("enabled", True), ("enabled", True), old,
+                                          reconcile={"irlume-reconcile.path": ("disabled", False),
+                                                     "irlume-reconcile.timer": (enabled, active),
+                                                     "irlume-reconcile.service": ("disabled", False)},
+                                          timer_armed=False)
+                    self.assert_unit(state, "irlume-reconcile.timer", enabled, active)
+                    self.assert_unit(state, "irlume-reconcile.path", "disabled", False)
+                    self.assert_unit(state, "irlume-reconcile.service", "disabled", False)
+
+    def test_debian_pre_timer_upgrade_respects_existing_migration_marker(self):
+        for old in ("0.6.1", "0.6.1-2", "0.7.0~rc1"):
+            for timer_armed in (False, True):
+                with self.subTest(old=old, timer_armed=timer_armed):
+                    state = self.run_hook("debian", ("enabled", True), ("enabled", True), old,
+                                          reconcile=("disabled", False), timer_armed=timer_armed)
+                    self.assert_unit(state, "irlume-reconcile.timer",
+                                     "disabled" if timer_armed else "enabled", not timer_armed,
+                                     starts=int(not timer_armed))
+                    self.assert_unit(state, "irlume-reconcile.path", "disabled", False)
+                    self.assert_unit(state, "irlume-reconcile.service", "disabled", False)
+                    self.assertTrue(state["timer_armed"])
+
+    def test_debian_first_install_without_marker_arms_timer(self):
+        state = self.run_hook("debian", ("disabled", False), ("disabled", False), None,
+                              reconcile=("disabled", False), timer_armed=False)
+        for unit in RECONCILE:
+            self.assert_unit(state, unit, "enabled", True, starts=1)
+        self.assertTrue(state["timer_armed"])
+
     def test_first_install_enables_and_starts_the_reconcile_units(self):
         for family in ("debian", "arch", "fedora"):
             with self.subTest(family=family):

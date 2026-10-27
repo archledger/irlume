@@ -38,12 +38,12 @@ if [ -z "${2:-}" ]; then
     # same-transaction strip is re-applied. Self-gates; no-op on a fresh box.
     systemctl enable --now irlume-reconcile.service 2>/dev/null || true
 fi
-# The timer is NEW in 0.7.0, and the block above only enables units on FIRST
-# install so an upgrade cannot re-enable something the admin turned off. That
-# would leave every upgrader without the backstop, which is exactly the
-# population the self-heal exists for (issue #93). Arm it ONCE, recorded by a
-# marker, so a later deliberate `systemctl disable` is still respected.
-if [ ! -e /var/lib/irlume/.reconcile-timer-armed ]; then
+# The timer is NEW in 0.7.0. Arm it once on first install or an upgrade from
+# before that release, recorded by a marker so a later disable is respected.
+# A newer install from another package lane can lack this marker despite
+# already having the timer; its absence alone must not undo an admin choice.
+if [ ! -e /var/lib/irlume/.reconcile-timer-armed ] &&
+    { [ -z "${2:-}" ] || dpkg --compare-versions "$2" lt 0.7.0; }; then
     # /var/lib is system-owned and already exists; only the leaf is ours.
     # shellcheck disable=SC2174
     mkdir -p -m 0700 /var/lib/irlume

@@ -182,7 +182,7 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        support::cleanup_sandbox(&self.root);
     }
 }
 

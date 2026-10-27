@@ -4,6 +4,122 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const COVERAGE_DIR: &str = "llvm-profiles";
+
+fn coverage_output_path(root: &Path, profile: &Path) -> std::io::Result<PathBuf> {
+    let name = profile.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing LLVM profile filename",
+        )
+    })?;
+    let directory = root.join(COVERAGE_DIR);
+    std::fs::create_dir_all(&directory)?;
+    // Separate test processes can also live in separate PID namespaces, with
+    // identical PIDs. A nonce distinguishes every invocation while retaining
+    // LLVM's %p/%m merge patterns. Collection refuses any accidental collision.
+    let mut unique =
+        std::ffi::OsString::from(format!("namespace-{:032x}-", rand::random::<u128>()));
+    unique.push(name);
+    Ok(directory.join(unique))
+}
+
+fn collect_coverage(root: &Path, profile: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let open_directory = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    let root_fd = open_directory(root)?;
+    let directory = PathBuf::from(format!(
+        "/proc/self/fd/{}/{}",
+        root_fd.as_raw_fd(),
+        COVERAGE_DIR
+    ));
+    let directory_fd = match open_directory(&directory) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // Keep reads and unlinks anchored to the validated directory, even if its
+    // child-visible name is replaced. Never follow child-provided symlinks.
+    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", directory_fd.as_raw_fd()))?;
+    let destination = profile
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(destination)?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LLVM profile is not a regular file",
+            ));
+        }
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(entry.path())?;
+        if !source.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LLVM profile changed to a non-regular file",
+            ));
+        }
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination.join(entry.file_name()))?;
+        // The fixture and coverage target may be on different filesystems.
+        // Never overwrite another invocation's counters or delete the source
+        // until its complete copy succeeded.
+        std::io::copy(&mut source, &mut target)?;
+        target.flush()?;
+        std::fs::remove_file(entry.path())?;
+    }
+    std::fs::remove_dir(directory)
+}
+
+/// Preserve namespace profiles before deleting a completed fixture. The test
+/// process keeps its inherited LLVM_PROFILE_FILE; only child commands override
+/// it. cargo-llvm-cov collects *.profraw directly in that original directory.
+pub(crate) fn remove_sandbox(root: &Path) -> std::io::Result<()> {
+    let profiles_exist = match std::fs::symlink_metadata(root.join(COVERAGE_DIR)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if profiles_exist {
+        let profile = std::env::var_os("LLVM_PROFILE_FILE").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "LLVM_PROFILE_FILE removed before fixture cleanup",
+            )
+        })?;
+        collect_coverage(root, Path::new(&profile))?;
+    }
+    std::fs::remove_dir_all(root)
+}
+
+/// Fail a successful test on cleanup errors, but preserve an existing panic
+/// rather than aborting the test process with a second panic from Drop.
+pub(crate) fn cleanup_sandbox(root: &Path) {
+    if let Err(error) = remove_sandbox(root) {
+        let message = format!("retained fixture {}: {error}", root.display());
+        if std::thread::panicking() {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr().lock(), "{message}");
+        } else {
+            panic!("{message}");
+        }
+    }
+}
+
 /// Run the CLI as namespace-root with a private fixed `/usr/bin`, so code that
 /// deliberately ignores PATH cannot reach the host's privileged tools. Each
 /// directory in `hidden` that exists on the host is covered by an empty tmpfs,
@@ -315,6 +431,13 @@ fn namespace_command(
     if matches!(mode, Namespace::Mount) {
         command.args(["--cap-add", "CAP_SYS_ADMIN"]);
     }
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env(
+            "LLVM_PROFILE_FILE",
+            coverage_output_path(root, Path::new(&profile))
+                .expect("prepare private LLVM profile output"),
+        );
+    }
     command
         .args(["--bind", root.to_str().unwrap(), root.to_str().unwrap()])
         .args(["--chdir", root.join("work").to_str().unwrap(), "--", bin])
@@ -439,6 +562,234 @@ done
 mod parent_tests {
     use super::*;
 
+    #[test]
+    fn coverage_names_do_not_collide_between_pid_namespaces() {
+        const CHILD: &str = "IRLUME_TEST_COVERAGE_NAME_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let profile =
+                coverage_output_path(Path::new(&root), Path::new("probe.profraw")).unwrap();
+            println!(
+                "profile-name:{}",
+                profile.file_name().unwrap().to_str().unwrap()
+            );
+            println!("profile-pid:{}", std::process::id());
+            return;
+        }
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.0.join("work")).unwrap();
+        let binary = std::env::current_exe().unwrap();
+        let test = format!(
+            "{}::coverage_names_do_not_collide_between_pid_namespaces",
+            module_path!().split_once("::").unwrap().1
+        );
+        let mut names = Vec::new();
+        let mut pids = Vec::new();
+        for _ in 0..2 {
+            let output = isolated_root_command(
+                &fixture.0,
+                binary.to_str().unwrap(),
+                &["--exact", &test, "--nocapture"],
+                &[],
+                &[],
+                &[],
+            )
+            .env(CHILD, fixture.0.join("names"))
+            .output()
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("1 passed; 0 failed; 0 ignored"), "{text}");
+            names.push(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("profile-name:"))
+                    .unwrap()
+                    .to_owned(),
+            );
+            pids.push(
+                text.lines()
+                    .find_map(|line| line.strip_prefix("profile-pid:"))
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(pids[0], pids[1], "the two namespaces must reuse their PID");
+        assert_ne!(
+            names[0], names[1],
+            "different test processes need distinct profile names"
+        );
+    }
+
+    #[test]
+    fn instrumented_namespaces_keep_profiles_and_the_host_read_only() {
+        let fixture = Fixture::new();
+        let sandbox = fixture.0.join("sandbox");
+        let destination = fixture.0.join("profiles");
+        std::fs::create_dir_all(sandbox.join("work")).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let source = fixture.0.join("probe.rs");
+        let binary = fixture.0.join("probe");
+        let outside = fixture.0.join("host-file");
+        std::fs::write(&outside, "unchanged").unwrap();
+        std::fs::write(
+            &source,
+            r#"
+            fn main() {
+                assert!(std::fs::write(std::env::args().nth(1).unwrap(), "changed").is_err());
+                println!("instrumented child");
+            }
+        "#,
+        )
+        .unwrap();
+        let built = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args(["-C", "instrument-coverage"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let profile = destination.join("probe-%p-%m.profraw");
+        for mode in [Namespace::Private, Namespace::HostPids, Namespace::Mount] {
+            let output_path = coverage_output_path(&sandbox, &profile).unwrap();
+            let output = namespace_command(
+                &sandbox,
+                binary.to_str().unwrap(),
+                &[outside.to_str().unwrap()],
+                &[],
+                &[],
+                &[],
+                mode,
+            )
+            .env("LLVM_PROFILE_FILE", output_path)
+            .output()
+            .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(output.stderr.is_empty(), "{output:?}");
+            assert_eq!(output.stdout, b"instrumented child\n");
+        }
+        collect_coverage(&sandbox, &profile).unwrap();
+        std::fs::remove_dir_all(&sandbox).unwrap();
+        let profiles: Vec<_> = std::fs::read_dir(&destination).unwrap().collect();
+        assert_eq!(profiles.len(), 3, "each invocation keeps its own counters");
+        for profile in profiles {
+            let profile = profile.unwrap();
+            assert_eq!(profile.path().extension().unwrap(), "profraw");
+            assert!(profile.metadata().unwrap().len() > 0);
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn coverage_collection_refuses_collisions_and_keeps_source_bytes() {
+        let fixture = Fixture::new();
+        let sandbox = fixture.0.join("sandbox");
+        let destination = fixture.0.join("profiles");
+        std::fs::create_dir(&destination).unwrap();
+        let profile = destination.join("probe.profraw");
+        let source = coverage_output_path(&sandbox, &profile).unwrap();
+        std::fs::write(&source, "new counters").unwrap();
+        let existing = destination.join(source.file_name().unwrap());
+        std::fs::write(&existing, "old counters").unwrap();
+        assert!(collect_coverage(&sandbox, &profile).is_err());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "new counters");
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "old counters");
+    }
+
+    #[test]
+    fn coverage_collection_refuses_non_regular_profiles() {
+        let fixture = Fixture::new();
+        let sandbox = fixture.0.join("sandbox");
+        let profile = fixture.0.join("probe.profraw");
+        let source = coverage_output_path(&sandbox, &profile).unwrap();
+        let outside = fixture.0.join("outside");
+        std::fs::write(&outside, "bounded fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, &source).unwrap();
+        assert!(collect_coverage(&sandbox, &profile).is_err());
+        assert!(source.is_symlink());
+    }
+
+    #[test]
+    fn coverage_collection_never_follows_a_replaced_directory() {
+        let fixture = Fixture::new();
+        let sandbox = fixture.0.join("sandbox");
+        let sibling = fixture.0.join("sibling");
+        std::fs::create_dir(&sandbox).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let counters = sibling.join("other.profraw");
+        std::fs::write(&counters, "unrelated counters").unwrap();
+        std::os::unix::fs::symlink(&sibling, sandbox.join(COVERAGE_DIR)).unwrap();
+        assert!(collect_coverage(&sandbox, &fixture.0.join("report/probe.profraw")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(counters).unwrap(),
+            "unrelated counters"
+        );
+        assert!(!fixture.0.join("report/other.profraw").exists());
+        assert!(sandbox.join(COVERAGE_DIR).is_symlink());
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_the_fixture_without_double_panic() {
+        const CHILD: &str = "IRLUME_TEST_COVERAGE_CLEANUP_CHILD";
+        const ROOT: &str = "IRLUME_TEST_COVERAGE_CLEANUP_ROOT";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    cleanup_sandbox(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(PathBuf::from(std::env::var_os(ROOT).unwrap()));
+            if mode == "unwinding" {
+                panic!("original assertion failure");
+            }
+            return;
+        }
+        let fixture = Fixture::new();
+        let sandbox = fixture.0.join("sandbox");
+        std::fs::create_dir_all(sandbox.join(COVERAGE_DIR)).unwrap();
+        let counters = sandbox.join("retained.profraw");
+        std::fs::write(&counters, "retained counters").unwrap();
+        // A bounded, non-regular entry forces collection to fail. No global
+        // environment mutation and no disk-filling or permission tricks.
+        std::os::unix::fs::symlink(&counters, sandbox.join(COVERAGE_DIR).join("bad.profraw"))
+            .unwrap();
+        let test = format!(
+            "{}::cleanup_failure_preserves_the_fixture_without_double_panic",
+            module_path!().split_once("::").unwrap().1
+        );
+        for mode in ["normal", "unwinding"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, mode)
+                .env(ROOT, &sandbox)
+                .env(
+                    "LLVM_PROFILE_FILE",
+                    std::env::var_os("LLVM_PROFILE_FILE")
+                        .unwrap_or_else(|| fixture.0.join("report/probe-%p-%m.profraw").into()),
+                )
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(101),
+                "test failure, not process abort: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("0 passed; 1 failed"),
+                "{output:?}"
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("retained fixture"), "{error}");
+            if mode == "unwinding" {
+                assert!(error.contains("original assertion failure"), "{error}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(&counters).unwrap(),
+                "retained counters"
+            );
+        }
+    }
+
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -473,7 +824,7 @@ mod parent_tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            cleanup_sandbox(&self.0);
         }
     }
 

@@ -101,6 +101,8 @@ mod attempt_record;
 mod connection_slots;
 mod diagnostics;
 mod enrollment_session;
+#[cfg(test)]
+mod listener_tests;
 mod live;
 mod operation_authorization;
 mod position_session;
@@ -1301,6 +1303,18 @@ fn main() {
     if users::run_helper() {
         return;
     }
+    // Adopt while startup is single-threaded, before another open can reuse
+    // fd3 or a helper can inherit it. A selected but unusable descriptor must
+    // not reach the self-bind path, which unlinks the configured socket.
+    let inherited = match inherited_listener() {
+        Ok(listener) => listener,
+        Err(e) => {
+            jout_err!(
+                "irlumed: cannot secure activation listener ({e}); face authentication is unavailable; passwords still work"
+            );
+            std::process::exit(1);
+        }
+    };
     users::initialize();
     latch_split_camera_pairs();
     // Next, before models load. The watchdog deadline starts ticking the moment
@@ -1342,7 +1356,7 @@ fn main() {
     // Self-binding stays for anyone running the daemon directly (development,
     // a distro without the socket unit installed, IRLUME_SOCKET pointing
     // somewhere else in a test).
-    let listener = match inherited_listener() {
+    let listener = match inherited {
         Some(l) => {
             jout_info!("irlumed: using the socket systemd bound (socket activation)");
             l
@@ -4279,7 +4293,16 @@ fn refusal_throttled(uid: u32) -> bool {
 /// child is not mistaken for ours) and `LISTEN_FDS` counts descriptors starting
 /// at 3. We ask for exactly one, because the unit lists exactly one
 /// `ListenStream=`.
-fn inherited_listener() -> Option<UnixListener> {
+///
+/// Only the shipped single-listener setup is supported. Refused counts keep
+/// the existing self-bind behavior; their descriptors are not adopted or
+/// secured here. This does not validate socket type or authenticate a launcher.
+///
+/// # Errors
+/// Returns the OS error if the selected descriptor does not exist or its
+/// close-on-exec flag cannot be set. A selected descriptor never falls back
+/// to self-binding on error.
+fn inherited_listener() -> std::io::Result<Option<UnixListener>> {
     use std::os::fd::FromRawFd;
     const SD_LISTEN_FDS_START: i32 = 3;
     let pid_is_ours = std::env::var("LISTEN_PID")
@@ -4298,21 +4321,41 @@ fn inherited_listener() -> Option<UnixListener> {
     // LISTEN_PID as true and skipped the 0666 chmod: the socket stayed at the
     // 0750 the unit's UMask produces, and every non-root client, the lock
     // screen included, got EACCES with nothing in any log.
+    // Production calls this during single-threaded startup. Tests hold the
+    // environment lock in a fresh child when they manipulate the descriptor.
     std::env::remove_var("LISTEN_FDS");
     std::env::remove_var("LISTEN_PID");
+    std::env::remove_var("LISTEN_FDNAMES");
+    std::env::remove_var("LISTEN_PIDFDID");
     if !pid_is_ours {
-        return None;
+        return Ok(None);
     }
-    let n = fds?;
+    let Some(n) = fds else {
+        return Ok(None);
+    };
     if n != 1 {
         jout_warn!("irlumed: LISTEN_FDS={n}, expected exactly 1; binding our own socket instead");
-        return None;
+        return Ok(None);
+    }
+    // This checks existence only, not the descriptor's socket type.
+    // SAFETY: F_GETFD reads descriptor flags and takes no pointer argument.
+    let flags = unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the selected descriptor is open and owned by this process.
+    // The systemd launch contract supplies a listening socket. Startup has
+    // not transferred its ownership or started other threads.
+    let listener = unsafe { UnixListener::from_raw_fd(SD_LISTEN_FDS_START) };
+    // SAFETY: F_SETFD takes integer flags; listener owns the live descriptor.
+    let result =
+        unsafe { libc::fcntl(SD_LISTEN_FDS_START, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if result == -1 {
+        // The owned listener drops on this error; activation remains false.
+        return Err(std::io::Error::last_os_error());
     }
     SOCKET_ACTIVATED.store(true, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: systemd guarantees fd 3 is an open listening socket when
-    // LISTEN_PID names us and LISTEN_FDS is 1, and nothing else in this process
-    // has taken it: this runs before any other socket is opened.
-    Some(unsafe { UnixListener::from_raw_fd(SD_LISTEN_FDS_START) })
+    Ok(Some(listener))
 }
 
 /// Whether systemd handed us the socket, read from the latch alone: the fd
@@ -14177,7 +14220,10 @@ mod tests {
         std::env::set_var("LISTEN_PID", std::process::id().to_string());
         std::env::set_var("LISTEN_FDS", "2");
         let took = inherited_listener();
-        assert!(took.is_none(), "two fds must refuse the inheritance");
+        assert!(
+            matches!(took, Ok(None)),
+            "two fds must refuse the inheritance"
+        );
         assert!(
             !socket_activated(),
             "a refused take must not read as activation: the self-bound socket \
@@ -14215,8 +14261,9 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 31] = [
+        let sources: [(&str, &str); 32] = [
             ("main.rs", include_str!("main.rs")),
+            ("listener_tests.rs", include_str!("listener_tests.rs")),
             (
                 "selection_provenance_tests.rs",
                 include_str!("selection_provenance_tests.rs"),

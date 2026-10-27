@@ -114,7 +114,11 @@ elif name == "systemd-tmpfiles":
     else:
         status = unexpected()
 elif name == "apparmor_parser" and args == ["-r", "/etc/apparmor.d/usr.bin.irlumed"]:
-    state["profile_loaded"] = True
+    if state["parser_fails"]:
+        print("synthetic AppArmor parser failure", file=sys.stderr)
+        status = 1
+    else:
+        state["profile_loaded"] = True
 elif name == "policy-rc.d" and len(args) == 2 and args[0] in state["units"] and args[1] in ("start", "restart", "try-restart", "stop"):
     status = state["policy"]
 else:
@@ -211,7 +215,8 @@ class PpaServiceHookTests(unittest.TestCase):
 
     def run_hook(self, service=("enabled", False), socket=("enabled", False),
                  *, old="0.11.3-1", action="configure", policy=0,
-                 systemd=True, dpkg_root=False, hook="postinst"):
+                 systemd=True, dpkg_root=False, hook="postinst",
+                 parser_fails=False, parser_available=True):
         with tempfile.TemporaryDirectory(prefix="irlume-ppa-hook-") as temporary:
             directory = Path(temporary)
             runtime = directory / "run/systemd/system"
@@ -232,8 +237,10 @@ class PpaServiceHookTests(unittest.TestCase):
                                "starts": 0, "restarts": 0, "stops": 0, "enable_checked": False}
             state_path.write_text(json.dumps({"units": units, "calls": [], "errors": [],
                 "fresh": old is None, "policy": policy, "prepared": False, "profile_loaded": False,
-                "reloads": 0, "activation_order": [], "purged": []}))
+                "parser_fails": parser_fails, "reloads": 0, "activation_order": [], "purged": []}))
             for name in ("systemctl", "deb-systemd-helper", "systemd-tmpfiles", "apparmor_parser", "policy-rc.d"):
+                if name == "apparmor_parser" and not parser_available:
+                    continue
                 path = boundary / name
                 path.write_text(f"#!{sys.executable}\n{SHIM}")
                 path.chmod(0o700)
@@ -258,8 +265,9 @@ class PpaServiceHookTests(unittest.TestCase):
             args = [self.commands["sh"], str(script), action]
             if old is not None:
                 args.append(old)
-            run(args, cwd=directory, env=env)
+            stdout, stderr = run(args, cwd=directory, env=env)
             state = json.loads(state_path.read_text())
+            state["stdout"], state["stderr"] = stdout, stderr
             self.assertEqual(state["errors"], [], "unexpected or unsafe hook command")
             return state
 
@@ -267,6 +275,44 @@ class PpaServiceHookTests(unittest.TestCase):
         actual = {k: v for k, v in state["units"][unit].items() if k != "enable_checked"}
         self.assertEqual(actual, {"enabled": enabled, "active": active,
                                  "starts": starts, "restarts": restarts, "stops": stops}, state["calls"])
+
+    def test_parser_failure_reports_diagnostics_without_aborting(self):
+        for old in (None, "0.15.0-1"):
+            with self.subTest(old=old):
+                active = old is not None
+                state = self.run_hook(("enabled", active), ("enabled", active),
+                                      old=old, parser_fails=True)
+                output = state["stdout"] + state["stderr"]
+                self.assertIn("synthetic AppArmor parser failure", output)
+                self.assertEqual(state["stderr"].count("WARNING:"), 1)
+                self.assertIn("AppArmor profile did not load", state["stderr"])
+                self.assertIn("may run unconfined", state["stderr"])
+                self.assertFalse(state["profile_loaded"])
+                for unit in (DAEMON, SOCKET):
+                    self.assert_unit(state, unit, "enabled", True,
+                                     starts=int(old is None), restarts=int(active))
+                self.assertTrue(state["activation_order"])
+                for event in state["activation_order"]:
+                    self.assertTrue(event["prepared"])
+                    self.assertFalse(event["profile_loaded"])
+                    self.assertGreater(event["reloads"], 0)
+
+    def test_parser_success_adds_no_warning(self):
+        for old in (None, "0.15.0-1"):
+            with self.subTest(old=old):
+                state = self.run_hook(old=old)
+                self.assertTrue(state["profile_loaded"])
+                self.assertEqual(state["stderr"], "")
+                self.assertNotIn("WARNING:", state["stdout"])
+
+    def test_absent_parser_stays_quiet_without_host_fallback(self):
+        for old in (None, "0.15.0-1"):
+            with self.subTest(old=old):
+                state = self.run_hook(old=old, parser_available=False)
+                self.assertFalse(state["profile_loaded"])
+                self.assertFalse(any(call[0] == "apparmor_parser" for call in state["calls"]))
+                self.assertEqual(state["stderr"], "")
+                self.assertNotIn("WARNING:", state["stdout"])
 
     def test_upgrade_preserves_enabled_stopped_daemon_and_socket(self):
         state = self.run_hook()

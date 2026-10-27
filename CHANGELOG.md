@@ -1043,6 +1043,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PPA packages preserve AppArmor parser diagnostics and warn when profile
+  loading fails, while keeping installation non-fatal and service ordering
+  unchanged.
+
 - Debian package upgrades preserve reconciliation timer enablement and stopped
   state when switching from a package lane without the migration marker.
   Fresh installs and upgrades from before 0.7.0 still arm the timer.

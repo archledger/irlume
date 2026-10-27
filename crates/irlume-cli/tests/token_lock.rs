@@ -109,7 +109,7 @@ impl RaceFixture {
 }
 impl Drop for RaceFixture {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        support::cleanup_sandbox(&self.0);
     }
 }
 
@@ -208,7 +208,7 @@ fn helper_transfers_exclusion_only_after_proving_session_delivery() {
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+            support::cleanup_sandbox(&self.0);
         }
     }
     std::fs::create_dir(&root).unwrap();

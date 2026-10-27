@@ -213,7 +213,7 @@ impl Drop for Bed {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.server.take().unwrap().join().unwrap();
-        std::fs::remove_dir_all(&self.root).unwrap();
+        support::cleanup_sandbox(&self.root);
     }
 }
 

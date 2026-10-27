@@ -1043,6 +1043,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Debian package upgrades preserve reconciliation timer enablement and stopped
+  state when switching from a package lane without the migration marker.
+  Fresh installs and upgrades from before 0.7.0 still arm the timer.
+
 - Secure the single systemd activation listener against exec inheritance and
   refuse startup if securing it fails (#1213). AppArmor policy is unchanged.
 

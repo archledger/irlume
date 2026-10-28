@@ -623,6 +623,48 @@ def check_controls(controls):
             raise RuntimeError("invalid compiler control diagnostics/status")
 
 
+def check_legacy_refusal(status, stderr, source):
+    """Require the pinned compiler to reject both fresh-clock entry imports."""
+    if (
+        type(status) is not int
+        or status == 0
+        or type(stderr) is not str
+        or len(stderr) > PROFILE_LIMIT
+    ):
+        raise RuntimeError("legacy entry control did not fail as expected")
+    try:
+        records = [
+            strict_json(line.encode(), PROFILE_LIMIT)
+            for line in stderr.splitlines()
+            if line.strip()
+        ]
+    except (ValueError, UnicodeError) as error:
+        raise RuntimeError("invalid legacy control diagnostics") from error
+    if any(type(row) is not dict for row in records):
+        raise RuntimeError("invalid legacy control diagnostics")
+    errors = [
+        row
+        for row in records
+        if row.get("level") == "error" and row.get("code") is not None
+    ]
+    if len(errors) != 1:
+        raise RuntimeError("legacy control failed for another reason")
+    error = errors[0]
+    spans = error.get("spans")
+    if (
+        type(error.get("code")) is not dict
+        or error["code"].get("code") != "E0432"
+        or error.get("message")
+        != "unresolved imports `kernel::run`, `kernel::run_case`"
+        or type(spans) is not list
+        or any(type(span) is not dict for span in spans)
+    ):
+        raise RuntimeError("legacy control did not reject both entry points")
+    primary = [span for span in spans if span.get("is_primary") is True]
+    if not primary or any(span.get("file_name") != str(source) for span in primary):
+        raise RuntimeError("legacy control diagnostic source mismatch")
+
+
 def check_bounds_codegen(ir):
     """Require compiled sentinel operations; no runtime property is inferred."""
     for pattern in (
@@ -935,6 +977,13 @@ class CompilerCommand:
 
 
 RUST_TESTS = (
+    "kernel::tests::r2a_clock_regression_after_birth_retains_custody",
+    "kernel::tests::r2a_reservation_requires_exact_finite_origin_budget",
+    "kernel::tests::r2a_delayed_entry_does_not_restart_phase_or_total_caps",
+    "kernel::tests::r2a_invalid_reservation_refuses_before_any_os_effect",
+    "kernel::tests::r2a_pre_origin_and_expired_start_refuse_before_acquisition",
+    "kernel::tests::r2a_clean_completion_retains_original_finalization_deadline",
+    "kernel::tests::r2a_quarantine_and_late_native_return_cannot_refresh_budget",
     "kernel::tests::b01_complete_requires_cutover_and_returns_owned_sentinel",
     "kernel::tests::b02_withheld_predicates_retain_sentinel_and_leases",
     "kernel::tests::b03_native_cadence_stalls_reach_deadline_before_operation_cap",
@@ -1078,6 +1127,13 @@ class BuildSession:
             "    unsafe { sys::run(input) }\n}\n"
         )
         self.driver = self.generated("native-driver.rs", driver.encode())
+        self.legacy_control = self.generated(
+            "legacy-entry-control.rs",
+            (
+                f"#[path = {json.dumps(str(kernel))}] pub mod kernel;\n"
+                "pub use kernel::{run, run_case};\n"
+            ).encode(),
+        )
         self.control_sys = self.generated(
             "control-sys.rs",
             native.read_bytes() + b'\ncompile_error!("job-sys-active-control");\n',
@@ -1105,7 +1161,7 @@ class BuildSession:
                 "scripts/ci/isolated-cli-probe.c",
             )
         ]
-        sources += [self.driver, self.control_sys, self.control]
+        sources += [self.driver, self.control_sys, self.control, self.legacy_control]
         self.rustup, self.cargo = shutil.which("rustup"), shutil.which("cargo")
         if not self.rustup or not self.cargo:
             raise RuntimeError(
@@ -1339,6 +1395,24 @@ class BuildSession:
         )
         if "job-sys-active-control" not in control.stderr:
             raise RuntimeError("native negative control failed for wrong reason")
+        legacy = self.command(
+            "legacy-entry-control",
+            [
+                self.rustup,
+                "run",
+                "1.88.0",
+                "rustc",
+                str(self.legacy_control),
+                *flags,
+                "--crate-type=rlib",
+                "--emit=metadata",
+                "--error-format=json",
+                "-o",
+                str(self.path / "legacy-control.rmeta"),
+            ],
+            failure=True,
+        )
+        check_legacy_refusal(legacy.returncode, legacy.stderr, self.legacy_control)
         self.output.save(
             "native-products",
             {

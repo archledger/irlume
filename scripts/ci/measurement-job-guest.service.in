@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
+[Unit]
+Description=Contained-job boot-only evidence fixture
+After=local-fs.target
+ConditionVirtualization=vm
+
+[Service]
+Type=exec
+ExecStart=/opt/irlume/measurement-job-guest.sh
+WorkingDirectory=/
+User=root
+Group=root
+Delegate=cpu memory pids
+DelegateSubgroup=evidence
+Restart=no
+NotifyAccess=none
+RuntimeMaxSec=150s
+RuntimeRandomizedExtraSec=0
+TimeoutStartSec=5s
+TimeoutStopSec=5s
+KillMode=control-group
+StateDirectory=irlume-job-evidence
+StateDirectoryMode=0700
+UMask=0077

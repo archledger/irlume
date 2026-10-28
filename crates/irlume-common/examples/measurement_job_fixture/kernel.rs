@@ -205,6 +205,50 @@ pub enum Phase {
     Cleanup = 2,
 }
 
+/// One validated CLOCK_BOOTTIME reservation. Values are correlation data, not
+/// proof that E supplied them or that the caller shares E's clock namespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    origin: u64,
+    deadline: u64,
+}
+
+impl Reservation {
+    /// Validate the fixed total, without sampling or restarting a clock.
+    ///
+    /// # Errors
+    /// Refuses overflow and any total other than exactly origin plus 20 seconds.
+    pub fn new(origin: u64, deadline: u64) -> Result<Self> {
+        if origin.checked_add(20 * SECOND) != Some(deadline) {
+            return Err(failure("deadline", 0));
+        }
+        Ok(Self { origin, deadline })
+    }
+
+    pub const fn origin(self) -> u64 {
+        self.origin
+    }
+
+    pub const fn deadline(self) -> u64 {
+        self.deadline
+    }
+
+    /// Remaining time for any native or finalization operation. The caller must
+    /// also arrange independent supervision for blocking I/O; this is arithmetic.
+    ///
+    /// # Errors
+    /// Refuses an observation before the origin or at/after the total deadline.
+    pub fn remaining(self, now: u64) -> Result<u64> {
+        if now < self.origin {
+            return Err(failure("clock-before-reservation", 0));
+        }
+        if now >= self.deadline {
+            return Err(failure("expired", 0));
+        }
+        Ok(self.deadline - now)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Deadlines {
     pub caps: [u64; 4],
@@ -216,14 +260,31 @@ impl Deadlines {
     ///
     /// # Errors
     /// Returns an error if a finite total deadline cannot be represented.
+    #[cfg(test)]
     pub fn new(now: u64) -> Result<Self> {
         let total = now.checked_add(20 * SECOND).ok_or(failure("deadline", 0))?;
+        Self::from_reservation(Reservation::new(now, total)?, now)
+    }
+
+    /// Retain E's origin even when M enters late. All phase caps precede the
+    /// validated total; current time cannot extend any cap.
+    ///
+    /// # Errors
+    /// Refuses a clock before the reservation or entry at/after its startup cap.
+    pub fn from_reservation(reservation: Reservation, now: u64) -> Result<Self> {
+        reservation.remaining(now)?;
+        let origin = reservation.origin();
+        // Reservation construction proved origin + 20 seconds fits, so these
+        // smaller positive additions fit as well.
+        if now >= origin + 5 * SECOND {
+            return Err(failure("expired", 0));
+        }
         Ok(Self {
             caps: [
-                now + 5 * SECOND,
-                now + 10 * SECOND,
-                now + 15 * SECOND,
-                total,
+                origin + 5 * SECOND,
+                origin + 10 * SECOND,
+                origin + 15 * SECOND,
+                reservation.deadline(),
             ],
             tightened: [false; 3],
         })
@@ -718,16 +779,31 @@ pub struct Quarantine<H> {
     pub worker: Option<Child<H>>,
     pub transferred: [Option<H>; 3],
     pub deadlines: Option<Deadlines>,
+    reservation: Option<Reservation>,
     cleanup_guard_failed: bool,
 }
 
 #[must_use = "an incomplete job still has an owner which must be retained"]
 #[derive(Debug)]
 pub enum Completion<H> {
-    Clean { report: Report, sentinel: Option<H> },
+    Clean {
+        report: Report,
+        sentinel: Option<H>,
+        reservation: Option<Reservation>,
+    },
     Quarantined(Quarantine<H>),
 }
 impl<H> Completion<H> {
+    /// The original finalization budget survives both completion variants.
+    /// None means no valid reservation was established, never permission to
+    /// allocate a new budget. This metadata does not grant runtime acceptance.
+    pub fn reservation(&self) -> Option<Reservation> {
+        match self {
+            Self::Clean { reservation, .. } => *reservation,
+            Self::Quarantined(owner) => owner.reservation,
+        }
+    }
+
     pub fn report(&self) -> &Report {
         match self {
             Self::Clean { report, .. } => report,
@@ -779,6 +855,7 @@ impl<H> Quarantine<H> {
             worker: None,
             transferred: std::array::from_fn(|_| None),
             deadlines: None,
+            reservation: None,
             cleanup_guard_failed: false,
         }
     }
@@ -814,6 +891,9 @@ fn guard<E: Effects>(os: &mut E, owner: &mut Quarantine<E::Handle>, phase: Phase
                 state.result_return = Some(now);
                 state.result_postcheck_pending = false;
             }
+        }
+        if let Some(reservation) = owner.reservation {
+            reservation.remaining(now)?;
         }
         if owner
             .deadlines
@@ -1484,24 +1564,69 @@ fn initialization_refusal<H>(mut owner: Quarantine<H>, error: Failure) -> Comple
     Completion::Clean {
         report: owner.report,
         sentinel: None,
+        reservation: owner.reservation,
     }
 }
 
 /// Execute only through an injected effect boundary. Native callers must obey
 /// the adapter's unsafe boot contract and retain any returned quarantine owner.
+#[cfg(test)]
 pub fn run<E: Effects>(os: &mut E, epoch: u64) -> Completion<E::Handle> {
     run_case(os, epoch, Case::SupervisorOnly)
 }
 
-pub fn run_case<E: Effects>(os: &mut E, epoch: u64, case: Case) -> Completion<E::Handle> {
+fn case_owner<H>(epoch: u64, case: Case) -> Quarantine<H> {
     let mut owner = Quarantine::new(epoch); // Synthetic custody precedes every fallible operation.
     owner.report.case = case;
     if case.bounds().is_some() {
         owner.report.bounds = Some(bounds::State::default());
     }
-    let initialized = os.clock().and_then(Deadlines::new);
+    owner
+}
+
+/// Legacy pure-test convenience. No normal native build exposes this fresh-clock entry.
+#[cfg(test)]
+pub fn run_case<E: Effects>(os: &mut E, epoch: u64, case: Case) -> Completion<E::Handle> {
+    let mut owner = case_owner(epoch, case);
+    let initialized = os.clock().and_then(|now| {
+        let total = now.checked_add(20 * SECOND).ok_or(failure("deadline", 0))?;
+        let reservation = Reservation::new(now, total)?;
+        owner.reservation = Some(reservation);
+        Deadlines::from_reservation(reservation, now)
+    });
+    execute_case(os, owner, initialized)
+}
+
+/// Run only within the supplied reservation. Invalid pairs refuse before any
+/// effect, and delayed entry cannot restart startup or total time. The returned
+/// reservation is also the adapter's finalization budget. Native callers must
+/// obey sys::run's unsafe boot/custody contract.
+pub fn run_reserved<E: Effects>(
+    os: &mut E,
+    epoch: u64,
+    case: Case,
+    origin: u64,
+    total: u64,
+) -> Completion<E::Handle> {
+    let mut owner = case_owner(epoch, case);
+    let reservation = match Reservation::new(origin, total) {
+        Ok(value) => value,
+        Err(error) => return initialization_refusal(owner, error),
+    };
+    owner.reservation = Some(reservation);
+    let initialized = os
+        .clock()
+        .and_then(|now| Deadlines::from_reservation(reservation, now));
+    execute_case(os, owner, initialized)
+}
+
+fn execute_case<E: Effects>(
+    os: &mut E,
+    mut owner: Quarantine<E::Handle>,
+    initialized: Result<Deadlines>,
+) -> Completion<E::Handle> {
     match initialized {
-        Ok(deadlines) if epoch != 0 => owner.deadlines = Some(deadlines),
+        Ok(deadlines) if owner.report.epoch != 0 => owner.deadlines = Some(deadlines),
         Ok(_) => return initialization_refusal(owner, failure("epoch", 0)),
         Err(error) => return initialization_refusal(owner, error),
     }
@@ -1614,6 +1739,7 @@ fn finish<E: Effects>(os: &mut E, mut owner: Quarantine<E::Handle>) -> Completio
                 return Completion::Clean {
                     report: owner.report,
                     sentinel,
+                    reservation: owner.reservation,
                 };
             }
             Err(error) => owner.fail(error),
@@ -3141,7 +3267,10 @@ mod tests {
             case,
             ..Fake::default()
         };
-        let Completion::Clean { report, sentinel } = run_case(&mut os, 9, case) else {
+        let Completion::Clean {
+            report, sentinel, ..
+        } = run_case(&mut os, 9, case)
+        else {
             panic!("complete control quarantined");
         };
         assert!(report.case_passed(), "{report:?}");
@@ -3548,5 +3677,158 @@ mod tests {
     #[test]
     fn b31_withheld_sentinel() {
         bounded_case(bounds::BoundCase::WithheldSentinel);
+    }
+
+    #[test]
+    fn r2a_reservation_requires_exact_finite_origin_budget() {
+        let origin = 100 * SECOND;
+        let reservation = Reservation::new(origin, origin + 20 * SECOND).unwrap();
+        assert_eq!(reservation.origin(), origin);
+        assert_eq!(reservation.deadline(), origin + 20 * SECOND);
+        for (start, end) in [
+            (0, 0),
+            (origin, origin - 1),
+            (origin, origin + 19 * SECOND),
+            (origin, origin + 20 * SECOND + 1),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(Reservation::new(start, end), Err(failure("deadline", 0)));
+        }
+        assert!(Reservation::new(u64::MAX - 20 * SECOND, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn r2a_delayed_entry_does_not_restart_phase_or_total_caps() {
+        let origin = 100 * SECOND;
+        let reservation = Reservation::new(origin, origin + 20 * SECOND).unwrap();
+        let mut deadlines = Deadlines::from_reservation(reservation, origin + 4 * SECOND).unwrap();
+        assert_eq!(
+            deadlines.caps,
+            [
+                origin + 5 * SECOND,
+                origin + 10 * SECOND,
+                origin + 15 * SECOND,
+                origin + 20 * SECOND
+            ]
+        );
+        deadlines
+            .tighten(Phase::Exercise, origin + 4 * SECOND)
+            .unwrap();
+        assert_eq!(deadlines.cap(Phase::Exercise), origin + 9 * SECOND);
+        deadlines
+            .tighten(Phase::Exercise, origin + 8 * SECOND)
+            .unwrap();
+        assert_eq!(deadlines.cap(Phase::Exercise), origin + 9 * SECOND);
+        assert_eq!(deadlines.caps[3], reservation.deadline());
+    }
+
+    #[test]
+    fn r2a_invalid_reservation_refuses_before_any_os_effect() {
+        for (origin, total) in [(0, 0), (1, 20 * SECOND), (u64::MAX, u64::MAX)] {
+            let mut os = Fake::default();
+            let done = run_reserved(&mut os, 9, Case::SupervisorOnly, origin, total);
+            assert_eq!(done.report().outcome, Outcome::NoJobCreated);
+            assert_eq!(done.report().first, Some(failure("deadline", 0)));
+            assert_eq!(done.reservation(), None);
+            assert_eq!(done.report().operations, 0);
+            assert!(os.log.is_empty());
+        }
+    }
+
+    #[test]
+    fn r2a_pre_origin_and_expired_start_refuse_before_acquisition() {
+        let origin = 10 * SECOND;
+        let total = origin + 20 * SECOND;
+        for (now, reason) in [
+            (origin - 1, "clock-before-reservation"),
+            (origin + 5 * SECOND, "expired"),
+            (total, "expired"),
+            (total + 1, "expired"),
+        ] {
+            let mut os = Fake {
+                now,
+                ..Fake::default()
+            };
+            let done = run_reserved(&mut os, 9, Case::SupervisorOnly, origin, total);
+            assert_eq!(done.report().outcome, Outcome::NoJobCreated);
+            assert_eq!(done.report().first, Some(failure(reason, 0)));
+            assert_eq!(done.report().operations, 0);
+            assert_eq!(os.log, ["clock"]);
+            assert_eq!(done.reservation().unwrap().deadline(), total);
+            assert!(!done.report().kill && !done.report().direct_reaped);
+        }
+    }
+
+    #[test]
+    fn r2a_clean_completion_retains_original_finalization_deadline() {
+        let origin = 10 * SECOND;
+        let total = origin + 20 * SECOND;
+        let case = Case::Bounds(bounds::BoundCase::Complete);
+        let mut os = Fake {
+            case,
+            now: origin + 4 * SECOND,
+            ..Fake::default()
+        };
+        let done = run_reserved(&mut os, 9, case, origin, total);
+        assert!(done.report().case_passed());
+        let reservation = done.reservation().unwrap();
+        assert_eq!(reservation.origin(), origin);
+        assert_eq!(reservation.deadline(), total);
+        assert_eq!(done.report().bounds.as_ref().unwrap().caps[3], total);
+        assert_eq!(reservation.remaining(total - 1), Ok(1));
+        assert_eq!(reservation.remaining(total), Err(failure("expired", 0)));
+        assert_eq!(reservation.remaining(total + 1), Err(failure("expired", 0)));
+        assert_eq!(
+            reservation.remaining(origin - 1),
+            Err(failure("clock-before-reservation", 0))
+        );
+    }
+
+    #[test]
+    fn r2a_quarantine_and_late_native_return_cannot_refresh_budget() {
+        let origin = 10 * SECOND;
+        let total = origin + 20 * SECOND;
+        let case = Case::Bounds(bounds::BoundCase::WithheldWait);
+        let mut os = Fake {
+            case,
+            now: origin,
+            ..Fake::default()
+        };
+        let done = run_reserved(&mut os, 9, case, origin, total);
+        assert!(matches!(done, Completion::Quarantined(_)));
+        assert_eq!(done.reservation().unwrap().deadline(), total);
+        assert_eq!(done.report().releases, 0);
+        let mut os = Fake {
+            now: origin,
+            advance_on: Some(("parked", total)),
+            ..Fake::default()
+        };
+        let late = run_reserved(&mut os, 9, Case::SupervisorOnly, origin, total);
+        assert!(matches!(late, Completion::Quarantined(_)));
+        assert_eq!(late.report().first, Some(failure("expired", 0)));
+        assert_eq!(late.report().releases, 0);
+        assert_eq!(
+            late.reservation().unwrap().remaining(os.now),
+            Err(failure("expired", 0))
+        );
+    }
+
+    #[test]
+    fn r2a_clock_regression_after_birth_retains_custody() {
+        let origin = 10 * SECOND;
+        let total = origin + 20 * SECOND;
+        let mut os = Fake {
+            now: origin,
+            advance_on: Some(("parked", origin - 1)),
+            ..Fake::default()
+        };
+        let done = run_reserved(&mut os, 9, Case::SupervisorOnly, origin, total);
+        assert!(matches!(done, Completion::Quarantined(_)));
+        assert_eq!(
+            done.report().first,
+            Some(failure("clock-before-reservation", 0))
+        );
+        assert_eq!(done.report().releases, 0);
+        assert_eq!(done.reservation().unwrap().deadline(), total);
     }
 }

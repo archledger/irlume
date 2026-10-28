@@ -1232,6 +1232,64 @@ class Task6WrapperTests(unittest.TestCase):
             self.assert_workflow(document)
 
 
+class ReservationBuildTests(unittest.TestCase):
+    def diagnostic(self):
+        return {
+            "level": "error",
+            "code": {"code": "E0432"},
+            "message": "unresolved imports `kernel::run`, `kernel::run_case`",
+            "spans": [{"file_name": "/private/legacy.rs", "is_primary": True}],
+        }
+
+    def test_legacy_refusal_requires_both_imports_at_the_owned_source(self):
+        job.check_legacy_refusal(1, json.dumps(self.diagnostic()), "/private/legacy.rs")
+
+    def test_legacy_refusal_rejects_success_or_unrelated_diagnostics(self):
+        original = self.diagnostic()
+        variants = []
+        for key, value in [
+            ("level", "warning"),
+            ("code", {"code": "E0425"}),
+            ("message", "unresolved import `kernel::run_case`"),
+            ("message", "unresolved import `kernel::run`"),
+            ("spans", []),
+            ("spans", [{"file_name": "/other.rs", "is_primary": True}]),
+        ]:
+            variant = copy.deepcopy(original)
+            variant[key] = value
+            variants.append(json.dumps(variant))
+        variants += [
+            "not JSON",
+            "[]",
+            json.dumps(original) + "\n" + json.dumps(original),
+        ]
+        for text in variants:
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                job.check_legacy_refusal(1, text, "/private/legacy.rs")
+        for status in (0, True):
+            with self.subTest(status=status), self.assertRaises(RuntimeError):
+                job.check_legacy_refusal(
+                    status, json.dumps(original), "/private/legacy.rs"
+                )
+
+    def test_reservation_cases_are_in_the_exact_rust_inventory(self):
+        expected = {
+            "r2a_clock_regression_after_birth_retains_custody",
+            "r2a_reservation_requires_exact_finite_origin_budget",
+            "r2a_delayed_entry_does_not_restart_phase_or_total_caps",
+            "r2a_invalid_reservation_refuses_before_any_os_effect",
+            "r2a_pre_origin_and_expired_start_refuse_before_acquisition",
+            "r2a_clean_completion_retains_original_finalization_deadline",
+            "r2a_quarantine_and_late_native_return_cannot_refresh_budget",
+        }
+        actual = {
+            name.removeprefix("kernel::tests::")
+            for name in job.RUST_TESTS
+            if "::r2a_" in name
+        }
+        self.assertEqual(actual, expected)
+
+
 class Task5BuildTests(unittest.TestCase):
     def test_bounds_codegen_requires_sentinel_operations_and_data(self):
         parts = ("call i32 @memfd_create(", "call i32 @fcntl(", "irlume-job-custody-v1")
@@ -1828,6 +1886,11 @@ PORTABLE_TESTS = {
         "test_c15_failed_reap_retains_named_owner",
     ],
     Task5BuildTests: ["test_bounds_codegen_requires_sentinel_operations_and_data"],
+    ReservationBuildTests: [
+        "test_legacy_refusal_requires_both_imports_at_the_owned_source",
+        "test_legacy_refusal_rejects_success_or_unrelated_diagnostics",
+        "test_reservation_cases_are_in_the_exact_rust_inventory",
+    ],
     Task4BuildTests: [
         "test_child_codegen_rejects_absent_calls_and_declarations_only",
     ],

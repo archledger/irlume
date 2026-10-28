@@ -78,6 +78,8 @@ pub struct Input {
     pub evidence: OwnedFd,
     pub epoch: u64,
     pub case: Case,
+    pub reserved_at: u64,
+    pub total_deadline: u64,
 }
 
 struct Native {
@@ -1474,12 +1476,17 @@ fn child_exit(status: i32) -> ! {
 /// Arrange independent E/H rejection and VM recovery.
 /// The procfs instance must represent M's initial PID namespace. No actor other
 /// than this fixture may signal its children; OOM events invalidate a cut case.
+/// reserved_at and total_deadline come from E's reservation in the same
+/// CLOCK_BOOTTIME domain. The returned reservation also bounds finalization;
+/// missing/expired metadata never permits a replacement budget.
 pub unsafe fn run(input: Input) -> Completion<OwnedFd> {
     let Input {
         parent,
         evidence,
         epoch,
         case,
+        reserved_at,
+        total_deadline,
     } = input;
     let mut native = Native {
         parent: Some(parent),
@@ -1491,5 +1498,5 @@ pub unsafe fn run(input: Input) -> Completion<OwnedFd> {
         case,
         work_cap: None,
     };
-    kernel::run_case(&mut native, epoch, case)
+    kernel::run_reserved(&mut native, epoch, case, reserved_at, total_deadline)
 }

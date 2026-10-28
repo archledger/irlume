@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.img
+*.iso
+*.qcow2
+*.raw
+*.onnx
+*.pem
+*.key
+/runs/
+/private/
+/payload*/

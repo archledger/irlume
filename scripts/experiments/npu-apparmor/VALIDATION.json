@@ -1,0 +1,25 @@
+{
+  "verified_at": "2026-10-28T16:01:35+00:00",
+  "source_base": "683956282b4f239914158f7ea08ce7dda184093d",
+  "rust_diff_sha256": "f8ad0bb5ac5fa6f04b3193fd7ee6befb5cd8d4d587989f9e1f5695e4aaf98858",
+  "rust_diff_matches_retained_validation": true,
+  "fresh_checks": {
+    "offline_python_tests": 59,
+    "python_version": "3.14.8",
+    "ruff": "passed",
+    "cargo_1_88_fmt_all_check": "passed",
+    "git_diff_check": "passed"
+  },
+  "retained_checks_for_identical_rust_diff": {
+    "vision_tests_passed": 394,
+    "vision_tests_failed": 0,
+    "ignored_hardware_tests": 22,
+    "clippy": "passed"
+  },
+  "not_claimed": [
+    "fresh full-workspace build/test/Clippy/rustdoc",
+    "successful native NPU inference",
+    "full AppArmor/native-loading acceptance",
+    "production certification"
+  ]
+}

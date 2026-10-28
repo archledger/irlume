@@ -1,0 +1,117 @@
+{
+  "scope": "source-only experimental checkpoint; no successful NPU inference",
+  "source_base": "683956282b4f239914158f7ea08ce7dda184093d",
+  "files": {
+    "irlume-1046-native-host-v4.py": {
+      "archive_path": "attempt4-launch/irlume-1046-native-host-v4.py",
+      "archive_sha256": "275ea02ce5fa51b1b6d49ec8ef70b340fe69e7a84d33f62e39b4c113d5f8f5d7",
+      "stored_sha256": "275ea02ce5fa51b1b6d49ec8ef70b340fe69e7a84d33f62e39b4c113d5f8f5d7"
+    },
+    "irlume-1046-native-attempt4.py": {
+      "archive_path": "attempt4-launch/irlume-1046-native-attempt4.py",
+      "archive_sha256": "1590a0757549b7b33b5c53668b8c497ab3f819394fa80bb4294bc008a2eaef66",
+      "stored_sha256": "1590a0757549b7b33b5c53668b8c497ab3f819394fa80bb4294bc008a2eaef66"
+    },
+    "irlume_1046_native_protocol.py": {
+      "archive_path": "attempt2-ready/irlume_1046_native_protocol.py",
+      "archive_sha256": "a52533d9cc6076bbbd6046e477c77bf9ca3cceeaa02254778a1beaa1c991579c",
+      "stored_sha256": "a52533d9cc6076bbbd6046e477c77bf9ca3cceeaa02254778a1beaa1c991579c"
+    },
+    "irlume-1046-native-guest.py": {
+      "archive_path": "attempt4-launch/irlume-1046-native-guest.py",
+      "archive_sha256": "3c4985a569280dc9ab721e11bfc2b5c1e3d4a5538c06154afe21ed59be0f56d0",
+      "stored_sha256": "3c4985a569280dc9ab721e11bfc2b5c1e3d4a5538c06154afe21ed59be0f56d0"
+    },
+    "irlume_1046_native_audit.py": {
+      "archive_path": "attempt4-launch/irlume_1046_native_audit.py",
+      "archive_sha256": "d3af1ed8e3e7967bd1672baa5d10ea4ea25569e742900f1a4a886f3120f6bd41",
+      "stored_sha256": "d3af1ed8e3e7967bd1672baa5d10ea4ea25569e742900f1a4a886f3120f6bd41"
+    },
+    "irlume_1046_native_preflight.py": {
+      "archive_path": "run-v3/helpers/irlume_1046_native_preflight.py",
+      "archive_sha256": "005f7402f886abff25f2abf44ce2c34ec3d5e5097cbe93ac3021d526d5436cda",
+      "stored_sha256": "005f7402f886abff25f2abf44ce2c34ec3d5e5097cbe93ac3021d526d5436cda"
+    },
+    "irlume_1046_native_result.py": {
+      "archive_path": "run-v3/helpers/irlume_1046_native_result.py",
+      "archive_sha256": "078ec6c1b9ebf4d82292ed3fab9cdaf90aa2f15266d447663ae739d71d7945a4",
+      "stored_sha256": "078ec6c1b9ebf4d82292ed3fab9cdaf90aa2f15266d447663ae739d71d7945a4"
+    },
+    "irlume-1046-native-inputs.py": {
+      "archive_path": "final-software/helpers/irlume-1046-native-inputs.py",
+      "archive_sha256": "05cc4dc11b7bdf25ded15aa594907dda1603832e5407402f7fe97c5c7cced806",
+      "stored_sha256": "05cc4dc11b7bdf25ded15aa594907dda1603832e5407402f7fe97c5c7cced806"
+    },
+    "irlume-1046-repackage-native-v2.py": {
+      "archive_path": "guard-v2/helpers/irlume-1046-repackage-native-v2.py",
+      "archive_sha256": "d81c28c32f890a0b84b21666b33d9d53f50f8f1c6cc037b3753908da5a9ee642",
+      "stored_sha256": "97a0eb0688bd7b9b311122ed55b5b925fe563e0d1255d245d429740992f300a9"
+    },
+    "irlume-1046-devicefree-fence-proof.py": {
+      "archive_path": "guard-v2/helpers/irlume-1046-devicefree-fence-proof.py",
+      "archive_sha256": "a479021923ddbdce86a20762f71a6be7bb3cbeabece696587e7a9299719e9ce9",
+      "stored_sha256": "a479021923ddbdce86a20762f71a6be7bb3cbeabece696587e7a9299719e9ce9"
+    },
+    "test_irlume_1046_native_attempt2.py": {
+      "archive_path": "attempt2-prepared/test_irlume_1046_native_attempt2.py",
+      "archive_sha256": "b3b80e1017f6a6bd7d0fd93770867edff7d16a210b3a031fa23b16f67874c59d",
+      "stored_sha256": "cdabd7089d26f13ae117878f10a30b2c61c5ea591387f818cdf56dd8126b5544"
+    },
+    "test_irlume_1046_native_host_v2.py": {
+      "archive_path": "guard-v2/helpers/test_irlume_1046_native_host_v2.py",
+      "archive_sha256": "295a285fbae4ef7e72b6ea90afb62e64cefd537eed4576c5060e6a803d183652",
+      "stored_sha256": "2607a14dd6f8a76622c7cdf5e0d4436f410b84fd6be9bd004ca0da31128460a2"
+    },
+    "test_irlume_1046_native_protocol.py": {
+      "archive_path": "guard-v2/helpers/test_irlume_1046_native_protocol.py",
+      "archive_sha256": "1b40cf66104a604f300c18b4bdceabf658fae9a31ad42f4dc3497dc2e108fbdd",
+      "stored_sha256": "1b40cf66104a604f300c18b4bdceabf658fae9a31ad42f4dc3497dc2e108fbdd"
+    },
+    "test_irlume_1046_native_preflight.py": {
+      "archive_path": "ort-origin/test_irlume_1046_native_preflight.py",
+      "archive_sha256": "e95e69c226e496f8824e3d5db2ee840ecbd1658fe2041c1949c3bde71f2f4164",
+      "stored_sha256": "b59e0a3c59e22515dd471f44166751f5d310af033a73b334e1e4b936ceb00ccd"
+    },
+    "test_irlume_1046_native_result.py": {
+      "archive_path": "final-software/helpers/test_irlume_1046_native_result.py",
+      "archive_sha256": "599326dcd7699eb2f67c7bd2b3be04f9011b1f8cdeb08f5a20b2b5ba465df879",
+      "stored_sha256": "3364d05bcd4d5ba2547ae896d0894ee6433922112a560dd3c5199e632f8478e3"
+    },
+    "test_irlume_1046_native_guest.py": {
+      "archive_path": "attempt3-audit-fix/test_irlume_1046_native_guest.py",
+      "archive_sha256": "21f9f244bd26531cbba0828c01fec6072ce45c365342fca1fb122876c45ae8ce",
+      "stored_sha256": "21f9f244bd26531cbba0828c01fec6072ce45c365342fca1fb122876c45ae8ce"
+    },
+    "test_irlume_1046_native_audit.py": {
+      "archive_path": "attempt3-audit-fix/test_irlume_1046_native_audit.py",
+      "archive_sha256": "0c382c4576addcc166b674b02ead4cf1fa3e31306d11bd0fca01bbb61ff362c1",
+      "stored_sha256": "0c382c4576addcc166b674b02ead4cf1fa3e31306d11bd0fca01bbb61ff362c1"
+    },
+    "test_irlume_1046_native_control.py": {
+      "archive_path": "attempt3-audit-fix/test_irlume_1046_native_control.py",
+      "archive_sha256": "1614156e42733ab58a065463364d1dea5e2dc1156ac383d43d4666d3982eb9fb",
+      "stored_sha256": "1614156e42733ab58a065463364d1dea5e2dc1156ac383d43d4666d3982eb9fb"
+    },
+    "test_irlume_1046_native_guest_space.py": {
+      "archive_path": "attempt3-prepared/test_irlume_1046_native_guest_space.py",
+      "archive_sha256": "a142319e5e7e49459dcf5f2ea2f796cb52e38d3be5af5b94b799449a30e5160d",
+      "stored_sha256": "a142319e5e7e49459dcf5f2ea2f796cb52e38d3be5af5b94b799449a30e5160d"
+    },
+    "fixtures/attempt4-domain.xml": {
+      "archive_path": "attempt4-launch/domain.xml",
+      "archive_sha256": "41264f0c458cc55ca0f21f4d3ccbc778086554fc74ffd5afe54f9866f44658e2",
+      "stored_sha256": "41264f0c458cc55ca0f21f4d3ccbc778086554fc74ffd5afe54f9866f44658e2"
+    },
+    "fixtures/attempt4-inputs.json": {
+      "archive_path": "attempt4-launch/inputs-v3.json",
+      "archive_sha256": "03d72f6130a46214af96df168a62c92994569f03392081f7f4096a7bd2bb836f",
+      "stored_sha256": "03d72f6130a46214af96df168a62c92994569f03392081f7f4096a7bd2bb836f"
+    }
+  },
+  "checkpoint_changes": [
+    "Test imports target the retained v4 controller and wrapper instead of omitted older launchers.",
+    "Restore recorded SONAME-alias, typed-scope, canonical-PCI, power-mode and test-summary regressions.",
+    "Restore payload revision selection through revision 5 in the archived packager.",
+    "Runtime controller, protocol, guest, audit, result and ELF-preflight source bytes are otherwise preserved."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "uuid": "3b452049-c1f1-446d-8c56-7a8ae7d4c06d",
+  "xml_sha256": "41264f0c458cc55ca0f21f4d3ccbc778086554fc74ffd5afe54f9866f44658e2",
+  "seed_sha256": "6208737809283a14e897305446928a7fb1c9ee34d603b4674e06d8e8e0c98a75",
+  "payload": {
+    "path": "/tmp/opencode/irlume-1046-native-payload-v5.iso",
+    "sha256": "974553404c0ff5b0beb59135dc9e8fab3b3f42faa2244e659ec3661bb89bc2f0",
+    "bytes": 473737216
+  },
+  "native_case_count": 2,
+  "negative_controls": 2,
+  "planned_native_inferences": 12,
+  "native_started": false,
+  "revision": 5,
+  "attempt": 4
+}

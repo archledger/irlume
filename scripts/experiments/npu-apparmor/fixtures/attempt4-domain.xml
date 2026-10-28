@@ -1,0 +1,15 @@
+<domain type="kvm">
+<name>irlume-aa-native-a4</name><uuid>3b452049-c1f1-446d-8c56-7a8ae7d4c06d</uuid>
+<memory unit="MiB">4096</memory><currentMemory unit="MiB">4096</currentMemory><vcpu>2</vcpu>
+<memtune><hard_limit unit="MiB">6144</hard_limit></memtune><cputune><global_period>100000</global_period><global_quota>200000</global_quota></cputune>
+<os><type arch="x86_64" machine="q35">hvm</type><boot dev="hd" /></os><features><acpi /><apic /></features><cpu mode="host-passthrough" /><clock offset="utc" />
+<on_poweroff>destroy</on_poweroff><on_reboot>destroy</on_reboot><on_crash>destroy</on_crash>
+<devices><emulator>/usr/bin/qemu-system-x86_64</emulator>
+<disk type="file" device="disk"><driver name="qemu" type="qcow2" /><source file="/tmp/irlume-1046-native-inputs-20261028-a4/guest.qcow2" /><target dev="vda" bus="virtio" /><backingStore type="file"><format type="qcow2" /><source file="/tmp/irlume-1046-libvirt-base-20261027/base.img" /><backingStore /></backingStore></disk>
+<disk type="file" device="disk"><driver name="qemu" type="raw" /><source file="/var/lib/libvirt/images/irlume-1046-native-20261028/seed.iso" /><target dev="vdb" bus="virtio" /><readonly /></disk>
+<disk type="file" device="disk"><driver name="qemu" type="raw" /><source file="/var/lib/libvirt/images/irlume-1046-native-20261028-a4/payload.iso" /><target dev="vdc" bus="virtio" /><readonly /></disk>
+<disk type="file" device="disk"><driver name="qemu" type="raw" /><source file="/var/lib/libvirt/images/irlume-1046-native-20261028-a4/evidence.img" /><target dev="vdd" bus="virtio" /></disk>
+<serial type="pty"><target port="0" /></serial><console type="pty"><target type="serial" port="0" /></console>
+<video><model type="none" /></video><memballoon model="none" />
+<hostdev mode="subsystem" type="pci" managed="yes"><driver name="vfio" /><source><address domain="0x0000" bus="0x00" slot="0x0b" function="0x0" /></source></hostdev>
+</devices><seclabel type="dynamic" model="selinux" relabel="yes" /></domain>

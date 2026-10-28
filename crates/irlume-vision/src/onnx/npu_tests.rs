@@ -935,6 +935,185 @@ mod npu_reference_tests {
     }
 }
 
+mod npu_apparmor {
+    use super::*;
+
+    const MODEL_PIN: &str = "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60";
+
+    fn model_matches_pin(bytes: &[u8]) -> bool {
+        irlume_common::sha256_hex(bytes) == MODEL_PIN
+    }
+
+    fn validate_native_sample(raw: &[f32]) -> Result<(), &'static str> {
+        if raw.len() != EMBED_DIM {
+            return Err("unexpected native output dimensions");
+        }
+        if raw.iter().any(|value| !value.is_finite()) {
+            return Err("nonfinite native output");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_sample_oracle_rejects_wrong_shape_and_nonfinite_values() {
+        assert!(validate_native_sample(&[1.0; EMBED_DIM]).is_ok());
+        assert!(validate_native_sample(&[1.0; EMBED_DIM - 1]).is_err());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut raw = [1.0; EMBED_DIM];
+            raw[42] = bad;
+            assert!(validate_native_sample(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn native_model_pin_rejects_unknown_bytes_before_runtime() {
+        assert!(!model_matches_pin(b"not the shipped model"));
+        let pins = include_str!("../../../../models/SHA256SUMS");
+        assert!(pins
+            .lines()
+            .any(|line| line == format!("{MODEL_PIN}  glintr100.onnx")));
+    }
+
+    /// The guest must observe this exact denied read before a native run.
+    #[test]
+    #[ignore = "requires the isolated AppArmor guest and its known denied file"]
+    fn npu_apparmor_hw_audit_control() {
+        assert_eq!(
+            std::fs::read_to_string("/proc/self/attr/current")
+                .unwrap()
+                .trim(),
+            "irlumed (enforce)"
+        );
+        let denied = std::fs::read("/opt/irlume-aa-denied")
+            .expect_err("the control file must be denied by the active profile");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        // SAFETY: gettid takes no arguments and only observes this thread.
+        let tid = unsafe { libc::gettid() };
+        println!(
+            "NATIVE_AA_DENIAL_CONTROL pid={} tid={tid}",
+            std::process::id()
+        );
+    }
+
+    /// Strict synthetic native execution, not a daemon or model certification.
+    /// The outer guest runner must validate the complete native closure before
+    /// exec, and must preserve each case's exclusive cache on every outcome.
+    #[test]
+    #[ignore = "requires the reviewed isolated AppArmor guest and its passed-through NPU"]
+    fn npu_apparmor_hw_native_recognizer() {
+        use crate::npu::{boot_id, Cache, Marker, Platform};
+        use std::path::Path;
+
+        // These are refusal checks, not a native-launch admission capability.
+        // SAFETY: geteuid takes no arguments and only observes this process.
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        assert_eq!(
+            std::fs::read_to_string("/proc/self/attr/current")
+                .unwrap()
+                .trim(),
+            "irlumed (enforce)"
+        );
+        let case = std::env::var("IRLUME_NPU_AA_CASE").expect("explicit case");
+        let executable = match case.as_str() {
+            "bin-native" => "/usr/bin/irlumed",
+            "local-native" => "/usr/local/bin/irlumed",
+            _ => panic!("unknown case"),
+        };
+        assert_eq!(
+            std::fs::read_link("/proc/self/exe").unwrap(),
+            Path::new(executable)
+        );
+        assert!(std::env::var_os("IRLUME_TEST_ALLOW_UNCERTIFIED_EP").is_none());
+        assert!(std::env::var_os("IRLUME_NPU_TEST_PRECISION").is_none());
+        let model_path = "/usr/share/irlume/models/glintr100.onnx";
+        assert_eq!(std::fs::metadata(model_path).unwrap().len(), 260_694_151);
+        let bytes = std::fs::read(model_path).unwrap();
+        assert!(model_matches_pin(&bytes), "unrecognized model bytes");
+
+        // Capture the CPU runtime in the native inventory, not after it freezes.
+        let inputs: Vec<_> = (0..3).map(npu_reference::chip).collect();
+        let mut cpu = Embedder::load_from_memory(&bytes).expect("CPU reference session");
+        let expected: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                cpu.embed_preprocessed(input)
+                    .expect("CPU reference inference")
+            })
+            .collect();
+        let cpu_digest = cpu.cpu_reference_digest().expect("CPU reference digest");
+        let mut platform = Platform::open_admitted().expect("real NPU identity; no fake firmware");
+        let identity = platform.identity().clone();
+        assert_eq!(identity.pci_id, "8086:643e");
+        assert_eq!(identity.library, "/usr/lib64/libopenvino_c.so.2621");
+        assert!(!identity.firmware.is_empty() && !identity.firmware.contains("unverified"));
+        let identity_digest = identity.digest();
+        let execution_digest = platform
+            .execution_digest()
+            .expect("complete execution identity");
+        let cache_root = Path::new("/var/cache/irlume/npu").join(&case);
+        std::fs::create_dir(&cache_root).expect("new case-owned cache, never reused");
+        let cache = Cache::prepare(&cache_root, &identity, &boot_id().unwrap()).unwrap();
+        let mut native = platform
+            .compile(&cache, &bytes, MODEL_PIN)
+            .expect("explicit NPU compile");
+        assert_eq!(cache.marker(MODEL_PIN), Marker::Absent);
+        let mut digests = Vec::new();
+        let mut distances = Vec::new();
+        for repetition in 0..2 {
+            for (index, input) in inputs.iter().enumerate() {
+                // This is the raw native object, not a Slot/Embedder fallback.
+                let raw = native.infer(input).expect("native inference must succeed");
+                validate_native_sample(&raw).expect("finite 512-value native output");
+                let digest = irlume_common::sha256_hex(
+                    &raw.iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                );
+                if repetition == 0 {
+                    digests.push(digest);
+                } else {
+                    assert_eq!(
+                        digest, digests[index],
+                        "native output changed on repetition"
+                    );
+                }
+                let (decoded, norm) = embedding_and_norm(&raw).unwrap();
+                assert!(norm.is_finite() && norm > 0.0);
+                let distance = decoded
+                    .iter()
+                    .zip(&expected[index])
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(
+                    distance.is_finite() && distance <= 0.01,
+                    "synthetic parity bound exceeded"
+                );
+                distances.push(distance);
+                assert_eq!(cache.marker(MODEL_PIN), Marker::Absent);
+            }
+        }
+        drop(native);
+        assert_eq!(cpu.cpu_reference_digest().unwrap(), cpu_digest);
+        assert_eq!(platform.execution_digest().unwrap(), execution_digest);
+        assert_eq!(cache.marker(MODEL_PIN), Marker::Absent);
+        println!(
+            "NATIVE_AA_RESULT {}",
+            serde_json::json!({
+                "case": case, "scope": "test-only-native", "executable": executable,
+                "label": "irlumed (enforce)", "identity": format!("{identity:?}"),
+                "pid": std::process::id(), "pci_id": identity.pci_id,
+                "firmware": identity.firmware, "library": identity.library,
+                "identity_digest": identity_digest, "execution_digest": execution_digest,
+                "model_sha256": MODEL_PIN, "cpu_reference_digest": cpu_digest,
+                "execution_device": "NPU", "native_inferences": 6,
+                "raw_output_digests": digests, "synthetic_distances": distances,
+                "markers_absent": true
+            })
+        );
+    }
+}
+
 /// The models on a real NPU, through the same struct paths production
 /// uses, against their ONNX Runtime CPU sessions. Placement bypasses
 /// [`crate::npu::CERTIFIED`] on purpose: this is the evidence a

@@ -196,12 +196,87 @@ R5_PRIVATE_PIDS = b"""\
 1518 1433 0:93 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
 """
 # The same table without row 1505, the user-bus bind the profile no longer
-# requests; a native table of the bus-free profile is still to be recorded.
+# requests.
 R5_NO_BUS = b"".join(
     line
     for line in R5_PRIVATE_PIDS.splitlines(keepends=True)
     if b" /run/user/" not in line
 )
+# Native tables of the bus-free profile. Same host as above, after its debugfs
+# tracing automount: the /sys/kernel/debug cover sits on the debugfs and hides
+# it and its tracefs (rows 1689, 1690, 1693).
+R5_TRACING = b"""\
+1660 1522 0:35 /private/runtime / ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1661 1660 0:93 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,seclabel,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64
+1667 1661 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1668 1661 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1669 1661 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1670 1661 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1671 1661 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1672 1661 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1666 1661 0:84 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1665 1661 0:84 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1663 1661 0:84 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1662 1661 0:84 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1664 1661 0:84 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1673 1660 0:96 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,subset=pid
+1674 1660 0:97 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64
+1675 1674 0:84 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1676 1674 0:35 /private/attempt /run/irlume/attempt rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1677 1674 0:35 /private/base.raw /run/irlume/base.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1678 1674 0:35 /private/payload.raw /run/irlume/payload.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1679 1674 0:35 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1680 1660 0:98 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+1683 1680 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1684 1683 0:85 / /sys/fs/cgroup/net_cls ro,relatime - cgroup net_cls rw,seclabel,net_cls
+1689 1680 0:9 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime - debugfs debugfs rw,seclabel
+1690 1689 0:14 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime - tracefs tracefs rw,seclabel
+1681 1680 0:84 /systemd/inaccessible/dir /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1682 1680 0:84 /systemd/inaccessible/dir /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1685 1680 0:84 /systemd/inaccessible/dir /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1686 1680 0:84 /systemd/inaccessible/dir /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1687 1680 0:84 /systemd/inaccessible/dir /sys/fs/selinux ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1688 1680 0:84 /systemd/inaccessible/dir /sys/kernel/config ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1693 1689 0:84 /systemd/inaccessible/dir /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1691 1680 0:84 /systemd/inaccessible/dir /sys/kernel/security ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1692 1680 0:84 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1694 1660 0:99 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
+"""
+# systemd 262.1, Linux 7.2.11, an ext4 root, no tracing automount: every
+# kernel view has a single cover on /sys.
+R5_ARCHHOST = b"""\
+335 170 259:2 /private/runtime / ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+336 335 0:54 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64,huge=advise
+342 336 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+343 336 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+344 336 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+345 336 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+346 336 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+347 336 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,size=15992344k,nr_inodes=3998086,mode=755,inode64,huge=advise
+341 336 0:66 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+340 336 0:66 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+338 336 0:66 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+337 336 0:66 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+339 336 0:66 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+348 335 0:55 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,subset=pid
+349 335 0:56 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64,huge=advise
+350 349 0:66 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+351 349 259:2 /private/attempt /run/irlume/attempt rw,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+352 349 259:2 /private/base.raw /run/irlume/base.raw ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+353 349 259:2 /private/payload.raw /run/irlume/payload.raw ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+373 349 259:2 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+388 335 0:58 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw
+390 388 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+392 388 0:66 /systemd/inaccessible/dir /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+393 388 0:66 /systemd/inaccessible/dir /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+397 388 0:66 /systemd/inaccessible/dir /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+391 388 0:66 /systemd/inaccessible/dir /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+396 388 0:66 /systemd/inaccessible/dir /sys/kernel/config ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+394 388 0:66 /systemd/inaccessible/dir /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+389 388 0:66 /systemd/inaccessible/dir /sys/kernel/security ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+395 388 0:66 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+398 335 0:59 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64,huge=advise
+"""
 
 
 def selection():
@@ -373,6 +448,26 @@ def witness(plan):
         "started_ns": 100,
         "finished_ns": 200,
     }
+
+
+def native_row(plan, data):
+    """A witness row whose denial nodes and os-release staging match a table."""
+    row = witness(plan)
+    view = root.parse_mountinfo(data)
+    for i, path in enumerate(root.DENIAL_NODES):
+        mode = 0o100000 if path == "/dev/ptmx" else 0o40000
+        node = {"device": 3, "inode": 700 + i, "mode": mode}
+        row["denied"][path] = node if path in view else None
+    stage = root.OS_RELEASE_STAGE
+    row["run_entries"] += ("/run/host", "/run/host/os-release", stage)
+    row["run_entries"] += (stage + "/os-release",)
+    row["os_release"] = {
+        "link_target": ".os-release-stage/os-release",
+        "stage_mode": 0o40755,
+        "file_mode": 0o100644,
+    }
+    row["mountinfo"] = data
+    return row
 
 
 class ProfileTests(unittest.TestCase):
@@ -883,6 +978,21 @@ class ParserTests(unittest.TestCase):
         self.assertLessEqual({"hidepid=invisible", "subset=pid"}, proc.super_options)
         self.assertFalse(any(p != "/proc" and root.nested(p, "/proc") for p in view))
 
+    def test_debug_cover_stacked_on_the_debugfs_hides_only_debugfs_and_tracefs(self):
+        view = root.parse_mountinfo(R5_TRACING)
+        self.assertEqual(len(view), R5_TRACING.count(b"\n") - 2)
+        cover = view["/sys/kernel/debug"]
+        self.assertEqual(
+            (cover.filesystem, cover.root, cover.number, cover.parent),
+            ("tmpfs", "/systemd/inaccessible/dir", 1693, 1689),
+        )
+        self.assertNotIn(1689, {mount.number for mount in view.values()})
+        self.assertNotIn("/sys/kernel/debug/tracing", view)
+        # Untriggered, the cover is a single mount on /sys.
+        view = root.parse_mountinfo(R5_ARCHHOST)
+        self.assertEqual(len(view), R5_ARCHHOST.count(b"\n"))
+        self.assertEqual(view["/sys/kernel/debug"].parent, view["/sys"].number)
+
     def test_property_wire_types_reject_malformed_structs_and_integer_ranges(self):
         for variant, kind in (
             (("as", "wrong"), "as"),
@@ -1274,6 +1384,160 @@ class CoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
 
+    def test_native_tables_of_the_bus_free_profile_are_accepted(self):
+        plan, _ = selection()
+        for label, data in (("tracing", R5_TRACING), ("archhost", R5_ARCHHOST)):
+            with self.subTest(label=label):
+                row = native_row(plan, data)
+                self.assertIsNone(root.check_core(plan, row, 1000, 250))
+
+    def test_occluded_debugfs_is_one_exact_shape(self):
+        plan, _ = selection()
+
+        def line(number, parent, path, kind, device, mount_root=b"/", flags=b"rw"):
+            return b"%d %d %s %s %s %s,nosuid,nodev,noexec,relatime - %s\n" % (
+                number,
+                parent,
+                device,
+                mount_root,
+                path,
+                flags,
+                kind,
+            )
+
+        debug, tracing = b"/sys/kernel/debug", b"/sys/kernel/debug/tracing"
+        debugfs = line(1689, 1680, debug, b"debugfs debugfs rw,seclabel", b"0:9")
+        tracefs = line(1690, 1689, tracing, b"tracefs tracefs rw,seclabel", b"0:14")
+        tmpfs = (
+            b"tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,"
+            b"uid=1000,gid=1000,inode64"
+        )
+        dir_root = b"/systemd/inaccessible/dir"
+        cover = line(1693, 1689, debug, tmpfs, b"0:84", dir_root, b"ro")
+        for row in (debugfs, tracefs, cover):
+            self.assertEqual(R5_TRACING.count(row), 1)
+
+        def edit(row, old, new, data=R5_TRACING):
+            self.assertEqual(row.count(old), 1)
+            return data.replace(row, row.replace(old, new))
+
+        def extra(row, data=R5_TRACING):
+            return data + row
+
+        def hide(path, kind, device):
+            """Stack the path's cover on the host filesystem it replaces."""
+            old = b" 1680 0:84 %s %s " % (dir_root, path)
+            self.assertEqual(R5_TRACING.count(old), 1)
+            data = R5_TRACING.replace(old, b" 1695 0:84 %s %s " % (dir_root, path))
+            return extra(line(1695, 1680, path, kind, device), data)
+
+        for label, data in (
+            ("tracefs automount", R5_TRACING),
+            ("no tracefs", R5_TRACING.replace(tracefs, b"")),
+        ):
+            with self.subTest(label=label):
+                row = native_row(plan, data)
+                self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        occluded = "^occluded debugfs$"
+        refused = (
+            (
+                "second debugfs",
+                extra(
+                    line(1695, 1689, debug, b"debugfs debugfs rw", b"0:9"),
+                    edit(cover, b"1693 1689", b"1693 1695"),
+                ),
+            ),
+            (
+                "debugfs on the cover",
+                extra(debugfs.replace(b"1689 1680", b"1695 1693")),
+            ),
+            ("cover on the cover", extra(cover.replace(b"1693 1689", b"1695 1693"))),
+            ("tmpfs on the cover", extra(line(1695, 1693, debug, tmpfs, b"0:99"))),
+            (
+                "mount below the cover",
+                extra(line(1695, 1693, debug + b"/x", tmpfs, b"0:84", dir_root, b"ro")),
+            ),
+            (
+                "debugfs at tracing",
+                edit(tracefs, b"tracefs tracefs", b"debugfs debugfs"),
+            ),
+            ("tracefs elsewhere", edit(tracefs, b"/tracing ", b"/trace ")),
+            ("tracefs on the cover", edit(tracefs, b"1690 1689", b"1690 1693")),
+            ("tracefs on /sys", edit(tracefs, b"1690 1689", b"1690 1680")),
+            ("tracefs source", edit(tracefs, b"tracefs tracefs", b"tracefs none")),
+            ("tracefs root", edit(tracefs, b" / /sys", b" /instances /sys")),
+            ("other filesystem", edit(tracefs, b"tracefs tracefs", b"tmpfs tmpfs")),
+            ("tracefs type", edit(tracefs, b"- tracefs tracefs", b"- tmpfs tracefs")),
+            ("two tracefs", extra(tracefs.replace(b"1690 1689", b"1695 1690"))),
+            (
+                "tracefs child",
+                extra(
+                    line(1695, 1690, tracing + b"/x", b"tracefs tracefs rw", b"0:14")
+                ),
+            ),
+            (
+                "foreign child of the debugfs",
+                extra(line(1695, 1689, b"/tmp/x", b"tmpfs tmpfs rw", b"0:99")),
+            ),
+            ("cover beside the debugfs", edit(cover, b"1693 1689", b"1693 1680")),
+            ("tracefs pair", extra(tracefs.replace(b"1690 1689", b"1695 1689"))),
+            ("debugfs off /sys", edit(debugfs, b"1689 1680", b"1689 1660")),
+            ("debugfs type", edit(debugfs, b"- debugfs debugfs", b"- tmpfs debugfs")),
+            ("debugfs source", edit(debugfs, b"debugfs debugfs", b"debugfs none")),
+            ("debugfs root", edit(debugfs, b" / /sys", b" /x /sys")),
+            ("shared debugfs", edit(debugfs, b"relatime -", b"relatime shared:7 -")),
+            ("slave tracefs", edit(tracefs, b"relatime -", b"relatime master:7 -")),
+            ("shared cover", edit(cover, b"relatime -", b"relatime shared:9 -")),
+            ("reg cover", edit(cover, b"inaccessible/dir", b"inaccessible/reg")),
+            ("other cover root", edit(cover, dir_root, b"/x")),
+            ("writable cover", edit(cover, b" ro,nosuid", b" rw,nosuid")),
+            ("executable cover", edit(cover, b"nodev,noexec,", b"nodev,")),
+            ("debugfs cover", edit(cover, b"tmpfs tmpfs", b"debugfs debugfs")),
+            (
+                "hidden security view",
+                hide(b"/sys/kernel/security", b"securityfs securityfs rw", b"0:8"),
+                "^stacked mount: /sys/kernel/security$",
+            ),
+            (
+                "hidden tracing view",
+                hide(b"/sys/kernel/tracing", b"tracefs tracefs rw,seclabel", b"0:14"),
+                "^stacked mount: /sys/kernel/tracing$",
+            ),
+        )
+        # The parser takes these; the witness check refuses them.
+        witnessed = (
+            (
+                "cover device",
+                edit(cover, b"1689 0:84", b"1689 0:99"),
+                "^inaccessible covers disagree$",
+            ),
+            (
+                "cover prefix",
+                edit(cover, b" /systemd/", b" /x/systemd/"),
+                "^inaccessible covers disagree$",
+            ),
+            (
+                "no cover",
+                R5_TRACING.replace(cover, b""),
+                "^missing or unexpected rooted mount$",
+            ),
+            (
+                "neither cover nor tracefs",
+                R5_TRACING.replace(cover, b"").replace(tracefs, b""),
+                "^writable protected rooted mount$",
+            ),
+        )
+        good = native_row(plan, R5_TRACING)
+        for label, data, *message in refused + witnessed:
+            message = message[0] if message else occluded
+            self.assertNotEqual(data, R5_TRACING)
+            with self.subTest(label=label):
+                if label not in {case[0] for case in witnessed}:
+                    with self.assertRaisesRegex(ValueError, message):
+                        root.parse_mountinfo(data)
+                with self.assertRaisesRegex(ValueError, message):
+                    root.check_core(plan, dict(good, mountinfo=data), 1000, 250)
+
     def test_kernel_views_are_single_covers_or_absent(self):
         plan, _ = selection()
         base = witness(plan)
@@ -1386,7 +1650,12 @@ class CoreTests(unittest.TestCase):
                 "other device": "inaccessible covers disagree",
                 "other prefix": "inaccessible covers disagree",
                 "propagation": "rooted mount is not private",
-                "stacked on its top": "stacked mount: " + path,
+                # A debugfs under a cover is refused as a shape, not a stack.
+                "stacked on its top": (
+                    "^occluded debugfs$"
+                    if path == "/sys/kernel/debug"
+                    else "stacked mount: " + path
+                ),
             }
             for label, bad in cases:
                 self.assertNotEqual(bad["mountinfo"], b"")

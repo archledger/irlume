@@ -72,6 +72,10 @@ LEGACY_CGROUPS = (
 INACCESSIBLE = re.compile(
     r"((?:/[^/]+)*)/systemd/inaccessible/(dir|reg|chr|blk|fifo|sock)"
 )
+SEALED = frozenset({"ro", "nosuid", "nodev", "noexec"})
+# The one kernel view whose cover may hide mounts (occluded_debugfs).
+DEBUGFS = "/sys/kernel/debug"
+TRACING = DEBUGFS + "/tracing"
 ATTEMPT = "/run/irlume/attempt"
 OS_RELEASE_STAGE = "/run/host/.os-release-stage"
 ENTRY = "opt/irlume/measurement-job-guardian-native.py"
@@ -489,24 +493,84 @@ def mount_rows(data):
     return rows
 
 
+def occluded_debugfs(rows):
+    """Return the debugfs and tracefs rows the /sys/kernel/debug cover hides.
+
+    The host's tracing automount is a tracefs on its debugfs. G's mount
+    namespace copies it locked (fs/namespace.c copy_mnt_ns, lock_mnt_tree),
+    and systemd's recursive bind of the debugfs onto G's sysfs keeps the lock
+    (copy_tree; v259.10 and v262.1 src/shared/mount-util.c
+    bind_mount_submounts). The umount before the cover then fails and is
+    ignored (src/core/namespace.c MOUNT_INACCESSIBLE): the tracefs is locked,
+    and since Linux 7.2.11 ("namespace: never expire a locked mount") the
+    debugfs above it is EBUSY. So the cover lands on the debugfs. Only that
+    shape is accepted: one debugfs on /sys, the cover on it as the only other
+    mount at its path, at most one tracefs at tracing on the debugfs, nothing
+    else below the path or on a hidden row, no propagation tags. With fewer
+    than two mounts at the path nothing is hidden there: ((), None).
+    """
+    at = [mount for path, mount in rows if path == DEBUGFS]
+    under = [(path, mount) for path, mount in rows if path.startswith(DEBUGFS + "/")]
+    if len(at) < 2:
+        return (), None
+    paths = {mount.number: path for path, mount in rows}
+    if len(at) != 2 or len(under) > 1:
+        raise ValueError("occluded debugfs")
+    debugfs, cover = sorted(at, key=lambda mount: paths.get(mount.parent) != "/sys")
+    hidden = (debugfs, *(mount for _, mount in under))
+    numbers = {mount.number for mount in hidden}
+    kind = INACCESSIBLE.fullmatch(cover.root)
+    if (
+        (debugfs.filesystem, debugfs.source, debugfs.root, paths.get(debugfs.parent))
+        != ("debugfs", "debugfs", "/", "/sys")
+        or cover.parent != debugfs.number
+        or cover.filesystem != "tmpfs"
+        or kind is None
+        or kind[2] != "dir"
+        or not SEALED <= cover.options
+        or any(
+            (path, mount.filesystem, mount.source, mount.root, mount.parent)
+            != (TRACING, "tracefs", "tracefs", "/", debugfs.number)
+            for path, mount in under
+        )
+        or any(mount.propagation for mount in (*hidden, cover))
+        or any(
+            mount.parent in numbers
+            for _, mount in rows
+            if mount.number not in numbers | {cover.number}
+        )
+    ):
+        raise ValueError("occluded debugfs")
+    return hidden, cover
+
+
 def mount_tree(rows):
     """Return the mount view a path walk reaches; refuse every hidden entry.
 
     The tree root is the one row whose parent is not listed, at /. A child at
     its parent's own path covers the parent, and a child below a sibling's
     path is occluded by that sibling. Both stack a mount no path walk
-    reaches, so either is refused, as is any row the walk never meets.
+    reaches, so either is refused, as is any row the walk never meets. The
+    one exception is occluded_debugfs: its rows are dropped and its cover
+    takes the debugfs's place in the walk, keeping its own parent field.
     """
+    hidden, cover = occluded_debugfs(rows)
+    numbers = {mount.number for mount in hidden}
+    rows = [row for row in rows if row[1].number not in numbers]
+    parents = {mount.number: mount.parent for _, mount in rows}
+    if cover is not None:
+        parents[cover.number] = hidden[0].parent
     by_id = {mount.number: (path, mount) for path, mount in rows}
-    tops = [row for row in rows if row[1].parent not in by_id]
+    tops = [row for row in rows if parents[row[1].number] not in by_id]
     if len(tops) != 1 or tops[0][0] != "/":
         raise ValueError("mountinfo tree root")
     children = {number: [] for number in by_id}
     for path, mount in rows:
-        if mount.parent in by_id:
-            if not below(path, by_id[mount.parent][0]):
+        parent = parents[mount.number]
+        if parent in by_id:
+            if not below(path, by_id[parent][0]):
                 raise ValueError("mountinfo tree")
-            children[mount.parent].append((path, mount))
+            children[parent].append((path, mount))
     visible, level = {}, [tops[0]]
     while level:
         following = []
@@ -600,7 +664,6 @@ def check_mounts(plan, row):
         or any(path != "/proc" and nested(path, "/proc") for path in mounts)
     ):
         raise ValueError("rooted proc view")
-    sealed = {"ro", "nosuid", "nodev", "noexec"}
     covers = set()
     for path in sorted(set(DENIAL_NODES) & mounts.keys()):
         mount = mounts[path]
@@ -608,7 +671,7 @@ def check_mounts(plan, row):
         if (
             mount.filesystem != "tmpfs"
             or match is None
-            or not sealed <= mount.options
+            or not SEALED <= mount.options
             or path in KERNEL_HIDDEN
             and match[2] != "dir"
         ):

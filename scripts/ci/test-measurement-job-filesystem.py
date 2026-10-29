@@ -250,6 +250,42 @@ class FilesystemTests(unittest.TestCase):
         with self.assertRaises((ValueError, OSError)):
             self.collect()
 
+    def test_private_dev_number_links_are_exact_and_optional(self):
+        self.collect()
+        links = self.path("/dev/char")
+        links.mkdir()
+        for number, name in fs.CHAR_LINKS.items():
+            (links / number).symlink_to("../" + name)
+        self.collect()
+        cases = (
+            ("extra number", lambda: (links / "1:1").symlink_to("../mem")),
+            (
+                "wrong target",
+                lambda: (
+                    (links / "1:3").unlink(),
+                    (links / "1:3").symlink_to("../zero"),
+                ),
+            ),
+            ("not a link", lambda: ((links / "1:9").unlink(), (links / "1:9").touch())),
+            ("block directory", lambda: self.path("/dev/block").mkdir()),
+        )
+        for label, change in cases:
+            change()
+            with self.subTest(label), self.assertRaises(ValueError):
+                self.collect()
+            for extra in (links / "1:1", self.path("/dev/block")):
+                if extra.is_dir():
+                    extra.rmdir()
+                elif extra.is_symlink():
+                    extra.unlink()
+            for number, name in fs.CHAR_LINKS.items():
+                link = links / number
+                if link.is_symlink() and link.readlink() == Path("../" + name):
+                    continue
+                link.unlink(missing_ok=True)
+                link.symlink_to("../" + name)
+        self.collect()
+
     def test_wrong_device_number_and_symlink_target_refuse(self):
         inode = self.path("/dev/null").stat().st_ino
         self.devices[inode] = os.makedev(1, 5)

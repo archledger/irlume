@@ -35,6 +35,13 @@ DEVICES = {
     "urandom": (1, 9),
     "tty": (5, 0),
 }
+# A private /dev links every cloned character node as /dev/char/MAJ:MIN ->
+# ../NAME (systemd v255 to v259 src/core/namespace.c, clone_device_node);
+# ptmx is cloned too, then made inaccessible.
+CHAR_LINKS = {
+    f"{major}:{minor}": name
+    for name, (major, minor) in {**DEVICES, "ptmx": (5, 2)}.items()
+}
 DEV_LINKS = {
     "fd": "/proc/self/fd",
     "stdin": "/proc/self/fd/0",
@@ -201,7 +208,8 @@ def directory_policy(plan):
     return {
         "/dev": set(DEVICES)
         | set(DEV_LINKS)
-        | {"pts", "ptmx", "shm", "mqueue", "hugepages"},
+        | {"pts", "ptmx", "shm", "mqueue", "hugepages", "char"},
+        "/dev/char": set(CHAR_LINKS),
         "/run": {"irlume", "user", "host", "credentials"},
         "/run/irlume": {"attempt", "base.raw", "payload.raw", "runtime-manifest.json"},
         "/run/user": {uid},
@@ -215,7 +223,7 @@ def directory_policy(plan):
 def check_roles(plan, bus_identity, nodes, entries):
     for path, names in entries.items():
         if names is None:
-            if path not in ("/run/host", root.OS_RELEASE_STAGE):
+            if path not in ("/run/host", root.OS_RELEASE_STAGE, "/dev/char"):
                 raise ValueError("missing filesystem structural directory")
         elif not set(names) <= directory_policy(plan)[path]:
             raise ValueError("unexpected filesystem directory entry")
@@ -263,6 +271,12 @@ def check_roles(plan, bus_identity, nodes, entries):
             or node["rdev"] != os.makedev(*device)
         ):
             raise ValueError("unexpected minimal device node")
+    for number, name in CHAR_LINKS.items():
+        node = nodes["/dev/char/" + number]
+        if node is not None and (
+            not stat.S_ISLNK(node["mode"]) or node.get("target") != "../" + name
+        ):
+            raise ValueError("unexpected device number link")
     for name, target in DEV_LINKS.items():
         node = nodes["/dev/" + name]
         if node is None and name == "core":
@@ -330,6 +344,7 @@ def target_paths(plan):
         *root.KERNEL_DENIED,
         *("/dev/" + name for name in DEVICES),
         *("/dev/" + name for name in DEV_LINKS),
+        *("/dev/char/" + number for number in CHAR_LINKS),
         "/run/host/os-release",
         root.OS_RELEASE_STAGE,
         root.OS_RELEASE_STAGE + "/os-release",

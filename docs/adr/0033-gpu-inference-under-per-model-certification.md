@@ -10,6 +10,10 @@ key binds the numerics set).
 Amended 2026-10-22 by the [measurement-only build boundary](#amendment-2026-10-22-measurement-only-evidence-builds),
 which specifies future tooling and admits no production loading profile.
 
+Amended 2026-10-29 by the [`auto` ranking contract](#amendment-2026-10-29-the-auto-ranking-contract),
+which specifies phase 6 and adds no order, certification entry or loading
+permission.
+
 Amends ADR-0022 section 15 ("No GPU") on the maintainer's decision to
 reopen GPU support during #1053. Section 15 asked for "evidence that
 CPU-only users face unacceptable latency"; the #1053 Phase 2 measurements
@@ -240,7 +244,10 @@ The #1053 contract holds: `auto` places the recognizer on an accelerator
 only when that accelerator's model certification passed on its identity.
 Ranking among several certified devices is set by measured evidence on
 the decision hardware (the UX5406S rerun of the measurement record is
-pending), not by device class or vendor.
+pending), not by device class or vendor. (Amended 2026-10-29, below: CPU
+is a ranked target, orders live in a separate reviewed table, `auto`
+probes a device only when that table could select it, and a refusal falls
+through to the next class, then CPU.)
 
 #### Pure recommendation foundation, 2026-10-23
 
@@ -634,3 +641,194 @@ Toy compiler tests or the earlier unit-test-only hardware runs do not
 meet these implementation and measurement requirements. Ordinary GPU
 loading, installation and enforcing-profile validation remain section 4
 and #1162; this evidence profile is not their conformance proof.
+
+## Amendment 2026-10-29: the `auto` ranking contract
+
+Section 6 leaves `auto` ranking to measured evidence, and the 2026-10-23
+foundation added the pure `recognizer_ranking::recommend`, which no
+production code calls. This amendment fixes how phase 6 (#1163) calls it.
+Three facts constrain that:
+
+- `recommend` supplies no default order: under `auto`, an eligible
+  candidate yields CPU without an order bound to the same workload
+  (`MissingEvidence`, `EvidenceMismatch`), and an explicit `npu` or `gpu`
+  consumes no order.
+- A GPU's certification key exists only after the process has loaded
+  OpenVINO, enumerated the GPU and compiled the warm-up model
+  (`GpuPlatform::open` assembles the identity after those steps), and on
+  `xe` the enumeration alone keeps the GPU out of runtime suspend until
+  the process exits (amendment 2026-10-22; a bare `clGetPlatformIDs` and
+  `clGetDeviceIDs` probe reproduces it, [the precision
+  record](../research/2026-10-21-gpu-f32-precision.md)). Probing the GPU
+  to learn whether `auto` may use it pays that hold even when the answer
+  is CPU.
+- The certification entry says whether a GPU may answer, not whether
+  `auto` should prefer it, and the costs that would decide that are
+  unmeasured under `f32`: single-request latency (the precision record)
+  and the idle power of the hold (amendment 2026-10-22, decision 1).
+
+Decision:
+
+1. CPU is a ranked target. Certification makes an accelerator eligible;
+   only a reviewed order puts it ahead of CPU (Phasing item 6). Orders
+   live in `RANKED`, a compiled table beside the certification tables
+   that stays empty until reviewed evidence fills it. An order has the
+   shape `recommend` takes: a workload key and a strict order over CPU
+   and at most one target per accelerator class, CPU exactly once. The
+   workload key binds the model's SHA-256, the consumer (the CPU
+   reference's ONNX Runtime version, the wired thresholds and the decision
+   fingerprint) and the ranking protocol version of decision 4. A GPU
+   target names its certification's numerics key, which binds the
+   compile configuration; an NPU target names the identity key of its
+   ADR-0022 entry. Each order also records the PCI vendor and device IDs
+   of every accelerator it ranks, and names its evidence record.
+   `RANKED` may hold several orders for one workload key, because each
+   certified identity and each re-certification under a new key is
+   measured on its own; the accelerator keys they name tell them apart.
+   No accelerator target (class and key) appears in two orders for one
+   workload, so a live key picks at most one order; a test over the
+   compiled table checks this, and an order measured for a target that
+   an older order names replaces that order. The certification entry
+   keeps its fields: re-ranking needs no re-certification, and a GPU
+   re-certified under a new numerics key has no order until one is
+   measured.
+2. `auto` probes only what an order could select. Before any runtime
+   work, the daemon opens an accelerator class's context under `auto`
+   only when that class's switch allows it and at least one order for
+   this workload passes for the class: the order puts a key of that
+   class ahead of CPU, an entry of that class for this model and
+   consumer carries that key, and the host exposes a device with the PCI
+   IDs the order records for it. The check reads every order for the
+   workload, because the live key that picks one (decision 3) exists
+   only after the probe. The IDs come from sysfs, whose `vendor` and
+   `device` attributes return the kernel's cached values and take no
+   runtime-PM reference (`drivers/pci/pci-sysfs.c` at v7.2 and on
+   mainline of 2026-10-28). A class that fails the check runs no
+   discovery and reports why on CPU (decision 5).
+3. A refusal falls through to the next class, then CPU. At engine build
+   (ADR-0022 sections 8 and 10 unchanged), the classes that pass
+   decision 2 are probed one at a time, each at most once, in the
+   sequence their passing orders give them. Where those orders disagree,
+   or none ranks both classes, the NPU goes first, because only the GPU
+   probe has a known hold (on `xe`); on such a host the NPU can win where
+   the GPU's own order put the GPU first. A probe that refuses
+   (admission, no entry for the live key, compile, parity, the runtime
+   guard) leaves its slot on CPU, and the walk moves on. For a slot that
+   places, the daemon calls `recommend` with that slot alone,
+   `ReportedEligible` under its live key, and the one order that names
+   the key, or no order when none does. The answer decides:
+   - an accelerator answer keeps the slot and ends the walk;
+   - `MissingEvidence` (no order names the live key) or
+     `OrderedEvidence` with CPU (the order puts CPU ahead of the live
+     key) drops the slot, and the walk moves on;
+   - every other CPU answer (`InvalidOrder`, `EvidenceMismatch`,
+     `InvalidKey`, `WorkloadMismatch`, `AmbiguousCandidates`,
+     `NoEligibleAccelerator`) rejects the order or the inputs, which only
+     an inconsistent table or walk produces, so the walk ends on CPU with
+     no further probe.
+
+   A refused or dropped slot is not passed to later calls: under `auto`
+   `recommend` skips an absent class as it skips a refused one, so that
+   slot can neither win nor invalidate the next class's order. The walk
+   ends on CPU when no class is left. Retirement after placement stays
+   ADR-0022 section 9: CPU for the engine's lifetime, never the other
+   accelerator.
+4. Ranking protocol `irlume-ranking-v1` measures every target of an order
+   on one host, on the certified identity, through the production
+   compile:
+   - decision latency from the first frame the engine receives to the
+     decision, p50 and p95 over the same recorded authentications, with
+     the desktop idle and with the compositor rendering continuously on
+     the integrated GPU;
+   - CPU time per authentication;
+   - idle power with the display off and runtime power management on
+     (`power/control` at `auto`), in alternating windows with and without
+     the context retained, from package energy and, on battery, the
+     discharge rate, with the power profile recorded;
+   - resident memory added, cold compile from an emptied cache and warm
+     import.
+
+   An accelerator goes ahead of CPU only when its p95 latency is lower
+   than CPU's in each latency condition, its CPU time per authentication
+   is lower, and, for each power source measured, the mean idle power of
+   the windows with the context retained exceeds the mean of the windows
+   without it by no more than the margin. A run whose windows without
+   the context differ from each other by more than the margin decides
+   nothing and is repeated, so a noisier baseline cannot widen the
+   allowance. The power figures are preliminary: windows of 10 minutes,
+   3 of each kind, and a margin of 50 mW, until the preliminary ranking
+   measurement on the UX5406S (#1163) confirms or replaces them before
+   the first order lands. Two qualifying accelerators are ordered by p95
+   latency under compositor load. Memory, compile and import figures are
+   recorded and do not rank; the Context weighs them for the regime. CPU
+   authentication violates no user-facing latency target (Status), so
+   `auto` does not trade idle power for latency; explicit `gpu` remains
+   for an owner who accepts that cost. Once the first order lands, a
+   changed metric, rule or figure is a new version, and orders measured
+   under an older one stop matching.
+5. Health, `status --json` and doctor gain optional fields under contract
+   1: the target the selection resolved to (`cpu`, `npu` or `gpu`) and a
+   closed reason from `recognizer_ranking::Reason`. On CPU under `auto`
+   the reason is the last one the walk met (decision 2 checks the NPU,
+   then the GPU, before any probe), so a refusal is reported as
+   `Refused` with its cause, not as `NoEligibleAccelerator`. Phase 6
+   extends both closed sets additively, one new wire string per value:
+   `Refusal` gains a failed compile (including a compile or inference
+   that did not return earlier in this boot), a failed parity check (the
+   startup check or the extended reference set) and a runtime-suspend
+   guard that could not be armed, and `Reason` gains no device with an
+   order's PCI IDs. The other causes map to existing values: a switch
+   that is off is `SwitchDisabled`; no order putting the class's key
+   ahead of CPU before the probe, and no order naming the live key after
+   it, are `MissingEvidence`, as when `recommend` gets no order; no entry
+   for the model and consumer, or for the live key, is `NotCertified`;
+   closed admission is `LoadingNotAdmitted`; more than one GPU is
+   `AmbiguousDevice`, an absent runtime or no GPU found after the PCI
+   check is `RuntimeUnavailable`, an unreadable identity or an
+   unclassified library is `IdentityUnavailable`, and an ineligible
+   model is `NotCertified`. The fields report the
+   policy result of the published engine; `device` and `accelerator` keep
+   reporting execution, so a retirement to CPU leaves the resolved target
+   unchanged. No key, workload or measured value is carried, root and
+   non-root callers see the same values, absence means unreported and an
+   unknown value decodes as `unknown`, as for selection provenance.
+6. Explicit `gpu` and `npu` are unchanged: they consume no order, the
+   check of decision 2 does not apply to them, and they report what their
+   probe found. Each switch filters only its own class (section 8), so
+   under `auto` an NPU switch that is off does not keep the GPU from
+   consideration, unlike today's NPU-only `auto`, which the NPU switch
+   stops.
+
+What this changes: no behavior today. `RANKED` does not exist yet,
+loading admission stays closed, both `CERTIFIED` tables stay empty and
+`auto` keeps the recognizer on CPU. Once an admitted, certified GPU
+exists, `auto` still stays on CPU until a reviewed order for its numerics
+key lands, so explicit `gpu` is the first way to use it; running the
+protocol in the certification campaign's window lets an entry and its
+order land together. A probe that ends on CPU (a live key no entry or
+order names, an order that puts CPU first, or a slot refusal) still keeps
+an `xe` GPU out of runtime suspend until the daemon exits; decision 2
+confines that to hosts with a ranked device's PCI IDs. What it leaves
+open: the power figures of decision 4 until the UX5406S measurement sets
+them; an accelerator answer ends the walk even when the order that names
+the live key ranks only that class, so the walk's sequence, not a
+measurement, then decides between the classes; and an order names CPU
+only by position, not by processor model,
+so one host's measurement ranks the GPU against that host's CPU wherever
+the order's accelerator keys match.
+
+Acceptance (phase 6, synthetic tables and an injected opener): under
+`auto` the opener is never called unless the class's switch, a matching
+entry, an order putting the class ahead of CPU and that order's PCI IDs
+all allow it, checked over every order for the workload; both orders of
+two eligible classes are followed, and disagreeing orders probe the NPU
+first; a live key selects the one order that names it, and a live key no
+order names, or an order putting CPU first, drops the slot and moves on;
+a refused first candidate falls through to the next and then to CPU,
+each probed once; a rejected order ends the walk with no further probe;
+a table that names one accelerator target in two orders of a workload
+fails its test; the GPU switch off wins and the NPU switch off does not
+block the GPU; explicit `gpu` probes with no order; a refusal under
+`auto` is reported with its cause; a retirement keeps the resolved
+target and reports CPU execution; an unknown reason string decodes as
+`unknown`; an older daemon's missing fields decode as unreported.

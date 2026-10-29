@@ -67,9 +67,15 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   mapped bytes to the hashed file would close this.
 - Restrict path-socket connects from the future QEMU child with Landlock
   (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
-- Evaluate `ProtectControlGroupsEx=strict`: G can still read the host cgroup
-  tree's unit names and process counts.
-- Check whether G inherits the user's session keyring.
+- G can still read the host cgroup tree's unit names and process counts.
+  `ProtectControlGroupsEx=strict` hides them: on systemd 259.10 the service
+  runs in a cgroup namespace (`0::/`) under a new read-only cgroup2 mount
+  that lists only its own cgroup. Adopting it needs two changes. G sees `/`
+  as its cgroup, so H's LAUNCH must carry the cgroup ID (systemd's
+  `ControlGroupId`, equal to the inode of G's `/sys/fs/cgroup`) in place of
+  the path. The host cgroup2 and legacy mounts stay below the new mount,
+  so the mount parser needs an exact occluded-cgroup shape. Do this before
+  G starts the QEMU child.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
   uid, gid, namespace, liveness and socket node, and H stays the verifier of
   G's unit, invocation and start time.
@@ -81,7 +87,11 @@ close #1164 on the strength of this source checkpoint.
 ## Validation retained with this checkpoint
 
 All 36 `scripts/ci/test-measurement-*.py` suites pass (782 tests), with
-`TMPDIR` unset and with a long `TMPDIR`. The portable 69-test and controller
+`TMPDIR` unset and with a long `TMPDIR`. G runs with `KeyringMode=private`,
+read back by H: a user manager's services otherwise share its session
+keyring, which G's private user namespace does not replace (probed on
+systemd 259.10 and 262.1). The startup-only runs above predate that
+property. The portable 69-test and controller
 43-test suites also pass. Each change in the 2026-10-29 series was written
 test first, and its mutation controls fail at least one test. The startup-only
 native runs above used a pinned runtime prepared from the same source.

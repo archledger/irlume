@@ -63,10 +63,17 @@ ThinkPad X13 Yoga Gen 4, 2026-10-19. A measurement build of origin/main (`f97a97
 for the probe, `07023313` for the campaign) with the compile
 configuration's precision changed to `f32`, installed beside the untouched
 f16 binaries under a root-owned prefix with a process-local ICD. Identity
-`f592e9bc` (probe, kernel 7.2.9) and `d689e37d` (campaign, after the
-kernel moved to 7.2.11 and the binary was rebuilt; the field responsible
-for the change was not isolated because the runs did not archive their
-field-level identity dumps).
+`f592e9bc` (probe) and `d689e37d` (campaign), both on kernel 7.2.11.
+The two differ only in the memory size the plugin reports
+(`GPU_DEVICE_TOTAL_MEM_SIZE`), which the identity hashed until #1172: it
+fell by 4,096 bytes, from 14,944,182,272 to 14,944,178,176, across the
+reboot between the runs. A 2026-10-29 identity run with field dumps
+rebuilt both digests exactly from the current fields, varying only that
+size, and the same method gives the archived f16 `6aa45541` from its
+recorded size. The two sizes are recovered from the digests, not from
+archived dumps. Under the current definition the probe, the campaign,
+the 2026-10-21 witness and the 2026-10-29 run share identity `27288f0e`
+(`artifacts/irlume/2026-10-29-gpu-npu-program/g2-thinkpad-identity/`).
 
 | Arm | n | CPU accepts | GPU accepts | Verdict diffs | Max abs drift | Outcome |
 |---|---|---|---|---|---|---|

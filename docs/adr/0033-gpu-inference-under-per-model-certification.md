@@ -354,7 +354,8 @@ by three orders of magnitude:
   points) while all 3,397 CPU/GPU verdicts agreed and no new grant
   occurred; section 7.4 passed and section 7.5 failed.
 - The same ThinkPad, 2026-10-19, `f32` (identities `f592e9bc` and
-  `d689e37d`, the second after a kernel update): maximum absolute drift
+  `d689e37d`, which differ only in the memory size reported after a
+  reboot; both are `27288f0e` since #1172): maximum absolute drift
   6.6e-7 on genuine LFW and 3.1e-7 to 4.0e-7 on the eight other arms, zero
   verdict differences in 3,397 comparisons, no new grant, every
   shifted-threshold recount unchanged; three retained-process runs of 1,000

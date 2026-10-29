@@ -29,6 +29,23 @@ def deadline():
     return time.monotonic_ns() + 5_000_000_000
 
 
+def kernel_threads():
+    with open("/proc/self/status", "rb") as stream:
+        for line in stream:
+            if line.startswith(b"Threads:"):
+                return int(line.partition(b":")[2])
+    raise AssertionError("no Threads line")
+
+
+def await_single_thread(limit_ns=2_000_000_000):
+    # join() returns once the thread clears its TID, before the kernel drops
+    # it from the thread group: a later self snapshot can still count two.
+    end = time.monotonic_ns() + limit_ns
+    while kernel_threads() != 1 and time.monotonic_ns() < end:
+        time.sleep(0.001)
+    return kernel_threads()
+
+
 class ProcTests(unittest.TestCase):
     def test_path_only_handle_inspects_symlink_without_following_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -55,6 +72,7 @@ class ProcTests(unittest.TestCase):
             stop.set()
             worker.join(timeout=2)
         self.assertFalse(worker.is_alive())
+        self.assertEqual(await_single_thread(), 1)
 
     def test_thread_count_is_checked_after_the_last_proc_read(self):
         collector = startup.ProcCollector(deadline())

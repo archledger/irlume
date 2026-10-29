@@ -2658,8 +2658,21 @@ mod tests {
     type Calls = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
     fn fake(replies: Vec<Result<Vec<f32>, String>>) -> (Slot, Calls) {
+        fake_on(Slot::npu, replies)
+    }
+
+    /// The same scripted model placed on the GPU (ADR-0033), so the two
+    /// retirement paths of [`Slot::run`] cannot drift apart unseen.
+    fn fake_gpu(replies: Vec<Result<Vec<f32>, String>>) -> (Slot, Calls) {
+        fake_on(Slot::gpu, replies)
+    }
+
+    fn fake_on(
+        place: fn(Box<dyn Infer>) -> Slot,
+        replies: Vec<Result<Vec<f32>, String>>,
+    ) -> (Slot, Calls) {
         let calls = Calls::default();
-        let slot = Slot::npu(Box::new(Fake {
+        let slot = place(Box::new(Fake {
             replies,
             calls: calls.clone(),
             seen: None,
@@ -2703,6 +2716,39 @@ mod tests {
         let (mut slot, _) = fake(vec![Ok(vec![])]);
         assert_eq!(slot.run(&[1.0], first), None);
         assert!(matches!(slot.device(), Device::Cpu(CpuReason::Retired(_))));
+    }
+
+    #[test]
+    fn an_inference_error_retires_the_gpu_for_good() {
+        let (mut slot, calls) = fake_gpu(vec![Err("device lost".into()), Ok(vec![0.5])]);
+        assert_eq!(slot.device(), Device::Gpu);
+        assert_eq!(slot.run(&[1.0], first), None, "the caller runs CPU");
+        assert_eq!(
+            slot.device(),
+            Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(
+                "device lost".into()
+            ))),
+            "the reason names the GPU, not the NPU"
+        );
+        assert!(!slot.check_runtime_guard(), "off the accelerator");
+        assert_eq!(slot.run(&[1.0], first), None);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a retired GPU is not called again"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_output_retires_the_gpu_too() {
+        let (mut slot, calls) = fake_gpu(vec![Ok(vec![]), Ok(vec![0.5])]);
+        assert_eq!(slot.run(&[1.0], first), None);
+        assert!(matches!(
+            slot.device(),
+            Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(why))) if why.contains("empty")
+        ));
+        assert_eq!(slot.run(&[1.0], first), None);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2876,6 +2922,80 @@ mod tests {
                 slot.device(),
                 Device::Cpu(CpuReason::Retired(why)) if why.contains("not hashed")
             ));
+            assert!(slot.certification().is_none());
+            assert!(!base.path().join("inference-marker").exists());
+            fs::write(base.path().join("maps"), original).unwrap();
+            assert_eq!(slot.run(&[0.0], first), None, "retirement is permanent");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), load_on);
+        }
+    }
+
+    fn gpu_entry() -> &'static gpu::certification::Certification {
+        Box::leak(Box::new(gpu::certification::Certification {
+            model_sha256: "model",
+            role: Role::Recognizer,
+            numerics_key: "synthetic-key",
+            identity_digest: "synthetic",
+            onnx_runtime: "1.28.1",
+            thresholds: &[],
+            decision_fingerprint: "decision",
+            fingerprint: &[],
+            cpu_reference_digest: "cpu",
+            gpu_reference_digest: "gpu",
+            support_digest: "support",
+            extended_reference_digest: "extended",
+            runtime_witness: gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
+            evidence: "synthetic",
+        }))
+    }
+
+    /// The GPU wraps its compiled model in the same [`Marked`]
+    /// (`GpuPlatform::compile_certified`); a late mapping retires it to CPU
+    /// with the GPU reason (#1161).
+    #[test]
+    fn gpu_inference_inventory_rejects_lazy_mappings_and_retires_slot() {
+        for load_on in [1, 2] {
+            let base = tempfile::tempdir().unwrap();
+            let maps = base.path().join("maps");
+            let extra = base.path().join("liblazy.so");
+            fs::write(&extra, b"synthetic late dependency").unwrap();
+            let mut count = 0;
+            let (model, calls) = inference_inventory_model(base.path(), move || {
+                count += 1;
+                if count == load_on {
+                    let changed = fs::read_to_string(&maps).unwrap() + &map_line(&extra);
+                    fs::write(&maps, changed).unwrap();
+                }
+            });
+            let original = fs::read_to_string(&model.maps).unwrap();
+            let mut slot = Slot::gpu_certified(
+                Box::new(model),
+                gpu::certification::Matched {
+                    entry: gpu_entry(),
+                    extended_required: false,
+                },
+                None,
+            );
+            assert_eq!(slot.device(), Device::Gpu);
+            assert!(slot.gpu_certification().is_some());
+            for _ in 1..load_on {
+                assert_eq!(slot.run(&[0.0], first), Some(0.25));
+            }
+            let mut decoded = false;
+            assert_eq!(
+                slot.run(&[0.0], |raw| {
+                    decoded = true;
+                    first(raw)
+                }),
+                None,
+                "unqualified output must request CPU fallback"
+            );
+            assert!(!decoded, "rejected output must not reach the decoder");
+            assert!(matches!(
+                slot.device(),
+                Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(why))) if why.contains("not hashed")
+            ));
+            assert!(slot.gpu_certification().is_none());
             assert!(slot.certification().is_none());
             assert!(!base.path().join("inference-marker").exists());
             fs::write(base.path().join("maps"), original).unwrap();

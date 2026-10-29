@@ -4,6 +4,7 @@
 """Service ownership tests use a fake bus; never create a systemd unit."""
 
 import importlib.util
+import json
 import os
 import socket
 import subprocess
@@ -374,6 +375,202 @@ os._exit(0)
                 self.assertEqual(
                     (root / "active.json").read_bytes(), b"changed-by-another-writer"
                 )
+            finally:
+                gate.close()
+
+    def retained_claim(self, root, run_id="one", intent=b"intent"):
+        end = time.monotonic_ns() + 2_000_000_000
+        gate = service.AdmissionGate(root, end)
+        gate.claim(run_id, intent, end)
+        gate.close()
+        return (root / "active.json").read_bytes(), end
+
+    def assert_unresolved(self, root, record):
+        self.assertEqual((root / "active.json").read_bytes(), record)
+        self.assertEqual(
+            sorted(p.name for p in root.iterdir() if p.name != "admission.lock"),
+            ["active.json"],
+        )
+
+    def test_failed_claim_resolves_only_to_non_accepting_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record, end = self.retained_claim(root)
+            gate = service.AdmissionGate(root, end)
+            try:
+                data, identity = gate.read_blocker(end)
+                self.assertEqual(data, record)
+                gate.resolve_failed(data, identity, b"resolution", end)
+                self.assertIsNone(gate.record)
+            finally:
+                gate.close()
+            self.assertFalse((root / "active.json").exists())
+            self.assertEqual((root / "resolved-one.json").read_bytes(), b"resolution")
+            self.assertEqual((root / "resolved-one.json").stat().st_mode & 0o777, 0o600)
+            self.assertFalse(list(root.glob("terminal-*")))
+            gate = service.AdmissionGate(root, end)
+            try:
+                gate.claim("two", b"next", end)
+            finally:
+                gate.close()
+
+    def test_resolution_refuses_any_other_blocker_bytes(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            tempfile.TemporaryDirectory() as elsewhere,
+        ):
+            root = Path(directory)
+            record, end = self.retained_claim(root)
+            value = json.loads(record)
+            other, _ = self.retained_claim(Path(elsewhere), "two")
+            bad = {
+                "reordered": (
+                    json.dumps(dict(reversed(value.items()))) + "\n"
+                ).encode(),
+                "compact": (
+                    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode(),
+                "extra-key": (
+                    json.dumps(dict(value, extra=1), sort_keys=True) + "\n"
+                ).encode(),
+                "wrong-sha": record.replace(value["intent_sha256"].encode(), b"0" * 64),
+                "no-newline": record[:-1],
+                "other-run": other,
+                "not-json": b"blocker",
+                "not-bytes": record.decode(),
+            }
+            gate = service.AdmissionGate(root, end)
+            try:
+                _, identity = gate.read_blocker(end)
+                for label, blocker in bad.items():
+                    with self.subTest(label), self.assertRaises(ValueError):
+                        gate.resolve_failed(blocker, identity, b"resolution", end)
+                    self.assert_unresolved(root, record)
+            finally:
+                gate.close()
+
+    def test_resolution_refuses_a_replaced_linked_or_special_blocker(self):
+        for change in ("copy", "link", "fifo", "symlink"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                record, end = self.retained_claim(root)
+                gate = service.AdmissionGate(root, end)
+                try:
+                    _, identity = gate.read_blocker(end)
+                    active = root / "active.json"
+                    if change == "copy":
+                        # Keep the old inode alive so the copy cannot reuse it.
+                        active.rename(root / "kept")
+                        active.write_bytes(record)
+                        active.chmod(0o600)
+                    elif change == "link":
+                        os.link(active, root / "second")
+                    else:
+                        (root / "kept").write_bytes(record)
+                        active.unlink()
+                        if change == "fifo":
+                            os.mkfifo(active, 0o600)
+                        else:
+                            active.symlink_to("kept")
+                    with self.subTest(change), self.assertRaises((ValueError, OSError)):
+                        gate.resolve_failed(record, identity, b"resolution", end)
+                    self.assertFalse(list(root.glob("resolved-*")))
+                    self.assertTrue(active.exists() or active.is_symlink())
+                finally:
+                    gate.close()
+
+    def test_resolution_clears_only_a_claim_this_gate_could_have_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record, end = self.retained_claim(root)
+            value = json.loads(record)
+            forged = (json.dumps(dict(value, extra=1), sort_keys=True) + "\n").encode()
+            (root / "active.json").write_bytes(forged)
+            gate = service.AdmissionGate(root, end)
+            try:
+                data, identity = gate.read_blocker(end)
+                self.assertEqual(data, forged)
+                with self.assertRaisesRegex(ValueError, "blocker format"):
+                    gate.resolve_failed(data, identity, b"resolution", end)
+            finally:
+                gate.close()
+            self.assert_unresolved(root, forged)
+
+    def test_blocker_swapped_after_the_evidence_write_is_never_unlinked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record, end = self.retained_claim(root)
+            gate = service.AdmissionGate(root, end)
+            write = gate.write
+
+            def write_then_swap(name, data, deadline):
+                write(name, data, deadline)
+                (root / "active.json").rename(root / "kept")
+                (root / "active.json").write_bytes(record)
+                (root / "active.json").chmod(0o600)
+
+            try:
+                _, identity = gate.read_blocker(end)
+                with (
+                    mock.patch.object(gate, "write", side_effect=write_then_swap),
+                    self.assertRaisesRegex(ValueError, "ownership"),
+                ):
+                    gate.resolve_failed(record, identity, b"resolution", end)
+            finally:
+                gate.close()
+            self.assertEqual((root / "active.json").read_bytes(), record)
+            self.assertTrue((root / "resolved-one.json").is_file())
+
+    def test_resolution_needs_an_idle_open_gate_and_no_prior_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record, end = self.retained_claim(root)
+            gate = service.AdmissionGate(root, end)
+            _, identity = gate.read_blocker(end)
+            gate.record = b"claimed"
+            with self.assertRaises(ValueError):
+                gate.resolve_failed(record, identity, b"resolution", end)
+            gate.record = None
+            gate.close()
+            with self.assertRaises(ValueError):
+                gate.resolve_failed(record, identity, b"resolution", end)
+            for name in ("terminal-one.json", "resolved-one.json"):
+                (root / name).write_bytes(b"earlier")
+                gate = service.AdmissionGate(root, end)
+                try:
+                    with self.subTest(name), self.assertRaises(FileExistsError):
+                        gate.resolve_failed(record, identity, b"resolution", end)
+                finally:
+                    gate.close()
+                self.assertEqual((root / "active.json").read_bytes(), record)
+                self.assertEqual((root / name).read_bytes(), b"earlier")
+                (root / name).unlink()
+
+    def test_failed_evidence_write_keeps_the_blocker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            end = time.monotonic_ns() + 2_000_000_000
+            gate = service.AdmissionGate(root, end)
+            try:
+                gate.claim("one", b"intent", end)
+                record = (root / "active.json").read_bytes()
+                with (
+                    mock.patch.object(gate, "write", side_effect=OSError("full")),
+                    self.assertRaises(OSError),
+                ):
+                    gate.complete(b"proof", end)
+                self.assertEqual((root / "active.json").read_bytes(), record)
+            finally:
+                gate.close()
+            gate = service.AdmissionGate(root, end)
+            try:
+                _, identity = gate.read_blocker(end)
+                with (
+                    mock.patch.object(gate, "write", side_effect=OSError("full")),
+                    self.assertRaises(OSError),
+                ):
+                    gate.resolve_failed(record, identity, b"resolution", end)
+                self.assertEqual((root / "active.json").read_bytes(), record)
             finally:
                 gate.close()
 

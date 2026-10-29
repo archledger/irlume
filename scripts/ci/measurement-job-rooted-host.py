@@ -3,6 +3,8 @@
 # Copyright the irlume contributors.
 """Concrete startup-only H ownership. No child or virtual machine is created."""
 
+import hashlib
+import json
 import os
 import re
 import select
@@ -10,6 +12,7 @@ import socket
 import stat
 import time
 import types
+from pathlib import Path
 from typing import NamedTuple
 
 
@@ -35,6 +38,31 @@ FAILURE_OBSERVATION = (
     "ControlGroup",
     "ExecMainStartTimestampMonotonic",
 )
+
+
+def admission_path(root, gate):
+    """Name-checked identity of the admission directory, its ancestors and lock."""
+    with root.closure.inputs.opened_parent(gate.root) as (parent, ancestors):
+        named = os.stat(gate.root.name, dir_fd=parent, follow_symlinks=False)
+        actual = os.fstat(gate.root_fd)
+        if (
+            (named.st_dev, named.st_ino) != (actual.st_dev, actual.st_ino)
+            or not stat.S_ISDIR(actual.st_mode)
+            or stat.S_IMODE(actual.st_mode) != 0o700
+            or actual.st_uid != os.getuid()
+        ):
+            raise ValueError("rooted admission path changed")
+    lock = os.fstat(gate.lock_fd)
+    named = os.stat("admission.lock", dir_fd=gate.root_fd, follow_symlinks=False)
+    if (
+        (named.st_dev, named.st_ino) != (lock.st_dev, lock.st_ino)
+        or not stat.S_ISREG(lock.st_mode)
+        or stat.S_IMODE(lock.st_mode) != 0o600
+        or lock.st_uid != os.getuid()
+        or lock.st_nlink != 1
+    ):
+        raise ValueError("rooted admission lock changed")
+    return ancestors, (actual.st_dev, actual.st_ino), (lock.st_dev, lock.st_ino)
 
 
 def boot_id():
@@ -232,31 +260,10 @@ class HostOwner:
 
     def check_gate(self, deadline):
         self.before(deadline)
-        inputs = self.root.closure.inputs
-        with inputs.opened_parent(self.gate.root) as (parent, ancestors):
-            named = os.stat(self.gate.root.name, dir_fd=parent, follow_symlinks=False)
-            actual = os.fstat(self.gate.root_fd)
-            if (
-                ancestors != self.gate_ancestors
-                or (named.st_dev, named.st_ino) != self.gate_identity
-                or (actual.st_dev, actual.st_ino) != self.gate_identity
-                or not stat.S_ISDIR(actual.st_mode)
-                or stat.S_IMODE(actual.st_mode) != 0o700
-                or actual.st_uid != os.getuid()
-            ):
-                raise ValueError("rooted admission path changed")
-        lock = os.fstat(self.gate.lock_fd)
-        named = os.stat(
-            "admission.lock", dir_fd=self.gate.root_fd, follow_symlinks=False
-        )
-        if (
-            (lock.st_dev, lock.st_ino) != self.lock_identity
-            or (named.st_dev, named.st_ino) != self.lock_identity
-            or not stat.S_ISREG(lock.st_mode)
-            or stat.S_IMODE(lock.st_mode) != 0o600
-            or lock.st_uid != os.getuid()
-            or lock.st_nlink != 1
-        ):
+        ancestors, gate, lock = admission_path(self.root, self.gate)
+        if ancestors != self.gate_ancestors or gate != self.gate_identity:
+            raise ValueError("rooted admission path changed")
+        if lock != self.lock_identity:
             raise ValueError("rooted admission lock changed")
         self.before(deadline)
 
@@ -273,12 +280,9 @@ class HostOwner:
             raise ValueError("rooted host already acquired")
         self.before(deadline)
         self.gate = self.gate_factory(deadline)
-        info = os.fstat(self.gate.root_fd)
-        self.gate_identity = info.st_dev, info.st_ino
-        lock = os.fstat(self.gate.lock_fd)
-        self.lock_identity = lock.st_dev, lock.st_ino
-        with self.root.closure.inputs.opened_parent(self.gate.root) as (_, ancestors):
-            self.gate_ancestors = ancestors
+        self.gate_ancestors, self.gate_identity, self.lock_identity = admission_path(
+            self.root, self.gate
+        )
         self.check_gate(deadline)
         try:
             os.stat("active.json", dir_fd=self.gate.root_fd, follow_symlinks=False)
@@ -843,6 +847,676 @@ class HostOwner:
             except CLEANUP_FAILURES as error:
                 errors.append(error)
         self.runtime.native.raise_errors("rooted host failure and cleanup", errors)
+
+
+RESOLVE_NS = 30_000_000_000
+RESOLUTION_SCOPE = "contained-job-rooted-failed-attempt-resolution-v1"
+PROC_LIMIT = 65536
+FD_LIMIT = 1 << 20
+HEX32 = "[0-9a-f]{32}"
+UNIT_PATH = r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]{1,255}"
+PROPERTIES = "org.freedesktop.DBus.Properties"
+# Files H or G can leave in an attempt directory, with their required type.
+ATTEMPT_ENTRIES = {
+    "control.sock": stat.S_ISSOCK,
+    "guardian-config.json": stat.S_ISREG,
+    "host-finished.json": stat.S_ISREG,
+    "host-intent.json": stat.S_ISREG,
+    "host-started.json": stat.S_ISREG,
+    "startup-witness.json": stat.S_ISREG,
+}
+FAILURE_V1 = frozenset(
+    (
+        "scope",
+        "run_id",
+        "reason",
+        "admission_state",
+        "creation_attempted",
+        "cleanup_errors",
+        "native_authorized",
+        "full_contract_proven",
+    )
+)
+FAILURE_V2 = FAILURE_V1 | {
+    "boot_id",
+    "created",
+    "creation_reply",
+    "invocation_id",
+    "invocation_source",
+    "observed",
+    "stop_attempted",
+    "stop_reply",
+    "stop_error",
+}
+SERVICE_FIELDS = (
+    "Id",
+    "InvocationID",
+    "Transient",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "MainPID",
+    "ExecMainPID",
+    "ControlGroup",
+    "ExecMainStartTimestampMonotonic",
+    "ExecMainExitTimestampMonotonic",
+    "ActiveEnterTimestampMonotonic",
+    "ExecStart",
+)
+
+
+class Resolution(NamedTuple):
+    record: bytes
+    sha256: str
+    committed: bool
+    admission_state: str
+
+
+class ReadOnlyBus:
+    """The manager reads a resolver needs; no method can start or stop a unit."""
+
+    METHODS = ("GetUnit", "GetAll", "GetUnitProcesses", "GetUnitByInvocationID")
+
+    def __init__(self, bus):
+        self._bus = bus
+
+    def call(self, path, interface, method, signature, args, deadline):
+        if method not in self.METHODS:
+            raise ValueError("resolver bus method")
+        return self._bus.call(path, interface, method, signature, args, deadline)
+
+    def normal(self, variant, kind):
+        return self._bus.normal(variant, kind)
+
+    def close(self):
+        self._bus.close()
+
+
+def read_owned(directory, name, limit, mode=None):
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        dir_fd=directory,
+    )
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or (mode is not None and stat.S_IMODE(info.st_mode) != mode)
+            or info.st_nlink != 1
+            or not 0 < info.st_size <= limit
+        ):
+            raise ValueError("resolver input file: " + name)
+        data = bytearray()
+        while len(data) < info.st_size:
+            part = os.read(fd, info.st_size - len(data))
+            if not part:
+                break
+            data.extend(part)
+        named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            len(data) != info.st_size
+            or os.read(fd, 1)
+            or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+        ):
+            raise ValueError("resolver input file changed: " + name)
+    finally:
+        os.close(fd)
+    return bytes(data), info
+
+
+def observe_failed_unit(bus, transport, unit, deadline):
+    path = bus.call(
+        transport.MANAGER_PATH, transport.MANAGER, "GetUnit", "s", (unit,), deadline
+    )
+    if type(path) is not str or re.fullmatch(UNIT_PATH, path) is None:
+        raise ValueError("resolver unit path")
+    raw, row = {}, {}
+    for name, kinds in (
+        ("Unit", transport.UNIT_TYPES),
+        ("Service", transport.PROPERTY_TYPES),
+    ):
+        values = bus.call(
+            path,
+            PROPERTIES,
+            "GetAll",
+            "s",
+            (transport.BUS_NAME + "." + name,),
+            deadline,
+        )
+        if type(values) is not dict or len(values) > 4096:
+            raise ValueError("resolver property dictionary")
+        raw[name] = values
+        for key, kind in kinds.items():
+            if key not in values:
+                raise ValueError("missing D-Bus property: " + key)
+            row[key] = bus.normal(values[key], kind)
+    row["InvocationID"] = bytes(row["InvocationID"]).hex()
+    row["ExecMainPID"] = bus.normal(raw["Service"].get("ExecMainPID"), "u")
+    job, refs = raw["Unit"].get("Job"), raw["Unit"].get("Refs")
+    if (
+        type(job) is not tuple
+        or len(job) != 2
+        or job[0] != "(uo)"
+        or type(job[1]) not in (tuple, list)
+        or list(job[1]) != [0, "/"]
+    ):
+        raise ValueError("resolver unit has a queued job")
+    if (
+        type(refs) is not tuple
+        or len(refs) != 2
+        or refs[0] != "as"
+        or type(refs[1]) not in (tuple, list)
+        or len(refs[1]) != 0
+    ):
+        raise ValueError("resolver unit is still referenced")
+    processes = bus.call(
+        transport.MANAGER_PATH,
+        transport.MANAGER,
+        "GetUnitProcesses",
+        "s",
+        (unit,),
+        deadline,
+    )
+    if type(processes) is not list or processes:
+        raise ValueError("resolver unit still has processes")
+    return row
+
+
+def check_failed_unit(row, unit, invocation, argv, value, main_pid):
+    expected = {
+        "Id": unit,
+        "Transient": True,
+        "InvocationID": invocation,
+        "ActiveState": "failed",
+        "SubState": "failed",
+        "MainPID": 0,
+        "ControlGroup": "",
+        "Restart": "no",
+        "ExecStartPre": (),
+        "ExecStartPost": (),
+        "ExecStop": (),
+        "ExecStopPost": (),
+        "ExecStart": ((argv[0], argv, False),),
+    }
+    for key, want in expected.items():
+        if type(row[key]) is not type(want) or row[key] != want:
+            raise ValueError("resolver unit state: " + key)
+    start = row["ExecMainStartTimestampMonotonic"]
+    end = row["ExecMainExitTimestampMonotonic"]
+    if not value["origin_ns"] <= start * 1000 <= value["startup_deadline_ns"]:
+        raise ValueError("resolver unit start window")
+    if not end >= start > 0:
+        raise ValueError("resolver unit exit order")
+    if row["ExecMainPID"] <= 1 or main_pid not in (None, row["ExecMainPID"]):
+        raise ValueError("resolver unit main process")
+
+
+def bind_invocation(bus, transport, unit, invocation, deadline):
+    path = bus.call(
+        transport.MANAGER_PATH,
+        transport.MANAGER,
+        "GetUnitByInvocationID",
+        "ay",
+        (bytes.fromhex(invocation),),
+        deadline,
+    )
+    if type(path) is not str or re.fullmatch(UNIT_PATH, path) is None:
+        raise ValueError("resolver invocation path")
+    values = bus.call(
+        path, PROPERTIES, "GetAll", "s", (transport.BUS_NAME + ".Unit",), deadline
+    )
+    if (
+        type(values) is not dict
+        or bus.normal(values.get("Id"), "s") != unit
+        or bytes(bus.normal(values.get("InvocationID"), "ay")).hex() != invocation
+    ):
+        raise ValueError("resolver invocation binding")
+    return path
+
+
+def unit_cgroups(unit, uid, base="/sys/fs/cgroup"):
+    """Directories named after the unit below the user manager, depth-limited."""
+    root = Path(base) / f"user.slice/user-{uid}.slice/user@{uid}.service"
+    if not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode):
+        raise ValueError("resolver user manager cgroup")
+    found, seen, frontier = [], 0, [(root, 0)]
+    while frontier:
+        path, depth = frontier.pop()
+        try:
+            entries = list(os.scandir(path))
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            seen += 1
+            if seen > PROC_LIMIT:
+                raise ValueError("resolver cgroup scan cap")
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if entry.name == unit:
+                found.append(str(Path(entry.path).relative_to(root)))
+            elif depth < 3:
+                frontier.append((Path(entry.path), depth + 1))
+    return sorted(found)
+
+
+def own_namespaces(names):
+    return {name: os.stat(f"/proc/self/ns/{name}").st_ino for name in names}
+
+
+def scan_processes(targets, unit, before_tick, *, proc="/proc", pids=None):
+    """Find any process that may belong to the attempt; fails closed.
+
+    A same-user process whose files cannot be inspected is accepted only when
+    its /proc start tick is earlier than before_tick, the attempt owner's own
+    start tick on the same clock: the guardian and every descendant started
+    later. A process whose real or effective uid differs (a setuid helper) is
+    foreign: under NoNewPrivileges no guardian descendant can become one.
+    """
+    uid, own = os.getuid(), os.getpid()
+    if pids is None:
+        pids = [int(name) for name in os.listdir(proc) if name.isdigit()]
+    if len(pids) > PROC_LIMIT:
+        raise ValueError("resolver process scan cap")
+    summary = {"processes": 0, "same_uid": 0, "unreadable_before_owner": 0}
+    matches, descriptors = [], 0
+    for pid in sorted(pids):
+        if pid == own:
+            continue
+        base = f"{proc}/{pid}"
+        try:
+            with open(base + "/stat", "rb") as file:
+                row = file.read(4097)
+            with open(base + "/status", "rb") as file:
+                status = file.read(65536)
+            with open(base + "/cgroup", "rb") as file:
+                cgroup = file.read(65536)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        summary["processes"] += 1
+        fields = row.rpartition(b") ")[2].split()
+        uids = [
+            line.split()[1:3] for line in status.splitlines() if line[:4] == b"Uid:"
+        ]
+        if len(row) > 4096 or len(fields) < 20 or len(uids) != 1:
+            raise ValueError("resolver process identity")
+        if any(
+            unit.encode() in line.split(b":", 2)[-1].split(b"/")
+            for line in cgroup.splitlines()
+        ):
+            matches.append({"pid": pid, "via": ["cgroup"]})
+            continue
+        if uids[0] != [str(uid).encode()] * 2:
+            continue
+        summary["same_uid"] += 1
+        hits = set()
+        try:
+            for name in ("exe", "cwd", "root"):
+                try:
+                    info = os.stat(f"{base}/{name}")
+                except FileNotFoundError:
+                    continue
+                if (info.st_dev, info.st_ino) in targets:
+                    hits.add(name)
+            try:
+                entries = os.listdir(base + "/fd")
+            except FileNotFoundError:
+                entries = []
+            descriptors += len(entries)
+            if descriptors > FD_LIMIT:
+                raise ValueError("resolver descriptor scan cap")
+            for entry in entries:
+                try:
+                    info = os.stat(f"{base}/fd/{entry}")
+                except FileNotFoundError:
+                    continue
+                if (info.st_dev, info.st_ino) in targets:
+                    hits.add("fd")
+        except PermissionError:
+            if hits:
+                matches.append({"pid": pid, "via": sorted(hits) + ["unreadable"]})
+            elif int(fields[19]) >= before_tick:
+                matches.append({"pid": pid, "via": ["unreadable-after-owner"]})
+            else:
+                summary["unreadable_before_owner"] += 1
+            continue
+        if hits:
+            matches.append({"pid": pid, "via": sorted(hits)})
+    summary["matches"] = matches
+    return summary
+
+
+def resolve_failed_startup(
+    run_id,
+    runtime,
+    *,
+    invocation_id=None,
+    commit=False,
+    gate_factory=None,
+    bus_factory=None,
+    process_start=None,
+    process_scan=None,
+    cgroup_scan=None,
+    namespaces=None,
+    now=time.monotonic_ns,
+):
+    """Clear the admission blocker of a failed startup attempt whose H has exited.
+
+    Everything is read-only until the final non-accepting resolved-<run>.json
+    write and blocker unlink; with commit=False nothing is written. A v1 failure
+    record needs the caller's invocation evidence, which the manager must bind.
+    """
+    transport = runtime.native.service
+    deadline = now() + RESOLVE_NS
+    uid = os.getuid()
+    if UNRESOLVED or uid == 0 or os.geteuid() != uid:
+        raise ValueError("resolver needs an unprivileged, unowned process")
+    if (
+        type(run_id) is not str
+        or re.fullmatch("[a-z0-9][a-z0-9-]{0,63}", run_id) is None
+    ):
+        raise ValueError("resolver run ID")
+    if invocation_id is not None and (
+        type(invocation_id) is not str
+        or re.fullmatch(HEX32, invocation_id) is None
+        or invocation_id == "0" * 32
+    ):
+        raise ValueError("resolver invocation ID")
+    gate = (gate_factory or transport.AdmissionGate.for_current_user)(deadline)
+    owned, errors, result = {"bus": None}, [], None
+    try:
+        result = _resolve(
+            run_id,
+            runtime,
+            gate,
+            owned,
+            invocation_id,
+            commit,
+            deadline,
+            bus_factory or transport.SystemdBus,
+            process_start or runtime.native.process_start,
+            process_scan or scan_processes,
+            cgroup_scan or unit_cgroups,
+            namespaces or own_namespaces,
+            now,
+        )
+    except CLEANUP_FAILURES as error:
+        errors.append(error)
+    for close in (owned["bus"], gate):
+        if close is not None:
+            try:
+                close.close()
+            except CLEANUP_FAILURES as error:
+                errors.append(error)
+    runtime.native.raise_errors("rooted failed-attempt resolution", errors)
+    return result
+
+
+def _resolve(
+    run_id,
+    runtime,
+    gate,
+    owned,
+    invocation_id,
+    commit,
+    deadline,
+    bus_factory,
+    process_start,
+    process_scan,
+    cgroup_scan,
+    namespaces,
+    now,
+):
+    root = runtime.preflight.root
+    transport = runtime.native.service
+    uid = os.getuid()
+
+    def check():
+        if now() >= deadline:
+            raise TimeoutError("resolver deadline")
+
+    gate_path = admission_path(root, gate)
+    blocker, blocker_identity = gate.read_blocker(deadline)
+    try:
+        claim = json.loads(blocker)
+        intent = bytes.fromhex(claim["intent_hex"])
+        exact = gate.encode_claim(claim["run_id"], intent) == blocker
+    except (TypeError, ValueError, KeyError) as error:
+        raise ValueError("resolver blocker format") from error
+    if not exact or claim["run_id"] != run_id:
+        raise ValueError("resolver blocker format")
+    for prefix in ("terminal-", "resolved-"):
+        try:
+            os.stat(
+                prefix + run_id + ".json", dir_fd=gate.root_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            continue
+        raise FileExistsError("resolver outcome already recorded")
+
+    failure_name = "failed-" + run_id + ".json"
+    failure_data, failure_info = read_owned(gate.root_fd, failure_name, 65536, 0o600)
+    failure = root.runtime._json(failure_data)
+    keys = {
+        "contained-job-rooted-host-failure-v1": FAILURE_V1,
+        "contained-job-rooted-host-failure-v2": FAILURE_V2,
+    }.get(failure.get("scope") if type(failure) is dict else None)
+    if (
+        keys is None
+        or root.closure.canonical(failure) != failure_data
+        or set(failure) != keys
+        or failure["run_id"] != run_id
+        or failure["admission_state"] != "present"
+        or failure["creation_attempted"] is not True
+        or failure["native_authorized"] is not False
+        or failure["full_contract_proven"] is not False
+    ):
+        raise ValueError("resolver failure record shape")
+    main_pid = None
+    if keys is FAILURE_V2:
+        # Uncertain creation (created false) is never resolved here.
+        if (
+            invocation_id is not None
+            or failure["created"] is not True
+            or type(failure["invocation_id"]) is not str
+            or re.fullmatch(HEX32, failure["invocation_id"]) is None
+            or failure["invocation_id"] == "0" * 32
+            or failure["boot_id"] != boot_id()
+        ):
+            raise ValueError("resolver v2 failure record")
+        invocation, source = failure["invocation_id"], "failure-record"
+        observed = failure["observed"]
+        # MainPID 0 means no main process at that moment, not a pid claim.
+        if type(observed) is dict and type(observed.get("MainPID")) is int:
+            main_pid = observed["MainPID"] if observed["MainPID"] > 1 else None
+    elif invocation_id is None:
+        raise ValueError("resolver needs caller invocation evidence for a v1 record")
+    else:
+        invocation, source = invocation_id, "caller-evidence"
+
+    attempt_name = "attempt-" + run_id
+    attempt_path = str(gate.root / attempt_name)
+    targets = {
+        gate_path[1]: "admission-directory",
+        gate_path[2]: "admission.lock",
+        blocker_identity: "active.json",
+        (failure_info.st_dev, failure_info.st_ino): failure_name,
+    }
+    entries = []
+    directory = os.open(
+        attempt_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=gate.root_fd,
+    )
+    try:
+        attempt = os.fstat(directory)
+        if attempt.st_uid != uid or stat.S_IMODE(attempt.st_mode) != 0o700:
+            raise ValueError("resolver attempt directory")
+        targets[(attempt.st_dev, attempt.st_ino)] = attempt_name
+        for name in sorted(os.listdir(directory)):
+            check()
+            kind = ATTEMPT_ENTRIES.get(name)
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if (
+                kind is None
+                or not kind(info.st_mode)
+                or info.st_uid != uid
+                or info.st_mode & 0o077
+                or info.st_nlink != 1
+            ):
+                raise ValueError("resolver attempt entry: " + name)
+            digest = None
+            if stat.S_ISREG(info.st_mode):
+                data, _ = read_owned(directory, name, 1 << 20)
+                digest = hashlib.sha256(data).hexdigest()
+            kind = "file" if digest is not None else "socket"
+            entries.append([name, kind, info.st_size, digest])
+            targets[(info.st_dev, info.st_ino)] = attempt_name + "/" + name
+        intent_data, _ = read_owned(directory, "host-intent.json", 65536, 0o400)
+        config_data, _ = read_owned(
+            directory, "guardian-config.json", runtime.protocol.CONFIG_LIMIT, 0o400
+        )
+    finally:
+        os.close(directory)
+
+    plan_intent = root.runtime._json(intent_data)
+    if (
+        intent_data != intent
+        or root.closure.canonical(plan_intent) != intent
+        or set(plan_intent)
+        != {"scope", "config_sha256", "run_id", "unit", "path", "client"}
+        or plan_intent["scope"] != "contained-job-rooted-host-intent-v1"
+        or plan_intent["run_id"] != run_id
+        or plan_intent["path"] != attempt_path
+    ):
+        raise ValueError("resolver intent binding")
+    value = runtime.protocol.decode_header(
+        config_data,
+        plan_intent["config_sha256"],
+        runtime.protocol.Dependencies(root, runtime.artifact),
+    )
+    plan = value["root_plan"]
+    selection = value["host_spec"]
+    spec = root.guardian.Specification(
+        **dict(
+            selection, cpus=tuple(selection["cpus"]), cases=tuple(selection["cases"])
+        )
+    )
+    unit = root.guardian.unit_name(spec)
+    if (
+        plan["attempt"]
+        != {"path": attempt_path, "device": attempt.st_dev, "inode": attempt.st_ino}
+        or value["client"] != plan_intent["client"]
+        or unit != plan_intent["unit"]
+        or spec.run_id != run_id
+    ):
+        raise ValueError("resolver configuration binding")
+    argv = root.entry_argv(plan, plan_intent["config_sha256"])
+    # /proc and pid checks prove nothing from another namespace than H's.
+    if namespaces(tuple(plan["host_namespaces"])) != plan["host_namespaces"]:
+        raise ValueError("resolver must run in the attempt owner's namespaces")
+    targets[(plan["root"]["device"], plan["root"]["inode"])] = "native-root"
+    try:
+        launcher = os.stat(
+            plan["root"]["path"] + plan["launcher"]["path"], follow_symlinks=False
+        )
+    except FileNotFoundError:
+        pass
+    else:
+        targets[(launcher.st_dev, launcher.st_ino)] = "launcher"
+
+    client = value["client"]
+    try:
+        start = process_start(client["pid"])
+    except (FileNotFoundError, ProcessLookupError):
+        client_state = "absent"
+    else:
+        if type(start) is not int or start == client["starttime"]:
+            raise ValueError("resolver attempt owner is alive")
+        client_state = "reused"
+    check()
+
+    owned["bus"] = bus = ReadOnlyBus(bus_factory(uid, deadline=deadline))
+    row = observe_failed_unit(bus, transport, unit, deadline)
+    check_failed_unit(row, unit, invocation, argv, value, main_pid)
+    manager_path = bind_invocation(bus, transport, unit, invocation, deadline)
+    if cgroup_scan(unit, uid):
+        raise ValueError("resolver unit cgroup remains")
+    check()
+    scan = process_scan(targets, unit, client["starttime"])
+    if scan["matches"]:
+        raise ValueError("resolver found attempt processes")
+    check()
+
+    if observe_failed_unit(bus, transport, unit, deadline) != row:
+        raise ValueError("resolver unit changed during resolution")
+    if admission_path(root, gate) != gate_path:
+        raise ValueError("resolver admission path changed")
+    again, identity = gate.read_blocker(deadline, len(blocker))
+    if again != blocker or identity != blocker_identity:
+        raise ValueError("resolver blocker changed")
+    check()
+    record = root.closure.canonical(
+        {
+            "scope": RESOLUTION_SCOPE,
+            "run_id": run_id,
+            "outcome": "failed-attempt-resolved",
+            "accepted": False,
+            "startup_complete": False,
+            "native_authorized": False,
+            "full_contract_proven": False,
+            "blocker": {
+                "sha256": hashlib.sha256(blocker).hexdigest(),
+                "size": len(blocker),
+                "device": blocker_identity[0],
+                "inode": blocker_identity[1],
+                "hex": blocker.hex(),
+            },
+            "intent_sha256": claim["intent_sha256"],
+            "config_sha256": plan_intent["config_sha256"],
+            "attempt": {
+                "path": attempt_path,
+                "device": attempt.st_dev,
+                "inode": attempt.st_ino,
+                "entries": entries,
+            },
+            "failure_record": {
+                "name": failure_name,
+                "sha256": hashlib.sha256(failure_data).hexdigest(),
+                "scope": failure["scope"],
+                "reason": failure["reason"],
+            },
+            "invocation": {
+                "id": invocation,
+                "source": source,
+                "manager_path": manager_path,
+            },
+            "client": {
+                "pid": client["pid"],
+                "starttime": client["starttime"],
+                "state": client_state,
+            },
+            "service": {key: row[key] for key in SERVICE_FIELDS},
+            "service_processes": [],
+            "cgroups": [],
+            "host_scan": scan,
+            "observed_monotonic_ns": now(),
+            "boot_id": boot_id(),
+        }
+    )
+    digest = hashlib.sha256(record).hexdigest()
+    if not commit:
+        return Resolution(record, digest, False, "present")
+    gate.resolve_failed(blocker, blocker_identity, record, deadline)
+    try:
+        os.stat("active.json", dir_fd=gate.root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return Resolution(record, digest, True, "absent")
+    raise ValueError("resolver blocker still present after commit")
 
 
 def run_startup(selection, support, **factories):

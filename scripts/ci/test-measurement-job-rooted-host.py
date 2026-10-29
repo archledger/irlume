@@ -3,10 +3,14 @@
 # Copyright the irlume contributors.
 """Concrete H tests with fake manager/peer endpoints; no service or VM."""
 
+import copy
 import hashlib
 import importlib.util
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import time
 import types
 import unittest
@@ -118,6 +122,157 @@ class LeaseBusTests(unittest.TestCase):
             with self.subTest(wrong=wrong), self.assertRaises(ValueError):
                 adapter.pin_cleanup(10_000_000_000)
             self.assertIsNone(adapter.cleanup_binding)
+
+
+def stat_is_file(info):
+    return (info.st_mode & 0o170000) == 0o100000
+
+
+class ProcessScanTests(unittest.TestCase):
+    UNIT = "irlume-job-guardian-run-01.service"
+
+    def child(self, *args, **kwargs):
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-c", *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            **kwargs,
+        )
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        self.assertEqual(process.stdout.readline(), b"ready\n")
+        return process
+
+    def test_real_processes_holding_or_inside_attempt_paths_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "host-intent.json"
+            path.write_bytes(b"intent")
+            info, folder = path.stat(), Path(directory).stat()
+            targets = {
+                (info.st_dev, info.st_ino): "file",
+                (folder.st_dev, folder.st_ino): "dir",
+            }
+            holder = self.child(
+                "import sys; f = open(sys.argv[1]); print('ready', flush=True); sys.stdin.read()",
+                str(path),
+                cwd="/",
+            )
+            inside = self.child(
+                "import sys; print('ready', flush=True); sys.stdin.read()",
+                cwd=directory,
+            )
+            idle = self.child(
+                "import sys; print('ready', flush=True); sys.stdin.read()", cwd="/"
+            )
+            scan = host.scan_processes(
+                targets,
+                self.UNIT,
+                0,
+                pids=[holder.pid, inside.pid, idle.pid, os.getpid()],
+            )
+            self.assertEqual(
+                scan["matches"],
+                sorted(
+                    [
+                        {"pid": holder.pid, "via": ["fd"]},
+                        {"pid": inside.pid, "via": ["cwd"]},
+                    ],
+                    key=lambda row: row["pid"],
+                ),
+            )
+            self.assertEqual((scan["processes"], scan["same_uid"]), (3, 3))
+
+    def fake_process(
+        self,
+        proc,
+        pid,
+        *,
+        uids,
+        start,
+        cgroup="0::/user.slice/x.scope",
+        locked=False,
+        links=None,
+    ):
+        base = proc / str(pid)
+        (base / "fd").mkdir(parents=True)
+        fields = ["S"] + ["0"] * 18 + [str(start)] + ["0"] * 5
+        (base / "stat").write_text(f"{pid} (fake) " + " ".join(fields) + "\n")
+        real, effective = uids
+        (base / "status").write_text(
+            f"Name:\tfake\nUid:\t{real}\t{effective}\t{effective}\t{effective}\n"
+        )
+        (base / "cgroup").write_text(cgroup + "\n")
+        for name, target in (links or {}).items():
+            (base / name).symlink_to(target)
+        if locked:
+            (base / "fd").chmod(0)
+
+    def test_cgroup_members_partial_hits_and_unreadable_later_processes_match(self):
+        uid = os.getuid()
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory) / "proc"
+            target = Path(directory) / "attempt"
+            target.mkdir()
+            (target / "launcher").write_bytes(b"x")
+            folder, member = target.stat(), (target / "launcher").stat()
+            targets = {
+                (folder.st_dev, folder.st_ino): "attempt",
+                (member.st_dev, member.st_ino): "launcher",
+            }
+            same, other = (uid, uid), (uid + 1, uid + 1)
+            unit = f"0::/app.slice/{self.UNIT}"
+            self.fake_process(proc, 11, uids=other, start=5, cgroup=unit)
+            self.fake_process(proc, 12, uids=same, start=499, locked=True)
+            self.fake_process(proc, 13, uids=same, start=500, locked=True)
+            self.fake_process(proc, 14, uids=other, start=900, locked=True)
+            self.fake_process(proc, 15, uids=(uid, 0), start=900, locked=True)
+            self.fake_process(
+                proc, 16, uids=same, start=10, locked=True, links={"cwd": target}
+            )
+            self.fake_process(proc, 17, uids=same, start=900, links={"root": target})
+            self.fake_process(
+                proc, 18, uids=same, start=900, links={"exe": target / "launcher"}
+            )
+            self.fake_process(proc, 19, uids=same, start=900)
+            try:
+                scan = host.scan_processes(targets, self.UNIT, 500, proc=str(proc))
+            finally:
+                for pid in (12, 13, 14, 15, 16):
+                    (proc / str(pid) / "fd").chmod(0o700)
+        self.assertEqual(
+            scan["matches"],
+            [
+                {"pid": 11, "via": ["cgroup"]},
+                {"pid": 13, "via": ["unreadable-after-owner"]},
+                {"pid": 16, "via": ["cwd", "unreadable"]},
+                {"pid": 17, "via": ["root"]},
+                {"pid": 18, "via": ["exe"]},
+            ],
+        )
+        self.assertEqual(scan["unreadable_before_owner"], 1)
+        self.assertEqual((scan["processes"], scan["same_uid"]), (9, 6))
+
+    def test_unit_cgroups_finds_only_unit_directories_below_the_user_manager(self):
+        uid = os.getuid()
+        unit = self.UNIT
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            with self.assertRaises(FileNotFoundError):
+                host.unit_cgroups(unit, uid, base=str(base))
+            manager = base / f"user.slice/user-{uid}.slice/user@{uid}.service"
+            (manager / "app.slice" / unit).mkdir(parents=True)
+            (manager / "a/b/c" / unit).mkdir(parents=True)
+            (manager / "a/b/c/d" / unit).mkdir(parents=True)
+            (manager / "app.slice" / (unit + ".x")).mkdir()
+            (manager / "session.slice").mkdir()
+            (manager / "session.slice" / unit).write_text("not a directory")
+            self.assertEqual(
+                host.unit_cgroups(unit, uid, base=str(base)),
+                [f"a/b/c/{unit}", f"app.slice/{unit}"],
+            )
+            self.assertEqual(
+                host.unit_cgroups("other.service", uid, base=str(base)), []
+            )
 
 
 class BootIdentityTests(unittest.TestCase):
@@ -808,6 +963,548 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(record["stop_error"], "TimeoutError")
         self.assertEqual(record["cleanup_errors"], ["TimeoutError"])
         self.assert_blocker_and_reference_retained(bus)
+
+    FOREIGN = "/org/freedesktop/systemd1/unit/foreign_2eservice"
+
+    def retained_failure(self):
+        """A refused attempt left as a dead H leaves it, with its unit now failed."""
+        bus, end = self.refused_service()
+        self.owner.abort(self.owner.config, None, "ValueError", end)
+        observed = self.failure_record()["observed"]
+        self.close_owned()
+        self.owner.inputs = self.owner.gate = None
+        host.UNRESOLVED.pop(self.spec.run_id)
+        start = bus.service["ExecMainStartTimestampMonotonic"][1]
+        bus.unit.update(
+            ActiveState=("s", "failed"),
+            SubState=("s", "failed"),
+            Job=("(uo)", (0, "/")),
+            Refs=("as", []),
+        )
+        bus.after = dict(bus.unit)
+        bus.service.update(
+            MainPID=("u", 0),
+            ControlGroup=("s", ""),
+            ExecMainExitTimestampMonotonic=("t", start + 50),
+            Result=("s", "signal"),
+            ExecMainCode=("i", 2),
+            ExecMainStatus=("i", 9),
+            ExecMainPID=("u", observed["MainPID"]),
+        )
+        bus.leftover, bus.by_invocation, bus.get_unit = [], self.FOREIGN, None
+        self.scanned, self.cgroups = [], []
+        call = bus.call
+
+        def manager(path, interface, method, signature, args, deadline):
+            if method in ("GetUnitProcesses", "GetUnitByInvocationID"):
+                bus.calls.append((path, interface, method, signature, args, deadline))
+                answer = (
+                    bus.leftover if method == "GetUnitProcesses" else bus.by_invocation
+                )
+                if isinstance(answer, BaseException):
+                    raise answer
+                return copy.deepcopy(answer)
+            if method == "GetUnit" and bus.get_unit is not None:
+                raise bus.get_unit
+            if method == "GetAll" and path == self.FOREIGN:
+                bus.calls.append((path, interface, method, signature, args, deadline))
+                return copy.deepcopy(
+                    bus.foreign if hasattr(bus, "foreign") else bus.after
+                )
+            return call(path, interface, method, signature, args, deadline)
+
+        bus.call = manager
+        return bus, len(bus.calls)
+
+    def resolve(self, bus, **options):
+        defaults = {
+            "gate_factory": lambda deadline: native.service.AdmissionGate(
+                self.gate_path, deadline
+            ),
+            "bus_factory": lambda uid, deadline: bus,
+            "process_start": mock.Mock(side_effect=FileNotFoundError("exited")),
+            "process_scan": lambda targets, unit, before: (
+                self.scanned.append((dict(targets), unit, before))
+                or {
+                    "processes": 1,
+                    "same_uid": 1,
+                    "unreadable_before_owner": 0,
+                    "matches": [],
+                }
+            ),
+            "cgroup_scan": lambda unit, uid: self.cgroups.append((unit, uid)) or [],
+            "namespaces": lambda names: dict(
+                self.owner.value["root_plan"]["host_namespaces"]
+            ),
+        }
+        defaults.update(options)
+        return host.resolve_failed_startup(self.spec.run_id, self.runtime, **defaults)
+
+    def gate_state(self):
+        rows = {}
+        for path in sorted(self.gate_path.rglob("*")):
+            info = path.lstat()
+            data = path.read_bytes() if stat_is_file(info) else b""
+            rows[str(path.relative_to(self.gate_path))] = (
+                info.st_ino,
+                info.st_mode,
+                hashlib.sha256(data).hexdigest(),
+            )
+        return rows
+
+    def assert_refused(self, bus, pattern, errors=(ValueError,), **options):
+        before = self.gate_state()
+        with self.assertRaisesRegex(errors, pattern):
+            self.resolve(bus, commit=True, **options)
+        self.assertEqual(self.gate_state(), before)
+
+    def test_resolver_clears_a_proven_failed_attempt_with_non_accepting_evidence(self):
+        bus, mark = self.retained_failure()
+        blocker = (self.gate_path / "active.json").read_bytes()
+        before = self.gate_state()
+        dry = self.resolve(bus)
+        self.assertEqual((dry.committed, dry.admission_state), (False, "present"))
+        self.assertEqual(self.gate_state(), before)
+        result = self.resolve(bus, commit=True)
+        self.assertEqual((result.committed, result.admission_state), (True, "absent"))
+        after = self.gate_state()
+        name = f"resolved-{self.spec.run_id}.json"
+        self.assertEqual(set(before) - set(after), {"active.json"})
+        self.assertEqual(set(after) - set(before), {name})
+        self.assertTrue(all(after[key] == before[key] for key in after if key != name))
+        self.assertFalse(list(self.gate_path.glob("terminal-*")))
+        path = self.gate_path / name
+        self.assertEqual(path.read_bytes(), result.record)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(hashlib.sha256(result.record).hexdigest(), result.sha256)
+        record = json.loads(result.record)
+        self.assertEqual(self.root.closure.canonical(record), result.record)
+        self.assertEqual(hashlib.sha256(dry.record).hexdigest(), dry.sha256)
+        first = json.loads(dry.record)
+        first.pop("observed_monotonic_ns")
+        self.assertEqual(
+            first, {k: v for k, v in record.items() if k != "observed_monotonic_ns"}
+        )
+        run = self.spec.run_id
+        attempt = self.gate_path / f"attempt-{run}"
+        failure = self.gate_path / f"failed-{run}.json"
+        intent = (attempt / "host-intent.json").read_bytes()
+        identity = before["active.json"][0]
+        self.assertEqual(
+            record["blocker"],
+            {
+                "sha256": hashlib.sha256(blocker).hexdigest(),
+                "size": len(blocker),
+                "device": self.gate_path.stat().st_dev,
+                "inode": identity,
+                "hex": blocker.hex(),
+            },
+        )
+        self.assertEqual(
+            record["failure_record"]["sha256"],
+            hashlib.sha256(failure.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(record["intent_sha256"], hashlib.sha256(intent).hexdigest())
+        self.assertEqual(record["config_sha256"], self.owner.config.sha256)
+        self.assertEqual(
+            (record["attempt"]["device"], record["attempt"]["inode"]),
+            (attempt.stat().st_dev, attempt.stat().st_ino),
+        )
+        unit = self.owner.adapter.name
+        self.assertEqual(self.cgroups, [(unit, os.getuid())] * 2)
+        plan = self.owner.value["root_plan"]
+
+        def key(path):
+            info = path.lstat()
+            return info.st_dev, info.st_ino
+
+        expected = {
+            key(self.gate_path): "admission-directory",
+            key(self.gate_path / "admission.lock"): "admission.lock",
+            (self.gate_path.stat().st_dev, identity): "active.json",
+            key(failure): failure.name,
+            key(attempt): attempt.name,
+            (plan["root"]["device"], plan["root"]["inode"]): "native-root",
+            key(Path(plan["root"]["path"] + plan["launcher"]["path"])): "launcher",
+        }
+        for name in ("control.sock", "guardian-config.json", "host-intent.json"):
+            expected[key(attempt / name)] = f"{attempt.name}/{name}"
+        self.assertEqual(
+            self.scanned,
+            [(expected, unit, self.owner.value["client"]["starttime"])] * 2,
+        )
+        self.assertEqual(
+            {key: record[key] for key in ("scope", "run_id", "outcome")},
+            {
+                "scope": "contained-job-rooted-failed-attempt-resolution-v1",
+                "run_id": self.spec.run_id,
+                "outcome": "failed-attempt-resolved",
+            },
+        )
+        for flag in (
+            "accepted",
+            "startup_complete",
+            "native_authorized",
+            "full_contract_proven",
+        ):
+            self.assertIs(record[flag], False)
+        self.assertEqual(record["blocker"]["hex"], blocker.hex())
+        self.assertEqual(record["invocation"]["id"], "d" * 32)
+        self.assertEqual(record["invocation"]["source"], "failure-record")
+        self.assertEqual(record["invocation"]["manager_path"], self.FOREIGN)
+        self.assertEqual(record["client"]["state"], "absent")
+        self.assertEqual(
+            (record["service"]["ActiveState"], record["service"]["Result"]),
+            ("failed", "signal"),
+        )
+        self.assertEqual(
+            [entry[0] for entry in record["attempt"]["entries"]],
+            ["control.sock", "guardian-config.json", "host-intent.json"],
+        )
+        self.assertEqual(
+            record["failure_record"]["scope"], "contained-job-rooted-host-failure-v2"
+        )
+        methods = {call[2] for call in bus.calls[mark:]}
+        self.assertLessEqual(methods, set(host.ReadOnlyBus.METHODS))
+        self.assertIn("GetUnitByInvocationID", methods)
+        end = time.monotonic_ns() + 2_000_000_000
+        gate = native.service.AdmissionGate(self.gate_path, end)
+        try:
+            gate.claim("run-02", b"next", end)
+        finally:
+            gate.close()
+
+    def test_resolver_refuses_any_unit_not_proven_failed_and_released(self):
+        bus, _ = self.retained_failure()
+        value = self.owner.value
+        other = bus.variant("ay", tuple(bytes.fromhex("e" * 32)))
+        cases = {
+            "active": {
+                "unit": {"ActiveState": ("s", "active"), "SubState": ("s", "running")}
+            },
+            "inactive": {
+                "unit": {"ActiveState": ("s", "inactive"), "SubState": ("s", "dead")}
+            },
+            "other-invocation": {"unit": {"InvocationID": other}},
+            "not-transient": {"unit": {"Transient": ("b", False)}},
+            "other-id": {"unit": {"Id": ("s", "irlume-job-guardian-other.service")}},
+            "queued-job": {
+                "unit": {"Job": ("(uo)", (7, "/org/freedesktop/systemd1/job/7"))}
+            },
+            "referenced": {"unit": {"Refs": ("as", [":1.42"])}},
+            "main-pid": {"service": {"MainPID": ("u", 77)}},
+            "cgroup": {"service": {"ControlGroup": ("s", "/app.slice/x.service")}},
+            "restart": {"service": {"Restart": ("s", "on-failure")}},
+            "exec-start": {
+                "service": {
+                    "ExecStart": (
+                        "a(sasbttttuii)",
+                        [["/x", ["/x"], False, 0, 0, 0, 0, 0, 0, 0]],
+                    )
+                }
+            },
+            "early-start": {
+                "pattern": "start window",
+                "service": {
+                    "ExecMainStartTimestampMonotonic": (
+                        "t",
+                        value["origin_ns"] // 1000 - 1,
+                    )
+                },
+            },
+            "late-start": {
+                "pattern": "start window",
+                "service": {
+                    "ExecMainStartTimestampMonotonic": (
+                        "t",
+                        value["startup_deadline_ns"] // 1000 + 1,
+                    ),
+                    "ExecMainExitTimestampMonotonic": (
+                        "t",
+                        value["startup_deadline_ns"] // 1000 + 2,
+                    ),
+                },
+            },
+            "no-exit": {
+                "pattern": "exit order",
+                "service": {"ExecMainExitTimestampMonotonic": ("t", 0)},
+            },
+            "exec-main-pid": {"service": {"ExecMainPID": ("u", 77)}},
+            "processes": {"leftover": [["/app.slice/x", 77, "/x"]]},
+            "foreign-binding": {"foreign": dict(bus.after, Id=("s", "other.service"))},
+            "no-binding": {"by_invocation": RuntimeError("NoSuchUnit")},
+            "no-unit": {"get_unit": RuntimeError("NoSuchUnit")},
+        }
+        saved = copy.deepcopy((bus.unit, bus.service))
+        for label, change in cases.items():
+            bus.unit.update(change.get("unit", {}))
+            bus.after = dict(bus.unit)
+            bus.service.update(change.get("service", {}))
+            for key in ("leftover", "by_invocation", "get_unit", "foreign"):
+                if key in change:
+                    setattr(bus, key, change[key])
+            with self.subTest(label):
+                self.assert_refused(
+                    bus, change.get("pattern", ""), (ValueError, RuntimeError)
+                )
+            bus.unit, bus.service = copy.deepcopy(saved)
+            bus.after = dict(bus.unit)
+            bus.leftover, bus.by_invocation, bus.get_unit = [], self.FOREIGN, None
+            if hasattr(bus, "foreign"):
+                del bus.foreign
+        del bus.service["ExecMainPID"]
+        self.assert_refused(bus, "variant")
+        bus.service = copy.deepcopy(saved[1])
+        self.assertTrue(self.resolve(bus).sha256)
+
+    def test_resolver_refuses_changed_or_inconsistent_attempt_files(self):
+        bus, _ = self.retained_failure()
+        run = self.spec.run_id
+        gate, attempt = self.gate_path, self.gate_path / f"attempt-{run}"
+        failure = gate / f"failed-{run}.json"
+        original = failure.read_bytes()
+
+        def rewrite(path, data, mode):
+            path.chmod(0o600)
+            path.write_bytes(data)
+            path.chmod(mode)
+
+        def record(**changes):
+            value = dict(json.loads(original), **changes)
+            return lambda: rewrite(failure, self.root.closure.canonical(value), 0o600)
+
+        def edit(path, mode):
+            data = path.read_bytes()
+            return lambda: rewrite(path, data + b" ", mode), lambda: rewrite(
+                path, data, mode
+            )
+
+        def swap_attempt():
+            os.rename(attempt, gate / "kept")
+            attempt.mkdir(0o700)
+            for item in (gate / "kept").iterdir():
+                if item.is_file():
+                    (attempt / item.name).write_bytes(item.read_bytes())
+                    (attempt / item.name).chmod(0o400)
+
+        def unswap_attempt():
+            for item in attempt.iterdir():
+                item.unlink()
+            attempt.rmdir()
+            os.rename(gate / "kept", attempt)
+
+        restore_failure = lambda: rewrite(failure, original, 0o600)
+        cases = {
+            "intent": edit(attempt / "host-intent.json", 0o400),
+            "config": edit(attempt / "guardian-config.json", 0o400),
+            "intent-mode": (
+                lambda: (attempt / "host-intent.json").chmod(0o600),
+                lambda: (attempt / "host-intent.json").chmod(0o400),
+            ),
+            "unknown-entry": (
+                lambda: (
+                    (attempt / "extra").write_bytes(b"x"),
+                    (attempt / "extra").chmod(0o600),
+                ),
+                lambda: (attempt / "extra").unlink(),
+            ),
+            "replaced-attempt": (swap_attempt, unswap_attempt),
+            "failure-flag": (record(native_authorized=True), restore_failure),
+            "failure-uncertain": (record(created=False), restore_failure),
+            "failure-extra-key": (record(extra=1), restore_failure),
+            "failure-hardlink": (
+                lambda: os.link(failure, gate / "failure-link"),
+                lambda: (gate / "failure-link").unlink(),
+            ),
+            "failure-state": (record(admission_state="absent"), restore_failure),
+            "failure-run": (record(run_id="other"), restore_failure),
+            "failure-not-canonical": (
+                lambda: rewrite(failure, original + b"\n", 0o600),
+                restore_failure,
+            ),
+            "failure-other-boot": (
+                record(boot_id="0" * 8 + "-0000-0000-0000-" + "0" * 12),
+                restore_failure,
+            ),
+            "failure-missing": (
+                lambda: os.rename(failure, gate / "kept-failure"),
+                lambda: os.rename(gate / "kept-failure", failure),
+            ),
+            "failure-symlink": (
+                lambda: (
+                    os.rename(failure, gate / "kept-failure"),
+                    failure.symlink_to("kept-failure"),
+                ),
+                lambda: (failure.unlink(), os.rename(gate / "kept-failure", failure)),
+            ),
+            "terminal-exists": (
+                lambda: (gate / f"terminal-{run}.json").write_bytes(b"x"),
+                lambda: (gate / f"terminal-{run}.json").unlink(),
+            ),
+            "resolved-exists": (
+                lambda: (gate / f"resolved-{run}.json").write_bytes(b"x"),
+                lambda: (gate / f"resolved-{run}.json").unlink(),
+            ),
+        }
+        for label, (apply, undo) in cases.items():
+            apply()
+            with self.subTest(label):
+                self.assert_refused(bus, "", (ValueError, OSError))
+                before = self.gate_state()
+                with self.assertRaises((ValueError, OSError)):
+                    self.resolve(bus)
+                self.assertEqual(self.gate_state(), before)
+            undo()
+        self.assertTrue(self.resolve(bus).sha256)
+
+    def test_resolver_accepts_v2_records_whose_rows_saw_no_main_process(self):
+        bus, _ = self.retained_failure()
+        failure = self.gate_path / f"failed-{self.spec.run_id}.json"
+        value = json.loads(failure.read_bytes())
+        for source, observed in (
+            ("observation", dict(value["observed"], MainPID=0)),
+            ("cleanup", None),
+        ):
+            failure.write_bytes(
+                self.root.closure.canonical(
+                    dict(value, observed=observed, invocation_source=source)
+                )
+            )
+            with self.subTest(source):
+                self.assertTrue(self.resolve(bus).sha256)
+        failure.write_bytes(
+            self.root.closure.canonical(
+                dict(value, observed=dict(value["observed"], MainPID=77))
+            )
+        )
+        self.assert_refused(bus, "main process")
+
+    def test_resolver_runs_only_in_the_attempt_owners_namespaces(self):
+        bus, _ = self.retained_failure()
+        plan = self.owner.value["root_plan"]["host_namespaces"]
+        self.assert_refused(
+            bus,
+            "namespaces",
+            namespaces=lambda names: dict(plan, pid=plan["pid"] + 1),
+        )
+        self.assertEqual(
+            host.own_namespaces(("pid",)),
+            {"pid": os.stat("/proc/self/ns/pid").st_ino},
+        )
+
+    def test_resolver_refuses_while_any_ownership_is_unresolved(self):
+        bus, _ = self.retained_failure()
+        host.UNRESOLVED["other-run"] = object()
+        try:
+            self.assert_refused(bus, "unowned")
+        finally:
+            host.UNRESOLVED.pop("other-run")
+        self.assertTrue(self.resolve(bus).sha256)
+
+    def test_read_only_bus_refuses_every_state_changing_method(self):
+        bus = mock.Mock()
+        reader = host.ReadOnlyBus(bus)
+        for method in ("StartUnit", "StopUnit", "KillUnit", "ResetFailedUnit", "Unref"):
+            with self.subTest(method), self.assertRaisesRegex(ValueError, "bus method"):
+                reader.call("/org/freedesktop/systemd1", "x", method, "s", ("u",), 1)
+        bus.call.assert_not_called()
+        reader.call("/p", "i", "GetUnit", "s", ("u",), 1)
+        bus.call.assert_called_once_with("/p", "i", "GetUnit", "s", ("u",), 1)
+
+    def test_resolver_refuses_a_held_lock_or_a_live_attempt_owner(self):
+        bus, _ = self.retained_failure()
+        end = time.monotonic_ns() + 2_000_000_000
+        holder = native.service.AdmissionGate(self.gate_path, end)
+        try:
+            self.assert_refused(bus, "", (BlockingIOError,))
+        finally:
+            holder.close()
+        self.assert_refused(bus, "owner is alive", process_start=None)
+        self.assert_refused(
+            bus,
+            "process start",
+            process_start=mock.Mock(side_effect=ValueError("process start identity")),
+        )
+        starttime = self.owner.value["client"]["starttime"]
+        reused = self.resolve(bus, process_start=lambda pid: starttime + 1)
+        self.assertEqual(json.loads(reused.record)["client"]["state"], "reused")
+
+    def test_resolver_refuses_remaining_cgroups_processes_or_a_late_change(self):
+        bus, _ = self.retained_failure()
+        self.assert_refused(
+            bus, "cgroup", cgroup_scan=lambda unit, uid: ["app.slice/" + unit]
+        )
+        self.assert_refused(
+            bus,
+            "attempt processes",
+            process_scan=lambda targets, unit, before: {
+                "matches": [{"pid": 7, "via": ["fd"]}]
+            },
+        )
+
+        def changing(targets, unit, before):
+            bus.service["MainPID"] = ("u", 99)
+            return {"matches": []}
+
+        self.assert_refused(bus, "changed during resolution", process_scan=changing)
+
+    def test_resolver_binds_v1_records_only_to_manager_confirmed_caller_evidence(self):
+        bus, _ = self.retained_failure()
+        failure = self.gate_path / f"failed-{self.spec.run_id}.json"
+        value = json.loads(failure.read_bytes())
+        v1 = {key: value[key] for key in host.FAILURE_V1}
+        self.assert_refused(bus, "v2 failure record", invocation_id="d" * 32)
+        failure.write_bytes(
+            self.root.closure.canonical(
+                dict(v1, scope="contained-job-rooted-host-failure-v1")
+            )
+        )
+        self.assert_refused(bus, "caller invocation evidence")
+        self.assert_refused(bus, "InvocationID", invocation_id="e" * 32)
+        self.assert_refused(bus, "invocation ID", invocation_id="0" * 32)
+        result = self.resolve(bus, invocation_id="d" * 32)
+        self.assertEqual(
+            json.loads(result.record)["invocation"]["source"], "caller-evidence"
+        )
+
+    def test_resolver_keeps_the_blocker_when_persistence_fails(self):
+        bus, _ = self.retained_failure()
+        name = f"resolved-{self.spec.run_id}.json"
+        with mock.patch.object(
+            native.service.AdmissionGate, "write", side_effect=OSError("full")
+        ):
+            self.assert_refused(bus, "", (OSError,))
+        with (
+            mock.patch.object(native.service.os, "unlink", side_effect=OSError("busy")),
+            self.assertRaises(OSError),
+        ):
+            self.resolve(bus, commit=True)
+        self.assertTrue((self.gate_path / "active.json").is_file())
+        self.assertTrue((self.gate_path / name).is_file())
+        with self.assertRaises(FileExistsError):
+            self.resolve(bus, commit=True)
+
+    def test_resolver_deadline_keeps_the_blocker_at_every_check(self):
+        bus, _ = self.retained_failure()
+        calls = []
+
+        def counting():
+            calls.append(None)
+            return time.monotonic_ns()
+
+        self.resolve(bus, now=counting)
+        before = self.gate_state()
+        for jump in range(2, len(calls)):
+            seen = []
+
+            def late(jump=jump, seen=seen):
+                seen.append(None)
+                extra = host.RESOLVE_NS if len(seen) >= jump else 0
+                return time.monotonic_ns() + extra
+
+            with self.subTest(jump=jump), self.assertRaises(TimeoutError):
+                self.resolve(bus, commit=True, now=late)
+            self.assertEqual(self.gate_state(), before)
 
     def test_successful_gate_close_crossing_completion_deadline_refuses(self):
         _, record = self.terminal_owner()

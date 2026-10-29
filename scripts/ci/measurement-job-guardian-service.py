@@ -554,7 +554,9 @@ class AdmissionGate:
 
     complete receives H's already-verified, closed terminal evidence, never a
     wire flag. The H coordinator is responsible for its semantic verification.
-    A failed/unresolved attempt only closes the lock; its blocker stays on disk.
+    A failed/unresolved attempt only closes the lock; its blocker stays on disk
+    until resolve_failed clears it with separately proven, non-accepting
+    evidence.
     """
 
     def __init__(self, root, deadline):
@@ -666,9 +668,8 @@ class AdmissionGate:
         if errors:
             raise BaseExceptionGroup("admission persistence", errors)
 
-    def claim(self, run_id, intent, deadline):
-        if self.record is not None or self.lock_fd is None:
-            raise ValueError("admission already used or closed")
+    @staticmethod
+    def encode_claim(run_id, intent):
         if (
             type(run_id) is not str
             or re.fullmatch("[a-z0-9][a-z0-9-]{0,63}", run_id) is None
@@ -676,7 +677,7 @@ class AdmissionGate:
             raise ValueError("admission run ID")
         if type(intent) is not bytes or not 0 < len(intent) <= 65536:
             raise ValueError("admission intent cap")
-        record = (
+        return (
             json.dumps(
                 {
                     "run_id": run_id,
@@ -687,18 +688,18 @@ class AdmissionGate:
             )
             + "\n"
         ).encode()
+
+    def claim(self, run_id, intent, deadline):
+        if self.record is not None or self.lock_fd is None:
+            raise ValueError("admission already used or closed")
+        record = self.encode_claim(run_id, intent)
         self.write("active.json", record, deadline)
         self.record, self.run_id = record, run_id
 
-    def complete(self, terminal_evidence, deadline):
-        if self.record is None or self.lock_fd is None:
-            raise ValueError("no owned admission intent")
-        if (
-            type(terminal_evidence) is not bytes
-            or not 0 < len(terminal_evidence) <= 32 * 1024**2
-        ):
-            raise ValueError("terminal evidence cap")
-        self.write("terminal-" + self.run_id + ".json", terminal_evidence, deadline)
+    def read_blocker(self, deadline, limit=2 * 65536 + 256):
+        """Read active.json without trusting its type, owner, links or size."""
+        if self.lock_fd is None:
+            raise ValueError("admission closed")
         fd = os.open(
             "active.json",
             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
@@ -711,31 +712,82 @@ class AdmissionGate:
                 or info.st_uid != os.getuid()
                 or info.st_mode & 0o077
                 or info.st_nlink != 1
-                or info.st_size != len(self.record)
+                or not 0 < info.st_size <= limit
             ):
                 raise ValueError("active intent changed")
             data = bytearray()
-            while len(data) < len(self.record):
+            while len(data) < info.st_size:
                 self.check(deadline)
-                part = os.read(fd, len(self.record) - len(data))
+                part = os.read(fd, info.st_size - len(data))
                 if not part:
                     break
                 data.extend(part)
             named = os.stat("active.json", dir_fd=self.root_fd, follow_symlinks=False)
-            if bytes(data) != self.record or (named.st_dev, named.st_ino) != (
-                info.st_dev,
-                info.st_ino,
+            if (
+                len(data) != info.st_size
+                or os.read(fd, 1)
+                or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
             ):
                 raise ValueError("active intent ownership mismatch")
         finally:
             os.close(fd)
+        return bytes(data), (info.st_dev, info.st_ino)
+
+    def remove_blocker(self, record, deadline, identity=None):
+        data, actual = self.read_blocker(deadline, len(record))
+        if data != record or identity not in (None, actual):
+            raise ValueError("active intent ownership mismatch")
         self.check(deadline)
         os.unlink("active.json", dir_fd=self.root_fd)
-        # Only reached after durable terminal proof. A late sync failure may
-        # leave the old blocker after reboot; it cannot resurrect the domain.
+        # Only reached after durable evidence. A late sync failure may leave
+        # the old blocker after reboot; it cannot resurrect the domain.
         os.fsync(self.root_fd)
         self.check(deadline)
+
+    def complete(self, terminal_evidence, deadline):
+        if self.record is None or self.lock_fd is None:
+            raise ValueError("no owned admission intent")
+        if (
+            type(terminal_evidence) is not bytes
+            or not 0 < len(terminal_evidence) <= 32 * 1024**2
+        ):
+            raise ValueError("terminal evidence cap")
+        self.write("terminal-" + self.run_id + ".json", terminal_evidence, deadline)
+        self.remove_blocker(self.record, deadline)
         self.record = None
+
+    def resolve_failed(self, blocker, identity, resolution, deadline):
+        """Clear a dead owner's blocker after the caller proved its attempt over.
+
+        Writes non-accepting resolved-<run>.json, never terminal-<run>.json, and
+        unlinks only the exact claim bytes and file identity it was given.
+        """
+        if self.record is not None or self.lock_fd is None:
+            raise ValueError("admission resolution needs an idle gate")
+        try:
+            value = json.loads(blocker)
+            run_id, intent = value["run_id"], bytes.fromhex(value["intent_hex"])
+        except (TypeError, ValueError, KeyError) as error:
+            raise ValueError("admission blocker format") from error
+        if type(blocker) is not bytes or self.encode_claim(run_id, intent) != blocker:
+            raise ValueError("admission blocker format")
+        if type(resolution) is not bytes or not 0 < len(resolution) <= 65536:
+            raise ValueError("resolution evidence cap")
+        for prefix in ("terminal-", "resolved-"):
+            try:
+                os.stat(
+                    prefix + run_id + ".json",
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            raise FileExistsError("admission outcome already recorded")
+        data, actual = self.read_blocker(deadline, len(blocker))
+        if data != blocker or actual != identity:
+            raise ValueError("active intent ownership mismatch")
+        self.write("resolved-" + run_id + ".json", resolution, deadline)
+        self.remove_blocker(blocker, deadline, identity)
 
     def close(self):
         errors = []

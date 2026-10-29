@@ -217,7 +217,7 @@ def core_witness(plan, bus_identity, snapshot, deadline, now):
         ):
             raise ValueError("preflight volume and mount flags disagree")
     denied = {}
-    for path in (*root.DENIED, *root.KERNEL_DENIED):
+    for path in root.DENIAL_NODES:
         node = nodes[path]
         denied[path] = (
             None

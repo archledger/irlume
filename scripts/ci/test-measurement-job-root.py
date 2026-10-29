@@ -242,6 +242,9 @@ def selection():
 
 # The namespace root's parent lies outside the namespace: never a fixture ID.
 OUTSIDE = 1
+# The kernel views a typical host has (no smackfs), each under one cover.
+HOST_COVERS = tuple(p for p in root.KERNEL_HIDDEN if p != "/sys/fs/smackfs")
+COVER_DEVICE = "0:84"
 
 
 def mount_line(
@@ -253,9 +256,10 @@ def mount_line(
     parent=OUTSIDE,
     source_root="/",
     super_options="rw",
+    device=None,
 ):
     return (
-        f"{number} {parent} 0:{number} {source_root} {path} {options}"
+        f"{number} {parent} {device or f'0:{number}'} {source_root} {path} {options}"
         f" - {filesystem} source {super_options}\n"
     )
 
@@ -269,6 +273,20 @@ def add_mount(data, number, path, *args, **kwargs):
         if mounted != target and root.below(target, mounted) and len(mounted) >= depth:
             parent, depth = int(fields[0]), len(mounted)
     return data + mount_line(number, path, *args, parent=parent, **kwargs).encode()
+
+
+def add_cover(data, number, path, kind="dir", **kwargs):
+    """Append a systemd inaccessible cover in the user manager's runtime dir."""
+    return add_mount(
+        data,
+        number,
+        path,
+        "ro,nosuid,nodev,noexec,relatime",
+        "tmpfs",
+        source_root="/systemd/inaccessible/" + kind,
+        device=COVER_DEVICE,
+        **kwargs,
+    )
 
 
 def witness(plan):
@@ -302,6 +320,21 @@ def witness(plan):
             filesystem,
             **(proc if path == "/proc" else {}),
         )
+    # A user manager cannot mknod: the minimal nodes are rw,nosuid host binds.
+    for i, path in enumerate(root.DEVICE_BINDS):
+        mountinfo = add_mount(
+            mountinfo,
+            20 + i,
+            path,
+            "rw,nosuid",
+            "devtmpfs",
+            source_root=path[len("/dev") :],
+            device="0:7",
+        )
+    denied = dict.fromkeys(root.DENIAL_NODES)
+    for i, path in enumerate(HOST_COVERS):
+        mountinfo = add_cover(mountinfo, 30 + i, path)
+        denied[path] = {"device": 3, "inode": 600 + i, "mode": 0o40000}
     return {
         "root": {"device": 1, "inode": 10},
         "namespaces": {"pid": 201, "user": 202, "mnt": 203, "net": 204, "cgroup": 105},
@@ -309,7 +342,7 @@ def witness(plan):
         "gid_map": b"      1000       1000          1\n",
         "status": b"Name:\tpython3\nPid:\t1\nPPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nNStgid:\t1\nNSpid:\t1\nThreads:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n",
         "fds": (0, 1, 2),
-        "denied": dict.fromkeys((*root.DENIED, *root.KERNEL_DENIED)),
+        "denied": denied,
         "dev_log": None,
         "mountinfo": mountinfo,
         "tmpfs": {
@@ -892,8 +925,18 @@ class CoreTests(unittest.TestCase):
         self.assertNotEqual(second, row["mountinfo"])
         with self.assertRaisesRegex(ValueError, "rooted proc view"):
             root.check_core(plan, dict(row, mountinfo=second), 1000, 250)
-        for path in ("/proc/sys", "/proc/acpi"):
+        # Only the observed kernel denials are allowed paths below /proc at all.
+        for path in ("/proc/sys", "/proc/acpi", "/proc/1"):
             bad = dict(row, mountinfo=add_mount(row["mountinfo"], 60, path))
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(ValueError, "missing or unexpected rooted"),
+            ):
+                root.check_core(plan, bad, 1000, 250)
+        for path in root.KERNEL_DENIED:
+            bad = copy.deepcopy(row)
+            bad["denied"][path] = {"device": 3, "inode": 301, "mode": 0o100000}
+            bad["mountinfo"] = add_cover(bad["mountinfo"], 60, path, "reg")
             with (
                 self.subTest(path=path),
                 self.assertRaisesRegex(ValueError, "rooted proc view"),
@@ -1118,32 +1161,291 @@ class CoreTests(unittest.TestCase):
 
     def test_optional_denial_and_kernel_mounts_have_explicit_negative_controls(self):
         plan, _ = selection()
-        row = witness(plan)
+        row, plain = witness(plan), witness(plan)["mountinfo"]
         for i, path in enumerate(root.DENIED):
-            row["denied"][path] = {"device": 3, "inode": 300, "mode": 0o40000}
-            row["mountinfo"] = add_mount(row["mountinfo"], 40 + i, path)
+            kind, mode = ("reg", 0o100000) if path == "/dev/ptmx" else ("dir", 0o40000)
+            row["denied"][path] = {"device": 3, "inode": 300 + i, "mode": mode}
+            row["mountinfo"] = add_cover(row["mountinfo"], 40 + i, path, kind)
+            plain = add_mount(plain, 40 + i, path)
         self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        with self.assertRaisesRegex(ValueError, "not an inaccessible cover"):
+            root.check_core(plan, dict(row, mountinfo=plain), 1000, 250)
         for path in root.DENIED:
             bad = copy.deepcopy(row)
-            bad["denied"][path]["mode"] = 0o40755
+            bad["denied"][path]["mode"] |= 0o755
             with (
                 self.subTest(path=path),
                 self.assertRaisesRegex(ValueError, "readable or unsupported"),
             ):
                 root.check_core(plan, bad, 1000, 250)
-        # A subset=pid proc has no kernel files, so nothing may be mounted there.
-        for path in (*root.KERNEL_DENIED, *root.KERNEL_READONLY):
-            bad = copy.deepcopy(row)
-            if path in bad["denied"]:
-                bad["denied"][path] = {"device": 3, "inode": 301, "mode": 0o40000}
-            options = "ro,nosuid,nodev,noexec"
-            if path.startswith("/proc/"):
-                message = "rooted proc view"
-            else:
-                options, message = "rw,nosuid,nodev,noexec", "writable protected"
-            bad["mountinfo"] = add_mount(bad["mountinfo"], 60, path, options)
-            with self.subTest(path=path), self.assertRaisesRegex(ValueError, message):
+
+    def test_real_private_pid_table_is_accepted(self):
+        plan, _ = selection()
+        row = witness(plan)
+        view = root.parse_mountinfo(R5_PRIVATE_PIDS)
+        for i, path in enumerate(root.DENIAL_NODES):
+            mode = 0o100000 if path == "/dev/ptmx" else 0o40000
+            node = {"device": 3, "inode": 700 + i, "mode": mode}
+            row["denied"][path] = node if path in view else None
+        stage = root.OS_RELEASE_STAGE
+        row["run_entries"] += ("/run/host", "/run/host/os-release", stage)
+        row["run_entries"] += (stage + "/os-release",)
+        row["os_release"] = {
+            "link_target": ".os-release-stage/os-release",
+            "stage_mode": 0o40755,
+            "file_mode": 0o100644,
+        }
+        row["mountinfo"] = R5_PRIVATE_PIDS
+        self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        # The real table carries the legacy leaf, rw device binds and no /root.
+        self.assertIn("/sys/fs/cgroup/net_cls", view)
+        self.assertTrue(all("rw" in view[p].options for p in root.DEVICE_BINDS))
+        self.assertNotIn("/root", view)
+        for data, message in (
+            (R5_HOST_PROC, "stacked mount: /proc/sys/fs/binfmt_misc"),
+            (R5_PID_ONLY, "stacked mount: /proc/sys/fs/binfmt_misc"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
+
+    def test_kernel_views_are_single_covers_or_absent(self):
+        plan, _ = selection()
+        base = witness(plan)
+        for path in root.KERNEL_HIDDEN:
+            row = copy.deepcopy(base)
+            lines = row["mountinfo"].splitlines(keepends=True)
+            other = [x for x in lines if f" {path} ".encode() not in x]
+            absent = dict(row, mountinfo=b"".join(other))
+            absent["denied"] = dict(row["denied"], **{path: None})
+            self.assertIsNone(root.check_core(plan, absent, 1000, 250))
+            node = {"device": 3, "inode": 650, "mode": 0o40000}
+            covered = dict(absent, denied=dict(absent["denied"], **{path: node}))
+            covered["mountinfo"] = add_cover(absent["mountinfo"], 70, path)
+            self.assertIsNone(root.check_core(plan, covered, 1000, 250))
+            plain = add_mount(absent["mountinfo"], 70, path, "ro,nosuid,nodev,noexec")
+            sealed = "ro,nosuid,nodev,noexec"
+            cases = (
+                ("node without cover", dict(covered, mountinfo=absent["mountinfo"])),
+                ("cover without node", dict(covered, denied=absent["denied"])),
+                (
+                    "original top",
+                    dict(
+                        covered,
+                        mountinfo=add_mount(
+                            absent["mountinfo"], 70, path, sealed, "debugfs"
+                        ),
+                    ),
+                ),
+                ("other root", dict(covered, mountinfo=plain)),
+                (
+                    "reg cover",
+                    dict(
+                        covered,
+                        mountinfo=add_cover(absent["mountinfo"], 70, path, "reg"),
+                    ),
+                ),
+                (
+                    "writable",
+                    dict(
+                        covered,
+                        mountinfo=covered["mountinfo"].replace(
+                            f" {path} ro,".encode(), f" {path} rw,".encode()
+                        ),
+                    ),
+                ),
+                (
+                    "executable",
+                    dict(
+                        covered,
+                        mountinfo=covered["mountinfo"].replace(
+                            f" {path} ro,nosuid,nodev,noexec,".encode(),
+                            f" {path} ro,nosuid,nodev,".encode(),
+                        ),
+                    ),
+                ),
+                (
+                    "other device",
+                    dict(
+                        covered,
+                        mountinfo=add_mount(
+                            absent["mountinfo"],
+                            70,
+                            path,
+                            sealed,
+                            source_root="/systemd/inaccessible/dir",
+                            device="0:99",
+                        ),
+                    ),
+                ),
+                (
+                    "other prefix",
+                    dict(
+                        covered,
+                        mountinfo=add_mount(
+                            absent["mountinfo"],
+                            70,
+                            path,
+                            sealed,
+                            source_root="/x/systemd/inaccessible/dir",
+                            device=COVER_DEVICE,
+                        ),
+                    ),
+                ),
+                (
+                    "propagation",
+                    dict(
+                        covered,
+                        mountinfo=covered["mountinfo"].replace(
+                            f" {path} ro,nosuid,nodev,noexec,relatime -".encode(),
+                            f" {path} ro,nosuid,nodev,noexec,relatime master:3 -".encode(),
+                        ),
+                    ),
+                ),
+                (
+                    "stacked on its top",
+                    dict(
+                        covered,
+                        mountinfo=add_cover(
+                            add_mount(absent["mountinfo"], 69, path, sealed, "debugfs"),
+                            70,
+                            path,
+                        ),
+                    ),
+                ),
+            )
+            messages = {
+                "node without cover": "kernel cover and node disagree",
+                "cover without node": "denial target reported absent",
+                "writable": "writable protected rooted mount",
+                "other device": "inaccessible covers disagree",
+                "other prefix": "inaccessible covers disagree",
+                "propagation": "rooted mount is not private",
+                "stacked on its top": "stacked mount: " + path,
+            }
+            for label, bad in cases:
+                self.assertNotEqual(bad["mountinfo"], b"")
+                with (
+                    self.subTest(path=path, label=label),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        messages.get(label, "denial is not an inaccessible cover"),
+                    ),
+                ):
+                    root.check_core(plan, bad, 1000, 250)
+
+    def test_legacy_cgroup_leaf_is_one_named_read_only_hierarchy(self):
+        plan, _ = selection()
+        row = witness(plan)
+
+        def leaf(name, options="ro,relatime", filesystem="cgroup", **kwargs):
+            kwargs.setdefault("super_options", "rw," + name)
+            return add_mount(
+                row["mountinfo"],
+                80,
+                "/sys/fs/cgroup/" + name,
+                options,
+                filesystem,
+                **kwargs,
+            )
+
+        for name in ("net_cls", "net_cls,net_prio", "net_prio"):
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    root.check_core(plan, dict(row, mountinfo=leaf(name)), 1000, 250)
+                )
+        cases = (
+            ("rw", leaf("net_cls", "rw,relatime"), "writable protected"),
+            ("cgroup2", leaf("net_cls", filesystem="cgroup2"), "legacy cgroup hier"),
+            ("memory", leaf("memory"), "missing or unexpected rooted mount"),
+            ("named", leaf("name=systemd"), "missing or unexpected rooted mount"),
+            (
+                "two",
+                add_mount(
+                    leaf("net_cls"),
+                    81,
+                    "/sys/fs/cgroup/net_prio",
+                    "ro,relatime",
+                    "cgroup",
+                    super_options="rw,net_prio",
+                ),
+                "legacy cgroup hierarchy count",
+            ),
+            (
+                "child",
+                add_mount(leaf("net_cls"), 81, "/sys/fs/cgroup/net_cls/x"),
+                "missing or unexpected rooted mount",
+            ),
+            (
+                "controller",
+                leaf("net_cls,net_prio", super_options="rw,net_cls"),
+                "legacy cgroup hierarchy",
+            ),
+            ("root", leaf("net_cls", source_root="/x"), "legacy cgroup hierarchy"),
+            (
+                "propagation",
+                leaf("net_cls", "ro,relatime master:4"),
+                "rooted mount is not private",
+            ),
+        )
+        for label, data, message in cases:
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
+
+    def test_device_binds_are_nosuid_devtmpfs_leaves_on_one_device(self):
+        plan, _ = selection()
+        row = witness(plan)
+        lines = row["mountinfo"].splitlines(keepends=True)
+        null = next(x for x in lines if b" /dev/null " in x)
+        self.assertIn(b" /null /dev/null rw,nosuid - devtmpfs ", null)
+        cases = (
+            ("root", null.replace(b" /null /dev/null ", b" /zero /dev/null ")),
+            ("type", null.replace(b" - devtmpfs ", b" - tmpfs ")),
+            ("suid", null.replace(b" rw,nosuid ", b" rw ")),
+            ("device", null.replace(b" 0:7 ", b" 0:8 ")),
+            ("propagation", null.replace(b" rw,nosuid ", b" rw,nosuid shared:5 ")),
+        )
+        messages = {
+            "device": "device binds disagree",
+            "propagation": "rooted mount is not private",
+        }
+        for label, changed in cases:
+            self.assertNotEqual(changed, null)
+            bad = dict(row, mountinfo=row["mountinfo"].replace(null, changed))
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(
+                    ValueError, messages.get(label, "unexpected device bind")
+                ),
+            ):
                 root.check_core(plan, bad, 1000, 250)
+        # Absent binds stay optional; a read-only one is also accepted.
+        without = b"".join(x for x in lines if x != null)
+        readonly = row["mountinfo"].replace(null, null.replace(b" rw,", b" ro,"))
+        for data in (without, readonly):
+            self.assertIsNone(
+                root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
+            )
+
+    def test_root_home_window_is_refused(self):
+        plan, _ = selection()
+        row = witness(plan)
+        for options in ("rw,relatime", "ro,relatime"):
+            data = add_mount(
+                row["mountinfo"],
+                90,
+                "/root",
+                options,
+                "btrfs",
+                source_root="/private/runtime/root",
+            )
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "missing or unexpected rooted"),
+            ):
+                root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
 
 
 if __name__ == "__main__":

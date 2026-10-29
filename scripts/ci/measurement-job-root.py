@@ -41,24 +41,8 @@ DENIED = (
     "/run/credentials",
 )
 NAMESPACES = ("pid", "user", "mnt", "net", "cgroup")
+# Absent from a subset=pid proc; still observed as denial nodes.
 KERNEL_DENIED = ("/proc/kallsyms", "/proc/kcore")
-KERNEL_READONLY = tuple(
-    "/proc/" + name
-    for name in (
-        "acpi",
-        "apm",
-        "asound",
-        "bus",
-        "fs",
-        "irq",
-        "latency_stats",
-        "mtrr",
-        "scsi",
-        "sys",
-        "sysrq-trigger",
-        "timer_stats",
-    )
-) + ("/sys/kernel/debug", "/sys/kernel/tracing")
 # Covered with InaccessiblePaths=-+PATH. ProcSubset=pid leaves no /proc/sys, so
 # only sysfs views are listed.
 KERNEL_HIDDEN = (
@@ -71,6 +55,22 @@ KERNEL_HIDDEN = (
     "/sys/kernel/debug",
     "/sys/kernel/security",
     "/sys/kernel/tracing",
+)
+# Every path G observes as a denial: absent, or covered by an inaccessible node.
+DENIAL_NODES = (*DENIED, *KERNEL_DENIED, *KERNEL_HIDDEN)
+DEVICE_BINDS = tuple(
+    "/dev/" + name for name in ("null", "zero", "full", "random", "urandom", "tty")
+)
+# A host cgroup v1 hierarchy (a VPN's net_cls for split tunnelling) shows
+# through the read-only cgroup2 mount as one child mount.
+LEGACY_CGROUPS = (
+    "/sys/fs/cgroup/net_cls",
+    "/sys/fs/cgroup/net_cls,net_prio",
+    "/sys/fs/cgroup/net_prio",
+)
+# systemd's inaccessible nodes, in the manager's runtime directory.
+INACCESSIBLE = re.compile(
+    r"((?:/[^/]+)*)/systemd/inaccessible/(dir|reg|chr|blk|fifo|sock)"
 )
 ATTEMPT = "/run/irlume/attempt"
 OS_RELEASE_STAGE = "/run/host/.os-release-stage"
@@ -537,9 +537,14 @@ def parse_mountinfo(data):
 
 def check_mounts(plan, row):
     mounts = parse_mountinfo(row["mountinfo"])
-    for path in (*DENIED, *KERNEL_DENIED):
+    for path in DENIAL_NODES:
         if path in mounts and row["denied"][path] is None:
             raise ValueError("mounted denial target reported absent")
+    for path in KERNEL_HIDDEN:
+        # "-" skips only a missing path (systemd namespace.c, MOUNT_INACCESSIBLE),
+        # so every node G can see must carry a cover.
+        if (path in mounts) != (row["denied"][path] is not None):
+            raise ValueError("kernel cover and node disagree")
     ptmx = row["denied"]["/dev/ptmx"]
     if ptmx is not None and "blocked_by" in ptmx and "/dev/ptmx" in mounts:
         raise ValueError("mount at blocked ptmx symlink")
@@ -548,26 +553,16 @@ def check_mounts(plan, row):
         target for _, target, _, _ in root_properties(plan)["BindReadOnlyPaths"]
     )
     required = readonly | {"/proc", "/dev", "/run", "/tmp", ATTEMPT}
-    devices = {
-        "/dev/" + name for name in ("null", "zero", "full", "random", "urandom", "tty")
-    }
+    legacy = set(LEGACY_CGROUPS) & mounts.keys()
     allowed = (
-        required
-        | set(DENIED)
-        | set(KERNEL_DENIED)
-        | set(KERNEL_READONLY)
-        | devices
-        | {OS_RELEASE_STAGE}
+        required | set(DENIAL_NODES) | set(DEVICE_BINDS) | legacy | {OS_RELEASE_STAGE}
     )
     if not required <= mounts.keys() or not mounts.keys() <= allowed:
         raise ValueError("missing or unexpected rooted mount")
-    readonly |= (
-        set(DENIED)
-        | set(KERNEL_DENIED)
-        | set(KERNEL_READONLY)
-        | devices
-        | {OS_RELEASE_STAGE, "/dev"}
-    )
+    # Device binds stay writable: a user manager cannot mknod, so systemd binds
+    # the host nodes (namespace.c clone_device_node) and makes only /dev itself
+    # read-only, not its submounts (make_read_only).
+    readonly |= set(DENIAL_NODES) | legacy | {OS_RELEASE_STAGE, "/dev"}
     types = {
         "/proc": "proc",
         "/dev": "tmpfs",
@@ -603,6 +598,45 @@ def check_mounts(plan, row):
         or any(path != "/proc" and nested(path, "/proc") for path in mounts)
     ):
         raise ValueError("rooted proc view")
+    sealed = {"ro", "nosuid", "nodev", "noexec"}
+    covers = set()
+    for path in sorted(set(DENIAL_NODES) & mounts.keys()):
+        mount = mounts[path]
+        match = INACCESSIBLE.fullmatch(mount.root)
+        if (
+            mount.filesystem != "tmpfs"
+            or match is None
+            or not sealed <= mount.options
+            or path in KERNEL_HIDDEN
+            and match[2] != "dir"
+        ):
+            raise ValueError("denial is not an inaccessible cover")
+        covers.add((mount.device, match[1]))
+    if len(covers) > 1:
+        raise ValueError("inaccessible covers disagree")
+    binds = sorted(set(DEVICE_BINDS) & mounts.keys())
+    for path in binds:
+        mount = mounts[path]
+        if (
+            mount.filesystem != "devtmpfs"
+            or mount.root != path[len("/dev") :]
+            or mount.parent != mounts["/dev"].number
+            or "nosuid" not in mount.options
+        ):
+            raise ValueError("unexpected device bind")
+    if len({mounts[path].device for path in binds}) > 1:
+        raise ValueError("device binds disagree")
+    if len(legacy) > 1:
+        raise ValueError("legacy cgroup hierarchy count")
+    for path in legacy:
+        mount = mounts[path]
+        if (
+            mount.filesystem != "cgroup"
+            or mount.root != "/"
+            or mount.parent != mounts["/sys/fs/cgroup"].number
+            or not set(path.rpartition("/")[2].split(",")) <= mount.super_options
+        ):
+            raise ValueError("legacy cgroup hierarchy")
     runtime._fields(row["tmpfs"], ("/run", "/tmp"))
     for path, mode in (("/run", 0o40755), ("/tmp", 0o41777)):
         node = row["tmpfs"][path]
@@ -729,7 +763,7 @@ def check_core(plan, row, deadline_ns, now_ns):
         or fds != (0, 1, 2)
     ):
         raise ValueError("rooted inherited descriptors")
-    runtime._fields(row["denied"], (*DENIED, *KERNEL_DENIED))
+    runtime._fields(row["denied"], DENIAL_NODES)
     for path, node in row["denied"].items():
         if node is None:
             continue

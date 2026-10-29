@@ -87,15 +87,16 @@ class FilesystemTests(unittest.TestCase):
             self.devices[target.stat().st_ino] = os.makedev(*device)
         for name, target in fs.DEV_LINKS.items():
             self.path("/dev/" + name).symlink_to(target)
-        for path in (*fs.root.DENIED, *fs.root.KERNEL_DENIED):
+        for path in (*fs.root.DENIED, *fs.root.KERNEL_DENIED, *fixtures.HOST_COVERS):
             target = self.path(path)
             if path == "/dev/ptmx":
                 target.symlink_to("pts/ptmx")
-            elif path in fs.root.DENIED:
-                target.mkdir(mode=0)
-            else:
+            elif path in fs.root.KERNEL_DENIED:
                 target.touch()
                 target.chmod(0)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.mkdir(mode=0)
         bus = self.path(f"/run/user/{os.getuid()}/bus")
         endpoint = socket.socket(socket.AF_UNIX)
         try:
@@ -413,6 +414,20 @@ class FilesystemTests(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 tree.recheck()
+
+    def test_kernel_view_nodes_are_observed_and_must_be_inaccessible(self):
+        row = self.collect()
+        for path in fs.root.KERNEL_HIDDEN:
+            expected = None if path not in fixtures.HOST_COVERS else 0o40000
+            node = row["nodes"][path]
+            self.assertEqual(None if node is None else node["mode"], expected)
+        target = self.path("/sys/kernel/debug")
+        target.chmod(0o555)
+        try:
+            with self.assertRaisesRegex(ValueError, "filesystem denial is accessible"):
+                self.collect()
+        finally:
+            target.chmod(0)
 
     def test_denial_host_alias_and_ptmx_ancestor_type_refuse(self):
         plan = copy.deepcopy(self.plan)

@@ -287,7 +287,7 @@ def check_roles(plan, bus_identity, nodes, entries):
             or node.get("target") != target
         ):
             raise ValueError("unexpected minimal device symlink")
-    for path in (*root.DENIED, *root.KERNEL_DENIED):
+    for path in root.DENIAL_NODES:
         node = nodes[path]
         if node is None:
             continue
@@ -340,8 +340,7 @@ def target_paths(plan):
         "/run/irlume/payload.raw",
         "/run/irlume/runtime-manifest.json",
         f"/run/user/{plan['uid']}/bus",
-        *root.DENIED,
-        *root.KERNEL_DENIED,
+        *root.DENIAL_NODES,
         *("/dev/" + name for name in DEVICES),
         *("/dev/" + name for name in DEV_LINKS),
         *("/dev/char/" + number for number in CHAR_LINKS),

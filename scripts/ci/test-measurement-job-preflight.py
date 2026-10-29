@@ -195,6 +195,27 @@ class AdapterTests(unittest.TestCase):
         self.raw["nodes"]["/dev/pts"]["mode"] |= 0o777
         self.assertEqual(row, saved)
 
+    def test_kernel_view_node_needs_its_cover_and_stacking_refuses_first(self):
+        self.assertEqual(self.raw["nodes"]["/sys/kernel/debug"]["mode"], 0o40000)
+        lines = self.raw["proc"]["mountinfo"].splitlines(keepends=True)
+        bad = copy.deepcopy(self.raw)
+        bad["proc"]["mountinfo"] = b"".join(
+            line for line in lines if b" /sys/kernel/debug " not in line
+        )
+        with self.assertRaisesRegex(ValueError, "kernel cover and node disagree"):
+            self.check(bad)
+        tmp = next(line for line in lines if b" /tmp " in line)
+        number = tmp.split(b" ")[0]
+        stacked = tmp.replace(number + b" ", b"99 ", 1).replace(
+            b" " + tmp.split(b" ")[1] + b" ", b" " + number + b" ", 1
+        )
+        bad = copy.deepcopy(self.raw)
+        bad["proc"]["mountinfo"] += stacked
+        # Refused by the mount tree before the volume flags are compared.
+        bad["volumes"]["/tmp"]["flags"] ^= os.ST_NOEXEC
+        with self.assertRaisesRegex(ValueError, "stacked mount: /tmp"):
+            self.check(bad)
+
     def test_snapshot_parent_types_and_inventory_order_are_checked_directly(self):
         bad = copy.deepcopy(self.raw)
         bad["nodes"]["/sys/fs"]["mode"] = 0o100400

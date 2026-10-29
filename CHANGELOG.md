@@ -1070,6 +1070,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The NPU execution identity loads the compiler loader, the compiler and
+  the IR and ONNX frontends before it reads the mapped libraries, so the
+  libraries those four need are hashed too (ADR-0022 §4, #1238). A compile
+  no longer refuses its own dependencies when the process had not mapped
+  them already (`libzstd` in the #1046 run). A library only a compile maps
+  is still refused, the legacy identity is unchanged, and a compile-time
+  library that does not load leaves the identity unreadable.
+
 - PPA packages preserve AppArmor parser diagnostics and warn when profile
   loading fails, while keeping installation non-fatal and service ordering
   unchanged.

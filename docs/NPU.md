@@ -448,7 +448,8 @@ hardware class, loaded firmware, runtime/plugin/driver/compiler versions and
 the fixed compile configuration. Its inventory includes all observed absolute
 file-backed executable mappings, including unrelated shared native code, plus
 the known compiler loader, compiler, IR frontend and ONNX frontend hashed
-before compilation.
+before compilation. Those four are loaded before the mappings are observed,
+so the libraries they need themselves are in the inventory too.
 
 The main executable, identified through `/proc/self/exe`, is excluded only
 from the portable key to avoid a key that changes when its certification entry

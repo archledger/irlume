@@ -20,7 +20,15 @@ LIMITS = {
 }
 NAMESPACES = ("pid", "user", "mnt", "net", "cgroup")
 START_NS = 5_000_000_000
-MAX_OPERATIONS = 1024
+# One hard budget for a whole startup observation (collect_startup): the proc
+# snapshot, both filesystem views and the proc reads between them. G's native
+# views spend 1104 operations on the laptop (systemd 259.10) and 1096 on
+# archhost (262.1). With every optional kernel view and /run/credentials
+# present and one more page of maps and mountinfo they would spend 1128; 1536
+# is 408 (36%) above that. The count follows the fixed node list, at most 128
+# directory entries, the exact descriptor inventory and the LIMITS-capped proc
+# reads, not the host's process count.
+MAX_OPERATIONS = 1536
 MAX_FDS = 128
 # Cancellation must not bypass owned-resource cleanup or hide a close failure.
 CLEANUP_ERRORS = (BaseException,)

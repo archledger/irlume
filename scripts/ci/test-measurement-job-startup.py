@@ -379,6 +379,14 @@ raise SystemExit(1)
             finally:
                 os.close(fd)
 
+    def test_operation_cap_admits_exactly_its_budget(self):
+        collector = startup.ProcCollector(time.monotonic_ns() + 5_000_000_000)
+        collector.operations = startup.MAX_OPERATIONS - 1
+        self.assertEqual(collector._call(os.getpid), os.getpid())
+        self.assertEqual(collector.operations, startup.MAX_OPERATIONS)
+        with self.assertRaisesRegex(ValueError, "^startup observation operation cap$"):
+            collector._call(os.getpid)
+
     def test_deadline_ceiling_operation_budget_and_post_cleanup_check(self):
         now = [1]
         collector = startup.ProcCollector(100_000_000_000, _clock=lambda: now[0])

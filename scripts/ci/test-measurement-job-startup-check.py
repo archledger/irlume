@@ -8,7 +8,9 @@ import copy
 import importlib.machinery
 import importlib.util
 import os
+import stat
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -20,6 +22,26 @@ SPEC = importlib.util.spec_from_file_location(
 )
 startup = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(startup)
+
+
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+filesystem = load("startup_check_filesystem", "measurement-job-filesystem.py")
+root_tests = load("startup_check_root_tests", "test-measurement-job-root.py")
+# G's /proc/self/maps once the runtime's python3 has loaded every measurement
+# module: 10703 bytes in 93 lines, three page reads. Same shape, synthetic text.
+G_MAPS = b"".join(
+    (b"%012x-%012x r-xp 00000000 00:2e %d " % (i << 12, (i + 1) << 12, i)).ljust(
+        114, b"x"
+    )
+    + b"\n"
+    for i in range(93)
+)
 
 
 def module(name):
@@ -504,6 +526,187 @@ class CompositionTests(unittest.TestCase):
                     _module_table=lambda table=table: table,
                 )
             self.assertIn("tree-close", self.events)
+
+
+class NativeBudgetTests(unittest.TestCase):
+    """Run the real reader through collect_startup over G's native views.
+
+    The root is what G observed on both hosts (V1 probe): a private /dev with
+    its /dev/char links and /dev/core, every kernel view but smackfs under a
+    cover, selinux only on the laptop, no /run/credentials. Each read of a
+    /proc file returns whole lines up to one page, as a seq_file read does.
+    The other startup dependencies are inert.
+    """
+
+    def view(self, selinux):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        self.root, self.proc = base / "root", base / "proc"
+
+        def path(absolute):
+            return self.root / absolute.lstrip("/")
+
+        for name in ("/dev/char", "/proc", "/run/irlume", "/run/host", "/tmp"):
+            path(name).mkdir(parents=True)
+        self.devices = {}
+        for name, numbers in filesystem.DEVICES.items():
+            path("/dev/" + name).touch()
+            self.devices[path("/dev/" + name).stat().st_ino] = os.makedev(*numbers)
+        for name, target in filesystem.DEV_LINKS.items():
+            path("/dev/" + name).symlink_to(target)
+        for number, name in filesystem.CHAR_LINKS.items():
+            path("/dev/char/" + number).symlink_to("../" + name)
+        covers = ["/dev/pts", "/dev/shm", "/dev/mqueue", "/dev/hugepages"]
+        covers += root_tests.HOST_COVERS
+        if selinux:
+            covers.append("/sys/fs/selinux")
+        for name in covers:
+            path(name).parent.mkdir(parents=True, exist_ok=True)
+            path(name).mkdir(mode=0)
+        path("/dev/ptmx").touch(mode=0)
+        stage = path(filesystem.root.OS_RELEASE_STAGE)
+        stage.mkdir()
+        (stage / "os-release").write_bytes(b"ID=fedora\n")
+        path("/run/host/os-release").symlink_to(".os-release-stage/os-release")
+        plan, _ = root_tests.selection()
+        plan["uid"], plan["gid"] = os.getuid(), os.getgid()
+        for key, name in (
+            ("attempt", filesystem.root.ATTEMPT),
+            ("base", "/run/irlume/base.raw"),
+            ("payload", "/run/irlume/payload.raw"),
+            ("manifest", "/run/irlume/runtime-manifest.json"),
+        ):
+            if key == "attempt":
+                path(name).mkdir(mode=0o700)
+            else:
+                path(name).write_bytes(b"immutable\n")
+                path(name).chmod(0o400)
+            info = path(name).stat()
+            plan[key]["device"], plan[key]["inode"] = info.st_dev, info.st_ino
+        info = self.root.stat()
+        plan["root"]["device"], plan["root"]["inode"] = info.st_dev, info.st_ino
+        (self.proc / "ns").mkdir(parents=True)
+        for name in filesystem.startup.NAMESPACES:
+            (self.proc / "ns" / name).touch()
+        return plan
+
+    def observe(self, mountinfo, selinux):
+        """Return the operations collect_startup spent on one native view."""
+        plan = self.view(selinux)
+        files = {
+            "mountinfo": mountinfo,
+            "maps": G_MAPS,
+            "status": root_tests.witness(plan)["status"],
+            "uid_map": b"      1000       1000          1\n",
+            "gid_map": b"      1000       1000          1\n",
+        }
+        for name, data in files.items():
+            (self.proc / name).write_bytes(data)
+        real_open, real_stat, real_read = os.open, os.stat, os.read
+        real_metadata, pid, pages = filesystem.metadata, os.getpid(), set()
+
+        def open_view(path, flags, *args, **kwargs):
+            path = {"/": self.root, f"/proc/{pid}": self.proc}.get(path, path)
+            fd = real_open(path, flags, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None and path in files:
+                pages.add(fd)
+            else:
+                pages.discard(fd)
+            return fd
+
+        def stat_view(path, *args, **kwargs):
+            return real_stat(self.root if path == "/" else path, *args, **kwargs)
+
+        def read_page(fd, size):
+            data = real_read(fd, size)
+            if fd not in pages:
+                return data
+            page = b""
+            for line in data.splitlines(keepends=True):
+                if page and len(page) + len(line) > 4096:
+                    break
+                page += line
+            os.lseek(fd, len(page) - len(data), os.SEEK_CUR)
+            return page
+
+        def device_metadata(info):
+            result = real_metadata(info)
+            if info.st_ino in self.devices:
+                result.update(mode=stat.S_IFCHR | 0o666, rdev=self.devices[info.st_ino])
+            return result
+
+        readers = []
+
+        class Reader(filesystem.FilesystemCollector):
+            def __init__(self, deadline):
+                super().__init__(deadline)
+                readers.append(self)
+
+        @contextlib.contextmanager
+        def runtime_tree(*args, **kwargs):
+            yield types.SimpleNamespace(
+                manifest={}, file_facts=dict, check=lambda: None
+            )
+
+        preflight, tree, state, python = (
+            module(name) for name in ("preflight", "tree", "state", "python")
+        )
+        preflight.filesystem = types.SimpleNamespace(
+            FilesystemCollector=Reader, startup=filesystem.startup
+        )
+        preflight.root = types.SimpleNamespace(
+            check_plan=lambda plan: None, check_status=lambda *args: None
+        )
+        preflight.core_witness = lambda plan, snapshot, deadline, now: {
+            key: snapshot["proc"][key] for key in ("namespaces", "root")
+        }
+        tree.RootedRuntimeSnapshot = types.SimpleNamespace(open=runtime_tree)
+        state.check_runtime_state = lambda *args: None
+        python.collect_python_state = lambda deadline, **kwargs: {}
+        main = module("main")
+        table = {"main": main}
+        with (
+            mock.patch.object(os, "open", side_effect=open_view),
+            mock.patch.object(os, "stat", side_effect=stat_view),
+            mock.patch.object(os, "read", side_effect=read_page),
+            mock.patch.object(filesystem, "metadata", side_effect=device_metadata),
+        ):
+            try:
+                startup.collect_startup(
+                    plan,
+                    b"manifest",
+                    startup.Dependencies(preflight, tree, state, python),
+                    (main,),
+                    time.monotonic_ns() + 5_000_000_000,
+                    _module_table=lambda: table,
+                )
+            finally:
+                self.assertEqual(len(readers), 1)
+                self.assertEqual(readers[0].owned, {})
+        return readers[0].operations
+
+    def test_native_views_fit_the_operation_budget(self):
+        for label, mountinfo, selinux, spent in (
+            ("laptop", root_tests.R5_TRACING, True, 1104),
+            ("archhost", root_tests.R5_ARCHHOST, False, 1096),
+        ):
+            with self.subTest(label=label):
+                # The measured counts the budget comment cites; the cap stays
+                # within half again the larger one.
+                self.assertEqual(self.observe(mountinfo, selinux), spent)
+                self.assertLess(spent, filesystem.startup.MAX_OPERATIONS)
+                self.assertLessEqual(filesystem.startup.MAX_OPERATIONS, 1104 * 3 // 2)
+
+    def test_operation_budget_is_a_hard_cap_at_the_native_count(self):
+        budget = filesystem.startup
+        with mock.patch.object(budget, "MAX_OPERATIONS", 1104):
+            self.assertEqual(self.observe(root_tests.R5_TRACING, True), 1104)
+        with (
+            mock.patch.object(budget, "MAX_OPERATIONS", 1103),
+            self.assertRaisesRegex(ValueError, "^startup observation operation cap$"),
+        ):
+            self.observe(root_tests.R5_TRACING, True)
 
 
 if __name__ == "__main__":

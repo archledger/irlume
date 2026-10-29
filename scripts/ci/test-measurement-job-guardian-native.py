@@ -50,6 +50,7 @@ class NativeEffectsTests(unittest.TestCase):
             ("property", "effective service property"),
             ("argv", "executable binding"),
             ("membership", "effective placement"),
+            ("membership-v1-only", "effective placement"),
             ("affinity", "effective placement"),
             ("client", "client identity"),
             ("endpoint", "control endpoint"),
@@ -102,9 +103,10 @@ class NativeEffectsTests(unittest.TestCase):
                 ):
                     if path == "/proc/self/cgroup":
                         return io.StringIO(
-                            "0::/wrong\n"
-                            if fault == "membership"
-                            else "0::" + group + "\n"
+                            {
+                                "membership": "0::/wrong\n",
+                                "membership-v1-only": "1:net_cls:/\n",
+                            }.get(fault, "1:net_cls:/\n0::" + group + "\n")
                         )
                     return real_open(path, *args, **kwargs)
 

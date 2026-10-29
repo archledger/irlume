@@ -475,9 +475,11 @@ class GuardianEffects:
             raise ValueError("guardian executable binding")
         with open("/proc/self/cgroup", encoding="ascii") as file:
             membership = file.read(4097)
-        if membership != "0::" + identity.cgroup + "\n" or os.sched_getaffinity(
-            0
-        ) != set(spec.cpus):
+        try:
+            placed = guardian.unified_cgroup(membership) == identity.cgroup
+        except ValueError:
+            placed = False
+        if not placed or os.sched_getaffinity(0) != set(spec.cpus):
             raise ValueError("guardian effective placement")
         if process_start(self.config["client_pid"]) != self.config["client_starttime"]:
             raise ValueError("guardian client identity")

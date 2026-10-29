@@ -122,6 +122,28 @@ class ServiceIdentity(NamedTuple):
     deadline_ns: int
 
 
+def unified_cgroup(data):
+    """The cgroup v2 path in /proc/<pid>/cgroup text.
+
+    Legacy v1 hierarchies mounted beside the unified one (for example a VPN's
+    net_cls for split tunnelling) add their own lines; they do not place the
+    process. Exactly one unified line is required.
+    """
+    if type(data) is not str or not 0 < len(data) <= 4096 or not data.endswith("\n"):
+        raise ValueError("cgroup membership format")
+    unified = []
+    for line in data[:-1].split("\n"):
+        if re.fullmatch(r"0::(/[\x21-\x7e]*)", line):
+            unified.append(line[3:])
+        elif (
+            re.fullmatch(r"[1-9][0-9]{0,5}:[a-z0-9_,=.-]+:/[\x21-\x7e]*", line) is None
+        ):
+            raise ValueError("cgroup membership format")
+    if len(unified) != 1:
+        raise ValueError("cgroup membership format")
+    return unified[0]
+
+
 def unit_name(spec):
     validate_spec(spec)
     return "irlume-job-guardian-" + spec.run_id + ".service"

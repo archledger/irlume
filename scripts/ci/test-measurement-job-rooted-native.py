@@ -379,12 +379,13 @@ class EffectsTests(unittest.TestCase):
 
     def test_preflight_closes_bus_and_checks_exact_exec_and_placement(self):
         bus, group = self.make_bus()
+        # A legacy net_cls hierarchy (VPN split tunnelling) beside the unified one.
         with (
             mock.patch.object(native.service, "SystemdBus", return_value=bus),
             mock.patch.object(
                 self.effects,
                 "read_cgroup",
-                return_value=("0::" + group + "\n").encode(),
+                return_value=("1:net_cls:/\n0::" + group + "\n").encode(),
             ),
             mock.patch.object(
                 rooted.os, "sched_getaffinity", return_value=set(self.effects.spec.cpus)
@@ -408,14 +409,28 @@ class EffectsTests(unittest.TestCase):
         self.assertIsNone(self.effects.attempt_fd)
 
     def test_preflight_refuses_argv_placement_and_client_changes_after_bus_close(self):
-        for case in ("argv", "cgroup", "affinity", "client"):
+        cases = (
+            "argv",
+            "cgroup",
+            "v1-only",
+            "two-unified",
+            "parent",
+            "affinity",
+            "client",
+        )
+        for case in cases:
             bus, group = self.make_bus()
             if case == "argv":
                 bus.service["ExecStart"] = (
                     "a(sasbttttuii)",
                     [["/wrong", ["/wrong"], False, 0, 0, 0, 0, 0, 0, 0]],
                 )
-            cgroup = b"wrong\n" if case == "cgroup" else ("0::" + group + "\n").encode()
+            cgroup = {
+                "cgroup": b"wrong\n",
+                "v1-only": b"1:net_cls:/\n",
+                "two-unified": ("0::" + group + "\n0::/other\n").encode(),
+                "parent": ("0::" + group.rsplit("/", 1)[0] + "\n").encode(),
+            }.get(case, ("1:net_cls:/\n0::" + group + "\n").encode())
             affinity = set() if case == "affinity" else set(self.effects.spec.cpus)
 
             def start(pid, case=case):

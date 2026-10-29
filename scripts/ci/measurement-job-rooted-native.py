@@ -298,9 +298,10 @@ class GuardianEffects:
         argv = self.root.entry_argv(self.value["root_plan"], config.sha256)
         if base["ExecStart"] != ((argv[0], argv, False),):
             raise ValueError("rooted static executable binding")
-        if self.read_cgroup(deadline) != ("0::" + identity.cgroup + "\n").encode(
-            "ascii"
-        ) or os.sched_getaffinity(0) != set(self.spec.cpus):
+        membership = self.read_cgroup(deadline).decode("ascii")
+        if self.root.guardian.unified_cgroup(
+            membership
+        ) != identity.cgroup or os.sched_getaffinity(0) != set(self.spec.cpus):
             raise ValueError("rooted guardian placement")
         client = self.value["client"]
         self.root.runtime._integer(

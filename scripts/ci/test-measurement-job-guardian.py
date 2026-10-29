@@ -90,6 +90,45 @@ def terminal(spec, **changes):
     return len(data).to_bytes(4, "big") + data
 
 
+class CgroupMembershipTests(unittest.TestCase):
+    UNIT = "/user.slice/user-1000.slice/user@1000.service/app.slice/x.service"
+
+    def test_unified_path_is_found_beside_legacy_hierarchies(self):
+        for text in (
+            f"0::{self.UNIT}\n",
+            f"1:net_cls:/\n0::{self.UNIT}\n",
+            f"2:name=systemd:/user.slice\n1:net_cls,net_prio:/vpn\n0::{self.UNIT}\n",
+            f"0::{self.UNIT}\n12:cpu,cpuacct:/\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guardian.unified_cgroup(text), self.UNIT)
+
+    def test_missing_ambiguous_or_malformed_membership_refuses(self):
+        for text in (
+            "",
+            "1:net_cls:/\n",
+            f"0::{self.UNIT}\n0::/other\n",
+            f"0::{self.UNIT}",
+            "0::relative\n",
+            f"0:cpu:{self.UNIT}\n",
+            f"1::/\n0::{self.UNIT}\n",
+            f"01:net_cls:/\n0::{self.UNIT}\n",
+            f"x:net_cls:/\n0::{self.UNIT}\n",
+            f"1:NET:/\n0::{self.UNIT}\n",
+            f"1:net_cls:relative\n0::{self.UNIT}\n",
+            f"0::{self.UNIT} trailing\n",
+            f"\n0::{self.UNIT}\n",
+            "0::/" + "a" * 4096 + "\n",
+            b"0::/x\n",
+            None,
+        ):
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(ValueError, "cgroup membership"),
+            ):
+                guardian.unified_cgroup(text)
+
+
 class LaunchTests(unittest.TestCase):
     def test_qemu_has_only_bounded_owned_streams_and_fixed_devices(self):
         spec = specification()

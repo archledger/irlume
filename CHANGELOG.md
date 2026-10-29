@@ -518,6 +518,23 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- ADR-0033 specifies how `auto` will rank the recognizer's devices
+  (amendment 2026-10-29, #1163). CPU is a ranked target: a certified
+  accelerator goes ahead of it only through a reviewed order in a separate
+  table, so the certification entry is unchanged; the orders for one
+  model, consumer and ranking protocol version are told apart by the
+  accelerator keys they name. `auto` opens an accelerator only when
+  some order and a matching entry could select it and the host has the
+  ranked device's PCI IDs, because enumerating an `xe` GPU keeps it out
+  of runtime suspend until the daemon exits. After a probe the order that
+  names the live key decides; a refused or unranked candidate falls
+  through to the next class and then to CPU. The protocol ranks on p95
+  decision latency with and without compositor load, CPU time per
+  authentication and idle power (preliminary figures), and the resolved
+  device and a closed reason are reported in additive fields. Docs only:
+  `auto` keeps the recognizer on CPU, loading admission stays closed and
+  both `CERTIFIED` tables stay empty.
+
 - Update ctutils to 0.4.4 in the application and fuzz lockfiles.
 
 - Version the decision fingerprint to bind bounded threshold coverage and

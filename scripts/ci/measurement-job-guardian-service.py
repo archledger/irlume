@@ -3,12 +3,14 @@
 # Copyright the irlume contributors.
 """One referenced transient service; importing this module touches no bus."""
 
+import array
 import fcntl
 import hashlib
 import json
 import os
 import pwd
 import re
+import socket
 import stat
 import time
 from builtins import BaseExceptionGroup
@@ -65,7 +67,9 @@ UNIT_TYPES = {
 class SystemdBus:
     """Private broker connection. Only explicit methods create or stop a unit."""
 
-    def __init__(self, uid, *, deadline, _address=None, _socket_factory=None):
+    def __init__(
+        self, uid, *, deadline, fds=False, _address=None, _socket_factory=None
+    ):
         if (
             type(uid) is not int
             or uid <= 0
@@ -73,12 +77,18 @@ class SystemdBus:
             or os.geteuid() != uid
         ):
             raise ValueError("guardian requires the caller's unprivileged user bus")
+        if type(fds) is not bool:
+            raise ValueError("user-bus descriptor passing flag")
         import jeepney
         from jeepney.io.blocking import prep_socket
 
         if jeepney.__version__ != "0.9.0":
             raise ValueError("unreviewed Jeepney version")
         self.protocol = jeepney
+        # Only GetUnitByPIDFD sends a descriptor. Replies are read with recv(),
+        # so the kernel drops any descriptor sent to us, and jeepney refuses
+        # a message that declares one.
+        self.fds = fds
         self.socket = None
         self.closed = False
         self.last_partial = {}
@@ -90,7 +100,7 @@ class SystemdBus:
             # DBusConnection.__init__, whose default reply wait is unbounded.
             self.socket = (_socket_factory or prep_socket)(
                 _address or f"/run/user/{uid}/bus",
-                enable_fds=False,
+                enable_fds=fds,
                 timeout=self.remaining(deadline),
             )
             self.socket.set_inheritable(False)
@@ -136,6 +146,7 @@ class SystemdBus:
         *,
         destination=BUS_NAME,
         expected=None,
+        values=1,
     ):
         protocol = self.protocol
         expected = expected or {"GetAll": "a{sv}", "GetUnitProcesses": "a(sus)"}.get(
@@ -148,11 +159,20 @@ class SystemdBus:
             tuple(args),
         )
         self.serial += 1
-        data = message.serialise(serial=self.serial)
+        # Without negotiated passing, jeepney refuses any "h" argument.
+        descriptors = array.array("i") if self.fds else None
+        data = message.serialise(serial=self.serial, fds=descriptors)
         if len(data) > 1024 * 1024:
             raise ValueError("user-bus request cap")
         self.socket.settimeout(self.remaining(deadline))
-        self.socket.sendall(data)
+        if descriptors:
+            sent = self.socket.sendmsg(
+                [data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)]
+            )
+            if sent != len(data):
+                raise ValueError("user-bus partial descriptor message")
+        else:
+            self.socket.sendall(data)
         received = 0
         for _ in range(4096):
             reply = self.parser.get_next_message()
@@ -181,11 +201,11 @@ class SystemdBus:
             if (
                 reply.header.message_type != protocol.MessageType.method_return
                 or fields.get(protocol.HeaderFields.signature, "") != expected
-                or len(reply.body) != 1
+                or len(reply.body) != values
             ):
                 raise ValueError("user-bus reply signature")
             # The owner stores this result before its post-call deadline check.
-            return reply.body[0]
+            return reply.body[0] if values == 1 else tuple(reply.body)
         raise ValueError("user-bus event cap")
 
     def variant(self, kind, value):
@@ -314,6 +334,39 @@ class SystemdBus:
             self.last_partial["InvocationID"]
         ).hex()
         return dict(self.last_partial)
+
+    def unit_by_pidfd(self, pidfd, deadline):
+        """The unit and invocation holding a process, resolved by descriptor.
+
+        The manager reads the PID from the descriptor in its own namespace and
+        rechecks it after the lookup (systemd v259.10 and v262.1 dbus-manager.c,
+        method_get_unit_by_pidfd), so a caller in a child PID namespace can
+        name itself without knowing its host PID.
+        """
+        if not self.fds:
+            raise ValueError("user-bus descriptor passing is not negotiated")
+        if type(pidfd) is not int or pidfd < 0:
+            raise ValueError("invalid process descriptor")
+        path, unit, invocation = self.call(
+            MANAGER_PATH,
+            MANAGER,
+            "GetUnitByPIDFD",
+            "h",
+            (pidfd,),
+            deadline,
+            expected="osay",
+            values=3,
+        )
+        if (
+            type(path) is not str
+            or not path.startswith("/org/freedesktop/systemd1/unit/")
+            or type(unit) is not str
+            or not 0 < len(unit) <= 255
+            or type(invocation) is not bytes
+            or len(invocation) != 16
+        ):
+            raise ValueError("invalid process unit reply")
+        return path, unit, invocation.hex()
 
     def processes(self, name, deadline):
         rows = self.call(

@@ -22,6 +22,25 @@ def load(name, filename):
 root = load("root", "measurement-job-root.py")
 fixtures = load("root_fixtures", "test-measurement-job-closure.py")
 guardian_tests = load("root_guardian_tests", "test-measurement-job-guardian.py")
+# Literal, not derived from the module constants, so a reorder or drop is caught.
+HIDDEN_PROFILE = (
+    "-+/dev/pts",
+    "-+/dev/ptmx",
+    "-+/dev/shm",
+    "-+/dev/mqueue",
+    "-+/dev/hugepages",
+    "-+/sys/fs/selinux",
+    "-+/run/credentials",
+    "-+/sys/firmware/efi/efivars",
+    "-+/sys/fs/bpf",
+    "-+/sys/fs/fuse/connections",
+    "-+/sys/fs/pstore",
+    "-+/sys/fs/smackfs",
+    "-+/sys/kernel/config",
+    "-+/sys/kernel/debug",
+    "-+/sys/kernel/security",
+    "-+/sys/kernel/tracing",
+)
 
 
 def selection():
@@ -100,10 +119,10 @@ def witness(plan):
     ]
     return {
         "root": {"device": 1, "inode": 10},
-        "namespaces": {"pid": 101, "user": 202, "mnt": 203, "net": 204, "cgroup": 105},
+        "namespaces": {"pid": 201, "user": 202, "mnt": 203, "net": 204, "cgroup": 105},
         "uid_map": b"      1000       1000          1\n",
         "gid_map": b"      1000       1000          1\n",
-        "status": b"Name:\tpython3\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nThreads:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\n",
+        "status": b"Name:\tpython3\nPid:\t1\nPPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nNStgid:\t1\nNSpid:\t1\nThreads:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n",
         "fds": (0, 1, 2),
         "denied": dict.fromkeys((*root.DENIED, *root.KERNEL_DENIED)),
         "dev_log": None,
@@ -176,15 +195,24 @@ class ProfileTests(unittest.TestCase):
         for key, value in root.guardian.service_properties(spec).items():
             self.assertEqual(props[key], value)
         self.assertEqual(props["PrivateUsersEx"], "self")
-        self.assertEqual(props["PrivatePIDs"], "no")
+        self.assertEqual(
+            (props["PrivatePIDs"], props["ProcSubset"], props["ProtectProc"]),
+            ("yes", "pid", "invisible"),
+        )
         self.assertIs(props["ProtectControlGroups"], True)
         self.assertIs(props["BindLogSockets"], False)
         self.assertEqual(props["DeviceAllow"], ())
         self.assertEqual(
             props["BindPaths"], (("/private/attempt", "/run/irlume/attempt", False, 0),)
         )
+        self.assertEqual(props["InaccessiblePaths"], HIDDEN_PROFILE)
+        self.assertFalse(
+            any(p.startswith("-+/proc/") for p in props["InaccessiblePaths"])
+        )
+        self.assertEqual(props["ProtectHome"], "read-only")
+        self.assertIs(props["ProtectKernelLogs"], True)
         self.assertEqual(
-            props["InaccessiblePaths"], tuple("-+" + p for p in root.DENIED)
+            (type(props["RestrictNamespaces"]), props["RestrictNamespaces"]), (int, 0)
         )
         self.assertEqual(
             root.entry_argv(plan, "c" * 64),
@@ -281,6 +309,56 @@ class ProfileTests(unittest.TestCase):
             ("TemporaryFileSystem", ("a(ss)", (("/tmp", "rw"),))),
         ):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                root.check_properties(dict(variants, **{key: value}), plan)
+        # The earlier layout also listed /proc/sys/fs, absent under ProcSubset=pid.
+        sysctl = (*HIDDEN_PROFILE[:7], "-+/proc/sys/fs", *HIDDEN_PROFILE[7:])
+        swapped = (*HIDDEN_PROFILE[:7], HIDDEN_PROFILE[8], HIDDEN_PROFILE[7])
+        swapped += HIDDEN_PROFILE[9:]
+        unrooted = tuple(
+            "-/sys/kernel/debug" if p == "-+/sys/kernel/debug" else p
+            for p in HIDDEN_PROFILE
+        )
+        for key, value, message in (
+            ("PrivatePIDs", ("s", "no"), "effective root property: PrivatePIDs"),
+            ("ProcSubset", ("s", "all"), "effective root property: ProcSubset"),
+            ("ProcSubset", ("b", True), "root property signature"),
+            *(
+                ("ProtectProc", ("s", mode), "effective root property: ProtectProc")
+                for mode in ("default", "noaccess", "ptraceable")
+            ),
+            ("ProtectHome", ("s", "no"), "effective root property: ProtectHome"),
+            ("ProtectHome", ("s", "yes"), "effective root property: ProtectHome"),
+            ("ProtectHome", ("s", "tmpfs"), "effective root property: ProtectHome"),
+            ("ProtectHome", ("b", True), "root property signature"),
+            (
+                "ProtectKernelLogs",
+                ("b", False),
+                "effective root property: ProtectKernelLogs",
+            ),
+            (
+                "RestrictNamespaces",
+                ("t", 2**64 - 1),
+                "effective root property: RestrictNamespaces",
+            ),
+            (
+                "RestrictNamespaces",
+                ("t", 0x10000000),
+                "effective root property: RestrictNamespaces",
+            ),
+            ("RestrictNamespaces", ("b", True), "root property signature"),
+            *(
+                (
+                    "InaccessiblePaths",
+                    ("as", paths),
+                    "effective root property: InaccessiblePaths",
+                )
+                for paths in (HIDDEN_PROFILE[:7], sysctl, swapped, unrooted)
+            ),
+        ):
+            with (
+                self.subTest(key=key, value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
                 root.check_properties(dict(variants, **{key: value}), plan)
 
     def test_selection_rejects_internally_valid_but_unselected_entries(self):
@@ -535,12 +613,17 @@ class CoreTests(unittest.TestCase):
     def test_namespaces_root_and_identity_maps_are_independently_checked(self):
         plan, _ = selection()
         row = witness(plan)
+        # Only the cgroup namespace stays the host's; PrivatePIDs= gives G its own.
+        self.assertNotEqual(row["namespaces"]["pid"], plan["host_namespaces"]["pid"])
         for key in root.NAMESPACES:
             bad = copy.deepcopy(row)
             bad["namespaces"][key] = (
-                plan["host_namespaces"][key] if key in ("mnt", "user", "net") else 999
+                plan["host_namespaces"][key] if key != "cgroup" else 999
             )
-            with self.subTest(namespace=key), self.assertRaises(ValueError):
+            with (
+                self.subTest(namespace=key),
+                self.assertRaisesRegex(ValueError, "rooted namespace mismatch: " + key),
+            ):
                 root.check_core(plan, bad, 1000, 250)
         for key, value in (
             ("root", {"device": 1, "inode": 99}),
@@ -578,6 +661,40 @@ class CoreTests(unittest.TestCase):
             root.check_core(
                 plan, dict(row, status=row["status"] + b"Threads:\t1\n"), 1000, 250
             )
+
+    def test_status_requires_seccomp_filter_mode(self):
+        plan, _ = selection()
+        row = witness(plan)
+        self.assertIn(b"\nSeccomp:\t2\n", row["status"])
+        self.assertIsNone(root.check_status(row["status"], 1000, 1000))
+        for after in (b"Seccomp:\t0\n", b"Seccomp:\t1\n", b""):
+            status = row["status"].replace(b"Seccomp:\t2\n", after)
+            with self.subTest(after=after):
+                with self.assertRaisesRegex(ValueError, "process status identity"):
+                    root.check_status(status, 1000, 1000)
+                with self.assertRaisesRegex(ValueError, "process status identity"):
+                    root.check_core(plan, dict(row, status=status), 1000, 250)
+
+    def test_status_requires_the_pid_namespace_init(self):
+        plan, _ = selection()
+        row = witness(plan)
+        for before, after in (
+            (b"Pid:\t1\n", b"Pid:\t4242\n"),
+            (b"Pid:\t1\n", b""),
+            (b"PPid:\t0\n", b"PPid:\t1\n"),
+            (b"PPid:\t0\n", b""),
+            # A host-visible proc lists every namespace level of the PID.
+            (b"NSpid:\t1\n", b"NSpid:\t4242\t1\n"),
+            (b"NSpid:\t1\n", b"NSpid:\t4242\n"),
+            (b"NSpid:\t1\n", b""),
+        ):
+            status = row["status"].replace(before, after)
+            self.assertNotEqual(status, row["status"])
+            with self.subTest(before=before, after=after):
+                with self.assertRaisesRegex(ValueError, "process status identity"):
+                    root.check_status(status, 1000, 1000)
+                with self.assertRaisesRegex(ValueError, "process status identity"):
+                    root.check_core(plan, dict(row, status=status), 1000, 250)
 
     def test_denied_nodes_cannot_be_readable_or_host_backed(self):
         plan, _ = selection()

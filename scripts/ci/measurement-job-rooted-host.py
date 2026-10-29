@@ -856,6 +856,14 @@ FD_LIMIT = 1 << 20
 HEX32 = "[0-9a-f]{32}"
 UNIT_PATH = r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]{1,255}"
 PROPERTIES = "org.freedesktop.DBus.Properties"
+# With PrivatePIDs=yes systemd resets ExecMainStartTimestamp from the main
+# process's /proc stat starttime (v259.10 and v262.1 service.c,
+# service_set_main_pidref), which counts whole USER_HZ ticks (Linux
+# fs/proc/array.c; 100 Hz on x86-64). Its boottime-to-monotonic mapping
+# (time-util.c, dual_timestamp_from_boottime) adds the gap between two clock
+# reads; a host suspend between the fork and that mapping moves it earlier,
+# which still refuses.
+START_TICK_NS = 10_000_000
 # Files H or G can leave in an attempt directory, with their required type.
 ATTEMPT_ENTRIES = {
     "control.sock": stat.S_ISSOCK,
@@ -1048,7 +1056,11 @@ def check_failed_unit(row, unit, invocation, argv, value, main_pid):
             raise ValueError("resolver unit state: " + key)
     start = row["ExecMainStartTimestampMonotonic"]
     end = row["ExecMainExitTimestampMonotonic"]
-    if not value["origin_ns"] <= start * 1000 <= value["startup_deadline_ns"]:
+    if (
+        not value["origin_ns"] - START_TICK_NS
+        <= start * 1000
+        <= value["startup_deadline_ns"]
+    ):
         raise ValueError("resolver unit start window")
     if not end >= start > 0:
         raise ValueError("resolver unit exit order")

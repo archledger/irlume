@@ -262,8 +262,15 @@ class GuardianEffects:
             or os.geteuid() != os.getuid()
         ):
             raise ValueError("rooted guardian user identity")
+        # PrivatePIDs=yes makes the main process the init of a fresh PID
+        # namespace (systemd exec-invoke.c setup_private_pids); G never learns
+        # its host PID, so the binding uses the manager's MainPID.
+        if os.getpid() != 1 or os.getppid() != 0:
+            raise ValueError("rooted guardian is not its PID namespace init")
         runtime, errors = self.runtime, []
-        bus = runtime.native.service.SystemdBus(os.getuid(), deadline=deadline)
+        bus = runtime.native.service.SystemdBus(
+            os.getuid(), deadline=deadline, fds=True
+        )
         bridge = None
         try:
             bridge = runtime.bus_bridge.RootedBus(
@@ -273,6 +280,10 @@ class GuardianEffects:
                 ),
             )
             observed = bridge.observe(config, manifest, deadline)
+            with self.root.closure.owned_fd(os.pidfd_open(os.getpid())) as pidfd:
+                invocation = bridge.process_invocation(
+                    config, manifest, pidfd, deadline
+                )
         except CLEANUP_FAILURES as error:
             errors.append(error)
         self.service_observation = None if bridge is None else bridge.partial
@@ -283,15 +294,19 @@ class GuardianEffects:
         runtime.native.raise_errors("rooted service preflight and close", errors)
         self.before(deadline)
         base = observed["service"]
+        if invocation != base["InvocationID"]:
+            raise ValueError("rooted guardian is not the observed invocation")
         keys = (
             (set(self.root.guardian.service_properties(self.spec)) - {"AddRef"})
             | set(runtime.native.service.UNIT_TYPES)
             | {"MainPID", "ControlGroup", "ExecMainStartTimestampMonotonic"}
         )
+        # Namespace init plus unit membership of this exact invocation is the
+        # main process: only it and its descendants share the namespace.
         identity = self.root.guardian.check_service(
             {key: base[key] for key in keys},
             self.spec,
-            os.getpid(),
+            base["MainPID"],
             os.getuid(),
             self.now(),
         )
@@ -303,12 +318,7 @@ class GuardianEffects:
             membership
         ) != identity.cgroup or os.sched_getaffinity(0) != set(self.spec.cpus):
             raise ValueError("rooted guardian placement")
-        client = self.value["client"]
-        self.root.runtime._integer(
-            runtime.native.process_start(client["pid"]),
-            client["starttime"],
-            client["starttime"],
-        )
+        # /proc/1 is G itself; its starttime is boot-relative, not per namespace.
         starttime = runtime.native.process_start(os.getpid())
         self.root.runtime._integer(starttime, 1, self.root.runtime.U64_MAX)
         self.before(deadline)
@@ -355,20 +365,19 @@ class GuardianEffects:
             raise ValueError("rooted control connection cap")
         client = self.value["client"]
         connected, self.connecting = self.connecting, None
+        # SO_PEERCRED reports PID 0 for a peer outside G's PID namespace, and
+        # G's proc lists no host process, so G binds H by credentials, the
+        # socket node and the peer pidfd only; H's checks of G stay complete.
         # PeerChannel consumes the socket, including on constructor failure.
         self.channel = self.root.guardian.PeerChannel(
-            connected, (client["pid"], client["uid"], client["gid"])
+            connected, (0, client["uid"], client["gid"])
         )
         self.channel.check(deadline)
-        observed_start = self.runtime.native.process_start(client["pid"])
-        self.channel.check(deadline)
-        self.root.runtime._integer(
-            observed_start, client["starttime"], client["starttime"]
-        )
         if self.root.closure.inputs.identity(
             os.stat("control.sock", dir_fd=self.attempt_fd, follow_symlinks=False)
         ) != self.root.closure.inputs.identity(info):
             raise ValueError("rooted control socket replaced")
+        self.channel.check(deadline)
         self.before(deadline)
 
     def receive(self, deadline):

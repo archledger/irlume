@@ -171,6 +171,20 @@ class RootedBus:
         self.bus.remaining(deadline)
         return {"service": {**first, **base}, "root": roots}
 
+    def process_invocation(self, config, manifest, pidfd, deadline):
+        """The invocation of the configured unit that holds a caller-owned pidfd."""
+        self.root.runtime._integer(deadline, 1, self.root.runtime.U64_MAX)
+        self.bus.remaining(deadline)
+        value, spec = self.config(config, manifest)
+        deadline = min(deadline, value["startup_deadline_ns"])
+        self.bus.remaining(deadline)
+        reply = self.bus.unit_by_pidfd(pidfd, deadline)
+        self.partial["pidfd_unit"] = reply
+        self.bus.remaining(deadline)
+        if reply[1] != self.root.guardian.unit_name(spec):
+            raise ValueError("rooted service process unit")
+        return reply[2]
+
 
 if __name__ == "__main__":
     raise SystemExit(77)

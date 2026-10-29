@@ -58,13 +58,27 @@ KERNEL_READONLY = tuple(
         "timer_stats",
     )
 ) + ("/sys/kernel/debug", "/sys/kernel/tracing")
+# Covered with InaccessiblePaths=-+PATH. ProcSubset=pid leaves no /proc/sys, so
+# only sysfs views are listed.
+KERNEL_HIDDEN = (
+    "/sys/firmware/efi/efivars",
+    "/sys/fs/bpf",
+    "/sys/fs/fuse/connections",
+    "/sys/fs/pstore",
+    "/sys/fs/smackfs",
+    "/sys/kernel/config",
+    "/sys/kernel/debug",
+    "/sys/kernel/security",
+    "/sys/kernel/tracing",
+)
 ATTEMPT = "/run/irlume/attempt"
 OS_RELEASE_STAGE = "/run/host/.os-release-stage"
 ENTRY = "opt/irlume/measurement-job-guardian-native.py"
 # Linux UAPI linux/mount.h. Explicitly override systemd's namespace-local shared default.
 MS_PRIVATE = 1 << 18
-# systemd v259.10 src/core/dbus-execute.c and dbus-cgroup.c.
+# systemd v259.10 and v262.1 src/core/dbus-execute.c and dbus-cgroup.c.
 # https://github.com/systemd/systemd/blob/v259.10/src/core/dbus-execute.c
+# https://github.com/systemd/systemd/blob/v262.1/src/core/dbus-execute.c
 PROPERTY_TYPES = {
     "MountFlags": "t",
     "RootDirectory": "s",
@@ -73,11 +87,16 @@ PROPERTY_TYPES = {
     "PrivateNetwork": "b",
     "PrivateDevices": "b",
     "PrivatePIDs": "s",
+    "ProcSubset": "s",
+    "ProtectProc": "s",
     "MountAPIVFS": "b",
     "BindLogSockets": "b",
     "ProtectSystem": "s",
+    "ProtectHome": "s",
     "ProtectKernelTunables": "b",
+    "ProtectKernelLogs": "b",
     "ProtectControlGroups": "b",
+    "RestrictNamespaces": "t",
     "CapabilityBoundingSet": "t",
     "AmbientCapabilities": "t",
     "DevicePolicy": "s",
@@ -207,12 +226,20 @@ def root_properties(plan):
         "PrivateMounts": True,
         "PrivateNetwork": True,
         "PrivateDevices": True,
-        "PrivatePIDs": "no",
+        # G is PID 1 of its own namespace on a fresh proc that lists only
+        # its own processes (systemd exec-invoke.c setup_private_pids).
+        "PrivatePIDs": "yes",
+        "ProcSubset": "pid",
+        "ProtectProc": "invisible",
         "MountAPIVFS": True,
         "BindLogSockets": False,
         "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
         "ProtectKernelTunables": True,
+        "ProtectKernelLogs": True,
         "ProtectControlGroups": True,
+        # Zero allows no namespace types; unset is all ones (nsflags.h).
+        "RestrictNamespaces": 0,
         "CapabilityBoundingSet": 0,
         "AmbientCapabilities": 0,
         "DevicePolicy": "closed",
@@ -231,7 +258,7 @@ def root_properties(plan):
             ("/tmp", "rw,nosuid,nodev,noexec,size=16M,mode=1777"),
             ("/run", "rw,nosuid,nodev,noexec,size=16M,mode=0755"),
         ),
-        "InaccessiblePaths": tuple("-+" + path for path in DENIED),
+        "InaccessiblePaths": tuple("-+" + path for path in (*DENIED, *KERNEL_HIDDEN)),
     }
 
 
@@ -360,10 +387,16 @@ def check_status(data, uid, gid):
             raise ValueError("process status duplicate or malformed field")
         rows[key] = value.split()
     expected = {
+        # PrivatePIDs=yes: the namespace init, with no visible parent or host PID.
+        "Pid": ["1"],
+        "PPid": ["0"],
+        "NSpid": ["1"],
         "Uid": [str(uid)] * 4,
         "Gid": [str(gid)] * 4,
         "Threads": ["1"],
         "NoNewPrivs": ["1"],
+        # Filter mode: systemd skips RestrictNamespaces= without seccomp.
+        "Seccomp": ["2"],
     }
     expected.update(
         {
@@ -593,7 +626,7 @@ def check_core(plan, row, deadline_ns, now_ns):
     for name, number in row["namespaces"].items():
         runtime._integer(number, 1, runtime.U64_MAX)
         same = number == plan["host_namespaces"][name]
-        if same != (name in ("pid", "cgroup")):
+        if same != (name == "cgroup"):
             raise ValueError("rooted namespace mismatch: " + name)
     check_id_map(row["uid_map"], plan["uid"])
     check_id_map(row["gid_map"], plan["gid"])

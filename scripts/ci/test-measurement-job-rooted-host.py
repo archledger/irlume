@@ -1208,7 +1208,7 @@ class FactoryTests(unittest.TestCase):
                 "service": {
                     "ExecMainStartTimestampMonotonic": (
                         "t",
-                        value["origin_ns"] // 1000 - 1,
+                        (value["origin_ns"] - host.START_TICK_NS) // 1000 - 1,
                     )
                 },
             },
@@ -1256,6 +1256,21 @@ class FactoryTests(unittest.TestCase):
         self.assert_refused(bus, "variant")
         bus.service = copy.deepcopy(saved[1])
         self.assertTrue(self.resolve(bus).sha256)
+
+    def test_resolver_start_window_allows_one_proc_clock_tick(self):
+        # PrivatePIDs= start timestamps are whole 10 ms ticks, never later.
+        self.assertEqual(host.START_TICK_NS, 10_000_000)
+        bus, _ = self.retained_failure()
+        value = self.owner.value
+        edge = -(-(value["origin_ns"] - host.START_TICK_NS) // 1000)
+        self.assertGreaterEqual(edge * 1000, value["origin_ns"] - host.START_TICK_NS)
+        self.assertLess((edge - 1) * 1000, value["origin_ns"] - host.START_TICK_NS)
+        saved = copy.deepcopy(bus.service)
+        bus.service["ExecMainStartTimestampMonotonic"] = ("t", edge - 1)
+        self.assert_refused(bus, "start window")
+        bus.service = copy.deepcopy(saved)
+        bus.service["ExecMainStartTimestampMonotonic"] = ("t", edge)
+        self.assertTrue(self.resolve(bus, commit=True).committed)
 
     def test_resolver_refuses_changed_or_inconsistent_attempt_files(self):
         bus, _ = self.retained_failure()

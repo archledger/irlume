@@ -249,6 +249,161 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(descriptors(), before)
 
 
+class DescriptorTests(unittest.TestCase):
+    """GetUnitByPIDFD over a real socket pair; no manager or unit is involved."""
+
+    UNIT = "irlume-job-guardian-test.service"
+    PATH = "/org/freedesktop/systemd1/unit/irlume_2djob_2dguardian_2dtest_2eservice"
+
+    def serve(self, reply):
+        import array
+
+        import jeepney
+
+        client, server = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        seen = {"methods": [], "pids": [], "fds": 0}
+
+        def run():
+            parser = jeepney.Parser()
+            server.settimeout(2)
+            while True:
+                try:
+                    data, ancillary, _, _ = server.recvmsg(
+                        4096, socket.CMSG_SPACE(4 * 4)
+                    )
+                except OSError:
+                    return
+                if not data:
+                    return
+                received = array.array("i")
+                for level, kind, payload in ancillary:
+                    if (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+                        received.frombytes(payload)
+                parser.add_data(data, list(received))
+                for request in iter(parser.get_next_message, None):
+                    method = request.header.fields[jeepney.HeaderFields.member]
+                    seen["methods"].append(method)
+                    if method == "Hello":
+                        signature, body = "s", (":test.1",)
+                    else:
+                        fd = request.body[0]
+                        seen["fds"] += 1
+                        with open(f"/proc/self/fdinfo/{fd}") as info:
+                            seen["pids"] += [
+                                line.split()[1]
+                                for line in info
+                                if line.startswith("Pid:")
+                            ]
+                        os.close(fd)
+                        signature, body = reply
+                    message = jeepney.new_method_return(request, signature, body)
+                    server.sendall(message.serialise(serial=len(seen["methods"])))
+
+        thread = Thread(target=run)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        return client, seen
+
+    def connect(self, client, fds):
+        options = []
+
+        def factory(address, **kwargs):
+            options.append(kwargs)
+            return client
+
+        bus = service.SystemdBus(
+            os.getuid(),
+            deadline=time.monotonic_ns() + 2_000_000_000,
+            fds=fds,
+            _socket_factory=factory,
+        )
+        self.addCleanup(lambda: bus.closed or bus.close())
+        self.assertEqual(options[0]["enable_fds"], fds)
+        return bus
+
+    def test_pidfd_is_passed_as_a_descriptor_and_reply_is_typed(self):
+        client, seen = self.serve(("osay", (self.PATH, self.UNIT, b"\xab" * 16)))
+        bus = self.connect(client, True)
+        fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, fd)
+        self.assertEqual(
+            bus.unit_by_pidfd(fd, time.monotonic_ns() + 2_000_000_000),
+            (self.PATH, self.UNIT, "ab" * 16),
+        )
+        bus.close()
+        self.assertEqual(seen["methods"], ["Hello", "GetUnitByPIDFD"])
+        # The kernel installed a new descriptor naming this very process.
+        self.assertEqual((seen["fds"], seen["pids"]), (1, [str(os.getpid())]))
+
+    def test_descriptor_passing_must_be_negotiated_first(self):
+        client, seen = self.serve(("osay", (self.PATH, self.UNIT, b"\xab" * 16)))
+        bus = self.connect(client, False)
+        fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, fd)
+        end = time.monotonic_ns() + 2_000_000_000
+        with self.assertRaisesRegex(ValueError, "not negotiated"):
+            bus.unit_by_pidfd(fd, end)
+        # jeepney refuses an "h" argument when no descriptor array is offered.
+        with self.assertRaises(RuntimeError):
+            bus.call(
+                service.MANAGER_PATH,
+                service.MANAGER,
+                "GetUnitByPIDFD",
+                "h",
+                (fd,),
+                end,
+                expected="osay",
+                values=3,
+            )
+        bus.close()
+        self.assertEqual(seen["methods"], ["Hello"])
+        with self.assertRaisesRegex(ValueError, "descriptor passing flag"):
+            service.SystemdBus(os.getuid(), deadline=end, fds=1)
+
+    def test_short_descriptor_send_refuses(self):
+        client, _ = self.serve(("osay", (self.PATH, self.UNIT, b"\xab" * 16)))
+
+        class Short:
+            def __getattr__(self, name):
+                return getattr(client, name)
+
+            def sendmsg(self, buffers, ancillary):
+                return client.sendmsg(buffers, ancillary) - 1
+
+        bus = self.connect(Short(), True)
+        fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, fd)
+        with self.assertRaisesRegex(ValueError, "partial descriptor message"):
+            bus.unit_by_pidfd(fd, time.monotonic_ns() + 2_000_000_000)
+
+    def test_malformed_unit_replies_refuse(self):
+        for reply, message in (
+            (("os", (self.PATH, self.UNIT)), "reply signature"),
+            (("o", (self.PATH,)), "reply signature"),
+            (("osay", (self.PATH, self.UNIT, b"\xab" * 15)), "process unit reply"),
+            (("osay", ("/other/path", self.UNIT, b"\xab" * 16)), "process unit reply"),
+            (("osay", (self.PATH, "", b"\xab" * 16)), "process unit reply"),
+        ):
+            client, _ = self.serve(reply)
+            bus = self.connect(client, True)
+            fd = os.pidfd_open(os.getpid())
+            try:
+                with (
+                    self.subTest(reply=reply),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    bus.unit_by_pidfd(fd, time.monotonic_ns() + 2_000_000_000)
+            finally:
+                os.close(fd)
+                bus.close()
+        with self.assertRaisesRegex(ValueError, "invalid process descriptor"):
+            client, _ = self.serve(("osay", (self.PATH, self.UNIT, b"\xab" * 16)))
+            self.connect(client, True).unit_by_pidfd(
+                True, time.monotonic_ns() + 2_000_000_000
+            )
+
+
 class GateTests(unittest.TestCase):
     def test_fifo_replacement_refuses_without_waiting_for_a_writer(self):
         with tempfile.TemporaryDirectory() as directory:

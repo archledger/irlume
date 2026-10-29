@@ -5,6 +5,7 @@
 
 import copy
 import importlib.util
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,10 @@ class FakeBus(transport.SystemdBus):
     def __init__(self, fixture):
         self.calls, self.time = [], 100
         self.late = None
+        # Descriptor passing as negotiated by SystemdBus(fds=True).
+        self.fds = True
+        self.pidfd_pid = os.getpid()
+        self.pidfd_unit = self.pidfd_invocation = None
         self.unit_reads = 0
         self.job = "/org/freedesktop/systemd1/job/123"
         self.path = "/org/freedesktop/systemd1/unit/test_2eservice"
@@ -72,12 +77,23 @@ class FakeBus(transport.SystemdBus):
             raise TimeoutError("fake deadline")
         return 1
 
-    def call(self, path, interface, method, signature, args, deadline):
+    def call(self, path, interface, method, signature, args, deadline, **options):
         self.calls.append((path, interface, method, signature, args, deadline))
         if self.late == method:
             self.time = deadline
         if method == "StartTransientUnit":
             return self.job
+        if method == "GetUnitByPIDFD":
+            if options != {"expected": "osay", "values": 3} or signature != "h":
+                raise AssertionError("unexpected GetUnitByPIDFD shape")
+            # Resolve the descriptor as the manager does: by the PID it names.
+            with open(f"/proc/self/fdinfo/{args[0]}") as info:
+                rows = [line.split()[1:] for line in info if line.startswith("Pid:")]
+            if rows != [[str(self.pidfd_pid)]]:
+                raise RuntimeError("user-bus error: NoUnitForPID")
+            unit = self.pidfd_unit or self.unit["Id"][1]
+            invocation = self.pidfd_invocation or bytes(self.unit["InvocationID"][1])
+            return self.path, unit, invocation
         if method == "GetUnit":
             return self.path
         if method == "GetAll" and args[0].endswith(".Unit"):
@@ -160,12 +176,17 @@ class BridgeTests(unittest.TestCase):
             ("PrivateMounts", ("b", True)),
             ("PrivateNetwork", ("b", True)),
             ("PrivateDevices", ("b", True)),
-            ("PrivatePIDs", ("s", "no")),
+            ("PrivatePIDs", ("s", "yes")),
+            ("ProcSubset", ("s", "pid")),
+            ("ProtectProc", ("s", "invisible")),
             ("MountAPIVFS", ("b", True)),
             ("BindLogSockets", ("b", False)),
             ("ProtectSystem", ("s", "strict")),
+            ("ProtectHome", ("s", "read-only")),
             ("ProtectKernelTunables", ("b", True)),
+            ("ProtectKernelLogs", ("b", True)),
             ("ProtectControlGroups", ("b", True)),
+            ("RestrictNamespaces", ("t", 0)),
             ("CapabilityBoundingSet", ("t", 0)),
             ("AmbientCapabilities", ("t", 0)),
             ("DevicePolicy", ("s", "closed")),
@@ -221,6 +242,15 @@ class BridgeTests(unittest.TestCase):
                         "-+/dev/hugepages",
                         "-+/sys/fs/selinux",
                         "-+/run/credentials",
+                        "-+/sys/firmware/efi/efivars",
+                        "-+/sys/fs/bpf",
+                        "-+/sys/fs/fuse/connections",
+                        "-+/sys/fs/pstore",
+                        "-+/sys/fs/smackfs",
+                        "-+/sys/kernel/config",
+                        "-+/sys/kernel/debug",
+                        "-+/sys/kernel/security",
+                        "-+/sys/kernel/tracing",
                     ],
                 ),
             ),
@@ -304,6 +334,75 @@ class BridgeTests(unittest.TestCase):
         self.bus.service["PrivateUsers"] = ("s", "yes")
         with self.assertRaises(ValueError):
             self.bridge.observe(self.fixture.config, self.fixture.manifest, 1000)
+
+    def test_observe_refuses_pid_kernel_view_and_namespace_profile_drift(self):
+        saved = copy.deepcopy(self.bus.service)
+        for name, value, message in (
+            ("PrivatePIDs", ("s", "no"), "effective root property: PrivatePIDs"),
+            ("ProcSubset", ("s", "all"), "effective root property: ProcSubset"),
+            ("ProtectProc", ("s", "default"), "effective root property: ProtectProc"),
+            ("ProcSubset", None, "missing rooted bus property: ProcSubset"),
+            ("ProtectHome", ("s", "no"), "effective root property: ProtectHome"),
+            (
+                "RestrictNamespaces",
+                ("t", 2**64 - 1),
+                "effective root property: RestrictNamespaces",
+            ),
+            (
+                "ProtectKernelLogs",
+                None,
+                "missing rooted bus property: ProtectKernelLogs",
+            ),
+        ):
+            self.bus.service = copy.deepcopy(saved)
+            if value is None:
+                del self.bus.service[name]
+            else:
+                self.bus.service[name] = value
+            with (
+                self.subTest(name=name, value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self.bridge.observe(self.fixture.config, self.fixture.manifest, 1000)
+
+    def test_process_invocation_names_only_the_configured_unit(self):
+        fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, fd)
+        invocation = self.bridge.process_invocation(
+            self.fixture.config, self.fixture.manifest, fd, 1000
+        )
+        self.assertEqual(invocation, "d" * 32)
+        call = self.bus.calls[-1]
+        self.assertEqual(call[2:5], ("GetUnitByPIDFD", "h", (fd,)))
+        self.assertEqual(
+            self.bridge.partial["pidfd_unit"],
+            (self.bus.path, self.fixture.service.unit, "d" * 32),
+        )
+        self.bus.pidfd_unit = "irlume-job-guardian-other.service"
+        with self.assertRaisesRegex(ValueError, "rooted service process unit"):
+            self.bridge.process_invocation(
+                self.fixture.config, self.fixture.manifest, fd, 1000
+            )
+        self.assertEqual(
+            self.bridge.partial["pidfd_unit"][1], "irlume-job-guardian-other.service"
+        )
+        self.bus.pidfd_unit, self.bus.pidfd_pid = None, os.getpid() + 1
+        with self.assertRaisesRegex(RuntimeError, "NoUnitForPID"):
+            self.bridge.process_invocation(
+                self.fixture.config, self.fixture.manifest, fd, 1000
+            )
+        self.bus.pidfd_pid, self.bus.fds = os.getpid(), False
+        calls = len(self.bus.calls)
+        with self.assertRaisesRegex(ValueError, "descriptor passing"):
+            self.bridge.process_invocation(
+                self.fixture.config, self.fixture.manifest, fd, 1000
+            )
+        self.assertEqual(len(self.bus.calls), calls)
+        self.bus.fds, self.bus.late = True, "GetUnitByPIDFD"
+        with self.assertRaises(TimeoutError):
+            self.bridge.process_invocation(
+                self.fixture.config, self.fixture.manifest, fd, 1000
+            )
 
     def test_late_start_retains_reply_and_creation_uncertainty(self):
         self.bus.late = "StartTransientUnit"

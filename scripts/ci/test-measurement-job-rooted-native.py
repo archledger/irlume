@@ -360,6 +360,9 @@ class EffectsTests(unittest.TestCase):
         self.assertEqual(collect.call_args.args[-1], self.deadline)
         self.assertIsNone(effects.attempt_fd)
 
+    # The manager's host number for G; G itself is PID 1 of its namespace.
+    HOST_PID = 4242
+
     def make_bus(self):
         bus = bus_fixtures.FakeBus(self.fixture)
         root = self.runtime.preflight.root
@@ -368,7 +371,7 @@ class EffectsTests(unittest.TestCase):
             "a(sasbttttuii)",
             [[argv[0], list(argv), False, 0, 0, 0, 0, 0, 0, 0]],
         )
-        bus.service["MainPID"] = ("u", os.getpid())
+        bus.service["MainPID"] = ("u", self.HOST_PID)
         now = time.monotonic_ns() // 1000
         bus.service["ExecMainStartTimestampMonotonic"] = ("t", now - 100)
         bus.unit["ActiveEnterTimestampMonotonic"] = ("t", now - 50)
@@ -377,47 +380,94 @@ class EffectsTests(unittest.TestCase):
         group = bus.service["ControlGroup"][1]
         return bus, group
 
-    def test_preflight_closes_bus_and_checks_exact_exec_and_placement(self):
-        bus, group = self.make_bus()
-        # A legacy net_cls hierarchy (VPN split tunnelling) beside the unified one.
+    def preflight(self, bus, *, cgroup=None, affinity=None, pid=1, ppid=0):
+        """Run preflight as the PID namespace init; host PIDs are never read."""
+        group = bus.service["ControlGroup"][1]
+        if cgroup is None:
+            cgroup = ("1:net_cls:/\n0::" + group + "\n").encode()
+        if affinity is None:
+            affinity = set(self.effects.spec.cpus)
+        real, opening = os.getpid(), os.pidfd_open
+        self.opened, self.started = [], []
+
+        def pidfd_open(target):
+            self.opened.append(target)
+            # Our own process stands in for G's namespace PID 1.
+            return opening(real if target == pid else target)
+
+        def start(target):
+            self.started.append(target)
+            if target != pid:
+                raise AssertionError("G read another process start")
+            return 123
+
         with (
-            mock.patch.object(native.service, "SystemdBus", return_value=bus),
-            mock.patch.object(
-                self.effects,
-                "read_cgroup",
-                return_value=("1:net_cls:/\n0::" + group + "\n").encode(),
-            ),
-            mock.patch.object(
-                rooted.os, "sched_getaffinity", return_value=set(self.effects.spec.cpus)
-            ),
-            mock.patch.object(
-                native,
-                "process_start",
-                side_effect=lambda pid: (
-                    self.fixture.client["starttime"]
-                    if pid == self.fixture.client["pid"]
-                    else 123
-                ),
-            ),
+            mock.patch.object(native.service, "SystemdBus", return_value=bus) as made,
+            mock.patch.object(self.effects, "read_cgroup", return_value=cgroup),
+            mock.patch.object(rooted.os, "sched_getaffinity", return_value=affinity),
+            mock.patch.object(rooted.os, "getpid", return_value=pid),
+            mock.patch.object(rooted.os, "getppid", return_value=ppid),
+            mock.patch.object(rooted.os, "pidfd_open", side_effect=pidfd_open),
+            mock.patch.object(native, "process_start", side_effect=start),
         ):
-            identity, start = self.effects.preflight(
-                self.config, self.manifest, self.deadline
-            )
-        self.assertEqual(identity.pid, os.getpid())
+            self.made = made
+            return self.effects.preflight(self.config, self.manifest, self.deadline)
+
+    def test_preflight_closes_bus_and_checks_exact_exec_and_placement(self):
+        bus, _ = self.make_bus()
+        before = set(os.listdir("/proc/self/fd"))
+        identity, start = self.preflight(bus)
+        # The binding PID is the manager's MainPID, the same number H binds.
+        self.assertEqual(identity.pid, self.HOST_PID)
+        self.assertEqual(identity.invocation_id, "d" * 32)
         self.assertEqual(start, 123)
+        self.assertEqual(self.started, [1])
+        self.assertEqual(self.opened, [1])
+        self.made.assert_called_once_with(os.getuid(), deadline=self.deadline, fds=True)
+        call = next(c for c in bus.calls if c[2] == "GetUnitByPIDFD")
+        self.assertEqual(call[3], "h")
+        self.assertEqual(set(os.listdir("/proc/self/fd")), before)
         bus.close.assert_called_once()
         self.assertIsNone(self.effects.attempt_fd)
 
-    def test_preflight_refuses_argv_placement_and_client_changes_after_bus_close(self):
+    def test_preflight_requires_the_pid_namespace_init_before_the_bus(self):
+        for pid, ppid in ((2, 0), (1, 7), (os.getpid(), os.getppid())):
+            bus, _ = self.make_bus()
+            with (
+                self.subTest(pid=pid, ppid=ppid),
+                self.assertRaisesRegex(ValueError, "PID namespace init"),
+            ):
+                self.preflight(bus, pid=pid, ppid=ppid)
+            self.made.assert_not_called()
+            self.assertEqual((self.opened, self.started), ([], []))
+
+    def test_preflight_binds_its_own_pidfd_to_the_observed_invocation(self):
         cases = (
-            "argv",
-            "cgroup",
-            "v1-only",
-            "two-unified",
-            "parent",
-            "affinity",
-            "client",
+            ("unit", "rooted service process unit", ValueError),
+            ("invocation", "not the observed invocation", ValueError),
+            ("foreign", "NoUnitForPID", RuntimeError),
+            ("main-pid", "", ValueError),
+            ("init-pid", "", ValueError),
         )
+        for case, message, error in cases:
+            bus, _ = self.make_bus()
+            if case == "unit":
+                bus.pidfd_unit = "irlume-job-guardian-other.service"
+            elif case == "invocation":
+                bus.pidfd_invocation = bytes.fromhex("e" * 32)
+            elif case == "foreign":
+                bus.pidfd_pid = os.getpid() + 1
+            else:
+                bus.service["MainPID"] = ("u", 0 if case == "main-pid" else 1)
+            before = set(os.listdir("/proc/self/fd"))
+            with self.subTest(case=case), self.assertRaisesRegex(error, message):
+                self.preflight(bus)
+            self.assertEqual(set(os.listdir("/proc/self/fd")), before)
+            bus.close.assert_called_once()
+            self.assertEqual(self.started, [])
+
+    def test_preflight_refuses_argv_and_placement_changes_after_bus_close(self):
+        cases = ("argv", "cgroup", "v1-only", "two-unified", "parent", "affinity")
         for case in cases:
             bus, group = self.make_bus()
             if case == "argv":
@@ -430,32 +480,32 @@ class EffectsTests(unittest.TestCase):
                 "v1-only": b"1:net_cls:/\n",
                 "two-unified": ("0::" + group + "\n0::/other\n").encode(),
                 "parent": ("0::" + group.rsplit("/", 1)[0] + "\n").encode(),
-            }.get(case, ("1:net_cls:/\n0::" + group + "\n").encode())
-            affinity = set() if case == "affinity" else set(self.effects.spec.cpus)
-
-            def start(pid, case=case):
-                return (
-                    self.fixture.client["starttime"] + (case == "client")
-                    if pid == self.fixture.client["pid"]
-                    else 123
-                )
-
-            with (
-                mock.patch.object(native.service, "SystemdBus", return_value=bus),
-                mock.patch.object(self.effects, "read_cgroup", return_value=cgroup),
-                mock.patch.object(
-                    rooted.os, "sched_getaffinity", return_value=affinity
-                ),
-                mock.patch.object(native, "process_start", side_effect=start),
-                self.subTest(case=case),
-                self.assertRaises(ValueError),
-            ):
-                self.effects.preflight(self.config, self.manifest, self.deadline)
+            }.get(case)
+            affinity = set() if case == "affinity" else None
+            with self.subTest(case=case), self.assertRaises(ValueError):
+                self.preflight(bus, cgroup=cgroup, affinity=affinity)
             bus.close.assert_called_once()
+
+    def test_preflight_never_reads_the_client_process(self):
+        # G's proc lists only its own namespace; the client is H's to check.
+        bus, _ = self.make_bus()
+        client = self.fixture.client
+        self.assertNotEqual(client["pid"], 1)
+        self.preflight(bus)
+        self.assertNotIn(client["pid"], self.started)
+        self.assertNotIn(client["pid"], self.opened)
+
+    def as_init(self):
+        """G's view of itself under PrivatePIDs=yes."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(rooted.os, "getpid", return_value=1))
+        stack.enter_context(mock.patch.object(rooted.os, "getppid", return_value=0))
+        return stack
 
     def test_bus_is_closed_if_bridge_construction_fails(self):
         bus = mock.Mock()
         with (
+            self.as_init(),
             mock.patch.object(native.service, "SystemdBus", return_value=bus),
             mock.patch.object(
                 self.runtime.bus_bridge,
@@ -473,6 +523,7 @@ class EffectsTests(unittest.TestCase):
         bridge = mock.Mock()
         bridge.observe.side_effect = ValueError("observation failed")
         with (
+            self.as_init(),
             mock.patch.object(native.service, "SystemdBus", return_value=bus),
             mock.patch.object(
                 self.runtime.bus_bridge, "RootedBus", return_value=bridge
@@ -488,6 +539,7 @@ class EffectsTests(unittest.TestCase):
     def test_suboperations_cannot_extend_the_configuration_deadline(self):
         later = self.deadline + 5_000_000_000
         with (
+            self.as_init(),
             mock.patch.object(
                 native.service,
                 "SystemdBus",
@@ -506,7 +558,7 @@ class EffectsTests(unittest.TestCase):
         channel.send.assert_called_once_with(b"data", self.deadline)
         channel.require_idle.assert_called_once_with(self.deadline)
 
-    def test_same_pid_with_different_starttime_refuses_after_channel_creation(self):
+    def control_socket(self):
         fd = self.open_attempt()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(listener.close)
@@ -514,13 +566,18 @@ class EffectsTests(unittest.TestCase):
         (self.path / "control.sock").chmod(0o600)
         wire = mock.Mock()
         wire.connect_ex.return_value = 0
-        channel = mock.Mock()
-        checks = []
-        channel.check.side_effect = lambda deadline: checks.append("alive")
+        return fd, wire
 
-        def changed_start(pid):
-            checks.append("starttime")
-            return self.fixture.client["starttime"] + 1
+    def test_host_peer_is_expected_outside_the_pid_namespace(self):
+        fd, wire = self.control_socket()
+        channel = mock.Mock()
+        sequence = []
+        channel.check.side_effect = lambda deadline: sequence.append("alive")
+        stating = os.stat
+
+        def stat_socket(*args, **kwargs):
+            sequence.append("socket")
+            return stating(*args, **kwargs)
 
         with (
             mock.patch.object(rooted.socket, "socket", return_value=wire),
@@ -529,24 +586,50 @@ class EffectsTests(unittest.TestCase):
                 "PeerChannel",
                 return_value=channel,
             ) as construct,
+            mock.patch.object(rooted.os, "stat", side_effect=stat_socket),
             mock.patch.object(
                 native,
                 "process_start",
-                side_effect=changed_start,
+                side_effect=AssertionError("G read a host process"),
             ),
-            self.assertRaises(ValueError),
         ):
             self.effects.connect(self.config, self.deadline)
-        self.assertEqual(channel.check.call_count, 2)
-        self.assertEqual(checks, ["alive", "starttime", "alive"])
+        # SO_PEERCRED gives PID 0 for any peer outside G's namespace.
         construct.assert_called_once_with(
-            wire,
-            (
-                self.fixture.client["pid"],
-                self.fixture.client["uid"],
-                self.fixture.client["gid"],
-            ),
+            wire, (0, self.fixture.client["uid"], self.fixture.client["gid"])
         )
+        self.assertEqual(sequence, ["socket", "alive", "socket", "alive"])
+        channel.receive.assert_not_called()
+        self.effects.close_control()
+        channel.close.assert_called_once()
+        self.assertGreater(os.fstat(fd).st_ino, 0)
+
+    def test_control_socket_replaced_during_connect_prevents_exchange(self):
+        fd, wire = self.control_socket()
+        channel = mock.Mock()
+        stating, seen = os.stat, []
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(replacement.close)
+
+        def replace_after_connect(*args, **kwargs):
+            seen.append(args)
+            if len(seen) == 2:
+                (self.path / "control.sock").unlink()
+                replacement.bind(str(self.path / "control.sock"))
+                (self.path / "control.sock").chmod(0o600)
+            return stating(*args, **kwargs)
+
+        with (
+            mock.patch.object(rooted.socket, "socket", return_value=wire),
+            mock.patch.object(
+                self.runtime.preflight.root.guardian,
+                "PeerChannel",
+                return_value=channel,
+            ),
+            mock.patch.object(rooted.os, "stat", side_effect=replace_after_connect),
+            self.assertRaisesRegex(ValueError, "rooted control socket replaced"),
+        ):
+            self.effects.connect(self.config, self.deadline)
         channel.receive.assert_not_called()
         channel.send.assert_not_called()
         self.effects.close_control()
@@ -624,24 +707,15 @@ class EffectsTests(unittest.TestCase):
         self.effects.close_control()
         wire.close.assert_called_once()
 
-    def test_peer_death_after_matching_starttime_prevents_exchange(self):
-        fd = self.open_attempt()
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.addCleanup(listener.close)
-        listener.bind(str(self.path / "control.sock"))
-        (self.path / "control.sock").chmod(0o600)
-        wire, channel = mock.Mock(), mock.Mock()
-        wire.connect_ex.return_value = 0
+    def test_peer_death_after_socket_recheck_prevents_exchange(self):
+        fd, wire = self.control_socket()
+        channel = mock.Mock()
         sequence = []
 
         def alive(deadline):
             sequence.append("alive")
-            if len(sequence) == 3:
+            if len(sequence) == 2:
                 raise ConnectionError("peer exited")
-
-        def same_start(pid):
-            sequence.append("starttime")
-            return self.fixture.client["starttime"]
 
         channel.check.side_effect = alive
         with (
@@ -651,11 +725,10 @@ class EffectsTests(unittest.TestCase):
                 "PeerChannel",
                 return_value=channel,
             ),
-            mock.patch.object(native, "process_start", side_effect=same_start),
             self.assertRaises(ConnectionError),
         ):
             self.effects.connect(self.config, self.deadline)
-        self.assertEqual(sequence, ["alive", "starttime", "alive"])
+        self.assertEqual(sequence, ["alive", "alive"])
         channel.receive.assert_not_called()
         channel.send.assert_not_called()
         self.effects.close_control()

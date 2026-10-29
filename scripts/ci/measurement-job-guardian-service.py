@@ -352,6 +352,7 @@ class UnitLease:
     A timed-out creation can still have created a service. Such a lease remains
     unresolved and cannot be retried or treated as a missing unit. The private
     bus connection owns AddRef until verified terminal evidence is persisted.
+    A created lease can stop only the exact invocation it bound or observed.
     """
 
     def __init__(self, name, bus, now=time.monotonic_ns):
@@ -373,6 +374,8 @@ class UnitLease:
         self.last_processes = None
         self.terminal = False
         self.close_attempted = False
+        self.stop_attempted = False
+        self.stop_reply = None
         self.previous = None
 
     def check(self, deadline):
@@ -455,13 +458,33 @@ class UnitLease:
         if row.get("ControlGroup") not in (self.bound["ControlGroup"], ""):
             raise ValueError("changed service cgroup")
 
+    def cleanup_identity(self):
+        # A created service refused before binding is still this lease's to stop.
+        row = self.bound if self.bound is not None else self.last_observation
+        if (
+            not self.created
+            or type(row) is not dict
+            or row.get("Id") != self.name
+            or type(row.get("InvocationID")) is not str
+            or re.fullmatch("[0-9a-f]{32}", row["InvocationID"]) is None
+            or row["InvocationID"] == "0" * 32
+        ):
+            raise ValueError("service invocation not established")
+        return {"Id": row["Id"], "InvocationID": row["InvocationID"]}
+
     def stop(self, deadline):
-        if self.bound is None or not self.created or self.close_attempted:
-            raise ValueError("cannot stop unbound service")
+        if self.close_attempted:
+            raise ValueError("cannot stop released service")
+        identity = self.cleanup_identity()
         row = self.observe(deadline)
-        self.same_invocation(row)
+        if type(row) is not dict or any(row.get(k) != v for k, v in identity.items()):
+            raise ValueError("lost service invocation")
+        if self.bound is not None:
+            self.same_invocation(row)
         self.unresolved = True
-        self.bus.stop(self.name, deadline)
+        self.stop_attempted = True
+        # As with creation, keep a late reply as evidence before checking time.
+        self.stop_reply = self.bus.stop(self.name, deadline)
         self.check(deadline)
 
     def verify_terminal(self, deadline, acceptance_deadline):

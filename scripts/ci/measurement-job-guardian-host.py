@@ -538,11 +538,8 @@ class HostEffects:
             self.close_channels()
         except CLEANUP_FAILURES as error:
             errors.append(error)
-        if (
-            self.lease is not None
-            and self.lease.bound is not None
-            and not self.lease.terminal
-        ):
+        # A created service is stopped even when it was refused before binding.
+        if self.lease is not None and self.lease.created and not self.lease.terminal:
             try:
                 self.lease.stop(deadline)
             except CLEANUP_FAILURES as error:

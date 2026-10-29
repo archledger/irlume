@@ -5,6 +5,7 @@
 
 import hashlib
 import importlib.util
+import json
 import os
 import time
 import types
@@ -90,6 +91,51 @@ class LeaseBusTests(unittest.TestCase):
         self.bus.observe = mock.Mock(return_value=replacement)
         with self.assertRaises(ValueError):
             self.adapter.observe(self.adapter.name, 10_000_000_000)
+
+    def test_cleanup_pin_takes_one_exact_raw_observation(self):
+        row = {"Id": self.adapter.name, "InvocationID": "d" * 32}
+        unit = dict(
+            row,
+            Transient=True,
+            ExecStart=((self.adapter.argv[0], self.adapter.argv, False),),
+        )
+        self.bus.observe = mock.Mock(return_value=dict(unit, ActiveState="active"))
+        self.assertEqual(self.adapter.pin_cleanup(10_000_000_000), row)
+        self.bus.observe.assert_called_once_with(self.adapter.name, 10_000_000_000)
+        with self.assertRaisesRegex(ValueError, "rooted cleanup binding"):
+            self.adapter.pin_cleanup(10_000_000_000)
+        self.bus.observe.assert_called_once()
+        for wrong in (
+            {"Id": self.adapter.name + "x"},
+            {"InvocationID": "0" * 32},
+            {"Transient": False},
+            {"ExecStart": (("/usr/bin/other", ("/usr/bin/other",), False),)},
+        ):
+            adapter = host.LeaseBus(
+                self.config, self.fixture.manifest, self.support, self.bus
+            )
+            self.bus.observe = mock.Mock(return_value=dict(unit, **wrong))
+            with self.subTest(wrong=wrong), self.assertRaises(ValueError):
+                adapter.pin_cleanup(10_000_000_000)
+            self.assertIsNone(adapter.cleanup_binding)
+
+
+class BootIdentityTests(unittest.TestCase):
+    def test_boot_identity_is_one_lowercase_uuid_line(self):
+        good = b"0123abcd-4567-89ef-0123-456789abcdef"
+        with mock.patch.object(
+            host, "open", mock.mock_open(read_data=good + b"\n"), create=True
+        ):
+            self.assertEqual(host.boot_id(), good.decode())
+        for data in (b"", good, good.upper() + b"\n", good + b"\n\n", b"x" + good):
+            with (
+                self.subTest(data=data),
+                mock.patch.object(
+                    host, "open", mock.mock_open(read_data=data), create=True
+                ),
+                self.assertRaisesRegex(ValueError, "host boot identity"),
+            ):
+                host.boot_id()
 
 
 class FactoryTests(unittest.TestCase):
@@ -455,6 +501,313 @@ class FactoryTests(unittest.TestCase):
             [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in retained], identities
         )
         self.owner.inputs.recheck(deadline + self.root.guardian.STOP_NS)
+        self.assertNotIn("StopUnit", [call[2] for call in bus.calls])
+        record = self.failure_record()
+        self.assertEqual(
+            {key: record[key] for key in self.STOP_FIELDS},
+            {
+                "creation_attempted": True,
+                "created": False,
+                "creation_reply": bus.job,
+                "invocation_id": None,
+                "invocation_source": None,
+                "observed": None,
+                "stop_attempted": False,
+                "stop_reply": None,
+                "stop_error": None,
+                "cleanup_errors": [],
+            },
+        )
+
+    STOP_FIELDS = (
+        "creation_attempted",
+        "created",
+        "creation_reply",
+        "invocation_id",
+        "invocation_source",
+        "observed",
+        "stop_attempted",
+        "stop_reply",
+        "stop_error",
+        "cleanup_errors",
+    )
+
+    def failure_record(self):
+        data = (self.gate_path / f"failed-{self.spec.run_id}.json").read_bytes()
+        record = json.loads(data)
+        self.assertEqual(self.root.closure.canonical(record), data)
+        self.assertEqual(record["scope"], "contained-job-rooted-host-failure-v2")
+        self.assertEqual(record["run_id"], self.spec.run_id)
+        self.assertEqual(record["admission_state"], "present")
+        self.assertEqual(
+            record["boot_id"],
+            Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        )
+        self.assertIs(record["native_authorized"], False)
+        self.assertIs(record["full_contract_proven"], False)
+        return record
+
+    def refused_service(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        # A third CPU in the effective mask refuses the service before binding.
+        bus.service["CPUAffinity"] = ("ay", [7])
+        bus.stop = mock.Mock(return_value="/org/freedesktop/systemd1/job/77")
+        with self.assertRaisesRegex(ValueError, "CPUAffinity"):
+            self.owner.start(self.owner.config, deadline)
+        self.assertTrue(self.owner.lease.created)
+        self.assertIsNone(self.owner.lease.bound)
+        return bus, deadline + self.root.guardian.STOP_NS
+
+    def assert_blocker_and_reference_retained(self, bus):
+        self.assertTrue((self.gate_path / "active.json").is_file())
+        self.assertIsNotNone(self.owner.gate.lock_fd)
+        self.assertIs(host.UNRESOLVED[self.spec.run_id], self.owner)
+        bus.close.assert_not_called()
+
+    def test_abort_stops_created_service_refused_before_binding(self):
+        bus, end = self.refused_service()
+        self.owner.abort(self.owner.config, None, "ValueError", end)
+        bus.stop.assert_called_once_with(
+            self.owner.adapter.name, end - host.FAILURE_RECORD_NS
+        )
+        record = self.failure_record()
+        self.assertEqual(
+            {key: record[key] for key in self.STOP_FIELDS},
+            {
+                "creation_attempted": True,
+                "created": True,
+                "creation_reply": bus.job,
+                "invocation_id": "d" * 32,
+                "invocation_source": "observation",
+                "observed": {
+                    "Id": self.owner.adapter.name,
+                    "InvocationID": "d" * 32,
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": bus.service["MainPID"][1],
+                    "ControlGroup": bus.service["ControlGroup"][1],
+                    "ExecMainStartTimestampMonotonic": bus.service[
+                        "ExecMainStartTimestampMonotonic"
+                    ][1],
+                },
+                "stop_attempted": True,
+                "stop_reply": "/org/freedesktop/systemd1/job/77",
+                "stop_error": None,
+                "cleanup_errors": [],
+            },
+        )
+        self.assertIsNone(self.owner.lease.bound)
+        self.assert_blocker_and_reference_retained(bus)
+
+    def test_abort_never_stops_a_changed_invocation_refused_before_binding(self):
+        bus, end = self.refused_service()
+        bus.unit["InvocationID"] = bus.variant("ay", tuple(bytes.fromhex("e" * 32)))
+        bus.after = dict(bus.unit)
+        with self.assertRaisesRegex(ValueError, "lost invocation"):
+            self.owner.abort(self.owner.config, None, "ValueError", end)
+        bus.stop.assert_not_called()
+        record = self.failure_record()
+        self.assertEqual(record["invocation_id"], "d" * 32)
+        self.assertEqual(record["invocation_source"], "observation")
+        self.assertEqual(record["observed"]["InvocationID"], "d" * 32)
+        self.assertIs(record["stop_attempted"], False)
+        self.assertIsNone(record["stop_reply"])
+        self.assertEqual(record["stop_error"], "ValueError")
+        self.assertEqual(record["cleanup_errors"], ["ValueError"])
+        self.assert_blocker_and_reference_retained(bus)
+
+    def test_abort_after_terminal_proof_records_invocation_without_stop(self):
+        bus, _ = self.terminal_owner()
+        bus.stop = mock.Mock(side_effect=AssertionError("terminal stop"))
+        self.owner.abort(
+            self.owner.config,
+            self.owner.identity,
+            "OSError",
+            self.owner.value["startup_deadline_ns"] + self.root.guardian.STOP_NS,
+        )
+        bus.stop.assert_not_called()
+        record = self.failure_record()
+        self.assertEqual(record["invocation_id"], "d" * 32)
+        self.assertEqual(record["invocation_source"], "bound")
+        self.assertIs(record["stop_attempted"], False)
+        self.assertIsNone(record["stop_error"])
+        self.assertEqual(record["cleanup_errors"], [])
+
+    def test_abort_never_redirects_a_bound_invocation_to_a_later_one(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        bus.stop = mock.Mock(side_effect=AssertionError("redirected stop"))
+        self.owner.start(self.owner.config, deadline)
+        bus.unit["InvocationID"] = bus.variant("ay", tuple(bytes.fromhex("e" * 32)))
+        bus.after = dict(bus.unit)
+        self.owner.lease.observe(deadline)
+        end = deadline + self.root.guardian.STOP_NS
+        with self.assertRaisesRegex(ValueError, "lost invocation"):
+            self.owner.abort(self.owner.config, self.owner.identity, "ValueError", end)
+        bus.stop.assert_not_called()
+        record = self.failure_record()
+        self.assertEqual(record["invocation_id"], "d" * 32)
+        self.assertEqual(record["invocation_source"], "bound")
+        self.assertEqual(record["observed"]["InvocationID"], "e" * 32)
+        self.assertIs(record["stop_attempted"], False)
+        self.assertEqual(record["stop_error"], "ValueError")
+        self.assert_blocker_and_reference_retained(bus)
+
+    def unobserved_service(self, trigger):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        if trigger == "changed":
+            # The first observation straddles activating -> active.
+            bus.unit.update(
+                ActiveState=bus.variant("s", "activating"),
+                SubState=bus.variant("s", "start"),
+            )
+            error = (ValueError, "changed during observation")
+        else:
+            bus.late = "GetUnit"
+            error = (TimeoutError, "")
+        bus.stop = mock.Mock(return_value="/org/freedesktop/systemd1/job/77")
+        with self.assertRaisesRegex(*error):
+            self.owner.start(self.owner.config, deadline)
+        self.assertTrue(self.owner.lease.created)
+        self.assertIsNone(self.owner.lease.last_observation)
+        return bus, deadline + self.root.guardian.STOP_NS
+
+    def assert_unobserved_service_stopped(self, trigger):
+        bus, end = self.unobserved_service(trigger)
+        self.owner.abort(self.owner.config, None, "ValueError", end)
+        bus.stop.assert_called_once_with(
+            self.owner.adapter.name, end - host.FAILURE_RECORD_NS
+        )
+        self.assertEqual(
+            self.owner.adapter.cleanup_binding,
+            {"Id": self.owner.adapter.name, "InvocationID": "d" * 32},
+        )
+        record = self.failure_record()
+        self.assertEqual(
+            {key: record[key] for key in self.STOP_FIELDS},
+            {
+                "creation_attempted": True,
+                "created": True,
+                "creation_reply": bus.job,
+                "invocation_id": "d" * 32,
+                "invocation_source": "cleanup",
+                "observed": None,
+                "stop_attempted": True,
+                "stop_reply": "/org/freedesktop/systemd1/job/77",
+                "stop_error": None,
+                "cleanup_errors": [],
+            },
+        )
+        self.assert_blocker_and_reference_retained(bus)
+
+    def test_abort_stops_created_service_refused_inside_first_observation(self):
+        self.assert_unobserved_service_stopped("changed")
+
+    def test_abort_stops_created_service_whose_first_observation_timed_out(self):
+        self.assert_unobserved_service_stopped("late")
+
+    def stalled_cleanup_observation(self, stall_at):
+        bus, end = self.unobserved_service("late")
+        clock, deadlines, observe = [time.monotonic_ns()], [], bus.observe
+
+        def raw(name, deadline):
+            deadlines.append(deadline)
+            if len(deadlines) == stall_at:
+                clock[0] = deadline
+                raise TimeoutError("manager stalled")
+            return observe(name, deadline)
+
+        bus.observe = raw
+        with (
+            mock.patch.object(self.owner, "now", side_effect=lambda: clock[0]),
+            self.assertRaises(TimeoutError),
+        ):
+            self.owner.abort(self.owner.config, None, "TimeoutError", end)
+        self.assertEqual(deadlines, [end - host.FAILURE_RECORD_NS] * stall_at)
+        bus.stop.assert_not_called()
+        record = self.failure_record()
+        self.assertIs(record["stop_attempted"], False)
+        self.assertEqual(record["stop_error"], "TimeoutError")
+        self.assertEqual(record["cleanup_errors"], ["TimeoutError"])
+        self.assert_blocker_and_reference_retained(bus)
+        return record
+
+    def test_stalled_cleanup_pin_leaves_time_for_the_failure_record(self):
+        record = self.stalled_cleanup_observation(1)
+        self.assertIsNone(self.owner.adapter.cleanup_binding)
+        self.assertIsNone(record["invocation_id"])
+        self.assertIsNone(record["invocation_source"])
+
+    def test_stalled_observation_after_the_pin_keeps_the_pinned_invocation(self):
+        record = self.stalled_cleanup_observation(2)
+        self.assertEqual(self.owner.adapter.cleanup_binding["InvocationID"], "d" * 32)
+        self.assertEqual(record["invocation_id"], "d" * 32)
+        self.assertEqual(record["invocation_source"], "cleanup")
+
+    def test_invocation_changed_after_the_pin_is_recorded_but_never_stopped(self):
+        bus, end = self.unobserved_service("late")
+        observe, rows = bus.observe, []
+
+        def raw(name, deadline):
+            rows.append(observe(name, deadline))
+            if len(rows) > 1:
+                return dict(rows[-1], InvocationID="e" * 32)
+            return rows[-1]
+
+        bus.observe = raw
+        with self.assertRaisesRegex(ValueError, "rooted cleanup lost invocation"):
+            self.owner.abort(self.owner.config, None, "TimeoutError", end)
+        bus.stop.assert_not_called()
+        record = self.failure_record()
+        self.assertEqual(record["invocation_id"], "d" * 32)
+        self.assertEqual(record["invocation_source"], "cleanup")
+        self.assertIs(record["stop_attempted"], False)
+        self.assertEqual(record["stop_error"], "ValueError")
+        self.assert_blocker_and_reference_retained(bus)
+
+    def test_cleanup_pin_refuses_an_anonymous_invocation(self):
+        bus, end = self.unobserved_service("changed")
+        bus.after["InvocationID"] = bus.variant("ay", tuple(bytes(16)))
+        with self.assertRaisesRegex(ValueError, "rooted cleanup invocation"):
+            self.owner.abort(self.owner.config, None, "ValueError", end)
+        bus.stop.assert_not_called()
+        self.assertIsNone(self.owner.adapter.cleanup_binding)
+        record = self.failure_record()
+        self.assertIsNone(record["invocation_id"])
+        self.assertIsNone(record["invocation_source"])
+        self.assertIs(record["stop_attempted"], False)
+        self.assertEqual(record["stop_error"], "ValueError")
+        self.assert_blocker_and_reference_retained(bus)
+
+    def test_stalled_stop_leaves_time_for_the_failure_record(self):
+        bus, end = self.refused_service()
+        clock = [time.monotonic_ns()]
+
+        def stalled(name, deadline):
+            clock[0] = deadline
+            raise TimeoutError("stop reply lost")
+
+        bus.stop = mock.Mock(side_effect=stalled)
+        with (
+            mock.patch.object(self.owner, "now", side_effect=lambda: clock[0]),
+            self.assertRaises(TimeoutError),
+        ):
+            self.owner.abort(self.owner.config, None, "ValueError", end)
+        self.assertEqual(clock[0], end - host.FAILURE_RECORD_NS)
+        record = self.failure_record()
+        self.assertIs(record["stop_attempted"], True)
+        self.assertIsNone(record["stop_reply"])
+        self.assertEqual(record["stop_error"], "TimeoutError")
+        self.assertEqual(record["cleanup_errors"], ["TimeoutError"])
+        self.assert_blocker_and_reference_retained(bus)
 
     def test_successful_gate_close_crossing_completion_deadline_refuses(self):
         _, record = self.terminal_owner()

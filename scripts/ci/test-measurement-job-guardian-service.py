@@ -12,6 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from threading import Event, Thread
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location(
@@ -418,6 +419,7 @@ class Bus:
 
     def stop(self, name, deadline):
         self.calls.append(("stop", name, deadline))
+        return "/org/freedesktop/systemd1/job/43"
 
     def close(self):
         self.calls.append(("close",))
@@ -509,6 +511,100 @@ class LeaseTests(unittest.TestCase):
             lease.stop(100)
         self.assertEqual(len([c for c in bus.calls if c[0] == "stop"]), 1)
 
+    def test_observed_unbound_invocation_is_stopped_only_while_unchanged(self):
+        for change in (
+            {},
+            {"InvocationID": "b" * 32},
+            {"Id": "irlume-job-guardian-x.service"},
+        ):
+            bus, lease = self.lease()
+            lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+            lease.observe(100)
+            self.assertEqual(
+                lease.cleanup_identity(),
+                {"Id": bus.row["Id"], "InvocationID": "a" * 32},
+            )
+            bus.row.update(change)
+            with self.subTest(change=change):
+                if change:
+                    with self.assertRaisesRegex(ValueError, "lost service invocation"):
+                        lease.stop(100)
+                    self.assertNotIn("stop", [call[0] for call in bus.calls])
+                    self.assertFalse(lease.stop_attempted)
+                    self.assertFalse(lease.unresolved)
+                    continue
+                lease.stop(100)
+                self.assertIsNone(lease.bound)
+                self.assertEqual(bus.calls[-1], ("stop", bus.row["Id"], 100))
+                self.assertTrue(lease.stop_attempted)
+                self.assertTrue(lease.unresolved)
+                self.assertEqual(lease.stop_reply, "/org/freedesktop/systemd1/job/43")
+
+    def test_unobserved_or_anonymous_invocation_cannot_be_stopped(self):
+        changes = {
+            "unobserved": None,
+            "zero": lambda row: row.update(InvocationID="0" * 32),
+            "missing": lambda row: row.pop("InvocationID"),
+            "upper": lambda row: row.update(InvocationID="A" * 32),
+            "short": lambda row: row.update(InvocationID="a" * 31),
+            "bytes": lambda row: row.update(InvocationID=b"\xaa" * 16),
+            "other-unit": lambda row: row.update(Id="irlume-job-guardian-x.service"),
+        }
+        for label, change in changes.items():
+            bus, lease = self.lease()
+            lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+            if change is not None:
+                change(bus.row)
+                lease.observe(100)
+            calls = list(bus.calls)
+            with self.subTest(label), self.assertRaisesRegex(ValueError, "established"):
+                lease.stop(100)
+            self.assertEqual(bus.calls, calls)
+            self.assertFalse(lease.stop_attempted)
+            self.assertFalse(lease.unresolved)
+        bus, lease = self.lease()
+        bus.failure = TimeoutError("reply lost after creation")
+        with self.assertRaises(TimeoutError):
+            lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+        bus.failure = None
+        lease.observe(100)
+        with self.assertRaisesRegex(ValueError, "established"):
+            lease.stop(100)
+        self.assertNotIn("stop", [call[0] for call in bus.calls])
+        self.assertFalse(lease.stop_attempted)
+
+    def test_bound_invocation_outranks_a_later_changed_observation(self):
+        bus, lease = self.lease()
+        lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+        lease.bind(lease.observe(100))
+        bus.row["InvocationID"] = "b" * 32
+        lease.observe(100)
+        self.assertEqual(lease.cleanup_identity()["InvocationID"], "a" * 32)
+        with self.assertRaisesRegex(ValueError, "lost service invocation"):
+            lease.stop(100)
+        self.assertNotIn("stop", [call[0] for call in bus.calls])
+        self.assertFalse(lease.stop_attempted)
+
+    def test_stop_request_failure_or_late_reply_stays_unresolved(self):
+        bus, lease = self.lease()
+        lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+        lease.observe(100)
+        bus.stop = mock.Mock(side_effect=TimeoutError("stop reply lost"))
+        with self.assertRaises(TimeoutError):
+            lease.stop(100)
+        bus.stop.assert_called_once_with(bus.row["Id"], 100)
+        self.assertTrue(lease.stop_attempted)
+        self.assertIsNone(lease.stop_reply)
+        self.assertTrue(lease.unresolved)
+        bus, lease = self.lease()
+        lease.create({"AddRef": True}, ("/fixed/entry",), 100)
+        lease.observe(100)
+        lease.now = iter((10, 10, 100)).__next__
+        with self.assertRaises(TimeoutError):
+            lease.stop(100)
+        self.assertEqual(lease.stop_reply, "/org/freedesktop/systemd1/job/43")
+        self.assertTrue(lease.unresolved)
+
     def test_returned_creation_and_observations_survive_post_call_expiry(self):
         _, lease = self.lease()
         times = iter((10, 100))
@@ -536,6 +632,9 @@ class LeaseTests(unittest.TestCase):
         )
         lease.verify_terminal(100, 100_000)
         lease.release(100)
+        self.assertEqual(bus.calls[-1], ("close",))
+        with self.assertRaisesRegex(ValueError, "released"):
+            lease.stop(100)
         self.assertEqual(bus.calls[-1], ("close",))
 
 

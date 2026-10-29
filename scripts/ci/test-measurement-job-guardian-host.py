@@ -191,6 +191,37 @@ class Effects:
         self.step("abort")
 
 
+class CreationBus:
+    def __init__(self, **effective):
+        self.effective, self.stops = effective, []
+
+    def start(self, name, properties, argv, deadline):
+        self.created = (name, properties, argv, deadline)
+        now = time.monotonic_ns() // 1000
+        self.row = {
+            **{k: v for k, v in properties.items() if k != "AddRef"},
+            "Id": name,
+            "InvocationID": "a" * 32,
+            "MainPID": 4200,
+            "ControlGroup": f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/"
+            + name,
+            "ExecMainStartTimestampMonotonic": now,
+            "ActiveEnterTimestampMonotonic": now,
+            "ActiveState": "active",
+            "SubState": "running",
+            "Transient": True,
+            "ExecStart": ((argv[0], argv, False),),
+            **self.effective,
+        }
+        return "/org/freedesktop/systemd1/job/42"
+
+    def observe(self, name, deadline):
+        return dict(self.row)
+
+    def stop(self, name, deadline):
+        self.stops.append(name)  # This is a fake bus: no unit was created.
+
+
 class HostTests(unittest.TestCase):
     def test_success_clears_gate_only_after_closed_receipt_and_terminal_unit(self):
         spec = specification()
@@ -359,6 +390,7 @@ class NativeHostTests(unittest.TestCase):
 
                 effects.lease = SimpleNamespace(
                     terminal=True,
+                    created=True,
                     bound=None,
                     release=failed_release,
                     creation_reply="job",
@@ -498,34 +530,8 @@ class NativeHostTests(unittest.TestCase):
     def test_concrete_creation_uses_addref_and_binds_exact_snapshot(self):
         spec = specification()
 
-        class Bus:
-            def start(self, name, properties, argv, deadline):
-                self.created = (name, properties, argv, deadline)
-                now = time.monotonic_ns() // 1000
-                self.row = {
-                    **{k: v for k, v in properties.items() if k != "AddRef"},
-                    "Id": name,
-                    "InvocationID": "a" * 32,
-                    "MainPID": 4200,
-                    "ControlGroup": f"/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/"
-                    + name,
-                    "ExecMainStartTimestampMonotonic": now,
-                    "ActiveEnterTimestampMonotonic": now,
-                    "ActiveState": "active",
-                    "SubState": "running",
-                    "Transient": True,
-                    "ExecStart": ((argv[0], argv, False),),
-                }
-                return "/org/freedesktop/systemd1/job/42"
-
-            def observe(self, name, deadline):
-                return dict(self.row)
-
-            def stop(self, name, deadline):
-                pass  # This is a fake bus: no unit was created.
-
         with tempfile.TemporaryDirectory() as directory:
-            bus = Bus()
+            bus = CreationBus()
             effects = host.HostEffects(
                 spec,
                 _gate_factory=lambda deadline: host.native.service.AdmissionGate(
@@ -543,6 +549,34 @@ class NativeHostTests(unittest.TestCase):
                 self.assertIsNotNone(effects.lease.bound)
             finally:
                 effects.abort({"state": "test-abort"}, end)
+            self.assertEqual(bus.stops, [host.g.unit_name(spec)])
+            host.UNRESOLVED.clear()
+
+    def test_abort_stops_created_service_refused_before_binding(self):
+        spec = specification()
+        # A third CPU in the effective mask refuses the service before binding.
+        bus = CreationBus(CPUAffinity=(7,))
+        with tempfile.TemporaryDirectory() as directory:
+            effects = host.HostEffects(
+                spec,
+                _gate_factory=lambda deadline: host.native.service.AdmissionGate(
+                    Path(directory), deadline
+                ),
+                _bus_factory=lambda uid, deadline: bus,
+            )
+            end = time.monotonic_ns() + 3_000_000_000
+            try:
+                effects.prepare(spec, time.monotonic_ns(), end)
+                with self.assertRaisesRegex(ValueError, "CPUAffinity"):
+                    effects.start_service(spec, end)
+                self.assertTrue(effects.lease.created)
+                self.assertIsNone(effects.lease.bound)
+            finally:
+                effects.abort({"state": "test-abort"}, end)
+            self.assertEqual(bus.stops, [host.g.unit_name(spec)])
+            self.assertTrue(effects.lease.stop_attempted)
+            self.assertTrue((Path(directory) / "active.json").exists())
+            self.assertIs(host.UNRESOLVED[spec.run_id], effects)
             host.UNRESOLVED.clear()
 
 

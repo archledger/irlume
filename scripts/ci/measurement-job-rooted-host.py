@@ -22,6 +22,27 @@ class Dependencies(NamedTuple):
 PREPARE_NS = 60_000_000_000
 UNRESOLVED = {}
 CLEANUP_FAILURES = (BaseException,)
+# Abort keeps this part of its window (STOP_NS after the startup deadline) to
+# persist the failure record; it must stay well below the guardian's STOP_NS.
+FAILURE_RECORD_NS = 1_000_000_000
+JOB_PATH = r"/org/freedesktop/systemd1/job/[1-9][0-9]{0,19}"
+FAILURE_OBSERVATION = (
+    "Id",
+    "InvocationID",
+    "ActiveState",
+    "SubState",
+    "MainPID",
+    "ControlGroup",
+    "ExecMainStartTimestampMonotonic",
+)
+
+
+def boot_id():
+    with open("/proc/sys/kernel/random/boot_id", "rb") as file:
+        value = file.read(64)
+    if re.fullmatch(rb"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n", value) is None:
+        raise ValueError("host boot identity")
+    return value[:-1].decode("ascii")
 
 
 def observe_host(runtime, deadline):
@@ -127,6 +148,18 @@ class LeaseBus:
             raise ValueError("rooted cleanup invocation")
         self.cleanup_binding = {key: bound[key] for key in ("Id", "InvocationID")}
 
+    def pin_cleanup(self, deadline):
+        # Only for a created unit whose startup observation never completed.
+        if self.cleanup_binding is not None:
+            raise ValueError("rooted cleanup binding")
+        row = self.bus.observe(self.name, deadline)
+        if row.get("Transient") is not True or row.get("ExecStart") != (
+            (self.argv[0], self.argv, False),
+        ):
+            raise ValueError("rooted cleanup unit mismatch")
+        self.enter_cleanup(row)
+        return dict(self.cleanup_binding)
+
     def stop(self, name, deadline):
         self.check_name(name)
         if self.cleanup_binding is None:
@@ -178,7 +211,7 @@ class HostOwner:
         ) = None
         self.listener = self.channel = None
         self.config = self.value = self.identity = self.starttime = None
-        self.completed = None
+        self.completed = self.boot_id = None
         self.used = self.claim_attempted = self.aborted = self.committed = False
         self.commit_state = "not-attempted"
         self.output_bytes = 0
@@ -267,6 +300,7 @@ class HostOwner:
         self.directory_identity = info.st_dev, info.st_ino
         self.check_attempt(deadline)
         os.fsync(self.gate.root_fd)
+        self.boot_id = boot_id()
         self.coordinates = self.host_observer(deadline)
         plan = dict(
             self.inputs.identities(),
@@ -642,29 +676,73 @@ class HostOwner:
             self.close_control()
         except CLEANUP_FAILURES as error:
             errors.append(error)
-        if (
-            self.lease is not None
-            and self.lease.bound is not None
-            and not self.lease.terminal
-        ):
+        lease = self.lease
+        row = None if lease is None else lease.last_observation
+        observed = (
+            {key: row.get(key) for key in FAILURE_OBSERVATION}
+            if type(row) is dict
+            else None
+        )
+        reply = None if lease is None else lease.creation_reply
+        if reply is None and self.adapter is not None:
+            # The bridge keeps a reply that arrived after its deadline.
+            late = self.adapter.bridge.start_reply
+            if type(late) is str and re.fullmatch(JOB_PATH, late) is not None:
+                reply = late
+        invocation = source = stop_error = None
+        # A created service is stopped even when it was refused before binding.
+        if lease is not None and lease.created and not lease.terminal:
+            end = deadline - FAILURE_RECORD_NS
             try:
-                self.adapter.enter_cleanup(self.lease.bound)
-                self.lease.stop(deadline)
+                try:
+                    owned = lease.cleanup_identity()
+                except ValueError:
+                    # Refused inside its first observation: pin the current
+                    # invocation of the unit this lease created, then observe it.
+                    owned = self.adapter.pin_cleanup(end)
+                    # Recorded even when the observation below refuses the stop.
+                    invocation, source = owned["InvocationID"], "cleanup"
+                    lease.observe(end)
+                else:
+                    invocation = owned["InvocationID"]
+                    source = "bound" if lease.bound is not None else "observation"
+                    self.adapter.enter_cleanup(owned)
+                lease.stop(end)
             except CLEANUP_FAILURES as error:
                 errors.append(error)
+                stop_error = type(error).__name__
+        elif lease is not None and lease.bound is not None:
+            invocation, source = lease.bound["InvocationID"], "bound"
         if self.gate is not None and self.claim_attempted:
             if self.commit_state != "absent":
                 self.commit_state = self.active_state()
             try:
                 self.check_gate(deadline)
+                # created: this lease validated a creation reply in time; a late
+                # reply can still appear in creation_reply. invocation_source is
+                # bound, observation (startup row), cleanup (pinned at abort) or
+                # null; observed is the last startup row before any stop.
                 failure = self.root.closure.canonical(
                     {
-                        "scope": "contained-job-rooted-host-failure-v1",
+                        "scope": "contained-job-rooted-host-failure-v2",
                         "run_id": self.spec.run_id,
                         "reason": reason,
                         "admission_state": self.commit_state,
-                        "creation_attempted": self.lease is not None
-                        and self.lease.creation_attempted,
+                        "boot_id": self.boot_id,
+                        "creation_attempted": lease is not None
+                        and lease.creation_attempted,
+                        "created": lease is not None and lease.created,
+                        "creation_reply": reply,
+                        "invocation_id": invocation,
+                        "invocation_source": source,
+                        "observed": observed,
+                        "stop_attempted": lease is not None and lease.stop_attempted,
+                        "stop_reply": (
+                            lease.stop_reply
+                            if lease is not None and type(lease.stop_reply) is str
+                            else None
+                        ),
+                        "stop_error": stop_error,
                         "cleanup_errors": [type(error).__name__ for error in errors],
                         "native_authorized": False,
                         "full_contract_proven": False,

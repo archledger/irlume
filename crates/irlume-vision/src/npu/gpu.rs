@@ -633,6 +633,11 @@ pub(crate) fn gpu_libraries(
                 .map(str::to_owned)
         })
         .ok_or_else(|| "unversioned OpenVINO core".to_owned())?;
+    // Unlike the NPU's compile-time libraries (#1238), both frontends are
+    // mapped with their own dependencies by now: the platform reads this
+    // inventory after its warm-up, whose read of an ONNX buffer loads the
+    // IR frontend and then the ONNX one (the 2026.2.1 FrontEndManager tries
+    // them in that order).
     for frontend in [
         "libopenvino_ir_frontend.so.",
         "libopenvino_onnx_frontend.so.",

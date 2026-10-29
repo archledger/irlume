@@ -971,9 +971,7 @@ struct Marked {
 
 impl Marked {
     fn verify_libraries(&self) -> Result<(), String> {
-        fs::read_to_string(&self.maps)
-            .map_err(|error| format!("maps: {error}"))
-            .and_then(|maps| execution_loaded_as_hashed(&maps, &self.libraries))
+        still_loaded_as_hashed(&self.maps, &self.libraries)
     }
 }
 
@@ -1059,14 +1057,20 @@ fn resolve_library(dirs: &[&str]) -> Result<PathBuf, CpuReason> {
 /// probe does: the binding then opens the same object, and a library that
 /// does not load is an error message instead of a binding panic.
 fn probe_library(path: &Path) -> Result<(), CpuReason> {
+    open_for_process(path).map_err(CpuReason::RuntimeAbsent)
+}
+
+/// `dlopen` the library at absolute `path` with `RTLD_NOW | RTLD_LOCAL`,
+/// mapping its whole `DT_NEEDED` closure, and keep the handle for the life
+/// of the process. A later `dlopen` of the same file, by this path or
+/// another spelling of it, returns this object (glibc compares the name,
+/// then the device and inode), so no other copy is ever mapped.
+fn open_for_process(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
-        return Err(CpuReason::RuntimeAbsent(format!(
-            "{} is not an absolute path",
-            path.display()
-        )));
+        return Err(format!("{} is not an absolute path", path.display()));
     }
     let name = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| CpuReason::RuntimeAbsent(format!("{} contains a NUL byte", path.display())))?;
+        .map_err(|_| format!("{} contains a NUL byte", path.display()))?;
     // SAFETY: dlopen and dlerror with a valid NUL-terminated absolute path;
     // the error string is copied out before any other dl call. The handle
     // is deliberately never closed (see above).
@@ -1074,15 +1078,24 @@ fn probe_library(path: &Path) -> Result<(), CpuReason> {
         let handle = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
         if handle.is_null() {
             let why = libc::dlerror();
-            let why = if why.is_null() {
+            return Err(if why.is_null() {
                 "dlopen failed with no message".to_owned()
             } else {
                 std::ffi::CStr::from_ptr(why).to_string_lossy().into_owned()
-            };
-            return Err(CpuReason::RuntimeAbsent(why));
+            });
         }
     }
     Ok(())
+}
+
+/// Load one compile-time library of the identity, by the absolute path the
+/// identity hashes, before the execution inventory is read (#1238).
+/// OpenVINO later opens the same file with `RTLD_NOW` and gets this object.
+/// A library that is absent or does not load leaves the identity
+/// unreadable, as an absent one always has.
+fn load_compile_time_library(path: &Path) -> Result<(), CpuReason> {
+    open_for_process(path)
+        .map_err(|why| CpuReason::IdentityUnreadable(format!("loading {}: {why}", path.display())))
 }
 
 /// The only accelerator node: its PCI `vendor:device` and bus address.
@@ -1256,20 +1269,76 @@ fn execution_libraries(
     Ok((libraries, hashed))
 }
 
-fn library_inventory(
-    maps: &str,
-    scope: InventoryScope,
-) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
-    let unreadable = |why: String| CpuReason::IdentityUnreadable(why);
-    let mut paths: Vec<PathBuf> = maps
-        .lines()
+/// The library part of the identity, as [`identity_libraries`] reads it.
+#[derive(Debug)]
+struct IdentityLibraries {
+    /// The legacy manifest, [`Identity::libraries`].
+    legacy: String,
+    /// The execution manifest [`Platform::execution_digest`] keys on.
+    execution: String,
+    /// The execution inventory every compile and inference is checked
+    /// against.
+    hashed: Vec<HashedLibrary>,
+}
+
+/// Read the identity's libraries from the memory map at `maps` (ADR-0022
+/// §4). The compile-time libraries are loaded with `load` first, and the
+/// execution inventory is read from the map after that, so their own
+/// dependencies are mapped and bound like everything else mapped: a
+/// compile then maps nothing new unless something else loads, which stays
+/// a refusal (#1238). The legacy manifest is read from the map before the
+/// loading, so its membership does not change.
+fn identity_libraries(
+    maps: &Path,
+    executable: &Path,
+    mut load: impl FnMut(&Path) -> Result<(), CpuReason>,
+) -> Result<IdentityLibraries, CpuReason> {
+    let read = || {
+        fs::read_to_string(maps)
+            .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))
+    };
+    let enumerated = read()?;
+    let mapped = mapped_paths(&enumerated, InventoryScope::Execution);
+    // An incomplete inventory refuses before anything is loaded.
+    for library in compile_time_libraries(&mapped)? {
+        load(&library)?;
+    }
+    let (legacy, _) = runtime_libraries(&enumerated)?;
+    let (execution, hashed) = execution_libraries(&read()?, executable)?;
+    Ok(IdentityLibraries {
+        legacy,
+        execution,
+        hashed,
+    })
+}
+
+/// Every file-backed executable mapping in `maps` must still be one the
+/// execution inventory hashed, and the same file: checked after every
+/// compile and around every inference (ADR-0022 §4).
+fn still_loaded_as_hashed(maps: &Path, libraries: &[HashedLibrary]) -> Result<(), String> {
+    fs::read_to_string(maps)
+        .map_err(|error| format!("maps: {error}"))
+        .and_then(|maps| execution_loaded_as_hashed(&maps, libraries))
+}
+
+fn mapped_paths(maps: &str, scope: InventoryScope) -> Vec<PathBuf> {
+    maps.lines()
         .filter_map(maps::mapping)
         .filter(|mapping| scope.includes(mapping))
-        .map(|mapping| mapping.path)
-        .map(PathBuf::from)
-        .collect();
+        .map(|mapping| PathBuf::from(mapping.path))
+        .collect()
+}
+
+/// The compile-time libraries of the identity, once the C API, the Level
+/// Zero loader, the NPU user-mode driver, the NPU plugin and the core are
+/// all among `mapped`: the NPU compiler loader beside the plugin, which
+/// applying the compile configuration loads, and the NPU compiler beside
+/// the plugin and the IR and ONNX frontends beside the core, which
+/// compiling loads.
+fn compile_time_libraries(mapped: &[PathBuf]) -> Result<[PathBuf; 4], CpuReason> {
+    let unreadable = |why: String| CpuReason::IdentityUnreadable(why);
     let named = |prefix: &str| {
-        paths
+        mapped
             .iter()
             .find(|path| {
                 path.file_name()
@@ -1296,10 +1365,22 @@ fn library_inventory(
                 .map(str::to_owned)
         })
         .ok_or_else(|| unreadable("unversioned OpenVINO core".into()))?;
-    paths.push(plugin.with_file_name("libopenvino_intel_npu_compiler_loader.so"));
-    paths.push(plugin.with_file_name("libopenvino_intel_npu_compiler.so"));
-    paths.push(core.with_file_name(format!("libopenvino_ir_frontend.so.{version}")));
-    paths.push(core.with_file_name(format!("libopenvino_onnx_frontend.so.{version}")));
+    Ok([
+        plugin.with_file_name("libopenvino_intel_npu_compiler_loader.so"),
+        plugin.with_file_name("libopenvino_intel_npu_compiler.so"),
+        core.with_file_name(format!("libopenvino_ir_frontend.so.{version}")),
+        core.with_file_name(format!("libopenvino_onnx_frontend.so.{version}")),
+    ])
+}
+
+fn library_inventory(
+    maps: &str,
+    scope: InventoryScope,
+) -> Result<(String, Vec<HashedLibrary>), CpuReason> {
+    let unreadable = |why: String| CpuReason::IdentityUnreadable(why);
+    let mut paths = mapped_paths(maps, scope);
+    let compile_time = compile_time_libraries(&paths)?;
+    paths.extend(compile_time);
     paths.sort();
     paths.dedup();
     let mut lines = String::new();
@@ -1447,13 +1528,14 @@ impl Platform {
                     .map(|(_, version)| version.build_number)
                     .next()
                     .ok_or_else(|| CpuReason::IdentityUnreadable("no NPU plugin version".into()))?;
-                let maps = fs::read_to_string(sources.maps)
-                    .map_err(|error| CpuReason::IdentityUnreadable(format!("maps: {error}")))?;
-                let (libraries, _) = runtime_libraries(&maps)?;
                 let executable = fs::read_link("/proc/self/exe").map_err(|error| {
                     CpuReason::IdentityUnreadable(format!("process executable: {error}"))
                 })?;
-                let (execution_manifest, hashed) = execution_libraries(&maps, &executable)?;
+                let IdentityLibraries {
+                    legacy: libraries,
+                    execution: execution_manifest,
+                    hashed,
+                } = identity_libraries(sources.maps, &executable, load_compile_time_library)?;
                 let identity = Identity {
                     library: selected.display().to_string(),
                     openvino_build: openvino::version().build_number,
@@ -1557,7 +1639,8 @@ impl Platform {
     }
 
     /// Portable key from the full observed file-backed executable inventory,
-    /// plus the known compiler/frontends loaded during compilation. This
+    /// observed after the known compiler loader, compiler and frontends that
+    /// compiling loads are loaded, so their own dependencies are in it. This
     /// conservatively binds unrelated native libraries too. The main executable
     /// is omitted from this key to avoid self-reference with the compiled table,
     /// but remains in the mapped-file verification inventory.
@@ -1613,10 +1696,7 @@ impl Platform {
             };
             // The libraries compiling loaded must be the ones the identity
             // hashed (ADR-0022 §4).
-            let loaded = fs::read_to_string(&self.maps)
-                .map_err(|error| format!("maps: {error}"))
-                .and_then(|maps| execution_loaded_as_hashed(&maps, &self.libraries));
-            if let Err(why) = loaded {
+            if let Err(why) = still_loaded_as_hashed(&self.maps, &self.libraries) {
                 drop(inner);
                 return match discard_blobs(&cache.blobs()) {
                     Ok(()) => (Err(CpuReason::CompileFailed(why)), true),
@@ -3128,6 +3208,237 @@ mod tests {
             runtime_libraries(&swapped),
             Err(CpuReason::IdentityUnreadable(_))
         ));
+    }
+
+    /// A provider laid out as in the #1046 guest: the core and frontends in
+    /// one directory, the NPU plugin, compiler loader and compiler in a
+    /// subdirectory, the compiler's own dependencies elsewhere, and the
+    /// process executable. `maps` starts as an enumerated NPU maps it: no
+    /// compile-time library and no dependency of one.
+    struct ClosureFixture {
+        _dir: tempfile::TempDir,
+        maps: PathBuf,
+        executable: PathBuf,
+        compile_time: [PathBuf; 4],
+        /// A system library only the compiler needs (`libzstd` in #1046).
+        dependency: PathBuf,
+        /// A library only the compiler needs whose path names OpenVINO, as
+        /// oneTBB's does in an upstream archive: in the legacy manifest's
+        /// spelling scope.
+        provider_dependency: PathBuf,
+        /// A library no compile-time library needs.
+        unrelated: PathBuf,
+    }
+
+    fn closure_fixture() -> ClosureFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let lib = d.join("lib64");
+        let plugins = lib.join("openvino-2026.2.1");
+        let system = d.join("lib/x86_64-linux-gnu");
+        let archive = d.join("openvino/3rdparty");
+        for directory in [&plugins, &system, &archive] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let enumerated = [
+            d.join("irlumed"),
+            lib.join("libopenvino_c.so.2026.2.1"),
+            lib.join("libopenvino.so.2026.2.1"),
+            lib.join("libze_loader.so.1.32.0"),
+            lib.join("libze_intel_npu.so.1.38.0"),
+            plugins.join("libopenvino_intel_npu_plugin.so"),
+            system.join("libc.so.6"),
+        ];
+        let compile_time = [
+            plugins.join("libopenvino_intel_npu_compiler_loader.so"),
+            plugins.join("libopenvino_intel_npu_compiler.so"),
+            lib.join("libopenvino_ir_frontend.so.2026.2.1"),
+            lib.join("libopenvino_onnx_frontend.so.2026.2.1"),
+        ];
+        let dependency = system.join("libzstd.so.1.5.7");
+        let provider_dependency = archive.join("libtbb.so.12");
+        let unrelated = system.join("libunrelated.so.1");
+        let all = enumerated.iter().chain(&compile_time).chain([
+            &dependency,
+            &provider_dependency,
+            &unrelated,
+        ]);
+        for (index, path) in all.enumerate() {
+            fs::write(path, format!("fixture library {index}")).unwrap();
+        }
+        let maps = d.join("maps");
+        let lines: String = enumerated.iter().map(|path| map_line(path)).collect();
+        fs::write(&maps, lines).unwrap();
+        ClosureFixture {
+            maps,
+            executable: enumerated[0].clone(),
+            compile_time,
+            dependency,
+            provider_dependency,
+            unrelated,
+            _dir: dir,
+        }
+    }
+
+    fn mapped(maps: &str, path: &Path) -> bool {
+        maps.lines()
+            .filter_map(maps::mapping)
+            .any(|mapping| Path::new(mapping.path) == path)
+    }
+
+    /// `dlopen` as the memory map shows it: the first open maps the library
+    /// and, for the compiler, its own dependencies; a later open of the same
+    /// file maps nothing, because glibc returns the object already loaded.
+    fn scripted_dlopen(fixture: &ClosureFixture, path: &Path) {
+        let mut maps = fs::read_to_string(&fixture.maps).unwrap();
+        let mut closure = vec![path];
+        if path == fixture.compile_time[1] {
+            closure
+                .extend([&fixture.dependency, &fixture.provider_dependency].map(PathBuf::as_path));
+        }
+        for library in closure {
+            if !mapped(&maps, library) {
+                maps.push_str(&map_line(library));
+            }
+        }
+        fs::write(&fixture.maps, maps).unwrap();
+    }
+
+    /// Compiling opens the compiler loader, the compiler and both frontends.
+    fn scripted_compile(fixture: &ClosureFixture) {
+        for library in &fixture.compile_time {
+            scripted_dlopen(fixture, library);
+        }
+    }
+
+    #[test]
+    fn the_dependencies_of_compile_time_libraries_are_hashed_before_any_compile() {
+        // #1238: the #1046 guest's compile mapped libzstd, which only the NPU
+        // compiler needs, after the identity was hashed, and was refused.
+        let fixture = closure_fixture();
+        let enumerated = fs::read_to_string(&fixture.maps).unwrap();
+        let mut loaded = Vec::new();
+        let libraries = identity_libraries(&fixture.maps, &fixture.executable, |path: &Path| {
+            loaded.push(path.to_path_buf());
+            scripted_dlopen(&fixture, path);
+            Ok(())
+        })
+        .unwrap();
+        scripted_compile(&fixture);
+        assert_eq!(
+            still_loaded_as_hashed(&fixture.maps, &libraries.hashed),
+            Ok(())
+        );
+        assert_eq!(loaded, fixture.compile_time, "each loaded once, in order");
+        for dependency in [&fixture.dependency, &fixture.provider_dependency] {
+            let line = format!("{} ", dependency.display());
+            assert!(
+                libraries.execution.contains(&line),
+                "{}",
+                libraries.execution
+            );
+        }
+        // The legacy manifest keeps its membership: it is read before the
+        // loading, so a dependency in its spelling scope moves no legacy
+        // digest (ADR-0022, Separate exact and portable identities).
+        assert_eq!(libraries.legacy, runtime_libraries(&enumerated).unwrap().0);
+        assert!(!libraries.legacy.contains("libtbb"));
+        // The dependency is held to the inode rule like every mapping: an
+        // update that replaces it leaves the mapped copy deleted.
+        let mapped_line = map_line(&fixture.dependency);
+        let staged = fixture.maps.with_file_name("staged");
+        fs::write(&staged, b"an updated libzstd").unwrap();
+        fs::rename(&staged, &fixture.dependency).unwrap();
+        let maps = fs::read_to_string(&fixture.maps).unwrap().replace(
+            &mapped_line,
+            &format!("{} (deleted)\n", mapped_line.trim_end()),
+        );
+        fs::write(&fixture.maps, maps).unwrap();
+        assert!(still_loaded_as_hashed(&fixture.maps, &libraries.hashed)
+            .is_err_and(|why| why.contains("libzstd.so.1.5.7 is not the file that was hashed")));
+    }
+
+    #[test]
+    fn a_library_only_a_compile_maps_is_still_refused() {
+        // Loading the compile-time libraries binds their closure, not
+        // whatever else a compile maps.
+        let fixture = closure_fixture();
+        let libraries = identity_libraries(&fixture.maps, &fixture.executable, |path: &Path| {
+            scripted_dlopen(&fixture, path);
+            Ok(())
+        })
+        .unwrap();
+        assert!(!libraries.execution.contains("libunrelated"));
+        let identified = fs::read_to_string(&fixture.maps).unwrap();
+        let unhashed = format!(
+            "{} is mapped but was not hashed",
+            fixture.unrelated.display()
+        );
+        for with_compile in [false, true] {
+            fs::write(&fixture.maps, &identified).unwrap();
+            if with_compile {
+                scripted_compile(&fixture);
+            }
+            // Mappings are listed by address; the new one can land first.
+            let maps = map_line(&fixture.unrelated) + &fs::read_to_string(&fixture.maps).unwrap();
+            fs::write(&fixture.maps, maps).unwrap();
+            assert_eq!(
+                still_loaded_as_hashed(&fixture.maps, &libraries.hashed),
+                Err(unhashed.clone()),
+                "with_compile {with_compile}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compile_time_library_that_does_not_load_leaves_the_identity_unreadable() {
+        // Absent, which already refused before #1238, or present and not
+        // loadable: either way there is no identity.
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("libopenvino_intel_npu_compiler.so");
+        let not_elf = dir.path().join("libopenvino_ir_frontend.so.2026.2.1");
+        fs::write(&not_elf, b"not an ELF object").unwrap();
+        for path in [&absent, &not_elf] {
+            let result = load_compile_time_library(path);
+            assert!(
+                matches!(&result, Err(CpuReason::IdentityUnreadable(why))
+                    if why.contains(&path.display().to_string())),
+                "{result:?}"
+            );
+        }
+        // The first refusal ends the identity; nothing after it is loaded.
+        let fixture = closure_fixture();
+        let refused = CpuReason::IdentityUnreadable("the compiler does not load".into());
+        let mut loaded = Vec::new();
+        let result = identity_libraries(&fixture.maps, &fixture.executable, |path: &Path| {
+            loaded.push(path.to_path_buf());
+            if path == fixture.compile_time[1] {
+                return Err(refused.clone());
+            }
+            scripted_dlopen(&fixture, path);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), refused);
+        assert_eq!(loaded, fixture.compile_time[..2]);
+        // An incomplete inventory refuses before anything is loaded.
+        let fixture = closure_fixture();
+        let without_driver: String = fs::read_to_string(&fixture.maps)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("libze_intel_npu"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&fixture.maps, without_driver).unwrap();
+        let mut loads = 0;
+        let result = identity_libraries(&fixture.maps, &fixture.executable, |_: &Path| {
+            loads += 1;
+            Ok(())
+        });
+        assert!(
+            matches!(&result, Err(CpuReason::IdentityUnreadable(why)) if why.contains("libze_intel_npu")),
+            "{result:?}"
+        );
+        assert_eq!(loads, 0);
     }
 
     #[test]

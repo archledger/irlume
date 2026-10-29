@@ -528,6 +528,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The f32 precision record and the ADR-0033 amendment of 2026-10-21 now
+  name the cause of the ThinkPad identity change from `f592e9bc` to
+  `d689e37d` (#1164). The two identities differ only in the memory size
+  the plugin reported, which fell by one page across a reboot. The kernel
+  was 7.2.11 for both, so this was not the kernel update the record
+  named. Under the #1172 definition both are identity `27288f0e`. Docs
+  only.
+
 - ADR-0033 specifies how `auto` will rank the recognizer's devices
   (amendment 2026-10-29, #1163). CPU is a ranked target: a certified
   accelerator goes ahead of it only through a reviewed order in a separate

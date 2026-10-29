@@ -3,10 +3,13 @@
 # Copyright the irlume contributors.
 """Synthetic finite runtime trees; never execute a member of the tree."""
 
+import contextlib
 import copy
 import hashlib
 import importlib.util
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -77,6 +80,46 @@ def manifest():
     ]
     value["members"].sort(key=lambda row: row["path"])
     return value, files
+
+
+class OtherDevice:
+    def __init__(self, info, device):
+        self._info, self.st_dev = info, device
+
+    def __getattr__(self, name):
+        return getattr(self._info, name)
+
+
+@contextlib.contextmanager
+def on_device(path, device):
+    """Report one member on another device in stat and fstat, as a mount would."""
+    info = os.stat(path, follow_symlinks=False)
+    target = info.st_dev, info.st_ino
+    real_stat, real_fstat = os.stat, os.fstat
+
+    def moved(result):
+        if (result.st_dev, result.st_ino) == target:
+            return OtherDevice(result, device)
+        return result
+
+    with (
+        mock.patch.object(
+            os, "stat", side_effect=lambda *a, **k: moved(real_stat(*a, **k))
+        ),
+        mock.patch.object(
+            os, "fstat", side_effect=lambda *a, **k: moved(real_fstat(*a, **k))
+        ),
+    ):
+        yield
+
+
+CROSSES = "^runtime member crosses a filesystem$"
+
+
+def btrfs_subvolume(path):
+    subprocess.run(
+        ["btrfs", "subvolume", "create", str(path)], check=True, capture_output=True
+    )
 
 
 class ManifestTests(unittest.TestCase):
@@ -293,9 +336,17 @@ class TreeTests(unittest.TestCase):
                 )
             self.assertEqual(descriptors(), before)
 
-    def make_tree(self, directory, files=None):
-        root = Path(directory) / "root"
-        root.mkdir(mode=0o700)
+    def make_tree(self, directory, files=None, *, root="root", subvolume=None):
+        """Build a tree; subvolume names a btrfs subvolume to create, "." the root."""
+        root = Path(directory) / root
+        if subvolume == ".":
+            btrfs_subvolume(root)
+            root.chmod(0o700)
+        else:
+            root.mkdir(mode=0o700)
+            if subvolume is not None:
+                (root / subvolume).parent.mkdir(parents=True, exist_ok=True)
+                btrfs_subvolume(root / subvolume)
         files = manifest()[1] if files is None else files
         for name, data in files.items():
             path = root / name
@@ -367,6 +418,81 @@ class TreeTests(unittest.TestCase):
                     closure.prepare_manifest(
                         root, profile(), deadline=time.monotonic_ns() + 2_000_000_000
                     )
+
+    def test_member_on_another_device_refuses_at_every_scan(self):
+        # A tmpfs mounted on a directory, or an ext4 file bound into the tree.
+        for member, device in (
+            ("opt/irlume", os.makedev(0, 4095)),
+            ("usr/bin/python3", os.makedev(259, 4095)),
+        ):
+            with (
+                self.subTest(member=member),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = self.make_tree(directory)
+                self.assertNotEqual(device, root.stat().st_dev)
+                end = time.monotonic_ns() + 2_000_000_000
+                data, digest = closure.prepare_manifest(root, profile(), deadline=end)
+                with (
+                    on_device(root / member, device),
+                    self.assertRaisesRegex(ValueError, CROSSES),
+                ):
+                    closure.prepare_manifest(root, profile(), deadline=end)
+                with (
+                    on_device(root / member, device),
+                    self.assertRaisesRegex(ValueError, CROSSES),
+                ):
+                    closure.RuntimeSnapshot.open(root, data, digest, deadline=end)
+                with closure.RuntimeSnapshot.open(
+                    root, data, digest, deadline=end
+                ) as owned:
+                    owned.check()
+                    owned.recheck(end)
+                    with on_device(root / member, device):
+                        with self.assertRaisesRegex(ValueError, CROSSES):
+                            owned.check()
+                        with self.assertRaisesRegex(ValueError, CROSSES):
+                            owned.recheck(end)
+                    owned.check()
+
+    def test_nested_btrfs_subvolume_refuses_and_a_subvolume_root_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            kind = subprocess.run(
+                ["stat", "-f", "-c", "%T", directory],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if kind != "btrfs":
+                self.skipTest(
+                    f"{directory} is on {kind}, not btrfs; set TMPDIR to a btrfs "
+                    "directory to run this test"
+                )
+            if shutil.which("btrfs") is None:
+                self.skipTest("btrfs-progs (the btrfs command) is not installed")
+            end = time.monotonic_ns() + 10_000_000_000
+            plain = self.make_tree(directory, root="plain")
+            data, digest = closure.prepare_manifest(plain, profile(), deadline=end)
+            with closure.RuntimeSnapshot.open(
+                plain, data, digest, deadline=end
+            ) as owned:
+                owned.check()
+            # The same bytes with opt/ as a nested subvolume: a directory entry,
+            # not a mount, whose stat device is the subvolume's own.
+            nested = self.make_tree(directory, root="nested", subvolume="opt")
+            self.assertNotEqual((nested / "opt").stat().st_dev, nested.stat().st_dev)
+            with self.assertRaisesRegex(ValueError, CROSSES):
+                closure.prepare_manifest(nested, profile(), deadline=end)
+            with self.assertRaisesRegex(ValueError, CROSSES):
+                closure.RuntimeSnapshot.open(nested, data, digest, deadline=end)
+            # A tree that is a subvolume itself keeps every member on its device.
+            own = self.make_tree(directory, root="own", subvolume=".")
+            self.assertNotEqual(own.stat().st_dev, plain.stat().st_dev)
+            self.assertEqual(
+                closure.prepare_manifest(own, profile(), deadline=end), (data, digest)
+            )
+            with closure.RuntimeSnapshot.open(own, data, digest, deadline=end) as owned:
+                owned.check()
 
     def test_tree_and_manifest_budget_limits_are_checked(self):
         with tempfile.TemporaryDirectory() as directory:

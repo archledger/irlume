@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,12 +37,17 @@ class WitnessTests(unittest.TestCase):
         self.plan = fixture.plan
         self.deps = codec.Dependencies(preflight_tests.preflight, state_tests.state)
         _, self.manifest = preflight_tests.fixtures.fixtures.selection()
-        _, files, python, maps = state_tests.observation()
+        initial = fixture.raw
+        # The runtime lives on G's root mount, as stat and maps both report.
+        mounts = preflight_tests.preflight.root.parse_mountinfo(
+            initial["proc"]["mountinfo"]
+        )
+        self.device = mounts["/"].device
+        _, files, python, maps = state_tests.observation(self.device)
         old = "/opt/irlume/entry.py"
         new = "/opt/irlume/measurement-job-guardian-native.py"
         files[new] = files.pop(old)
         python["modules"][0]["origin"] = new
-        initial = fixture.raw
         initial["proc"]["maps"] = maps
         final = copy.deepcopy(initial)
         final["finished_ns"] = 450
@@ -101,6 +107,21 @@ class WitnessTests(unittest.TestCase):
         self.assertIs(type(self.decode(data)["maps"]), bytes)
         self.assertIs(type(self.decode(data)["python"]["version"]), tuple)
         self.assertLess(len(data), 1024**2)
+
+    def test_mappings_carry_the_root_mount_device_not_the_stat_device(self):
+        observation = copy.deepcopy(self.observation)
+        # A btrfs subvolume: stat reports its own device, maps the mount's.
+        for row in observation["files"].values():
+            row["device"] = os.makedev(0, 52)
+        data, _ = self.encode(observation)
+        self.assertEqual(self.decode(data), observation)
+        stat_device = observation["maps"].replace(
+            b" %02x:%02x " % self.device, b" 00:34 "
+        )
+        self.assertNotEqual(stat_device, observation["maps"])
+        observation["maps"] = stat_device
+        with self.assertRaisesRegex(ValueError, "^runtime mapped file identity$"):
+            self.encode(observation)
 
     def test_wrong_hash_binding_or_authority_refuses(self):
         data, _ = self.encode()

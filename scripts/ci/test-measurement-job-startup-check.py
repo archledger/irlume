@@ -161,6 +161,7 @@ class CompositionTests(unittest.TestCase):
         self.events = []
         self.deadlines = []
         self.plan_observations = []
+        self.runtime_args = []
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.tree_file = Path(directory.name) / "runtime.py"
@@ -263,12 +264,17 @@ class CompositionTests(unittest.TestCase):
         preflight.root = types.SimpleNamespace(
             check_status=check_status,
             check_plan=lambda value: None,
+            parse_mountinfo=lambda data: {"view of": data},
         )
 
         def core_witness(plan, fs, deadline, now):
             test.deadlines.append(deadline)
             test.plan_observations.append(copy.deepcopy(plan))
-            return {"namespaces": {}, "root": {"device": 1, "inode": 2}}
+            return {
+                "namespaces": {},
+                "root": {"device": 1, "inode": 2},
+                "mountinfo": b"mountinfo %d" % len(test.plan_observations),
+            }
 
         preflight.core_witness = core_witness
 
@@ -280,6 +286,7 @@ class CompositionTests(unittest.TestCase):
 
         def validate(*args):
             events.append("runtime-check")
+            test.runtime_args.append(args)
             if fail == "runtime":
                 raise ValueError("injected runtime failure")
 
@@ -318,6 +325,26 @@ class CompositionTests(unittest.TestCase):
         self.assertNotIn("native_authorized", result)
         self.assertTrue(self.deadlines)
         self.assertEqual(set(self.deadlines), {500})
+
+    def test_both_runtime_checks_use_the_first_core_mount_view(self):
+        deps = self.setup_dependencies()
+        main = module("main")
+        table = {"main": main}
+        with mock.patch.object(startup.os, "stat", side_effect=root_stat()):
+            startup.collect_startup(
+                {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
+                b"manifest",
+                deps,
+                (main,),
+                1000,
+                _module_table=lambda: table,
+            )
+        # The mount table the first core witness checked; the final view
+        # refuses any change to it.
+        self.assertEqual(
+            [args[4:] for args in self.runtime_args],
+            [({"view of": b"mountinfo 1"},)] * 2,
+        )
 
     def test_runtime_failure_closes_tree_without_final_filesystem_acceptance(self):
         deps = self.setup_dependencies(fail="runtime")
@@ -656,10 +683,12 @@ class NativeBudgetTests(unittest.TestCase):
             FilesystemCollector=Reader, startup=filesystem.startup
         )
         preflight.root = types.SimpleNamespace(
-            check_plan=lambda plan: None, check_status=lambda *args: None
+            check_plan=lambda plan: None,
+            check_status=lambda *args: None,
+            parse_mountinfo=filesystem.root.parse_mountinfo,
         )
         preflight.core_witness = lambda plan, snapshot, deadline, now: {
-            key: snapshot["proc"][key] for key in ("namespaces", "root")
+            key: snapshot["proc"][key] for key in ("namespaces", "root", "mountinfo")
         }
         tree.RootedRuntimeSnapshot = types.SimpleNamespace(open=runtime_tree)
         state.check_runtime_state = lambda *args: None

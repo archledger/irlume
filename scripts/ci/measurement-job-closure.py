@@ -369,6 +369,12 @@ class RuntimeSnapshot:
                     continue
                 path = relative_path(prefix + "/" + name if prefix else name)
                 before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                # Inode numbers are unique only per stat device. A mount inside
+                # the tree reports another device, and so does a nested btrfs
+                # subvolume or snapshot, which is a plain directory entry with
+                # its own anonymous device (fs/btrfs/inode.c btrfs_getattr).
+                if before.st_dev != self.root_info.st_dev:
+                    raise ValueError("runtime member crosses a filesystem")
                 mode = stat.S_IMODE(before.st_mode)
                 if stat.S_ISDIR(before.st_mode):
                     with owned_fd(

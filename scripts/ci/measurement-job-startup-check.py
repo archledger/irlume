@@ -200,6 +200,8 @@ def collect_startup(
     first_core = dependencies.preflight.core_witness(
         plan, initial, reader.deadline, reader._after()
     )
+    # The mount table the core witness checked; reobserve refuses any change.
+    mounts = dependencies.preflight.root.parse_mountinfo(first_core["mountinfo"])
     with dependencies.runtime_tree.RootedRuntimeSnapshot.open(
         plan, manifest_data, first_core, deadline=reader.deadline
     ) as tree:
@@ -210,7 +212,7 @@ def collect_startup(
             raise ValueError("startup module identities changed")
         first_maps, _ = fresh_process(first_core)
         dependencies.runtime_state.check_runtime_state(
-            manifest, files, first_python, first_maps
+            manifest, files, first_python, first_maps, mounts
         )
         last_modules = capture()
         if not same_modules(first_modules, last_modules):
@@ -220,7 +222,7 @@ def collect_startup(
             raise ValueError("startup Python state changed")
         maps, _ = fresh_process(first_core)
         dependencies.runtime_state.check_runtime_state(
-            manifest, files, last_python, maps
+            manifest, files, last_python, maps, mounts
         )
         tree.check()
     # The root snapshot FD must be closed before reobserving the complete table.

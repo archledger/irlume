@@ -194,7 +194,11 @@ def validate(observation, plan, manifest_data, binding, dependencies, timer):
     if observation["runtime_manifest_sha256"] != plan["manifest"]["sha256"]:
         raise ValueError("startup witness manifest digest")
     dependencies.runtime_state.check_runtime_state(
-        manifest, observation["files"], observation["python"], observation["maps"]
+        manifest,
+        observation["files"],
+        observation["python"],
+        observation["maps"],
+        preflight.root.parse_mountinfo(final_core["mountinfo"]),
     )
     timer.check()
 

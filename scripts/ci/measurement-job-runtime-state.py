@@ -5,7 +5,6 @@
 
 import importlib.machinery
 import importlib.util
-import os
 import re
 import stat
 from pathlib import Path
@@ -190,7 +189,27 @@ def check_python(manifest, files, state):
     return extensions
 
 
-def check_maps(data, files):
+def mount_device(mounts, path):
+    """Return the device of the mount holding path.
+
+    mounts is root.parse_mountinfo's view, which refuses stacked and hidden
+    mounts, so a path walk ends on the deepest mount point that is path or
+    one of its parent directories.
+    """
+    if type(mounts) is not dict or "/" not in mounts:
+        raise ValueError("runtime mount view")
+    point = path
+    while point not in mounts:
+        point = point.rpartition("/")[0] or "/"
+    device = mounts[point].device
+    if type(device) is not tuple or len(device) != 2:
+        raise ValueError("runtime mount device")
+    for number in device:
+        runtime._integer(number, 0, runtime.U32_MAX)
+    return device
+
+
+def check_maps(data, files, mounts):
     if (
         type(data) is not bytes
         or not 0 < len(data) <= 1024**2
@@ -275,11 +294,19 @@ def check_maps(data, files):
         if path not in files:
             raise ValueError("runtime unlisted mapped file")
         selected = files[path]
-        if (major, minor, inode) != (
-            os.major(selected["device"]),
-            os.minor(selected["device"]),
-            selected["inode"],
-        ):
+        # Linux 7.2 maps shows the mapped inode's superblock device
+        # (fs/proc/task_mmu.c show_map_vma), as mountinfo does for each
+        # mount (fs/proc_namespace.c show_mountinfo). stat can differ: btrfs
+        # reports the subvolume's anonymous device (fs/btrfs/inode.c
+        # btrfs_getattr), so the snapshot's stat device stays its own pin.
+        # On btrfs the maps device names the filesystem and an inode number
+        # is unique only per subvolume, so a file in another subvolume or
+        # snapshot can carry the same device and inode here. This check does
+        # not bind a mapping to the runtime's subvolume; that rests on the
+        # tree pins, the root's device and the scan's refusal of members on
+        # any other device (measurement-job-closure.py), which hold at each
+        # scan and check, not between them.
+        if inode != selected["inode"] or (major, minor) != mount_device(mounts, path):
             raise ValueError("runtime mapped file identity")
         # A private PROT_NONE loader reservation exposes no file bytes.
         if (
@@ -294,10 +321,13 @@ def check_maps(data, files):
     return executable
 
 
-def check_runtime_state(manifest, files, state, maps):
-    """Check supplied observations; callers must prove collection and freshness."""
+def check_runtime_state(manifest, files, state, maps, mounts):
+    """Check supplied observations; callers must prove collection and freshness.
+
+    mounts is the parsed mount view of the process whose maps these are.
+    """
     extensions = check_python(manifest, files, state)
-    executable = check_maps(maps, files)
+    executable = check_maps(maps, files, mounts)
     required = {
         "/" + manifest["python"]["executable"],
         "/" + manifest["native"]["interpreter"],

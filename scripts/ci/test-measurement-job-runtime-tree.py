@@ -295,6 +295,28 @@ class RootedTreeTests(unittest.TestCase):
         with self.assertRaises(ValueError), self.open(core=core):
             pass
 
+    def test_static_members_share_the_root_device_and_api_mounts_need_not(self):
+        other = os.makedev(0, 4095)
+        self.assertNotEqual(other, self.path.stat().st_dev)
+        entry = "/" + self.manifest["python"]["entry"]
+        with fixtures.on_device(self.path / "proc", other), self.open() as snapshot:
+            self.assertIn(entry, snapshot.file_facts())
+        for name in ("etc", "opt", self.manifest["python"]["executable"]):
+            with (
+                self.subTest(name=name),
+                fixtures.on_device(self.path / name, other),
+                self.assertRaisesRegex(ValueError, fixtures.CROSSES),
+                self.open(),
+            ):
+                pass
+        with self.open() as snapshot:
+            with (
+                fixtures.on_device(self.path / entry[1:], other),
+                self.assertRaisesRegex(ValueError, fixtures.CROSSES),
+            ):
+                snapshot.file_facts()
+            self.assertIn(entry, snapshot.file_facts())
+
     def test_file_facts_rechecks_snapshot_before_export(self):
         with self.open() as snapshot:
             path = self.path / self.manifest["python"]["entry"]

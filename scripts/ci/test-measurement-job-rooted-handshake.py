@@ -180,7 +180,7 @@ class HandshakeTests(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
         self.plan = fixture.plan
-        temporary = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name)
         info = self.path.stat()
@@ -605,7 +605,7 @@ class HandshakeTests(unittest.TestCase):
         self.assertIn("abort", effects.calls)
 
     def test_wrong_attempt_identity_is_rejected_before_write_or_connect(self):
-        wrong = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        wrong = tempfile.TemporaryDirectory()
         self.addCleanup(wrong.cleanup)
         runner, effects = self.guardian_run()
         effects.open_attempt = lambda config, deadline: os.open(

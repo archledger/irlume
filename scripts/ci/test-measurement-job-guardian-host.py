@@ -16,6 +16,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parent
+# sun_path holds 108 bytes, so directories that will hold a bound AF_UNIX
+# socket use this short base instead of TMPDIR, which may be long.
+SOCKET_BASE = "/tmp"
 SPEC = importlib.util.spec_from_file_location(
     "host", HERE / "measurement-job-guardian-host.py"
 )
@@ -262,7 +265,10 @@ class NativeHostTests(unittest.TestCase):
     def test_post_finish_expiry_or_channel_close_failure_keeps_blocker(self):
         spec = specification()
         for fault in ("expiry", "channel"):
-            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory,
+            ):
                 end = time.monotonic_ns() + 2_000_000_000
                 effects = host.HostEffects(
                     spec,
@@ -341,7 +347,7 @@ class NativeHostTests(unittest.TestCase):
                     reply = bad
                 self.peer.sendall(reply)
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             effects = Transcript(
                 spec,
                 _gate_factory=lambda deadline: host.native.service.AdmissionGate(
@@ -368,7 +374,7 @@ class NativeHostTests(unittest.TestCase):
 
     def test_release_failure_is_journaled_after_output_directory_closed(self):
         spec = specification()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             effects = host.HostEffects(
                 spec,
                 _gate_factory=lambda deadline: host.native.service.AdmissionGate(
@@ -429,7 +435,7 @@ class NativeHostTests(unittest.TestCase):
     def test_failed_host_persists_partial_or_surplus_control_before_disposal(self):
         spec = specification()
         for partial in (True, False):
-            with tempfile.TemporaryDirectory() as directory:
+            with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
                 end = time.monotonic_ns() + 2_000_000_000
                 effects = host.HostEffects(
                     spec,
@@ -475,7 +481,7 @@ class NativeHostTests(unittest.TestCase):
                 raise OSError("reference close failed")
 
         spec = specification()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             end = time.monotonic_ns() + 2_000_000_000
             effects = host.HostEffects(
                 spec,
@@ -500,7 +506,7 @@ class NativeHostTests(unittest.TestCase):
 
     def test_preparation_claims_shared_gate_before_service_creation(self):
         spec = specification()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             gate_root = Path(directory)
             factory = lambda deadline: host.native.service.AdmissionGate(
                 gate_root, deadline
@@ -530,7 +536,7 @@ class NativeHostTests(unittest.TestCase):
     def test_concrete_creation_uses_addref_and_binds_exact_snapshot(self):
         spec = specification()
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             bus = CreationBus()
             effects = host.HostEffects(
                 spec,
@@ -556,7 +562,7 @@ class NativeHostTests(unittest.TestCase):
         spec = specification()
         # A third CPU in the effective mask refuses the service before binding.
         bus = CreationBus(CPUAffinity=(7,))
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory:
             effects = host.HostEffects(
                 spec,
                 _gate_factory=lambda deadline: host.native.service.AdmissionGate(

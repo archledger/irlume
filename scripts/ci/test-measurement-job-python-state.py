@@ -68,7 +68,7 @@ m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
 r=m.collect_python_state(time.monotonic_ns()+5000000000,local_modules=(("python_state",m),))
 print(json.dumps({{"modules":len(r["modules"]),"flags":r["flags"],"jit_enabled":r["jit_enabled"]}}))
 """
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "probe.py"
             script.write_text(code)
             result = subprocess.run(

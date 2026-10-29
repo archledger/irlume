@@ -16,6 +16,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+# sun_path holds 108 bytes, so directories that will hold a bound AF_UNIX
+# socket use this short base instead of TMPDIR, which may be long.
+SOCKET_BASE = "/tmp"
 
 
 def load(name, filename):
@@ -47,7 +50,7 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(reader.owned, {})
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        self.temporary = tempfile.TemporaryDirectory(dir=SOCKET_BASE)
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
         self.plan, _ = fixtures.selection()

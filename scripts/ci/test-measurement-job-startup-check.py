@@ -139,7 +139,7 @@ class CompositionTests(unittest.TestCase):
         self.events = []
         self.deadlines = []
         self.plan_observations = []
-        directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.tree_file = Path(directory.name) / "runtime.py"
         self.tree_file.write_bytes(b"original\n")

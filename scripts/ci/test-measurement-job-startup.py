@@ -31,7 +31,7 @@ def deadline():
 
 class ProcTests(unittest.TestCase):
     def test_path_only_handle_inspects_symlink_without_following_it(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "link"
             path.symlink_to("missing-target")
             collector = startup.ProcCollector(deadline())
@@ -116,7 +116,7 @@ class ProcTests(unittest.TestCase):
                 opened.assert_not_called()
 
     def test_bounded_read_rejects_overflow_symlink_and_fifo(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / "status").write_bytes(b"x" * 33)
             (path / "link").symlink_to("status")
@@ -136,7 +136,7 @@ class ProcTests(unittest.TestCase):
                 os.close(fd)
 
     def test_late_open_is_closed_and_late_read_retains_returned_bytes(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "status"
             path.write_bytes(b"returned\n")
             fd = os.open(path.parent, os.O_DIRECTORY | os.O_RDONLY | os.O_CLOEXEC)
@@ -349,7 +349,7 @@ raise SystemExit(1)
         real_fstat(0)  # The failure was injected; the collector did not close stdin.
 
     def test_cancellation_and_cleanup_errors_are_both_retained(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "status").write_bytes(b"data\n")
             fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             collector = startup.ProcCollector(deadline())
@@ -405,7 +405,7 @@ raise SystemExit(1)
         self.assertEqual(collector.owned, {})
 
     def test_normal_bounded_read_accepts_exact_limit_and_cloexec_is_verified(self):
-        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as directory:
+        with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "status").write_bytes(b"x" * 32)
             fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             try:

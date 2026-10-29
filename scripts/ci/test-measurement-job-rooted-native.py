@@ -18,6 +18,9 @@ from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+# sun_path holds 108 bytes, so directories that will hold a bound AF_UNIX
+# socket use this short base instead of TMPDIR, which may be long.
+SOCKET_BASE = "/tmp"
 
 
 def load(name, filename):
@@ -140,7 +143,7 @@ class ManifestReaderTests(unittest.TestCase):
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
         self.plan, self.data, self.root = fixture.plan, fixture.manifest, fixture.root
-        directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name)
         (self.path / "run/irlume").mkdir(parents=True)
@@ -320,7 +323,7 @@ class EffectsTests(unittest.TestCase):
         )
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        directory = tempfile.TemporaryDirectory(dir=SOCKET_BASE)
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name)
         info = self.path.stat()

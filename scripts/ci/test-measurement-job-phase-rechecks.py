@@ -32,7 +32,7 @@ rooted_fixtures = load("phase_rooted_fixtures", "test-measurement-job-runtime-tr
 
 class PhaseTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
         self.path = self.directory / "input.bin"

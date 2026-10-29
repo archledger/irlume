@@ -16,6 +16,9 @@ from threading import Event, Thread
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+# sun_path holds 108 bytes, so directories that will hold a bound AF_UNIX
+# socket use this short base instead of TMPDIR, which may be long.
+SOCKET_BASE = "/tmp"
 SPEC = importlib.util.spec_from_file_location(
     "service", HERE / "measurement-job-guardian-service.py"
 )
@@ -187,7 +190,7 @@ class TransportTests(unittest.TestCase):
             before = descriptors()
             with (
                 self.subTest(authenticate=authenticate),
-                tempfile.TemporaryDirectory() as directory,
+                tempfile.TemporaryDirectory(dir=SOCKET_BASE) as directory,
             ):
                 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 listener.bind(str(Path(directory) / "bus"))

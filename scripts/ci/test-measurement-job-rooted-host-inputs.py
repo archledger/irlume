@@ -15,6 +15,10 @@ from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+# sun_path holds 108 bytes. test-measurement-job-rooted-host.py binds H's
+# control socket below this fixture's directory, so it uses this short base
+# instead of TMPDIR, which may be long.
+SOCKET_BASE = "/tmp"
 
 
 def load(name, filename):
@@ -31,7 +35,7 @@ root = fixtures.root_tests.root
 
 class InputOwnerTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        temporary = tempfile.TemporaryDirectory(dir=SOCKET_BASE)
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name)
         fixture = fixtures.ProtocolTests()

@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- Both daemon AppArmor profiles grant scoped GPU access: render nodes listed
+  through `/dev/dri/by-path`, the DRM class walk, read-only GuC and HuC
+  reports in debugfs, OpenCL ICD registrations with system layers denied, and
+  `/usr/local` compute runtime libraries, plus an optional
+  `local/irlumed-gpu` include. Rules shared with the NPU let oneTBB read
+  `/proc/sys/vm/nr_hugepages` and the transparent huge page mode. The packaged unit, NixOS module and
+  `install-host.sh` unit set `NEO_CACHE_PERSISTENT=0` and unset the OpenCL
+  loader and compute runtime cache overrides. GPU loading admission stays
+  closed (ADR-0033 section 4, #1162).
+
 - A private kernel namespace observation probe (ADR-0022, Kernel namespace
   observation, #1164). It uses `listns` to check for the initial user
   namespace without trusting procfs or UID 0. Explicit kernel tests cover

@@ -93,6 +93,9 @@ Environment="IRLUME_VIT_PAD_MODEL=$REPO/models/liveness_vit.onnx"
 Environment="IRLUME_PAD_IR_MODEL=$REPO/models/flir.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
 Environment="IRLUME_STATE_DIR=$STATE_HOME/.local/share/irlume"
+# GPU launch environment, as in packaging/systemd/irlumed.service (#1162).
+Environment="NEO_CACHE_PERSISTENT=0"
+UnsetEnvironment=OCL_ICD_VENDORS OPENCL_VENDOR_PATH OPENCL_LAYERS OPENCL_LAYER_PATH OCL_ICD_PLATFORM_SORT OCL_ICD_DEFAULT_PLATFORM OCL_ICD_ASSUME_ICD_EXTENSION NEO_CACHE_DIR
 Restart=on-failure
 RestartSec=2
 

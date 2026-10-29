@@ -107,10 +107,17 @@ def observe_host(runtime, deadline):
     return result
 
 
+def load_bus_bridge(runtime):
+    """H's typed manager calls. G's runtime never loads this module."""
+    return runtime.native.load(
+        "rooted_host_bus", runtime.native.HERE / "measurement-job-rooted-bus.py"
+    )
+
+
 class LeaseBus:
     """Adapt one canonical rooted configuration to the retained UnitLease."""
 
-    def __init__(self, config, manifest, support, bus):
+    def __init__(self, config, manifest, support, bus, bridge):
         runtime = support.runtime
         self.root = runtime.preflight.root
         deps = runtime.protocol.Dependencies(self.root, runtime.artifact)
@@ -122,11 +129,8 @@ class LeaseBus:
         self.name = self.root.guardian.unit_name(self.spec)
         self.properties = self.root.guardian.service_properties(self.spec)
         self.argv = self.root.entry_argv(value["root_plan"], config.sha256)
-        self.bridge = runtime.bus_bridge.RootedBus(
-            bus,
-            runtime.bus_bridge.Dependencies(
-                runtime.protocol, deps, runtime.native.service
-            ),
+        self.bridge = bridge.RootedBus(
+            bus, bridge.Dependencies(runtime.protocol, deps, runtime.native.service)
         )
         self.last_root = None
         self.cleanup_binding = None
@@ -231,6 +235,8 @@ class HostOwner:
             gate_factory or self.runtime.native.service.AdmissionGate.for_current_user
         )
         self.bus_factory = bus_factory or self.runtime.native.service.SystemdBus
+        # Loaded before admission, so no code is read inside the startup window.
+        self.bus_bridge = load_bus_bridge(self.runtime)
         self.host_observer = host_observer or (
             lambda deadline: observe_host(self.runtime, deadline)
         )
@@ -342,7 +348,6 @@ class HostOwner:
             self.spec,
             plan,
             client,
-            self.coordinates["bus"],
             origin,
             self.inputs.manifest,
             self.runtime.protocol.Dependencies(self.root, self.runtime.artifact),
@@ -472,8 +477,11 @@ class HostOwner:
             raise ValueError("rooted service lacks exclusive durable intent")
         deadline = min(deadline, self.value["startup_deadline_ns"])
         self.phase_recheck("prestart", deadline)
-        self.bus = self.bus_factory(os.getuid(), deadline=deadline)
-        self.adapter = LeaseBus(config, self.inputs.manifest, self.support, self.bus)
+        # Descriptor passing lets check_peer resolve the peer's pidfd.
+        self.bus = self.bus_factory(os.getuid(), deadline=deadline, fds=True)
+        self.adapter = LeaseBus(
+            config, self.inputs.manifest, self.support, self.bus, self.bus_bridge
+        )
         self.lease = self.runtime.native.service.UnitLease(
             self.adapter.name, self.adapter, now=self.now
         )
@@ -513,9 +521,16 @@ class HostOwner:
     def check_peer(self, deadline):
         self.channel.check(deadline)
         start = self.runtime.native.process_start(self.identity.pid)
+        # The manager names the unit and invocation holding the connected
+        # peer's pidfd (SO_PEERPIDFD), independent of PID numbers.
+        invocation = self.adapter.bridge.process_invocation(
+            self.config, self.inputs.manifest, self.channel.peer_fd, deadline
+        )
         self.channel.check(deadline)
         if type(start) is not int or start != self.starttime:
             raise ValueError("rooted connected guardian starttime changed")
+        if invocation != self.identity.invocation_id:
+            raise ValueError("rooted connected guardian invocation")
 
     def connect(self, identity, deadline):
         if (
@@ -856,14 +871,6 @@ FD_LIMIT = 1 << 20
 HEX32 = "[0-9a-f]{32}"
 UNIT_PATH = r"/org/freedesktop/systemd1/unit/[A-Za-z0-9_]{1,255}"
 PROPERTIES = "org.freedesktop.DBus.Properties"
-# With PrivatePIDs=yes systemd resets ExecMainStartTimestamp from the main
-# process's /proc stat starttime (v259.10 and v262.1 service.c,
-# service_set_main_pidref), which counts whole USER_HZ ticks (Linux
-# fs/proc/array.c; 100 Hz on x86-64). Its boottime-to-monotonic mapping
-# (time-util.c, dual_timestamp_from_boottime) adds the gap between two clock
-# reads; a host suspend between the fork and that mapping moves it earlier,
-# which still refuses.
-START_TICK_NS = 10_000_000
 # Files H or G can leave in an attempt directory, with their required type.
 ATTEMPT_ENTRIES = {
     "control.sock": stat.S_ISSOCK,
@@ -1035,7 +1042,7 @@ def observe_failed_unit(bus, transport, unit, deadline):
     return row
 
 
-def check_failed_unit(row, unit, invocation, argv, value, main_pid):
+def check_failed_unit(row, unit, invocation, argv, value, main_pid, tick):
     expected = {
         "Id": unit,
         "Transient": True,
@@ -1056,11 +1063,8 @@ def check_failed_unit(row, unit, invocation, argv, value, main_pid):
             raise ValueError("resolver unit state: " + key)
     start = row["ExecMainStartTimestampMonotonic"]
     end = row["ExecMainExitTimestampMonotonic"]
-    if (
-        not value["origin_ns"] - START_TICK_NS
-        <= start * 1000
-        <= value["startup_deadline_ns"]
-    ):
+    # tick: the guardian's START_TICK_NS, the floor of a PrivatePIDs= start.
+    if not value["origin_ns"] - tick <= start * 1000 <= value["startup_deadline_ns"]:
         raise ValueError("resolver unit start window")
     if not end >= start > 0:
         raise ValueError("resolver unit exit order")
@@ -1454,7 +1458,9 @@ def _resolve(
 
     owned["bus"] = bus = ReadOnlyBus(bus_factory(uid, deadline=deadline))
     row = observe_failed_unit(bus, transport, unit, deadline)
-    check_failed_unit(row, unit, invocation, argv, value, main_pid)
+    check_failed_unit(
+        row, unit, invocation, argv, value, main_pid, root.guardian.START_TICK_NS
+    )
     manager_path = bind_invocation(bus, transport, unit, invocation, deadline)
     if cgroup_scan(unit, uid):
         raise ValueError("resolver unit cgroup remains")

@@ -30,7 +30,7 @@ class AdapterTests(unittest.TestCase):
         )
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        self.plan, self.bus = fixture.plan, fixture.bus
+        self.plan = fixture.plan
         self.raw = fixture.collect()
         core = fixtures.fixtures.witness(self.plan)
         self.raw["proc"] = {
@@ -63,7 +63,7 @@ class AdapterTests(unittest.TestCase):
 
     def check(self, raw=None, deadline=1000, now=400):
         return preflight.core_witness(
-            self.plan, self.bus, self.raw if raw is None else raw, deadline, now
+            self.plan, self.raw if raw is None else raw, deadline, now
         )
 
     def test_raw_snapshot_schema_matches_collector_shape(self):
@@ -76,6 +76,24 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(row["dev_log"])
         self.assertNotIn("native_authorized", row)
         self.assertEqual(self.raw, before)
+
+    def test_witness_observes_no_user_bus_path(self):
+        self.assertIn("/run/user", self.raw["nodes"])
+        self.assertIsNone(self.raw["nodes"]["/run/user"])
+        self.assertFalse(any(p.startswith("/run/user/") for p in self.raw["nodes"]))
+        # The old witness shape, with the bus node, is not this schema.
+        bad = copy.deepcopy(self.raw)
+        bad["nodes"]["/run/user/1000"] = None
+        bad["nodes"]["/run/user/1000/bus"] = None
+        with self.assertRaises(ValueError):
+            self.check(bad)
+        # H refuses a user runtime directory even when G's inventory omits it.
+        bad = copy.deepcopy(self.raw)
+        bad["nodes"]["/run/user"] = dict(bad["nodes"]["/run"])
+        with self.assertRaisesRegex(
+            ValueError, "^user runtime directory in rooted view$"
+        ):
+            self.check(bad)
 
     def test_extra_missing_and_wrong_typed_metadata_refuse(self):
         for key, value in (

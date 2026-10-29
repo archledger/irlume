@@ -53,8 +53,9 @@ class LeaseBusTests(unittest.TestCase):
         )
         self.bus = fixtures.FakeBus(fixture)
         self.bus.close = mock.Mock()
+        self.bridge = host.load_bus_bridge(self.runtime)
         self.adapter = host.LeaseBus(
-            self.config, fixture.manifest, self.support, self.bus
+            self.config, fixture.manifest, self.support, self.bus, self.bridge
         )
 
     def test_exact_creation_delegates_to_typed_bridge(self):
@@ -116,7 +117,7 @@ class LeaseBusTests(unittest.TestCase):
             {"ExecStart": (("/usr/bin/other", ("/usr/bin/other",), False),)},
         ):
             adapter = host.LeaseBus(
-                self.config, self.fixture.manifest, self.support, self.bus
+                self.config, self.fixture.manifest, self.support, self.bus, self.bridge
             )
             self.bus.observe = mock.Mock(return_value=dict(unit, **wrong))
             with self.subTest(wrong=wrong), self.assertRaises(ValueError):
@@ -313,7 +314,8 @@ class FactoryTests(unittest.TestCase):
         self.coordinates = {
             "host_namespaces": fixture.plan["host_namespaces"],
             "host_api": fixture.plan["host_api"],
-            "bus": fixture.bus,
+            # H's own bus node, a stability coordinate only it observes.
+            "bus": {"device": 1, "inode": 900},
         }
         self.owner = host.HostOwner(
             self.selection,
@@ -450,6 +452,8 @@ class FactoryTests(unittest.TestCase):
         self.owner.listener.accept.return_value = (mock.Mock(), None)
         channel, order = mock.Mock(), []
         channel.check.side_effect = lambda end: order.append("alive")
+        channel.peer_fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, channel.peer_fd)
 
         def changed_start(pid):
             order.append("starttime")
@@ -462,6 +466,74 @@ class FactoryTests(unittest.TestCase):
         ):
             self.owner.connect(identity, deadline)
         self.assertEqual(order, ["alive", "starttime", "alive"])
+        channel.send.assert_not_called()
+
+    def connectable_owner(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        identity = self.owner.start(self.owner.config, deadline)
+        with mock.patch.object(native, "process_start", return_value=100):
+            self.owner.process_start(identity, deadline)
+        self.owner.listener.close()
+        channel = mock.Mock()
+        # A real pidfd: the fake manager resolves it by the PID it names.
+        channel.peer_fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, channel.peer_fd)
+        return bus, identity, channel, deadline
+
+    def test_connect_binds_peer_pidfd_invocation(self):
+        bus, identity, channel, deadline = self.connectable_owner()
+        # H opened its manager connection with descriptor passing.
+        self.owner.bus_factory.assert_called_once_with(
+            os.getuid(), deadline=deadline, fds=True
+        )
+        other = "irlume-job-guardian-other.service"
+        cases = (
+            ("invocation", "pidfd_invocation", bytes.fromhex("e" * 32), "invocation"),
+            ("unit", "pidfd_unit", other, "process unit"),
+        )
+
+        def peer_calls():
+            return [call[4] for call in bus.calls if call[2] == "GetUnitByPIDFD"]
+
+        with (
+            mock.patch.object(self.root.guardian, "PeerChannel", return_value=channel),
+            mock.patch.object(native, "process_start", return_value=100),
+        ):
+            for label, field, value, message in cases:
+                self.owner.channel = None
+                self.owner.listener = mock.Mock()
+                self.owner.listener.accept.return_value = (mock.Mock(), None)
+                setattr(bus, field, value)
+                with (
+                    self.subTest(at="connect", case=label),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    self.owner.connect(identity, deadline)
+                setattr(bus, field, None)
+                self.assertEqual(peer_calls()[-1], (channel.peer_fd,))
+            self.owner.channel = None
+            self.owner.listener = mock.Mock()
+            self.owner.listener.accept.return_value = (mock.Mock(), None)
+            count = len(peer_calls())
+            self.owner.connect(identity, deadline)
+            # Once after accept and once more in the recheck connect ends with.
+            self.assertEqual(peer_calls()[count:], [(channel.peer_fd,)] * 2)
+            self.assertEqual(
+                self.owner.adapter.bridge.partial["pidfd_unit"][1:],
+                (identity.unit, identity.invocation_id),
+            )
+            for label, field, value, message in cases:
+                setattr(bus, field, value)
+                with (
+                    self.subTest(at="recheck", case=label),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    self.owner.recheck(identity, 100, deadline)
+                setattr(bus, field, None)
+            self.owner.recheck(identity, 100, deadline)
         channel.send.assert_not_called()
 
     def test_commit_allows_peer_exit_after_final_write(self):
@@ -1177,6 +1249,7 @@ class FactoryTests(unittest.TestCase):
     def test_resolver_refuses_any_unit_not_proven_failed_and_released(self):
         bus, _ = self.retained_failure()
         value = self.owner.value
+        tick = self.root.guardian.START_TICK_NS
         other = bus.variant("ay", tuple(bytes.fromhex("e" * 32)))
         cases = {
             "active": {
@@ -1208,7 +1281,7 @@ class FactoryTests(unittest.TestCase):
                 "service": {
                     "ExecMainStartTimestampMonotonic": (
                         "t",
-                        (value["origin_ns"] - host.START_TICK_NS) // 1000 - 1,
+                        (value["origin_ns"] - tick) // 1000 - 1,
                     )
                 },
             },
@@ -1259,12 +1332,15 @@ class FactoryTests(unittest.TestCase):
 
     def test_resolver_start_window_allows_one_proc_clock_tick(self):
         # PrivatePIDs= start timestamps are whole 10 ms ticks, never later.
-        self.assertEqual(host.START_TICK_NS, 10_000_000)
+        # G's binding window uses the same constant, so H keeps no copy.
+        tick = self.root.guardian.START_TICK_NS
+        self.assertEqual(tick, 10_000_000)
+        self.assertFalse(hasattr(host, "START_TICK_NS"))
         bus, _ = self.retained_failure()
         value = self.owner.value
-        edge = -(-(value["origin_ns"] - host.START_TICK_NS) // 1000)
-        self.assertGreaterEqual(edge * 1000, value["origin_ns"] - host.START_TICK_NS)
-        self.assertLess((edge - 1) * 1000, value["origin_ns"] - host.START_TICK_NS)
+        edge = -(-(value["origin_ns"] - tick) // 1000)
+        self.assertGreaterEqual(edge * 1000, value["origin_ns"] - tick)
+        self.assertLess((edge - 1) * 1000, value["origin_ns"] - tick)
         saved = copy.deepcopy(bus.service)
         bus.service["ExecMainStartTimestampMonotonic"] = ("t", edge - 1)
         self.assert_refused(bus, "start window")
@@ -1542,13 +1618,16 @@ class FactoryTests(unittest.TestCase):
         self.assertIsNone(self.owner.gate.lock_fd)
 
     def test_run_uses_real_host_controller_with_closed_artifact_and_stub_decoder(self):
-        messages, buses = [], []
+        messages, buses, options = [], [], []
         real_listener = host.socket.socket(host.socket.AF_UNIX, host.socket.SOCK_STREAM)
         self.addCleanup(real_listener.close)
         channel, listener = mock.Mock(), mock.Mock(wraps=real_listener)
         listener.accept.return_value = (mock.Mock(), None)
+        channel.peer_fd = os.pidfd_open(os.getpid())
+        self.addCleanup(os.close, channel.peer_fd)
 
         def bus_factory(*args, **kwargs):
+            options.append(kwargs["fds"])
             bus = self.make_bus(install=False)
             buses.append(bus)
             return bus
@@ -1623,6 +1702,12 @@ class FactoryTests(unittest.TestCase):
         self.assertIs(result["native_authorized"], False)
         self.assertIs(result["full_contract_proven"], False)
         decoder.assert_called_once()
+        self.assertEqual(options, [True])
+        # Connect, its recheck and the recheck before COMMIT bind the peer.
+        self.assertEqual(
+            [call[4] for call in buses[0].calls if call[2] == "GetUnitByPIDFD"],
+            [(channel.peer_fd,)] * 3,
+        )
         self.assertFalse((self.gate_path / "active.json").exists())
         self.assertTrue((self.gate_path / "terminal-run-01.json").is_file())
         self.assertEqual(set(self.owner.phases), {"prestart", "postservice"})

@@ -143,37 +143,52 @@ class _Controller:
 
 
 class Guardian(_Controller):
-    """Effects collect/preflight without retained attempt FDs or child creation."""
+    """Effects collect/preflight without retained attempt FDs or child creation.
+
+    G holds no manager connection. Its service identity is H's, from LAUNCH,
+    bound to G's own kernel view before the witness is written or READY sent.
+    """
 
     def execute(self):
         support, protocol = self.support, self.support.protocol
         snapshot = self.call(self.io.collect, self.config, self.manifest, self.deadline)
         self.state = "collected"
-        observed = self.call(
-            self.io.preflight, self.config, self.manifest, self.deadline
-        )
-        if type(observed) is not tuple or len(observed) != 2:
-            raise ValueError("startup service observation")
-        self.identity, starttime = observed
-        binding = self.binding(starttime)
+        # Kernel-local checks only; the effects keep the view for bind_service.
+        self.call(self.io.preflight, self.config, self.manifest, self.deadline)
         self.root.runtime._integer(
             snapshot["started_ns"], self.value["origin_ns"], self.check()
         )
-        data, digest = self.call(
-            support.witness.encode,
-            snapshot,
-            self.value["root_plan"],
-            self.value["bus_identity"],
-            self.manifest,
-            binding,
-            support.witness_deps,
-            clock=self.io.now,
-        )
-        self.check()
         directory = self.io.open_attempt(self.config, self.deadline)
         if type(directory) is not int or directory < 3:
             raise ValueError("startup attempt descriptor")
         with support.artifact.owned(directory):
+            self.check()
+            # Nothing crosses the control socket before the attempt is proven.
+            support.artifact.check_directory(directory, self.directory_identity())
+            self.control_attempted = True
+            self.call(self.io.connect, self.config, self.deadline)
+            frame = self.call(self.io.receive, self.deadline)
+            self.identity = protocol.check_launch(
+                frame, self.config, self.manifest, support.protocol_deps
+            )
+            starttime = self.call(
+                self.io.bind_service,
+                self.config,
+                self.manifest,
+                self.identity,
+                self.deadline,
+            )
+            binding = self.binding(starttime)
+            # Still inside the witness window that starts at the snapshot.
+            data, digest = self.call(
+                support.witness.encode,
+                snapshot,
+                self.value["root_plan"],
+                self.manifest,
+                binding,
+                support.witness_deps,
+                clock=self.io.now,
+            )
             self.check()
             self.reference = self.call(
                 support.artifact.write_closed,
@@ -185,12 +200,6 @@ class Guardian(_Controller):
                 clock=self.io.now,
             )
             self.state = "published"
-            self.control_attempted = True
-            self.call(self.io.connect, self.config, self.deadline)
-            frame = self.call(self.io.receive, self.deadline)
-            protocol.check_launch(
-                frame, self.config, self.manifest, support.protocol_deps
-            )
             self.call(
                 self.io.send,
                 protocol.ready(
@@ -251,7 +260,9 @@ class Host(_Controller):
         self.call(self.io.connect, self.identity, self.deadline)
         self.call(
             self.io.send,
-            protocol.launch(self.config, self.manifest, support.protocol_deps),
+            protocol.launch(
+                self.config, self.identity, self.manifest, support.protocol_deps
+            ),
             self.deadline,
         )
         frame = self.call(self.io.receive, self.deadline)
@@ -273,7 +284,6 @@ class Host(_Controller):
             data,
             self.reference["sha256"],
             self.value["root_plan"],
-            self.value["bus_identity"],
             self.manifest,
             binding,
             support.witness_deps,

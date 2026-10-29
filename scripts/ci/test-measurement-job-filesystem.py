@@ -66,7 +66,6 @@ class FilesystemTests(unittest.TestCase):
             "/sys/fs",
             "/run/host",
             "/tmp",
-            f"/run/user/{os.getuid()}",
         ):
             self.path(path).mkdir(parents=True, exist_ok=True)
         for name, path in self.paths.items():
@@ -97,13 +96,6 @@ class FilesystemTests(unittest.TestCase):
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.mkdir(mode=0)
-        bus = self.path(f"/run/user/{os.getuid()}/bus")
-        endpoint = socket.socket(socket.AF_UNIX)
-        try:
-            endpoint.bind(str(bus))
-        finally:
-            endpoint.close()
-        self.bus = {"device": bus.stat().st_dev, "inode": bus.stat().st_ino}
         info = self.base.stat()
         self.plan["root"]["device"], self.plan["root"]["inode"] = (
             info.st_dev,
@@ -116,7 +108,6 @@ class FilesystemTests(unittest.TestCase):
     def collect(
         self,
         plan=None,
-        bus=None,
         process_root=None,
         opened=None,
         process_mountinfo=b"fixture\n",
@@ -203,7 +194,7 @@ class FilesystemTests(unittest.TestCase):
             mock.patch.object(fs, "metadata", side_effect=device_metadata),
             mock.patch.object(collector, "_read", side_effect=read),
         ):
-            result = collector.collect(plan or self.plan, bus or self.bus)
+            result = collector.collect(plan or self.plan)
             if after is not None:
                 result = after(collector, result)
         self.assertEqual(collector.owned, {})
@@ -221,14 +212,41 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(row["entries"]["/tmp"], ())
         self.assertNotIn("accepted", row)
 
-    def test_wrong_selected_root_input_or_bus_identity_refuses(self):
+    def test_wrong_selected_root_or_input_refuses(self):
         for key in ("root", "base", "payload", "manifest", "attempt"):
             plan = copy.deepcopy(self.plan)
             plan[key]["inode"] += 2**32
             with self.subTest(key=key), self.assertRaises(ValueError):
                 self.collect(plan)
-        with self.assertRaises(ValueError):
-            self.collect(bus={**self.bus, "inode": self.bus["inode"] + 1})
+
+    def test_user_runtime_directory_refuses(self):
+        row = self.collect()
+        self.assertIsNone(row["nodes"]["/run/user"])
+        self.assertNotIn("user", row["entries"]["/run"])
+        user = self.path("/run/user")
+        user.mkdir()
+        with self.assertRaisesRegex(
+            ValueError, "^unexpected filesystem directory entry$"
+        ):
+            self.collect()
+        user.rmdir()
+        endpoint = socket.socket(socket.AF_UNIX)
+        try:
+            endpoint.bind(str(user))
+        finally:
+            endpoint.close()
+        with self.assertRaisesRegex(
+            ValueError, "^unexpected filesystem directory entry$"
+        ):
+            self.collect()
+        user.unlink()
+        # A witness whose inventory omits the node is refused on the node itself.
+        nodes = copy.deepcopy(row["nodes"])
+        nodes["/run/user"] = dict(nodes["/run"])
+        with self.assertRaisesRegex(
+            ValueError, "^user runtime directory in rooted view$"
+        ):
+            fs.check_roles(self.plan, nodes, row["entries"])
 
     def test_writable_wrong_type_and_symlinked_inputs_refuse(self):
         target = self.path(self.paths["base"])
@@ -245,9 +263,9 @@ class FilesystemTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.collect()
         self.path("/dev/kvm").unlink()
-        user = self.path(f"/run/user/{os.getuid()}")
-        user.rename(user.with_name("moved"))
-        user.symlink_to("moved", target_is_directory=True)
+        inputs = self.path("/run/irlume")
+        inputs.rename(inputs.with_name("moved"))
+        inputs.symlink_to("moved", target_is_directory=True)
         with self.assertRaises((ValueError, OSError)):
             self.collect()
 
@@ -311,10 +329,10 @@ class FilesystemTests(unittest.TestCase):
     def test_real_unrooted_process_cannot_pass_as_selected_fixture_root(self):
         collector = fs.FilesystemCollector(time.monotonic_ns() + 5_000_000_000)
         with self.assertRaisesRegex(ValueError, "filesystem root does not match"):
-            collector.collect(self.plan, self.bus)
+            collector.collect(self.plan)
         self.assertEqual(collector.owned, {})
         with self.assertRaisesRegex(ValueError, "single-use"):
-            collector.collect(self.plan, self.bus)
+            collector.collect(self.plan)
 
     def test_special_endpoints_are_never_opened_for_data(self):
         opened = []
@@ -323,14 +341,13 @@ class FilesystemTests(unittest.TestCase):
             "base.raw",
             "payload.raw",
             "runtime-manifest.json",
-            "bus",
             "ptmx",
         }
         endpoints = [(path, flags) for path, flags in opened if path in targets]
         self.assertEqual(len(endpoints), len(targets))
         self.assertTrue(all(flags & os.O_PATH for _, flags in endpoints))
 
-    def test_attempt_mode_input_hardlink_and_bus_type_are_checked(self):
+    def test_attempt_mode_and_input_hardlink_are_checked(self):
         attempt = self.path(fs.root.ATTEMPT)
         attempt.chmod(0o755)
         with self.assertRaises(ValueError):
@@ -341,12 +358,7 @@ class FilesystemTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.collect()
         extra.unlink()
-        bus = self.path(f"/run/user/{os.getuid()}/bus")
-        bus.unlink()
-        bus.touch()
-        self.bus = {"device": bus.stat().st_dev, "inode": bus.stat().st_ino}
-        with self.assertRaises(ValueError):
-            self.collect()
+        self.collect()
 
     def test_directory_entry_limit_and_optional_os_release_topology(self):
         stage = self.path(fs.root.OS_RELEASE_STAGE)
@@ -476,11 +488,11 @@ class FilesystemTests(unittest.TestCase):
             name for name in entries["/run/irlume"] if name != "base.raw"
         )
         with self.assertRaises(ValueError):
-            fs.check_roles(self.plan, self.bus, row["nodes"], entries)
+            fs.check_roles(self.plan, row["nodes"], entries)
         entries = copy.deepcopy(row["entries"])
         entries["/run"] = None
         with self.assertRaises(ValueError):
-            fs.check_roles(self.plan, self.bus, row["nodes"], entries)
+            fs.check_roles(self.plan, row["nodes"], entries)
 
     def test_final_root_mount_and_stdio_changes_refuse(self):
         for changes in (
@@ -577,12 +589,12 @@ class FilesystemTests(unittest.TestCase):
         os.fstat(0)
 
     def test_final_observation_reuses_selection_and_preserves_both_timestamps(self):
-        original_uid = self.plan["uid"]
-
         def finish(collector, first):
+            # Either change refuses unless the original selection is reused.
             self.plan["uid"] += 1
+            self.plan["base"]["inode"] += 1
             final = collector.reobserve()
-            self.assertIn(f"/run/user/{original_uid}/bus", final["nodes"])
+            self.assertIsNone(final["nodes"]["/run/user"])
             self.assertEqual(final["started_ns"], first["started_ns"])
             self.assertGreater(final["finished_ns"], first["finished_ns"])
             self.assertIsNot(final["nodes"], first["nodes"])

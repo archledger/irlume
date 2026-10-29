@@ -38,6 +38,14 @@ CONTROL_LIMIT = 16 * 1024
 KINDS = {"launch", "ready", "commit", "cancel", "done"}
 HOST_NS = 300_000_000_000
 STOP_NS = 5_000_000_000
+# With PrivatePIDs=yes systemd resets ExecMainStartTimestamp from the main
+# process's /proc stat starttime (v259.10 and v262.1 service.c,
+# service_set_main_pidref), which counts whole USER_HZ ticks (Linux
+# fs/proc/array.c; 100 Hz on x86-64). Its boottime-to-monotonic mapping
+# (time-util.c, dual_timestamp_from_boottime) adds the gap between two clock
+# reads; a host suspend between the fork and that mapping moves it earlier,
+# which still refuses. H's resolver and G's service binding share it.
+START_TICK_NS = 10_000_000
 IO_LIMIT = 65536
 # Linux UAPI asm-generic/socket.h; Python 3.14 does not export this constant.
 # SO_PEERPIDFD binds the socket's stored peer, without a PID lookup/reuse race.

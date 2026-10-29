@@ -42,6 +42,13 @@ HIDDEN_PROFILE = (
     "-+/sys/kernel/tracing",
 )
 
+# Literal: only the selected inputs; G gets no path to the user bus.
+INPUT_BINDS = (
+    ("/private/base.raw", "/run/irlume/base.raw", False, 0),
+    ("/private/payload.raw", "/run/irlume/payload.raw", False, 0),
+    ("/private/runtime-manifest.json", "/run/irlume/runtime-manifest.json", False, 0),
+)
+
 # Sanitized G mount tables from transient units on a Fedora 44 host (systemd
 # 259.10, Linux 7.2.13, a VPN net_cls hierarchy), with plan paths in place of
 # host paths.
@@ -188,6 +195,13 @@ R5_PRIVATE_PIDS = b"""\
 1517 1506 0:84 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
 1518 1433 0:93 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
 """
+# The same table without row 1505, the user-bus bind the profile no longer
+# requests; a native table of the bus-free profile is still to be recorded.
+R5_NO_BUS = b"".join(
+    line
+    for line in R5_PRIVATE_PIDS.splitlines(keepends=True)
+    if b" /run/user/" not in line
+)
 
 
 def selection():
@@ -306,7 +320,6 @@ def witness(plan):
             "/run/irlume/base.raw",
             "/run/irlume/payload.raw",
             "/run/irlume/runtime-manifest.json",
-            f"/run/user/{plan['uid']}/bus",
         )
     ]
     mountinfo = b""
@@ -355,9 +368,6 @@ def witness(plan):
             "/run/irlume/base.raw",
             "/run/irlume/payload.raw",
             "/run/irlume/runtime-manifest.json",
-            "/run/user",
-            "/run/user/1000",
-            "/run/user/1000/bus",
         ),
         "os_release": None,
         "started_ns": 100,
@@ -439,6 +449,37 @@ class ProfileTests(unittest.TestCase):
                 "c" * 64,
             ),
         )
+
+    def test_profile_binds_no_user_bus(self):
+        plan, data = selection()
+        spec = root.guardian.Specification(**guardian_tests.specification()._asdict())
+        props = root.service_properties(spec, plan, data)
+        self.assertEqual(props["BindReadOnlyPaths"], INPUT_BINDS)
+        for name in ("BindPaths", "BindReadOnlyPaths"):
+            for source, target, _, _ in props[name]:
+                with self.subTest(name=name, target=target):
+                    self.assertFalse(source.startswith("/run/user"))
+                    self.assertFalse(target.startswith("/run/user"))
+        self.assertNotIn("/run/user", repr(root.wire_properties(plan)))
+
+    def test_check_properties_refuses_user_bus_bind(self):
+        plan, _ = selection()
+        variants = {
+            key: (root.PROPERTY_TYPES[key], value)
+            for key, value in root.root_properties(plan).items()
+        }
+        variants.update(PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes"))
+        variants["BindReadOnlyPaths"] = ("a(ssbt)", INPUT_BINDS)
+        self.assertIsNone(root.check_properties(variants, plan))
+        bus = f"/run/user/{plan['uid']}/bus"
+        variants["BindReadOnlyPaths"] = (
+            "a(ssbt)",
+            (*INPUT_BINDS, (bus, bus, False, 0)),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "^effective root property: BindReadOnlyPaths$"
+        ):
+            root.check_properties(variants, plan)
 
     def test_plan_rejects_aliases_overlap_bad_types_and_unknown_fields(self):
         plan, _ = selection()
@@ -1097,6 +1138,28 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             root.check_core(plan, dict(row, mountinfo=bad), 1000, 250)
 
+    def test_mounts_refuse_user_bus_and_runtime_dir(self):
+        plan, _ = selection()
+        row = witness(plan)
+        self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        bus = f"/run/user/{plan['uid']}/bus"
+        bad = dict(
+            row,
+            mountinfo=add_mount(
+                row["mountinfo"], 40, bus, "ro,nosuid,nodev,noexec", "tmpfs"
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "^missing or unexpected rooted mount$"):
+            root.check_core(plan, bad, 1000, 250)
+        user = f"/run/user/{plan['uid']}"
+        for extra in (("/run/user",), ("/run/user", user), ("/run/user", user, bus)):
+            entries = tuple(sorted((*row["run_entries"], *extra)))
+            with (
+                self.subTest(extra=extra),
+                self.assertRaisesRegex(ValueError, "^unexpected rooted run entry$"),
+            ):
+                root.check_core(plan, dict(row, run_entries=entries), 1000, 250)
+
     def test_tmpfs_and_run_contents_are_bounded_and_private(self):
         plan, _ = selection()
         row = witness(plan)
@@ -1182,7 +1245,8 @@ class CoreTests(unittest.TestCase):
     def test_real_private_pid_table_is_accepted(self):
         plan, _ = selection()
         row = witness(plan)
-        view = root.parse_mountinfo(R5_PRIVATE_PIDS)
+        self.assertEqual(R5_PRIVATE_PIDS.count(b"\n") - R5_NO_BUS.count(b"\n"), 1)
+        view = root.parse_mountinfo(R5_NO_BUS)
         for i, path in enumerate(root.DENIAL_NODES):
             mode = 0o100000 if path == "/dev/ptmx" else 0o40000
             node = {"device": 3, "inode": 700 + i, "mode": mode}
@@ -1195,7 +1259,7 @@ class CoreTests(unittest.TestCase):
             "stage_mode": 0o40755,
             "file_mode": 0o100644,
         }
-        row["mountinfo"] = R5_PRIVATE_PIDS
+        row["mountinfo"] = R5_NO_BUS
         self.assertIsNone(root.check_core(plan, row, 1000, 250))
         # The real table carries the legacy leaf, rw device binds and no /root.
         self.assertIn("/sys/fs/cgroup/net_cls", view)
@@ -1204,6 +1268,8 @@ class CoreTests(unittest.TestCase):
         for data, message in (
             (R5_HOST_PROC, "stacked mount: /proc/sys/fs/binfmt_misc"),
             (R5_PID_ONLY, "stacked mount: /proc/sys/fs/binfmt_misc"),
+            # The recorded table with the user-bus bind is no longer the profile.
+            (R5_PRIVATE_PIDS, "^missing or unexpected rooted mount$"),
         ):
             with self.assertRaisesRegex(ValueError, message):
                 root.check_core(plan, dict(row, mountinfo=data), 1000, 250)

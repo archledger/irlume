@@ -246,6 +246,9 @@ def root_properties(plan):
         "DevicePolicy": "closed",
         "DeviceAllow": (),
         "BindPaths": ((plan["attempt"]["path"], ATTEMPT, False, 0),),
+        # Only the selected inputs. G has no user-bus path: H makes every
+        # manager call, and the private network namespace separates abstract
+        # sockets, so neither G nor a later child can reach systemd --user.
         "BindReadOnlyPaths": tuple(
             (plan[key]["path"], target, False, 0)
             for key, target in (
@@ -253,8 +256,7 @@ def root_properties(plan):
                 ("payload", "/run/irlume/payload.raw"),
                 ("manifest", "/run/irlume/runtime-manifest.json"),
             )
-        )
-        + ((f"/run/user/{plan['uid']}/bus", f"/run/user/{plan['uid']}/bus", False, 0),),
+        ),
         "TemporaryFileSystem": (
             ("/tmp", "rw,nosuid,nodev,noexec,size=16M,mode=1777"),
             ("/run", "rw,nosuid,nodev,noexec,size=16M,mode=0755"),
@@ -651,8 +653,6 @@ def check_mounts(plan, row):
     entries = row["run_entries"]
     run_allowed = {
         "/run/irlume",
-        "/run/user",
-        f"/run/user/{plan['uid']}",
         "/run/host",
         "/run/host/os-release",
         OS_RELEASE_STAGE,

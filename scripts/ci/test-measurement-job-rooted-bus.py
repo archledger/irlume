@@ -211,12 +211,6 @@ class BridgeTests(unittest.TestCase):
                             False,
                             0,
                         ),
-                        (
-                            f"/run/user/{plan['uid']}/bus",
-                            f"/run/user/{plan['uid']}/bus",
-                            False,
-                            0,
-                        ),
                     ],
                 ),
             ),

@@ -643,7 +643,7 @@ def run_service(argv, *, _module=None):
     config = guardian.runtime._json(data)
     if (
         type(config) is dict
-        and config.get("scope") == "contained-job-rooted-startup-config-v1"
+        and config.get("scope") == "contained-job-rooted-startup-config-v2"
     ):
         if (
             argv[2] != "/run/irlume/attempt/guardian-config.json"

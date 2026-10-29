@@ -53,12 +53,10 @@ class ProtocolTests(unittest.TestCase):
             "gid": self.plan["gid"],
             "starttime": 100,
         }
-        self.bus = {"device": 1, "inode": 900}
         self.config = protocol.make_config(
             self.spec,
             self.plan,
             self.client,
-            self.bus,
             1_000_000,
             self.manifest,
             self.deps,
@@ -117,9 +115,10 @@ class ProtocolTests(unittest.TestCase):
                 )
 
     def test_ready_commit_done_bind_same_config_service_and_artifact(self):
-        request = protocol.launch(self.config, self.manifest, self.deps)
-        self.assertIsNone(
-            protocol.check_launch(request, self.config, self.manifest, self.deps)
+        request = protocol.launch(self.config, self.service, self.manifest, self.deps)
+        self.assertEqual(
+            protocol.check_launch(request, self.config, self.manifest, self.deps),
+            self.service,
         )
         ready = protocol.ready(
             self.config, self.service, self.reference, self.manifest, self.deps
@@ -181,21 +180,121 @@ class ProtocolTests(unittest.TestCase):
                 legacy, self.config, self.service, self.manifest, self.deps
             )
 
-    def test_configuration_mode_and_bus_identity_cannot_be_relaxed(self):
+    def test_configuration_v2_fields_are_exact(self):
         original = protocol.decode_config(
             self.config.data, self.config.sha256, self.manifest, self.deps
         )
+        self.assertEqual(original["scope"], "contained-job-rooted-startup-config-v2")
+        self.assertEqual(
+            set(original),
+            {
+                "scope",
+                "mode",
+                "host_spec",
+                "root_plan",
+                "client",
+                "origin_ns",
+                "startup_deadline_ns",
+            },
+        )
         for field, value in (
             ("mode", "boot"),
-            ("bus_identity", {"device": 1, "inode": True}),
             ("client", dict(self.client, starttime=False)),
+            # The v1 schema carried the user-bus identity for G to check.
+            ("bus_identity", {"device": 1, "inode": 900}),
+            ("scope", "contained-job-rooted-startup-config-v1"),
         ):
             bad = dict(original, **{field: value})
             data = self.root.closure.canonical(bad)
             with self.subTest(field=field), self.assertRaises(ValueError):
-                protocol.decode_config(
-                    data, hashlib.sha256(data).hexdigest(), self.manifest, self.deps
+                protocol.decode_header(
+                    data, hashlib.sha256(data).hexdigest(), self.deps
                 )
+        v1 = dict(
+            original,
+            scope="contained-job-rooted-startup-config-v1",
+            bus_identity={"device": 1, "inode": 900},
+        )
+        data = self.root.closure.canonical(v1)
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            protocol.decode_header(data, hashlib.sha256(data).hexdigest(), self.deps)
+
+    def test_launch_carries_checked_service_identity(self):
+        frame = protocol.launch(self.config, self.service, self.manifest, self.deps)
+        row = self.root.guardian.decode(frame)
+        self.assertEqual(
+            row["payload"],
+            {
+                "scope": "rooted-startup-launch-v2",
+                "run_id": self.plan["run_id"],
+                "config_sha256": self.config.sha256,
+                "service": self.service._asdict(),
+            },
+        )
+        identity = protocol.check_launch(frame, self.config, self.manifest, self.deps)
+        self.assertIs(type(identity), self.root.guardian.ServiceIdentity)
+        self.assertEqual(identity, self.service)
+        uid = self.plan["uid"]
+        manager = f"/user.slice/user-{uid}.slice/user@{uid}.service"
+        startup = protocol.decode_config(
+            self.config.data, self.config.sha256, self.manifest, self.deps
+        )["startup_deadline_ns"]
+        wrong = {
+            "unit": {"unit": "irlume-job-guardian-other.service"},
+            "zero invocation": {"invocation_id": "0" * 32},
+            "short invocation": {"invocation_id": "d" * 31},
+            "outside manager": {"cgroup": "/system.slice/" + self.service.unit},
+            "other manager": {
+                "cgroup": f"/user.slice/user-{uid + 1}.slice/user@{uid + 1}.service/"
+                + self.service.unit
+            },
+            "not the unit": {"cgroup": manager + "/app.slice/other.service"},
+            "dotted cgroup": {"cgroup": manager + "/app.slice/../" + self.service.unit},
+            "early deadline": {"deadline_ns": startup - 1},
+            "pid": {"pid": 1},
+            "pid type": {"pid": True},
+        }
+        for label, changes in wrong.items():
+            service = self.service._replace(**changes)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                protocol.launch(self.config, service, self.manifest, self.deps)
+            bad = copy.deepcopy(row)
+            bad["payload"]["service"].update(changes)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                protocol.check_launch(
+                    self.root.guardian.encode(bad),
+                    self.config,
+                    self.manifest,
+                    self.deps,
+                )
+        edits = {
+            "extra field": lambda r: r["payload"]["service"].update(extra=1),
+            "missing field": lambda r: r["payload"]["service"].pop("cgroup"),
+            "extra payload": lambda r: r["payload"].update(extra=1),
+            "missing service": lambda r: r["payload"].pop("service"),
+            "v1 scope": lambda r: r["payload"].update(scope="rooted-startup-launch-v1"),
+            "v1 payload": lambda r: (
+                r["payload"].update(scope="rooted-startup-launch-v1"),
+                r["payload"].pop("service"),
+            ),
+            "other run": lambda r: r["payload"].update(run_id="run-02"),
+            "other config": lambda r: r["payload"].update(config_sha256="f" * 64),
+            "not launch": lambda r: r.update(kind="ready"),
+        }
+        for label, edit in edits.items():
+            bad = copy.deepcopy(row)
+            edit(bad)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                protocol.check_launch(
+                    self.root.guardian.encode(bad),
+                    self.config,
+                    self.manifest,
+                    self.deps,
+                )
+        with self.assertRaises(ValueError):
+            protocol.launch(
+                self.config, self.service._asdict(), self.manifest, self.deps
+            )
 
     def test_config_limit_and_canonical_form_apply_to_both_directions(self):
         with (
@@ -206,7 +305,6 @@ class ProtocolTests(unittest.TestCase):
                 self.spec,
                 self.plan,
                 self.client,
-                self.bus,
                 1_000_000,
                 self.manifest,
                 self.deps,
@@ -221,7 +319,6 @@ class ProtocolTests(unittest.TestCase):
                 self.spec,
                 self.plan,
                 self.client,
-                self.bus,
                 True,
                 self.manifest,
                 self.deps,
@@ -256,7 +353,6 @@ class ProtocolTests(unittest.TestCase):
                 self.spec._replace(overlay="/elsewhere/overlay.qcow2"),
                 self.plan,
                 self.client,
-                self.bus,
                 1_000_000,
                 self.manifest,
                 self.deps,
@@ -271,7 +367,7 @@ class ProtocolTests(unittest.TestCase):
         self.plan["manifest"]["sha256"] = hashlib.sha256(data).hexdigest()
         with self.assertRaises(ValueError):
             protocol.make_config(
-                self.spec, self.plan, self.client, self.bus, 1_000_000, data, self.deps
+                self.spec, self.plan, self.client, 1_000_000, data, self.deps
             )
 
     def test_commit_and_done_reject_replayed_version_and_true_authority(self):
@@ -316,7 +412,6 @@ class ProtocolTests(unittest.TestCase):
                 spec,
                 self.plan,
                 self.client,
-                self.bus,
                 1_000_000,
                 self.manifest,
                 self.deps,
@@ -324,7 +419,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_launch_digest_and_artifact_owner_are_independent_bindings(self):
         row = self.root.guardian.decode(
-            protocol.launch(self.config, self.manifest, self.deps)
+            protocol.launch(self.config, self.service, self.manifest, self.deps)
         )
         row["payload"]["config_sha256"] = "f" * 64
         with self.assertRaises(ValueError):
@@ -357,7 +452,6 @@ class ProtocolTests(unittest.TestCase):
                 spec,
                 self.plan,
                 self.client,
-                self.bus,
                 1_000_000,
                 self.manifest,
                 self.deps,
@@ -402,7 +496,6 @@ class ProtocolTests(unittest.TestCase):
                 self.spec,
                 self.plan,
                 self.client,
-                self.bus,
                 origin,
                 self.manifest,
                 self.deps,

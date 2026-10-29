@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from builtins import BaseExceptionGroup
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -70,7 +71,12 @@ class Effects:
 
     def preflight(self, config, manifest, deadline):
         self.mark("preflight")
-        return self.f.service, 123
+        return "local-view"
+
+    def bind_service(self, config, manifest, identity, deadline):
+        self.mark("bind-service")
+        self.bound = identity
+        return 123
 
     def open_attempt(self, config, deadline):
         self.mark("open-attempt")
@@ -104,7 +110,9 @@ class Effects:
         if self.messages:
             return self.messages.pop(0)
         if not self.sent:
-            return protocol.launch(self.f.config, self.f.manifest, self.f.protocol_deps)
+            return protocol.launch(
+                self.f.config, self.f.service, self.f.manifest, self.f.protocol_deps
+            )
         ready = self.f.guardian.decode(self.sent[0])["payload"]["startup"]
         return protocol.commit(
             self.f.config, self.f.service, ready, self.f.manifest, self.f.protocol_deps
@@ -171,7 +179,7 @@ class HandshakeTests(unittest.TestCase):
         )
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        self.plan, self.bus = fixture.plan, fixture.bus
+        self.plan = fixture.plan
         temporary = tempfile.TemporaryDirectory(dir="/tmp/opencode")
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name)
@@ -223,7 +231,6 @@ class HandshakeTests(unittest.TestCase):
         )
         self.observation["core"] = fixture.deps.preflight.core_witness(
             self.plan,
-            self.bus,
             self.observation["filesystem"],
             5_001_000_000,
             1_006_000,
@@ -246,7 +253,6 @@ class HandshakeTests(unittest.TestCase):
             spec,
             self.plan,
             client,
-            self.bus,
             1_000_000,
             self.manifest,
             self.protocol_deps,
@@ -284,6 +290,106 @@ class HandshakeTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             runner.run()
+
+    def recorded_guardian_run(self, fail=None):
+        """Run G, recording the witness write among its effects."""
+        runner, effects = self.guardian_run(fail)
+        write = artifact.write_closed
+
+        def recorded(*args, **kwargs):
+            effects.calls.append("write-closed")
+            return write(*args, **kwargs)
+
+        with mock.patch.object(artifact, "write_closed", side_effect=recorded):
+            runner.run()
+        return runner, effects
+
+    def test_guardian_receives_launch_before_publishing(self):
+        runner, effects = self.recorded_guardian_run()
+        self.assertEqual(
+            effects.calls,
+            [
+                "collect",
+                "preflight",
+                "open-attempt",
+                "connect",
+                "receive",
+                "bind-service",
+                "write-closed",
+                "send-ready",
+                "receive",
+                "idle",
+                "send-done",
+                "close-control",
+            ],
+        )
+        # G's identity is H's LAUNCH identity, checked locally by bind_service.
+        self.assertEqual(effects.bound, self.service)
+        self.assertEqual(runner.identity, self.service)
+        ready = self.guardian.decode(effects.sent[0])["payload"]
+        self.assertEqual(ready["service"], self.service._asdict())
+
+    def test_guardian_refuses_launch_service_before_publishing(self):
+        for fail in ("bind-service", "receive"):
+            runner, effects = self.guardian_run()
+            effects.fail = fail
+            write = artifact.write_closed
+            with (
+                self.subTest(fail=fail),
+                mock.patch.object(
+                    artifact,
+                    "write_closed",
+                    side_effect=AssertionError("published before binding"),
+                ),
+                self.assertRaisesRegex(ValueError, "injected " + fail),
+            ):
+                runner.run()
+            self.assertIs(artifact.write_closed, write)
+            self.assertEqual(effects.sent, [])
+            self.assertFalse((self.path / artifact.NAME).exists())
+            self.assertIn("close-control", effects.calls)
+        # A LAUNCH for another unit never reaches the local binding.
+        runner, effects = self.guardian_run()
+        other = self.service._replace(unit="irlume-job-guardian-other.service")
+        frame = self.guardian.decode(
+            protocol.launch(
+                self.config, self.service, self.manifest, self.protocol_deps
+            )
+        )
+        frame["payload"]["service"] = other._asdict()
+        effects.messages = [self.guardian.encode(frame)]
+        with self.assertRaisesRegex(ValueError, "rooted startup service identity"):
+            runner.run()
+        self.assertNotIn("bind-service", effects.calls)
+        self.assertEqual(effects.sent, [])
+        self.assertFalse((self.path / artifact.NAME).exists())
+
+    def test_host_sends_launch_with_exactly_its_identity(self):
+        guardian, g_effects = self.guardian_run()
+        guardian.run()
+        effects = Effects(self, "H", g_effects.sent)
+        runner = controller.Host(
+            self.config,
+            self.manifest,
+            self.support,
+            effects,
+            host.verify_service_terminal,
+        )
+        runner.run()
+        self.assertLess(
+            effects.calls.index("connect"), effects.calls.index("send-launch")
+        )
+        self.assertEqual(
+            effects.sent[0],
+            protocol.launch(
+                self.config, self.service, self.manifest, self.protocol_deps
+            ),
+        )
+        self.assertEqual(
+            self.guardian.decode(effects.sent[0])["payload"]["service"],
+            self.service._asdict(),
+        )
+        effects.release(runner.deadline)
 
     def test_host_validates_real_closed_witness_before_commit_and_release(self):
         guardian, g_effects = self.guardian_run()
@@ -541,7 +647,7 @@ class HandshakeTests(unittest.TestCase):
             view["proc"]["started_ns"] = started
         deadline = config["startup_deadline_ns"]
         observation["core"] = self.support.witness_deps.preflight.core_witness(
-            self.plan, self.bus, observation["filesystem"], deadline, 1_006_000
+            self.plan, observation["filesystem"], deadline, 1_006_000
         )
         binding = {
             "run_id": self.plan["run_id"],
@@ -554,7 +660,6 @@ class HandshakeTests(unittest.TestCase):
         data, digest = self.support.witness.encode(
             observation,
             self.plan,
-            self.bus,
             self.manifest,
             binding,
             self.support.witness_deps,

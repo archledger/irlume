@@ -186,12 +186,11 @@ def check_snapshot(plan, snapshot, deadline, now):
             raise ValueError("preflight directory inventory")
 
 
-def core_witness(plan, bus_identity, snapshot, deadline, now):
+def core_witness(plan, snapshot, deadline, now):
     """Return a checked core candidate, without granting provenance or admission."""
     check_snapshot(plan, snapshot, deadline, now)
-    root.identity(bus_identity)
     nodes, proc = snapshot["nodes"], snapshot["proc"]
-    filesystem.check_roles(plan, bus_identity, nodes, snapshot["entries"])
+    filesystem.check_roles(plan, nodes, snapshot["entries"])
     root.identity(proc["root"])
     runtime._fields(proc["namespaces"], root.NAMESPACES)
     if not filesystem.selected_identity(nodes["/"], proc["root"]):

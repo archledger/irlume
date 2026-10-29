@@ -204,29 +204,30 @@ def selected_identity(node, selected):
 
 
 def directory_policy(plan):
-    uid = str(plan["uid"])
+    # No user runtime directory: G's view has no path to the user bus.
     return {
         "/dev": set(DEVICES)
         | set(DEV_LINKS)
         | {"pts", "ptmx", "shm", "mqueue", "hugepages", "char"},
         "/dev/char": set(CHAR_LINKS),
-        "/run": {"irlume", "user", "host", "credentials"},
+        "/run": {"irlume", "host", "credentials"},
         "/run/irlume": {"attempt", "base.raw", "payload.raw", "runtime-manifest.json"},
-        "/run/user": {uid},
-        "/run/user/" + uid: {"bus"},
         "/run/host": {".os-release-stage", "os-release"},
         root.OS_RELEASE_STAGE: {"os-release"},
         "/tmp": set(),
     }
 
 
-def check_roles(plan, bus_identity, nodes, entries):
+def check_roles(plan, nodes, entries):
     for path, names in entries.items():
         if names is None:
             if path not in ("/run/host", root.OS_RELEASE_STAGE, "/dev/char"):
                 raise ValueError("missing filesystem structural directory")
         elif not set(names) <= directory_policy(plan)[path]:
             raise ValueError("unexpected filesystem directory entry")
+    # Observed on its own, so a witness whose inventory omits it still refuses.
+    if nodes["/run/user"] is not None:
+        raise ValueError("user runtime directory in rooted view")
     for path, node in nodes.items():
         if path == "/":
             continue
@@ -256,13 +257,6 @@ def check_roles(plan, bus_identity, nodes, entries):
             or node["size"] <= 0
         ):
             raise ValueError("selected input is not a frozen regular file")
-    bus = nodes[f"/run/user/{plan['uid']}/bus"]
-    if (
-        not selected_identity(bus, bus_identity)
-        or not stat.S_ISSOCK(bus["mode"])
-        or bus["uid"] != plan["uid"]
-    ):
-        raise ValueError("selected user bus identity or type")
     for name, device in DEVICES.items():
         node = nodes["/dev/" + name]
         if (
@@ -339,7 +333,8 @@ def target_paths(plan):
         "/run/irlume/base.raw",
         "/run/irlume/payload.raw",
         "/run/irlume/runtime-manifest.json",
-        f"/run/user/{plan['uid']}/bus",
+        # Required absent: the user runtime directory and its bus socket.
+        "/run/user",
         *root.DENIAL_NODES,
         *("/dev/" + name for name in DEVICES),
         *("/dev/" + name for name in DEV_LINKS),
@@ -353,12 +348,11 @@ def target_paths(plan):
 class FilesystemCollector(startup.ProcCollector):
     """Collect fixed identities after the proc phase, without restarting its clock."""
 
-    def collect(self, plan, bus_identity):
+    def collect(self, plan):
         root.check_plan(plan)
-        root.identity(bus_identity)
         process = super().collect()
-        result = self._observe_filesystem(plan, bus_identity, process)
-        self._final_selection = copy.deepcopy((plan, bus_identity, process))
+        result = self._observe_filesystem(plan, process)
+        self._final_selection = copy.deepcopy((plan, process))
         self._final_observed = False
         return result
 
@@ -368,10 +362,10 @@ class FilesystemCollector(startup.ProcCollector):
             raise ValueError("filesystem final observation is unavailable")
         self._final_observed = True
         self._after()
-        plan, bus_identity, process = copy.deepcopy(self._final_selection)
-        return self._observe_filesystem(plan, bus_identity, process)
+        plan, process = copy.deepcopy(self._final_selection)
+        return self._observe_filesystem(plan, process)
 
-    def _observe_filesystem(self, plan, bus_identity, process):
+    def _observe_filesystem(self, plan, process):
         self.filesystem_partial = {"nodes": {}, "entries": {}}
         with (
             self._open("/", directory=True, path_only=True) as root_fd,
@@ -388,7 +382,7 @@ class FilesystemCollector(startup.ProcCollector):
             for path in directory_policy(plan):
                 entries[path] = tree.entries(path)
             volumes = {path: tree.volume(path) for path in ("/", "/run", "/tmp")}
-            check_roles(plan, bus_identity, tree.nodes, entries)
+            check_roles(plan, tree.nodes, entries)
             tree.recheck()
             if (
                 metadata(self._call(os.stat, "/", follow_symlinks=False))

@@ -146,7 +146,6 @@ class Dependencies(NamedTuple):
 
 def collect_startup(
     plan,
-    bus_identity,
     manifest_data,
     dependencies,
     module_roots,
@@ -167,10 +166,9 @@ def collect_startup(
     if type(module_roots) is not tuple or not 1 <= len(module_roots) <= 12:
         raise ValueError("invalid startup module roots")
     dependencies.preflight.root.check_plan(plan)
-    dependencies.preflight.root.identity(bus_identity)
     if type(manifest_data) is not bytes:
         raise ValueError("invalid startup manifest bytes")
-    plan, bus_identity = copy.deepcopy((plan, bus_identity))
+    plan = copy.deepcopy(plan)
     table = (lambda: sys.modules) if _module_table is None else _module_table
     reader = dependencies.preflight.filesystem.FilesystemCollector(deadline)
     roots = (*module_roots, *dependencies)
@@ -198,9 +196,9 @@ def collect_startup(
                 raise ValueError("startup namespaces changed")
         return maps, status
 
-    initial = reader.collect(plan, bus_identity)
+    initial = reader.collect(plan)
     first_core = dependencies.preflight.core_witness(
-        plan, bus_identity, initial, reader.deadline, reader._after()
+        plan, initial, reader.deadline, reader._after()
     )
     with dependencies.runtime_tree.RootedRuntimeSnapshot.open(
         plan, manifest_data, first_core, deadline=reader.deadline
@@ -228,7 +226,7 @@ def collect_startup(
     # The root snapshot FD must be closed before reobserving the complete table.
     final = reader.reobserve()
     final_core = dependencies.preflight.core_witness(
-        plan, bus_identity, final, reader.deadline, reader._after()
+        plan, final, reader.deadline, reader._after()
     )
     if not same_modules(first_modules, capture()):
         raise ValueError("startup module identities changed")

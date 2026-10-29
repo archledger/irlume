@@ -10,7 +10,9 @@ from pathlib import PurePosixPath
 from typing import NamedTuple
 
 CONFIG_LIMIT = 32 * 1024
-CONFIG_SCOPE = "contained-job-rooted-startup-config-v1"
+# v2: no user-bus identity; G never connects to the manager (H sends its
+# service identity in LAUNCH instead).
+CONFIG_SCOPE = "contained-job-rooted-startup-config-v2"
 
 
 class Dependencies(NamedTuple):
@@ -43,7 +45,6 @@ def validate_header(value, deps):
             "client",
             "origin_ns",
             "startup_deadline_ns",
-            "bus_identity",
         ),
     )
     if (
@@ -89,7 +90,6 @@ def validate_header(value, deps):
         value["origin_ns"] + guardian.STOP_NS,
         value["origin_ns"] + guardian.STOP_NS,
     )
-    root.identity(value["bus_identity"])
     return spec
 
 
@@ -107,7 +107,7 @@ def validate_config(value, manifest_data, deps):
     return spec
 
 
-def make_config(spec, plan, client, bus_identity, origin, manifest_data, deps):
+def make_config(spec, plan, client, origin, manifest_data, deps):
     root, runtime, guardian = dependencies(deps)
     if type(spec) is not guardian.Specification or type(spec.mode) is not str:
         raise ValueError("rooted startup specification mode type")
@@ -121,7 +121,6 @@ def make_config(spec, plan, client, bus_identity, origin, manifest_data, deps):
         "client": client,
         "origin_ns": origin,
         "startup_deadline_ns": origin + guardian.STOP_NS,
-        "bus_identity": bus_identity,
     }
     validate_config(value, manifest_data, deps)
     data = root.closure.canonical(value)
@@ -153,12 +152,9 @@ def decode_config(data, expected, manifest_data, deps):
     return value
 
 
-def context(config, service, reference, manifest_data, deps):
-    if type(config) is not Configuration:
-        raise ValueError("rooted startup configuration owner")
-    value = decode_config(config.data, config.sha256, manifest_data, deps)
+def check_service_identity(value, spec, service, deps):
+    """The shape every message naming H's service must have for this config."""
     _, runtime, guardian = dependencies(deps)
-    spec = validate_config(value, manifest_data, deps)
     if (
         type(service) is not guardian.ServiceIdentity
         or type(service.unit) is not str
@@ -185,32 +181,55 @@ def context(config, service, reference, manifest_data, deps):
         or ".." in PurePosixPath(group).parts
     ):
         raise ValueError("rooted startup cgroup")
+
+
+def context(config, service, reference, manifest_data, deps):
+    if type(config) is not Configuration:
+        raise ValueError("rooted startup configuration owner")
+    value = decode_config(config.data, config.sha256, manifest_data, deps)
+    _, _, guardian = dependencies(deps)
+    spec = validate_config(value, manifest_data, deps)
+    check_service_identity(value, spec, service, deps)
     deps.artifact.check_metadata(reference)
+    uid = value["root_plan"]["uid"]
     if reference["uid"] != uid or reference["gid"] != value["root_plan"]["gid"]:
         raise ValueError("rooted startup artifact owner")
     return value, guardian
 
 
-def launch(config, manifest_data, deps):
+def launch(config, service, manifest_data, deps):
+    """H's first frame: the service identity it observed from the manager."""
     if type(config) is not Configuration:
         raise ValueError("rooted startup configuration owner")
     value = decode_config(config.data, config.sha256, manifest_data, deps)
+    spec = validate_config(value, manifest_data, deps)
+    check_service_identity(value, spec, service, deps)
     return deps.root.guardian.encode(
         {
             "kind": "launch",
             "payload": {
-                "scope": "rooted-startup-launch-v1",
+                "scope": "rooted-startup-launch-v2",
                 "run_id": value["root_plan"]["run_id"],
                 "config_sha256": config.sha256,
+                "service": service._asdict(),
             },
         }
     )
 
 
 def check_launch(frame, config, manifest_data, deps):
-    guardian = deps.root.guardian
-    if guardian.encode(guardian.decode(frame)) != launch(config, manifest_data, deps):
+    """Return H's service identity from the exact LAUNCH for this config."""
+    _, runtime, guardian = dependencies(deps)
+    row = guardian.decode(frame)
+    if row["kind"] != "launch":
+        raise ValueError("rooted startup expected LAUNCH")
+    runtime._fields(row["payload"], ("scope", "run_id", "config_sha256", "service"))
+    service = row["payload"]["service"]
+    runtime._fields(service, guardian.ServiceIdentity._fields)
+    identity = guardian.ServiceIdentity(**service)
+    if guardian.encode(row) != launch(config, identity, manifest_data, deps):
         raise ValueError("rooted startup LAUNCH mismatch")
+    return identity
 
 
 def ready(config, service, reference, manifest_data, deps):

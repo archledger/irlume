@@ -33,7 +33,7 @@ class WitnessTests(unittest.TestCase):
         )
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
-        self.plan, self.bus = fixture.plan, fixture.bus
+        self.plan = fixture.plan
         self.deps = codec.Dependencies(preflight_tests.preflight, state_tests.state)
         _, self.manifest = preflight_tests.fixtures.fixtures.selection()
         _, files, python, maps = state_tests.observation()
@@ -45,7 +45,7 @@ class WitnessTests(unittest.TestCase):
         initial["proc"]["maps"] = maps
         final = copy.deepcopy(initial)
         final["finished_ns"] = 450
-        core = self.deps.preflight.core_witness(self.plan, self.bus, final, 1000, 500)
+        core = self.deps.preflight.core_witness(self.plan, final, 1000, 500)
         self.observation = {
             "initial_filesystem": initial,
             "filesystem": final,
@@ -71,7 +71,6 @@ class WitnessTests(unittest.TestCase):
         return codec.encode(
             self.observation if observation is None else observation,
             self.plan,
-            self.bus,
             self.manifest,
             self.binding,
             self.deps,
@@ -83,7 +82,6 @@ class WitnessTests(unittest.TestCase):
             data,
             hashlib.sha256(data).hexdigest() if digest is None else digest,
             self.plan,
-            self.bus,
             self.manifest,
             self.binding,
             self.deps,

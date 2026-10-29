@@ -4,6 +4,7 @@
 """Startup composition contracts; no service, namespace or VM is created."""
 
 import contextlib
+import copy
 import importlib.machinery
 import importlib.util
 import os
@@ -137,7 +138,7 @@ class CompositionTests(unittest.TestCase):
     def setup_dependencies(self, fail=None):
         self.events = []
         self.deadlines = []
-        self.bus_observations = []
+        self.plan_observations = []
         directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
         self.addCleanup(directory.cleanup)
         self.tree_file = Path(directory.name) / "runtime.py"
@@ -167,7 +168,7 @@ class CompositionTests(unittest.TestCase):
                     raise TimeoutError("injected deadline expiry")
                 return clock[0]
 
-            def collect(self, plan, bus):
+            def collect(self, plan):
                 events.append("filesystem-initial")
                 return test.initial
 
@@ -240,12 +241,11 @@ class CompositionTests(unittest.TestCase):
         preflight.root = types.SimpleNamespace(
             check_status=check_status,
             check_plan=lambda value: None,
-            identity=lambda value: None,
         )
 
-        def core_witness(plan, bus, fs, deadline, now):
+        def core_witness(plan, fs, deadline, now):
             test.deadlines.append(deadline)
-            test.bus_observations.append(dict(bus))
+            test.plan_observations.append(copy.deepcopy(plan))
             return {"namespaces": {}, "root": {"device": 1, "inode": 2}}
 
         preflight.core_witness = core_witness
@@ -282,7 +282,6 @@ class CompositionTests(unittest.TestCase):
         with mock.patch.object(startup.os, "stat", side_effect=root_stat()):
             result = startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -305,7 +304,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -322,7 +320,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -338,7 +335,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaises(OSError):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -360,7 +356,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "module identities"):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -389,7 +384,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Python state"):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -414,7 +408,6 @@ class CompositionTests(unittest.TestCase):
             ):
                 startup.collect_startup(
                     {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                    {},
                     b"manifest",
                     deps,
                     (main,),
@@ -445,7 +438,6 @@ class CompositionTests(unittest.TestCase):
         ):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -458,19 +450,21 @@ class CompositionTests(unittest.TestCase):
         main = module("main")
         table = {"main": main}
         plan = {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}}
-        bus = {"device": 1, "inode": 2}
 
         def mutate(*args):
             plan["manifest"]["sha256"] = "b" * 64
-            bus["inode"] = 99
+            plan["uid"] = 99
 
         deps.runtime_state.check_runtime_state = mutate
         with mock.patch.object(startup.os, "stat", side_effect=root_stat()):
             result = startup.collect_startup(
-                plan, bus, b"manifest", deps, (main,), 1000, _module_table=lambda: table
+                plan, b"manifest", deps, (main,), 1000, _module_table=lambda: table
             )
         self.assertEqual(result["runtime_manifest_sha256"], "a" * 64)
-        self.assertEqual([row["inode"] for row in self.bus_observations], [2, 2])
+        self.assertEqual(
+            [(row["uid"], row["manifest"]["sha256"]) for row in self.plan_observations],
+            [(1000, "a" * 64)] * 2,
+        )
 
     def test_expiry_after_tree_cleanup_cannot_return_a_result(self):
         deps = self.setup_dependencies(fail="expire-close")
@@ -479,7 +473,6 @@ class CompositionTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             startup.collect_startup(
                 {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                {},
                 b"manifest",
                 deps,
                 (main,),
@@ -504,7 +497,6 @@ class CompositionTests(unittest.TestCase):
             ):
                 startup.collect_startup(
                     {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
-                    {},
                     b"manifest",
                     deps,
                     (main,),

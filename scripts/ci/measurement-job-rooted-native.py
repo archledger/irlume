@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""Concrete startup-only G bootstrap. No child or virtual machine is created."""
+"""Concrete startup-only G bootstrap. No child or virtual machine is created.
+
+G never opens the user bus: it has no path to it, imports no bus library and
+learns its service identity from H's LAUNCH, which it binds to its own view.
+"""
 
 import contextlib
 import errno
 import hashlib
-import importlib
 import os
 import select
 import socket
@@ -18,6 +21,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 CLEANUP_FAILURES = (BaseException,)
+# The host cgroup tree, read-only in G's view (ProtectControlGroups=yes).
+CGROUP_ROOT = "/sys/fs/cgroup"
 
 
 class Runtime(NamedTuple):
@@ -32,7 +37,13 @@ class Runtime(NamedTuple):
     artifact: types.ModuleType
     protocol: types.ModuleType
     handshake: types.ModuleType
-    bus_bridge: types.ModuleType
+
+
+class LocalView(NamedTuple):
+    """What preflight observed of G itself; bind_service compares H's LAUNCH."""
+
+    cgroup: str
+    starttime: int
 
 
 def load_runtime(native, entry):
@@ -48,7 +59,6 @@ def load_runtime(native, entry):
         "witness-file",
         "rooted-protocol",
         "rooted-handshake",
-        "rooted-bus",
     )
     modules = tuple(
         native.load(
@@ -58,13 +68,6 @@ def load_runtime(native, entry):
         for name in names
     )
     return Runtime(native, (native, entry, *modules), *modules)
-
-
-def prime_bus_imports():
-    package = importlib.import_module("jeepney")
-    importlib.import_module("jeepney.io.blocking")
-    if type(package.__version__) is not str or package.__version__ != "0.9.0":
-        raise ValueError("unselected Jeepney version")
 
 
 def read_manifest(plan, root, deadline):
@@ -195,7 +198,7 @@ class GuardianEffects:
             self.value, manifest, self.protocol_deps
         )
         self.attempt_fd = self.channel = self.connecting = None
-        self.service_observation = None
+        self.local = None
 
     def now(self):
         return time.monotonic_ns()
@@ -231,7 +234,6 @@ class GuardianEffects:
         )
         return runtime.startup.collect_startup(
             self.value["root_plan"],
-            self.value["bus_identity"],
             manifest,
             dependencies,
             runtime.roots,
@@ -252,7 +254,28 @@ class GuardianEffects:
             raise ValueError("rooted cgroup byte cap")
         return data
 
+    def read_members(self, cgroup, deadline):
+        """The unit's cgroup.procs as G sees it.
+
+        A process outside G's PID namespace reads as 0 (Linux
+        kernel/cgroup/cgroup.c, cgroup_procs_show).
+        """
+        self.before(deadline)
+        with self.root.closure.owned_fd(
+            os.open(
+                CGROUP_ROOT + cgroup + "/cgroup.procs",
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+        ) as fd:
+            data = os.read(fd, 4097)
+            tail = os.read(fd, 1)
+        self.before(deadline)
+        if len(data) > 4096 or tail:
+            raise ValueError("rooted cgroup member byte cap")
+        return data
+
     def preflight(self, config, manifest, deadline):
+        """Kernel-local checks only; G opens no bus and binds H's LAUNCH later."""
         self.same_inputs(config, manifest)
         deadline = self.limit(deadline)
         self.before(deadline)
@@ -264,65 +287,59 @@ class GuardianEffects:
             raise ValueError("rooted guardian user identity")
         # PrivatePIDs=yes makes the main process the init of a fresh PID
         # namespace (systemd exec-invoke.c setup_private_pids); G never learns
-        # its host PID, so the binding uses the manager's MainPID.
+        # its host PID, so the binding uses the manager's MainPID from H.
         if os.getpid() != 1 or os.getppid() != 0:
             raise ValueError("rooted guardian is not its PID namespace init")
-        runtime, errors = self.runtime, []
-        bus = runtime.native.service.SystemdBus(
-            os.getuid(), deadline=deadline, fds=True
-        )
-        bridge = None
-        try:
-            bridge = runtime.bus_bridge.RootedBus(
-                bus,
-                runtime.bus_bridge.Dependencies(
-                    runtime.protocol, self.protocol_deps, runtime.native.service
-                ),
-            )
-            observed = bridge.observe(config, manifest, deadline)
-            with self.root.closure.owned_fd(os.pidfd_open(os.getpid())) as pidfd:
-                invocation = bridge.process_invocation(
-                    config, manifest, pidfd, deadline
-                )
-        except CLEANUP_FAILURES as error:
-            errors.append(error)
-        self.service_observation = None if bridge is None else bridge.partial
-        try:
-            bus.close()
-        except CLEANUP_FAILURES as error:
-            errors.append(error)
-        runtime.native.raise_errors("rooted service preflight and close", errors)
-        self.before(deadline)
-        base = observed["service"]
-        if invocation != base["InvocationID"]:
-            raise ValueError("rooted guardian is not the observed invocation")
-        keys = (
-            (set(self.root.guardian.service_properties(self.spec)) - {"AddRef"})
-            | set(runtime.native.service.UNIT_TYPES)
-            | {"MainPID", "ControlGroup", "ExecMainStartTimestampMonotonic"}
-        )
-        # Namespace init plus unit membership of this exact invocation is the
-        # main process: only it and its descendants share the namespace.
-        identity = self.root.guardian.check_service(
-            {key: base[key] for key in keys},
-            self.spec,
-            base["MainPID"],
-            os.getuid(),
-            self.now(),
-        )
-        argv = self.root.entry_argv(self.value["root_plan"], config.sha256)
-        if base["ExecStart"] != ((argv[0], argv, False),):
-            raise ValueError("rooted static executable binding")
-        membership = self.read_cgroup(deadline).decode("ascii")
-        if self.root.guardian.unified_cgroup(
-            membership
-        ) != identity.cgroup or os.sched_getaffinity(0) != set(self.spec.cpus):
+        guardian = self.root.guardian
+        cgroup = guardian.unified_cgroup(self.read_cgroup(deadline).decode("ascii"))
+        if os.sched_getaffinity(0) != set(self.spec.cpus):
             raise ValueError("rooted guardian placement")
         # /proc/1 is G itself; its starttime is boot-relative, not per namespace.
-        starttime = runtime.native.process_start(os.getpid())
+        starttime = self.runtime.native.process_start(os.getpid())
         self.root.runtime._integer(starttime, 1, self.root.runtime.U64_MAX)
         self.before(deadline)
-        return identity, starttime
+        self.local = LocalView(cgroup, starttime)
+        return self.local
+
+    def bind_service(self, config, manifest, identity, deadline):
+        """Bind H's LAUNCH identity to G's own view; return G's start time.
+
+        check_launch already pinned the unit name, invocation shape and the
+        cgroup below this user's manager. G adds what its kernel shows: the
+        same cgroup, read again so a migration since preflight refuses; a
+        main-process start inside G's own window; and no other process in
+        the unit. H stays the verifier of the manager's lifecycle properties.
+        """
+        self.same_inputs(config, manifest)
+        deadline = self.limit(deadline)
+        self.before(deadline)
+        local = self.local
+        if type(local) is not LocalView:
+            raise ValueError("rooted service binding before preflight")
+        guardian = self.root.guardian
+        if type(identity) is not guardian.ServiceIdentity:
+            raise ValueError("rooted service identity")
+        current = guardian.unified_cgroup(self.read_cgroup(deadline).decode("ascii"))
+        if (
+            type(identity.cgroup) is not str
+            or identity.cgroup != local.cgroup
+            or current != local.cgroup
+        ):
+            raise ValueError("rooted guardian cgroup binding")
+        # deadline_ns is the manager's main-process start plus HOST_NS. That
+        # start is G's own: not before the origin, less one proc clock tick,
+        # and not after now.
+        if (
+            type(identity.deadline_ns) is not int
+            or not self.value["origin_ns"] + guardian.HOST_NS - guardian.START_TICK_NS
+            <= identity.deadline_ns
+            <= self.now() + guardian.HOST_NS
+        ):
+            raise ValueError("rooted guardian start window")
+        if self.read_members(local.cgroup, deadline) != b"1\n":
+            raise ValueError("rooted guardian cgroup members")
+        self.before(deadline)
+        return local.starttime
 
     def open_attempt(self, config, deadline):
         self.same_inputs(config)
@@ -415,7 +432,6 @@ def run_service(data, digest, native, entry):
     runtime.protocol.decode_config(data, digest, manifest, protocol_deps)
     selected = root.check_selection(value["root_plan"], manifest)
     sys.path = ["/" + path for path in selected["python"]["roots"]]
-    prime_bus_imports()
     effects = GuardianEffects(config, manifest, runtime)
     witness_deps = runtime.witness.Dependencies(runtime.preflight, runtime.state)
     support = runtime.handshake.Dependencies(

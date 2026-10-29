@@ -148,7 +148,7 @@ def check_binding(binding, dependencies):
     return dict(binding)
 
 
-def validate(observation, plan, bus, manifest_data, binding, dependencies, timer):
+def validate(observation, plan, manifest_data, binding, dependencies, timer):
     preflight = dependencies.preflight
     runtime = preflight.runtime
     manifest = preflight.root.check_selection(plan, manifest_data)
@@ -174,8 +174,8 @@ def validate(observation, plan, bus, manifest_data, binding, dependencies, timer
     now = timer.check()
     runtime._integer(observation["finished_ns"], observation["started_ns"], now)
     first, last = observation["initial_filesystem"], observation["filesystem"]
-    preflight.core_witness(plan, bus, first, timer.deadline, timer.check())
-    final_core = preflight.core_witness(plan, bus, last, timer.deadline, timer.check())
+    preflight.core_witness(plan, first, timer.deadline, timer.check())
+    final_core = preflight.core_witness(plan, last, timer.deadline, timer.check())
     if (
         first["started_ns"] != observation["started_ns"]
         or last["started_ns"] != observation["started_ns"]
@@ -213,7 +213,6 @@ def context(dependencies, binding, clock):
 def encode(
     observation,
     plan,
-    bus,
     manifest_data,
     binding,
     dependencies,
@@ -223,7 +222,7 @@ def encode(
     binding, timer = context(dependencies, binding, clock)
     packed = transform(observation, Budget(timer))
     frozen = transform(packed, Budget(timer), decode=True)
-    validate(frozen, plan, bus, manifest_data, binding, dependencies, timer)
+    validate(frozen, plan, manifest_data, binding, dependencies, timer)
     wire = {
         "scope": "contained-job-startup-witness-v1",
         "binding": binding,
@@ -243,7 +242,6 @@ def decode(
     data,
     expected_digest,
     plan,
-    bus,
     manifest_data,
     binding,
     dependencies,
@@ -284,7 +282,7 @@ def decode(
     ):
         raise ValueError("startup witness binding or canonical encoding")
     frozen = transform(wire["observation"], Budget(timer), decode=True)
-    validate(frozen, plan, bus, manifest_data, binding, dependencies, timer)
+    validate(frozen, plan, manifest_data, binding, dependencies, timer)
     timer.check()
     return frozen
 

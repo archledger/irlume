@@ -12,6 +12,7 @@ import importlib.util
 import re
 import stat
 from pathlib import Path
+from typing import NamedTuple
 
 
 class SourceLoader(importlib.machinery.SourceFileLoader):
@@ -425,8 +426,26 @@ def mount_options(value):
     return frozenset(parts)
 
 
-def parse_mountinfo(data):
-    result, ids = {}, set()
+class Mount(NamedTuple):
+    """One mountinfo row; the first three fields keep the earlier tuple order."""
+
+    filesystem: str
+    options: frozenset
+    propagation: tuple
+    root: str
+    source: str
+    super_options: frozenset
+    number: int
+    parent: int
+    device: tuple
+
+
+def below(path, parent):
+    return parent == "/" or nested(path, parent)
+
+
+def mount_rows(data):
+    rows, ids = [], set()
     for line in lines(data, 1024**2, 4096):
         fields = line.split(" ")
         if "" in fields or fields.count("-") != 1:
@@ -441,11 +460,7 @@ def parse_mountinfo(data):
         device = fields[2].split(":")
         if len(device) != 2:
             raise ValueError("mountinfo device")
-        tuple(decimal(part, runtime.U32_MAX) for part in device)
-        mount_path(fields[3])
-        path = mount_path(fields[4])
-        if path in result:
-            raise ValueError("stacked mount")
+        device = tuple(decimal(part, runtime.U32_MAX) for part in device)
         optional = fields[6:sep]
         if any(
             re.fullmatch(r"(?:shared|master|propagate_from):[0-9]+|unbindable", item)
@@ -453,9 +468,71 @@ def parse_mountinfo(data):
             for item in optional
         ):
             raise ValueError("mountinfo optional field")
-        mount_options(fields[-1])
-        result[path] = (fields[sep + 1], mount_options(fields[5]), tuple(optional))
-    return result
+        rows.append(
+            (
+                mount_path(fields[4]),
+                Mount(
+                    fields[sep + 1],
+                    mount_options(fields[5]),
+                    tuple(optional),
+                    mount_path(fields[3]),
+                    fields[sep + 2],
+                    mount_options(fields[-1]),
+                    number,
+                    parent,
+                    device,
+                ),
+            )
+        )
+    return rows
+
+
+def mount_tree(rows):
+    """Return the mount view a path walk reaches; refuse every hidden entry.
+
+    The tree root is the one row whose parent is not listed, at /. A child at
+    its parent's own path covers the parent, and a child below a sibling's
+    path is occluded by that sibling. Both stack a mount no path walk
+    reaches, so either is refused, as is any row the walk never meets.
+    """
+    by_id = {mount.number: (path, mount) for path, mount in rows}
+    tops = [row for row in rows if row[1].parent not in by_id]
+    if len(tops) != 1 or tops[0][0] != "/":
+        raise ValueError("mountinfo tree root")
+    children = {number: [] for number in by_id}
+    for path, mount in rows:
+        if mount.parent in by_id:
+            if not below(path, by_id[mount.parent][0]):
+                raise ValueError("mountinfo tree")
+            children[mount.parent].append((path, mount))
+    visible, level = {}, [tops[0]]
+    while level:
+        following = []
+        for path, mount in sorted(level, key=lambda row: row[0]):
+            kids = sorted(children[mount.number], key=lambda row: row[0])
+            siblings, seen = {kid for kid, _ in kids}, set()
+            for kid, _ in kids:
+                parts = kid.split("/")
+                if (
+                    kid == path
+                    or kid in seen
+                    or any(
+                        "/".join(parts[:i]) in siblings for i in range(2, len(parts))
+                    )
+                ):
+                    raise ValueError("stacked mount: " + kid)
+                seen.add(kid)
+            visible[path] = mount
+            following.extend(kids)
+        level = following
+    if len(visible) != len(rows):
+        raise ValueError("mountinfo tree")
+    return visible
+
+
+def parse_mountinfo(data):
+    """The reachable mount view; a hidden or unreachable row is refused."""
+    return mount_tree(mount_rows(data))
 
 
 def check_mounts(plan, row):
@@ -499,12 +576,13 @@ def check_mounts(plan, row):
         "/run": "tmpfs",
         "/tmp": "tmpfs",
     }
-    for path, (filesystem, options, propagation) in mounts.items():
+    for path, mount in mounts.items():
+        options = mount.options
         if path in readonly and "ro" not in options:
             raise ValueError("writable protected rooted mount")
-        if path in types and filesystem != types[path]:
+        if path in types and mount.filesystem != types[path]:
             raise ValueError("rooted API filesystem type")
-        if propagation:
+        if mount.propagation:
             raise ValueError("rooted mount is not private")
         if (
             path in ("/proc", "/sys", "/sys/fs/cgroup", "/run", "/tmp")
@@ -513,6 +591,18 @@ def check_mounts(plan, row):
             raise ValueError("unsafe rooted API mount flags")
         if path in ("/run", "/tmp", ATTEMPT) and "rw" not in options:
             raise ValueError("rooted writable state unavailable")
+    # One fresh proc for G's own PID namespace, mounted on the root. systemd
+    # v259.10 drops hidepid= and subset= when its probe finds them unsupported
+    # (namespace.c, mount_procfs), so the effective options are pinned here.
+    proc = mounts["/proc"]
+    if (
+        proc.root != "/"
+        or proc.parent != mounts["/"].number
+        or not {"hidepid=invisible", "subset=pid"} <= proc.super_options
+        or sum(mount.filesystem == "proc" for mount in mounts.values()) != 1
+        or any(path != "/proc" and nested(path, "/proc") for path in mounts)
+    ):
+        raise ValueError("rooted proc view")
     runtime._fields(row["tmpfs"], ("/run", "/tmp"))
     for path, mode in (("/run", 0o40755), ("/tmp", 0o41777)):
         node = row["tmpfs"][path]

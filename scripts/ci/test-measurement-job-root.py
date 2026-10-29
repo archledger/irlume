@@ -42,6 +42,153 @@ HIDDEN_PROFILE = (
     "-+/sys/kernel/tracing",
 )
 
+# Sanitized G mount tables from transient units on a Fedora 44 host (systemd
+# 259.10, Linux 7.2.13, a VPN net_cls hierarchy), with plan paths in place of
+# host paths.
+# PrivatePIDs=no: the host /proc rbind and its binfmt_misc chains.
+R5_HOST_PROC = b"""\
+1433 1391 0:35 /private/runtime / ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1434 1433 0:81 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,seclabel,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64
+1444 1434 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1445 1434 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1446 1434 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1447 1434 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1448 1434 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1449 1434 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1443 1434 0:84 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1442 1434 0:84 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1440 1434 0:84 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1435 1434 0:84 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1441 1434 0:84 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1450 1433 0:25 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+1451 1450 0:34 / /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw,fd=41,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=8874
+1452 1451 0:54 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime - binfmt_misc binfmt_misc rw
+1501 1450 0:25 /acpi /proc/acpi ro,nosuid,nodev,noexec,relatime - proc proc rw
+1502 1450 0:25 /asound /proc/asound ro,nosuid,nodev,noexec,relatime - proc proc rw
+1503 1450 0:25 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+1504 1450 0:25 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+1505 1450 0:25 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+1506 1450 0:84 /systemd/inaccessible/reg /proc/kallsyms ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1507 1450 0:84 /systemd/inaccessible/reg /proc/kcore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1508 1450 0:25 /latency_stats /proc/latency_stats ro,nosuid,nodev,noexec,relatime - proc proc rw
+1509 1450 0:25 /mtrr /proc/mtrr ro,nosuid,nodev,noexec,relatime - proc proc rw
+1510 1450 0:25 /scsi /proc/scsi ro,nosuid,nodev,noexec,relatime - proc proc rw
+1511 1450 0:25 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+1512 1511 0:34 / /proc/sys/fs/binfmt_misc rw,relatime - autofs systemd-1 rw,fd=41,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=8874
+1513 1512 0:54 / /proc/sys/fs/binfmt_misc ro,nosuid,nodev,noexec,relatime - binfmt_misc binfmt_misc rw
+1514 1450 0:25 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+1515 1433 0:35 /private/runtime/root /root rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1516 1433 0:87 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64
+1517 1516 0:84 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1518 1516 0:35 /private/attempt /run/irlume/attempt rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1519 1516 0:35 /private/base.raw /run/irlume/base.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1520 1516 0:35 /private/payload.raw /run/irlume/payload.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1521 1516 0:35 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1522 1516 0:84 /bus /run/user/1000/bus ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1523 1433 0:91 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+1524 1523 0:32 / /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - efivarfs efivarfs rw
+1525 1523 0:33 / /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - bpf bpf rw,mode=700
+1526 1523 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1527 1526 0:85 / /sys/fs/cgroup/net_cls ro,relatime - cgroup net_cls rw,seclabel,net_cls
+1528 1523 0:41 / /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - fusectl fusectl rw
+1545 1523 0:31 / /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - pstore none rw,seclabel
+1547 1523 0:20 / /sys/kernel/config ro,nosuid,nodev,noexec,relatime - configfs configfs rw
+1548 1523 0:9 / /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - debugfs debugfs rw,seclabel
+1549 1523 0:8 / /sys/kernel/security ro,nosuid,nodev,noexec,relatime - securityfs securityfs rw
+1550 1523 0:14 / /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tracefs tracefs rw,seclabel
+1546 1523 0:84 /systemd/inaccessible/dir /sys/fs/selinux ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1551 1433 0:92 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
+"""
+# PrivatePIDs=yes without ProcSubset/ProtectProc: binfmt_misc is re-added.
+R5_PID_ONLY = b"""\
+1433 1391 0:35 /private/runtime / ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1434 1433 0:81 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,seclabel,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64
+1444 1434 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1445 1434 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1446 1434 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1447 1434 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1448 1434 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1449 1434 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1443 1434 0:84 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1442 1434 0:84 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1440 1434 0:84 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1435 1434 0:84 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1441 1434 0:84 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1450 1433 0:87 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+1451 1450 0:54 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime - binfmt_misc binfmt_misc rw
+1452 1450 0:87 /acpi /proc/acpi ro,nosuid,nodev,noexec,relatime - proc proc rw
+1501 1450 0:87 /asound /proc/asound ro,nosuid,nodev,noexec,relatime - proc proc rw
+1502 1450 0:87 /bus /proc/bus ro,nosuid,nodev,noexec,relatime - proc proc rw
+1503 1450 0:87 /fs /proc/fs ro,nosuid,nodev,noexec,relatime - proc proc rw
+1504 1450 0:87 /irq /proc/irq ro,nosuid,nodev,noexec,relatime - proc proc rw
+1505 1450 0:84 /systemd/inaccessible/reg /proc/kallsyms ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1506 1450 0:84 /systemd/inaccessible/reg /proc/kcore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1507 1450 0:87 /latency_stats /proc/latency_stats ro,nosuid,nodev,noexec,relatime - proc proc rw
+1508 1450 0:87 /mtrr /proc/mtrr ro,nosuid,nodev,noexec,relatime - proc proc rw
+1509 1450 0:87 /scsi /proc/scsi ro,nosuid,nodev,noexec,relatime - proc proc rw
+1510 1450 0:87 /sys /proc/sys ro,nosuid,nodev,noexec,relatime - proc proc rw
+1511 1510 0:54 / /proc/sys/fs/binfmt_misc ro,nosuid,nodev,noexec,relatime - binfmt_misc binfmt_misc rw
+1512 1450 0:87 /sysrq-trigger /proc/sysrq-trigger ro,nosuid,nodev,noexec,relatime - proc proc rw
+1513 1433 0:35 /private/runtime/root /root rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1514 1433 0:91 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64
+1515 1514 0:84 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1516 1514 0:35 /private/attempt /run/irlume/attempt rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1517 1514 0:35 /private/base.raw /run/irlume/base.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1518 1514 0:35 /private/payload.raw /run/irlume/payload.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1519 1514 0:35 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1520 1514 0:84 /bus /run/user/1000/bus ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1521 1433 0:92 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+1522 1521 0:32 / /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - efivarfs efivarfs rw
+1523 1521 0:33 / /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - bpf bpf rw,mode=700
+1524 1521 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1525 1524 0:85 / /sys/fs/cgroup/net_cls ro,relatime - cgroup net_cls rw,seclabel,net_cls
+1526 1521 0:41 / /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - fusectl fusectl rw
+1527 1521 0:31 / /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - pstore none rw,seclabel
+1545 1521 0:20 / /sys/kernel/config ro,nosuid,nodev,noexec,relatime - configfs configfs rw
+1546 1521 0:9 / /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - debugfs debugfs rw,seclabel
+1547 1521 0:8 / /sys/kernel/security ro,nosuid,nodev,noexec,relatime - securityfs securityfs rw
+1548 1521 0:14 / /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tracefs tracefs rw,seclabel
+1528 1521 0:84 /systemd/inaccessible/dir /sys/fs/selinux ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1549 1433 0:93 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
+"""
+# This series' profile: one fresh subset=pid proc, single covers.
+R5_PRIVATE_PIDS = b"""\
+1433 1391 0:35 /private/runtime / ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1434 1433 0:81 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,seclabel,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64
+1444 1434 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1445 1434 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1446 1434 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1447 1434 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1448 1434 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1449 1434 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1443 1434 0:84 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1442 1434 0:84 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1440 1434 0:84 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1435 1434 0:84 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1441 1434 0:84 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1450 1433 0:87 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,subset=pid
+1451 1433 0:91 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64
+1452 1451 0:84 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1501 1451 0:35 /private/attempt /run/irlume/attempt rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1502 1451 0:35 /private/base.raw /run/irlume/base.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1503 1451 0:35 /private/payload.raw /run/irlume/payload.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1504 1451 0:35 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1505 1451 0:84 /bus /run/user/1000/bus ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1506 1433 0:92 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+1509 1506 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1510 1509 0:85 / /sys/fs/cgroup/net_cls ro,relatime - cgroup net_cls rw,seclabel,net_cls
+1507 1506 0:84 /systemd/inaccessible/dir /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1508 1506 0:84 /systemd/inaccessible/dir /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1511 1506 0:84 /systemd/inaccessible/dir /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1512 1506 0:84 /systemd/inaccessible/dir /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1513 1506 0:84 /systemd/inaccessible/dir /sys/fs/selinux ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1514 1506 0:84 /systemd/inaccessible/dir /sys/kernel/config ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1515 1506 0:84 /systemd/inaccessible/dir /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1516 1506 0:84 /systemd/inaccessible/dir /sys/kernel/security ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1517 1506 0:84 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1518 1433 0:93 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
+"""
+
 
 def selection():
     manifest, _ = fixtures.manifest()
@@ -93,8 +240,35 @@ def selection():
     return plan, data
 
 
-def mount_line(number, path, options="ro,nosuid,nodev,noexec", filesystem="tmpfs"):
-    return f"{number} 1 0:{number} / {path} {options} - {filesystem} source rw\n"
+# The namespace root's parent lies outside the namespace: never a fixture ID.
+OUTSIDE = 1
+
+
+def mount_line(
+    number,
+    path,
+    options="ro,nosuid,nodev,noexec",
+    filesystem="tmpfs",
+    *,
+    parent=OUTSIDE,
+    source_root="/",
+    super_options="rw",
+):
+    return (
+        f"{number} {parent} 0:{number} {source_root} {path} {options}"
+        f" - {filesystem} source {super_options}\n"
+    )
+
+
+def add_mount(data, number, path, *args, **kwargs):
+    """Append a mount on the deepest listed mount at or above its path."""
+    parent, depth, target = OUTSIDE, -1, root.mount_path(path)
+    for line in data.decode().splitlines():
+        fields = line.split(" ")
+        mounted = root.mount_path(fields[4])
+        if mounted != target and root.below(target, mounted) and len(mounted) >= depth:
+            parent, depth = int(fields[0]), len(mounted)
+    return data + mount_line(number, path, *args, parent=parent, **kwargs).encode()
 
 
 def witness(plan):
@@ -117,6 +291,17 @@ def witness(plan):
             f"/run/user/{plan['uid']}/bus",
         )
     ]
+    mountinfo = b""
+    for i, (path, options, filesystem) in enumerate(mounts):
+        proc = {"super_options": "rw,hidepid=invisible,subset=pid"}
+        mountinfo = add_mount(
+            mountinfo,
+            i + 2,
+            path,
+            options,
+            filesystem,
+            **(proc if path == "/proc" else {}),
+        )
     return {
         "root": {"device": 1, "inode": 10},
         "namespaces": {"pid": 201, "user": 202, "mnt": 203, "net": 204, "cgroup": 105},
@@ -126,9 +311,7 @@ def witness(plan):
         "fds": (0, 1, 2),
         "denied": dict.fromkeys((*root.DENIED, *root.KERNEL_DENIED)),
         "dev_log": None,
-        "mountinfo": "".join(
-            mount_line(i + 1, *row) for i, row in enumerate(mounts)
-        ).encode(),
+        "mountinfo": mountinfo,
         "tmpfs": {
             path: {"device": 4, "inode": i + 500, "mode": mode, "bytes": 16 * 1024**2}
             for i, (path, mode) in enumerate((("/run", 0o40755), ("/tmp", 0o41777)))
@@ -407,7 +590,7 @@ class ReviewCorrectionsTests(unittest.TestCase):
             stage + "/os-release",
             "/run/host/os-release",
         )
-        row["mountinfo"] += mount_line(40, stage).encode()
+        row["mountinfo"] = add_mount(row["mountinfo"], 40, stage)
         row["os_release"] = {
             "link_target": ".os-release-stage/os-release",
             "stage_mode": 0o40755,
@@ -461,13 +644,12 @@ class ReviewCorrectionsTests(unittest.TestCase):
             "file_mode": None,
         }
         self.assertIsNone(root.check_core(plan, row, 1000, 250))
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "missing or unexpected rooted mount"):
             root.check_core(
                 plan,
                 dict(
                     row,
-                    mountinfo=row["mountinfo"]
-                    + mount_line(40, "/run/host/os-release").encode(),
+                    mountinfo=add_mount(row["mountinfo"], 40, "/run/host/os-release"),
                 ),
                 1000,
                 250,
@@ -494,12 +676,13 @@ class ReviewCorrectionsTests(unittest.TestCase):
         row = witness(plan)
         for path in ("/dev/shm", "/dev/pts", "/run/credentials"):
             self.assertIsNone(row["denied"][path])
-            with self.subTest(path=path), self.assertRaises(ValueError):
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(ValueError, "denial target reported absent"),
+            ):
                 root.check_core(
                     plan,
-                    dict(
-                        row, mountinfo=row["mountinfo"] + mount_line(40, path).encode()
-                    ),
+                    dict(row, mountinfo=add_mount(row["mountinfo"], 40, path)),
                     1000,
                     250,
                 )
@@ -535,9 +718,8 @@ class ParserTests(unittest.TestCase):
                 root.check_id_map(data, 1001)
 
     def test_mountinfo_parses_escaped_spaces_but_rejects_truncation_and_aliases(self):
-        self.assertIn(
-            "/some path", root.parse_mountinfo(mount_line(1, r"/some\040path").encode())
-        )
+        data = add_mount(mount_line(2, "/").encode(), 3, r"/some\040path")
+        self.assertIn("/some path", root.parse_mountinfo(data))
         for data in (
             mount_line(1, "/").encode() * 2,
             mount_line(1, "/", "ro,rw").encode(),
@@ -547,6 +729,85 @@ class ParserTests(unittest.TestCase):
         ):
             with self.subTest(data=data), self.assertRaises(ValueError):
                 root.parse_mountinfo(data)
+
+    def test_mount_tree_keeps_the_walkable_view(self):
+        top = mount_line(2, "/").encode()
+        self.assertEqual(set(root.parse_mountinfo(top)), {"/"})
+        data = add_mount(add_mount(top, 3, "/run"), 4, root.ATTEMPT)
+        view = root.parse_mountinfo(data)
+        self.assertEqual(set(view), {"/", "/run", root.ATTEMPT})
+        self.assertEqual(view[root.ATTEMPT].parent, view["/run"].number)
+        self.assertEqual(view["/run"].parent, view["/"].number)
+        # Index access keeps the earlier (filesystem, options, propagation) order.
+        row = view["/run"]
+        self.assertEqual(row[:3], (row.filesystem, row.options, row.propagation))
+        self.assertEqual(
+            (row.root, row.source, row.super_options, row.device),
+            ("/", "source", frozenset({"rw"}), (0, 3)),
+        )
+
+    def test_mount_tree_refuses_roots_cycles_and_hidden_entries(self):
+        top = mount_line(2, "/")
+
+        def rows(*items):
+            return "".join(
+                mount_line(number, path, parent=parent)
+                for number, parent, path in items
+            )
+
+        for label, data, message in (
+            ("no root", rows((2, 3, "/"), (3, 2, "/x")), "mountinfo tree root"),
+            ("two roots", rows((2, 1, "/"), (3, 1, "/tmp")), "mountinfo tree root"),
+            ("root not at /", rows((2, 1, "/tmp")), "mountinfo tree root"),
+            ("self parent", rows((2, 2, "/")), "mountinfo tree root"),
+            (
+                "outside parent",
+                top + rows((3, 2, "/run"), (4, 3, "/tmp/x")),
+                "^mountinfo tree$",
+            ),
+            (
+                "unreached cycle",
+                top + rows((3, 4, "/a"), (4, 3, "/a")),
+                "^mountinfo tree$",
+            ),
+            (
+                "duplicate sibling",
+                top + rows((3, 2, "/tmp"), (4, 2, "/tmp")),
+                "^stacked mount: /tmp$",
+            ),
+            ("cover over /", top + rows((3, 2, "/")), "^stacked mount: /$"),
+            (
+                "tmpfs on /tmp",
+                top + rows((3, 2, "/tmp"), (4, 3, "/tmp")),
+                "^stacked mount: /tmp$",
+            ),
+            (
+                "occluded",
+                top + rows((3, 2, "/proc"), (4, 3, "/proc/sys"), (5, 3, "/proc/sys/x")),
+                "^stacked mount: /proc/sys/x$",
+            ),
+        ):
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                root.parse_mountinfo(data.encode())
+
+    def test_real_tables_refuse_hidden_binfmt_and_keep_the_private_view(self):
+        for data in (R5_HOST_PROC, R5_PID_ONLY):
+            with self.assertRaisesRegex(
+                ValueError, "^stacked mount: /proc/sys/fs/binfmt_misc$"
+            ):
+                root.parse_mountinfo(data)
+        view = root.parse_mountinfo(R5_PRIVATE_PIDS)
+        self.assertEqual(len(view), R5_PRIVATE_PIDS.count(b"\n"))
+        proc = view["/proc"]
+        self.assertEqual(
+            (proc.filesystem, proc.root, proc.parent),
+            ("proc", "/", view["/"].number),
+        )
+        self.assertLessEqual({"hidepid=invisible", "subset=pid"}, proc.super_options)
+        self.assertFalse(any(p != "/proc" and root.nested(p, "/proc") for p in view))
 
     def test_property_wire_types_reject_malformed_structs_and_integer_ranges(self):
         for variant, kind in (
@@ -580,12 +841,12 @@ class CoreTests(unittest.TestCase):
             "blocked_by": "/dev/pts",
         }
         self.assertIsNone(root.check_core(plan, row, 1000, 250))
-        for change in (
-            "missing-parent",
-            "readable-parent",
-            "wrong-target",
-            "host-link",
-            "link-mount",
+        for change, message in (
+            ("missing-parent", "unproven ptmx ancestor denial"),
+            ("readable-parent", "readable or unsupported denied node"),
+            ("wrong-target", "unproven ptmx ancestor denial"),
+            ("host-link", "host-backed denied node"),
+            ("link-mount", "mount at blocked ptmx symlink"),
         ):
             bad = copy.deepcopy(row)
             if change == "missing-parent":
@@ -597,8 +858,46 @@ class CoreTests(unittest.TestCase):
             elif change == "host-link":
                 bad["denied"]["/dev/ptmx"].update(plan["host_api"]["/dev/ptmx"])
             else:
-                bad["mountinfo"] += mount_line(90, "/dev/ptmx").encode()
-            with self.subTest(change=change), self.assertRaises(ValueError):
+                bad["mountinfo"] = add_mount(bad["mountinfo"], 90, "/dev/ptmx")
+            with (
+                self.subTest(change=change),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                root.check_core(plan, bad, 1000, 250)
+
+    def test_proc_is_one_fresh_subset_pid_instance(self):
+        plan, _ = selection()
+        row = witness(plan)
+        line = next(x for x in row["mountinfo"].splitlines() if b" /proc " in x)
+        self.assertTrue(line.endswith(b" rw,hidepid=invisible,subset=pid"))
+        changes = {
+            "host instance": line.replace(b",hidepid=invisible,subset=pid", b""),
+            "no subset": line.replace(b",subset=pid", b""),
+            "no hidepid": line.replace(b"hidepid=invisible,", b""),
+            "ptraceable": line.replace(b"=invisible", b"=ptraceable"),
+            "subdirectory": line.replace(b" / /proc ", b" /sys /proc "),
+        }
+        for label, changed in changes.items():
+            self.assertNotEqual(changed, line)
+            bad = dict(row, mountinfo=row["mountinfo"].replace(line, changed))
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(ValueError, "rooted proc view"),
+            ):
+                root.check_core(plan, bad, 1000, 250)
+        second = row["mountinfo"].replace(
+            b" /run/irlume/base.raw ro,nosuid,nodev,noexec - ext4 ",
+            b" /run/irlume/base.raw ro,nosuid,nodev,noexec - proc ",
+        )
+        self.assertNotEqual(second, row["mountinfo"])
+        with self.assertRaisesRegex(ValueError, "rooted proc view"):
+            root.check_core(plan, dict(row, mountinfo=second), 1000, 250)
+        for path in ("/proc/sys", "/proc/acpi"):
+            bad = dict(row, mountinfo=add_mount(row["mountinfo"], 60, path))
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(ValueError, "rooted proc view"),
+            ):
                 root.check_core(plan, bad, 1000, 250)
 
     def test_core_match_returns_no_qualification_or_authority(self):
@@ -732,12 +1031,15 @@ class CoreTests(unittest.TestCase):
             "/sys/unknown",
             "/run/irlume/attempt/nested",
         ):
-            with self.subTest(path=path), self.assertRaises(ValueError):
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(
+                    ValueError, "missing or unexpected rooted mount"
+                ),
+            ):
                 root.check_core(
                     plan,
-                    dict(
-                        row, mountinfo=row["mountinfo"] + mount_line(40, path).encode()
-                    ),
+                    dict(row, mountinfo=add_mount(row["mountinfo"], 40, path)),
                     1000,
                     250,
                 )
@@ -817,19 +1119,30 @@ class CoreTests(unittest.TestCase):
     def test_optional_denial_and_kernel_mounts_have_explicit_negative_controls(self):
         plan, _ = selection()
         row = witness(plan)
-        for i, path in enumerate((*root.DENIED, *root.KERNEL_DENIED)):
+        for i, path in enumerate(root.DENIED):
             row["denied"][path] = {"device": 3, "inode": 300, "mode": 0o40000}
-            row["mountinfo"] += mount_line(40 + i, path).encode()
+            row["mountinfo"] = add_mount(row["mountinfo"], 40 + i, path)
         self.assertIsNone(root.check_core(plan, row, 1000, 250))
-        for path in (*root.DENIED, *root.KERNEL_DENIED, *root.KERNEL_READONLY):
+        for path in root.DENIED:
+            bad = copy.deepcopy(row)
+            bad["denied"][path]["mode"] = 0o40755
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(ValueError, "readable or unsupported"),
+            ):
+                root.check_core(plan, bad, 1000, 250)
+        # A subset=pid proc has no kernel files, so nothing may be mounted there.
+        for path in (*root.KERNEL_DENIED, *root.KERNEL_READONLY):
             bad = copy.deepcopy(row)
             if path in bad["denied"]:
-                bad["denied"][path]["mode"] = 0o40755
+                bad["denied"][path] = {"device": 3, "inode": 301, "mode": 0o40000}
+            options = "ro,nosuid,nodev,noexec"
+            if path.startswith("/proc/"):
+                message = "rooted proc view"
             else:
-                bad["mountinfo"] += mount_line(
-                    60, path, "rw,nosuid,nodev,noexec"
-                ).encode()
-            with self.subTest(path=path), self.assertRaises(ValueError):
+                options, message = "rw,nosuid,nodev,noexec", "writable protected"
+            bad["mountinfo"] = add_mount(bad["mountinfo"], 60, path, options)
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, message):
                 root.check_core(plan, bad, 1000, 250)
 
 

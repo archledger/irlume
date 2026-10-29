@@ -73,9 +73,9 @@ class Effects:
         self.mark("preflight")
         return "local-view"
 
-    def bind_service(self, config, manifest, identity, deadline):
+    def bind_service(self, config, manifest, identity, cgroup_id, deadline):
         self.mark("bind-service")
-        self.bound = identity
+        self.bound = identity, cgroup_id
         return 123
 
     def open_attempt(self, config, deadline):
@@ -98,6 +98,11 @@ class Effects:
         self.mark("process-start")
         return 123
 
+    def cgroup_id(self, identity, deadline):
+        self.mark("cgroup-id")
+        self.cgroup_identity = identity
+        return self.f.cgroup_id
+
     def attempt_fd(self, deadline):
         self.mark("attempt-fd")
         return self.fd
@@ -111,7 +116,11 @@ class Effects:
             return self.messages.pop(0)
         if not self.sent:
             return protocol.launch(
-                self.f.config, self.f.service, self.f.manifest, self.f.protocol_deps
+                self.f.config,
+                self.f.service,
+                self.f.cgroup_id,
+                self.f.manifest,
+                self.f.protocol_deps,
             )
         ready = self.f.guardian.decode(self.sent[0])["payload"]["startup"]
         return protocol.commit(
@@ -265,6 +274,7 @@ class HandshakeTests(unittest.TestCase):
             + self.guardian.unit_name(spec),
             self.guardian.HOST_NS + 1_001_000,
         )
+        self.cgroup_id = 286458
         self.support = controller.Dependencies(
             protocol, self.protocol_deps, proof_tests.codec, fixture.deps, artifact
         )
@@ -323,8 +333,9 @@ class HandshakeTests(unittest.TestCase):
                 "close-control",
             ],
         )
-        # G's identity is H's LAUNCH identity, checked locally by bind_service.
-        self.assertEqual(effects.bound, self.service)
+        # G's identity is H's LAUNCH identity, checked locally by bind_service
+        # with the cgroup ID that came with it.
+        self.assertEqual(effects.bound, (self.service, self.cgroup_id))
         self.assertEqual(runner.identity, self.service)
         ready = self.guardian.decode(effects.sent[0])["payload"]
         self.assertEqual(ready["service"], self.service._asdict())
@@ -353,7 +364,11 @@ class HandshakeTests(unittest.TestCase):
         other = self.service._replace(unit="irlume-job-guardian-other.service")
         frame = self.guardian.decode(
             protocol.launch(
-                self.config, self.service, self.manifest, self.protocol_deps
+                self.config,
+                self.service,
+                self.cgroup_id,
+                self.manifest,
+                self.protocol_deps,
             )
         )
         frame["payload"]["service"] = other._asdict()
@@ -376,20 +391,47 @@ class HandshakeTests(unittest.TestCase):
             host.verify_service_terminal,
         )
         runner.run()
+        self.assertEqual(
+            effects.calls[:5],
+            ["prepare", "start", "process-start", "cgroup-id", "connect"],
+        )
         self.assertLess(
             effects.calls.index("connect"), effects.calls.index("send-launch")
         )
+        # H asks for the cgroup ID of exactly the identity it started.
+        self.assertIs(effects.cgroup_identity, self.service)
         self.assertEqual(
             effects.sent[0],
             protocol.launch(
-                self.config, self.service, self.manifest, self.protocol_deps
+                self.config,
+                self.service,
+                self.cgroup_id,
+                self.manifest,
+                self.protocol_deps,
             ),
         )
-        self.assertEqual(
-            self.guardian.decode(effects.sent[0])["payload"]["service"],
-            self.service._asdict(),
-        )
+        payload = self.guardian.decode(effects.sent[0])["payload"]
+        self.assertEqual(payload["service"], self.service._asdict())
+        self.assertEqual(payload["cgroup_id"], self.cgroup_id)
         effects.release(runner.deadline)
+
+    def test_host_sends_no_launch_without_a_cgroup_id(self):
+        guardian, g_effects = self.guardian_run()
+        guardian.run()
+        for value in (0, None, True, 2**64):
+            effects = Effects(self, "H", g_effects.sent)
+            effects.cgroup_id = lambda identity, deadline, value=value: value
+            runner = controller.Host(
+                self.config,
+                self.manifest,
+                self.support,
+                effects,
+                host.verify_service_terminal,
+            )
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                runner.run()
+            self.assertEqual(effects.sent, [])
+            self.assertIn("abort", effects.calls)
 
     def test_host_validates_real_closed_witness_before_commit_and_release(self):
         guardian, g_effects = self.guardian_run()

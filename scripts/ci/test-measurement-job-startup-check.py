@@ -718,6 +718,8 @@ class NativeBudgetTests(unittest.TestCase):
     def test_native_views_fit_the_operation_budget(self):
         for label, mountinfo, selinux, spent in (
             ("laptop", root_tests.R5_TRACING, True, 1104),
+            # One more row (the host cgroup2 below G's own), same pages.
+            ("laptop strict", root_tests.R5_STRICT, True, 1104),
             ("archhost", root_tests.R5_ARCHHOST, False, 1096),
         ):
             with self.subTest(label=label):

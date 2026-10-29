@@ -4,7 +4,8 @@
 """Concrete startup-only G bootstrap. No child or virtual machine is created.
 
 G never opens the user bus: it has no path to it, imports no bus library and
-learns its service identity from H's LAUNCH, which it binds to its own view.
+learns its service identity from H's LAUNCH, which it binds to its own view by
+the unit's cgroup ID: G sees no cgroup path but its own namespace root.
 """
 
 import contextlib
@@ -21,7 +22,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 CLEANUP_FAILURES = (BaseException,)
-# The host cgroup tree, read-only in G's view (ProtectControlGroups=yes).
+# G's own cgroup, the root of its cgroup namespace: a fresh read-only cgroup2
+# whose root directory's st_ino is the unit's cgroup ID
+# (ProtectControlGroups=strict; Linux include/linux/kernfs.h kernfs_id_ino).
 CGROUP_ROOT = "/sys/fs/cgroup"
 
 
@@ -42,7 +45,8 @@ class Runtime(NamedTuple):
 class LocalView(NamedTuple):
     """What preflight observed of G itself; bind_service compares H's LAUNCH."""
 
-    cgroup: str
+    # (st_dev, st_ino) of CGROUP_ROOT.
+    cgroup: tuple
     starttime: int
 
 
@@ -254,25 +258,45 @@ class GuardianEffects:
             raise ValueError("rooted cgroup byte cap")
         return data
 
-    def read_members(self, cgroup, deadline):
-        """The unit's cgroup.procs as G sees it.
+    def read_cgroup_root(self, deadline):
+        """(st_dev, st_ino) of G's cgroup directory."""
+        self.before(deadline)
+        with self.root.closure.owned_fd(
+            os.open(
+                CGROUP_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            )
+        ) as directory:
+            info = os.fstat(directory)
+        self.before(deadline)
+        return info.st_dev, info.st_ino
 
-        A process outside G's PID namespace reads as 0 (Linux
-        kernel/cgroup/cgroup.c, cgroup_procs_show).
+    def read_members(self, deadline):
+        """The unit's cgroup.procs as G sees it, with its directory's identity.
+
+        The file is opened relative to that directory. A process outside G's
+        PID namespace reads as 0 (Linux kernel/cgroup/cgroup.c,
+        cgroup_procs_show).
         """
         self.before(deadline)
         with self.root.closure.owned_fd(
             os.open(
-                CGROUP_ROOT + cgroup + "/cgroup.procs",
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                CGROUP_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
             )
-        ) as fd:
-            data = os.read(fd, 4097)
-            tail = os.read(fd, 1)
+        ) as directory:
+            info = os.fstat(directory)
+            with self.root.closure.owned_fd(
+                os.open(
+                    "cgroup.procs",
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+            ) as fd:
+                data = os.read(fd, 4097)
+                tail = os.read(fd, 1)
         self.before(deadline)
         if len(data) > 4096 or tail:
             raise ValueError("rooted cgroup member byte cap")
-        return data
+        return (info.st_dev, info.st_ino), data
 
     def preflight(self, config, manifest, deadline):
         """Kernel-local checks only; G opens no bus and binds H's LAUNCH later."""
@@ -291,24 +315,33 @@ class GuardianEffects:
         if os.getpid() != 1 or os.getppid() != 0:
             raise ValueError("rooted guardian is not its PID namespace init")
         guardian = self.root.guardian
+        # ProtectControlGroups=strict: G is at the root of its own cgroup
+        # namespace. systemd keeps a host view without a namespace or when
+        # the fresh cgroup2 is refused (src/core/execute.c,
+        # src/core/namespace.c), so G checks the effect itself.
         cgroup = guardian.unified_cgroup(self.read_cgroup(deadline).decode("ascii"))
+        if cgroup != "/":
+            raise ValueError("rooted guardian cgroup namespace")
+        directory = self.read_cgroup_root(deadline)
         if os.sched_getaffinity(0) != set(self.spec.cpus):
             raise ValueError("rooted guardian placement")
         # /proc/1 is G itself; its starttime is boot-relative, not per namespace.
         starttime = self.runtime.native.process_start(os.getpid())
         self.root.runtime._integer(starttime, 1, self.root.runtime.U64_MAX)
         self.before(deadline)
-        self.local = LocalView(cgroup, starttime)
+        self.local = LocalView(directory, starttime)
         return self.local
 
-    def bind_service(self, config, manifest, identity, deadline):
+    def bind_service(self, config, manifest, identity, cgroup_id, deadline):
         """Bind H's LAUNCH identity to G's own view; return G's start time.
 
         check_launch already pinned the unit name, invocation shape and the
-        cgroup below this user's manager. G adds what its kernel shows: the
-        same cgroup, read again so a migration since preflight refuses; a
-        main-process start inside G's own window; and no other process in
-        the unit. H stays the verifier of the manager's lifecycle properties.
+        cgroup path below this user's manager, which G cannot see. G binds
+        the identity by the unit's cgroup ID: still the root of its cgroup
+        namespace, read again so a migration since preflight refuses; the
+        same directory, whose inode number is the ID; a main-process start
+        inside G's own window; and no other process in the unit. H stays the
+        verifier of the manager's lifecycle properties.
         """
         self.same_inputs(config, manifest)
         deadline = self.limit(deadline)
@@ -320,12 +353,10 @@ class GuardianEffects:
         if type(identity) is not guardian.ServiceIdentity:
             raise ValueError("rooted service identity")
         current = guardian.unified_cgroup(self.read_cgroup(deadline).decode("ascii"))
-        if (
-            type(identity.cgroup) is not str
-            or identity.cgroup != local.cgroup
-            or current != local.cgroup
-        ):
-            raise ValueError("rooted guardian cgroup binding")
+        if current != "/":
+            raise ValueError("rooted guardian cgroup namespace")
+        if type(cgroup_id) is not int or cgroup_id != local.cgroup[1]:
+            raise ValueError("rooted guardian cgroup ID")
         # deadline_ns is the manager's main-process start plus HOST_NS. That
         # start is G's own: not before the origin, less one proc clock tick,
         # and not after now.
@@ -336,7 +367,10 @@ class GuardianEffects:
             <= self.now() + guardian.HOST_NS
         ):
             raise ValueError("rooted guardian start window")
-        if self.read_members(local.cgroup, deadline) != b"1\n":
+        directory, members = self.read_members(deadline)
+        if directory != local.cgroup:
+            raise ValueError("rooted guardian cgroup binding")
+        if members != b"1\n":
             raise ValueError("rooted guardian cgroup members")
         self.before(deadline)
         return local.starttime

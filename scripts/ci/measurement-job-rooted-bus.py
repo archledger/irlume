@@ -151,10 +151,18 @@ class RootedBus:
             path, transport.BUS_NAME + ".Service", "service", deadline
         )
         base = self.normalize(service, transport.PROPERTY_TYPES, deadline)
+        # The unit cgroup's kernfs ID, also its directory's st_ino; zero when
+        # the cgroup was never realized or has no handle (systemd
+        # src/core/cgroup.c unit_update_cgroup, dbus-unit.c).
+        ids = self.normalize(service, {"ControlGroupId": "t"}, deadline)
+        cgroup_id = ids["ControlGroupId"]
+        if not 1 <= cgroup_id <= self.root.runtime.U64_MAX:
+            raise ValueError("rooted service cgroup ID")
+        self.partial["cgroup_id"] = cgroup_id
         kinds = {
             **self.root.PROPERTY_TYPES,
             "PrivateUsers": "b",
-            "ProtectControlGroupsEx": "s",
+            "ProtectControlGroups": "b",
         }
         roots = {}
         for name, kind in kinds.items():
@@ -169,7 +177,7 @@ class RootedBus:
             raise ValueError("rooted service changed during observation")
         self.root.check_properties(roots, value["root_plan"])
         self.bus.remaining(deadline)
-        return {"service": {**first, **base}, "root": roots}
+        return {"service": {**first, **base}, "root": roots, "cgroup_id": cgroup_id}
 
     def process_invocation(self, config, manifest, pidfd, deadline):
         """The invocation of the configured unit that holds a caller-owned pidfd."""

@@ -69,6 +69,8 @@ class ProtocolTests(unittest.TestCase):
             + self.root.guardian.unit_name(self.spec),
             301_000_000_000,
         )
+        # The manager's ControlGroupId for that cgroup (H's observation).
+        self.cgroup_id = 286458
         self.reference = {
             "device": 1,
             "inode": 2,
@@ -115,10 +117,12 @@ class ProtocolTests(unittest.TestCase):
                 )
 
     def test_ready_commit_done_bind_same_config_service_and_artifact(self):
-        request = protocol.launch(self.config, self.service, self.manifest, self.deps)
+        request = protocol.launch(
+            self.config, self.service, self.cgroup_id, self.manifest, self.deps
+        )
         self.assertEqual(
             protocol.check_launch(request, self.config, self.manifest, self.deps),
-            self.service,
+            (self.service, self.cgroup_id),
         )
         ready = protocol.ready(
             self.config, self.service, self.reference, self.manifest, self.deps
@@ -220,20 +224,26 @@ class ProtocolTests(unittest.TestCase):
             protocol.decode_header(data, hashlib.sha256(data).hexdigest(), self.deps)
 
     def test_launch_carries_checked_service_identity(self):
-        frame = protocol.launch(self.config, self.service, self.manifest, self.deps)
+        frame = protocol.launch(
+            self.config, self.service, self.cgroup_id, self.manifest, self.deps
+        )
         row = self.root.guardian.decode(frame)
         self.assertEqual(
             row["payload"],
             {
-                "scope": "rooted-startup-launch-v2",
+                "scope": "rooted-startup-launch-v3",
                 "run_id": self.plan["run_id"],
                 "config_sha256": self.config.sha256,
                 "service": self.service._asdict(),
+                "cgroup_id": self.cgroup_id,
             },
         )
-        identity = protocol.check_launch(frame, self.config, self.manifest, self.deps)
+        identity, cgroup_id = protocol.check_launch(
+            frame, self.config, self.manifest, self.deps
+        )
         self.assertIs(type(identity), self.root.guardian.ServiceIdentity)
         self.assertEqual(identity, self.service)
+        self.assertEqual((type(cgroup_id), cgroup_id), (int, self.cgroup_id))
         uid = self.plan["uid"]
         manager = f"/user.slice/user-{uid}.slice/user@{uid}.service"
         startup = protocol.decode_config(
@@ -257,7 +267,9 @@ class ProtocolTests(unittest.TestCase):
         for label, changes in wrong.items():
             service = self.service._replace(**changes)
             with self.subTest(label=label), self.assertRaises(ValueError):
-                protocol.launch(self.config, service, self.manifest, self.deps)
+                protocol.launch(
+                    self.config, service, self.cgroup_id, self.manifest, self.deps
+                )
             bad = copy.deepcopy(row)
             bad["payload"]["service"].update(changes)
             with self.subTest(label=label), self.assertRaises(ValueError):
@@ -267,12 +279,47 @@ class ProtocolTests(unittest.TestCase):
                     self.manifest,
                     self.deps,
                 )
+        for value in (0, -1, 2**64, True, 286458.0, "286458", None):
+            with self.subTest(cgroup_id=value), self.assertRaises(ValueError):
+                protocol.launch(
+                    self.config, self.service, value, self.manifest, self.deps
+                )
+            bad = copy.deepcopy(row)
+            bad["payload"]["cgroup_id"] = value
+            with self.subTest(cgroup_id=value), self.assertRaises(ValueError):
+                protocol.check_launch(
+                    self.root.guardian.encode(bad),
+                    self.config,
+                    self.manifest,
+                    self.deps,
+                )
+        for value in (1, 2**64 - 1):
+            bad = copy.deepcopy(row)
+            bad["payload"]["cgroup_id"] = value
+            self.assertEqual(
+                protocol.check_launch(
+                    self.root.guardian.encode(bad),
+                    self.config,
+                    self.manifest,
+                    self.deps,
+                ),
+                (self.service, value),
+            )
         edits = {
             "extra field": lambda r: r["payload"]["service"].update(extra=1),
+            "cgroup ID in service": lambda r: r["payload"]["service"].update(
+                cgroup_id=r["payload"].pop("cgroup_id")
+            ),
+            "missing cgroup ID": lambda r: r["payload"].pop("cgroup_id"),
             "missing field": lambda r: r["payload"]["service"].pop("cgroup"),
             "extra payload": lambda r: r["payload"].update(extra=1),
             "missing service": lambda r: r["payload"].pop("service"),
             "v1 scope": lambda r: r["payload"].update(scope="rooted-startup-launch-v1"),
+            "v2 scope": lambda r: r["payload"].update(scope="rooted-startup-launch-v2"),
+            "v2 payload": lambda r: (
+                r["payload"].update(scope="rooted-startup-launch-v2"),
+                r["payload"].pop("cgroup_id"),
+            ),
             "v1 payload": lambda r: (
                 r["payload"].update(scope="rooted-startup-launch-v1"),
                 r["payload"].pop("service"),
@@ -293,7 +340,11 @@ class ProtocolTests(unittest.TestCase):
                 )
         with self.assertRaises(ValueError):
             protocol.launch(
-                self.config, self.service._asdict(), self.manifest, self.deps
+                self.config,
+                self.service._asdict(),
+                self.cgroup_id,
+                self.manifest,
+                self.deps,
             )
 
     def test_config_limit_and_canonical_form_apply_to_both_directions(self):
@@ -419,7 +470,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_launch_digest_and_artifact_owner_are_independent_bindings(self):
         row = self.root.guardian.decode(
-            protocol.launch(self.config, self.service, self.manifest, self.deps)
+            protocol.launch(
+                self.config, self.service, self.cgroup_id, self.manifest, self.deps
+            )
         )
         row["payload"]["config_sha256"] = "f" * 64
         with self.assertRaises(ValueError):

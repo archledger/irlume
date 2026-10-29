@@ -61,8 +61,9 @@ DENIAL_NODES = (*DENIED, *KERNEL_DENIED, *KERNEL_HIDDEN)
 DEVICE_BINDS = tuple(
     "/dev/" + name for name in ("null", "zero", "full", "random", "urandom", "tty")
 )
-# A host cgroup v1 hierarchy (a VPN's net_cls for split tunnelling) shows
-# through the read-only cgroup2 mount as one child mount.
+# A host cgroup v1 hierarchy (a VPN's net_cls for split tunnelling) is a
+# locked child of the host cgroup2 copy; under ProtectControlGroups=strict both
+# stay hidden below G's fresh cgroup2 (occluded_cgroup).
 LEGACY_CGROUPS = (
     "/sys/fs/cgroup/net_cls",
     "/sys/fs/cgroup/net_cls,net_prio",
@@ -73,9 +74,14 @@ INACCESSIBLE = re.compile(
     r"((?:/[^/]+)*)/systemd/inaccessible/(dir|reg|chr|blk|fifo|sock)"
 )
 SEALED = frozenset({"ro", "nosuid", "nodev", "noexec"})
-# The one kernel view whose cover may hide mounts (occluded_debugfs).
+# The kernel view whose cover may hide mounts (occluded_debugfs).
 DEBUGFS = "/sys/kernel/debug"
 TRACING = DEBUGFS + "/tracing"
+# G's cgroup2, which may hide the host copy (occluded_cgroup).
+CGROUP = "/sys/fs/cgroup"
+# A cgroup2 root outside the reader's cgroup namespace: one /.. per level up
+# (Linux kernel/cgroup/cgroup.c cgroup_show_path, fs/kernfs/dir.c).
+UPWARD = re.compile(r"(?:/\.\.){1,64}")
 ATTEMPT = "/run/irlume/attempt"
 OS_RELEASE_STAGE = "/run/host/.os-release-stage"
 ENTRY = "opt/irlume/measurement-job-guardian-native.py"
@@ -101,7 +107,7 @@ PROPERTY_TYPES = {
     "ProtectKernelTunables": "b",
     "ProtectKernelLogs": "b",
     "KeyringMode": "s",
-    "ProtectControlGroups": "b",
+    "ProtectControlGroupsEx": "s",
     "RestrictNamespaces": "t",
     "CapabilityBoundingSet": "t",
     "AmbientCapabilities": "t",
@@ -248,7 +254,12 @@ def root_properties(plan):
         # a new one, linked to no user keyring and holding only systemd's
         # invocation_id key (systemd.exec).
         "KeyringMode": "private",
-        "ProtectControlGroups": True,
+        # strict: G gets its own cgroup namespace and a fresh read-only
+        # cgroup2 rooted at its own cgroup, so it sees no other unit
+        # (systemd.exec; v259.10 and v262.1 src/core/namespace.c
+        # protect_control_groups_strict_table). The bool property only maps
+        # to yes or no.
+        "ProtectControlGroupsEx": "strict",
         # Zero allows no namespace types; unset is all ones (nsflags.h).
         "RestrictNamespaces": 0,
         "CapabilityBoundingSet": 0,
@@ -344,9 +355,9 @@ def check_properties(variants, plan):
     expected = {
         **root_properties(plan),
         "PrivateUsers": True,
-        "ProtectControlGroupsEx": "yes",
+        "ProtectControlGroups": True,
     }
-    kinds = {**PROPERTY_TYPES, "PrivateUsers": "b", "ProtectControlGroupsEx": "s"}
+    kinds = {**PROPERTY_TYPES, "PrivateUsers": "b", "ProtectControlGroups": "b"}
     runtime._fields(variants, expected)
     for name, value in expected.items():
         if normal_variant(variants[name], kinds[name]) != value:
@@ -480,6 +491,7 @@ def mount_rows(data):
             for item in optional
         ):
             raise ValueError("mountinfo optional field")
+        upward = fields[sep + 1] == "cgroup2" and UPWARD.fullmatch(fields[3])
         rows.append(
             (
                 mount_path(fields[4]),
@@ -487,7 +499,7 @@ def mount_rows(data):
                     fields[sep + 1],
                     mount_options(fields[5]),
                     tuple(optional),
-                    mount_path(fields[3]),
+                    fields[3] if upward else mount_path(fields[3]),
                     fields[sep + 2],
                     mount_options(fields[-1]),
                     number,
@@ -550,6 +562,55 @@ def occluded_debugfs(rows):
     return hidden, cover
 
 
+def occluded_cgroup(rows):
+    """Return the host cgroup rows G's own cgroup2 hides at /sys/fs/cgroup.
+
+    ProtectControlGroups=strict mounts a fresh cgroup2 in G's cgroup
+    namespace on /sys/fs/cgroup (v259.10 and v262.1 src/core/namespace.c
+    mount_private_apivfs). Its umount of the host copy there is not checked:
+    a locked child (a legacy hierarchy) keeps that copy, now rw, below the
+    new mount, and its root is printed upward from G's namespace. Only that
+    shape is accepted: the host copy on /sys, the read-only cover on it with
+    the same device and root /, at most one legacy hierarchy on the host
+    copy, nothing else below the path or on a hidden row, no propagation
+    tags. With fewer than two mounts at the path nothing is hidden there:
+    ((), None).
+    """
+    at = [mount for path, mount in rows if path == CGROUP]
+    under = [(path, mount) for path, mount in rows if path.startswith(CGROUP + "/")]
+    if len(at) < 2:
+        return (), None
+    paths = {mount.number: path for path, mount in rows}
+    if len(at) != 2 or len(under) > 1:
+        raise ValueError("occluded cgroup")
+    host, cover = sorted(at, key=lambda mount: paths.get(mount.parent) != "/sys")
+    hidden = (host, *(mount for _, mount in under))
+    numbers = {mount.number for mount in hidden}
+    if (
+        (host.filesystem, host.source, paths.get(host.parent))
+        != ("cgroup2", "cgroup2", "/sys")
+        or UPWARD.fullmatch(host.root) is None
+        or (cover.filesystem, cover.root, cover.parent, cover.device)
+        != ("cgroup2", "/", host.number, host.device)
+        or "ro" not in cover.options
+        or any(
+            path not in LEGACY_CGROUPS
+            or (mount.filesystem, mount.root, mount.parent)
+            != ("cgroup", "/", host.number)
+            or not set(path.rpartition("/")[2].split(",")) <= mount.super_options
+            for path, mount in under
+        )
+        or any(mount.propagation for mount in (*hidden, cover))
+        or any(
+            mount.parent in numbers
+            for _, mount in rows
+            if mount.number not in numbers | {cover.number}
+        )
+    ):
+        raise ValueError("occluded cgroup")
+    return hidden, cover
+
+
 def mount_tree(rows):
     """Return the mount view a path walk reaches; refuse every hidden entry.
 
@@ -557,15 +618,19 @@ def mount_tree(rows):
     its parent's own path covers the parent, and a child below a sibling's
     path is occluded by that sibling. Both stack a mount no path walk
     reaches, so either is refused, as is any row the walk never meets. The
-    one exception is occluded_debugfs: its rows are dropped and its cover
-    takes the debugfs's place in the walk, keeping its own parent field.
+    exceptions are occluded_debugfs and occluded_cgroup: their rows are
+    dropped and each cover takes its hidden mount's place in the walk,
+    keeping its own parent field. A visible row may not have an upward root.
     """
-    hidden, cover = occluded_debugfs(rows)
-    numbers = {mount.number for mount in hidden}
+    occluded = (occluded_debugfs(rows), occluded_cgroup(rows))
+    numbers = {mount.number for hidden, _ in occluded for mount in hidden}
     rows = [row for row in rows if row[1].number not in numbers]
+    if any(UPWARD.fullmatch(mount.root) for _, mount in rows):
+        raise ValueError("upward mount root")
     parents = {mount.number: mount.parent for _, mount in rows}
-    if cover is not None:
-        parents[cover.number] = hidden[0].parent
+    for hidden, cover in occluded:
+        if cover is not None:
+            parents[cover.number] = hidden[0].parent
     by_id = {mount.number: (path, mount) for path, mount in rows}
     tops = [row for row in rows if parents[row[1].number] not in by_id]
     if len(tops) != 1 or tops[0][0] != "/":
@@ -620,26 +685,27 @@ def check_mounts(plan, row):
     ptmx = row["denied"]["/dev/ptmx"]
     if ptmx is not None and "blocked_by" in ptmx and "/dev/ptmx" in mounts:
         raise ValueError("mount at blocked ptmx symlink")
-    readonly = {"/", "/sys", "/sys/fs/cgroup"}
+    readonly = {"/", "/sys", CGROUP}
     readonly.update(
         target for _, target, _, _ in root_properties(plan)["BindReadOnlyPaths"]
     )
     required = readonly | {"/proc", "/dev", "/run", "/tmp", ATTEMPT}
-    legacy = set(LEGACY_CGROUPS) & mounts.keys()
-    allowed = (
-        required | set(DENIAL_NODES) | set(DEVICE_BINDS) | legacy | {OS_RELEASE_STAGE}
-    )
+    allowed = required | set(DENIAL_NODES) | set(DEVICE_BINDS) | {OS_RELEASE_STAGE}
     if not required <= mounts.keys() or not mounts.keys() <= allowed:
         raise ValueError("missing or unexpected rooted mount")
+    # The root is printed from G's cgroup namespace, so / alone does not make
+    # it G's cgroup: check_core's namespace rule and G's cgroup ID binding do.
+    if mounts[CGROUP].root != "/":
+        raise ValueError("rooted cgroup view")
     # Device binds stay writable: a user manager cannot mknod, so systemd binds
     # the host nodes (namespace.c clone_device_node) and makes only /dev itself
     # read-only, not its submounts (make_read_only).
-    readonly |= set(DENIAL_NODES) | legacy | {OS_RELEASE_STAGE, "/dev"}
+    readonly |= set(DENIAL_NODES) | {OS_RELEASE_STAGE, "/dev"}
     types = {
         "/proc": "proc",
         "/dev": "tmpfs",
         "/sys": "sysfs",
-        "/sys/fs/cgroup": "cgroup2",
+        CGROUP: "cgroup2",
         "/run": "tmpfs",
         "/tmp": "tmpfs",
     }
@@ -652,7 +718,7 @@ def check_mounts(plan, row):
         if mount.propagation:
             raise ValueError("rooted mount is not private")
         if (
-            path in ("/proc", "/sys", "/sys/fs/cgroup", "/run", "/tmp")
+            path in ("/proc", "/sys", CGROUP, "/run", "/tmp")
             and not {"nosuid", "nodev", "noexec"} <= options
         ):
             raise ValueError("unsafe rooted API mount flags")
@@ -697,17 +763,6 @@ def check_mounts(plan, row):
             raise ValueError("unexpected device bind")
     if len({mounts[path].device for path in binds}) > 1:
         raise ValueError("device binds disagree")
-    if len(legacy) > 1:
-        raise ValueError("legacy cgroup hierarchy count")
-    for path in legacy:
-        mount = mounts[path]
-        if (
-            mount.filesystem != "cgroup"
-            or mount.root != "/"
-            or mount.parent != mounts["/sys/fs/cgroup"].number
-            or not set(path.rpartition("/")[2].split(",")) <= mount.super_options
-        ):
-            raise ValueError("legacy cgroup hierarchy")
     runtime._fields(row["tmpfs"], ("/run", "/tmp"))
     for path, mode in (("/run", 0o40755), ("/tmp", 0o41777)):
         node = row["tmpfs"][path]
@@ -816,10 +871,10 @@ def check_core(plan, row, deadline_ns, now_ns):
     if identity(row["root"]) != identity(plan["root"], ("path",)):
         raise ValueError("root identity mismatch")
     runtime._fields(row["namespaces"], NAMESPACES)
+    # Every namespace is G's own, cgroup included (ProtectControlGroups=strict).
     for name, number in row["namespaces"].items():
         runtime._integer(number, 1, runtime.U64_MAX)
-        same = number == plan["host_namespaces"][name]
-        if same != (name == "cgroup"):
+        if number == plan["host_namespaces"][name]:
             raise ValueError("rooted namespace mismatch: " + name)
     check_id_map(row["uid_map"], plan["uid"])
     check_id_map(row["gid_map"], plan["gid"])

@@ -277,6 +277,84 @@ R5_ARCHHOST = b"""\
 395 388 0:66 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
 398 335 0:59 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64,huge=advise
 """
+# The laptop table above under ProtectControlGroups=strict (2026-10-29 probe):
+# the host cgroup2 copy (1895, its root printed upward from G's cgroup
+# namespace) and its locked net_cls (1896) stay below a fresh read-only cgroup2
+# (1905), next to the debugfs occlusion.
+R5_STRICT = b"""\
+1786 1402 0:35 /private/runtime / ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1787 1786 0:113 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,seclabel,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64
+1879 1787 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1880 1787 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1881 1787 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1882 1787 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1883 1787 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1884 1787 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,seclabel,size=16060992k,nr_inodes=4015248,mode=755,inode64
+1878 1787 0:84 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1877 1787 0:84 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1875 1787 0:84 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1788 1787 0:84 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1876 1787 0:84 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1885 1786 0:114 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,subset=pid
+1886 1786 0:115 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64
+1887 1886 0:84 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1888 1886 0:35 /private/attempt /run/irlume/attempt rw,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1889 1886 0:35 /private/base.raw /run/irlume/base.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1890 1886 0:35 /private/payload.raw /run/irlume/payload.raw ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1891 1886 0:35 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,relatime - btrfs /dev/nvme0n1p3 rw,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=257,subvol=/home
+1892 1786 0:116 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw,seclabel
+1895 1892 0:30 /../../../../.. /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1896 1895 0:85 / /sys/fs/cgroup/net_cls rw,relatime - cgroup net_cls rw,seclabel,net_cls
+1901 1892 0:9 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime - debugfs debugfs rw,seclabel
+1902 1901 0:14 / /sys/kernel/debug/tracing rw,nosuid,nodev,noexec,relatime - tracefs tracefs rw,seclabel
+1893 1892 0:84 /systemd/inaccessible/dir /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1894 1892 0:84 /systemd/inaccessible/dir /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1905 1895 0:30 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+1897 1892 0:84 /systemd/inaccessible/dir /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1898 1892 0:84 /systemd/inaccessible/dir /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1899 1892 0:84 /systemd/inaccessible/dir /sys/fs/selinux ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1900 1892 0:84 /systemd/inaccessible/dir /sys/kernel/config ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1906 1901 0:84 /systemd/inaccessible/dir /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1903 1892 0:84 /systemd/inaccessible/dir /sys/kernel/security ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1904 1892 0:84 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,uid=1000,gid=1000,inode64
+1907 1786 0:117 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,seclabel,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64
+"""
+# archhost under ProtectControlGroups=strict (2026-10-29 probe): with no locked
+# child systemd unmounts the host copy, so G's cgroup2 (428) is the only
+# mount at /sys/fs/cgroup, directly on /sys.
+R5_ARCHHOST_STRICT = b"""\
+397 70 259:2 /private/runtime / ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+398 397 0:56 / /dev ro,nosuid,noexec - tmpfs tmpfs rw,size=4096k,nr_inodes=65536,mode=755,uid=1000,gid=1000,inode64,huge=advise
+404 398 0:7 /null /dev/null rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+405 398 0:7 /zero /dev/zero rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+406 398 0:7 /full /dev/full rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+407 398 0:7 /random /dev/random rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+408 398 0:7 /urandom /dev/urandom rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+409 398 0:7 /tty /dev/tty rw,nosuid - devtmpfs devtmpfs rw,size=15990216k,nr_inodes=3997554,mode=755,inode64,huge=advise
+403 398 0:54 /systemd/inaccessible/dir /dev/hugepages ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+402 398 0:54 /systemd/inaccessible/dir /dev/mqueue ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+400 398 0:54 /systemd/inaccessible/reg /dev/ptmx ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+399 398 0:54 /systemd/inaccessible/dir /dev/pts ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+401 398 0:54 /systemd/inaccessible/dir /dev/shm ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+410 397 0:58 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw,hidepid=invisible,subset=pid
+411 397 0:59 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,nr_inodes=409600,mode=755,uid=1000,gid=1000,inode64,huge=advise
+412 411 0:54 /systemd/propagate/.os-release-stage /run/host/.os-release-stage ro,nosuid,nodev,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+413 411 259:2 /private/attempt /run/irlume/attempt rw,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+414 411 259:2 /private/base.raw /run/irlume/base.raw ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+415 411 259:2 /private/payload.raw /run/irlume/payload.raw ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+417 411 259:2 /private/runtime-manifest.json /run/irlume/runtime-manifest.json ro,nosuid,relatime - ext4 /dev/nvme0n1p2 rw
+418 397 0:61 / /sys ro,nosuid,nodev,noexec,relatime - sysfs sysfs rw
+422 418 0:54 /systemd/inaccessible/dir /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+423 418 0:54 /systemd/inaccessible/dir /sys/fs/bpf ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+428 418 0:29 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+420 418 0:54 /systemd/inaccessible/dir /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+421 418 0:54 /systemd/inaccessible/dir /sys/fs/pstore ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+426 418 0:54 /systemd/inaccessible/dir /sys/kernel/config ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+424 418 0:54 /systemd/inaccessible/dir /sys/kernel/debug ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+419 418 0:54 /systemd/inaccessible/dir /sys/kernel/security ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+425 418 0:54 /systemd/inaccessible/dir /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,size=3217488k,nr_inodes=804372,mode=700,uid=1000,gid=1000,inode64,huge=advise
+427 397 0:66 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=16384k,nr_inodes=409600,uid=1000,gid=1000,inode64,huge=advise
+"""
 
 
 def selection():
@@ -379,6 +457,8 @@ def add_cover(data, number, path, kind="dir", **kwargs):
 
 
 def witness(plan):
+    # The cgroup2 is the strict view on a host without a legacy hierarchy:
+    # nothing to keep below it, so it sits on /sys (occluded_cgroup).
     mounts = [
         ("/", "ro", "ext4"),
         ("/proc", "rw,nosuid,nodev,noexec", "proc"),
@@ -425,7 +505,7 @@ def witness(plan):
         denied[path] = {"device": 3, "inode": 600 + i, "mode": 0o40000}
     return {
         "root": {"device": 1, "inode": 10},
-        "namespaces": {"pid": 201, "user": 202, "mnt": 203, "net": 204, "cgroup": 105},
+        "namespaces": {"pid": 201, "user": 202, "mnt": 203, "net": 204, "cgroup": 205},
         "uid_map": b"      1000       1000          1\n",
         "gid_map": b"      1000       1000          1\n",
         "status": b"Name:\tpython3\nPid:\t1\nPPid:\t0\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nNStgid:\t1\nNSpid:\t1\nThreads:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nCapAmb:\t0000000000000000\nNoNewPrivs:\t1\nSeccomp:\t2\n",
@@ -505,7 +585,9 @@ class ProfileTests(unittest.TestCase):
         decoded = parser.get_next_message()
         self.assertIsNotNone(decoded)
         observed = dict(decoded.body[2])
-        observed.update(PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes"))
+        self.assertEqual(observed["ProtectControlGroupsEx"], ("s", "strict"))
+        self.assertNotIn("ProtectControlGroups", observed)
+        observed.update(PrivateUsers=("b", True), ProtectControlGroups=("b", True))
         self.assertIsNone(root.check_properties(observed, plan))
         self.assertIsNone(parser.get_next_message())
 
@@ -520,7 +602,9 @@ class ProfileTests(unittest.TestCase):
             (props["PrivatePIDs"], props["ProcSubset"], props["ProtectProc"]),
             ("yes", "pid", "invisible"),
         )
-        self.assertIs(props["ProtectControlGroups"], True)
+        # G's own cgroup namespace and a fresh read-only cgroup2 of it.
+        self.assertEqual(props["ProtectControlGroupsEx"], "strict")
+        self.assertNotIn("ProtectControlGroups", props)
         self.assertIs(props["BindLogSockets"], False)
         self.assertEqual(props["DeviceAllow"], ())
         self.assertEqual(
@@ -565,7 +649,7 @@ class ProfileTests(unittest.TestCase):
             key: (root.PROPERTY_TYPES[key], value)
             for key, value in root.root_properties(plan).items()
         }
-        variants.update(PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes"))
+        variants.update(PrivateUsers=("b", True), ProtectControlGroups=("b", True))
         variants["BindReadOnlyPaths"] = ("a(ssbt)", INPUT_BINDS)
         self.assertIsNone(root.check_properties(variants, plan))
         bus = f"/run/user/{plan['uid']}/bus"
@@ -633,7 +717,7 @@ class ProfileTests(unittest.TestCase):
             key: (root.PROPERTY_TYPES[key], value)
             for key, value in root.root_properties(plan).items()
         }
-        variants.update(PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes"))
+        variants.update(PrivateUsers=("b", True), ProtectControlGroups=("b", True))
         self.assertIsNone(root.check_properties(variants, plan))
         for key in variants:
             bad = dict(variants)
@@ -646,7 +730,8 @@ class ProfileTests(unittest.TestCase):
             ("PrivateUsersEx", ("s", "identity")),
             ("PrivateNetwork", ("b", False)),
             ("CapabilityBoundingSet", ("t", False)),
-            ("ProtectControlGroupsEx", ("s", "strict")),
+            ("ProtectControlGroupsEx", ("s", "yes")),
+            ("ProtectControlGroups", ("b", False)),
             ("BindLogSockets", ("b", True)),
             ("InaccessiblePaths", ("as", tuple("-" + p for p in root.DENIED))),
             ("InaccessiblePaths", ("as", root.DENIED)),
@@ -689,6 +774,23 @@ class ProfileTests(unittest.TestCase):
                 for mode in ("inherit", "shared")
             ),
             ("KeyringMode", ("b", True), "root property signature"),
+            # yes keeps the host tree and namespace, private a writable one,
+            # no the host tree writable.
+            *(
+                (
+                    "ProtectControlGroupsEx",
+                    ("s", mode),
+                    "effective root property: ProtectControlGroupsEx",
+                )
+                for mode in ("yes", "private", "no", "true")
+            ),
+            ("ProtectControlGroupsEx", ("b", True), "root property signature"),
+            (
+                "ProtectControlGroups",
+                ("b", False),
+                "effective root property: ProtectControlGroups",
+            ),
+            ("ProtectControlGroups", ("s", "strict"), "root property signature"),
             (
                 "ProtectKernelLogs",
                 ("b", False),
@@ -842,7 +944,7 @@ class ReviewCorrectionsTests(unittest.TestCase):
         self.assertEqual(root.root_properties(plan).get("MountFlags"), 1 << 18)
         variants = dict(root.wire_properties(plan))
         self.assertEqual(variants.get("MountFlags"), ("t", 1 << 18))
-        variants.update(PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes"))
+        variants.update(PrivateUsers=("b", True), ProtectControlGroups=("b", True))
         for invalid in (("s", "private"), ("t", True), ("t", 0), ("t", 1 << 20)):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 root.check_properties(dict(variants, MountFlags=invalid), plan)
@@ -904,6 +1006,67 @@ class ParserTests(unittest.TestCase):
             mount_line(1, "/").encode().rstrip(b"\n"),
         ):
             with self.subTest(data=data), self.assertRaises(ValueError):
+                root.parse_mountinfo(data)
+
+    def test_upward_root_is_parsed_only_for_cgroup2_rows(self):
+        def row(mount_root, filesystem="cgroup2"):
+            return mount_line(
+                3, "/sys/fs/cgroup", "rw", filesystem, parent=2, source_root=mount_root
+            ).encode()
+
+        # cgroup_show_path prints a host cgroup2 root relative to the reader's
+        # cgroup namespace: one /.. per level up to the common ancestor.
+        for levels in (1, 5, 64):
+            with self.subTest(levels=levels):
+                [(path, mount)] = root.mount_rows(row("/.." * levels))
+                self.assertEqual((path, mount.root), ("/sys/fs/cgroup", "/.." * levels))
+        # Names that only start with dots are plain roots.
+        for mount_root in ("/..x", "/..."):
+            with self.subTest(mount_root=mount_root):
+                [(_, mount)] = root.mount_rows(row(mount_root))
+                self.assertIsNone(root.UPWARD.fullmatch(mount.root))
+        for mount_root in (
+            "/.." * 65,
+            "/../x",
+            "/../",
+            "/.../..",
+            "/..//..",
+            "/./..",
+            "..",
+            r"/\056\056",
+        ):
+            with (
+                self.subTest(mount_root=mount_root),
+                self.assertRaises(ValueError),
+            ):
+                root.mount_rows(row(mount_root))
+        for filesystem in ("cgroup", "tmpfs", "sysfs", "cgroup2x"):
+            with (
+                self.subTest(filesystem=filesystem),
+                self.assertRaisesRegex(ValueError, "^runtime member path$"),
+            ):
+                root.mount_rows(row("/..", filesystem))
+
+    def test_visible_upward_root_is_refused(self):
+        top = mount_line(2, "/").encode()
+        sysfs = add_mount(top, 3, "/sys", "ro,nosuid,nodev,noexec", "sysfs")
+        for mount_root in ("/", "/x"):
+            data = add_mount(
+                sysfs, 4, "/sys/fs/cgroup", "ro", "cgroup2", source_root=mount_root
+            )
+            self.assertEqual(
+                root.parse_mountinfo(data)["/sys/fs/cgroup"].root, mount_root
+            )
+        # The host tree seen from another cgroup namespace, with no fresh
+        # cgroup2 above it: systemd's privilege fallback keeps it visible.
+        for levels in (1, 5):
+            data = add_mount(
+                sysfs, 4, "/sys/fs/cgroup", "ro", "cgroup2", source_root="/.." * levels
+            )
+            with (
+                self.subTest(levels=levels),
+                self.assertRaisesRegex(ValueError, "^upward mount root$"),
+            ):
                 root.parse_mountinfo(data)
 
     def test_mount_tree_keeps_the_walkable_view(self):
@@ -1113,13 +1276,12 @@ class CoreTests(unittest.TestCase):
     def test_namespaces_root_and_identity_maps_are_independently_checked(self):
         plan, _ = selection()
         row = witness(plan)
-        # Only the cgroup namespace stays the host's; PrivatePIDs= gives G its own.
-        self.assertNotEqual(row["namespaces"]["pid"], plan["host_namespaces"]["pid"])
+        # No namespace is the host's: PrivatePIDs= gives G its own PID
+        # namespace and ProtectControlGroups=strict its own cgroup namespace.
         for key in root.NAMESPACES:
+            self.assertNotEqual(row["namespaces"][key], plan["host_namespaces"][key])
             bad = copy.deepcopy(row)
-            bad["namespaces"][key] = (
-                plan["host_namespaces"][key] if key != "cgroup" else 999
-            )
+            bad["namespaces"][key] = plan["host_namespaces"][key]
             with (
                 self.subTest(namespace=key),
                 self.assertRaisesRegex(ValueError, "rooted namespace mismatch: " + key),
@@ -1359,29 +1521,24 @@ class CoreTests(unittest.TestCase):
             ):
                 root.check_core(plan, bad, 1000, 250)
 
-    def test_real_private_pid_table_is_accepted(self):
+    def test_real_private_pid_table_shows_the_host_cgroup_view(self):
         plan, _ = selection()
-        row = witness(plan)
         self.assertEqual(R5_PRIVATE_PIDS.count(b"\n") - R5_NO_BUS.count(b"\n"), 1)
         view = root.parse_mountinfo(R5_NO_BUS)
-        for i, path in enumerate(root.DENIAL_NODES):
-            mode = 0o100000 if path == "/dev/ptmx" else 0o40000
-            node = {"device": 3, "inode": 700 + i, "mode": mode}
-            row["denied"][path] = node if path in view else None
-        stage = root.OS_RELEASE_STAGE
-        row["run_entries"] += ("/run/host", "/run/host/os-release", stage)
-        row["run_entries"] += (stage + "/os-release",)
-        row["os_release"] = {
-            "link_target": ".os-release-stage/os-release",
-            "stage_mode": 0o40755,
-            "file_mode": 0o100644,
-        }
-        row["mountinfo"] = R5_NO_BUS
-        self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        row = native_row(plan, R5_NO_BUS)
         # The real table carries the legacy leaf, rw device binds and no /root.
         self.assertIn("/sys/fs/cgroup/net_cls", view)
         self.assertTrue(all("rw" in view[p].options for p in root.DEVICE_BINDS))
         self.assertNotIn("/root", view)
+        # ProtectControlGroups=yes showed the host tree and its legacy leaf.
+        with self.assertRaisesRegex(ValueError, "^missing or unexpected rooted mount$"):
+            root.check_core(plan, row, 1000, 250)
+        leaf = b" /sys/fs/cgroup/net_cls "
+        leafless = b"".join(
+            line for line in R5_NO_BUS.splitlines(keepends=True) if leaf not in line
+        )
+        self.assertEqual(R5_NO_BUS.count(b"\n") - leafless.count(b"\n"), 1)
+        self.assertIsNone(root.check_core(plan, native_row(plan, leafless), 1000, 250))
         for data, message in (
             (R5_HOST_PROC, "stacked mount: /proc/sys/fs/binfmt_misc"),
             (R5_PID_ONLY, "stacked mount: /proc/sys/fs/binfmt_misc"),
@@ -1393,12 +1550,24 @@ class CoreTests(unittest.TestCase):
 
     def test_native_tables_of_the_bus_free_profile_are_accepted(self):
         plan, _ = selection()
-        for label, data in (("tracing", R5_TRACING), ("archhost", R5_ARCHHOST)):
+        # R5_ARCHHOST was recorded under ProtectControlGroups=yes. Its single
+        # cgroup2 on /sys, root /, has the shape strict leaves there
+        # (R5_ARCHHOST_STRICT), so the namespace rule and G's cgroup ID binding
+        # tell the two apart, not the mount table.
+        for label, data in (
+            ("strict", R5_STRICT),
+            ("archhost strict", R5_ARCHHOST_STRICT),
+            ("archhost", R5_ARCHHOST),
+        ):
             with self.subTest(label=label):
                 row = native_row(plan, data)
                 self.assertIsNone(root.check_core(plan, row, 1000, 250))
+        # The laptop's yes table shows the host's legacy hierarchy.
+        with self.assertRaisesRegex(ValueError, "^missing or unexpected rooted mount$"):
+            root.check_core(plan, native_row(plan, R5_TRACING), 1000, 250)
 
     def test_occluded_debugfs_is_one_exact_shape(self):
+        # On the strict laptop table, beside its occluded cgroup.
         plan, _ = selection()
 
         def line(number, parent, path, kind, device, mount_root=b"/", flags=b"rw"):
@@ -1413,34 +1582,34 @@ class CoreTests(unittest.TestCase):
             )
 
         debug, tracing = b"/sys/kernel/debug", b"/sys/kernel/debug/tracing"
-        debugfs = line(1689, 1680, debug, b"debugfs debugfs rw,seclabel", b"0:9")
-        tracefs = line(1690, 1689, tracing, b"tracefs tracefs rw,seclabel", b"0:14")
+        debugfs = line(1901, 1892, debug, b"debugfs debugfs rw,seclabel", b"0:9")
+        tracefs = line(1902, 1901, tracing, b"tracefs tracefs rw,seclabel", b"0:14")
         tmpfs = (
             b"tmpfs tmpfs rw,seclabel,size=3231088k,nr_inodes=807772,mode=700,"
             b"uid=1000,gid=1000,inode64"
         )
         dir_root = b"/systemd/inaccessible/dir"
-        cover = line(1693, 1689, debug, tmpfs, b"0:84", dir_root, b"ro")
+        cover = line(1906, 1901, debug, tmpfs, b"0:84", dir_root, b"ro")
         for row in (debugfs, tracefs, cover):
-            self.assertEqual(R5_TRACING.count(row), 1)
+            self.assertEqual(R5_STRICT.count(row), 1)
 
-        def edit(row, old, new, data=R5_TRACING):
+        def edit(row, old, new, data=R5_STRICT):
             self.assertEqual(row.count(old), 1)
             return data.replace(row, row.replace(old, new))
 
-        def extra(row, data=R5_TRACING):
+        def extra(row, data=R5_STRICT):
             return data + row
 
         def hide(path, kind, device):
             """Stack the path's cover on the host filesystem it replaces."""
-            old = b" 1680 0:84 %s %s " % (dir_root, path)
-            self.assertEqual(R5_TRACING.count(old), 1)
-            data = R5_TRACING.replace(old, b" 1695 0:84 %s %s " % (dir_root, path))
-            return extra(line(1695, 1680, path, kind, device), data)
+            old = b" 1892 0:84 %s %s " % (dir_root, path)
+            self.assertEqual(R5_STRICT.count(old), 1)
+            data = R5_STRICT.replace(old, b" 1908 0:84 %s %s " % (dir_root, path))
+            return extra(line(1908, 1892, path, kind, device), data)
 
         for label, data in (
-            ("tracefs automount", R5_TRACING),
-            ("no tracefs", R5_TRACING.replace(tracefs, b"")),
+            ("tracefs automount", R5_STRICT),
+            ("no tracefs", R5_STRICT.replace(tracefs, b"")),
         ):
             with self.subTest(label=label):
                 row = native_row(plan, data)
@@ -1450,45 +1619,45 @@ class CoreTests(unittest.TestCase):
             (
                 "second debugfs",
                 extra(
-                    line(1695, 1689, debug, b"debugfs debugfs rw", b"0:9"),
-                    edit(cover, b"1693 1689", b"1693 1695"),
+                    line(1908, 1901, debug, b"debugfs debugfs rw", b"0:9"),
+                    edit(cover, b"1906 1901", b"1906 1908"),
                 ),
             ),
             (
                 "debugfs on the cover",
-                extra(debugfs.replace(b"1689 1680", b"1695 1693")),
+                extra(debugfs.replace(b"1901 1892", b"1908 1906")),
             ),
-            ("cover on the cover", extra(cover.replace(b"1693 1689", b"1695 1693"))),
-            ("tmpfs on the cover", extra(line(1695, 1693, debug, tmpfs, b"0:99"))),
+            ("cover on the cover", extra(cover.replace(b"1906 1901", b"1908 1906"))),
+            ("tmpfs on the cover", extra(line(1908, 1906, debug, tmpfs, b"0:99"))),
             (
                 "mount below the cover",
-                extra(line(1695, 1693, debug + b"/x", tmpfs, b"0:84", dir_root, b"ro")),
+                extra(line(1908, 1906, debug + b"/x", tmpfs, b"0:84", dir_root, b"ro")),
             ),
             (
                 "debugfs at tracing",
                 edit(tracefs, b"tracefs tracefs", b"debugfs debugfs"),
             ),
             ("tracefs elsewhere", edit(tracefs, b"/tracing ", b"/trace ")),
-            ("tracefs on the cover", edit(tracefs, b"1690 1689", b"1690 1693")),
-            ("tracefs on /sys", edit(tracefs, b"1690 1689", b"1690 1680")),
+            ("tracefs on the cover", edit(tracefs, b"1902 1901", b"1902 1906")),
+            ("tracefs on /sys", edit(tracefs, b"1902 1901", b"1902 1892")),
             ("tracefs source", edit(tracefs, b"tracefs tracefs", b"tracefs none")),
             ("tracefs root", edit(tracefs, b" / /sys", b" /instances /sys")),
             ("other filesystem", edit(tracefs, b"tracefs tracefs", b"tmpfs tmpfs")),
             ("tracefs type", edit(tracefs, b"- tracefs tracefs", b"- tmpfs tracefs")),
-            ("two tracefs", extra(tracefs.replace(b"1690 1689", b"1695 1690"))),
+            ("two tracefs", extra(tracefs.replace(b"1902 1901", b"1908 1902"))),
             (
                 "tracefs child",
                 extra(
-                    line(1695, 1690, tracing + b"/x", b"tracefs tracefs rw", b"0:14")
+                    line(1908, 1902, tracing + b"/x", b"tracefs tracefs rw", b"0:14")
                 ),
             ),
             (
                 "foreign child of the debugfs",
-                extra(line(1695, 1689, b"/tmp/x", b"tmpfs tmpfs rw", b"0:99")),
+                extra(line(1908, 1901, b"/tmp/x", b"tmpfs tmpfs rw", b"0:99")),
             ),
-            ("cover beside the debugfs", edit(cover, b"1693 1689", b"1693 1680")),
-            ("tracefs pair", extra(tracefs.replace(b"1690 1689", b"1695 1689"))),
-            ("debugfs off /sys", edit(debugfs, b"1689 1680", b"1689 1660")),
+            ("cover beside the debugfs", edit(cover, b"1906 1901", b"1906 1892")),
+            ("tracefs pair", extra(tracefs.replace(b"1902 1901", b"1908 1901"))),
+            ("debugfs off /sys", edit(debugfs, b"1901 1892", b"1901 1786")),
             ("debugfs type", edit(debugfs, b"- debugfs debugfs", b"- tmpfs debugfs")),
             ("debugfs source", edit(debugfs, b"debugfs debugfs", b"debugfs none")),
             ("debugfs root", edit(debugfs, b" / /sys", b" /x /sys")),
@@ -1515,7 +1684,7 @@ class CoreTests(unittest.TestCase):
         witnessed = (
             (
                 "cover device",
-                edit(cover, b"1689 0:84", b"1689 0:99"),
+                edit(cover, b"1901 0:84", b"1901 0:99"),
                 "^inaccessible covers disagree$",
             ),
             (
@@ -1525,19 +1694,19 @@ class CoreTests(unittest.TestCase):
             ),
             (
                 "no cover",
-                R5_TRACING.replace(cover, b""),
+                R5_STRICT.replace(cover, b""),
                 "^missing or unexpected rooted mount$",
             ),
             (
                 "neither cover nor tracefs",
-                R5_TRACING.replace(cover, b"").replace(tracefs, b""),
+                R5_STRICT.replace(cover, b"").replace(tracefs, b""),
                 "^writable protected rooted mount$",
             ),
         )
-        good = native_row(plan, R5_TRACING)
+        good = native_row(plan, R5_STRICT)
         for label, data, *message in refused + witnessed:
             message = message[0] if message else occluded
-            self.assertNotEqual(data, R5_TRACING)
+            self.assertNotEqual(data, R5_STRICT)
             with self.subTest(label=label):
                 if label not in {case[0] for case in witnessed}:
                     with self.assertRaisesRegex(ValueError, message):
@@ -1675,7 +1844,7 @@ class CoreTests(unittest.TestCase):
                 ):
                     root.check_core(plan, bad, 1000, 250)
 
-    def test_legacy_cgroup_leaf_is_one_named_read_only_hierarchy(self):
+    def test_visible_legacy_cgroup_leaf_is_refused(self):
         plan, _ = selection()
         row = witness(plan)
 
@@ -1690,51 +1859,172 @@ class CoreTests(unittest.TestCase):
                 **kwargs,
             )
 
-        for name in ("net_cls", "net_cls,net_prio", "net_prio"):
-            with self.subTest(name=name):
-                self.assertIsNone(
-                    root.check_core(plan, dict(row, mountinfo=leaf(name)), 1000, 250)
-                )
-        cases = (
-            ("rw", leaf("net_cls", "rw,relatime"), "writable protected"),
-            ("cgroup2", leaf("net_cls", filesystem="cgroup2"), "legacy cgroup hier"),
-            ("memory", leaf("memory"), "missing or unexpected rooted mount"),
-            ("named", leaf("name=systemd"), "missing or unexpected rooted mount"),
-            (
-                "two",
-                add_mount(
-                    leaf("net_cls"),
-                    81,
-                    "/sys/fs/cgroup/net_prio",
-                    "ro,relatime",
-                    "cgroup",
-                    super_options="rw,net_prio",
+        # Under strict a legacy hierarchy only stays hidden below the fresh
+        # cgroup2 (occluded_cgroup); on G's own cgroup2 it is unexpected.
+        for name in (
+            "net_cls",
+            "net_cls,net_prio",
+            "net_prio",
+            "memory",
+            "name=systemd",
+        ):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    ValueError, "^missing or unexpected rooted mount$"
                 ),
-                "legacy cgroup hierarchy count",
+            ):
+                root.check_core(plan, dict(row, mountinfo=leaf(name)), 1000, 250)
+
+    def test_occluded_cgroup_is_one_exact_shape(self):
+        plan, _ = selection()
+        good = native_row(plan, R5_STRICT)
+        self.assertIsNone(root.check_core(plan, good, 1000, 250))
+        host = (
+            b"1895 1892 0:30 /../../../../.. /sys/fs/cgroup "
+            b"rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 "
+            b"rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting\n"
+        )
+        legacy = (
+            b"1896 1895 0:85 / /sys/fs/cgroup/net_cls rw,relatime"
+            b" - cgroup net_cls rw,seclabel,net_cls\n"
+        )
+        cover = (
+            b"1905 1895 0:30 / /sys/fs/cgroup "
+            b"ro,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 "
+            b"rw,seclabel,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting\n"
+        )
+        for row in (host, legacy, cover):
+            self.assertEqual(R5_STRICT.count(row), 1)
+
+        def edit(row, old, new, data=R5_STRICT):
+            self.assertEqual(row.count(old), 1)
+            return data.replace(row, row.replace(old, new))
+
+        def extra(row, data=R5_STRICT):
+            return data + row
+
+        hidden = R5_STRICT.replace(host, b"").replace(legacy, b"")
+        direct = edit(cover, b"1905 1895", b"1905 1892", hidden)
+        single = cover.replace(b"1905 1895", b"1905 1892")
+        view = root.parse_mountinfo(R5_STRICT)
+        self.assertEqual(len(view), R5_STRICT.count(b"\n") - 4)
+        self.assertEqual(
+            (view["/sys/fs/cgroup"].number, view["/sys/fs/cgroup"].parent),
+            (1905, 1895),
+        )
+        self.assertNotIn("/sys/fs/cgroup/net_cls", view)
+        for label, data in (
+            ("host copy and legacy hidden", R5_STRICT),
+            ("host copy hidden", R5_STRICT.replace(legacy, b"")),
+            # Without a locked child systemd can unmount the host copy.
+            ("cover on /sys", direct),
+            (
+                "other legacy name",
+                R5_STRICT.replace(
+                    legacy, legacy.replace(b"net_cls", b"net_cls,net_prio")
+                ),
+            ),
+            ("one level up", edit(host, b"/../../../../..", b"/..")),
+        ):
+            with self.subTest(label=label):
+                self.assertIsNone(
+                    root.check_core(plan, dict(good, mountinfo=data), 1000, 250)
+                )
+        occluded = "^occluded cgroup$"
+        refused = (
+            ("host root /", edit(host, b"/../../../../..", b"/")),
+            ("host root below the namespace", edit(host, b"/../../../../..", b"/x")),
+            ("host off /sys", edit(host, b"1895 1892", b"1895 1786")),
+            ("host on /sys/fs", edit(host, b"1895 1892", b"1895 1894")),
+            ("host source", edit(host, b"cgroup2 cgroup2", b"cgroup2 none")),
+            ("host shared", edit(host, b"relatime -", b"relatime shared:7 -")),
+            ("cover device", edit(cover, b"1895 0:30", b"1895 0:31")),
+            ("cover root", edit(cover, b" / /sys", b" /x /sys")),
+            ("cover type", edit(cover, b"- cgroup2 cgroup2", b"- tmpfs cgroup2")),
+            ("writable cover", edit(cover, b" ro,nosuid", b" rw,nosuid")),
+            ("shared cover", edit(cover, b"relatime -", b"relatime shared:9 -")),
+            ("slave cover", edit(cover, b"relatime -", b"relatime master:9 -")),
+            ("cover beside the host", edit(cover, b"1905 1895", b"1905 1892")),
+            ("cover on the legacy", edit(cover, b"1905 1895", b"1905 1896")),
+            (
+                "second legacy",
+                extra(
+                    b"1908 1895 0:86 / /sys/fs/cgroup/net_prio rw,relatime"
+                    b" - cgroup net_prio rw,net_prio\n"
+                ),
+            ),
+            ("legacy name", edit(legacy, b"/net_cls ", b"/memory ")),
+            # A v1 hierarchy named for its own controllers, but not a VPN's.
+            (
+                "legacy memory hierarchy",
+                R5_STRICT.replace(legacy, legacy.replace(b"net_cls", b"memory")),
             ),
             (
-                "child",
-                add_mount(leaf("net_cls"), 81, "/sys/fs/cgroup/net_cls/x"),
-                "missing or unexpected rooted mount",
+                "legacy path",
+                edit(legacy, b"/sys/fs/cgroup/net_cls", b"/sys/fs/cgroup/x"),
+            ),
+            ("legacy deeper", edit(legacy, b"/net_cls ", b"/net_cls/x ")),
+            ("legacy type", edit(legacy, b"- cgroup net_cls", b"- cgroup2 net_cls")),
+            ("legacy root", edit(legacy, b" / /sys", b" /x /sys")),
+            ("legacy controller", edit(legacy, b"seclabel,net_cls", b"seclabel")),
+            (
+                "legacy controllers partial",
+                edit(legacy, b"/net_cls ", b"/net_cls,net_prio "),
+            ),
+            ("legacy on the cover", edit(legacy, b"1896 1895", b"1896 1905")),
+            ("legacy slave", edit(legacy, b"relatime -", b"relatime master:4 -")),
+            (
+                "foreign child of the host copy",
+                extra(b"1908 1895 0:99 / /tmp/x rw - tmpfs tmpfs rw\n"),
             ),
             (
-                "controller",
-                leaf("net_cls,net_prio", super_options="rw,net_cls"),
-                "legacy cgroup hierarchy",
+                "child of the hidden legacy",
+                extra(
+                    b"1908 1896 0:99 / /sys/fs/cgroup/net_cls/x rw - tmpfs tmpfs rw\n"
+                ),
             ),
-            ("root", leaf("net_cls", source_root="/x"), "legacy cgroup hierarchy"),
             (
-                "propagation",
-                leaf("net_cls", "ro,relatime master:4"),
-                "rooted mount is not private",
+                "third cgroup2",
+                extra(cover.replace(b"1905 1895", b"1908 1905")),
+            ),
+            (
+                "visible legacy on the cover",
+                extra(legacy.replace(b"1896 1895", b"1908 1905")),
+            ),
+            (
+                "visible host copy",
+                hidden.replace(cover, b"") + host,
+                "^upward mount root$",
             ),
         )
-        for label, data, message in cases:
-            with (
-                self.subTest(label=label),
-                self.assertRaisesRegex(ValueError, message),
-            ):
-                root.check_core(plan, dict(row, mountinfo=data), 1000, 250)
+        # The parser takes these; the witness check refuses them.
+        witnessed = (
+            (
+                "visible legacy on a single cgroup2",
+                extra(legacy.replace(b"1896 1895", b"1896 1905"), direct),
+                "^missing or unexpected rooted mount$",
+            ),
+            (
+                "cover root below the namespace",
+                edit(single, b" / /sys", b" /x /sys", direct),
+                "^rooted cgroup view$",
+            ),
+            (
+                "writable single cgroup2",
+                edit(single, b" ro,nosuid", b" rw,nosuid", direct),
+                "^writable protected rooted mount$",
+            ),
+        )
+        for label, data, *message in refused + witnessed:
+            message = message[0] if message else occluded
+            self.assertNotEqual(data, R5_STRICT)
+            with self.subTest(label=label):
+                if label not in {case[0] for case in witnessed}:
+                    with self.assertRaisesRegex(ValueError, message):
+                        root.parse_mountinfo(data)
+                with self.assertRaisesRegex(ValueError, message):
+                    root.check_core(plan, dict(good, mountinfo=data), 1000, 250)
 
     def test_device_binds_are_nosuid_devtmpfs_leaves_on_one_device(self):
         plan, _ = selection()

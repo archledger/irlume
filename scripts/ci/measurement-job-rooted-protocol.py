@@ -197,39 +197,50 @@ def context(config, service, reference, manifest_data, deps):
     return value, guardian
 
 
-def launch(config, service, manifest_data, deps):
-    """H's first frame: the service identity it observed from the manager."""
+def launch(config, service, cgroup_id, manifest_data, deps):
+    """H's first frame: the service identity it observed from the manager.
+
+    v3 adds the unit's ControlGroupId: under ProtectControlGroups=strict G
+    sees its cgroup only as the root of its own namespace, so it binds the
+    identity by that directory's inode number, not by H's path.
+    """
     if type(config) is not Configuration:
         raise ValueError("rooted startup configuration owner")
     value = decode_config(config.data, config.sha256, manifest_data, deps)
     spec = validate_config(value, manifest_data, deps)
     check_service_identity(value, spec, service, deps)
+    _, runtime, _ = dependencies(deps)
+    runtime._integer(cgroup_id, 1, runtime.U64_MAX)
     return deps.root.guardian.encode(
         {
             "kind": "launch",
             "payload": {
-                "scope": "rooted-startup-launch-v2",
+                "scope": "rooted-startup-launch-v3",
                 "run_id": value["root_plan"]["run_id"],
                 "config_sha256": config.sha256,
                 "service": service._asdict(),
+                "cgroup_id": cgroup_id,
             },
         }
     )
 
 
 def check_launch(frame, config, manifest_data, deps):
-    """Return H's service identity from the exact LAUNCH for this config."""
+    """Return H's service identity and cgroup ID from the exact LAUNCH."""
     _, runtime, guardian = dependencies(deps)
     row = guardian.decode(frame)
     if row["kind"] != "launch":
         raise ValueError("rooted startup expected LAUNCH")
-    runtime._fields(row["payload"], ("scope", "run_id", "config_sha256", "service"))
+    runtime._fields(
+        row["payload"], ("scope", "run_id", "config_sha256", "service", "cgroup_id")
+    )
     service = row["payload"]["service"]
     runtime._fields(service, guardian.ServiceIdentity._fields)
     identity = guardian.ServiceIdentity(**service)
-    if guardian.encode(row) != launch(config, identity, manifest_data, deps):
+    cgroup_id = row["payload"]["cgroup_id"]
+    if guardian.encode(row) != launch(config, identity, cgroup_id, manifest_data, deps):
         raise ValueError("rooted startup LAUNCH mismatch")
-    return identity
+    return identity, cgroup_id
 
 
 def ready(config, service, reference, manifest_data, deps):

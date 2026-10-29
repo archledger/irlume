@@ -146,7 +146,8 @@ class Guardian(_Controller):
     """Effects collect/preflight without retained attempt FDs or child creation.
 
     G holds no manager connection. Its service identity is H's, from LAUNCH,
-    bound to G's own kernel view before the witness is written or READY sent.
+    bound to G's own kernel view by the cgroup ID that comes with it, before
+    the witness is written or READY sent.
     """
 
     def execute(self):
@@ -168,7 +169,7 @@ class Guardian(_Controller):
             self.control_attempted = True
             self.call(self.io.connect, self.config, self.deadline)
             frame = self.call(self.io.receive, self.deadline)
-            self.identity = protocol.check_launch(
+            self.identity, cgroup_id = protocol.check_launch(
                 frame, self.config, self.manifest, support.protocol_deps
             )
             starttime = self.call(
@@ -176,6 +177,7 @@ class Guardian(_Controller):
                 self.config,
                 self.manifest,
                 self.identity,
+                cgroup_id,
                 self.deadline,
             )
             binding = self.binding(starttime)
@@ -255,13 +257,18 @@ class Host(_Controller):
         self.call(self.io.prepare, self.config, self.manifest, self.deadline)
         self.identity = self.call(self.io.start, self.config, self.deadline)
         starttime = self.call(self.io.process_start, self.identity, self.deadline)
+        cgroup_id = self.call(self.io.cgroup_id, self.identity, self.deadline)
         binding = self.binding(starttime)
         self.control_attempted = True
         self.call(self.io.connect, self.identity, self.deadline)
         self.call(
             self.io.send,
             protocol.launch(
-                self.config, self.identity, self.manifest, support.protocol_deps
+                self.config,
+                self.identity,
+                cgroup_id,
+                self.manifest,
+                support.protocol_deps,
             ),
             self.deadline,
         )

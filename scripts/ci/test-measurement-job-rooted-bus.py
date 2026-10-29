@@ -67,9 +67,9 @@ class FakeBus(transport.SystemdBus):
             else:
                 self.service[name] = self.variant(kind, value)
         self.service.update(dict(fixture.root.wire_properties(fixture.plan)))
-        self.service.update(
-            PrivateUsers=("b", True), ProtectControlGroupsEx=("s", "yes")
-        )
+        self.service.update(PrivateUsers=("b", True), ProtectControlGroups=("b", True))
+        # The unit cgroup's ID, also the st_ino of its directory.
+        self.service["ControlGroupId"] = ("t", 286458)
         self.after = copy.deepcopy(self.unit)
 
     def remaining(self, deadline):
@@ -186,7 +186,7 @@ class BridgeTests(unittest.TestCase):
             ("ProtectKernelTunables", ("b", True)),
             ("ProtectKernelLogs", ("b", True)),
             ("KeyringMode", ("s", "private")),
-            ("ProtectControlGroups", ("b", True)),
+            ("ProtectControlGroupsEx", ("s", "strict")),
             ("RestrictNamespaces", ("t", 0)),
             ("CapabilityBoundingSet", ("t", 0)),
             ("AmbientCapabilities", ("t", 0)),
@@ -274,6 +274,11 @@ class BridgeTests(unittest.TestCase):
         self.fixture.root.check_properties(result["root"], self.fixture.plan)
         self.assertEqual(result["service"]["InvocationID"], "d" * 32)
         self.assertEqual(result["root"]["PrivateUsers"], ("b", True))
+        self.assertEqual(result["root"]["ProtectControlGroups"], ("b", True))
+        self.assertEqual(result["root"]["ProtectControlGroupsEx"], ("s", "strict"))
+        self.assertEqual(result["cgroup_id"], 286458)
+        self.assertEqual(self.bridge.partial["cgroup_id"], 286458)
+        self.assertNotIn("ControlGroupId", result["service"])
         self.assertEqual(self.bus.unit_reads, 2)
         self.assertEqual(
             self.bus.calls,
@@ -350,6 +355,26 @@ class BridgeTests(unittest.TestCase):
             ),
             ("KeyringMode", ("s", "inherit"), "effective root property: KeyringMode"),
             ("KeyringMode", None, "missing rooted bus property: KeyringMode"),
+            (
+                "ProtectControlGroupsEx",
+                ("s", "yes"),
+                "effective root property: ProtectControlGroupsEx",
+            ),
+            (
+                "ProtectControlGroupsEx",
+                None,
+                "missing rooted bus property: ProtectControlGroupsEx",
+            ),
+            (
+                "ProtectControlGroups",
+                ("b", False),
+                "effective root property: ProtectControlGroups",
+            ),
+            (
+                "ProtectControlGroups",
+                None,
+                "missing rooted bus property: ProtectControlGroups",
+            ),
         ):
             self.bus.service = copy.deepcopy(saved)
             if value is None:
@@ -361,6 +386,40 @@ class BridgeTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 self.bridge.observe(self.fixture.config, self.fixture.manifest, 1000)
+
+    def test_control_group_id_is_a_typed_nonzero_service_property(self):
+        saved = copy.deepcopy(self.bus.service)
+        for value, message in (
+            (None, "^missing rooted bus property: ControlGroupId$"),
+            (("u", 286458), "unexpected D-Bus variant signature"),
+            (("s", "286458"), "unexpected D-Bus variant signature"),
+            (("t", True), "unexpected D-Bus scalar type"),
+            # Zero: no realized cgroup, or no handle for it (systemd cgroup.c).
+            (("t", 0), "^rooted service cgroup ID$"),
+            (("t", -1), "^rooted service cgroup ID$"),
+            (("t", 2**64), "^rooted service cgroup ID$"),
+        ):
+            self.bus.service = copy.deepcopy(saved)
+            self.bus.unit_reads = 0
+            if value is None:
+                del self.bus.service["ControlGroupId"]
+            else:
+                self.bus.service["ControlGroupId"] = value
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                self.bridge.observe(self.fixture.config, self.fixture.manifest, 1000)
+            self.assertNotIn("cgroup_id", self.bridge.partial)
+        self.bus.service = saved
+        self.bus.unit_reads = 0
+        for value in (1, 2**64 - 1):
+            self.bus.service["ControlGroupId"] = ("t", value)
+            self.bus.unit_reads = 0
+            result = self.bridge.observe(
+                self.fixture.config, self.fixture.manifest, 1000
+            )
+            self.assertEqual(result["cgroup_id"], value)
 
     def test_process_invocation_names_only_the_configured_unit(self):
         fd = os.pidfd_open(os.getpid())

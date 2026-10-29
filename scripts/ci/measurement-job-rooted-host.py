@@ -132,7 +132,7 @@ class LeaseBus:
         self.bridge = bridge.RootedBus(
             bus, bridge.Dependencies(runtime.protocol, deps, runtime.native.service)
         )
-        self.last_root = None
+        self.last_root = self.last_cgroup_id = None
         self.cleanup_binding = None
 
     def check_name(self, name):
@@ -166,6 +166,7 @@ class LeaseBus:
             return row
         observed = self.bridge.observe(self.config, self.manifest, deadline)
         self.last_root = observed["root"]
+        self.last_cgroup_id = observed["cgroup_id"]
         return observed["service"]
 
     def enter_cleanup(self, bound):
@@ -245,7 +246,7 @@ class HostOwner:
         ) = None
         self.listener = self.channel = None
         self.config = self.value = self.identity = self.starttime = None
-        self.completed = self.boot_id = None
+        self.service_cgroup_id = self.completed = self.boot_id = None
         self.used = self.claim_attempted = self.aborted = self.committed = False
         self.commit_state = "not-attempted"
         self.output_bytes = 0
@@ -491,12 +492,15 @@ class HostOwner:
             row = self.lease.observe(deadline)
             if row["ActiveState"] == "active" and row["SubState"] == "running":
                 self.identity = self.active_identity(row)
+                # From the same Service reply as the row: G binds by it.
+                self.service_cgroup_id = self.adapter.last_cgroup_id
                 self.lease.bind(row)
                 self.write(
                     "host-started",
                     self.root.closure.canonical(
                         {
                             "service": self.identity._asdict(),
+                            "cgroup_id": self.service_cgroup_id,
                             "creation_reply": self.lease.creation_reply,
                         }
                     ),
@@ -517,6 +521,14 @@ class HostOwner:
         self.before(deadline)
         self.starttime = start
         return start
+
+    def cgroup_id(self, identity, deadline):
+        """The manager's ControlGroupId recorded with the bound identity."""
+        if self.identity is None or identity != self.identity:
+            raise ValueError("rooted cgroup identity mismatch")
+        self.before(deadline)
+        self.root.runtime._integer(self.service_cgroup_id, 1, self.root.runtime.U64_MAX)
+        return self.service_cgroup_id
 
     def check_peer(self, deadline):
         self.channel.check(deadline)
@@ -568,7 +580,10 @@ class HostOwner:
             raise ValueError("rooted host recheck identity")
         self.check_attempt(deadline)
         row = self.lease.observe(deadline)
-        if self.active_identity(row) != identity:
+        if (
+            self.active_identity(row) != identity
+            or self.adapter.last_cgroup_id != self.service_cgroup_id
+        ):
             raise ValueError("rooted guardian changed before commit")
         self.check_peer(deadline)
 

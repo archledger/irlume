@@ -359,6 +359,17 @@ class EffectsTests(unittest.TestCase):
             self.group,
             self.effects.value["origin_ns"] + root.guardian.HOST_NS,
         )
+        # G's own cgroup directory, the root of its cgroup namespace, whose
+        # inode number is the unit's ControlGroupId.
+        self.cgroup_root = self.cgroup_directory()
+        info = os.stat(self.cgroup_root)
+        self.cgroup_view = (info.st_dev, info.st_ino)
+        self.cgroup_id = info.st_ino
+
+    def cgroup_directory(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return directory.name
 
     def open_attempt(self):
         with mock.patch.object(
@@ -396,10 +407,19 @@ class EffectsTests(unittest.TestCase):
         self.assertEqual(collect.call_args.args[-1], self.deadline)
         self.assertIsNone(effects.attempt_fd)
 
-    def local(self, *, cgroup=None, affinity=None, pid=1, ppid=0, deadline=None):
+    def local(
+        self,
+        *,
+        cgroup=None,
+        affinity=None,
+        pid=1,
+        ppid=0,
+        deadline=None,
+        cgroup_root=None,
+    ):
         """Run preflight as the PID namespace init; host PIDs are never read."""
         if cgroup is None:
-            cgroup = ("1:net_cls:/\n0::" + self.group + "\n").encode()
+            cgroup = b"1:net_cls:/\n0::/\n"
         if affinity is None:
             affinity = set(self.effects.spec.cpus)
         self.started = []
@@ -419,6 +439,7 @@ class EffectsTests(unittest.TestCase):
                 rooted.os, "pidfd_open", side_effect=AssertionError("pidfd in G")
             ),
             mock.patch.object(self.effects, "read_cgroup", self.read),
+            mock.patch.object(rooted, "CGROUP_ROOT", cgroup_root or self.cgroup_root),
             mock.patch.object(rooted.os, "sched_getaffinity", return_value=affinity),
             mock.patch.object(rooted.os, "getpid", return_value=pid),
             mock.patch.object(rooted.os, "getppid", return_value=ppid),
@@ -428,34 +449,35 @@ class EffectsTests(unittest.TestCase):
                 self.config, self.manifest, deadline or self.deadline
             )
 
-    def members(self, data=b"1\n", *, link=False):
-        """A cgroup tree whose unit directory lists the given members."""
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        unit = Path(directory.name + self.group)
-        unit.mkdir(parents=True)
+    def members(self, base, data=b"1\n", *, link=False):
+        """G's cgroup directory listing the given members."""
+        unit = Path(base)
+        for name in ("cgroup.procs", "real.procs"):
+            (unit / name).unlink(missing_ok=True)
         if link:
             (unit / "real.procs").write_bytes(data)
             (unit / "cgroup.procs").symlink_to("real.procs")
         else:
             (unit / "cgroup.procs").write_bytes(data)
-        return directory.name
 
     def bind(
         self,
         identity=None,
         *,
+        cgroup_id=None,
         cgroup=None,
+        cgroup_root=None,
         procs=b"1\n",
         link=False,
         now=None,
         deadline=None,
         config=None,
     ):
-        """Run bind_service with H's LAUNCH identity against a cgroup tree."""
+        """Run bind_service with H's LAUNCH identity against G's cgroup."""
         if cgroup is None:
-            cgroup = ("0::" + self.group + "\n").encode()
-        base = self.members(procs, link=link)
+            cgroup = b"0::/\n"
+        base = cgroup_root or self.cgroup_root
+        self.members(base, procs, link=link)
         self.read = mock.Mock(return_value=cgroup)
         with (
             mock.patch.object(
@@ -471,6 +493,7 @@ class EffectsTests(unittest.TestCase):
                 config or self.config,
                 self.manifest,
                 self.identity if identity is None else identity,
+                self.cgroup_id if cgroup_id is None else cgroup_id,
                 deadline or self.deadline,
             )
 
@@ -487,7 +510,7 @@ class EffectsTests(unittest.TestCase):
             view = self.local()
             self.assertEqual(self.bind(), 123)
             self.assertFalse(any(name.startswith("jeepney") for name in sys.modules))
-        self.assertEqual(view, rooted.LocalView(self.group, 123))
+        self.assertEqual(view, rooted.LocalView(self.cgroup_view, 123))
         self.assertEqual(set(os.listdir("/proc/self/fd")), before)
         self.assertFalse(hasattr(self.effects, "service_observation"))
 
@@ -513,7 +536,7 @@ class EffectsTests(unittest.TestCase):
         before = set(os.listdir("/proc/self/fd"))
         view = self.local()
         self.assertIs(type(view), rooted.LocalView)
-        self.assertEqual(view, (self.group, 123))
+        self.assertEqual(view, (self.cgroup_view, 123))
         self.assertIs(self.effects.local, view)
         self.assertEqual(self.started, [1])
         self.read.assert_called_once_with(self.deadline)
@@ -535,13 +558,49 @@ class EffectsTests(unittest.TestCase):
         cases = {
             "malformed": b"wrong\n",
             "v1-only": b"1:net_cls:/\n",
-            "two-unified": ("0::" + self.group + "\n0::/other\n").encode(),
+            "two-unified": b"0::/\n0::/other\n",
             "affinity": None,
         }
         for case, cgroup in cases.items():
             affinity = set() if case == "affinity" else None
             with self.subTest(case=case), self.assertRaises(ValueError):
                 self.local(cgroup=cgroup, affinity=affinity)
+            self.assertIsNone(self.effects.local)
+
+    def test_preflight_requires_its_own_cgroup_namespace_root(self):
+        # The host path: no cgroup namespace, or a fallback to the host's.
+        # /../x: moved out of the namespace root. /x: below it.
+        for label, cgroup in (
+            ("host path", ("0::" + self.group + "\n").encode()),
+            ("host path beside v1", ("1:net_cls:/\n0::" + self.group + "\n").encode()),
+            ("outside", b"0::/../x\n"),
+            ("parent", b"0::/..\n"),
+            ("below", b"0::/x\n"),
+        ):
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    ValueError, "^rooted guardian cgroup namespace$"
+                ),
+            ):
+                self.local(cgroup=cgroup)
+            self.assertIsNone(self.effects.local)
+        link = Path(self.cgroup_directory()) / "link"
+        link.symlink_to(self.cgroup_root)
+        regular = Path(self.cgroup_directory()) / "file"
+        regular.write_bytes(b"")
+        for label, path, message in (
+            # O_DIRECTORY with O_NOFOLLOW: Linux refuses a final symlink
+            # with ENOTDIR before ELOOP.
+            ("symlink", link, "Not a directory"),
+            ("not a directory", regular, "Not a directory"),
+            ("missing", Path(self.cgroup_root) / "missing", "No such file"),
+        ):
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(OSError, message),
+            ):
+                self.local(cgroup_root=str(path))
             self.assertIsNone(self.effects.local)
 
     def test_preflight_never_reads_the_client_process(self):
@@ -563,10 +622,37 @@ class EffectsTests(unittest.TestCase):
         now = origin + 1_000_000
         # The earliest deadline: a start one proc clock tick before the origin.
         earliest = origin + guardian.HOST_NS - guardian.START_TICK_NS
-        other = self.group.replace("/app.slice/", "/session.slice/")
+        # Another directory at G's cgroup path, and an ID that names it.
+        other = self.cgroup_directory()
+        other_id = os.stat(other).st_ino
+        self.assertNotEqual(other_id, self.cgroup_id)
         cases = (
-            ("cgroup", {"identity": self.identity._replace(cgroup=other)}, "cgroup"),
-            ("migrated", {"cgroup": ("0::" + other + "\n").encode()}, "cgroup"),
+            ("other cgroup ID", {"cgroup_id": other_id}, "^rooted guardian cgroup ID$"),
+            ("next cgroup ID", {"cgroup_id": self.cgroup_id + 1}, "cgroup ID"),
+            ("cgroup ID type", {"cgroup_id": True}, "cgroup ID"),
+            ("cgroup ID text", {"cgroup_id": str(self.cgroup_id)}, "cgroup ID"),
+            # Equal as a number, not an integer.
+            ("cgroup ID float", {"cgroup_id": float(self.cgroup_id)}, "cgroup ID"),
+            (
+                "replaced cgroup",
+                {"cgroup_root": other},
+                "^rooted guardian cgroup binding$",
+            ),
+            (
+                "replaced cgroup with its ID",
+                {"cgroup_root": other, "cgroup_id": other_id},
+                "^rooted guardian cgroup ID$",
+            ),
+            (
+                "migrated",
+                {"cgroup": b"0::/../sibling\n"},
+                "^rooted guardian cgroup namespace$",
+            ),
+            (
+                "host path",
+                {"cgroup": ("0::" + self.group + "\n").encode()},
+                "^rooted guardian cgroup namespace$",
+            ),
             (
                 "early",
                 {"identity": self.identity._replace(deadline_ns=earliest - 1)},
@@ -599,6 +685,47 @@ class EffectsTests(unittest.TestCase):
         changed = self.runtime.protocol.Configuration(self.config.data, "f" * 64)
         with self.assertRaisesRegex(ValueError, "input changed"):
             self.bind(config=changed)
+
+    def test_bind_service_reads_members_through_the_checked_directory(self):
+        # The path names another directory once G has opened and checked its
+        # own: the members still come from the checked one.
+        self.local()
+        base = Path(self.cgroup_root)
+        moved = Path(self.cgroup_directory()) / "moved"
+        opening = os.open
+
+        def swap(path, flags, *args, **kwargs):
+            fd = opening(path, flags, *args, **kwargs)
+            if path == str(base) and flags & os.O_DIRECTORY and not moved.exists():
+                base.rename(moved)
+                base.mkdir()
+                (base / "cgroup.procs").write_bytes(b"1\n")
+            return fd
+
+        with (
+            mock.patch.object(rooted.os, "open", side_effect=swap),
+            self.assertRaisesRegex(ValueError, "^rooted guardian cgroup members$"),
+        ):
+            self.bind(procs=b"1\n2\n")
+        self.assertTrue(moved.exists())
+        self.assertEqual((base / "cgroup.procs").read_bytes(), b"1\n")
+
+    def test_bind_service_refuses_the_same_inode_on_another_device(self):
+        # G's inode number on another filesystem is not G's cgroup.
+        self.local()
+        statting = os.fstat
+
+        def elsewhere(fd):
+            info = statting(fd)
+            fields = list(info[:10])
+            fields[2] = info.st_dev + 1
+            return os.stat_result(fields)
+
+        with (
+            mock.patch.object(rooted.os, "fstat", side_effect=elsewhere),
+            self.assertRaisesRegex(ValueError, "^rooted guardian cgroup binding$"),
+        ):
+            self.bind()
 
     def test_bind_service_window_edges_are_inclusive(self):
         guardian = self.runtime.preflight.root.guardian

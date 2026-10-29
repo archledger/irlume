@@ -85,9 +85,17 @@ class LeaseBusTests(unittest.TestCase):
         self.assertEqual(self.bus.calls, [])
 
     def test_observation_keeps_root_evidence(self):
+        self.assertIsNone(self.adapter.last_cgroup_id)
         row = self.adapter.observe(self.adapter.name, 5_001_000_000)
         self.assertEqual(row["Id"], self.adapter.name)
         self.assertIn("RootDirectory", self.adapter.last_root)
+        # The cgroup ID comes from the same Service reply as the row.
+        self.assertEqual(self.adapter.last_cgroup_id, 286458)
+        self.assertNotIn("ControlGroupId", row)
+        self.bus.service["ControlGroupId"] = ("t", 286459)
+        self.bus.unit_reads = 0
+        self.adapter.observe(self.adapter.name, 5_001_000_000)
+        self.assertEqual(self.adapter.last_cgroup_id, 286459)
 
     def test_cleanup_observation_stays_bound_to_original_invocation(self):
         bound = {"Id": self.adapter.name, "InvocationID": "d" * 32}
@@ -439,6 +447,79 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(identity.invocation_id, "d" * 32)
         self.assertEqual(self.owner.lease.bound["InvocationID"], "d" * 32)
 
+    def test_start_records_the_cgroup_id_of_the_bound_row(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        observe = self.owner.bus_bridge.RootedBus.observe
+        seen = []
+
+        def activating_first(bridge, *args):
+            # The first row is still activating and has another ID; only the
+            # row that produced the identity names the recorded one.
+            result = observe(bridge, *args)
+            seen.append(result["cgroup_id"])
+            bus.unit_reads = 0
+            if len(seen) == 1:
+                bus.service["ControlGroupId"] = ("t", 286458)
+                return dict(
+                    result,
+                    cgroup_id=1,
+                    service=dict(result["service"], ActiveState="activating"),
+                )
+            return result
+
+        bus.service["ControlGroupId"] = ("t", 1)
+        with (
+            mock.patch.object(
+                self.owner.bus_bridge.RootedBus, "observe", activating_first
+            ),
+            mock.patch.object(host.time, "sleep"),
+        ):
+            identity = self.owner.start(self.owner.config, deadline)
+        self.assertEqual(seen, [1, 286458])
+        record = json.loads((self.owner.path / "host-started.json").read_bytes())
+        self.assertEqual(
+            record,
+            {
+                "service": identity._asdict(),
+                "cgroup_id": 286458,
+                "creation_reply": self.owner.lease.creation_reply,
+            },
+        )
+        self.assertEqual(self.owner.cgroup_id(identity, deadline), 286458)
+        for other in (
+            identity._replace(pid=identity.pid + 1),
+            identity._replace(invocation_id="e" * 32),
+            identity._asdict(),
+            None,
+        ):
+            with (
+                self.subTest(other=other),
+                self.assertRaisesRegex(ValueError, "rooted cgroup identity mismatch"),
+            ):
+                self.owner.cgroup_id(other, deadline)
+        # Not after the configuration deadline.
+        with self.assertRaises(TimeoutError):
+            self.owner.cgroup_id(identity, self.owner.now())
+
+    def test_start_without_a_cgroup_id_binds_nothing(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        del bus.service["ControlGroupId"]
+        with self.assertRaisesRegex(
+            ValueError, "missing rooted bus property: ControlGroupId"
+        ):
+            self.owner.start(self.owner.config, deadline)
+        self.assertIsNone(self.owner.identity)
+        self.assertIsNone(self.owner.lease.bound)
+        self.assertFalse((self.owner.path / "host-started.json").exists())
+        with self.assertRaisesRegex(ValueError, "rooted cgroup identity mismatch"):
+            self.owner.cgroup_id(None, deadline)
+
     def test_peer_liveness_brackets_connected_guardian_starttime(self):
         self.acquire()
         deadline = self.owner.value["startup_deadline_ns"]
@@ -597,6 +678,35 @@ class FactoryTests(unittest.TestCase):
                     self.assertEqual(len(peer_calls()), count)
             bus.service["ExecStart"] = exact
             self.owner.recheck(identity, 100, deadline)
+        channel.send.assert_not_called()
+
+    def test_recheck_refuses_a_changed_cgroup_id(self):
+        bus, identity, channel, deadline = self.connectable_owner()
+        with (
+            mock.patch.object(self.root.guardian, "PeerChannel", return_value=channel),
+            mock.patch.object(native, "process_start", return_value=100),
+        ):
+            self.owner.listener = mock.Mock()
+            self.owner.listener.accept.return_value = (mock.Mock(), None)
+            self.owner.connect(identity, deadline)
+            # A new cgroup directory for the same invocation, or none.
+            for value in (("t", 286459), ("t", 286457), ("t", 0)):
+                bus.service["ControlGroupId"] = value
+                with (
+                    self.subTest(value=value),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "rooted guardian changed before commit"
+                        if value[1]
+                        else "rooted service cgroup ID",
+                    ),
+                ):
+                    self.owner.recheck(identity, 100, deadline)
+                # LAUNCH still gets the ID bound with the identity.
+                self.assertEqual(self.owner.cgroup_id(identity, deadline), 286458)
+            bus.service["ControlGroupId"] = ("t", 286458)
+            self.owner.recheck(identity, 100, deadline)
+            self.assertEqual(self.owner.cgroup_id(identity, deadline), 286458)
         channel.send.assert_not_called()
 
     def test_commit_allows_peer_exit_after_final_write(self):

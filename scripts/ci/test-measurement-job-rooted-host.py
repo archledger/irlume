@@ -536,6 +536,69 @@ class FactoryTests(unittest.TestCase):
             self.owner.recheck(identity, 100, deadline)
         channel.send.assert_not_called()
 
+    def foreign_exec_starts(self):
+        """Wire ExecStart readbacks of a unit not running this config's entry."""
+        plan, digest = self.owner.value["root_plan"], self.owner.config.sha256
+        argv = list(self.root.entry_argv(plan, digest))
+        self.assertEqual(argv[-1], digest)
+        other = [*argv[:-1], "0" * 64]
+        self.assertNotEqual(other, argv)
+
+        def row(path, args, ignore=False):
+            return ("a(sasbttttuii)", [[path, args, ignore, 0, 0, 0, 0, 0, 0, 0]])
+
+        return {
+            "executable": row("/usr/bin/other", ["/usr/bin/other"]),
+            "config": row(argv[0], other),
+            "argv0": row(argv[0], ["other", *argv[1:]]),
+            "ignore-failure": row(argv[0], argv, True),
+            "none": ("a(sasbttttuii)", []),
+        }
+
+    def test_start_refuses_a_foreign_guardian_executable(self):
+        # Only H binds the unit's ExecStart to this config's entry argv.
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        bus.service["ExecStart"] = self.foreign_exec_starts()["executable"]
+        with self.assertRaisesRegex(
+            ValueError, "rooted host guardian executable mismatch"
+        ):
+            self.owner.start(self.owner.config, deadline)
+        self.assertTrue(self.owner.lease.created)
+        self.assertIsNone(self.owner.lease.bound)
+        self.assertIsNone(self.owner.identity)
+        self.assertFalse((self.owner.path / "host-started.json").exists())
+
+    def test_recheck_refuses_a_foreign_guardian_executable(self):
+        bus, identity, channel, deadline = self.connectable_owner()
+        exact = bus.service["ExecStart"]
+
+        def peer_calls():
+            return [call for call in bus.calls if call[2] == "GetUnitByPIDFD"]
+
+        with (
+            mock.patch.object(self.root.guardian, "PeerChannel", return_value=channel),
+            mock.patch.object(native, "process_start", return_value=100),
+        ):
+            self.owner.listener = mock.Mock()
+            self.owner.listener.accept.return_value = (mock.Mock(), None)
+            self.owner.connect(identity, deadline)
+            for label, value in self.foreign_exec_starts().items():
+                bus.service["ExecStart"] = value
+                count = len(peer_calls())
+                with self.subTest(case=label):
+                    with self.assertRaisesRegex(
+                        ValueError, "rooted host guardian executable mismatch"
+                    ):
+                        self.owner.recheck(identity, 100, deadline)
+                    # The unit is refused before the peer is consulted.
+                    self.assertEqual(len(peer_calls()), count)
+            bus.service["ExecStart"] = exact
+            self.owner.recheck(identity, 100, deadline)
+        channel.send.assert_not_called()
+
     def test_commit_allows_peer_exit_after_final_write(self):
         frame = self.root.guardian.encode({"kind": "commit", "payload": {}})
         with channel_fixtures.ChannelTests().exiting_peer() as (

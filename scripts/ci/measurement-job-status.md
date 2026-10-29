@@ -30,11 +30,17 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
 
 ## Remaining work, in order
 
-- [ ] Select, prepare and freeze the actual inert runtime and profile using the
+- [x] Select, prepare and freeze the actual inert runtime and profile using the
   tested launcher and current source; verify their manifest and dependency
   closure without increasing security or resource limits.
-- [ ] Qualify startup-only H/G with the real service manager and actual closed
-  startup evidence. This step must not start a VM.
+- [x] Qualify startup-only H/G with the real service manager and actual closed
+  startup evidence. This step must not start a VM. Done on 2026-10-29 with a
+  scratch admission directory on two hosts: systemd 259.10 on btrfs and
+  systemd 262.1 on ext4. Each run reached `startup-only-complete` (preflight,
+  LAUNCH, connect, witness, READY, COMMIT, DONE and the terminal check), and
+  H's peer pidfd matched the invocation in 3 of 3 lookups. The startup
+  observation used 1104 and 1096 of its 1536 operations.
+- [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
@@ -52,16 +58,33 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
 - [ ] Complete final review and applicable repository/CI gates before making
   the pull request ready for review or merging.
 
+### Open containment items
+
+- G sees the inode, the containing mount's device and the path of each
+  runtime mapping, but not the mapped bytes. On btrfs an inode number is
+  unique per subvolume only, and the tree checks (root device and
+  same-device members) hold at each scan, not between scans. Binding the
+  mapped bytes to the hashed file would close this.
+- Restrict path-socket connects from the future QEMU child with Landlock
+  (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
+- Evaluate `ProtectControlGroupsEx=strict`: G can still read the host cgroup
+  tree's unit names and process counts.
+- Check whether G inherits the user's session keyring.
+- With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
+  uid, gid, namespace, liveness and socket node, and H stays the verifier of
+  G's unit, invocation and start time.
+
 Provider testing, biometric/corpus work, production authentication, GPU enablement
 and the full 21-case campaign are outside this checkpoint's deliverable. Do not
 close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-The latest focused runs pass 34 H tests, 11 H input-owner tests and 29 guardian
-tests. Thirty focused mutation controls are validated. The affected legacy
-native/host, rooted native/controller, source-cache and service transport suites
-also pass, as do the portable 69-test and controller 43-test suites.
+All 36 `scripts/ci/test-measurement-*.py` suites pass (782 tests), with
+`TMPDIR` unset and with a long `TMPDIR`. The portable 69-test and controller
+43-test suites also pass. Each change in the 2026-10-29 series was written
+test first, and its mutation controls fail at least one test. The startup-only
+native runs above used a pinned runtime prepared from the same source.
 
 Ruff, formatting and source-boundary checks pass. The scoped production reviews
 are clear. The H/controller integration test uses a fake manager/peer and a stub

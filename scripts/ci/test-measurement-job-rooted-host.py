@@ -223,6 +223,19 @@ class FactoryTests(unittest.TestCase):
             self.owner.start(self.owner.config, deadline)
         self.owner.bus_factory.assert_not_called()
 
+    def test_start_binds_service_with_manager_padded_cpu_mask(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        bus = self.make_bus()
+        kind, requested = bus.service["CPUAffinity"]
+        self.assertEqual((kind, len(requested)), ("ay", 1))
+        # systemd returns its whole 8-byte CPU_ALLOC_SIZE buffer for this mask.
+        bus.service["CPUAffinity"] = (kind, requested + bytes(7))
+        identity = self.owner.start(self.owner.config, deadline)
+        self.assertEqual(identity.invocation_id, "d" * 32)
+        self.assertEqual(self.owner.lease.bound["InvocationID"], "d" * 32)
+
     def test_peer_liveness_brackets_connected_guardian_starttime(self):
         self.acquire()
         deadline = self.owner.value["startup_deadline_ns"]

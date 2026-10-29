@@ -586,6 +586,76 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 guardian.check_service(row, spec, 4200, 1000, 100_000)
 
+    def test_zero_padded_cpu_mask_readback_is_the_same_selection(self):
+        # systemd reads CPUAffinity back as its whole CPU_ALLOC_SIZE buffer.
+        for cpus, readback in (
+            ((0, 1), (3, 0, 0, 0, 0, 0, 0, 0)),
+            ((9, 10), (0, 6, 0, 0, 0, 0, 0, 0)),
+            ((63, 64), (0,) * 7 + (0x80, 1) + (0,) * 7),
+            ((0, 1), (3,) + (0,) * 511),
+            ((7, 4095), (0x80,) + (0,) * 510 + (0x80,)),
+        ):
+            spec = specification(cpus=cpus)
+            row = service_snapshot(spec)
+            row["CPUAffinity"] = readback
+            with self.subTest(cpus=cpus, size=len(readback)):
+                identity = guardian.check_service(row, spec, 4200, 1000, 100_000)
+                self.assertEqual(identity.invocation_id, "d" * 32)
+                self.assertEqual(row["CPUAffinity"], readback)
+
+    def test_cpu_mask_refuses_other_cpus_malformed_or_oversized_readback(self):
+        spec = specification()
+        self.assertEqual(guardian.service_properties(spec)["CPUAffinity"], (3,))
+        for value in (
+            (),
+            (0,),
+            (0,) * 8,
+            (1,),
+            (2,),
+            (7,),
+            (0, 3),
+            (3, 1),
+            (3, 0, 0, 0, 0, 0, 0, 0x80),
+            (3,) + (0,) * 510 + (1,),
+            (3,) + (0,) * 512,
+            (3, False),
+            (3.0,),
+            ("\x03",),
+            (3, -1),
+            (3, 256),
+            (259,),
+            [3, 0, 0, 0, 0, 0, 0, 0],
+            b"\x03\0\0\0\0\0\0\0",
+            None,
+        ):
+            row = service_snapshot(spec)
+            row["CPUAffinity"] = value
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "CPUAffinity"),
+            ):
+                guardian.check_service(row, spec, 4200, 1000, 100_000)
+
+    def test_multi_byte_cpu_mask_refuses_any_other_bit_or_truncation(self):
+        spec = specification(cpus=(9, 10))
+        self.assertEqual(guardian.service_properties(spec)["CPUAffinity"], (0, 6))
+        for value in (
+            (0,),
+            (0, 2, 0, 0, 0, 0, 0, 0),
+            (0, 4, 0, 0, 0, 0, 0, 0),
+            (0, 22, 0, 0, 0, 0, 0, 0),
+            (1, 6, 0, 0, 0, 0, 0, 0),
+            (0, 6, 1, 0, 0, 0, 0, 0),
+            (6, 0, 0, 0, 0, 0, 0, 0),
+        ):
+            row = service_snapshot(spec)
+            row["CPUAffinity"] = value
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "CPUAffinity"),
+            ):
+                guardian.check_service(row, spec, 4200, 1000, 100_000)
+
     def test_service_deadline_is_not_restarted_at_observation(self):
         spec = specification()
         row = service_snapshot(spec)

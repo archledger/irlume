@@ -44,6 +44,8 @@ IO_LIMIT = 65536
 SO_PEERPIDFD = 77
 STREAM_LIMIT = 8 * 1024 * 1024
 HOST_RECEIPT_BUDGET = 64 * 1024
+# Bytes for CPUs 0-4095, the range validate_spec accepts.
+CPU_MASK_LIMIT = 512
 # Cleanup must continue through cancellation; every captured error is re-raised.
 CLEANUP_FAILURES = (BaseException,)
 
@@ -179,10 +181,21 @@ def check_service(row, spec, pid, uid, now_ns):
     runtime._integer(uid, 1, 2**32 - 2)
     runtime._integer(now_ns)
     for name, expected in properties.items():
-        if type(row[name]) is not type(expected) or row[name] != expected:
+        if name != "CPUAffinity" and (
+            type(row[name]) is not type(expected) or row[name] != expected
+        ):
             raise ValueError("effective service property: " + name)
-    if any(type(byte) is not int for byte in row["CPUAffinity"]):
-        raise ValueError("effective CPU mask")
+    # systemd reads CPUAffinity back as its whole CPU_ALLOC_SIZE buffer (a
+    # multiple of eight bytes on x86-64): the requested bits, then zero bytes.
+    mask, observed = properties["CPUAffinity"], row["CPUAffinity"]
+    if (
+        type(observed) is not tuple
+        or len(observed) > CPU_MASK_LIMIT
+        or any(type(byte) is not int or not 0 <= byte <= 255 for byte in observed)
+        or observed[: len(mask)] != mask
+        or any(observed[len(mask) :])
+    ):
+        raise ValueError("effective service property: CPUAffinity")
     runtime._integer(row["MainPID"], pid, pid)
     name = unit_name(spec)
     group = row["ControlGroup"]

@@ -22,6 +22,10 @@ FLAGS = ["-I", "-S", "-B", "-X", "pycache_prefix=/dev/null"]
 PLATFORM = {"os": "linux", "machine": "x86_64", "bits": 64, "byte_order": "little"}
 ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
 CLEANUP_ERRORS = (BaseException,)
+# Predeclare the fixed RootDirectory profile's empty host paths. API roots are
+# overmounted at startup and checked independently by the core witness.
+API_ROOTS = frozenset(("dev", "proc", "sys", "run", "tmp"))
+ROOT_SCAFFOLD = API_ROOTS | {"bin", "etc", "root", "var"}
 
 
 class SourceLoader(importlib.machinery.SourceFileLoader):

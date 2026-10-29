@@ -27,7 +27,6 @@ closure = importlib.util.module_from_spec(spec)
 loader.exec_module(closure)
 inputs = closure.inputs
 PREPARATION_NS = 120_000_000_000
-API_ROOTS = frozenset(("dev", "proc", "sys", "run", "tmp"))
 
 
 class SourceFile(NamedTuple):
@@ -104,14 +103,14 @@ def freeze_selection(profile, records):
         raise ValueError("preparation Python roots")
     if type(records) is not list or not 1 <= len(records) <= closure.MAX_MEMBERS:
         raise ValueError("preparation selection count")
-    files, directories, members = [], set(), []
+    files, directories, members = [], set(closure.ROOT_SCAFFOLD), []
     previous = ""
     for record in records:
         closure.runtime._fields(record, ("source", "path", "mode", "size", "sha256"))
         source = str(absolute_path(record["source"]))
         path = closure.relative_path(record["path"])
-        if path <= previous or path.split("/")[0] in API_ROOTS:
-            raise ValueError("preparation destination order or API root")
+        if path <= previous or path.split("/")[0] in closure.ROOT_SCAFFOLD:
+            raise ValueError("preparation destination order or empty scaffold")
         previous = path
         if type(record["mode"]) is not int or record["mode"] not in (0o400, 0o500):
             raise ValueError("preparation file mode")
@@ -138,8 +137,8 @@ def freeze_selection(profile, records):
         )
     for path in profile["python"]["roots"]:
         closure.relative_path(path)
-        if path.split("/")[0] in API_ROOTS:
-            raise ValueError("preparation Python API root")
+        if path.split("/")[0] in closure.ROOT_SCAFFOLD:
+            raise ValueError("preparation Python root overlaps empty scaffold")
         directories.add(path)
         directories.update(
             str(parent) for parent in PurePosixPath(path).parents if str(parent) != "."

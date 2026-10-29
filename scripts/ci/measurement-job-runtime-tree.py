@@ -30,7 +30,7 @@ CLEANUP_ERRORS = (BaseException,)
 class RootedRuntimeSnapshot(closure.RuntimeSnapshot):
     """A fixed-root snapshot; API mount validation belongs to the core witness."""
 
-    _api_roots = frozenset(("dev", "proc", "sys", "run", "tmp"))
+    _api_roots = closure.API_ROOTS
 
     def __init__(self, plan, core, deadline):
         root.check_plan(plan)
@@ -81,7 +81,12 @@ class RootedRuntimeSnapshot(closure.RuntimeSnapshot):
         snapshot = cls(plan, core, deadline)
         try:
             members, images, snapshot.observations = snapshot.scan(contents=True)
-            if members != manifest["members"]:
+            static_members = [
+                member
+                for member in manifest["members"]
+                if member["path"] not in cls._api_roots
+            ]
+            if members != static_members:
                 raise ValueError("mounted runtime manifest mismatch")
             snapshot.graph = MappingProxyType(closure.verify_linkage(manifest, images))
             snapshot._manifest_data = data

@@ -32,11 +32,25 @@ core_fixtures = load("rooted_core_fixtures", "test-measurement-job-root.py")
 
 class RootedTreeTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        self.temp = tempfile.TemporaryDirectory(prefix="irlume-runtime-tree-")
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "root"
         self.path.mkdir()
         self.manifest, files = fixtures.manifest()
+        self.manifest["members"].extend(
+            {"path": name, "kind": "directory", "mode": 0o500}
+            for name in (
+                "bin",
+                "dev",
+                "etc",
+                "proc",
+                "root",
+                "run",
+                "sys",
+                "tmp",
+                "var",
+            )
+        )
         old = self.manifest["python"]["entry"]
         new = "opt/irlume/measurement-job-guardian-native.py"
         self.manifest["python"]["entry"] = new
@@ -55,8 +69,6 @@ class RootedTreeTests(unittest.TestCase):
         for row in reversed(self.manifest["members"]):
             if row["kind"] == "directory":
                 (self.path / row["path"]).chmod(row["mode"])
-        for name in ("dev", "proc", "sys", "run", "tmp"):
-            (self.path / name).mkdir(mode=0o500)
         self.path.chmod(0o500)
         self.data = rooted.closure.canonical(self.manifest)
         self.plan, _ = core_fixtures.selection()

@@ -175,9 +175,20 @@ def check_selection(plan, manifest_data):
         raise ValueError("rooted guardian fixed Python entry")
     if "/" + manifest["bootstrap"] != plan["launcher"]["path"]:
         raise ValueError("rooted guardian bootstrap path")
+    members = {member["path"]: member for member in manifest["members"]}
+    for name in closure.ROOT_SCAFFOLD:
+        if members.get(name) != {"path": name, "kind": "directory", "mode": 0o500}:
+            raise ValueError("rooted runtime missing empty scaffold")
+    if any(
+        path.split("/")[0] in closure.API_ROOTS for path in manifest["python"]["roots"]
+    ):
+        raise ValueError("rooted Python search root overlaps API mount")
     for member in manifest["members"]:
-        if member["path"].split("/")[0] in ("dev", "proc", "sys", "run", "tmp"):
-            raise ValueError("runtime member overlaps API mount")
+        if (
+            "/" in member["path"]
+            and member["path"].split("/")[0] in closure.ROOT_SCAFFOLD
+        ):
+            raise ValueError("runtime member populates empty scaffold")
         if (
             member["path"] == manifest["bootstrap"]
             and member["sha256"] != plan["launcher"]["sha256"]

@@ -307,6 +307,10 @@ jobs:
           IRLUME_JOB_OUTPUT: ${{ runner.temp }}/irlume-job-portable
         run: bash scripts/test-measurement-job.sh
 
+      - name: Contained-job rooted scaffold contracts
+        timeout-minutes: 2
+        run: python3 -B -X pycache_prefix=/dev/null scripts/ci/test-measurement-job-scaffold.py
+
       - name: Contained-job static build (no native execution)
         timeout-minutes: 20
         env:

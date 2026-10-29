@@ -26,6 +26,10 @@ guardian_tests = load("root_guardian_tests", "test-measurement-job-guardian.py")
 
 def selection():
     manifest, _ = fixtures.manifest()
+    manifest["members"].extend(
+        {"path": name, "kind": "directory", "mode": 0o500}
+        for name in ("bin", "dev", "etc", "proc", "root", "run", "sys", "tmp", "var")
+    )
     manifest["python"]["entry"] = "opt/irlume/measurement-job-guardian-native.py"
     next(m for m in manifest["members"] if m["path"] == "opt/irlume/entry.py")[
         "path"

@@ -31,13 +31,28 @@ fixtures = load("prepare_fixtures", "test-measurement-job-closure.py")
 
 class PreparationTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(dir="/tmp/opencode")
+        directory = tempfile.TemporaryDirectory(prefix="irlume-runtime-prepare-")
         self.addCleanup(directory.cleanup)
         self.base = Path(directory.name)
         self.source = self.base / "source"
         self.source.mkdir(mode=0o700)
         self.destination = self.base / "runtime"
         self.manifest, content = fixtures.manifest()
+        self.manifest["members"].extend(
+            {"path": name, "kind": "directory", "mode": 0o500}
+            for name in (
+                "bin",
+                "dev",
+                "etc",
+                "proc",
+                "root",
+                "run",
+                "sys",
+                "tmp",
+                "var",
+            )
+        )
+        self.manifest["members"].sort(key=lambda row: row["path"])
         self.profile = {
             name: value for name, value in self.manifest.items() if name != "members"
         }

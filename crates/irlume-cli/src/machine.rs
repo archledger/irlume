@@ -674,11 +674,8 @@ mod provider_runtime_reporting_tests {
         assert!(value.get("selection").is_none());
     }
 
-    /// The selection words `status --json` passes through are exactly the
-    /// schema's `recognizer.selection` enum (#1053): contract 1 adds no enum
-    /// value, and a word the schema lists must not be dropped.
-    #[test]
-    fn passed_selection_words_are_the_schema_enum() {
+    /// The words the schema's `recognizer.<field>` enum lists.
+    fn recognizer_schema_enum(field: &str) -> Vec<String> {
         let schema: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -687,14 +684,25 @@ mod provider_runtime_reporting_tests {
             .expect("schemas/machine-api-v1.schema.json readable from the workspace"),
         )
         .unwrap();
-        let listed: Vec<&str> = schema
-            .pointer("/$defs/statusData/properties/recognizer/properties/selection/enum")
+        schema
+            .pointer(&format!(
+                "/$defs/statusData/properties/recognizer/properties/{field}/enum"
+            ))
             .and_then(|words| words.as_array())
-            .expect("the schema lists the selection words")
+            .unwrap_or_else(|| panic!("the schema lists the {field} words"))
             .iter()
-            .map(|word| word.as_str().unwrap())
-            .collect();
-        assert_eq!(listed, ["auto", "cpu", "npu", "gpu"]);
+            .map(|word| word.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The selection words `status --json` passes through are exactly the
+    /// schema's `recognizer.selection` enum (#1053): contract 1 adds no enum
+    /// value, and a word the schema lists must not be dropped.
+    #[test]
+    fn passed_selection_words_are_the_schema_enum() {
+        let words = recognizer_schema_enum("selection");
+        assert_eq!(words, ["auto", "cpu", "npu", "gpu"]);
+        let listed: Vec<&str> = words.iter().map(String::as_str).collect();
         for word in listed.iter().copied().chain(["tpu", "AUTO", ""]) {
             let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
                 device: "cpu".into(),
@@ -708,6 +716,62 @@ mod provider_runtime_reporting_tests {
             let expected = listed.contains(&word).then_some(word);
             assert_eq!(
                 value.get("selection").and_then(|v| v.as_str()),
+                expected,
+                "{word:?}"
+            );
+        }
+    }
+
+    /// The accelerator words `status --json` passes through are exactly the
+    /// schema's `recognizer.accelerator` enum (ADR-0033 phase 3): a word the
+    /// schema does not list never reaches a consumer, and one it lists is
+    /// never dropped. CPU is the field's absence, not a word.
+    #[test]
+    fn passed_accelerator_words_are_the_schema_enum() {
+        let words = recognizer_schema_enum("accelerator");
+        assert_eq!(words, ["npu", "gpu"]);
+        let listed: Vec<&str> = words.iter().map(String::as_str).collect();
+        for word in listed
+            .iter()
+            .copied()
+            .chain(["cpu", "tpu", "GPU", "NPU", " gpu", ""])
+        {
+            let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some(irlume_common::RECOGNIZER_ON_GPU_REASON.into()),
+                accelerator: Some(word.into()),
+                ..Default::default()
+            }));
+            let expected = listed.contains(&word).then_some(word);
+            assert_eq!(
+                value.get("accelerator").and_then(|v| v.as_str()),
+                expected,
+                "{word:?}"
+            );
+        }
+    }
+
+    /// The device words `status --json` passes through are exactly the
+    /// schema's `recognizer.device` enum: contract 1 names `npu` and `cpu`
+    /// only, so a GPU placement reports `cpu` and the GPU travels in
+    /// `accelerator` (MACHINE-API.md).
+    #[test]
+    fn passed_device_words_are_the_schema_enum() {
+        let words = recognizer_schema_enum("device");
+        assert_eq!(words, ["npu", "cpu"]);
+        let listed: Vec<&str> = words.iter().map(String::as_str).collect();
+        for word in listed
+            .iter()
+            .copied()
+            .chain(["gpu", "tpu", "NPU", "CPU", ""])
+        {
+            let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
+                device: word.into(),
+                ..Default::default()
+            }));
+            let expected = listed.contains(&word).then_some(word);
+            assert_eq!(
+                value.get("device").and_then(|v| v.as_str()),
                 expected,
                 "{word:?}"
             );

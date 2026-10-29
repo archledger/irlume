@@ -100,6 +100,7 @@ PROPERTY_TYPES = {
     "ProtectHome": "s",
     "ProtectKernelTunables": "b",
     "ProtectKernelLogs": "b",
+    "KeyringMode": "s",
     "ProtectControlGroups": "b",
     "RestrictNamespaces": "t",
     "CapabilityBoundingSet": "t",
@@ -242,6 +243,11 @@ def root_properties(plan):
         "ProtectHome": "read-only",
         "ProtectKernelTunables": True,
         "ProtectKernelLogs": True,
+        # A user manager defaults to inherit: every service shares its session
+        # keyring, which links the user keyring. private gives each invocation
+        # a new one, linked to no user keyring and holding only systemd's
+        # invocation_id key (systemd.exec).
+        "KeyringMode": "private",
         "ProtectControlGroups": True,
         # Zero allows no namespace types; unset is all ones (nsflags.h).
         "RestrictNamespaces": 0,

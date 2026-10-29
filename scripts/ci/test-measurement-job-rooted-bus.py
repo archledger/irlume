@@ -185,6 +185,7 @@ class BridgeTests(unittest.TestCase):
             ("ProtectHome", ("s", "read-only")),
             ("ProtectKernelTunables", ("b", True)),
             ("ProtectKernelLogs", ("b", True)),
+            ("KeyringMode", ("s", "private")),
             ("ProtectControlGroups", ("b", True)),
             ("RestrictNamespaces", ("t", 0)),
             ("CapabilityBoundingSet", ("t", 0)),
@@ -347,6 +348,8 @@ class BridgeTests(unittest.TestCase):
                 None,
                 "missing rooted bus property: ProtectKernelLogs",
             ),
+            ("KeyringMode", ("s", "inherit"), "effective root property: KeyringMode"),
+            ("KeyringMode", None, "missing rooted bus property: KeyringMode"),
         ):
             self.bus.service = copy.deepcopy(saved)
             if value is None:

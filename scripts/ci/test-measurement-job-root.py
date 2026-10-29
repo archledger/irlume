@@ -535,6 +535,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(
             (type(props["RestrictNamespaces"]), props["RestrictNamespaces"]), (int, 0)
         )
+        # A user manager's services share its session keyring by default.
+        self.assertEqual(props["KeyringMode"], "private")
         self.assertEqual(
             root.entry_argv(plan, "c" * 64),
             (
@@ -682,6 +684,11 @@ class ProfileTests(unittest.TestCase):
             ("ProtectHome", ("s", "yes"), "effective root property: ProtectHome"),
             ("ProtectHome", ("s", "tmpfs"), "effective root property: ProtectHome"),
             ("ProtectHome", ("b", True), "root property signature"),
+            *(
+                ("KeyringMode", ("s", mode), "effective root property: KeyringMode")
+                for mode in ("inherit", "shared")
+            ),
+            ("KeyringMode", ("b", True), "root property signature"),
             (
                 "ProtectKernelLogs",
                 ("b", False),

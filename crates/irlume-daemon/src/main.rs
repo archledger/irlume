@@ -20339,6 +20339,101 @@ mod tests {
         );
     }
 
+    /// The packaged unit's GPU launch environment (ADR-0033, #1162). Its
+    /// `Environment=` entries in the namespaces the GPU stack reads (compute
+    /// runtime `NEO_`, `IGC_` and Level Zero `ZE_`, the OpenCL ICD loader's
+    /// `OCL_` and `OPENCL_`, and the locale) are exactly the cache-off
+    /// intent, which `npu` builds also check against `gpu-candidate-inputs-v1`
+    /// itself. None of them may be named by `UnsetEnvironment=`: systemd
+    /// applies it last, so it would silently undo the pin. Every unset name
+    /// stays in those namespaces, leaving generic loader variables to an
+    /// administrator's drop-in for the CPU path. `check-packaging-parity.sh`
+    /// keeps the NixOS module and `scripts/install-host.sh` on these lines.
+    #[test]
+    fn irlumed_units_pin_the_gpu_launch_environment() {
+        fn gpu_scoped(name: &str) -> bool {
+            name == "LANG"
+                || ["NEO_", "IGC_", "ZE_", "OCL_", "OPENCL_", "LC_"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+        }
+        // One assignment per `Environment=` line, quoted or bare, as the
+        // units write them; any other form fails rather than being misread.
+        fn read(unit: &str) -> (Vec<(&str, &str)>, Vec<&str>) {
+            let mut environment = Vec::new();
+            let mut unset = Vec::new();
+            for line in unit.lines().map(str::trim) {
+                if let Some(value) = line.strip_prefix("Environment=") {
+                    let quoted = value.strip_prefix('"').and_then(|v| v.strip_suffix('"'));
+                    let assignment = quoted.unwrap_or(value);
+                    assert!(
+                        !assignment.contains(['"', '\\'])
+                            && (quoted.is_some() || !assignment.contains(char::is_whitespace)),
+                        "not one plain assignment: {line}"
+                    );
+                    let pair = assignment.split_once('=');
+                    environment.push(pair.unwrap_or_else(|| panic!("no assignment: {line}")));
+                } else if let Some(names) = line.strip_prefix("UnsetEnvironment=") {
+                    unset.extend(names.split_whitespace());
+                }
+            }
+            (environment, unset)
+        }
+
+        // The reader sees both spellings, and the policy refuses an ICD
+        // override, so neither half below can pass by reading nothing.
+        let (control, control_unset) = read(
+            "Environment=\"OCL_ICD_VENDORS=/etc/x.icd\"\nEnvironment=ZE_AFFINITY_MASK=0\n\
+             UnsetEnvironment=A B\n",
+        );
+        assert_eq!(
+            control,
+            [("OCL_ICD_VENDORS", "/etc/x.icd"), ("ZE_AFFINITY_MASK", "0")]
+        );
+        assert_eq!(control_unset, ["A", "B"]);
+
+        let unit = include_str!("../../../packaging/systemd/irlumed.service");
+        let (environment, unset) = read(unit);
+        let gpu: Vec<(&str, &str)> = environment
+            .into_iter()
+            .filter(|(name, _)| gpu_scoped(name))
+            .collect();
+        assert_eq!(
+            gpu,
+            [("NEO_CACHE_PERSISTENT", "0")],
+            "packaging/systemd/irlumed.service GPU launch environment"
+        );
+        assert!(!unset.is_empty(), "the unit unsets the GPU overrides");
+        for name in &unset {
+            assert!(gpu_scoped(name), "{name} is not a GPU stack variable");
+            assert!(
+                gpu.iter().all(|(set, _)| set != name),
+                "UnsetEnvironment={name} undoes the unit's own pin"
+            );
+        }
+
+        #[cfg(feature = "npu")]
+        {
+            use irlume_auth::npu::gpu::launch;
+            use std::ffi::OsStr;
+            fn as_os<'a>(entries: &[(&'a str, &'a str)]) -> Vec<(&'a OsStr, &'a OsStr)> {
+                entries
+                    .iter()
+                    .map(|&(name, value)| (OsStr::new(name), OsStr::new(value)))
+                    .collect()
+            }
+            let policy = OsStr::new(launch::POLICY_ID);
+            let checked = launch::validate(policy, &as_os(&gpu))
+                .expect("the unit's GPU environment satisfies the candidate policy");
+            assert_eq!(checked.policy_id(), launch::POLICY_ID);
+            assert_eq!(checked.neo_cache_policy(), launch::NeoCachePolicy::Disabled);
+            assert_eq!(
+                launch::validate(policy, &as_os(&control)),
+                Err(launch::GpuLaunchInputError::UnsupportedName)
+            );
+        }
+    }
+
     /// A tamper gate must not be switched off by a capitalisation (#365).
     ///
     /// `IRLUME_MODELS_STRICT` used to be matched case-sensitively against a

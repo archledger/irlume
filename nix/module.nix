@@ -552,8 +552,24 @@ in
           "CAP_FOWNER"
         ];
         UMask = "0027";
+        # GPU launch environment, as in packaging/systemd/irlumed.service
+        # (ADR-0033, #1162): the OpenCL ICD loader's overrides and the compute
+        # runtime's cache directory are removed after every other source.
+        UnsetEnvironment = [
+          "OCL_ICD_VENDORS"
+          "OPENCL_VENDOR_PATH"
+          "OPENCL_LAYERS"
+          "OPENCL_LAYER_PATH"
+          "OCL_ICD_PLATFORM_SORT"
+          "OCL_ICD_DEFAULT_PLATFORM"
+          "OCL_ICD_ASSUME_ICD_EXTENSION"
+          "NEO_CACHE_DIR"
+        ];
       };
       environment = {
+        # The compute runtime's persistent compiler cache stays off, the
+        # cache-off intent of the gpu-candidate-inputs-v1 policy (#1162).
+        NEO_CACHE_PERSISTENT = "0";
         ORT_DYLIB_PATH = "${onnxruntime-bin}/lib/libonnxruntime.so";
         IRLUME_DET_MODEL = "${models}/face_detection_yunet_2023mar.onnx";
         IRLUME_MODEL = "${models}/glintr100.onnx";

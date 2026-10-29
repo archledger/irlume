@@ -355,6 +355,72 @@ observation, and its audit interval must have no related AppArmor denial.
 An admitted runtime additionally needs actual NPU identity, cache and marker
 coverage under enforce before it is qualified.
 
+## GPU runtime paths and launch environment
+
+The GPU recognizer (ADR-0033) reuses the OpenVINO, Level Zero, process-maps
+and cache rules above; its compile cache nests in `/var/cache/irlume/npu/gpu`.
+Both executable-path profiles add, for the GPU stack only:
+
+- render nodes, found the way the Intel compute runtime enumerates them: a
+  listing of `/dev/dri/by-path/`, and read and write access to
+  `/dev/dri/renderD*`. Card nodes stay closed.
+- the `/sys/class/drm/` render-node walk. Device attributes, including the
+  runtime-PM counter the GPU guard reads, resolve under `/sys/devices`, which
+  is already readable.
+- read-only GuC and HuC reports under `/sys/kernel/debug/dri/`: i915
+  `gt*/uc/` and xe `tile*/gt*/uc/`.
+- the OpenCL ICD registrations in `/etc/OpenCL/vendors/`. The system layer
+  directory `/etc/OpenCL/layers/` is denied without an audit record, so no
+  OpenCL layer loads.
+- read and executable map of the compute runtime (`libigdrcl`, also in an
+  `intel-opencl/` subdirectory), IGC (`libigc`, `libigdfcl`,
+  `libopencl-clang`), gmmlib (`libigdgmm`) and the ICD loader (`libOpenCL`) in
+  the three `/usr/local` library directories. Copies under `/usr/lib*` are
+  already covered by the distribution's `abstractions/base`.
+
+Both runtimes share one more rule: oneTBB's allocator, loaded by the OpenVINO
+core and both device plugins, reads `/proc/sys/vm/nr_hugepages` once per
+process, and the #1046 enforcing NPU attempt recorded that denial. The same
+initialization reads `/sys/kernel/mm/transparent_hugepage/enabled`, which
+`abstractions/base` grants only from AppArmor 5.0, so both profiles allow it. As with the
+NPU rules, none of this establishes loading admission, model certification or
+enforcing GPU coverage; the GPU loading admission stays closed.
+
+The packaged unit, the NixOS module and the unit `scripts/install-host.sh`
+writes set `NEO_CACHE_PERSISTENT=0`, the cache-off intent of the
+`gpu-candidate-inputs-v1` policy; otherwise the compute runtime keeps a
+persistent compiler cache under `NEO_CACHE_DIR`, `XDG_CACHE_HOME` or `HOME`.
+They also unset `OCL_ICD_VENDORS`, `OPENCL_VENDOR_PATH`, `OPENCL_LAYERS`,
+`OPENCL_LAYER_PATH`, `OCL_ICD_PLATFORM_SORT`, `OCL_ICD_DEFAULT_PLATFORM`,
+`OCL_ICD_ASSUME_ICD_EXTENSION` and `NEO_CACHE_DIR`. systemd applies
+`UnsetEnvironment=` after every other environment source, so an
+`Environment=` line in a drop-in does not bring these back; a drop-in that
+resets the list with an empty `UnsetEnvironment=` does. Generic loader
+variables such as `LD_LIBRARY_PATH` are left alone, so a drop-in for the CPU
+path keeps working.
+
+For a compute runtime under an administrator-selected prefix, both
+executable-path profiles include the optional
+`/etc/apparmor.d/local/irlumed-gpu` file. Keep it separate from
+`irlumed-npu`, root-owned without group/other writes, and limited to the
+libraries the registered `.icd` file and its dependencies load. For a runtime
+built into `/opt/intel-gpu` whose `/etc/OpenCL/vendors/intel.icd` names
+`/opt/intel-gpu/lib/intel-opencl/libigdrcl.so`:
+
+```text
+/opt/intel-gpu/lib/intel-opencl/libigdrcl.so mr,
+/opt/intel-gpu/lib/libigc.so.2* mr,
+/opt/intel-gpu/lib/libigdfcl.so.2* mr,
+/opt/intel-gpu/lib/libopencl-clang*.so* mr,
+/opt/intel-gpu/lib/libigdgmm.so.12* mr,
+```
+
+Adjust these to the files the runtime actually maps, and avoid a blanket
+`/opt/** mr,`. Parse and reload the profile as above, then restart the daemon.
+Once an admitted GPU runtime exists, validate under enforce: discovery must
+read back the render node and firmware, and the audit interval must have no
+related AppArmor denial.
+
 ## Loading admission remains future work
 
 A loading profile must establish the launch environment, effective native

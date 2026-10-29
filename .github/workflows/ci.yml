@@ -346,10 +346,13 @@ jobs:
           cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
           cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
           cargo test --locked -p irlume-auth --features npu --lib -- npu_probe gpu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization
-          # Synthetic published state and sandboxed config only; these exact
-          # tests need neither model loading nor the token-delivery CLI helper.
+          # Synthetic published state, sandboxed config and the shipped unit's
+          # text only; these exact tests need neither model loading nor the
+          # token-delivery CLI helper. The unit test checks its GPU launch
+          # environment against the npu-only candidate policy (#1162).
           # Require every name so a renamed or ignored regression fails CI.
-          ./scripts/run-tests-guarded.sh --min 8 \
+          ./scripts/run-tests-guarded.sh --min 9 \
+            --require tests::irlumed_units_pin_the_gpu_launch_environment \
             --require tests::npu_settings_snapshot_survives_atomic_replacement \
             --require tests::administrator_provider_selection_reads_machine_config_and_environment_only \
             --require tests::recognizer_device_selection_reads_machine_config_and_environment_only \
@@ -359,6 +362,7 @@ jobs:
             --require tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
             --require tests::health_projects_gpu_placement_and_reasons_for_non_root \
             -- cargo test --locked -p irlume-daemon --features npu --bin irlumed -- --exact \
+            tests::irlumed_units_pin_the_gpu_launch_environment \
             tests::npu_settings_snapshot_survives_atomic_replacement \
             tests::administrator_provider_selection_reads_machine_config_and_environment_only \
             tests::recognizer_device_selection_reads_machine_config_and_environment_only \

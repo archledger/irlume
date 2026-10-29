@@ -39,7 +39,10 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   systemd 262.1 on ext4. Each run reached `startup-only-complete` (preflight,
   LAUNCH, connect, witness, READY, COMMIT, DONE and the terminal check), and
   H's peer pidfd matched the invocation in 3 of 3 lookups. The startup
-  observation used 1104 and 1096 of its 1536 operations.
+  observation used 1104 and 1096 of its 1536 operations. Both hosts reached
+  `startup-only-complete` again with `KeyringMode=private` and
+  `ProtectControlGroupsEx=strict`, with the same operation counts and 3 of 3
+  lookups.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
@@ -67,15 +70,6 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   mapped bytes to the hashed file would close this.
 - Restrict path-socket connects from the future QEMU child with Landlock
   (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
-- G can still read the host cgroup tree's unit names and process counts.
-  `ProtectControlGroupsEx=strict` hides them: on systemd 259.10 the service
-  runs in a cgroup namespace (`0::/`) under a new read-only cgroup2 mount
-  that lists only its own cgroup. Adopting it needs two changes. G sees `/`
-  as its cgroup, so H's LAUNCH must carry the cgroup ID (systemd's
-  `ControlGroupId`, equal to the inode of G's `/sys/fs/cgroup`) in place of
-  the path. The host cgroup2 and legacy mounts stay below the new mount,
-  so the mount parser needs an exact occluded-cgroup shape. Do this before
-  G starts the QEMU child.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
   uid, gid, namespace, liveness and socket node, and H stays the verifier of
   G's unit, invocation and start time.
@@ -86,15 +80,27 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 36 `scripts/ci/test-measurement-*.py` suites pass (782 tests), with
+All 36 `scripts/ci/test-measurement-*.py` suites pass (793 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. G runs with `KeyringMode=private`,
 read back by H: a user manager's services otherwise share its session
 keyring, which G's private user namespace does not replace (probed on
-systemd 259.10 and 262.1). The startup-only runs above predate that
-property. The portable 69-test and controller
-43-test suites also pass. Each change in the 2026-10-29 series was written
-test first, and its mutation controls fail at least one test. The startup-only
-native runs above used a pinned runtime prepared from the same source.
+systemd 259.10 and 262.1). G also runs with `ProtectControlGroupsEx=strict`,
+so it no longer sees the host cgroup tree. systemd can fall back to a host
+view without saying so, so G proves the effect itself: its unified cgroup is
+`/`, the root of its own cgroup namespace; that directory's inode is the
+unit's `ControlGroupId`, which H reads from the manager and sends in LAUNCH
+v3; and its `cgroup.procs` lists only G. The witness requires a cgroup
+namespace other than H's and one read-only cgroup2 at `/sys/fs/cgroup`,
+alone or over the host copy with at most one legacy hierarchy. Probes with
+G's profile showed both: alone on archhost (systemd 262.1), over the host
+copy and its net_cls on the laptop (systemd 259.10). In the startup-only
+reruns H recorded the unit's `ControlGroupId` (288107 on the laptop, 10337 on
+archhost), G bound to it, and each witness shows G's own cgroup namespace and
+its host's shape. The portable 69-test and controller 43-test suites also
+pass. Each change in the 2026-10-29 series was written test first, and its
+mutation controls fail at least one test. The startup-only native runs above
+used a pinned runtime prepared from the same source, with two files patched
+to count startup operations.
 
 Ruff, formatting and source-boundary checks pass. The scoped production reviews
 are clear. The H/controller integration test uses a fake manager/peer and a stub

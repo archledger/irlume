@@ -41,7 +41,6 @@ def cases():
     ]
     for feature, symbol in PROVIDERS.items():
         result.extend([
-            Case('own-' + feature, (feature,), diagnostic=REFUSAL + 'ORT execution-provider feature'),
             Case('direct-' + feature, ('ort/' + feature,), diagnostic=f'`{symbol}` is ambiguous'),
             Case('direct-minimal-' + feature, ('ort/' + feature,), no_defaults=True,
                  diagnostic=REFUSAL + 'requires onnx'),
@@ -130,15 +129,19 @@ def run_matrix(cargo, output, selected):
 class MatrixTests(unittest.TestCase):
     def test_every_provider_has_all_activation_routes(self):
         indexed = {case.name: case for case in cases()}
-        self.assertEqual(len(indexed), 21)
+        self.assertEqual(len(indexed), 17)
         for feature, symbol in PROVIDERS.items():
-            for route in ['own-', 'direct-', 'direct-minimal-', 'unified-']:
+            for route in ['direct-', 'direct-minimal-', 'unified-']:
                 case = indexed[route + feature]
                 self.assertTrue(case.evidence)
                 self.assertTrue(case.diagnostic)
             self.assertTrue(indexed['unified-' + feature].unified)
             self.assertIn(symbol, indexed['direct-' + feature].diagnostic)
             self.assertTrue(indexed['direct-minimal-' + feature].no_defaults)
+
+    def test_vision_has_no_provider_features_of_its_own(self):
+        manifest = tomllib.loads((ROOT / 'crates/irlume-vision/Cargo.toml').read_text())
+        self.assertFalse(set(PROVIDERS) & set(manifest['features']))
 
     def test_positive_controls_and_missing_reference(self):
         indexed = {case.name: case for case in cases()}

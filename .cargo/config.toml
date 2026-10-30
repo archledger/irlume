@@ -1,15 +1,8 @@
 # Build tuning for irlume.
 #
-# Hardware acceleration has two layers:
-#
-#   1. ONNX Runtime execution provider: the big win (this is what howrs does).
-#      Pick at build time via cargo features on irlume-vision:
-#          cargo build -p irlume-daemon --features irlume-vision/cuda
-#          ... or openvino | coreml | tensorrt
-#      Default is CPU (ONNX Runtime's own SIMD + thread pool). Most of the
-#      compute lives here, not in our Rust code.
-#
-#   2. Our glue loops (alignment warp, cosine fold): let LLVM vectorize them.
+# Most of the compute runs in ONNX Runtime's own SIMD and thread pool, not in
+# our Rust code. Our glue loops (alignment warp, cosine fold): let LLVM vectorize
+# them.
 #      Uncomment ONE block below for the machine you build for. Leave commented
 #      for portable / distro binaries (the default target is a safe floor).
 #

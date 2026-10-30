@@ -797,6 +797,215 @@ class RuntimeStateTests(unittest.TestCase):
                 check(manifest, files, python, bad, MOUNTS)
 
 
+TREE = "/home/u/.cache/run/root"
+HOST_ENTRY = "opt/irlume/host.py"
+
+
+def prefixed(tree=TREE, host_entry=False):
+    """observation() as a process outside the tree sees it: a host-absolute tree.
+
+    host_entry adds a second selected source and makes it __main__.
+    """
+    manifest, files, python, maps = observation()
+    if host_entry:
+        data = b"# host entry\n"
+        manifest["members"].append(
+            {
+                "path": HOST_ENTRY,
+                "kind": "file",
+                "mode": 0o400,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+        manifest["members"].sort(key=lambda row: row["path"])
+        files["/" + HOST_ENTRY] = {
+            "device": os.makedev(0, 1),
+            "inode": 200,
+            "mode": stat.S_IFREG | 0o400,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        python["modules"][0]["origin"] = "/" + HOST_ENTRY
+    files = {tree + path: row for path, row in files.items()}
+    python["executable"] = tree + python["executable"]
+    python["sys_path"] = tuple(tree + path for path in python["sys_path"])
+    for module in python["modules"]:
+        if module["kind"] in ("source", "extension"):
+            module["origin"] = tree + module["origin"]
+            module["package_paths"] = tuple(
+                tree + path for path in module["package_paths"]
+            )
+    for path in (PYTHON, LOADER):
+        maps = maps.replace(
+            b" %s\n" % path.encode(), b" %s%s\n" % (tree.encode(), path.encode())
+        )
+    return manifest, files, python, maps
+
+
+def check_prefixed(
+    manifest, files, python, maps, rows=FAITHFUL, pages=FAITHFUL, **keywords
+):
+    pages = page_digests(files) if pages is FAITHFUL else pages
+    rows = mapped_rows(maps, pages) if rows is FAITHFUL else rows
+    return state.check_runtime_state(
+        manifest, files, python, maps, MOUNTS, rows, pages, **keywords
+    )
+
+
+class PrefixTests(unittest.TestCase):
+    """H checks itself from outside the tree: paths keep the tree's host prefix."""
+
+    def accepted(self, check_function, *args, **keywords):
+        """A refusal of a valid observation is an assertion failure."""
+        try:
+            return check_function(*args, **keywords)
+        except ValueError as error:
+            self.fail(f"refused: {error}")
+
+    def test_defaults_leave_the_rooted_check_unchanged(self):
+        manifest, files, python, maps = observation()
+        self.assertIsNone(self.accepted(check, manifest, files, python, maps, MOUNTS))
+        self.assertIsNone(
+            self.accepted(
+                check_prefixed, manifest, files, python, maps, prefix="", entry=None
+            )
+        )
+        self.assertEqual(
+            self.accepted(state.check_python, manifest, files, python, prefix=""), set()
+        )
+        # A prefixed observation is not a rooted one.
+        with self.assertRaises(ValueError):
+            check(*prefixed(), MOUNTS)
+
+    def test_prefixed_runtime_is_accepted_with_paths_compared_verbatim(self):
+        self.assertIsNone(self.accepted(check_prefixed, *prefixed(), prefix=TREE))
+        manifest, files, python, maps = prefixed(host_entry=True)
+        self.assertIsNone(
+            self.accepted(
+                check_prefixed,
+                manifest,
+                files,
+                python,
+                maps,
+                prefix=TREE,
+                entry=HOST_ENTRY,
+            )
+        )
+        self.assertEqual(
+            self.accepted(
+                state.check_python,
+                manifest,
+                files,
+                python,
+                prefix=TREE,
+                entry=HOST_ENTRY,
+            ),
+            set(),
+        )
+
+    def test_prefix_applies_to_executable_search_path_origins_files_and_maps(self):
+        manifest, files, python, maps = prefixed()
+        cases = []
+        bad = copy.deepcopy(python)
+        bad["executable"] = PYTHON
+        cases.append(("executable", files, bad, maps))
+        bad = copy.deepcopy(python)
+        bad["sys_path"] = tuple(path[len(TREE) :] for path in bad["sys_path"])
+        cases.append(("sys_path", files, bad, maps))
+        bad = copy.deepcopy(python)
+        bad["modules"][0]["origin"] = "/opt/irlume/entry.py"
+        cases.append(("origin", files, bad, maps))
+        bad = copy.deepcopy(python)
+        bad["modules"][0]["origin"] = "/usr/lib/python3.14/entry.py"
+        cases.append(("host-path origin", files, bad, maps))
+        bad = copy.deepcopy(python)
+        bad["modules"][0]["package_paths"] = ("/opt/irlume",)
+        cases.append(("package path", files, bad, maps))
+        unrooted = {path[len(TREE) :]: row for path, row in files.items()}
+        cases.append(("files", unrooted, python, maps))
+        cases.append(
+            ("maps", files, python, maps.replace(b" " + TREE.encode(), b" ", 1))
+        )
+        for name, facts, state_, data in cases:
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                check_prefixed(manifest, facts, state_, data, prefix=TREE)
+
+    def test_entry_keyword_selects_main_and_must_be_a_selected_source(self):
+        manifest, files, python, maps = prefixed(host_entry=True)
+        # G's selected entry offered as H's main, and H's main without entry=.
+        bad = copy.deepcopy(python)
+        bad["modules"][0]["origin"] = TREE + "/opt/irlume/entry.py"
+        with self.assertRaisesRegex(ValueError, "^runtime main entry$"):
+            check_prefixed(manifest, files, bad, maps, prefix=TREE, entry=HOST_ENTRY)
+        with self.assertRaisesRegex(ValueError, "^runtime main entry$"):
+            check_prefixed(manifest, files, python, maps, prefix=TREE)
+        for entry in (
+            "opt/irlume/missing.py",
+            "usr/bin/python3",
+            "/" + HOST_ENTRY,
+            "opt/irlume",
+            "",
+            b"opt/irlume/host.py",
+        ):
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                check_prefixed(manifest, files, python, maps, prefix=TREE, entry=entry)
+
+    def test_pages_must_carry_the_prefix_and_bind_the_mapped_bytes(self):
+        manifest, files, python, maps = prefixed()
+        unrooted = page_digests({path[len(TREE) :]: row for path, row in files.items()})
+        with self.assertRaisesRegex(ValueError, "^runtime page digests$"):
+            check_prefixed(
+                manifest,
+                files,
+                python,
+                maps,
+                rows=mapped_rows(maps, page_digests(files)),
+                pages=unrooted,
+                prefix=TREE,
+            )
+        rows = list(mapped_rows(maps, page_digests(files)))
+        rows[0] = dict(rows[0], sha256="0" * 64)
+        with self.assertRaisesRegex(ValueError, "^runtime mapped bytes differ$"):
+            check_prefixed(manifest, files, python, maps, rows=tuple(rows), prefix=TREE)
+
+    def test_prefix_is_a_canonical_directory_not_a_string_prefix(self):
+        # Facts under a sibling directory, or a prefix that is only a leading
+        # substring of the tree, never match.
+        for facts, prefix in (
+            (TREE + "x", TREE),
+            (TREE, TREE[:-1]),
+            (TREE, TREE + "/"),
+            (TREE + "/opt", TREE),
+        ):
+            with (
+                self.subTest(facts=facts, prefix=prefix),
+                self.assertRaises(ValueError),
+            ):
+                check_prefixed(*prefixed(facts), prefix=prefix)
+        # Consistent facts under a non-canonical prefix are refused as such.
+        for prefix in (
+            TREE + "/",
+            "/",
+            "//home/u/root",
+            "/home/u/../root",
+            "/home/./u/root",
+            "home/u/root",
+            "/home/u/root\n",
+        ):
+            with (
+                self.subTest(prefix=prefix),
+                self.assertRaisesRegex(ValueError, "^runtime path prefix$"),
+            ):
+                check_prefixed(*prefixed(prefix), prefix=prefix)
+        for prefix in (None, b"/root", ("/root",)):
+            with (
+                self.subTest(prefix=prefix),
+                self.assertRaisesRegex(ValueError, "^runtime path prefix$"),
+            ):
+                check_prefixed(*observation(), prefix=prefix)
+
+
 class CollectorAgreementTests(unittest.TestCase):
     """The collector and the snapshot's digests agree on a real kernel."""
 

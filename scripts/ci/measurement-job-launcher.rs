@@ -52,7 +52,11 @@ struct PathBeneathAttr {
     parent_fd: i32,
 }
 
-fn config_path(path: &str) -> bool {
+const PYTHON_FLAGS: [&str; 5] = ["-I", "-S", "-B", "-X", "pycache_prefix=/dev/null"];
+// The host role's tree: this launcher is its manifest bootstrap member.
+const TREE_LAUNCHER: &str = "/opt/irlume/launcher";
+
+fn selected_path(path: &str, name: &str) -> bool {
     path.starts_with('/')
         && path.len() <= 4096
         && path.bytes().all(|byte| (32..127).contains(&byte))
@@ -60,10 +64,71 @@ fn config_path(path: &str) -> bool {
             .split('/')
             .skip(1)
             .all(|part| !part.is_empty() && part != "." && part != "..")
-        && path.rsplit('/').next() == Some("guardian-config.json")
+        && path.rsplit('/').next() == Some(name)
+}
+
+fn config_path(path: &str) -> bool {
+    selected_path(path, "guardian-config.json")
+}
+
+fn request_path(path: &str) -> bool {
+    selected_path(path, "host-request.json")
+}
+
+fn sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The runtime tree holding this launcher: its executable link without
+/// `/opt/irlume/launcher`. A link that is not canonical, not printable ASCII,
+/// names an unlinked file (proc(5) appends " (deleted)") or leaves no root
+/// refuses, so the host role starts only the tree the launcher sits in.
+fn tree_root(exe: &[u8]) -> Option<&str> {
+    if exe.len() > 4096 || !exe.iter().all(|byte| (32..127).contains(byte)) {
+        return None;
+    }
+    let exe = std::str::from_utf8(exe).ok()?;
+    if exe.ends_with(" (deleted)") {
+        return None;
+    }
+    let root = exe.strip_suffix(TREE_LAUNCHER)?;
+    if !root.starts_with('/')
+        || root
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(root)
+}
+
+fn python(interpreter: &str, script: &str, extra: &[&str]) -> Vec<String> {
+    [interpreter]
+        .into_iter()
+        .chain(PYTHON_FLAGS)
+        .chain([script])
+        .chain(extra.iter().copied())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn arguments(input: &[OsString]) -> Result<(Vec<CString>, Option<CString>), ()> {
+    selected(input, || {
+        std::fs::read_link("/proc/self/exe")
+            .ok()
+            .map(|path| path.into_os_string())
+    })
+}
+
+/// `exe` yields this process's executable link; only the host role reads it.
+fn selected<F>(input: &[OsString], exe: F) -> Result<(Vec<CString>, Option<CString>), ()>
+where
+    F: FnOnce() -> Option<OsString>,
+{
     if input.len() > 3 || input.iter().any(|arg| arg.as_bytes().len() > 4096) {
         return Err(());
     }
@@ -72,38 +137,46 @@ fn arguments(input: &[OsString]) -> Result<(Vec<CString>, Option<CString>), ()> 
         .map(|arg| arg.to_str().ok_or(()))
         .collect::<Result<_, _>>()?;
     let mut control = None;
-    let (script, extra) = match text.as_slice() {
-        ["--host"] => ("/opt/irlume/measurement-job-guardian-host.py", Vec::new()),
-        ["--guest"] => ("/opt/irlume/measurement-job-boot.py", Vec::new()),
-        ["--guardian", path, digest]
-            if config_path(path)
-                && digest.len() == 64
-                && digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
-        {
+    let argv = match text.as_slice() {
+        ["--guest"] => python(
+            "/usr/bin/python3",
+            "/opt/irlume/measurement-job-boot.py",
+            &[],
+        ),
+        ["--guardian", path, digest] if config_path(path) && sha256_hex(digest) => {
             let folder = path.strip_suffix("guardian-config.json").ok_or(())?;
             control = Some(CString::new(format!("{folder}control.sock")).map_err(|_| ())?);
-            (
+            python(
+                "/usr/bin/python3",
                 "/opt/irlume/measurement-job-guardian-native.py",
-                vec!["--service", *path, *digest],
+                &["--service", *path, *digest],
             )
+        }
+        ["--host", path, digest] if request_path(path) && sha256_hex(digest) => {
+            // The tree's own loader, not the host's PT_INTERP, runs the tree's
+            // python. The loader options select tree libraries only while
+            // every needed name is a member; H's maps check refuses the rest.
+            let link = exe().ok_or(())?;
+            let root = tree_root(link.as_bytes()).ok_or(())?;
+            let mut argv = vec![
+                format!("{root}/lib64/ld-linux-x86-64.so.2"),
+                "--inhibit-cache".to_owned(),
+                "--library-path".to_owned(),
+                format!("{root}/lib64"),
+            ];
+            argv.extend(python(
+                &format!("{root}/usr/bin/python3"),
+                &format!("{root}/opt/irlume/measurement-job-host.py"),
+                &["--request", *path, *digest],
+            ));
+            argv
         }
         _ => return Err(()),
     };
-    let argv = [
-        "/usr/bin/python3",
-        "-I",
-        "-S",
-        "-B",
-        "-X",
-        "pycache_prefix=/dev/null",
-        script,
-    ]
-    .into_iter()
-    .chain(extra)
-    .map(|value| CString::new(value).map_err(|_| ()))
-    .collect::<Result<_, _>>()?;
+    let argv = argv
+        .into_iter()
+        .map(|value| CString::new(value).map_err(|_| ()))
+        .collect::<Result<_, _>>()?;
     Ok((argv, control))
 }
 
@@ -225,8 +298,9 @@ fn replace(argv: &[CString], control: Option<&CStr>) -> io::Error {
     }
     // SAFETY: All argument strings and pointer arrays remain alive and unchanged;
     // each string is NUL-terminated and both pointer arrays have a NULL sentinel.
-    // The path is the fixed absolute Python entry. execve never searches PATH or
-    // falls back to a shell, and a successful call does not return.
+    // The path is the fixed absolute Python, or for the host role the tree's
+    // absolute loader. execve never searches PATH or falls back to a shell, and
+    // a successful call does not return.
     unsafe { execve(program.as_ptr(), pointers.as_ptr(), environment.as_ptr()) };
     io::Error::last_os_error()
 }
@@ -253,28 +327,34 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
+    fn link(path: &str) -> impl FnOnce() -> Option<OsString> + '_ {
+        move || Some(OsString::from(path))
+    }
+
+    fn never() -> Option<OsString> {
+        panic!("the executable link was read")
+    }
+
+    fn strings(plan: &[CString]) -> Vec<&str> {
+        plan.iter().map(|value| value.to_str().unwrap()).collect()
+    }
+
     #[test]
     fn fixed_roles_have_only_the_selected_python_arguments() {
-        for (role, script) in [
-            ("--host", "/opt/irlume/measurement-job-guardian-host.py"),
-            ("--guest", "/opt/irlume/measurement-job-boot.py"),
-        ] {
-            let (plan, control) = arguments(&values(&[role])).unwrap();
-            assert!(control.is_none(), "{role}");
-            let actual: Vec<_> = plan.iter().map(|value| value.to_str().unwrap()).collect();
-            assert_eq!(
-                actual,
-                [
-                    "/usr/bin/python3",
-                    "-I",
-                    "-S",
-                    "-B",
-                    "-X",
-                    "pycache_prefix=/dev/null",
-                    script
-                ]
-            );
-        }
+        let (plan, control) = arguments(&values(&["--guest"])).unwrap();
+        assert!(control.is_none());
+        assert_eq!(
+            strings(&plan),
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-S",
+                "-B",
+                "-X",
+                "pycache_prefix=/dev/null",
+                "/opt/irlume/measurement-job-boot.py"
+            ]
+        );
     }
 
     #[test]
@@ -400,6 +480,167 @@ mod tests {
             let (_, control) = arguments(&values(&["--guardian", path, &digest])).unwrap();
             assert_eq!(control.as_deref(), Some(socket), "{path}");
         }
+    }
+
+    #[test]
+    fn host_execs_the_tree_loader_with_the_tree_python_and_entry() {
+        let digest = "e".repeat(64);
+        let request = "/run/user/1000/attempt/host-request.json";
+        for (launcher, root) in [
+            ("/t/opt/irlume/launcher", "/t"),
+            (
+                "/home/u/.cache/run 1/root/opt/irlume/launcher",
+                "/home/u/.cache/run 1/root",
+            ),
+        ] {
+            let (plan, control) =
+                selected(&values(&["--host", request, &digest]), link(launcher)).unwrap();
+            assert!(control.is_none(), "{launcher}");
+            let expected = [
+                format!("{root}/lib64/ld-linux-x86-64.so.2"),
+                "--inhibit-cache".into(),
+                "--library-path".into(),
+                format!("{root}/lib64"),
+                format!("{root}/usr/bin/python3"),
+                "-I".into(),
+                "-S".into(),
+                "-B".into(),
+                "-X".into(),
+                "pycache_prefix=/dev/null".into(),
+                format!("{root}/opt/irlume/measurement-job-host.py"),
+                "--request".into(),
+                request.into(),
+                digest.clone(),
+            ];
+            assert_eq!(strings(&plan), expected, "{launcher}");
+        }
+    }
+
+    #[test]
+    fn host_root_is_the_launcher_path_without_opt_irlume_launcher() {
+        for (path, root) in [
+            ("/t/opt/irlume/launcher", "/t"),
+            ("/a b/~x/opt/irlume/launcher", "/a b/~x"),
+            (
+                "/t/opt/irlume/launcher/opt/irlume/launcher",
+                "/t/opt/irlume/launcher",
+            ),
+        ] {
+            assert_eq!(tree_root(path.as_bytes()), Some(root), "{path}");
+        }
+        let mut path = "/".to_owned() + &"a".repeat(4075);
+        path.push_str("/opt/irlume/launcher");
+        assert_eq!(path.len(), 4096);
+        assert!(tree_root(path.as_bytes()).is_some());
+        path.insert(1, 'a');
+        assert!(tree_root(path.as_bytes()).is_none());
+        for path in [
+            "",
+            "/opt/irlume/launcher",
+            "opt/irlume/launcher",
+            "t/opt/irlume/launcher",
+            "/t/opt/irlume/launcher (deleted)",
+            "/t/opt/irlume/launcher/",
+            "/t/opt/irlume/launcher2",
+            "/t/opt/irlume/other",
+            "/t/xopt/irlume/launcher",
+            "/t/opt/irlume/x/launcher",
+            "/t/x/irlume/launcher",
+            "/t/opt/x/launcher",
+            "/t/launcher",
+            "/launcher",
+            "//t/opt/irlume/launcher",
+            "/t//opt/irlume/launcher",
+            "/t/./opt/irlume/launcher",
+            "/t/../opt/irlume/launcher",
+            "/./opt/irlume/launcher",
+            "/../opt/irlume/launcher",
+            "/t\n/opt/irlume/launcher",
+            "/t\x7f/opt/irlume/launcher",
+            "/é/opt/irlume/launcher",
+        ] {
+            assert_eq!(tree_root(path.as_bytes()), None, "{path:?}");
+        }
+        assert_eq!(tree_root(b"/\xff/opt/irlume/launcher"), None);
+    }
+
+    #[test]
+    fn host_request_shape_and_launcher_location_refuse() {
+        let digest = "f".repeat(64);
+        let good = "/private/host-request.json";
+        for args in [
+            vec!["--host"],
+            vec!["--host", good],
+            vec!["--host", good, &digest, "extra"],
+            vec!["--host", "--request", good],
+            vec!["--host", &digest, good],
+        ] {
+            assert!(selected(&values(&args), never).is_err(), "{args:?}");
+        }
+        for path in [
+            "relative/host-request.json",
+            "/a/../host-request.json",
+            "/a/./host-request.json",
+            "/a//host-request.json",
+            "/a/guardian-config.json",
+            "/a/not-host-request.json",
+            "/a/host-request.json/",
+            "/a/host-request.json.tmp",
+            "/a\n/host-request.json",
+            "/é/host-request.json",
+        ] {
+            assert!(
+                selected(&values(&["--host", path, &digest]), never).is_err(),
+                "{path:?}"
+            );
+        }
+        for bad in [
+            String::new(),
+            "A".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+            "g".repeat(64),
+        ] {
+            assert!(selected(&values(&["--host", good, &bad]), never).is_err());
+        }
+        for launcher in [
+            "/launcher",
+            "/opt/irlume/launcher",
+            "/t/opt/irlume/launcher (deleted)",
+            "/t/x/irlume/launcher",
+            "/t/opt/irlume/launcher/",
+        ] {
+            assert!(
+                selected(&values(&["--host", good, &digest]), link(launcher)).is_err(),
+                "{launcher}"
+            );
+        }
+        assert!(selected(&values(&["--host", good, &digest]), || None).is_err());
+        let mut path = "/a".repeat(2036);
+        path.push_str("/host-request.json");
+        assert_eq!(path.len(), 4090);
+        path.insert_str(1, "bcdef");
+        assert_eq!(path.len(), 4095);
+        path.insert(1, 'a');
+        assert!(selected(
+            &values(&["--host", &path, &digest]),
+            link("/t/opt/irlume/launcher")
+        )
+        .is_ok());
+        path.insert(1, 'a');
+        assert!(selected(&values(&["--host", &path, &digest]), never).is_err());
+    }
+
+    #[test]
+    fn only_the_host_role_reads_the_executable_link() {
+        let digest = "a".repeat(64);
+        assert!(selected(&values(&["--guest"]), never).is_ok());
+        assert!(selected(
+            &values(&["--guardian", "/private/guardian-config.json", &digest]),
+            never
+        )
+        .is_ok());
+        assert!(selected(&values(&["--host", "/private/other.json", &digest]), never).is_err());
     }
 
     #[test]

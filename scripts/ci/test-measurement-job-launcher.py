@@ -175,7 +175,28 @@ fn main() {
                       Filter{code:0x06,jt:0,jf:0,k:0x00050000|errno}, Filter{code:0x06,jt:0,jf:0,k:0x7fff0000}]);
             offset += 2;
         }
-        let mut command = Command::new("/launcher");
+        let mut target = String::from("/launcher");
+        if args.get(offset).and_then(|a| a.to_str()) == Some("--exec") {
+            target = args[offset + 1].to_str().unwrap().to_owned();
+            offset += 2;
+        }
+        let mut _held = None;
+        if args.get(offset).and_then(|a| a.to_str()) == Some("--deleted") {
+            // Unlinked after open, so the launcher's /proc/self/exe ends " (deleted)".
+            std::fs::copy("/launcher", &target).unwrap();
+            mode(&target, 0o500);
+            let file = File::open(&target).unwrap();
+            std::fs::remove_file(&target).unwrap();
+            target = format!("/proc/self/fd/{}", file.as_raw_fd());
+            _held = Some(file);
+            offset += 1;
+        }
+        let mut command = Command::new(&target);
+        if args.get(offset).and_then(|a| a.to_str()) == Some("--argv0") {
+            // The launcher's argv[0] names another path; /proc/self/exe is still target.
+            command.arg0(&args[offset + 1]);
+            offset += 2;
+        }
         if args.get(offset).and_then(|arg| arg.to_str()) == Some("--raw-invalid") {
             command.arg(std::ffi::OsString::from_vec(vec![0xff]));
         } else {
@@ -188,6 +209,7 @@ fn main() {
         std::process::exit(errno(UnixStream::connect(&args[1])));
     }
     ids("after");
+    println!("exe={}", hex(std::fs::read_link("/proc/self/exe").unwrap().as_os_str().as_bytes()));
     standard("after");
     for fd in [3,9,511] { println!("after_fd{fd}={}",std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok()); }
     println!("after_open={}", open_descriptors());
@@ -210,6 +232,28 @@ fn main() {
 }
 """
 GUARDIAN = ["--guardian", "/private/guardian-config.json", "c" * 64]
+# The host role derives the runtime tree /t from the launcher's own path
+# (/proc/self/exe minus /opt/irlume/launcher) and execs that tree's loader,
+# where the observation program stands in for ld.so.
+TREE_LAUNCHER, TREE_LOADER = "/t/opt/irlume/launcher", "/t/lib64/ld-linux-x86-64.so.2"
+HOST_REQUEST = "/private/host-request.json"
+HOST = ["--host", HOST_REQUEST, "d" * 64]
+HOST_ARGV = [
+    TREE_LOADER,
+    "--inhibit-cache",
+    "--library-path",
+    "/t/lib64",
+    "/t/usr/bin/python3",
+    "-I",
+    "-S",
+    "-B",
+    "-X",
+    "pycache_prefix=/dev/null",
+    "/t/opt/irlume/measurement-job-host.py",
+    "--request",
+    HOST_REQUEST,
+    HOST[2],
+]
 # Expected errno per probe inside the guardian's Landlock domain. Listeners are
 # live, so EACCES is Landlock's (net/unix/af_unix.c:1223-1236 run first). The
 # domain handles no network access and no signal scope, so TCP, UDP and signals
@@ -395,6 +439,11 @@ class LauncherTests(unittest.TestCase):
         listen=None,
         restrict_flags=None,
         version_denial=None,
+        launcher="/launcher",
+        loader=None,
+        loader_paths=(TREE_LOADER,),
+        deleted=False,
+        argv0=None,
     ):
         for path, expected in self.binary_facts.items():
             self.check_file(path, expected)
@@ -439,6 +488,18 @@ class LauncherTests(unittest.TestCase):
                 target.write_text("not an executable image\n")
                 target.chmod(0o500 if interpreter == "invalid" else 0o400)
             command += ["--ro-bind", str(target), "/usr/bin/python3"]
+        if launcher != "/launcher":
+            command += ["--dir", str(Path(launcher).parent)]
+            if not deleted:
+                command += ["--ro-bind", str(self.launcher), launcher]
+        if loader not in (None, "missing"):
+            target = self.probe
+            if loader in ("invalid", "non-executable"):
+                target = self.work / ("loader-" + loader + ".txt")
+                target.write_text("not an executable image\n")
+                target.chmod(0o500 if loader == "invalid" else 0o400)
+            for path in loader_paths:
+                command += ["--ro-bind", str(target), path]
         if listen is not None:
             command += ["--tmpfs", "/private"]
         poison = {
@@ -460,6 +521,12 @@ class LauncherTests(unittest.TestCase):
             command += ["--restrict-flags", str(restrict_flags)]
         if version_denial is not None:
             command += ["--deny-version", str(version_denial)]
+        if launcher != "/launcher":
+            command += ["--exec", launcher]
+        if deleted:
+            command += ["--deleted"]
+        if argv0 is not None:
+            command += ["--argv0", argv0]
         command += arguments
         info_path = self.work / f"bwrap-info-{self.counter + 1}.json"
         wrapper = """import os,sys
@@ -494,8 +561,28 @@ os.execv(sys.argv[2],sys.argv[2:])
         with self.assertRaises(RuntimeError):
             self.check_file(path, expected)
 
+    def host(self, arguments=HOST, **options):
+        """The launcher at the tree's opt/irlume/launcher, the probe as its loader."""
+        return self.execute(
+            arguments,
+            launcher=options.pop("launcher", TREE_LAUNCHER),
+            loader=options.pop("loader", "probe"),
+            **options,
+        )
+
+    def arguments_seen(self, result):
+        return [
+            bytes.fromhex(value).decode()
+            for value in re.findall(r"^arg=([0-9a-f]+)$", result.stdout, re.MULTILINE)
+        ]
+
+    def program_seen(self, result):
+        found = re.findall(r"^exe=([0-9a-f]+)$", result.stdout, re.MULTILINE)
+        self.assertEqual(len(found), 1, result.stdout)
+        return bytes.fromhex(found[0]).decode()
+
     def test_static_launcher_clears_environment_preserves_identity_and_closes_fd(self):
-        result = self.execute(["--host"])
+        result = self.host()
         self.assertEqual(result.returncode, 0, result.stderr)
         before = re.search(r"^before=(\d+,\d+,\d+)$", result.stdout, re.MULTILINE)
         after = re.search(r"^after=(\d+,\d+,\d+)$", result.stdout, re.MULTILINE)
@@ -526,40 +613,78 @@ os.execv(sys.argv[2],sys.argv[2:])
             )
         }
         self.assertEqual(environment, {"LC_ALL": "C", "PATH": "/usr/bin:/bin"})
-        args = [
-            bytes.fromhex(value).decode()
-            for value in re.findall(r"^arg=([0-9a-f]+)$", result.stdout, re.MULTILINE)
-        ]
-        self.assertEqual(
-            args,
-            [
-                "/usr/bin/python3",
-                "-I",
-                "-S",
-                "-B",
-                "-X",
-                "pycache_prefix=/dev/null",
-                "/opt/irlume/measurement-job-guardian-host.py",
-            ],
-        )
+        self.assertEqual(self.arguments_seen(result), HOST_ARGV)
+        self.assertEqual(self.program_seen(result), TREE_LOADER)
 
     def test_exec_failures_refuse_without_shell_or_observation_execution(self):
         for target in ("missing", "non-executable", "invalid"):
-            with self.subTest(target=target):
-                result = self.execute(["--host"], interpreter=target)
-                self.assertIn("before_fd9=true", result.stdout)
-                self.assertEqual(result.returncode, 77, result.stderr)
-                self.assertNotIn("after=", result.stdout)
-                self.assertEqual(result.stderr, "")
+            for arguments, options in (
+                (["--guest"], {"interpreter": target}),
+                (HOST, {"launcher": TREE_LAUNCHER, "loader": target}),
+            ):
+                with self.subTest(target=target, role=arguments[0]):
+                    result = self.execute(arguments, **options)
+                    self.assertIn("before_fd9=true", result.stdout)
+                    self.assertEqual(result.returncode, 77, result.stderr)
+                    self.assertNotIn("after=", result.stdout)
+                    self.assertEqual(result.stderr, "")
 
     def test_denied_or_unsupported_descriptor_sweep_refuses_before_exec(self):
         for code in (errno.EPERM, errno.ENOSYS):
-            with self.subTest(errno=code):
-                result = self.execute(["--host"], denial=(436, code))
-                self.assertIn("before_fd9=true", result.stdout)
-                self.assertEqual(result.returncode, 77, result.stderr)
-                self.assertNotIn("after=", result.stdout)
-                self.assertEqual(result.stderr, "")
+            for arguments, options in (
+                (["--guest"], {}),
+                (HOST, {"launcher": TREE_LAUNCHER, "loader": "probe"}),
+            ):
+                with self.subTest(errno=code, role=arguments[0]):
+                    result = self.execute(arguments, denial=(436, code), **options)
+                    self.assertIn("before_fd9=true", result.stdout)
+                    self.assertEqual(result.returncode, 77, result.stderr)
+                    self.assertNotIn("after=", result.stdout)
+                    self.assertEqual(result.stderr, "")
+
+    def test_host_refuses_a_malformed_request_shape_without_exec(self):
+        digest = HOST[2]
+        for args in (
+            ["--host"],
+            ["--host", HOST_REQUEST],
+            ["--host", "/private/other.json", digest],
+            ["--host", "/private/guardian-config.json", digest],
+            ["--host", "private/host-request.json", digest],
+            ["--host", HOST_REQUEST, digest.upper()],
+            ["--host", HOST_REQUEST, digest[:63]],
+            ["--host", HOST_REQUEST, digest, "extra"],
+        ):
+            with self.subTest(args=args):
+                self.assert_refused(self.host(args))
+
+    def test_host_refuses_a_launcher_outside_a_tree_opt_irlume_launcher(self):
+        # Every case binds the probe where a derived root would put the loader.
+        for launcher, loaders in (
+            ("/launcher", (TREE_LOADER,)),
+            ("/opt/irlume/launcher", (TREE_LOADER, "/lib64/ld-linux-x86-64.so.2")),
+            ("/t/x/irlume/launcher", (TREE_LOADER,)),
+            ("/t/opt/x/launcher", (TREE_LOADER,)),
+            ("/t/opt/irlume/other", (TREE_LOADER,)),
+        ):
+            with self.subTest(launcher=launcher):
+                self.assert_refused(self.host(launcher=launcher, loader_paths=loaders))
+
+    def test_host_root_is_the_executable_link_not_argv0(self):
+        # argv[0] names /u/opt/irlume/launcher and /u has a loader (the probe)
+        # too; the root comes from /proc/self/exe, so /t's loader starts.
+        result = self.host(
+            argv0="/u/opt/irlume/launcher",
+            loader_paths=(TREE_LOADER, "/u/lib64/ld-linux-x86-64.so.2"),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.program_seen(result), TREE_LOADER)
+        self.assertEqual(self.arguments_seen(result), HOST_ARGV)
+
+    def test_host_refuses_a_deleted_launcher(self):
+        # The feeder copies the launcher to /t/opt/irlume/launcher, unlinks it
+        # after open and executes /proc/self/fd/N, so readlink(/proc/self/exe)
+        # in the launcher is "/t/opt/irlume/launcher (deleted)".
+        self.assert_refused(self.host(deleted=True))
 
     def probes(self, result):
         return {
@@ -597,8 +722,9 @@ os.execv(sys.argv[2],sys.argv[2:])
     def test_host_role_is_not_confined_and_does_not_query_landlock(self):
         for denial in (None, (444, errno.ENOSYS)):
             with self.subTest(denial=denial):
-                result = self.execute(["--host"], listen="socket", denial=denial)
+                result = self.host(listen="socket", denial=denial)
                 self.assert_started(result, dict.fromkeys(CONFINED, 0))
+                self.assertEqual(self.arguments_seen(result), HOST_ARGV)
 
     def test_guardian_refuses_without_a_private_control_socket_node(self):
         for variant in ("missing", "regular", "mode", "symlink"):

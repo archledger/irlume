@@ -1,0 +1,1452 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright the irlume contributors.
+"""H's startup self-check: synthetic facts, then runs through the tree loader.
+
+HostRuntimeTests copy a prepared runtime (IRLUME_HOST_RUNTIME: root/ and
+inputs/manifest.json) into a private throwaway tree with the current sources
+and a launcher built from them. Without it they refuse; no host fallback.
+"""
+
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+import py_compile
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+
+
+def load(name, filename):
+    spec = importlib.util.spec_from_file_location(name, HERE / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+host = load("host_entry", "measurement-job-host.py")
+state = load("host_runtime_state", "measurement-job-runtime-state.py")
+root = load("host_root", "measurement-job-root.py")
+witness = load("host_witness", "measurement-job-startup-witness.py")
+state_tests = load("host_state_fixtures", "test-measurement-job-runtime-state.py")
+closure = root.closure
+DEPS = host.Dependencies(state, root, witness)
+ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+FLAGS = ["-I", "-S", "-B", "-X", "pycache_prefix=/dev/null"]
+LOADER = "lib64/ld-linux-x86-64.so.2"
+TREE = "/home/u/.cache/run/root"
+REQUEST = "/home/u/.cache/run/attempt/host-request.json"
+MANIFEST = "/home/u/.cache/run/inputs/manifest.json"
+MOUNTINFO = b"2 1 0:1 / / rw - ext4 /dev/root rw\n"
+STATUS = (
+    b"Name:\tld-linux-x86-64\nPid:\t4242\nPPid:\t4000\n"
+    b"Uid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nThreads:\t1\n"
+    b"CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n"
+    b"CapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\n"
+    b"CapAmb:\t0000000000000000\n"
+)
+STDIO = tuple((fd, (1, 3 + fd, stat.S_IFCHR | 0o620, 0x8801), 2) for fd in range(3))
+
+
+def deadline():
+    return time.monotonic_ns() + 60_000_000_000
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def synthetic_manifest():
+    """A selected runtime with H's entry, launcher, loader, jeepney and sources."""
+    image = state_tests.fixtures.fixtures.image
+    files = {
+        "usr/bin/python3": image(interpreter=closure.elf.INTERPRETER),
+        "opt/irlume/launcher": image(dynamic=False, kind=2),
+        LOADER: image(),
+        "usr/lib64/python3.14/os.py": b"# os\n",
+        "opt/irlume/vendor/jeepney/__init__.py": b"__version__ = '0.9.0'\n",
+        host.ENTRY: b"# host entry\n",
+    }
+    for name in host.SOURCES:
+        files["opt/irlume/" + name] = b"# " + name.encode() + b"\n"
+    value = state_tests.fixtures.profile()
+    value["python"]["entry"] = "opt/irlume/measurement-job-guardian-native.py"
+    # The selected runtime's order: stdlib, lib-dynload, vendor.
+    value["python"]["roots"] = [
+        "usr/lib64/python3.14",
+        "usr/lib64/python3.14/lib-dynload",
+        "opt/irlume/vendor",
+    ]
+    value["bootstrap"] = "opt/irlume/launcher"
+    folders = {
+        str(parent)
+        for path in files
+        for parent in Path(path).parents
+        if str(parent) != "."
+    }
+    folders.add("usr/lib64/python3.14/lib-dynload")
+    members = [{"path": d, "kind": "directory", "mode": 0o500} for d in folders]
+    members += [
+        {
+            "path": name,
+            "kind": "file",
+            "mode": 0o500 if data.startswith(b"\x7fELF") else 0o400,
+            "size": len(data),
+            "sha256": sha(data),
+        }
+        for name, data in files.items()
+    ]
+    value["members"] = sorted(members, key=lambda row: row["path"])
+    data = closure.canonical(value)
+    return value, data, sha(data)
+
+
+def request_bytes(tree=TREE, manifest_sha256=None, **changes):
+    value = {
+        "scope": host.REQUEST_SCOPE,
+        "mode": "self-check",
+        "runtime": tree,
+        "manifest": MANIFEST,
+        "manifest_sha256": manifest_sha256 or synthetic_manifest()[2],
+    }
+    value.update(changes)
+    return closure.canonical(value)
+
+
+def synthetic():
+    """A valid observation of H as the launcher starts it, and its checker's pages."""
+    manifest, data, digest = synthetic_manifest()
+    files = {
+        TREE + "/" + row["path"]: {
+            "device": os.makedev(0, 1),
+            "inode": 100 + number,
+            "mode": stat.S_IFREG | row["mode"],
+            "size": row["size"],
+            "sha256": row["sha256"],
+        }
+        for number, row in enumerate(manifest["members"])
+        if row["kind"] == "file"
+    }
+    jeepney = TREE + "/opt/irlume/vendor/jeepney"
+    python = {
+        "implementation": "cpython",
+        "version": (3, 14, 8),
+        "executable": TREE + "/usr/bin/python3",
+        "flags": {
+            "isolated": 1,
+            "no_site": 1,
+            "dont_write_bytecode": 1,
+            "ignore_environment": 1,
+            "safe_path": True,
+        },
+        "pycache_prefix": "/dev/null",
+        "environment": dict(ENVIRONMENT),
+        "sys_path": tuple(TREE + "/" + path for path in manifest["python"]["roots"]),
+        "jit_available": False,
+        "jit_enabled": False,
+        "modules": (
+            {
+                "name": "__main__",
+                "kind": "source",
+                "origin": TREE + "/" + host.ENTRY,
+                "package_paths": (),
+                "cached": None,
+            },
+            {
+                "name": "jeepney",
+                "kind": "source",
+                "origin": jeepney + "/__init__.py",
+                "package_paths": (jeepney,),
+                "cached": "/dev/null" + jeepney + "/__init__.cpython-314.pyc",
+            },
+            {
+                "name": "sys",
+                "kind": "builtin",
+                "origin": "built-in",
+                "package_paths": (),
+                "cached": None,
+            },
+        ),
+    }
+    maps = b""
+    for number, path in enumerate(("usr/bin/python3", LOADER), start=1):
+        maps += (
+            f"{number * 4096:016x}-{(number + 1) * 4096:016x} r-xp 00000000 00:01 "
+            f"{files[TREE + '/' + path]['inode']} {TREE}/{path}\n"
+        ).encode()
+    maps += b"0000000000004000-0000000000005000 rw-p 00000000 00:00 0 [heap]\n"
+    maps += b"0000000000006000-0000000000008000 r-xp 00000000 00:00 0 [vdso]\n"
+    pages = state_tests.page_digests(files)
+    request = request_bytes(manifest_sha256=digest)
+    entry = TREE + "/" + host.ENTRY
+    loader = files[TREE + "/" + LOADER]
+    observation = {
+        "pid": 4242,
+        "uid": 1000,
+        "gid": 1000,
+        "orig_argv": (
+            TREE + "/usr/bin/python3",
+            *FLAGS,
+            entry,
+            "--request",
+            REQUEST,
+            sha(request),
+        ),
+        "argv": (entry, "--request", REQUEST, sha(request)),
+        "file": entry,
+        "prefixes": (TREE + "/usr",) * 4,
+        "initial_path": (
+            TREE + "/usr/lib64/python314.zip",
+            TREE + "/usr/lib64/python3.14",
+            TREE + "/usr/lib64/python3.14/lib-dynload",
+        ),
+        "environment": dict(ENVIRONMENT),
+        "exe": {
+            "path": TREE + "/" + LOADER,
+            "device": loader["device"],
+            "inode": loader["inode"],
+        },
+        "preload": False,
+        "descriptors": {"initial": (0, 1, 2), "final": (0, 1, 2)},
+        "stdio": {"initial": STDIO, "final": STDIO},
+        "request_data": request,
+        "hooks": {"excepthook": True, "meta_path": True, "path_hooks": True},
+        "jeepney": {"version": "0.9.0", "origin": jeepney + "/__init__.py"},
+        "sources": tuple(
+            sorted(
+                (
+                    TREE + "/opt/irlume/" + name,
+                    files[TREE + "/opt/irlume/" + name]["sha256"],
+                )
+                for name in host.SOURCES
+            )
+        ),
+        "mountinfo": MOUNTINFO,
+        "namespaces": {
+            "pid": 1,
+            "user": 2,
+            "mnt": 3,
+            "net": 4,
+            "cgroup": 5,
+        },
+        "status": STATUS,
+        "files": files,
+        "python": python,
+        "maps": maps,
+        "mapped": state_tests.mapped_rows(maps, pages),
+        "started_ns": 1,
+        "finished_ns": 2,
+    }
+    return observation, data, digest, pages
+
+
+def accepted(test, function, *args, **keywords):
+    """A refusal of valid facts is an assertion failure, not an error."""
+    try:
+        return function(*args, **keywords)
+    except ValueError as error:
+        test.fail(f"refused: {error}")
+
+
+def validate(observation, data=None, digest=None, pages=None, tree=TREE):
+    _, default_data, default_digest, default_pages = synthetic()
+    return host.validate(
+        observation,
+        tree,
+        default_data if data is None else data,
+        default_digest if digest is None else digest,
+        default_pages if pages is None else pages,
+        DEPS,
+    )
+
+
+class HostRootTests(unittest.TestCase):
+    def test_tree_root_is_the_tree_python_without_usr_bin_python3(self):
+        self.assertEqual(
+            accepted(self, host.tree_root, TREE + "/usr/bin/python3"), TREE
+        )
+        for executable in (
+            "/usr/bin/python3",
+            "usr/bin/python3",
+            TREE + "/usr/bin/python3.14",
+            TREE + "/usr/local/bin/python3",
+            TREE + "//usr/bin/python3",
+            "/home/u/../root/usr/bin/python3",
+            "/home/./root/usr/bin/python3",
+            "//root/usr/bin/python3",
+            "/root\n/usr/bin/python3",
+            "/ré/usr/bin/python3",
+            None,
+        ):
+            with (
+                self.subTest(executable=executable),
+                self.assertRaisesRegex(ValueError, "^host runtime root$"),
+            ):
+                host.tree_root(executable)
+
+
+class HostRequestTests(unittest.TestCase):
+    def test_request_is_canonical_exact_and_bound_to_the_tree_and_digest(self):
+        data = request_bytes()
+        value = accepted(self, host.decode_request, data, sha(data), TREE, root)
+        self.assertEqual(value["runtime"], TREE)
+        self.assertEqual(value["manifest"], MANIFEST)
+
+    def test_request_refusals(self):
+        data = request_bytes()
+        cases = [
+            (data, "0" * 64, "host request digest"),
+            (data, sha(data).upper(), "host request digest"),
+            (
+                request_bytes(scope="contained-job-host-request-v2"),
+                None,
+                "host request scope or mode",
+            ),
+            (request_bytes(mode="startup-only"), None, "host request scope or mode"),
+            (
+                request_bytes(tree="/home/u/.cache/other/root"),
+                None,
+                "host request runtime",
+            ),
+            (request_bytes(tree=TREE + "x"), None, "host request runtime"),
+            (request_bytes(tree=TREE + "/"), None, "host request runtime"),
+            (
+                request_bytes(manifest="relative/manifest.json"),
+                None,
+                "host request manifest",
+            ),
+            (
+                request_bytes(manifest="/a/../manifest.json"),
+                None,
+                "host request manifest",
+            ),
+            (request_bytes(manifest_sha256="A" * 64), None, "host request manifest"),
+            (request_bytes(manifest_sha256=1), None, "host request manifest"),
+            (request_bytes(extra=1), None, "invalid fields"),
+            (data.replace(b",", b", ", 1), None, "host request encoding"),
+            (b"", None, "host request size"),
+            (b" " * (host.REQUEST_LIMIT + 1), None, "host request size"),
+        ]
+        for data_, digest, reason in cases:
+            with (
+                self.subTest(reason=reason, data=data_[:80]),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                host.decode_request(data_, digest or sha(data_), TREE, root)
+
+    def test_private_read_is_bounded_no_follow_and_owner_only(self):
+        inputs = closure.inputs
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory).resolve()
+            path = folder / "host-request.json"
+            path.write_bytes(b"{}")
+            path.chmod(0o400)
+            self.assertEqual(host.read_private(inputs, str(path), 2, deadline()), b"{}")
+            with self.assertRaisesRegex(ValueError, "^host input mode, owner or size$"):
+                host.read_private(inputs, str(path), 1, deadline())
+            path.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "^host input mode, owner or size$"):
+                host.read_private(inputs, str(path), 2, deadline())
+            path.chmod(0o400)
+            link = folder / "link.json"
+            link.symlink_to(path.name)
+            with self.assertRaises(OSError):
+                host.read_private(inputs, str(link), 2, deadline())
+            other = folder / "linked.json"
+            os.link(path, other)
+            with self.assertRaisesRegex(ValueError, "^host input mode, owner or size$"):
+                host.read_private(inputs, str(path), 2, deadline())
+            other.unlink()
+            folder.chmod(0o770)
+            try:
+                with self.assertRaises(ValueError):
+                    host.read_private(inputs, str(path), 2, deadline())
+            finally:
+                folder.chmod(0o700)
+            with self.assertRaises(ValueError):
+                host.read_private(inputs, "relative/host-request.json", 2, deadline())
+
+
+class HostLoaderTests(unittest.TestCase):
+    def test_native_is_compiled_from_the_digested_bytes_not_a_stale_cache(self):
+        probe = """import importlib.machinery,importlib.util,sys
+mode,tree,entry=sys.argv[1:4]
+if mode=="control":
+    path=tree+"/opt/irlume/measurement-job-guardian-native.py"
+    loader=importlib.machinery.SourceFileLoader("stale_control",path)
+    spec=importlib.util.spec_from_loader("stale_control",loader)
+    loader.exec_module(importlib.util.module_from_spec(spec))
+else:
+    spec=importlib.util.spec_from_file_location("host_probe",entry)
+    host=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(host)
+    print(host.load_native(tree).__source_sha256__)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory).resolve()
+            folder = tree / "opt/irlume"
+            folder.mkdir(parents=True)
+            for path in HERE.glob("measurement-job*.py"):
+                shutil.copyfile(path, folder / path.name)
+            target = folder / "measurement-job-guardian-native.py"
+            original = target.read_bytes()
+            poison = b'raise RuntimeError("stale native bytecode executed")\n'
+            target.write_bytes(poison + b"#" * (len(original) - len(poison)))
+            stamp = target.stat().st_mtime_ns
+            cache = f"{target.stem}.{sys.implementation.cache_tag}.pyc"
+            py_compile.compile(
+                str(target), cfile=str(folder / "__pycache__" / cache), doraise=True
+            )
+            target.write_bytes(original)
+            os.utime(target, ns=(stamp, stamp))
+            results = {}
+            for mode in ("control", "host"):
+                results[mode] = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        probe,
+                        mode,
+                        str(tree),
+                        str(HERE / "measurement-job-host.py"),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+        # The poison is live for a cache-reading load, so the entry's load
+        # proves it compiled the bytes it digested.
+        self.assertNotEqual(results["control"].returncode, 0)
+        self.assertIn("stale native bytecode executed", results["control"].stderr)
+        self.assertEqual(results["host"].returncode, 0, results["host"].stderr)
+        self.assertEqual(results["host"].stdout.strip(), sha(original))
+
+    def test_preload_file_presence_is_observed_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ld.so.preload"
+            self.assertIs(host.preload_present(str(path)), False)
+            path.symlink_to("missing")
+            self.assertIs(host.preload_present(str(path)), True)
+            path.unlink()
+            path.write_bytes(b"")
+            self.assertIs(host.preload_present(str(path)), True)
+
+
+HOOKS = """import importlib.util,json,sys
+case,entry=sys.argv[1:3]
+spec=importlib.util.spec_from_file_location("host_probe",entry)
+host=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(host)
+class Finder:
+    @classmethod
+    def find_spec(cls,*args):
+        return None
+def hook(path):
+    raise ImportError(path)
+if case=="extra-finder":
+    sys.meta_path.append(Finder)
+elif case=="replaced-finder":
+    sys.meta_path[2]=Finder
+elif case=="excepthook":
+    sys.excepthook=lambda *args:None
+elif case=="replaced-path-hook":
+    sys.path_hooks[1]=hook
+elif case=="extra-path-hook":
+    sys.path_hooks.insert(0,hook)
+print(json.dumps(host.import_hooks(),sort_keys=True))
+"""
+
+
+class HostHookTests(unittest.TestCase):
+    def test_collector_reports_each_changed_import_hook(self):
+        # A fresh interpreter with H's isolation flags, one change per case.
+        keys = ("excepthook", "meta_path", "path_hooks")
+        cases = (
+            ("none", None),
+            ("extra-finder", "meta_path"),
+            ("replaced-finder", "meta_path"),
+            ("excepthook", "excepthook"),
+            ("replaced-path-hook", "path_hooks"),
+            ("extra-path-hook", "path_hooks"),
+        )
+        for case, changed in cases:
+            with self.subTest(case=case):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-B",
+                        "-c",
+                        HOOKS,
+                        case,
+                        str(HERE / "measurement-job-host.py"),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout), {key: key != changed for key in keys}
+                )
+
+
+def mount_line(number, parent, device, point, kind="ext4"):
+    return f"{number} {parent} {device} / {point} rw - {kind} src rw\n".encode()
+
+
+class HostMountTests(unittest.TestCase):
+    def test_chain_is_the_path_walk_from_slash_to_the_tree(self):
+        data = mount_line(2, 1, "0:1", "/") + mount_line(3, 2, "0:2", "/home")
+        data += mount_line(4, 3, "0:3", "/home/u/.cache")
+        data += mount_line(5, 2, "0:4", "/mnt/share", "autofs")
+        data += mount_line(6, 5, "0:5", "/mnt/share", "cifs")
+        data += mount_line(7, 2, "0:6", "/home2")
+        data += mount_line(8, 4, "0:7", TREE + "x")
+        # A string prefix of the tree path that is not one of its directories.
+        data += mount_line(9, 2, "0:8", "/home/u/.ca")
+        chain = accepted(self, host.mount_chain, root, data, TREE)
+        self.assertEqual(list(chain), ["/", "/home", "/home/u/.cache"])
+        self.assertEqual(state.mount_device(chain, TREE + "/usr/bin/python3"), (0, 3))
+        single = accepted(
+            self, host.mount_chain, root, mount_line(2, 1, "0:1", "/"), TREE
+        )
+        self.assertEqual(list(single), ["/"])
+
+    def test_mounts_in_the_tree_stacks_and_hidden_rows_on_the_chain_refuse(self):
+        base = mount_line(2, 1, "0:1", "/") + mount_line(3, 2, "0:2", "/home")
+        for extra, reason in (
+            # <T> staged as its own mount (bind, tmpfs, subvolume) refuses.
+            (mount_line(4, 3, "0:3", TREE), "host mount at the runtime root"),
+            (mount_line(4, 3, "0:3", TREE + "/usr"), "host mount inside the runtime"),
+            (
+                mount_line(4, 3, "0:3", "/home"),
+                "host stacked mount on the runtime path",
+            ),
+            (
+                mount_line(4, 2, "0:3", "/home/u"),
+                "host mount chain is not one path walk",
+            ),
+            (mount_line(4, 1, "0:3", "/"), "host stacked mount on the runtime path"),
+        ):
+            with (
+                self.subTest(extra=extra),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                # /home/u below /home but parented on /: hidden under /home.
+                host.mount_chain(root, base + extra, TREE)
+        with self.assertRaisesRegex(ValueError, "^host mount chain root$"):
+            host.mount_chain(root, mount_line(3, 2, "0:2", "/home"), TREE)
+        with self.assertRaises(ValueError):
+            host.mount_chain(root, b"2 1 0:1 / / rw - ext4 src rw", TREE)
+
+
+class HostStatusTests(unittest.TestCase):
+    def test_status_is_single_threaded_unprivileged_and_this_process(self):
+        self.assertIsNone(
+            accepted(self, host.check_status, root, STATUS, 4242, 1000, 1000)
+        )
+        # A session's inheritable set grants nothing without an exec.
+        inheritable = STATUS.replace(
+            b"CapInh:\t0000000000000000", b"CapInh:\t0000000800000000"
+        )
+        self.assertIsNone(
+            accepted(self, host.check_status, root, inheritable, 4242, 1000, 1000)
+        )
+        for data in (
+            STATUS.replace(b"Threads:\t1", b"Threads:\t2"),
+            STATUS.replace(b"CapEff:\t0000000000000000", b"CapEff:\t0000000000000001"),
+            STATUS.replace(b"CapPrm:\t0000000000000000", b"CapPrm:\t0000000000000001"),
+            STATUS.replace(b"CapAmb:\t0000000000000000", b"CapAmb:\t0000000000000400"),
+            STATUS.replace(
+                b"Uid:\t1000\t1000\t1000\t1000", b"Uid:\t1000\t0\t1000\t1000"
+            ),
+            STATUS.replace(b"Pid:\t4242", b"Pid:\t4243"),
+        ):
+            with (
+                self.subTest(data=data),
+                self.assertRaisesRegex(ValueError, "^host process status$"),
+            ):
+                host.check_status(root, data, 4242, 1000, 1000)
+        root_status = STATUS.replace(b"\t1000", b"\t0")
+        with self.assertRaisesRegex(ValueError, "^host process status$"):
+            host.check_status(root, root_status, 4242, 0, 0)
+
+
+class HostValidateTests(unittest.TestCase):
+    """Each check refuses one perturbed fact of an otherwise valid observation."""
+
+    def refuses(self, reason, change):
+        observation, data, digest, pages = synthetic()
+        change(observation)
+        with self.assertRaisesRegex(ValueError, "^" + re.escape(reason) + "$"):
+            host.validate(observation, TREE, data, digest, pages, DEPS)
+
+    def test_synthetic_observation_is_accepted_without_authority(self):
+        observation, data, digest, pages = synthetic()
+        manifest = accepted(
+            self, host.validate, observation, TREE, data, digest, pages, DEPS
+        )
+        self.assertEqual(manifest["bootstrap"], "opt/irlume/launcher")
+
+    def test_environment_arguments_and_entry_are_exact(self):
+        cases = {
+            "host environment": [
+                lambda o: o["environment"].update(LD_PRELOAD="/usr/lib64/libz.so.1"),
+                lambda o: o["environment"].update(IRLUME_EXTRA="1"),
+                lambda o: o["environment"].update(PATH="/usr/local/bin:/usr/bin:/bin"),
+                lambda o: o["environment"].pop("LC_ALL"),
+            ],
+            "host interpreter arguments": [
+                lambda o: o.update(
+                    orig_argv=tuple(a for a in o["orig_argv"] if a != "-S")
+                ),
+                lambda o: o.update(
+                    orig_argv=o["orig_argv"][:1] + ("-O",) + o["orig_argv"][1:]
+                ),
+                lambda o: o.update(
+                    orig_argv=("/usr/bin/python3",) + o["orig_argv"][1:]
+                ),
+            ],
+            "host entry arguments": [
+                lambda o: o.update(argv=o["argv"] + ("extra",)),
+                lambda o: o.update(
+                    file=TREE + "/opt/irlume/measurement-job-guardian-native.py"
+                ),
+                lambda o: o.update(
+                    argv=("/opt/irlume/measurement-job-host.py",) + o["argv"][1:]
+                ),
+                # orig_argv matches, so only the argv[1] check refuses.
+                lambda o: o.update(
+                    argv=o["argv"][:1] + ("--other",) + o["argv"][2:],
+                    orig_argv=o["orig_argv"][:-3] + ("--other",) + o["orig_argv"][-2:],
+                ),
+            ],
+            "host interpreter prefix": [
+                lambda o: o.update(prefixes=("/usr",) + o["prefixes"][1:]),
+                lambda o: o.update(prefixes=o["prefixes"][:3] + (TREE + "x/usr",)),
+                # Inside the tree but not getpath's <T>/usr.
+                lambda o: o.update(prefixes=(TREE + "/opt",) * 4),
+                lambda o: o.update(prefixes=o["prefixes"][:3] + (TREE + "/usr/lib64",)),
+                lambda o: o.update(prefixes=o["prefixes"][:3]),
+            ],
+            "host initial search path": [
+                # Subsets of the selection that are not getpath's exact triple.
+                lambda o: o.update(initial_path=o["initial_path"][:2]),
+                lambda o: o.update(initial_path=o["initial_path"][1:]),
+                lambda o: o.update(initial_path=o["initial_path"][::-1]),
+                lambda o: o.update(initial_path=(TREE + "/opt/irlume/vendor",)),
+                lambda o: o.update(
+                    initial_path=o["initial_path"] + ("/usr/lib64/python3.14",)
+                ),
+                lambda o: o.update(initial_path=(TREE + "x/usr/lib64/python3.14",)),
+                lambda o: o.update(initial_path=(TREE + "/opt/irlume",)),
+                lambda o: o.update(initial_path=(TREE + "/opt/irlume/launcher.zip",)),
+                lambda o: o.update(initial_path=(TREE + "/usr/lib64/python313.zip",)),
+                lambda o: o.update(initial_path=o["initial_path"] * 2),
+                lambda o: o.update(initial_path=()),
+            ],
+        }
+        for reason, changes in cases.items():
+            for number, change in enumerate(changes):
+                with self.subTest(reason=reason, case=number):
+                    self.refuses(reason, change)
+
+    def test_process_executable_preload_descriptors_and_status(self):
+        cases = {
+            "host process executable": [
+                lambda o: o["exe"].update(path=TREE + "/usr/bin/python3"),
+                lambda o: o["exe"].update(path="/usr/lib64/ld-linux-x86-64.so.2"),
+                lambda o: o["exe"].update(inode=o["exe"]["inode"] + 1),
+                lambda o: o["exe"].update(device=o["exe"]["device"] + 1),
+            ],
+            "host loader preload file": [lambda o: o.update(preload=True)],
+            "host descriptors": [
+                lambda o: o["descriptors"].update(initial=(0, 1, 2, 5)),
+                lambda o: o["descriptors"].update(final=(0, 1, 2, 9)),
+                lambda o: o["stdio"].update(final=STDIO[:2] + ((2, (1, 9, 0, 0), 2),)),
+            ],
+            "host process status": [
+                lambda o: o.update(
+                    status=STATUS.replace(b"Threads:\t1", b"Threads:\t3")
+                ),
+                lambda o: o.update(pid=4243),
+            ],
+        }
+        for reason, changes in cases.items():
+            for number, change in enumerate(changes):
+                with self.subTest(reason=reason, case=number):
+                    self.refuses(reason, change)
+
+    def test_request_binds_the_tree_and_the_selected_manifest(self):
+        other = request_bytes(tree="/home/u/.cache/other/root")
+        stale = request_bytes(manifest_sha256="0" * 64)
+        cases = (
+            ("host request digest", lambda o: o.update(request_data=other)),
+            (
+                "host request runtime",
+                lambda o: o.update(
+                    request_data=other,
+                    argv=o["argv"][:3] + (sha(other),),
+                    orig_argv=o["orig_argv"][:-1] + (sha(other),),
+                ),
+            ),
+            (
+                "host request manifest digest",
+                lambda o: o.update(
+                    request_data=stale,
+                    argv=o["argv"][:3] + (sha(stale),),
+                    orig_argv=o["orig_argv"][:-1] + (sha(stale),),
+                ),
+            ),
+        )
+        for reason, change in cases:
+            with self.subTest(reason=reason):
+                self.refuses(reason, change)
+
+    def test_mount_view_maps_and_mapped_bytes(self):
+        libc = b"0000000000009000-000000000000a000 r-xp 00000000 00:01 9 /usr/lib64/libc.so.6\n"
+        cases = (
+            (
+                "host mount inside the runtime",
+                lambda o: o.update(
+                    mountinfo=MOUNTINFO + mount_line(3, 2, "0:2", TREE + "/opt")
+                ),
+            ),
+            (
+                "runtime unlisted mapped file",
+                lambda o: o.update(
+                    maps=o["maps"].replace(
+                        b"0000000000004000-", libc + b"0000000000004000-"
+                    )
+                ),
+            ),
+            (
+                "runtime writable or shared executable map",
+                lambda o: o.update(maps=o["maps"].replace(b"r-xp", b"rwxp", 1)),
+            ),
+            (
+                "runtime mapped file identity",
+                lambda o: o.update(maps=o["maps"].replace(b" 00:01 ", b" 00:02 ", 1)),
+            ),
+            (
+                "runtime mapped bytes differ",
+                lambda o: o.update(
+                    mapped=(dict(o["mapped"][0], sha256="0" * 64),) + o["mapped"][1:]
+                ),
+            ),
+        )
+        for reason, change in cases:
+            with self.subTest(reason=reason):
+                self.refuses(reason, change)
+
+    def test_python_state_is_the_selected_runtime_and_entry(self):
+        def module(o, name, **change):
+            o["python"]["modules"] = tuple(
+                dict(row, **change) if row["name"] == name else row
+                for row in o["python"]["modules"]
+            )
+
+        cases = (
+            ("runtime Python flag", lambda o: o["python"]["flags"].update(no_site=0)),
+            (
+                "runtime Python environment or search path",
+                lambda o: o["python"].update(pycache_prefix=None),
+            ),
+            (
+                "runtime Python environment or search path",
+                lambda o: o["python"].update(sys_path=o["python"]["sys_path"][:1]),
+            ),
+            (
+                "runtime Python environment or search path",
+                lambda o: o["python"].update(
+                    sys_path=("/usr/lib64/python3.14",) + o["python"]["sys_path"][1:]
+                ),
+            ),
+            (
+                "runtime main entry",
+                lambda o: module(
+                    o,
+                    "__main__",
+                    origin=TREE + "/opt/irlume/measurement-job-guardian-native.py",
+                ),
+            ),
+            (
+                "runtime module is not a selected file",
+                lambda o: module(
+                    o,
+                    "jeepney",
+                    origin="/usr/lib/python3.14/site-packages/jeepney/__init__.py",
+                ),
+            ),
+        )
+        for reason, change in cases:
+            with self.subTest(reason=reason):
+                self.refuses(reason, change)
+
+    def test_sources_jeepney_and_import_hooks(self):
+        cases = (
+            (
+                "host source digest",
+                lambda o: o.update(
+                    sources=((o["sources"][0][0], "0" * 64),) + o["sources"][1:]
+                ),
+            ),
+            (
+                "host source digest",
+                lambda o: o.update(
+                    sources=(("/opt/irlume/x.py", "0" * 64),) + o["sources"]
+                ),
+            ),
+            (
+                "host source digest",
+                lambda o: o.update(sources=o["sources"] + (o["sources"][0],)),
+            ),
+            ("host sources missing", lambda o: o.update(sources=o["sources"][1:])),
+            ("host jeepney", lambda o: o["jeepney"].update(version="0.8.0")),
+            (
+                "host jeepney",
+                lambda o: o["jeepney"].update(
+                    origin="/usr/lib/python3.14/site-packages/jeepney/__init__.py"
+                ),
+            ),
+            ("host import hooks", lambda o: o["hooks"].update(excepthook=False)),
+            ("host import hooks", lambda o: o["hooks"].update(meta_path=False)),
+            ("host import hooks", lambda o: o["hooks"].update(path_hooks=False)),
+        )
+        for reason, change in cases:
+            with self.subTest(reason=reason):
+                self.refuses(reason, change)
+
+    def test_bootstrap_and_manifest_digest_are_the_checker_own(self):
+        observation, data, digest, pages = synthetic()
+        with self.assertRaises(ValueError):
+            host.validate(observation, TREE, data, "0" * 64, pages, DEPS)
+        value = json.loads(data)
+        value["bootstrap"] = "usr/bin/python3"
+        other = closure.canonical(value)
+        request = request_bytes(manifest_sha256=sha(other))
+        observation.update(
+            request_data=request,
+            argv=observation["argv"][:3] + (sha(request),),
+            orig_argv=observation["orig_argv"][:-1] + (sha(request),),
+        )
+        with self.assertRaisesRegex(ValueError, "^host runtime bootstrap$"):
+            host.validate(observation, TREE, other, sha(other), pages, DEPS)
+        # The checker's tree, not the observation's, decides every path.
+        observation, data, digest, pages = synthetic()
+        with self.assertRaises(ValueError):
+            host.validate(observation, TREE + "x", data, digest, pages, DEPS)
+
+    def test_witness_is_canonical_bounded_and_carries_no_authority(self):
+        observation, data, digest, pages = synthetic()
+        encoded = host.encode(observation, TREE, digest, DEPS, deadline())
+        self.assertLessEqual(len(encoded), host.WITNESS_LIMIT)
+        wire = json.loads(encoded)
+        self.assertEqual(wire["scope"], host.SCOPE)
+        self.assertEqual(wire["runtime"], TREE)
+        self.assertEqual(wire["request_sha256"], observation["argv"][3])
+        self.assertEqual(wire["manifest_sha256"], digest)
+        for name in ("accepted", "native_authorized", "full_contract_proven"):
+            self.assertIs(wire[name], False)
+        decoded = host.decode(encoded, DEPS, deadline())
+        self.assertTrue(witness.typed_equal(decoded["observation"], observation))
+        accepted(
+            self, host.validate, decoded["observation"], TREE, data, digest, pages, DEPS
+        )
+        for change in (
+            lambda w: w.update(accepted=True),
+            lambda w: w.update(native_authorized=True),
+            lambda w: w.update(scope="contained-job-startup-witness-v2"),
+            lambda w: w.update(extra=1),
+        ):
+            bad = json.loads(encoded)
+            change(bad)
+            with self.assertRaises(ValueError):
+                host.decode(closure.canonical(bad), DEPS, deadline())
+        with self.assertRaises(ValueError):
+            host.decode(encoded + b" ", DEPS, deadline())
+
+
+ROOT_FIELDS = ("scope", "platform", "python", "native", "environment", "bootstrap")
+REPLACED = re.compile(r"opt/irlume/measurement-job[^/]*\.py")
+QEMU = "usr/bin/qemu-system-x86_64"
+# Appended to python-state in one copy: each collector call leaves a
+# descriptor open.
+LEAK = b"""
+
+_collect_python_state = collect_python_state
+
+
+def collect_python_state(*args, **keywords):
+    os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+    return _collect_python_state(*args, **keywords)
+"""
+
+
+def remove(path):
+    """Remove a throwaway tree whose directories are read-only."""
+    if not os.path.lexists(path):
+        return
+    for folder, names, _ in os.walk(path):
+        os.chmod(folder, 0o700)
+        for name in names:
+            child = os.path.join(folder, name)
+            if not os.path.islink(child):
+                os.chmod(child, 0o700)
+    shutil.rmtree(path)
+
+
+class HostRuntimeTests(unittest.TestCase):
+    """The entry runs through the tree loader in host namespaces."""
+
+    @classmethod
+    def setUpClass(cls):
+        if os.uname().sysname != "Linux" or os.uname().machine != "x86_64":
+            raise RuntimeError("host runtime tests require Linux x86-64")
+        source = os.environ.get("IRLUME_HOST_RUNTIME")
+        if not source:
+            raise RuntimeError(
+                "IRLUME_HOST_RUNTIME must name a prepared runtime (root/ and "
+                "inputs/manifest.json); no host fallback"
+            )
+        cls.rustup = shutil.which("rustup")
+        if cls.rustup is None:
+            raise RuntimeError("pinned Rust is required; no host fallback")
+        cls.work = Path(
+            tempfile.mkdtemp(prefix="irlume-host-", dir=os.environ.get("TMPDIR"))
+        ).resolve()
+        cls.addClassCleanup(remove, cls.work)
+        requested = os.environ.get("IRLUME_HOST_EVIDENCE")
+        if requested:
+            cls.evidence = Path(requested)
+            cls.evidence.mkdir(mode=0o700)
+        else:
+            cls.evidence = Path(
+                tempfile.mkdtemp(
+                    prefix="irlume-host-evidence-", dir=os.environ.get("TMPDIR")
+                )
+            )
+            print("Host evidence retained at", cls.evidence)
+        source = Path(source)
+        pinned = (source / "inputs/manifest.json").read_bytes()
+        # The source tree must be the runtime its manifest pins.
+        with closure.RuntimeSnapshot.open(
+            source / "root", pinned, sha(pinned), deadline=deadline()
+        ) as snapshot:
+            snapshot.check()
+        cls.build_launcher()
+        cls.prepare_tree(source / "root", json.loads(pinned))
+        cls.write_request()
+
+    @classmethod
+    def build_launcher(cls):
+        build = cls.work / "build"
+        build.mkdir(mode=0o700)
+        rust = build / "launcher.rs"
+        rust.write_bytes((HERE / "measurement-job-launcher.rs").read_bytes())
+        command = [
+            cls.rustup,
+            "run",
+            "1.88.0",
+            "rustc",
+            "--edition=2021",
+            "--crate-name",
+            "host_launcher",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "-Ctarget-feature=+crt-static",
+            "-Crelocation-model=static",
+            "-Clink-arg=-no-pie",
+            "-Cpanic=abort",
+            "-Copt-level=s",
+            "-Ccodegen-units=1",
+            "-Dwarnings",
+            str(rust),
+            "-o",
+            str(build / "launcher"),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+            env={
+                "HOME": str(Path.home()),
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "TMPDIR": str(build),
+            },
+            cwd=str(build),
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        metadata = closure.elf.inspect((build / "launcher").read_bytes())
+        if metadata["type"] != 2 or metadata["dynamic"] or metadata["interpreter"]:
+            raise RuntimeError("test launcher is not static ET_EXEC")
+        cls.launcher_bytes = (build / "launcher").read_bytes()
+
+    @classmethod
+    def prepare_tree(cls, source, pinned):
+        """Copy the pinned tree with this checkout's modules and launcher."""
+        cls.source, cls.pinned = source, pinned
+        tree, cls.manifest, cls.manifest_data, cls.manifest_sha256 = cls.copy_tree(
+            "root", "inputs"
+        )
+        cls.tree = str(tree)
+        cls.launcher = cls.tree + "/opt/irlume/launcher"
+        cls.loader = cls.tree + "/" + LOADER
+        cls.python = cls.tree + "/usr/bin/python3"
+        cls.entry = cls.tree + "/" + host.ENTRY
+        with closure.RuntimeSnapshot.open(
+            cls.tree, cls.manifest_data, cls.manifest_sha256, deadline=deadline()
+        ) as snapshot:
+            cls.pages = host.page_digests(snapshot, cls.tree)
+            cls.files = host.file_facts(snapshot, cls.tree)
+
+    @classmethod
+    def copy_tree(cls, name, inputs_name, replaced=None):
+        """A re-pinned copy of the source tree at work/name, without the QEMU
+        member, with this checkout's modules and launcher; replaced maps a
+        member path to the bytes it gets instead."""
+        tree = cls.work / name
+        tree.mkdir(mode=0o700)
+        added = {
+            "opt/irlume/" + path.name: path.read_bytes()
+            for path in sorted(HERE.glob("measurement-job*.py"))
+        }
+        added["opt/irlume/launcher"] = cls.launcher_bytes
+        added.update(replaced or {})
+        modes = {}
+        for row in cls.pinned["members"]:
+            path = row["path"]
+            if path == QEMU or path in added or REPLACED.fullmatch(path):
+                continue
+            target = tree / path
+            if row["kind"] == "directory":
+                target.mkdir(mode=0o700)
+                modes[target] = 0o500
+            else:
+                target.write_bytes((cls.source / path).read_bytes())
+                target.chmod(row["mode"])
+        for path, data in added.items():
+            target = tree / path
+            target.write_bytes(data)
+            target.chmod(0o500 if path == "opt/irlume/launcher" else 0o400)
+        for folder in sorted(modes, key=lambda p: len(p.parts), reverse=True):
+            folder.chmod(0o500)
+        tree.chmod(0o500)
+        profile = {field: cls.pinned[field] for field in ROOT_FIELDS}
+        manifest_data, manifest_sha256 = closure.prepare_manifest(
+            tree, profile, deadline=deadline()
+        )
+        inputs = cls.work / inputs_name
+        inputs.mkdir(mode=0o700)
+        manifest = inputs / "manifest.json"
+        manifest.write_bytes(manifest_data)
+        manifest.chmod(0o400)
+        return tree, manifest, manifest_data, manifest_sha256
+
+    @classmethod
+    def write_request(cls, name="attempt", **changes):
+        folder = cls.work / name
+        folder.mkdir(mode=0o700)
+        value = {
+            "scope": host.REQUEST_SCOPE,
+            "mode": "self-check",
+            "runtime": cls.tree,
+            "manifest": str(cls.manifest),
+            "manifest_sha256": cls.manifest_sha256,
+        }
+        value.update(changes)
+        data = closure.canonical(value)
+        path = folder / "host-request.json"
+        path.write_bytes(data)
+        path.chmod(0o400)
+        if name == "attempt":
+            cls.request, cls.request_sha256 = str(path), sha(data)
+        return str(path), sha(data)
+
+    def run_command(self, label, command, environment, *, pass_fds=(), executable=None):
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=120,
+            check=False,
+            env=environment,
+            cwd="/",
+            pass_fds=pass_fds,
+            executable=executable,
+        )
+        record = {
+            "argv": command,
+            "executable": executable,
+            "environment": sorted(environment),
+            "pass_fds": list(pass_fds),
+            "returncode": result.returncode,
+            "stdout_bytes": len(result.stdout),
+            "stdout_sha256": sha(result.stdout),
+            "stderr": result.stderr.decode("ascii", "replace"),
+        }
+        (self.evidence / (label + ".json")).write_text(
+            json.dumps(record, indent=2) + "\n"
+        )
+        return result
+
+    def through_loader(
+        self, *, tree=None, library_path=True, request=None, digest=None
+    ):
+        tree = tree or self.tree
+        argv = [tree + "/" + LOADER, "--inhibit-cache"]
+        if library_path:
+            argv += ["--library-path", tree + "/lib64"]
+        return argv + [
+            tree + "/usr/bin/python3",
+            *FLAGS,
+            tree + "/" + host.ENTRY,
+            "--request",
+            request or self.request,
+            digest or self.request_sha256,
+        ]
+
+    def refused(self, result, reason):
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        lines = result.stderr.decode("ascii", "replace").splitlines()
+        self.assertTrue(lines, "no refusal reason")
+        self.assertEqual(lines[-1], "measurement-job-host: " + reason)
+
+    def decoded(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertLessEqual(len(result.stdout), host.WITNESS_LIMIT)
+        return host.decode(result.stdout, DEPS, deadline())
+
+    def test_launcher_starts_the_self_check_despite_a_poisoned_caller(self):
+        poison = {
+            **ENVIRONMENT,
+            "LD_PRELOAD": "/untrusted.so",
+            "LD_AUDIT": "/audit.so",
+            "LD_LIBRARY_PATH": "/untrusted",
+            "GLIBC_TUNABLES": "untrusted.marker=1",
+            "PYTHONPATH": "/untrusted",
+            "IRLUME_POISON": "must-not-survive",
+        }
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 9, inheritable=True)
+            result = self.run_command(
+                "launcher-positive",
+                [self.launcher, "--host", self.request, self.request_sha256],
+                poison,
+                pass_fds=(9,),
+            )
+        finally:
+            os.close(9)
+            os.close(inherited)
+        (self.evidence / "witness.json").write_bytes(result.stdout)
+        wire = self.decoded(result)
+        self.assertEqual(wire["scope"], host.SCOPE)
+        for name in ("accepted", "native_authorized", "full_contract_proven"):
+            self.assertIs(wire[name], False)
+        observation = wire["observation"]
+        accepted(
+            self,
+            host.validate,
+            observation,
+            self.tree,
+            self.manifest_data,
+            self.manifest_sha256,
+            self.pages,
+            DEPS,
+        )
+        self.assertEqual(observation["environment"], ENVIRONMENT)
+        self.assertEqual(
+            observation["descriptors"], {"initial": (0, 1, 2), "final": (0, 1, 2)}
+        )
+        self.assertEqual(observation["exe"]["path"], self.loader)
+        self.assertEqual(
+            observation["jeepney"],
+            {
+                "version": "0.9.0",
+                "origin": self.tree + "/opt/irlume/vendor/jeepney/__init__.py",
+            },
+        )
+        self.assertEqual(observation["files"], self.files)
+        mapped = set()
+        for line in observation["maps"].decode().splitlines():
+            fields = line.split(None, 5)
+            if len(fields) == 6 and fields[4] != "0":
+                mapped.add(fields[5])
+        self.assertTrue(mapped)
+        self.assertTrue(
+            all(path.startswith(self.tree + "/") for path in mapped), mapped
+        )
+        self.assertIn(self.loader, mapped)
+        self.assertIn(self.tree + "/lib64/libc.so.6", mapped)
+        origins = {path for path, _ in observation["sources"]}
+        self.assertLessEqual(
+            {self.tree + "/opt/irlume/" + name for name in host.SOURCES}, origins
+        )
+        modules = {row["name"]: row for row in observation["python"]["modules"]}
+        self.assertEqual(modules["__main__"]["origin"], self.entry)
+        self.assertIn("jeepney.io.blocking", modules)
+
+    def test_real_witness_refuses_tampered_bytes_sources_and_host_mappings(self):
+        result = self.run_command(
+            "loader-positive", self.through_loader(), dict(ENVIRONMENT)
+        )
+        original = self.decoded(result)["observation"]
+        cases = (
+            (
+                "runtime mapped bytes differ",
+                lambda o: o.update(
+                    mapped=(dict(o["mapped"][0], sha256="0" * 64),) + o["mapped"][1:]
+                ),
+            ),
+            (
+                "host source digest",
+                lambda o: o.update(
+                    sources=((o["sources"][0][0], "0" * 64),) + o["sources"][1:]
+                ),
+            ),
+            (
+                "runtime unlisted mapped file",
+                lambda o: o.update(
+                    maps=o["maps"].replace(
+                        self.loader.encode(), b"/usr/lib64/ld-linux-x86-64.so.2"
+                    )
+                ),
+            ),
+        )
+        for reason, change in cases:
+            observation = copy.deepcopy(original)
+            change(observation)
+            with (
+                self.subTest(reason=reason),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                host.validate(
+                    observation,
+                    self.tree,
+                    self.manifest_data,
+                    self.manifest_sha256,
+                    self.pages,
+                    DEPS,
+                )
+
+    def test_ambient_or_partial_launch_shapes_refuse_with_their_reason(self):
+        python = shutil.which("python3")
+        self.assertIsNotNone(python)
+        python = str(Path(python).resolve())
+        preload = next(
+            path
+            for path in ("/usr/lib64/libz.so.1", self.tree + "/lib64/libz.so.1")
+            if os.path.exists(path)
+        )
+        # sys.executable and the prefixes keep the link (getpath does not
+        # resolve it), so only the realpath gate, before any input or module
+        # load, tells this tree from the one it names.
+        linked = self.work / "linked-root"
+        linked.symlink_to(self.tree)
+        cases = (
+            (
+                "linked-tree",
+                self.through_loader(tree=str(linked)),
+                ENVIRONMENT,
+                "host runtime root",
+            ),
+            (
+                "host-python",
+                [
+                    python,
+                    *FLAGS,
+                    self.entry,
+                    "--request",
+                    self.request,
+                    self.request_sha256,
+                ],
+                ENVIRONMENT,
+                "host runtime root",
+            ),
+            (
+                "host-python-ib",
+                [
+                    python,
+                    "-I",
+                    "-B",
+                    self.entry,
+                    "--request",
+                    self.request,
+                    self.request_sha256,
+                ],
+                ENVIRONMENT,
+                "host runtime root",
+            ),
+            (
+                "direct-exec",
+                [
+                    self.python,
+                    *FLAGS,
+                    self.entry,
+                    "--request",
+                    self.request,
+                    self.request_sha256,
+                ],
+                ENVIRONMENT,
+                "host process executable",
+            ),
+            (
+                "loader-without-library-path",
+                self.through_loader(library_path=False),
+                ENVIRONMENT,
+                "runtime unlisted mapped file",
+            ),
+            (
+                "loader-ld-preload",
+                self.through_loader(),
+                {**ENVIRONMENT, "LD_PRELOAD": preload},
+                "host environment",
+            ),
+            (
+                "loader-extra-variable",
+                self.through_loader(),
+                {**ENVIRONMENT, "IRLUME_EXTRA": "1"},
+                "host environment",
+            ),
+        )
+        for label, command, environment, reason in cases:
+            with self.subTest(case=label):
+                self.refused(
+                    self.run_command(label, command, dict(environment)), reason
+                )
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 5, inheritable=True)
+            result = self.run_command(
+                "loader-inherited-fd",
+                self.through_loader(),
+                dict(ENVIRONMENT),
+                pass_fds=(5,),
+            )
+        finally:
+            os.close(5)
+            os.close(inherited)
+        self.refused(result, "host descriptors")
+
+    def test_launcher_refuses_a_foreign_request_or_a_launcher_outside_the_tree(self):
+        result = self.run_command(
+            "launcher-wrong-digest",
+            [self.launcher, "--host", self.request, "0" * 64],
+            dict(ENVIRONMENT),
+        )
+        self.refused(result, "host request digest")
+        path, digest = self.write_request(
+            "other-runtime", runtime=str(self.work / "elsewhere")
+        )
+        result = self.run_command(
+            "launcher-other-runtime",
+            [self.launcher, "--host", path, digest],
+            dict(ENVIRONMENT),
+        )
+        self.refused(result, "host request runtime")
+        # A root taken from the wrong components of <work>/outside/opt/x/launcher
+        # would be <work>/outside: a stub loader there turns that into a start,
+        # not an exec failure that also exits 77.
+        outside = self.work / "outside"
+        stub = outside / LOADER
+        stub.parent.mkdir(mode=0o700, parents=True)
+        stub.write_bytes(b"#!/bin/sh\necho started\n")
+        stub.chmod(0o500)
+        result = self.run_command(
+            "outside-stub-control", [str(stub)], dict(ENVIRONMENT)
+        )
+        self.assertEqual((result.returncode, result.stdout), (0, b"started\n"))
+        copy_ = outside / "opt/x/launcher"
+        copy_.parent.mkdir(mode=0o700, parents=True)
+        copy_.write_bytes(self.launcher_bytes)
+        copy_.chmod(0o500)
+        result = self.run_command(
+            "launcher-outside-tree",
+            [str(copy_), "--host", self.request, self.request_sha256],
+            dict(ENVIRONMENT),
+        )
+        self.assertEqual(result.returncode, 77)
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+
+    def test_launcher_takes_its_tree_from_the_executable_link_not_argv0(self):
+        # argv[0] names a launcher in another directory; /proc/self/exe still
+        # selects this tree, so the self-check runs from it.
+        result = self.run_command(
+            "launcher-argv0-elsewhere",
+            [
+                str(self.work / "argv0-elsewhere/opt/irlume/launcher"),
+                "--host",
+                self.request,
+                self.request_sha256,
+            ],
+            dict(ENVIRONMENT),
+            executable=self.launcher,
+        )
+        observation = self.decoded(result)["observation"]
+        self.assertEqual(observation["exe"]["path"], self.loader)
+        accepted(
+            self,
+            host.validate,
+            observation,
+            self.tree,
+            self.manifest_data,
+            self.manifest_sha256,
+            self.pages,
+            DEPS,
+        )
+
+    def test_a_descriptor_left_open_during_the_passes_refuses(self):
+        # python-state's collector runs only between the two inventories; in
+        # this re-pinned copy it leaves one descriptor open per call, so the
+        # initial inventory is clean and only the final one can refuse.
+        name = "opt/irlume/measurement-job-python-state.py"
+        leaky = (HERE / Path(name).name).read_bytes() + LEAK
+        tree, manifest, _, manifest_sha256 = self.copy_tree(
+            "leaky-root", "leaky-inputs", {name: leaky}
+        )
+        self.addCleanup(remove, tree)
+        path, digest = self.write_request(
+            "leaky-attempt",
+            runtime=str(tree),
+            manifest=str(manifest),
+            manifest_sha256=manifest_sha256,
+        )
+        result = self.run_command(
+            "loader-leaked-fd",
+            self.through_loader(tree=str(tree), request=path, digest=digest),
+            dict(ENVIRONMENT),
+        )
+        self.refused(result, "host descriptors")
+
+    def test_tree_loader_with_the_exact_environment_passes_without_the_launcher(self):
+        # The control for the refusals above: the checks, not the launcher, decide.
+        wire = self.decoded(
+            self.run_command("loader-control", self.through_loader(), dict(ENVIRONMENT))
+        )
+        self.assertEqual(wire["runtime"], self.tree)
+
+
+if __name__ == "__main__":
+    unittest.main()

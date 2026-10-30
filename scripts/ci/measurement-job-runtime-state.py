@@ -35,10 +35,31 @@ FLAGS = {
 }
 
 
-def check_files(manifest, files):
+def check_prefix(prefix):
+    """prefix is "" for a rooted process, else the tree's canonical host path.
+
+    Facts and maps of an unrooted process name tree files as prefix + "/" +
+    member, compared verbatim: no path is rebased, so a path outside the
+    tree never stands for a member. relative_path bounds its length and depth.
+    """
+    if prefix == "":
+        return prefix
+    if type(prefix) is not str or not prefix.startswith("/"):
+        raise ValueError("runtime path prefix")
+    try:
+        closure.relative_path(prefix[1:])
+    except ValueError as error:
+        raise ValueError("runtime path prefix") from error
+    return prefix
+
+
+def check_files(manifest, files, *, prefix=""):
     members = closure.check_manifest(manifest)
+    prefix = check_prefix(prefix)
     selected = {
-        "/" + path: row for path, row in members.items() if row["kind"] == "file"
+        prefix + "/" + path: row
+        for path, row in members.items()
+        if row["kind"] == "file"
     }
     runtime._fields(files, selected)
     identities = set()
@@ -63,8 +84,18 @@ def check_files(manifest, files):
     return members
 
 
-def check_python(manifest, files, state):
-    members = check_files(manifest, files)
+def check_python(manifest, files, state, *, prefix="", entry=None):
+    """entry: the selected main source when it is not the manifest's own."""
+    members = check_files(manifest, files, prefix=prefix)
+    if entry is None:
+        entry = manifest["python"]["entry"]
+    elif (
+        type(entry) is not str
+        or entry not in members
+        or members[entry]["kind"] != "file"
+        or not entry.endswith(".py")
+    ):
+        raise ValueError("runtime main entry")
     runtime._fields(
         state,
         (
@@ -86,7 +117,7 @@ def check_python(manifest, files, state):
         or type(state["version"]) is not tuple
         or state["version"] != tuple(selected["version"])
         or any(type(n) is not int for n in state["version"])
-        or state["executable"] != "/" + selected["executable"]
+        or state["executable"] != prefix + "/" + selected["executable"]
     ):
         raise ValueError("runtime Python identity")
     runtime._fields(state["flags"], FLAGS)
@@ -101,7 +132,7 @@ def check_python(manifest, files, state):
         state["environment"] != manifest["environment"]
         or state["pycache_prefix"] != "/dev/null"
         or type(state["sys_path"]) is not tuple
-        or state["sys_path"] != tuple("/" + path for path in selected["roots"])
+        or state["sys_path"] != tuple(prefix + "/" + path for path in selected["roots"])
     ):
         raise ValueError("runtime Python environment or search path")
     if (
@@ -172,8 +203,8 @@ def check_python(manifest, files, state):
                 raise ValueError("runtime module is not a selected file")
             if package and (
                 package != (str(Path(origin).parent),)
-                or package[0][1:] not in members
-                or members[package[0][1:]]["kind"] != "directory"
+                or package[0][len(prefix) + 1 :] not in members
+                or members[package[0][len(prefix) + 1 :]]["kind"] != "directory"
             ):
                 raise ValueError("runtime package is not selected")
             if package and (
@@ -184,9 +215,7 @@ def check_python(manifest, files, state):
                 raise ValueError("runtime package has no package entry")
             if kind == "extension":
                 extensions.add(origin)
-        if name == "__main__" and (
-            kind != "source" or origin != "/" + selected["entry"]
-        ):
+        if name == "__main__" and (kind != "source" or origin != prefix + "/" + entry):
             raise ValueError("runtime main entry")
     if "__main__" not in names:
         raise ValueError("runtime main module missing")
@@ -393,18 +422,23 @@ def check_maps(data, files, mounts, mapped, pages):
     return executable
 
 
-def check_runtime_state(manifest, files, state, maps, mounts, mapped, pages):
+def check_runtime_state(
+    manifest, files, state, maps, mounts, mapped, pages, *, prefix="", entry=None
+):
     """Check supplied observations; callers must prove collection and freshness.
 
     mounts is the parsed mount view of the process whose maps these are;
     mapped holds that process's rows for those maps and pages the checker's
-    own page digests of the selected runtime (check_mapped).
+    own page digests of the selected runtime (check_mapped). prefix and
+    entry are for a process outside the tree (check_prefix, check_python);
+    their defaults are the rooted guardian's view.
     """
-    extensions = check_python(manifest, files, state)
+    prefix = check_prefix(prefix)
+    extensions = check_python(manifest, files, state, prefix=prefix, entry=entry)
     executable = check_maps(maps, files, mounts, mapped, pages)
     required = {
-        "/" + manifest["python"]["executable"],
-        "/" + manifest["native"]["interpreter"],
+        prefix + "/" + manifest["python"]["executable"],
+        prefix + "/" + manifest["native"]["interpreter"],
         *extensions,
     }
     if not required <= executable:

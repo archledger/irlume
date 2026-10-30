@@ -50,6 +50,27 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   operations, with the same mapped rows.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
+  First slice (H1), source only: the launcher's `--host
+  <dir>/host-request.json <sha256>` arm takes the runtime tree `<T>` from
+  its own `/proc/self/exe` and execs the tree's loader with
+  `--inhibit-cache --library-path <T>/lib64`, the tree's python and the new
+  entry `measurement-job-host.py`, in the host namespaces. The loader
+  options are not a boundary (glibc-hwcaps directories, the host's default
+  directories for a missing name, `LD_*` and `/etc/ld.so.preload` stay
+  reachable), so the entry checks its own process. Before any tree module
+  loads it checks the environment, exact argv, interpreter prefixes,
+  `/proc/self/exe` identity and that `/etc/ld.so.preload` is absent; then
+  the exact initial search path; then, in two passes, module identity,
+  Python state, every file mapping by identity and page bytes, the mount
+  chain to `<T>`, status and namespaces, with descriptors before and after.
+  It loads the module graph HostOwner uses but coordinates nothing; its only
+  output is a startup witness with no authority. `<T>` must be an ordinary
+  directory, not a mount point. Tests run it through the tree loader on a
+  re-pinned copy of the laptop runtime (this checkout's modules and
+  launcher, without the QEMU member); it has not yet run natively on either
+  host. Still open: H2 (HostOwner from the tree, with the witness bound into
+  admission), H3 (the real admission directory, after owner confirmation),
+  H4 (H loss) and the guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
 - [ ] Implement exclusive writable-overlay ownership and freeze it only after
@@ -113,8 +134,10 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 36 `scripts/ci/test-measurement-*.py` suites pass (835 tests), with
-`TMPDIR` unset and with a long `TMPDIR`. G runs with `KeyringMode=private`,
+All 37 `scripts/ci/test-measurement-*.py` suites pass (871 tests), with
+`TMPDIR` unset and with a long `TMPDIR`. `test-measurement-job-host.py`
+needs a prepared runtime named by `IRLUME_HOST_RUNTIME` and fails without
+one. G runs with `KeyringMode=private`,
 read back by H: a user manager's services otherwise share its session
 keyring, which G's private user namespace does not replace (probed on
 systemd 259.10 and 262.1). G also runs with `ProtectControlGroupsEx=strict`,

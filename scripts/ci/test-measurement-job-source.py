@@ -24,6 +24,7 @@ FILES = (
     "measurement-job-guardian-native.py",
     "measurement-job-guardian-service.py",
     "measurement-job-guardian-host.py",
+    "measurement-job-host.py",
 )
 ENTRIES = (
     "measurement-job-evidence.py",
@@ -31,6 +32,7 @@ ENTRIES = (
     "measurement-job-guardian.py",
     "measurement-job-guardian-native.py",
     "measurement-job-guardian-host.py",
+    "measurement-job-host.py",
 )
 
 

@@ -467,6 +467,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- GPU inference is withdrawn (ADR-0038, #1053): the recognizer runs on the CPU, or
+  on the NPU once a certification passes. ADR-0033 is withdrawn except its CPU
+  execution-provider rule, and ADR-0022 returns to no GPU.
 - Update ctutils to 0.4.4 in the application and fuzz lockfiles.
 
 - Version the decision fingerprint to bind bounded threshold coverage and

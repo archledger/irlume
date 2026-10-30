@@ -47,10 +47,12 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   rows: 72 mappings of 18 files, 4019 pages, of which 3684 were compared and
   335 were private copies, none in a code mapping. Under the launcher's
   Landlock domain both reached it again on 2026-10-30, using 1176 and 1172
-  operations, with the same mapped rows.
+  operations, with the same mapped rows. With the launcher that adds the
+  host role (H1 below) both reached it again on 2026-10-30, using 1178
+  operations each, with the same mapped rows.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
-  First slice (H1), source only: the launcher's `--host
+  First slice (H1): the launcher's `--host
   <dir>/host-request.json <sha256>` arm takes the runtime tree `<T>` from
   its own `/proc/self/exe` and execs the tree's loader with
   `--inhibit-cache --library-path <T>/lib64`, the tree's python and the new
@@ -66,11 +68,20 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   It loads the module graph HostOwner uses but coordinates nothing; its only
   output is a startup witness with no authority. `<T>` must be an ordinary
   directory, not a mount point. Tests run it through the tree loader on a
-  re-pinned copy of the laptop runtime (this checkout's modules and
-  launcher, without the QEMU member); it has not yet run natively on either
-  host. Still open: H2 (HostOwner from the tree, with the witness bound into
-  admission), H3 (the real admission directory, after owner confirmation),
-  H4 (H loss) and the guest side.
+  re-pinned copy of a prepared runtime (this checkout's modules and
+  launcher, without the QEMU member). On 2026-10-30 it ran natively from
+  the pinned runtime on both hosts (Fedora with glibc 2.43, Arch with glibc
+  2.44). With a poisoned caller environment and an inherited descriptor, H
+  wrote a witness that a separate checker accepted: 76 mapped rows of 19
+  tree files, 3691 pages compared and 337 private copies, in the host
+  namespaces. The host python, the tree python run directly, `LD_PRELOAD`,
+  a launcher outside the tree, a wrong request digest, a request naming
+  another tree and a one-byte change in a copy of the tree were each
+  refused. Without `--library-path` the laptop's tree loader maps the
+  host's libraries, which H refuses; on archhost the host's libc does not
+  load at all. Still open: H2 (HostOwner from the tree, with the witness
+  bound into admission), H3 (the real admission directory, after owner
+  confirmation), H4 (H loss) and the guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
 - [ ] Implement exclusive writable-overlay ownership and freeze it only after

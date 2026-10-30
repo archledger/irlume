@@ -45,7 +45,9 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   lookups. With the mapped-bytes check (startup witness v2) both reached it
   again on 2026-10-30, using 1170 and 1172 operations, and H accepted G's
   rows: 72 mappings of 18 files, 4019 pages, of which 3684 were compared and
-  335 were private copies, none in a code mapping.
+  335 were private copies, none in a code mapping. Under the launcher's
+  Landlock domain both reached it again on 2026-10-30, using 1176 and 1172
+  operations, with the same mapped rows.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
@@ -95,9 +97,12 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   descriptors, socketpairs, SCM_RIGHTS and other socket families. The
   unit's `NoNewPrivileges=` is the prerequisite; systemd 259 and 262 have no
   Landlock option. Bubblewrap tests with live listeners outside the domain
-  check each case and fail all 30 mutation controls. Still open: a witness
-  of the denials from inside G's unit, and a nested layer with no rules for
-  the future QEMU child.
+  check each case, and each of 30 mutation controls fails at least one of
+  them. G reached `startup-only-complete` on both hosts under a launcher
+  built from this source. The launcher execs G only after every Landlock
+  step succeeds, so the domain was applied, but nothing inside the unit has
+  yet shown what it denies. Still open: a witness of the denials from inside
+  G's unit, and a nested layer with no rules for the future QEMU child.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
   uid, gid, namespace, liveness and socket node, and H stays the verifier of
   G's unit, invocation and start time.

@@ -5,17 +5,22 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- GPU inference, which no tagged release carried (ADR-0038, #1053). A nightly
+  build's `recognizer_device=gpu` now takes the invalid-value path to `auto`
+  with a journal warning, and its `gpu` key and `IRLUME_GPU` are no longer read.
+  The `gpu` selection word, the `accelerator`, `gpu_platform`,
+  `gpu_runtime_available` and `gpu_qualified` status fields and the `gpu-platform`,
+  `gpu-runtime` and `gpu-qualification` doctor ids leave contract 1, and those ids
+  are never reused. The AppArmor profiles lose their render-node, OpenCL and
+  compute-runtime rules, and the units lose the GPU launch environment. The
+  recognizer ranking API goes with them.
+
 ### Added
 
-- Both daemon AppArmor profiles grant scoped GPU access: render nodes listed
-  through `/dev/dri/by-path`, the DRM class walk, read-only GuC and HuC
-  reports in debugfs, OpenCL ICD registrations with system layers denied, and
-  `/usr/local` compute runtime libraries, plus an optional
-  `local/irlumed-gpu` include. Rules shared with the NPU let oneTBB read
-  `/proc/sys/vm/nr_hugepages` and the transparent huge page mode. The packaged unit, NixOS module and
-  `install-host.sh` unit set `NEO_CACHE_PERSISTENT=0` and unset the OpenCL
-  loader and compute runtime cache overrides. GPU loading admission stays
-  closed (ADR-0033 section 4, #1162).
+- Both daemon AppArmor profiles let oneTBB, which the NPU runtime loads, read
+  `/proc/sys/vm/nr_hugepages` and the transparent huge page mode (#1046).
 
 - A private kernel namespace observation probe (ADR-0022, Kernel namespace
   observation, #1164). It uses `listns` to check for the initial user
@@ -58,7 +63,7 @@ All notable changes to irlume are documented here. This project adheres to
   string-table mappings. It does not resolve dependencies or permit loading.
 
 - Selection-source and parsing-issue reporting in Health, `status --json`
-  and doctor (ADR-0033 section 6, #1163). Missing provenance remains unreported;
+  and doctor (#1163). Missing provenance remains unreported;
   rejected raw settings are not exposed. Selection and accelerator placement
   behavior are unchanged.
 
@@ -74,18 +79,6 @@ All notable changes to irlume are documented here. This project adheres to
   consistency. It does not observe the host, establish a complete native
   closure or grant launch permission.
 
-- A pure recognizer-ranking recommendation API (ADR-0033 section 6, #1163).
-  It evaluates supplied candidate assertions and exact workload-bound order
-  evidence without choosing a default device-class preference. It does not
-  verify eligibility or change discovery, loading, actual placement or
-  reporting.
-
-- A pure checker for minimal GPU launch-candidate inputs (ADR-0033
-  section 4, #1162). It requires explicit NEO cache-off intent, rejects
-  unsupported environment entries and reports fixed, value-redacted errors.
-  A checked candidate does not authorize loading; production admission
-  remains closed.
-
 - CPU-reference isolation for non-shippable evidence builds (ADR-0022,
   Reference isolation, #1164). These builds reject ORT provider features,
   including features enabled through another dependency, and refuse any
@@ -98,31 +91,6 @@ All notable changes to irlume are documented here. This project adheres to
   evidence cfg, and normal consumers reject marked library dependencies.
   CLI and daemon startup also refuse an evidence-marked build before other
   work. This adds no measurement runtime, loading permission or certification.
-
-- The GPU recognizer target behind the closed loading admission (ADR-0033
-  phase 3, #1161). A `recognizer_device=gpu` selection with the GPU switch
-  on now opens a GPU context instead of skipping: the loading admission
-  comes first, and while it refuses (every build so far) nothing is
-  resolved, loaded or written and the recognizer stays on CPU with "the GPU
-  loading profile has not been admitted". Behind the admission sit the
-  production GPU platform (the single-GPU rule, the fixed configuration
-  read back, a warm-up compile in a private directory, the full identity),
-  a compile under the same marker, blob discard, binding-panic guard and
-  per-inference inventory checks as the NPU, and a GPU certification table,
-  empty, keyed on the numerics set of the ADR-0033 amendment of 2026-10-22
-  with a reviewed support list that refuses unlisted libraries. The engine
-  build requires the CPU and GPU reference digests, the extended reference
-  set when the support set differs from the certified one, and for an entry
-  certified through the driver hold a guard that retires the GPU if the
-  device's runtime-suspended time grows with the model retained. Reporting
-  stays within contract 1: `recognizer.device` keeps `npu` and `cpu`, a GPU
-  placement reads `device: "cpu"` with a fixed reason and the new optional
-  `recognizer.accelerator: "gpu"`, with `gpu_platform`,
-  `gpu_runtime_available` and `gpu_qualified` beside it; `irlume doctor`
-  gains `gpu-runtime`, `gpu-qualification` and `gpu-platform` rows and
-  prints `GPU` for a GPU placement; non-root Health replies get GPU-worded
-  fallback categories. `auto` stays NPU-only (phase 6). `CERTIFIED` stays
-  empty and CPU authentication stays authoritative.
 
 - The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
   control (unit 8, selector 6, D1 on interface 1), validated by maurerr's
@@ -497,61 +465,7 @@ All notable changes to irlume are documented here. This project adheres to
   needs the acceptance matrix in #1030 (ADR-0032 amendment 2026-10-13).
   Thanks to @maurerr for the report in #1061.
 
-- Measurement-only GPU certification-evidence lanes for the recognizer
-  on the decision hardware (ADR-0033 phase 4): recorded-frame corpus CPU
-  vs GPU at the wired threshold with presentation attacks, recognition
-  corpora genuine and impostor drift with zero-new-grants assertions,
-  and a suspend/resume recheck lane gated by bounded proof of an
-  attended suspend. Evidence uses committed model pins, the default
-  native-mesh cascade, PNM and nested attack takes, strict input
-  validation and per-demographic measured coverage. A wait without
-  suspend proof is inconclusive. `CERTIFIED` stays empty and loading
-  admission stays closed
-  (ADR-0033 section 5, #1053).
-
-- Complete GPU platform identity under closed admission: the test-only
-  GPU discovery now binds the plugin's `DEVICE_PCI_INFO` report to
-  exactly one DRM render node (sysfs address and `vendor`/`device`
-  attributes must match), reads the GuC/HuC firmware of that same node,
-  records the GPU plugin build, the loader family the plugin resolved
-  (`libOpenCL` or `libze_loader`, from the mapped libraries), the fixed
-  compile configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`
-  (`f16` until the ADR-0033 amendment of 2026-10-21, see Changed)
-  and the SHA-256 of every mapped native library under the ADR-0022
-  one-open-file inode discipline. `GPU_DRIVER_VERSION` is never read:
-  the property read kills the process on the measured 2026.2.1 builds,
-  so driver identity comes from the hashed manifest. Ignored
-  `gpu_hw_*` hardware tests collect the identity and compile the
-  recognizer on `GPU.0` under the fixed configuration with a CPU parity
-  canary and post-compile library re-verification. Loading admission
-  stays closed and `CERTIFIED` stays empty (ADR-0033 section 3, #1053).
-
 ### Changed
-
-- The f32 precision record and the ADR-0033 amendment of 2026-10-21 now
-  name the cause of the ThinkPad identity change from `f592e9bc` to
-  `d689e37d` (#1164). The two identities differ only in the memory size
-  the plugin reported, which fell by one page across a reboot. The kernel
-  was 7.2.11 for both, so this was not the kernel update the record
-  named. Under the #1172 definition both are identity `27288f0e`. Docs
-  only.
-
-- ADR-0033 specifies how `auto` will rank the recognizer's devices
-  (amendment 2026-10-29, #1163). CPU is a ranked target: a certified
-  accelerator goes ahead of it only through a reviewed order in a separate
-  table, so the certification entry is unchanged; the orders for one
-  model, consumer and ranking protocol version are told apart by the
-  accelerator keys they name. `auto` opens an accelerator only when
-  some order and a matching entry could select it and the host has the
-  ranked device's PCI IDs, because enumerating an `xe` GPU keeps it out
-  of runtime suspend until the daemon exits. After a probe the order that
-  names the live key decides; a refused or unranked candidate falls
-  through to the next class and then to CPU. The protocol ranks on p95
-  decision latency with and without compositor load, CPU time per
-  authentication and idle power (preliminary figures), and the resolved
-  device and a closed reason are reported in additive fields. Docs only:
-  `auto` keeps the recognizer on CPU, loading admission stays closed and
-  both `CERTIFIED` tables stay empty.
 
 - Update ctutils to 0.4.4 in the application and fuzz lockfiles.
 
@@ -663,31 +577,6 @@ All notable changes to irlume are documented here. This project adheres to
   build loads at two threads with a warning, and the smaller models keep two
   threads.
 
-- ADR-0033 narrows what a GPU certification entry keys on (amendment
-  2026-10-22, #1164): the OpenVINO libraries, the Intel compute runtime's
-  drivers and gmmlib, and the kernel compiler toolchain (IGC,
-  opencl-clang, clang, LLVM, the SPIR-V translator) instead of every
-  mapped library. Every other library stays hashed, inode-checked and on a
-  reviewed list, an unknown one refuses GPU placement, and when they
-  differ from the certified set the engine build reproduces an extended
-  reference digest, each input twice, before the GPU answers. On Fedora 44
-  the daemon's exact set would have moved on 13 dates in 92 days, the keyed
-  set on 6 (docs/research/2026-10-22-gpu-certification-key.md). The NPU keeps its
-  binding. Loading admission stays closed and `CERTIFIED` stays empty.
-
-- The GPU platform identity no longer hashes the memory size the plugin
-  reports (`GPU_DEVICE_TOTAL_MEM_SIZE`), and every GPU hardware lane prints
-  each identity field after the digest (#1164, ADR-0033 section 3). The
-  plugin answers that size with `CL_DEVICE_GLOBAL_MEM_SIZE`, which the
-  compute runtime derives on integrated GPUs from the boot's memory, so it
-  moved between boots of the UX5406S with every library and firmware
-  unchanged (four values from 30,629,322,752 to 30,629,355,520 bytes) and
-  moved the digest with it; ADR-0033 section 3 never named it. The
-  UX5406S evidence of 2026-10-21 (`ec747155`) belongs to identity
-  `1f570994` under the new definition, shown by recomputing the old digest
-  from the new field dump. Every GPU identity digest changes once.
-  Loading admission stays closed and `CERTIFIED` stays empty.
-
 - ADR-0013 restates the shipped ViT RGB PAD cue's banner evidence
   (ADR-0013 §4, amendment 2026-10-22, #1169). The 0.594 to 0.656 range is
   the Zenbook qualification's two banner presentation medians, 0.594 close
@@ -699,19 +588,6 @@ All notable changes to irlume are documented here. This project adheres to
   identity-median figure, which does not reproduce from its committed
   scores, points to the amendment. The threshold, the five-frame vote and
   the tests' pinned values are unchanged.
-
-- ADR-0033 records how a GPU meets the ADR-0022 section 7 runtime-suspend
-  arm when its driver holds it awake while a model is retained (amendment
-  2026-10-22, #1164). On `xe` the compute runtime's long-running VM keeps a
-  kernel runtime-PM reference until the process exits, so the arm cannot
-  occur; a hold witness takes its place (the lifetime diagnostic with the
-  display off, the retained control's runtime window with the device
-  active, the device suspending again after the process exits). The GPU
-  session stays in irlumed, so a GPU placement on such a host keeps the GPU
-  out of runtime suspend; system suspend is unaffected. A certification
-  resting on the hold retires the GPU to CPU if the device's
-  runtime-suspended counter ever grows with the model retained. Loading
-  admission stays closed and `CERTIFIED` stays empty.
 
 - ADR-0013 restates the shipped ViT RGB PAD cue's LFW evidence with figures
   that reproduce from the committed per-frame scores (ADR-0013 §4, amendment
@@ -737,27 +613,6 @@ All notable changes to irlume are documented here. This project adheres to
   and scores in benchmarks/pad-candidates/dim-room/; the mechanism on that
   unit stays open. Thanks to @maurerr for the report and the dim and lit
   measurements.
-
-- The fixed GPU compile configuration names `f32` as the inference
-  precision (`batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`),
-  ADR-0033 amendment 2026-10-21. The plugin's `f16` default measured
-  outside the ADR-0022 section 7 drift budget on both measured identities
-  (UX5406S Arc 140V: recorded genuine IR lower shift 5/1474 and recorded
-  genuine RGB +1/339; ThinkPad Iris Xe: genuine LFW drift 0.00108, one
-  pair in 400 either way), while `f32` reproduced the CPU reference within
-  1e-6 with zero verdict differences on the same corpora, and on the
-  UX5406S passed the recorded-frame and corpora arms (13 of 13) with
-  drift at or below 7.5e-7, the cache matrix (41 of 41), the
-  power-management diagnostic and the retained-process control across a
-  real system suspend (1,000 of 1,000 bit-exact calls). The runtime-suspend
-  witness is inconclusive on the `xe` driver while the model is retained:
-  the compute runtime's long-running VM holds a kernel runtime-PM
-  reference for the process lifetime; the ADR-0033 amendment of
-  2026-10-22 records how xe identities meet that arm (#1164). The `gpu_hw_*`
-  lanes and the cache control compile with the new configuration; every
-  `f16` identity leaves certification consideration. Loading admission
-  stays closed and `CERTIFIED` stays empty
-  (docs/research/2026-10-21-gpu-f32-precision.md, #1053).
 
 - docs/LIMITATIONS.md records that the NexiGo HelloCam N930W measured
   here (`3443:c803`) streams IR at 14.73 to 14.79 fps, about 1.2 to 1.7%
@@ -928,29 +783,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- GPU groundwork under closed admission (ADR-0033 sections 2 to 4 and 8):
-  a `gpu` kill switch beside the device selection (`gpu` in
-  `settings.conf` and `IRLUME_GPU`, either disabling source wins,
-  independent of the `npu`-named keys), GPU discovery that refuses before
-  `dlopen` exactly like the NPU context, the single-GPU rule (a system
-  exposing more than one GPU refuses placement until a reviewed rule
-  selects one device), and incomplete GPU identity observations: runtime
-  build, device name/capabilities, provider endpoint and agreeing loaded
-  GuC/HuC firmware across the actual GTs/tiles. Unreadable or conflicting
-  firmware refuses; the observation cannot key certification. Default and
-  accelerator builds retain the GPU-switch CPU reason from the successful
-  build's settings snapshot. Ordinary status preserves the fixed public
-  selection/switch reasons while native provider details remain masked.
-  The `gpu_hw_*` ignored tests collect preliminary
-  discovery evidence on real Intel GPUs; no loading profile is admitted and
-  `CERTIFIED` stays empty (#1053).
-
 - Recognizer device selection: `recognizer_device` in `settings.conf`
   (`IRLUME_RECOGNIZER_DEVICE` overrides) names the recognizer's intended
-  device, `auto` (the default), `cpu`, `npu` or `gpu`. A selection never
-  lowers a gate: `cpu` skips NPU discovery with the reason reported, `npu`
-  attempts placement under the unchanged kill switch, admission and
-  certification, `gpu` is reported but no build admits placement yet, and
+  device, `auto` (the default), `cpu` or `npu`. A selection never lowers a
+  gate: `cpu` skips NPU discovery with the reason reported, `npu` attempts
+  placement under the unchanged kill switch, admission and certification, and
   `auto` keeps today's switch-gated behavior. A malformed value or unreadable
   settings is a journal warning resolving to `auto`, the selection joins the
   one startup settings snapshot, and `doctor` (`recognizer-selection`) and

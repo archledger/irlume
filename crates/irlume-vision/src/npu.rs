@@ -26,10 +26,9 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub mod gpu;
 mod identity;
 mod maps;
-mod runtime;
+pub(crate) mod runtime;
 #[cfg(irlume_hw_evidence)]
 pub(crate) use runtime::{fixture_trusted_metadata, fixture_trusted_path};
 pub use runtime::{library_setting, LibrarySetting, RuntimeSelection};
@@ -348,12 +347,6 @@ pub enum CpuReason {
     /// The administrator selected CPU for the recognizer
     /// (`recognizer_device=cpu`); no NPU discovery or compile is attempted.
     CpuSelected,
-    /// The administrator selected GPU for the recognizer
-    /// (`recognizer_device=gpu`); no build admits GPU placement yet, and no
-    /// NPU discovery or compile is attempted.
-    GpuSelectedNotAdmitted,
-    /// The GPU kill switch disabled use (ADR-0033 section 8).
-    GpuDisabled,
     /// No reviewed installation/launch profile admits native loading. This
     /// is independent of model certification and is checked before dlopen.
     LoadingNotAdmitted,
@@ -375,9 +368,6 @@ pub enum CpuReason {
     Retired(String),
     /// The startup parity check against the CPU session failed.
     ParityMismatch(String),
-    /// The recognizer was selected for the GPU and is not on it
-    /// (ADR-0033); the reason names the GPU.
-    Gpu(gpu::GpuReason),
 }
 
 impl fmt::Display for CpuReason {
@@ -385,10 +375,6 @@ impl fmt::Display for CpuReason {
         match self {
             Self::Disabled => f.write_str("NPU use is disabled"),
             Self::CpuSelected => f.write_str(irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
-            Self::GpuSelectedNotAdmitted => {
-                f.write_str(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON)
-            }
-            Self::GpuDisabled => f.write_str(irlume_common::RECOGNIZER_GPU_DISABLED_REASON),
             Self::LoadingNotAdmitted => {
                 f.write_str("the NPU loading profile has not been admitted; using CPU")
             }
@@ -404,7 +390,6 @@ impl fmt::Display for CpuReason {
             ),
             Self::Retired(why) => write!(f, "NPU retired after an inference error: {why}"),
             Self::ParityMismatch(why) => write!(f, "NPU output differs from CPU: {why}"),
-            Self::Gpu(reason) => reason.fmt(f),
         }
     }
 }
@@ -414,8 +399,6 @@ impl fmt::Display for CpuReason {
 pub enum Device {
     /// On the NPU.
     Npu,
-    /// On the GPU (ADR-0033).
-    Gpu,
     /// On its CPU session, and why.
     Cpu(CpuReason),
 }
@@ -442,18 +425,6 @@ enum State {
         entry: Option<&'static Certification>,
         /// [`suspended`] when the entry's digests were last reproduced;
         /// `None` until the first check.
-        checked_at: Option<Duration>,
-    },
-    Gpu {
-        model: Box<dyn Infer>,
-        entry: Option<&'static gpu::certification::Certification>,
-        /// The live support digest differs from the entry's: the engine
-        /// build must reproduce the extended reference set (ADR-0033
-        /// amendment of 2026-10-22).
-        extended_required: bool,
-        /// Armed for an entry certified through the driver hold.
-        guard: Option<gpu::RuntimeGuard>,
-        /// As for the NPU.
         checked_at: Option<Duration>,
     },
 }
@@ -492,47 +463,11 @@ impl Slot {
         }
     }
 
-    /// A model compiled for the GPU without a certified entry: the
-    /// hardware tests' placements only.
-    #[cfg(test)]
-    pub(crate) fn gpu(model: Box<dyn Infer>) -> Self {
-        Self {
-            state: State::Gpu {
-                model,
-                entry: None,
-                extended_required: false,
-                guard: None,
-                checked_at: None,
-            },
-        }
-    }
-
-    /// A model compiled for the GPU under `matched`, whose CPU reference
-    /// and GPU reference digests (and the extended set when the support
-    /// set differs) must be reproduced before it answers; `guard` is armed
-    /// for an entry certified through the driver hold (ADR-0033 section 5
-    /// and its amendments of 2026-10-22).
-    pub(crate) fn gpu_certified(
-        model: Box<dyn Infer>,
-        matched: gpu::certification::Matched<'static>,
-        guard: Option<gpu::RuntimeGuard>,
-    ) -> Self {
-        Self {
-            state: State::Gpu {
-                model,
-                entry: Some(matched.entry),
-                extended_required: matched.extended_required,
-                guard,
-                checked_at: None,
-            },
-        }
-    }
-
     /// Record that the entry's digests were reproduced by a check that
     /// started at `baseline`, a [`Bound::AtMost`] reading taken before its
     /// first inference, so a suspend during or after the check is seen.
     pub(crate) fn note_checked(&mut self, baseline: Option<Duration>) {
-        if let State::Npu { checked_at, .. } | State::Gpu { checked_at, .. } = &mut self.state {
+        if let State::Npu { checked_at, .. } = &mut self.state {
             *checked_at = baseline;
         }
     }
@@ -543,11 +478,6 @@ impl Slot {
     pub(crate) fn resumed_since_check(&self) -> bool {
         let checked_at = match &self.state {
             State::Npu {
-                entry: Some(_),
-                checked_at,
-                ..
-            }
-            | State::Gpu {
                 entry: Some(_),
                 checked_at,
                 ..
@@ -563,7 +493,7 @@ impl Slot {
     /// Forget the last check, as a system resume would, for tests.
     #[cfg(test)]
     pub(crate) fn forget_check(&mut self) {
-        if let State::Npu { checked_at, .. } | State::Gpu { checked_at, .. } = &mut self.state {
+        if let State::Npu { checked_at, .. } = &mut self.state {
             *checked_at = None;
         }
     }
@@ -572,20 +502,7 @@ impl Slot {
     pub fn certification(&self) -> Option<&'static Certification> {
         match &self.state {
             State::Npu { entry, .. } => *entry,
-            State::Gpu { .. } | State::Cpu(_) => None,
-        }
-    }
-
-    /// The GPU entry the model is on the GPU under, if any, and whether the
-    /// extended reference set is required.
-    pub fn gpu_certification(&self) -> Option<(&'static gpu::certification::Certification, bool)> {
-        match &self.state {
-            State::Gpu {
-                entry: Some(entry),
-                extended_required,
-                ..
-            } => Some((entry, *extended_required)),
-            _ => None,
+            State::Cpu(_) => None,
         }
     }
 
@@ -594,28 +511,6 @@ impl Slot {
         match &self.state {
             State::Cpu(reason) => Device::Cpu(reason.clone()),
             State::Npu { .. } => Device::Npu,
-            State::Gpu { .. } => Device::Gpu,
-        }
-    }
-
-    /// Check the runtime-suspend guard of a GPU entry certified through the
-    /// driver hold, and retire the model to CPU when the device
-    /// runtime-suspended or the guard cannot read it. `false` means the
-    /// model is no longer on the accelerator.
-    pub(crate) fn check_runtime_guard(&mut self) -> bool {
-        let outcome = match &self.state {
-            State::Gpu {
-                guard: Some(guard), ..
-            } => guard.check(),
-            State::Cpu(_) => return false,
-            _ => return true,
-        };
-        match outcome {
-            Ok(()) => true,
-            Err(reason) => {
-                self.state = State::Cpu(CpuReason::Gpu(reason));
-                false
-            }
         }
     }
 
@@ -629,10 +524,8 @@ impl Slot {
         input: &[f32],
         decode: impl FnOnce(&[f32]) -> irlume_common::Result<T>,
     ) -> Option<T> {
-        let (model, gpu) = match &mut self.state {
-            State::Npu { model, .. } => (model, false),
-            State::Gpu { model, .. } => (model, true),
-            State::Cpu(_) => return None,
+        let State::Npu { model, .. } = &mut self.state else {
+            return None;
         };
         let outcome = model
             .infer(input)
@@ -640,11 +533,7 @@ impl Slot {
         match outcome {
             Ok(value) => Some(value),
             Err(why) => {
-                self.state = State::Cpu(if gpu {
-                    CpuReason::Gpu(gpu::GpuReason::Retired(why))
-                } else {
-                    CpuReason::Retired(why)
-                });
+                self.state = State::Cpu(CpuReason::Retired(why));
                 None
             }
         }
@@ -866,7 +755,7 @@ impl Cache {
 }
 
 /// An exact platform identity whose digest names its cache directory and
-/// markers: the NPU's [`Identity`] and the GPU's [`gpu::Identity`].
+/// markers.
 pub trait PlatformDigest: Clone {
     /// The exact identity digest.
     fn platform_digest(&self) -> String;
@@ -878,18 +767,9 @@ impl PlatformDigest for Identity {
     }
 }
 
-impl PlatformDigest for gpu::Identity {
-    fn platform_digest(&self) -> String {
-        self.digest()
-    }
-}
-
-/// An admission refusal observed no runtime, for either accelerator.
+/// An admission refusal observed no runtime.
 fn is_admission_refusal(reason: &CpuReason) -> bool {
-    matches!(
-        reason,
-        CpuReason::LoadingNotAdmitted | CpuReason::Gpu(gpu::GpuReason::LoadingNotAdmitted)
-    )
+    matches!(reason, CpuReason::LoadingNotAdmitted)
 }
 
 /// A boot ID as the kernel writes it (a UUID), or as the tests name one.
@@ -2661,12 +2541,6 @@ mod tests {
         fake_on(Slot::npu, replies)
     }
 
-    /// The same scripted model placed on the GPU (ADR-0033), so the two
-    /// retirement paths of [`Slot::run`] cannot drift apart unseen.
-    fn fake_gpu(replies: Vec<Result<Vec<f32>, String>>) -> (Slot, Calls) {
-        fake_on(Slot::gpu, replies)
-    }
-
     fn fake_on(
         place: fn(Box<dyn Infer>) -> Slot,
         replies: Vec<Result<Vec<f32>, String>>,
@@ -2716,39 +2590,6 @@ mod tests {
         let (mut slot, _) = fake(vec![Ok(vec![])]);
         assert_eq!(slot.run(&[1.0], first), None);
         assert!(matches!(slot.device(), Device::Cpu(CpuReason::Retired(_))));
-    }
-
-    #[test]
-    fn an_inference_error_retires_the_gpu_for_good() {
-        let (mut slot, calls) = fake_gpu(vec![Err("device lost".into()), Ok(vec![0.5])]);
-        assert_eq!(slot.device(), Device::Gpu);
-        assert_eq!(slot.run(&[1.0], first), None, "the caller runs CPU");
-        assert_eq!(
-            slot.device(),
-            Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(
-                "device lost".into()
-            ))),
-            "the reason names the GPU, not the NPU"
-        );
-        assert!(!slot.check_runtime_guard(), "off the accelerator");
-        assert_eq!(slot.run(&[1.0], first), None);
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a retired GPU is not called again"
-        );
-    }
-
-    #[test]
-    fn an_undecodable_output_retires_the_gpu_too() {
-        let (mut slot, calls) = fake_gpu(vec![Ok(vec![]), Ok(vec![0.5])]);
-        assert_eq!(slot.run(&[1.0], first), None);
-        assert!(matches!(
-            slot.device(),
-            Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(why))) if why.contains("empty")
-        ));
-        assert_eq!(slot.run(&[1.0], first), None);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2922,80 +2763,6 @@ mod tests {
                 slot.device(),
                 Device::Cpu(CpuReason::Retired(why)) if why.contains("not hashed")
             ));
-            assert!(slot.certification().is_none());
-            assert!(!base.path().join("inference-marker").exists());
-            fs::write(base.path().join("maps"), original).unwrap();
-            assert_eq!(slot.run(&[0.0], first), None, "retirement is permanent");
-            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), load_on);
-        }
-    }
-
-    fn gpu_entry() -> &'static gpu::certification::Certification {
-        Box::leak(Box::new(gpu::certification::Certification {
-            model_sha256: "model",
-            role: Role::Recognizer,
-            numerics_key: "synthetic-key",
-            identity_digest: "synthetic",
-            onnx_runtime: "1.28.1",
-            thresholds: &[],
-            decision_fingerprint: "decision",
-            fingerprint: &[],
-            cpu_reference_digest: "cpu",
-            gpu_reference_digest: "gpu",
-            support_digest: "support",
-            extended_reference_digest: "extended",
-            runtime_witness: gpu::certification::RuntimeWitness::ObservedRuntimeSuspend,
-            evidence: "synthetic",
-        }))
-    }
-
-    /// The GPU wraps its compiled model in the same [`Marked`]
-    /// (`GpuPlatform::compile_certified`); a late mapping retires it to CPU
-    /// with the GPU reason (#1161).
-    #[test]
-    fn gpu_inference_inventory_rejects_lazy_mappings_and_retires_slot() {
-        for load_on in [1, 2] {
-            let base = tempfile::tempdir().unwrap();
-            let maps = base.path().join("maps");
-            let extra = base.path().join("liblazy.so");
-            fs::write(&extra, b"synthetic late dependency").unwrap();
-            let mut count = 0;
-            let (model, calls) = inference_inventory_model(base.path(), move || {
-                count += 1;
-                if count == load_on {
-                    let changed = fs::read_to_string(&maps).unwrap() + &map_line(&extra);
-                    fs::write(&maps, changed).unwrap();
-                }
-            });
-            let original = fs::read_to_string(&model.maps).unwrap();
-            let mut slot = Slot::gpu_certified(
-                Box::new(model),
-                gpu::certification::Matched {
-                    entry: gpu_entry(),
-                    extended_required: false,
-                },
-                None,
-            );
-            assert_eq!(slot.device(), Device::Gpu);
-            assert!(slot.gpu_certification().is_some());
-            for _ in 1..load_on {
-                assert_eq!(slot.run(&[0.0], first), Some(0.25));
-            }
-            let mut decoded = false;
-            assert_eq!(
-                slot.run(&[0.0], |raw| {
-                    decoded = true;
-                    first(raw)
-                }),
-                None,
-                "unqualified output must request CPU fallback"
-            );
-            assert!(!decoded, "rejected output must not reach the decoder");
-            assert!(matches!(
-                slot.device(),
-                Device::Cpu(CpuReason::Gpu(gpu::GpuReason::Retired(why))) if why.contains("not hashed")
-            ));
-            assert!(slot.gpu_certification().is_none());
             assert!(slot.certification().is_none());
             assert!(!base.path().join("inference-marker").exists());
             fs::write(base.path().join("maps"), original).unwrap();

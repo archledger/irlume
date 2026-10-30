@@ -33,9 +33,9 @@ fn selection_provenance_preserves_existing_source_precedence() {
         (
             None,
             b"recognizer_device= GPU ",
-            Selection::Gpu,
+            Selection::Auto,
             Source::Settings,
-            Issue::None,
+            Issue::InvalidValue,
         ),
         (
             Some(OsStr::new("npu")),
@@ -120,21 +120,21 @@ fn selection_provenance_stamps_one_copied_plan_despite_newer_publication() {
     let _env = crate::tests::env_lock();
     let _restore = recognizer_selection::preserve_publication();
     let old = Plan::resolve(
-        Some(OsStr::new("gpu")),
+        Some(OsStr::new("cpu")),
         &SettingsSnapshot::Bytes(b"gpu=off".to_vec()),
     );
     recognizer_selection::publish(old);
     let copied = recognizer_selection::current_plan();
     recognizer_selection::publish(Plan::resolve(
         None,
-        &SettingsSnapshot::Bytes(b"recognizer_device=cpu".to_vec()),
+        &SettingsSnapshot::Bytes(b"recognizer_device=npu".to_vec()),
     ));
     let mut placement = irlume_common::RecognizerPlacement {
         reason: Some("original engine reason".into()),
         ..Default::default()
     };
     super::stamp_recognizer_selection(&mut placement, copied);
-    assert_eq!(placement.selection.as_deref(), Some("gpu"));
+    assert_eq!(placement.selection.as_deref(), Some("cpu"));
     assert_eq!(
         placement.selection_provenance,
         Some(Provenance {
@@ -145,7 +145,7 @@ fn selection_provenance_stamps_one_copied_plan_despite_newer_publication() {
     #[cfg(not(feature = "npu"))]
     assert_eq!(
         placement.reason.as_deref(),
-        Some(irlume_common::RECOGNIZER_GPU_DISABLED_REASON)
+        Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
     );
     #[cfg(feature = "npu")]
     assert_eq!(placement.reason.as_deref(), Some("original engine reason"));
@@ -186,16 +186,14 @@ fn selection_provenance_retirement_preserves_intent_and_peer_privacy() {
         &SettingsSnapshot::Bytes(b"recognizer_device=auto".to_vec()),
     );
     let mut before = irlume_common::RecognizerPlacement {
-        device: "cpu".into(),
-        accelerator: Some("gpu".into()),
-        reason: Some(irlume_common::RECOGNIZER_ON_GPU_REASON.into()),
+        device: "npu".into(),
         ..Default::default()
     };
     super::stamp_recognizer_selection(&mut before, Some(plan));
     let mut retired = before.clone();
-    retired.accelerator = None;
-    retired.reason = Some("GPU failed /private/provider serial=private-fixture".into());
-    retired.gpu_runtime_available = Some(true);
+    retired.device = "cpu".into();
+    retired.reason = Some("NPU failed /private/provider serial=private-fixture".into());
+    retired.runtime_available = Some(true);
     super::stamp_recognizer_selection(&mut retired, Some(plan));
     assert_eq!(retired.selection, before.selection);
     assert_eq!(retired.selection_provenance, before.selection_provenance);

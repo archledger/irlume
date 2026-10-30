@@ -305,18 +305,7 @@ mod npu_placement {
                  (npu/IRLUME_NPU) is off; the recognizer stays on CPU"
             );
         }
-        let gpu_allows = plan.gpu_allows();
-        if matches!(
-            plan.selection(),
-            super::recognizer_selection::Selection::Gpu
-        ) && !gpu_allows
-        {
-            irlume_common::jout_warn!(
-                "irlumed: recognizer_device=gpu is selected, but the GPU switch \
-                 (gpu/IRLUME_GPU) is off; the recognizer stays on CPU"
-            );
-        }
-        let placed = match placement_attempt(plan, settings.switch_allows(), gpu_allows) {
+        let placed = match placement_attempt(plan, settings.switch_allows()) {
             PlacementAttempt::Skip(reason) => engine.place_recognizer_on_npu(
                 weights,
                 &mut irlume_auth::npu::Context::not_selected(reason),
@@ -325,15 +314,6 @@ mod npu_placement {
                 let mut context = engine
                     .open_npu_context_with_runtime(&cache_base(), &settings.runtime_selection());
                 engine.place_recognizer_on_npu(weights, &mut context)
-            }
-            // The GPU context admits loading first and refuses, writing
-            // nothing, until a reviewed profile exists (ADR-0033 section 4).
-            PlacementAttempt::TryGpu => {
-                let mut context = engine.open_gpu_context_with_runtime(
-                    &gpu_cache_base(),
-                    &settings.runtime_selection(),
-                );
-                engine.place_recognizer_on_gpu(weights, &mut context)
             }
         };
         if let Err(error) = placed {
@@ -351,27 +331,17 @@ mod npu_placement {
         engine
     }
 
-    /// What the device selection and the kill switches decide before any
-    /// runtime work: an explicit CPU selection skips both accelerators, a
-    /// GPU selection tries the GPU unless its switch is off, and the NPU
-    /// switch still wins over a selected or automatic NPU attempt. `auto`
-    /// stays NPU-only until ranking evidence places it (ADR-0033 phase 6).
+    /// What the device selection and the kill switch decide before any
+    /// runtime work: an explicit CPU selection skips the NPU, and the NPU
+    /// switch still wins over a selected or automatic NPU attempt.
     #[cfg(feature = "npu")]
     pub(super) fn placement_attempt(
         plan: &super::recognizer_selection::Plan,
         switch_allows: bool,
-        gpu_allows: bool,
     ) -> PlacementAttempt {
         use super::recognizer_selection::Selection;
         match plan.selection() {
             Selection::Cpu => PlacementAttempt::Skip(irlume_auth::npu::CpuReason::CpuSelected),
-            // The GPU kill switch wins over the selection (ADR-0033 section
-            // 8); otherwise the GPU context decides, and its closed loading
-            // admission keeps the recognizer on CPU (section 4).
-            Selection::Gpu if !gpu_allows => {
-                PlacementAttempt::Skip(irlume_auth::npu::CpuReason::GpuDisabled)
-            }
-            Selection::Gpu => PlacementAttempt::TryGpu,
             Selection::Npu | Selection::Auto if switch_allows => PlacementAttempt::TryNpu,
             Selection::Npu | Selection::Auto => {
                 PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
@@ -384,22 +354,17 @@ mod npu_placement {
     pub(super) enum PlacementAttempt {
         Skip(irlume_auth::npu::CpuReason),
         TryNpu,
-        TryGpu,
     }
 
     #[cfg(feature = "npu")]
     fn log(engine: &irlume_auth::Engine) {
         let placement = engine.recognizer_placement();
-        match (placement.accelerator.as_deref(), &placement.reason) {
-            (Some("gpu"), _) => irlume_common::jout_info!(
-                "irlumed: recognizer on the GPU (platform {})",
-                placement.gpu_platform.as_deref().unwrap_or("unknown")
-            ),
-            (_, None) => irlume_common::jout_info!(
+        match &placement.reason {
+            None => irlume_common::jout_info!(
                 "irlumed: recognizer on the NPU (platform {})",
                 placement.platform.as_deref().unwrap_or("unknown")
             ),
-            (_, Some(reason)) => {
+            Some(reason) => {
                 irlume_common::jout_info!("irlumed: recognizer on CPU: {reason}");
             }
         }
@@ -411,16 +376,6 @@ mod npu_placement {
         std::env::var_os("CACHE_DIRECTORY")
             .filter(|dir| !dir.is_empty())
             .map_or_else(|| "/var/cache/irlume/npu".into(), std::path::PathBuf::from)
-    }
-
-    /// The GPU cache: `gpu/` inside the NPU's `CacheDirectory`, so the unit
-    /// needs no second `CacheDirectory=` (which would make
-    /// `$CACHE_DIRECTORY` a list) and the NPU cache's cleanup, which removes
-    /// only identity-digest directories, leaves it alone. Nothing is written
-    /// there while the GPU loading admission refuses.
-    #[cfg(feature = "npu")]
-    fn gpu_cache_base() -> std::path::PathBuf {
-        cache_base().join("gpu")
     }
 
     /// One startup read binds the NPU opt-in, the provider and the recognizer
@@ -446,16 +401,6 @@ mod npu_placement {
                 Err(_) => Self::Unreadable,
                 Ok(bytes) => Self::Bytes(bytes),
             }
-        }
-
-        /// The GPU kill switch is policy even in builds without accelerators.
-        pub(super) fn gpu_switch_allows(&self) -> bool {
-            let setting = match self {
-                Self::Absent => irlume_auth::gpu::Setting::Absent,
-                Self::Unreadable => irlume_auth::gpu::Setting::Unreadable,
-                Self::Bytes(bytes) => irlume_auth::gpu::settings_conf_value(bytes),
-            };
-            irlume_auth::gpu::switch_allows(std::env::var_os("IRLUME_GPU").as_deref(), setting)
         }
     }
 
@@ -501,10 +446,10 @@ mod npu_placement {
 
 /// The administrator's recognizer device selection (`recognizer_device` in
 /// `settings.conf`, overridden by `IRLUME_RECOGNIZER_DEVICE`): `auto` (the
-/// default), `cpu`, `npu` or `gpu`. A selection names the intended device;
-/// it never lowers a gate. The NPU kill switch still wins over `npu`, no
-/// build admits `gpu` placement yet, and a selection that cannot be honored
-/// keeps the recognizer on CPU with the reason reported (#1053).
+/// default), `cpu` or `npu`. A selection names the intended device; it never
+/// lowers a gate. The NPU kill switch still wins over `npu`, and a selection
+/// that cannot be honored keeps the recognizer on CPU with the reason reported
+/// (#1053). A stored `gpu` takes the invalid-value path (ADR-0038 section 3).
 mod recognizer_selection {
     use irlume_common::recognizer_selection::{
         RecognizerSelectionIssue as Issue, RecognizerSelectionProvenance as Provenance,
@@ -522,8 +467,6 @@ mod recognizer_selection {
         /// Attempt NPU placement under the ADR-0022 admission and
         /// certification gates; the kill switch still wins.
         Npu,
-        /// GPU placement: reported, but no build admits it yet.
-        Gpu,
     }
 
     impl Selection {
@@ -532,7 +475,6 @@ mod recognizer_selection {
                 Self::Auto => "auto",
                 Self::Cpu => "cpu",
                 Self::Npu => "npu",
-                Self::Gpu => "gpu",
             }
         }
 
@@ -543,7 +485,6 @@ mod recognizer_selection {
                 "auto" => Self::Auto,
                 "cpu" => Self::Cpu,
                 "npu" => Self::Npu,
-                "gpu" => Self::Gpu,
                 _ => return None,
             })
         }
@@ -604,7 +545,6 @@ mod recognizer_selection {
     pub(super) struct Plan {
         selection: Selection,
         warning: Option<&'static str>,
-        gpu_allows: bool,
         provenance: Provenance,
     }
 
@@ -615,10 +555,6 @@ mod recognizer_selection {
 
         pub(super) fn warning(&self) -> Option<&'static str> {
             self.warning
-        }
-
-        pub(super) fn gpu_allows(&self) -> bool {
-            self.gpu_allows
         }
 
         pub(super) fn provenance(&self) -> Provenance {
@@ -633,13 +569,11 @@ mod recognizer_selection {
             settings: &super::npu_placement::SettingsSnapshot,
         ) -> Self {
             use std::os::unix::ffi::OsStrExt;
-            let gpu_allows = settings.gpu_switch_allows();
             if let Some(raw) = env {
                 return match Selection::parse(raw.as_bytes()) {
                     Some(selection) => Self {
                         selection,
                         warning: None,
-                        gpu_allows,
                         provenance: Provenance {
                             source: Source::Environment,
                             issue: Issue::None,
@@ -647,10 +581,7 @@ mod recognizer_selection {
                     },
                     None => Self {
                         selection: Selection::Auto,
-                        gpu_allows,
-                        warning: Some(
-                            "IRLUME_RECOGNIZER_DEVICE is not one of auto, cpu, npu or gpu",
-                        ),
+                        warning: Some("IRLUME_RECOGNIZER_DEVICE is not one of auto, cpu or npu"),
                         provenance: Provenance {
                             source: Source::Environment,
                             issue: Issue::InvalidValue,
@@ -667,7 +598,6 @@ mod recognizer_selection {
                 Setting::Absent => Self {
                     selection: Selection::Auto,
                     warning: None,
-                    gpu_allows,
                     provenance: Provenance {
                         source: Source::Default,
                         issue: Issue::None,
@@ -677,7 +607,6 @@ mod recognizer_selection {
                     Some(selection) => Self {
                         selection,
                         warning: None,
-                        gpu_allows,
                         provenance: Provenance {
                             source: Source::Settings,
                             issue: Issue::None,
@@ -685,10 +614,8 @@ mod recognizer_selection {
                     },
                     None => Self {
                         selection: Selection::Auto,
-                        gpu_allows,
                         warning: Some(
-                            "recognizer_device in settings.conf is not one of auto, cpu, npu \
-                             or gpu",
+                            "recognizer_device in settings.conf is not one of auto, cpu or npu",
                         ),
                         provenance: Provenance {
                             source: Source::Settings,
@@ -699,7 +626,6 @@ mod recognizer_selection {
                 Setting::Unreadable => Self {
                     selection: Selection::Auto,
                     warning: Some("settings.conf is unreadable or not UTF-8"),
-                    gpu_allows,
                     provenance: Provenance {
                         source: Source::Settings,
                         issue: Issue::UnreadableSettings,
@@ -708,7 +634,6 @@ mod recognizer_selection {
                 Setting::Duplicate => Self {
                     selection: Selection::Auto,
                     warning: Some("recognizer_device is set more than once in settings.conf"),
-                    gpu_allows,
                     provenance: Provenance {
                         source: Source::Settings,
                         issue: Issue::DuplicateKey,
@@ -761,23 +686,13 @@ mod recognizer_selection {
         if let Some(warning) = plan.warning() {
             irlume_common::jout_warn!("irlumed: recognizer_device: {warning}; using auto");
         }
-        match plan.selection() {
-            Selection::Npu | Selection::Gpu => {
-                #[cfg(feature = "npu")]
-                if plan.selection() == Selection::Gpu {
-                    irlume_common::jout_info!(
-                        "irlumed: recognizer_device=gpu is selected; no build admits GPU \
-                         placement yet, the recognizer stays on CPU"
-                    );
-                }
-                #[cfg(not(feature = "npu"))]
-                irlume_common::jout_info!(
-                    "irlumed: recognizer_device={} is selected, but this build has no \
-                     accelerator support; the recognizer stays on CPU",
-                    plan.selection().as_str()
-                );
-            }
-            Selection::Auto | Selection::Cpu => {}
+        #[cfg(not(feature = "npu"))]
+        if plan.selection() == Selection::Npu {
+            irlume_common::jout_info!(
+                "irlumed: recognizer_device={} is selected, but this build has no \
+                 accelerator support; the recognizer stays on CPU",
+                plan.selection().as_str()
+            );
         }
         plan
     }
@@ -790,10 +705,6 @@ mod recognizer_selection {
     pub(super) fn selected_cpu_reason(plan: Plan) -> Option<&'static str> {
         match plan.selection() {
             Selection::Cpu => Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
-            Selection::Gpu if !plan.gpu_allows() => {
-                Some(irlume_common::RECOGNIZER_GPU_DISABLED_REASON)
-            }
-            Selection::Gpu => Some(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON),
             _ => None,
         }
     }
@@ -5618,27 +5529,9 @@ fn recognizer_for_peer(
     if uid != 0 {
         projected.reason = if placement.device == "npu" {
             None
-        } else if matches!(
-            placement.reason.as_deref(),
-            Some(
-                irlume_common::RECOGNIZER_CPU_SELECTED_REASON
-                    | irlume_common::RECOGNIZER_GPU_DISABLED_REASON
-                    | irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON
-                    | irlume_common::RECOGNIZER_ON_GPU_REASON
-            )
-        ) {
-            placement.reason.clone()
-        } else if placement.selection.as_deref() == Some("gpu")
-            || placement.gpu_runtime_available.is_some()
+        } else if placement.reason.as_deref() == Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
         {
-            Some(
-                match placement.gpu_runtime_available {
-                    None => "GPU discovery not reported; using CPU",
-                    Some(false) => "GPU runtime unavailable; using CPU",
-                    Some(true) => "GPU recognizer unavailable; using CPU",
-                }
-                .into(),
-            )
+            placement.reason.clone()
         } else {
             Some(
                 match placement.runtime_available {
@@ -5662,8 +5555,8 @@ fn publish_engine_camera_selection(engine: &irlume_auth::Engine) {
 
 /// In builds without the `npu` feature the engine cannot report
 /// selection-specific CPU reasons (the NPU context machinery that carries
-/// them does not exist there), so an explicit CPU or GPU selection stamps
-/// its shared reason text at publish time. With the `npu` feature the
+/// them does not exist there), so an explicit CPU selection stamps its
+/// shared reason text at publish time. With the `npu` feature the
 /// placement context already carries the exact reason; nothing is stamped.
 #[cfg(not(feature = "npu"))]
 fn stamp_selected_cpu_reason(
@@ -5701,20 +5594,13 @@ fn publish_recognizer_placement(engine: &irlume_auth::Engine) {
     if bits.recognizer.as_ref() == Some(&placement) {
         return;
     }
-    let left = bits.recognizer.as_ref().and_then(|previous| {
-        if previous.device == "npu" && placement.device != "npu" {
-            Some("NPU")
-        } else if previous.accelerator.as_deref() == Some("gpu")
-            && placement.accelerator.as_deref() != Some("gpu")
-        {
-            Some("GPU")
-        } else {
-            None
-        }
-    });
-    if let Some(device) = left {
+    let left_npu = bits
+        .recognizer
+        .as_ref()
+        .is_some_and(|previous| previous.device == "npu" && placement.device != "npu");
+    if left_npu {
         jout_warn!(
-            "irlumed: the recognizer left the {device}: {}",
+            "irlumed: the recognizer left the NPU: {}",
             placement.reason.as_deref().unwrap_or("no reason given")
         );
     }
@@ -19498,69 +19384,6 @@ mod tests {
         publish_engine_bits_raw(EngineBits::default());
     }
 
-    /// A GPU placement keeps the legacy device to the values released
-    /// clients know, travels in `accelerator`, and reaches a non-root peer
-    /// with its fixed public reason; GPU runtime errors reach it only as GPU
-    /// categories (ADR-0033 phase 3).
-    #[test]
-    fn health_projects_gpu_placement_and_reasons_for_non_root() {
-        let _g = env_lock();
-        let health = |uid| {
-            let Response::Health {
-                recognizer: Some(placement),
-                ..
-            } = dispatch_status(&Request::Health, &peer(uid)).unwrap()
-            else {
-                panic!("published recognizer in Health")
-            };
-            placement
-        };
-        publish_engine_bits_raw(EngineBits {
-            recognizer: Some(irlume_common::RecognizerPlacement {
-                device: "cpu".into(),
-                reason: Some(irlume_common::RECOGNIZER_ON_GPU_REASON.into()),
-                selection: Some("gpu".into()),
-                accelerator: Some("gpu".into()),
-                gpu_platform: Some("cd34".into()),
-                gpu_runtime_available: Some(true),
-                gpu_qualified: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        let ordinary = health(NOBODY);
-        assert_eq!(ordinary.device, "cpu");
-        assert_eq!(ordinary.accelerator.as_deref(), Some("gpu"));
-        assert_eq!(
-            ordinary.reason.as_deref(),
-            Some(irlume_common::RECOGNIZER_ON_GPU_REASON)
-        );
-        assert_eq!(ordinary.gpu_platform.as_deref(), Some("cd34"));
-        let detail = "GPU runtime: /usr/lib64/private/libigdrcl.so serial=fixture-private";
-        for (available, category) in [
-            (None, "GPU discovery not reported; using CPU"),
-            (Some(false), "GPU runtime unavailable; using CPU"),
-            (Some(true), "GPU recognizer unavailable; using CPU"),
-        ] {
-            publish_engine_bits_raw(EngineBits {
-                recognizer: Some(irlume_common::RecognizerPlacement {
-                    device: "cpu".into(),
-                    reason: Some(detail.into()),
-                    selection: Some("gpu".into()),
-                    gpu_runtime_available: available,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-            assert_eq!(health(0).reason.as_deref(), Some(detail));
-            let ordinary = health(NOBODY);
-            assert_eq!(ordinary.reason.as_deref(), Some(category));
-            let wire = serde_json::to_string(&ordinary).unwrap();
-            assert!(!wire.contains("fixture-private") && !wire.contains("/usr/lib64/private"));
-        }
-        publish_engine_bits_raw(EngineBits::default());
-    }
-
     #[test]
     fn health_projects_provider_errors_for_non_root_and_preserves_root_detail() {
         let _g = env_lock();
@@ -19623,36 +19446,31 @@ mod tests {
             };
             placement
         };
-        for (selection, reason) in [
-            ("cpu", irlume_common::RECOGNIZER_CPU_SELECTED_REASON),
-            ("gpu", irlume_common::RECOGNIZER_GPU_DISABLED_REASON),
-            ("gpu", irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON),
-        ] {
-            publish_engine_bits_raw(EngineBits {
-                recognizer: Some(irlume_common::RecognizerPlacement {
-                    device: "cpu".into(),
-                    reason: Some(reason.into()),
-                    platform: None,
-                    runtime_available: None,
-                    qualified: None,
-                    selection: Some(selection.into()),
-                    ..Default::default()
-                }),
+        let reason = irlume_common::RECOGNIZER_CPU_SELECTED_REASON;
+        publish_engine_bits_raw(EngineBits {
+            recognizer: Some(irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                reason: Some(reason.into()),
+                platform: None,
+                runtime_available: None,
+                qualified: None,
+                selection: Some("cpu".into()),
                 ..Default::default()
-            });
-            assert_eq!(projected_health(0).reason.as_deref(), Some(reason));
-            let ordinary = projected_health(NOBODY);
-            assert_eq!(ordinary.reason.as_deref(), Some(reason));
-            assert_eq!(ordinary.selection.as_deref(), Some(selection));
-            assert_eq!(ordinary.runtime_available, None);
-        }
+            }),
+            ..Default::default()
+        });
+        assert_eq!(projected_health(0).reason.as_deref(), Some(reason));
+        let ordinary = projected_health(NOBODY);
+        assert_eq!(ordinary.reason.as_deref(), Some(reason));
+        assert_eq!(ordinary.selection.as_deref(), Some("cpu"));
+        assert_eq!(ordinary.runtime_available, None);
         // Only exact public reasons survive. Native details remain masked
-        // even when they contain an otherwise safe GPU reason as a prefix.
+        // even when they contain an otherwise safe reason as a prefix.
         for detail in [
             detail.to_owned(),
             format!(
                 "{} /home/private/provider.so",
-                irlume_common::RECOGNIZER_GPU_DISABLED_REASON
+                irlume_common::RECOGNIZER_CPU_SELECTED_REASON
             ),
         ] {
             publish_engine_bits_raw(EngineBits {
@@ -19662,16 +19480,15 @@ mod tests {
                     platform: None,
                     runtime_available: None,
                     qualified: None,
-                    selection: Some("gpu".into()),
+                    selection: Some("auto".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             });
             assert_eq!(projected_health(0).reason.as_deref(), Some(detail.as_str()));
-            // A GPU selection is reported in GPU terms to a non-root peer.
             assert_eq!(
                 projected_health(NOBODY).reason.as_deref(),
-                Some("GPU discovery not reported; using CPU")
+                Some("NPU discovery not reported; using CPU")
             );
         }
         publish_engine_bits_raw(EngineBits::default());
@@ -20337,101 +20154,6 @@ mod tests {
                 .any(|line| line.trim() == "LimitCORE = 0;"),
             "nix/module.nix irlumed serviceConfig must set LimitCORE = 0"
         );
-    }
-
-    /// The packaged unit's GPU launch environment (ADR-0033, #1162). Its
-    /// `Environment=` entries in the namespaces the GPU stack reads (compute
-    /// runtime `NEO_`, `IGC_` and Level Zero `ZE_`, the OpenCL ICD loader's
-    /// `OCL_` and `OPENCL_`, and the locale) are exactly the cache-off
-    /// intent, which `npu` builds also check against `gpu-candidate-inputs-v1`
-    /// itself. None of them may be named by `UnsetEnvironment=`: systemd
-    /// applies it last, so it would silently undo the pin. Every unset name
-    /// stays in those namespaces, leaving generic loader variables to an
-    /// administrator's drop-in for the CPU path. `check-packaging-parity.sh`
-    /// keeps the NixOS module and `scripts/install-host.sh` on these lines.
-    #[test]
-    fn irlumed_units_pin_the_gpu_launch_environment() {
-        fn gpu_scoped(name: &str) -> bool {
-            name == "LANG"
-                || ["NEO_", "IGC_", "ZE_", "OCL_", "OPENCL_", "LC_"]
-                    .iter()
-                    .any(|prefix| name.starts_with(prefix))
-        }
-        // One assignment per `Environment=` line, quoted or bare, as the
-        // units write them; any other form fails rather than being misread.
-        fn read(unit: &str) -> (Vec<(&str, &str)>, Vec<&str>) {
-            let mut environment = Vec::new();
-            let mut unset = Vec::new();
-            for line in unit.lines().map(str::trim) {
-                if let Some(value) = line.strip_prefix("Environment=") {
-                    let quoted = value.strip_prefix('"').and_then(|v| v.strip_suffix('"'));
-                    let assignment = quoted.unwrap_or(value);
-                    assert!(
-                        !assignment.contains(['"', '\\'])
-                            && (quoted.is_some() || !assignment.contains(char::is_whitespace)),
-                        "not one plain assignment: {line}"
-                    );
-                    let pair = assignment.split_once('=');
-                    environment.push(pair.unwrap_or_else(|| panic!("no assignment: {line}")));
-                } else if let Some(names) = line.strip_prefix("UnsetEnvironment=") {
-                    unset.extend(names.split_whitespace());
-                }
-            }
-            (environment, unset)
-        }
-
-        // The reader sees both spellings, and the policy refuses an ICD
-        // override, so neither half below can pass by reading nothing.
-        let (control, control_unset) = read(
-            "Environment=\"OCL_ICD_VENDORS=/etc/x.icd\"\nEnvironment=ZE_AFFINITY_MASK=0\n\
-             UnsetEnvironment=A B\n",
-        );
-        assert_eq!(
-            control,
-            [("OCL_ICD_VENDORS", "/etc/x.icd"), ("ZE_AFFINITY_MASK", "0")]
-        );
-        assert_eq!(control_unset, ["A", "B"]);
-
-        let unit = include_str!("../../../packaging/systemd/irlumed.service");
-        let (environment, unset) = read(unit);
-        let gpu: Vec<(&str, &str)> = environment
-            .into_iter()
-            .filter(|(name, _)| gpu_scoped(name))
-            .collect();
-        assert_eq!(
-            gpu,
-            [("NEO_CACHE_PERSISTENT", "0")],
-            "packaging/systemd/irlumed.service GPU launch environment"
-        );
-        assert!(!unset.is_empty(), "the unit unsets the GPU overrides");
-        for name in &unset {
-            assert!(gpu_scoped(name), "{name} is not a GPU stack variable");
-            assert!(
-                gpu.iter().all(|(set, _)| set != name),
-                "UnsetEnvironment={name} undoes the unit's own pin"
-            );
-        }
-
-        #[cfg(feature = "npu")]
-        {
-            use irlume_auth::npu::gpu::launch;
-            use std::ffi::OsStr;
-            fn as_os<'a>(entries: &[(&'a str, &'a str)]) -> Vec<(&'a OsStr, &'a OsStr)> {
-                entries
-                    .iter()
-                    .map(|&(name, value)| (OsStr::new(name), OsStr::new(value)))
-                    .collect()
-            }
-            let policy = OsStr::new(launch::POLICY_ID);
-            let checked = launch::validate(policy, &as_os(&gpu))
-                .expect("the unit's GPU environment satisfies the candidate policy");
-            assert_eq!(checked.policy_id(), launch::POLICY_ID);
-            assert_eq!(checked.neo_cache_policy(), launch::NeoCachePolicy::Disabled);
-            assert_eq!(
-                launch::validate(policy, &as_os(&control)),
-                Err(launch::GpuLaunchInputError::UnsupportedName)
-            );
-        }
     }
 
     /// A tamper gate must not be switched off by a capitalisation (#365).
@@ -21177,68 +20899,11 @@ mod tests {
             .is_some_and(|at| at < publish));
     }
 
-    #[test]
-    fn recognizer_gpu_switch_reads_machine_config_and_environment_only() {
-        let _g = env_lock();
-        let _sb = sandbox("recognizer-gpu-switch");
-        struct Restore(&'static str, Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(value) => std::env::set_var(self.0, value),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-        let _restore_gpu = Restore("IRLUME_GPU", std::env::var_os("IRLUME_GPU"));
-        let _restore_npu = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
-        std::env::remove_var("IRLUME_GPU");
-        std::env::remove_var("IRLUME_NPU");
-        let settings = irlume_common::config::config_path("settings.conf");
-        let switch = || npu_placement::SettingsSnapshot::read().gpu_switch_allows();
-
-        // An absent file leaves the GPU switch permissive.
-        assert!(switch());
-        // Any off line wins over any on line, and malformed input disables.
-        for (text, expected) in [
-            ("gpu=on\n", true),
-            ("gpu=off\n", false),
-            ("gpu=on\ngpu=on\n", false),
-            ("gpu=on\ngpu=off\n", false),
-            ("gpu: off\n", false),
-            ("gpu\n", false),
-            ("gpu=maybe\n", false),
-            ("gpu=\n", false),
-            ("npu=off\n", true),
-        ] {
-            std::fs::write(&settings, text).unwrap();
-            assert_eq!(switch(), expected, "{text:?}");
-        }
-        std::fs::remove_file(&settings).unwrap();
-        std::fs::create_dir(&settings).unwrap();
-        assert!(!switch(), "an unreadable settings file disables");
-        std::fs::remove_dir(&settings).unwrap();
-        // Either source disabling wins, independently of the NPU switch.
-        std::fs::write(&settings, "gpu=on\nnpu=off\n").unwrap();
-        std::env::set_var("IRLUME_NPU", "off");
-        assert!(
-            switch(),
-            "the NPU-named keys never leak into the GPU switch"
-        );
-        std::env::remove_var("IRLUME_NPU");
-        std::env::set_var("IRLUME_GPU", "0");
-        assert!(!switch());
-        std::env::set_var("IRLUME_GPU", "garbage");
-        assert!(!switch());
-    }
-
     #[cfg(not(feature = "npu"))]
     #[test]
     fn non_npu_builds_stamp_selection_reasons_at_publish() {
         let _g = env_lock();
-        let _sb = sandbox("gpu-reason-publish");
-        let previous_gpu = std::env::var_os("IRLUME_GPU");
-        std::env::remove_var("IRLUME_GPU");
+        let _sb = sandbox("selection-reason-publish");
         let plan = |device: &str, bytes: &[u8]| {
             recognizer_selection::Plan::resolve(
                 Some(std::ffi::OsStr::new(device)),
@@ -21249,93 +20914,122 @@ mod tests {
             recognizer_selection::selected_cpu_reason(plan("cpu", b"gpu=off")),
             Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
         );
-        assert_eq!(
-            recognizer_selection::selected_cpu_reason(plan("gpu", b"gpu=on")),
-            Some(irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON)
-        );
-        assert_eq!(
-            recognizer_selection::selected_cpu_reason(plan("gpu", b"gpu=off")),
-            Some(irlume_common::RECOGNIZER_GPU_DISABLED_REASON)
-        );
-        for keep in ["auto", "npu", "tpu", ""] {
+        for keep in ["auto", "npu", "gpu", "tpu", ""] {
             assert_eq!(
                 recognizer_selection::selected_cpu_reason(plan(keep, b"")),
                 None
             );
         }
-        match previous_gpu {
-            Some(value) => std::env::set_var("IRLUME_GPU", value),
-            None => std::env::remove_var("IRLUME_GPU"),
-        }
     }
 
     #[cfg(not(feature = "npu"))]
     #[test]
-    fn gpu_reason_keeps_the_successful_build_snapshot_until_rebuild() {
+    fn selection_reason_keeps_the_successful_build_snapshot_until_rebuild() {
         let _g = env_lock();
-        let _sb = sandbox("gpu-reason-snapshot");
+        let _sb = sandbox("selection-reason-snapshot");
         let _publication = recognizer_selection::preserve_publication();
-        let previous_gpu = std::env::var_os("IRLUME_GPU");
-        std::env::remove_var("IRLUME_GPU");
         let settings = irlume_common::config::config_path("settings.conf");
-        for (first, replacement, expected) in [
-            ("off", "on", irlume_common::RECOGNIZER_GPU_DISABLED_REASON),
-            (
-                "on",
-                "off",
-                irlume_common::RECOGNIZER_GPU_NOT_ADMITTED_REASON,
-            ),
-        ] {
-            std::fs::write(&settings, format!("recognizer_device=gpu\ngpu={first}\n")).unwrap();
-            let snapshot = npu_placement::SettingsSnapshot::read();
-            let plan = recognizer_selection::Plan::resolve(None, &snapshot);
-            let new_file = settings.with_extension("replacement");
-            std::fs::write(
-                &new_file,
-                format!("recognizer_device=cpu\ngpu={replacement}\n"),
-            )
-            .unwrap();
-            std::fs::rename(new_file, &settings).unwrap();
-            recognizer_selection::publish(plan);
-            for _ in 0..2 {
-                let mut placement = irlume_common::RecognizerPlacement {
-                    device: "cpu".into(),
-                    platform: None,
-                    reason: None,
-                    runtime_available: None,
-                    qualified: None,
-                    selection: None,
-                    ..Default::default()
-                };
-                stamp_recognizer_selection(&mut placement, recognizer_selection::current_plan());
-                assert_eq!(placement.selection.as_deref(), Some("gpu"));
-                assert_eq!(placement.reason.as_deref(), Some(expected));
-                assert_eq!(placement.selection_provenance, Some(plan.provenance()));
-            }
-            // A failed construction must not publish the replacement plan.
-            let config = EngineBuildConfig {
-                det: "/nonexistent/irlume-gpu-test-detector".into(),
-                model: String::new(),
-                adapter: String::new(),
-                adapter_required: false,
-                mesh: String::new(),
-                blaze: String::new(),
-                vit_pad: String::new(),
-                pad_ir: String::new(),
-                rgb_dev: String::new(),
-                ir_dev: String::new(),
+        std::fs::write(&settings, "recognizer_device=cpu\n").unwrap();
+        let snapshot = npu_placement::SettingsSnapshot::read();
+        let plan = recognizer_selection::Plan::resolve(None, &snapshot);
+        let new_file = settings.with_extension("replacement");
+        std::fs::write(&new_file, "recognizer_device=auto\n").unwrap();
+        std::fs::rename(new_file, &settings).unwrap();
+        recognizer_selection::publish(plan);
+        for _ in 0..2 {
+            let mut placement = irlume_common::RecognizerPlacement {
+                device: "cpu".into(),
+                ..Default::default()
             };
-            assert!(build_engine_from_config(&config, None).is_err());
-            let retained = recognizer_selection::current_plan().unwrap();
-            assert_eq!(retained.provenance(), plan.provenance());
+            stamp_recognizer_selection(&mut placement, recognizer_selection::current_plan());
+            assert_eq!(placement.selection.as_deref(), Some("cpu"));
             assert_eq!(
-                recognizer_selection::selected_cpu_reason(retained),
-                Some(expected)
+                placement.reason.as_deref(),
+                Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
+            );
+            assert_eq!(placement.selection_provenance, Some(plan.provenance()));
+        }
+        // A failed construction must not publish the replacement plan.
+        let config = EngineBuildConfig {
+            det: "/nonexistent/irlume-selection-test-detector".into(),
+            model: String::new(),
+            adapter: String::new(),
+            adapter_required: false,
+            mesh: String::new(),
+            blaze: String::new(),
+            vit_pad: String::new(),
+            pad_ir: String::new(),
+            rgb_dev: String::new(),
+            ir_dev: String::new(),
+        };
+        assert!(build_engine_from_config(&config, None).is_err());
+        let retained = recognizer_selection::current_plan().unwrap();
+        assert_eq!(retained.provenance(), plan.provenance());
+        assert_eq!(
+            recognizer_selection::selected_cpu_reason(retained),
+            Some(irlume_common::RECOGNIZER_CPU_SELECTED_REASON)
+        );
+    }
+
+    /// A `gpu` key or `IRLUME_GPU` left behind by a nightly build does nothing:
+    /// it neither moves the selection nor touches the NPU switch (ADR-0038
+    /// section 3). A stored `gpu` selection is an invalid value, so it warns and
+    /// resolves to `auto`.
+    #[test]
+    fn retired_gpu_settings_have_no_effect() {
+        let _g = env_lock();
+        let _sb = sandbox("retired-gpu-settings");
+        struct Restore(&'static str, Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _restore_gpu = Restore("IRLUME_GPU", std::env::var_os("IRLUME_GPU"));
+        let _restore_device = Restore(
+            "IRLUME_RECOGNIZER_DEVICE",
+            std::env::var_os("IRLUME_RECOGNIZER_DEVICE"),
+        );
+        std::env::remove_var("IRLUME_RECOGNIZER_DEVICE");
+        let plan = |bytes: &[u8]| {
+            recognizer_selection::Plan::resolve(
+                None,
+                &npu_placement::SettingsSnapshot::Bytes(bytes.to_vec()),
+            )
+        };
+        for gpu in [None, Some("0"), Some("garbage")] {
+            match gpu {
+                Some(value) => std::env::set_var("IRLUME_GPU", value),
+                None => std::env::remove_var("IRLUME_GPU"),
+            }
+            for text in [b"gpu=off".as_slice(), b"gpu=on", b"gpu=maybe"] {
+                let resolved = plan(text);
+                assert_eq!(resolved.selection(), recognizer_selection::Selection::Auto);
+                assert_eq!(resolved.warning(), None);
+            }
+            assert_eq!(
+                plan(b"gpu=off\nrecognizer_device=cpu").selection(),
+                recognizer_selection::Selection::Cpu
             );
         }
-        match previous_gpu {
-            Some(value) => std::env::set_var("IRLUME_GPU", value),
-            None => std::env::remove_var("IRLUME_GPU"),
+        for (env, text) in [
+            (None, b"recognizer_device=gpu".as_slice()),
+            (None, b"recognizer_device= GPU "),
+            (Some("gpu"), b"recognizer_device=cpu"),
+        ] {
+            let resolved = recognizer_selection::Plan::resolve(
+                env.map(std::ffi::OsStr::new),
+                &npu_placement::SettingsSnapshot::Bytes(text.to_vec()),
+            );
+            assert_eq!(resolved.selection(), recognizer_selection::Selection::Auto);
+            assert!(resolved.warning().is_some());
+            assert_eq!(
+                resolved.provenance().issue,
+                irlume_common::recognizer_selection::RecognizerSelectionIssue::InvalidValue
+            );
         }
     }
 
@@ -21375,8 +21069,6 @@ mod tests {
             ("auto", Selection::Auto),
             ("cpu", Selection::Cpu),
             ("npu", Selection::Npu),
-            ("gpu", Selection::Gpu),
-            (" GPU ", Selection::Gpu),
             ("Cpu", Selection::Cpu),
         ] {
             std::fs::write(&settings, format!("recognizer_device={raw}\n")).unwrap();
@@ -21404,6 +21096,7 @@ mod tests {
         for raw in [
             "recognizer_device=",
             "recognizer_device=tensor",
+            "recognizer_device=gpu",
             "recognizer_device",
             "recognizer_device: cpu",
             "recognizer_device:cpu",
@@ -21447,78 +21140,48 @@ mod tests {
             }
         }
         let _restore_switch = Restore("IRLUME_NPU", std::env::var_os("IRLUME_NPU"));
-        let _restore_gpu = Restore("IRLUME_GPU", std::env::var_os("IRLUME_GPU"));
         let _restore_device = Restore(
             "IRLUME_RECOGNIZER_DEVICE",
             std::env::var_os("IRLUME_RECOGNIZER_DEVICE"),
         );
         std::env::remove_var("IRLUME_NPU");
-        std::env::remove_var("IRLUME_GPU");
         std::env::remove_var("IRLUME_RECOGNIZER_DEVICE");
         let settings = irlume_common::config::config_path("settings.conf");
 
-        let attempt = |selection: Selection, npu: &str, gpu: &str| {
-            std::fs::write(&settings, format!("npu={npu}\ngpu={gpu}\n")).unwrap();
+        let attempt = |selection: Selection, npu: &str| {
+            std::fs::write(&settings, format!("npu={npu}\n")).unwrap();
             let snapshot = npu_placement::SettingsSnapshot::read();
             let plan = Plan::resolve(
                 Some(std::ffi::OsStr::new(match selection {
                     Selection::Auto => "auto",
                     Selection::Cpu => "cpu",
                     Selection::Npu => "npu",
-                    Selection::Gpu => "gpu",
                 })),
                 &snapshot,
             );
-            npu_placement::placement_attempt(
-                &plan,
-                snapshot.switch_allows(),
-                snapshot.gpu_switch_allows(),
-            )
+            npu_placement::placement_attempt(&plan, snapshot.switch_allows())
         };
 
         use npu_placement::PlacementAttempt;
         assert!(matches!(
-            attempt(Selection::Cpu, "on", "on"),
+            attempt(Selection::Cpu, "on"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::CpuSelected)
         ));
-        // A selected GPU is tried; the GPU context's closed loading
-        // admission is what keeps it on CPU (ADR-0033 section 4).
-        assert!(matches!(
-            attempt(Selection::Gpu, "on", "on"),
-            PlacementAttempt::TryGpu
-        ));
-        assert!(matches!(
-            attempt(Selection::Gpu, "off", "on"),
-            PlacementAttempt::TryGpu
-        ));
-        // The GPU kill switch wins over a selected GPU; the off state of
-        // the NPU-named keys never leaks into it (ADR-0033 section 8).
-        assert!(matches!(
-            attempt(Selection::Gpu, "on", "off"),
-            PlacementAttempt::Skip(irlume_auth::npu::CpuReason::GpuDisabled)
-        ));
-        if let PlacementAttempt::Skip(reason) = attempt(Selection::Gpu, "on", "off") {
-            assert_eq!(
-                reason.to_string(),
-                irlume_common::RECOGNIZER_GPU_DISABLED_REASON
-            );
-        }
         // The kill switch wins over a selected or automatic NPU attempt.
         assert!(matches!(
-            attempt(Selection::Npu, "off", "on"),
+            attempt(Selection::Npu, "off"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
         ));
         assert!(matches!(
-            attempt(Selection::Auto, "off", "on"),
+            attempt(Selection::Auto, "off"),
             PlacementAttempt::Skip(irlume_auth::npu::CpuReason::Disabled)
         ));
         assert!(matches!(
-            attempt(Selection::Npu, "on", "on"),
+            attempt(Selection::Npu, "on"),
             PlacementAttempt::TryNpu
         ));
-        // `auto` stays NPU-only until ranking evidence (ADR-0033 phase 6).
         assert!(matches!(
-            attempt(Selection::Auto, "on", "on"),
+            attempt(Selection::Auto, "on"),
             PlacementAttempt::TryNpu
         ));
     }

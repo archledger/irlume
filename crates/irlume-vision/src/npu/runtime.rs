@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// plugins/frontends/compiler/driver configuration, startup environment and
 /// the binding's process-global first-provider lifetime. No environment or
 /// machine setting may turn this refusal into an opt-in bypass.
-pub(super) fn admit_loading() -> Result<(), CpuReason> {
+pub(crate) fn admit_loading() -> Result<(), CpuReason> {
     Err(CpuReason::LoadingNotAdmitted)
 }
 

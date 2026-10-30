@@ -622,28 +622,10 @@ APPARMOR_RUNTIME_RULES=(
   "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/openvino-*/libopenvino*.so* mr,"
   "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/libze_*.so* mr,"
   "include if exists <local/irlumed-npu>"
-  # Both recognizer runtimes load oneTBB, whose allocator reads this sysctl;
+  # The NPU runtime loads oneTBB, whose allocator reads this sysctl;
   # the #1046 enforcing NPU attempt recorded the denial.
   "@{PROC}/sys/vm/nr_hugepages r,"
   "/sys/kernel/mm/transparent_hugepage/enabled r,"
-  # ADR-0033: optional GPU render nodes (no card nodes), the render-node and
-  # firmware walks, OpenCL ICD registrations with system layers denied
-  # unaudited, /usr/local runtime libraries and a GPU-only local include.
-  "/dev/dri/by-path/ r,"
-  "/dev/dri/renderD[0-9]* rw,"
-  "/sys/class/drm/ r,"
-  "/sys/kernel/debug/dri/ r,"
-  "/sys/kernel/debug/dri/*/ r,"
-  "/sys/kernel/debug/dri/*/{gt,tile}[0-9]*/ r,"
-  "/sys/kernel/debug/dri/*/tile[0-9]*/gt[0-9]*/ r,"
-  "/sys/kernel/debug/dri/*/{,tile[0-9]*/}gt[0-9]*/uc/ r,"
-  "/sys/kernel/debug/dri/*/{,tile[0-9]*/}gt[0-9]*/uc/{guc,huc}_info r,"
-  "/etc/OpenCL/vendors/ r,"
-  "/etc/OpenCL/vendors/*.icd r,"
-  "deny /etc/OpenCL/layers/ r,"
-  "/usr/local/{lib,lib64,lib/x86_64-linux-gnu}/{libigc,libigdfcl,libopencl-clang,libigdgmm,libOpenCL}*.so* mr,"
-  "/usr/local/{lib,lib64,lib/x86_64-linux-gnu}/{,intel-opencl/}libigdrcl*.so* mr,"
-  "include if exists <local/irlumed-gpu>"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   executable="${profile##*/}"
@@ -661,71 +643,6 @@ for profile in "${APPARMOR_PROFILES[@]}"; do
     fi
   done
 done
-
-echo
-echo "== GPU launch environment in every irlumed unit (#1162) =="
-# The packaged unit, the unit scripts/install-host.sh writes and the NixOS
-# module keep the compute runtime's persistent compiler cache off (the
-# gpu-candidate-inputs-v1 cache-off intent) and unset the OpenCL ICD loader's
-# overrides and the runtime's cache directory. A lane missing either half
-# runs a GPU stack whose cache or ICD set its environment can redirect. The
-# irlume-daemon test irlumed_units_pin_the_gpu_launch_environment checks the
-# packaged unit against the policy itself.
-GPU_UNSET_NAMES=(
-  OCL_ICD_VENDORS OPENCL_VENDOR_PATH OPENCL_LAYERS OPENCL_LAYER_PATH
-  OCL_ICD_PLATFORM_SORT OCL_ICD_DEFAULT_PLATFORM OCL_ICD_ASSUME_ICD_EXTENSION
-  NEO_CACHE_DIR
-)
-GPU_CACHE_LINE='Environment="NEO_CACHE_PERSISTENT=0"'
-GPU_UNSET_LINE="UnsetEnvironment=${GPU_UNSET_NAMES[*]}"
-# Only the [Service] section, and only the irlumed unit install-host.sh
-# writes: a line elsewhere in either file configures nothing.
-gpu_unit_service() {
-  case "$1" in
-    packaging/systemd/irlumed.service)
-      sed -n '/^\[Service\]$/,/^\[Install\]$/p' "$1" ;;
-    scripts/install-host.sh)
-      sed -n '/^cat > \/etc\/systemd\/system\/irlumed.service <<EOF$/,/^EOF$/p' "$1" |
-        sed -n '/^\[Service\]$/,/^\[Install\]$/p' ;;
-    *)
-      echo "  ERROR: no unit extraction known for $1" >&2
-      exit 1
-      ;;
-  esac
-}
-for lane in packaging/systemd/irlumed.service scripts/install-host.sh; do
-  service="$(gpu_unit_service "$lane")"
-  for line in "$GPU_CACHE_LINE" "$GPU_UNSET_LINE"; do
-    label="${line%%=*}"
-    if grep -Fqx -- "$line" <<<"$service"; then
-      printf '  ok    %-34s %s\n' "GPU $label" "$lane"
-    else
-      printf '  MISS  %-34s %s (want: %s)\n' "GPU $label" "$lane" "$line"
-      fail=1
-    fi
-  done
-done
-nix_irlumed="$(uncommented nix/module.nix | sed -n '/^    systemd\.services\.irlumed = {$/,/^    };$/p' |
-  sed 's/^[[:space:]]*//')"
-nix_environment="$(sed -n '/^environment = {$/,/^}/p' <<<"$nix_irlumed")"
-if grep -Fqx 'NEO_CACHE_PERSISTENT = "0";' <<<"$nix_environment"; then
-  printf '  ok    %-34s %s\n' "GPU Environment" nix/module.nix
-else
-  printf '  MISS  %-34s %s (irlumed environment NEO_CACHE_PERSISTENT = "0")\n' \
-    "GPU Environment" nix/module.nix
-  fail=1
-fi
-# No match must reach the MISS below, not end the script under pipefail.
-nix_unset="$(sed -n '/^UnsetEnvironment = \[$/,/^\];$/p' <<<"$nix_irlumed" |
-  { grep -oE '^"[A-Z0-9_]+"$' || true; } | tr -d '"' | sort | paste -sd' ' -)"
-want_unset="$(printf '%s\n' "${GPU_UNSET_NAMES[@]}" | sort | paste -sd' ' -)"
-if [ -n "$nix_unset" ] && [ "$nix_unset" = "$want_unset" ]; then
-  printf '  ok    %-34s %s\n' "GPU UnsetEnvironment" nix/module.nix
-else
-  printf '  MISS  %-34s %s (have: %s; want: %s)\n' \
-    "GPU UnsetEnvironment" nix/module.nix "$nix_unset" "$want_unset"
-  fail=1
-fi
 
 echo
 echo "== tmpfiles.d setgid lock dir shipped and applied in every lane (#542) =="

@@ -164,44 +164,13 @@ profile irlumed /usr/local/bin/irlumed flags=(attach_disconnected) {
   # ancestors, selected alias and canonical target (docs/NPU.md).
   include if exists <local/irlumed-npu>
 
-  # Shared by the NPU and GPU recognizer runtimes. The OpenVINO core and both
-  # device plugins link oneTBB, whose allocator reads the preallocated
-  # huge-page count once per process; abstractions/base grants /proc/meminfo
+  # The OpenVINO core and the NPU plugin link oneTBB, whose allocator reads the
+  # preallocated huge-page count once per process; abstractions/base grants /proc/meminfo
   # but not this sysctl. The #1046 enforcing NPU attempt recorded the denial.
   # The same initialization reads the transparent huge page mode, which
   # abstractions/base grants only from AppArmor 5.0.
   @{PROC}/sys/vm/nr_hugepages r,
   /sys/kernel/mm/transparent_hugepage/enabled r,
-
-  # ADR-0033 optional GPU recognizer. Loading admission and per-model
-  # certification still apply; these rules do not enable native loading. The
-  # OpenVINO, Level Zero, maps and cache rules above serve the GPU plugin too:
-  # its compile cache nests in /var/cache/irlume/npu/gpu, and the bound
-  # device's runtime-PM counter resolves under /sys/devices, read-only below.
-  # Render nodes only: the compute runtime lists /dev/dri/by-path and opens
-  # each render link. Card nodes stay closed.
-  /dev/dri/by-path/ r,
-  /dev/dri/renderD[0-9]* rw,
-  # The render-node walk; its entries resolve under /sys/devices.
-  /sys/class/drm/ r,
-  # GuC and HuC builds from i915 gt*/uc and xe tile*/gt*/uc, read-only.
-  /sys/kernel/debug/dri/ r,
-  /sys/kernel/debug/dri/*/ r,
-  /sys/kernel/debug/dri/*/{gt,tile}[0-9]*/ r,
-  /sys/kernel/debug/dri/*/tile[0-9]*/gt[0-9]*/ r,
-  /sys/kernel/debug/dri/*/{,tile[0-9]*/}gt[0-9]*/uc/ r,
-  /sys/kernel/debug/dri/*/{,tile[0-9]*/}gt[0-9]*/uc/{guc,huc}_info r,
-  # OpenCL ICD registrations. System layers never load, and the refused
-  # directory read is not audited.
-  /etc/OpenCL/vendors/ r,
-  /etc/OpenCL/vendors/*.icd r,
-  deny /etc/OpenCL/layers/ r,
-  # abstractions/base covers the compute runtime, IGC, gmmlib and the ICD
-  # loader under /usr/lib*. /usr/local needs these; libze_* is granted above.
-  /usr/local/{lib,lib64,lib/x86_64-linux-gnu}/{libigc,libigdfcl,libopencl-clang,libigdgmm,libOpenCL}*.so* mr,
-  /usr/local/{lib,lib64,lib/x86_64-linux-gnu}/{,intel-opencl/}libigdrcl*.so* mr,
-  # An administrator-selected prefix needs its own local rules (docs/NPU.md).
-  include if exists <local/irlumed-gpu>
 
   # Models: packaged location or a hand-installed repo checkout.
   /usr/share/irlume/models/*.onnx r,

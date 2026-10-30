@@ -68,67 +68,32 @@ class ContractTests(unittest.TestCase):
                     document = copy.deepcopy(status)
                     document["data"]["recognizer"]["selection"] = value
                     self.assertEqual(
-                        not validate(document), value in ["auto", "cpu", "npu", "gpu"]
+                        not validate(document), value in ["auto", "cpu", "npu"]
                     )
             # Absent when the daemon did not report one.
             document = copy.deepcopy(status)
             del document["data"]["recognizer"]["selection"]
             self.assertEqual(validate(document), [])
 
-    def test_recognizer_gpu_fields_are_optional_and_closed(self):
-        # ADR-0033 phase 3 adds fields, not enum values: a GPU placement keeps
-        # `device` cpu with its fixed reason and names the GPU in
-        # `accelerator`, and a daemon older than GPU reporting sends none of
-        # the new fields (MACHINE-API.md). These are the shapes the CLI writes
-        # for each, added to the 0.15.0 capture, which predates them.
+    def test_recognizer_fields_are_optional_and_closed(self):
+        # These are the shapes the CLI writes for each placement, added to the
+        # 0.15.0 capture, which predates them. The GPU fields and word of a
+        # nightly build are gone (ADR-0038): --strict refuses them.
         status = fixture("status-daemon-running-0.15.0.json")
-        gpu = {
-            "known": True, "device": "cpu",
-            "reason": "the recognizer runs on the GPU (accelerator: gpu); "
-                      "CPU stays the reference",
-            "selection": "gpu",
-            "selection_provenance": {"source": "settings", "issue": "none"},
-            "accelerator": "gpu", "gpu_platform": "cd34",
-            "gpu_runtime_available": True, "gpu_qualified": True,
+        npu = {
+            "known": True, "device": "npu",
+            "platform": "ab12", "runtime_available": True, "qualified": True,
+            "selection": "auto",
+            "selection_provenance": {"source": "default", "issue": "none"},
         }
         placements = {
-            "gpu": gpu,
-            "npu": {
-                "known": True, "device": "npu", "accelerator": "npu",
-                "platform": "ab12", "runtime_available": True, "qualified": True,
-                "selection": "auto",
-                "selection_provenance": {"source": "default", "issue": "none"},
-            },
+            "npu": npu,
             "older-daemon": {
                 "known": True, "device": "cpu",
                 "reason": "NPU discovery not reported; using CPU", "selection": "auto",
             },
             "unreported": {"known": False},
         }
-        gpu_fields = [
-            "accelerator", "gpu_platform", "gpu_runtime_available", "gpu_qualified"
-        ]
-
-        def one_of(*words):
-            return lambda value: isinstance(value, str) and value in words
-
-        def boolean(value):
-            return isinstance(value, bool)
-
-        # Each value replaces the field in the GPU placement. `device` stays
-        # the two words contract 1 names, so `gpu` there is rejected, and
-        # `accelerator` is absent on CPU rather than `cpu`.
-        cases = [
-            ("device", ["cpu", "npu", "gpu", "GPU", "tpu", "", None, 0],
-             one_of("cpu", "npu")),
-            ("accelerator", ["gpu", "npu", "cpu", "GPU", "NPU", "tpu", "", None, 0],
-             one_of("gpu", "npu")),
-            ("gpu_runtime_available",
-             [True, False, None, 0, 1, "true", "false", [], {}], boolean),
-            ("gpu_qualified", [True, False, None, 0, 1, "true", "false", [], {}], boolean),
-            ("gpu_platform", ["cd34", None, 0, True, [], {}],
-             lambda value: isinstance(value, str)),
-        ]
         for strict in [False, True]:
             validate, note = CONFORMANCE.load_validator(
                 ROOT / "schemas/machine-api-v1.schema.json", strict=strict
@@ -143,31 +108,28 @@ class ContractTests(unittest.TestCase):
             for name, recognizer in placements.items():
                 with self.subTest(strict=strict, placement=name):
                     self.assertEqual(validate(with_recognizer(recognizer)), [])
-            for field, values, accepted in cases:
-                for value in values:
-                    with self.subTest(strict=strict, field=field, value=value):
-                        document = with_recognizer(dict(gpu, **{field: value}))
-                        self.assertEqual(not validate(document), accepted(value))
-            # Every GPU field is optional: an older daemon omits it.
-            for field in gpu_fields:
-                with self.subTest(strict=strict, absent=field):
-                    recognizer = dict(gpu)
-                    del recognizer[field]
-                    self.assertEqual(validate(with_recognizer(recognizer)), [])
+            # `device` stays the two words contract 1 names.
+            for value in ["cpu", "npu", "gpu", "GPU", "tpu", "", None, 0]:
+                with self.subTest(strict=strict, field="device", value=value):
+                    document = with_recognizer(dict(npu, device=value))
+                    self.assertEqual(not validate(document), value in ["cpu", "npu"])
             # The recognizer object is described, so --strict closes it.
-            with self.subTest(strict=strict, field="undocumented"):
-                document = with_recognizer(dict(gpu, undocumented=True))
-                self.assertEqual(not validate(document), not strict)
+            for field in [
+                "undocumented", "accelerator", "gpu_platform",
+                "gpu_runtime_available", "gpu_qualified",
+            ]:
+                with self.subTest(strict=strict, field=field):
+                    document = with_recognizer(dict(npu, **{field: True}))
+                    self.assertEqual(not validate(document), not strict)
 
     def test_doctor_recognizer_rows_validate_in_info_and_unknown_states(self):
-        # The eight rows `doctor` writes from the daemon's Health answer, in
-        # each branch's states: an answer with a GPU placement, an answer from
-        # a daemon older than GPU reporting, a Health without the report, and
-        # no answer. The last two give only the first row a detail.
+        # The five rows `doctor` writes from the daemon's Health answer, in
+        # each branch's states: an answer with an NPU placement, an answer from
+        # an older daemon, a Health without the report, and no answer. The last
+        # two give only the first row a detail.
         rows = [
             "recognizer-device", "recognizer-selection", "npu-runtime",
-            "npu-qualification", "npu-platform", "gpu-runtime",
-            "gpu-qualification", "gpu-platform",
+            "npu-qualification", "npu-platform",
         ]
 
         def answered(*details):
@@ -182,16 +144,13 @@ class ContractTests(unittest.TestCase):
             ]
 
         cases = {
-            "gpu-placement": answered(
-                ("info", "GPU"),
-                ("info", "gpu; no build admits GPU placement yet; "
+            "npu-placement": answered(
+                ("info", "NPU"),
+                ("info", "npu; admission and certification still decide; "
                          "source: settings; issue: none"),
-                ("unknown", "runtime discovery was not attempted or reported"),
-                ("unknown", "no model qualification was reported"),
-                ("info", "no NPU platform identity was read"),
-                ("info", "available to this engine; GPU discovery succeeded"),
-                ("info", "qualified for this engine's GPU placement"),
-                ("info", "cd34"),
+                ("info", "available to this engine; NPU discovery succeeded"),
+                ("info", "qualified for this engine's NPU placement"),
+                ("info", "ab12"),
             ),
             "older-daemon": answered(
                 ("info", "CPU: NPU discovery not reported; using CPU"),
@@ -200,9 +159,6 @@ class ContractTests(unittest.TestCase):
                 ("unknown", "runtime discovery was not attempted or reported"),
                 ("unknown", "no model qualification was reported"),
                 ("info", "no NPU platform identity was read"),
-                ("unknown", "GPU discovery was not attempted or reported"),
-                ("unknown", "no GPU qualification was reported"),
-                ("info", "no GPU platform identity was read"),
             ),
             "predates-report": unanswered("the daemon predates this report"),
             "no-answer": unanswered("the daemon did not answer"),

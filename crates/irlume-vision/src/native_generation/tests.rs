@@ -462,10 +462,7 @@ fn graph_is_borrowed_descriptive_and_does_not_replace_certification() {
     assert!(std::ptr::eq(g.description(), &d));
     assert_eq!(g.policy_id(), POLICY_ID);
     #[cfg(feature = "npu")]
-    assert!(matches!(
-        crate::npu::gpu::discover(&crate::npu::RuntimeSelection::Automatic),
-        crate::npu::gpu::Discovery::NotAdmitted
-    ));
+    assert!(crate::npu::runtime::admit_loading().is_err());
 }
 
 #[test]

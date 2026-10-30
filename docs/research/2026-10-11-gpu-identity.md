@@ -1,5 +1,9 @@
 # GPU platform identity probe (ADR-0033 section 3)
 
+> **Superseded (2026-10-30):** GPU inference was removed by
+> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> conclusions below remain historical evidence for that decision.
+
 - **What:** #1053 identity measurements behind the complete GPU
   identity slice. A C probe read the GPU plugin's device properties
   through the real installed C API, matched the plugin's PCI report

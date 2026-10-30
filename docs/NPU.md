@@ -15,254 +15,25 @@ build feature does not bypass loading admission or model certification.
 
 `recognizer_device` in `/etc/irlume/settings.conf` (`IRLUME_RECOGNIZER_DEVICE`
 on the daemon overrides it) names the recognizer's intended device: `auto`
-(the default), `cpu`, `npu` or `gpu` (#1053). The selection never lowers a
-gate:
+(the default), `cpu` or `npu` (#1053). The selection never lowers a gate:
 
-- `auto` ranks certified devices. No accelerator placement is admitted and
-  certified today, so `auto` keeps the recognizer on CPU, exactly the
-  switch-gated behavior.
+- `auto` takes the switch-gated NPU path. No NPU placement is admitted and
+  certified today, so `auto` keeps the recognizer on CPU.
 - `cpu` keeps every probe on the CPU reference and skips NPU discovery and
   compile; the placement reason names the selection.
 - `npu` attempts NPU placement under the same admission and certification
   gates; the separate `npu`/`IRLUME_NPU` kill switch still wins.
-- `gpu` attempts GPU placement (ADR-0033 phase 3) under its own loading
-  admission and certification gates; the `gpu`/`IRLUME_GPU` kill switch still
-  wins. The GPU loading admission is closed in every build so far, so the
-  recognizer stays on CPU with "the GPU loading profile has not been
-  admitted", and nothing is resolved, loaded or written. Builds without the
-  `npu` feature keep the fixed GPU-selected reason. `auto` stays NPU-only
-  until ranking evidence places it (phase 6).
-
 An IR adapter keeps the recognizer on CPU whatever the selection (ADR-0022
 §2). An empty, unknown, duplicated or non-UTF-8 value, or an unreadable
 `settings.conf`, is a journal warning and resolves to `auto`; authentication
 never fails over the device preference. The selection joins the same single
-startup settings snapshot as both accelerator switches and the provider
-selection, and a restart applies a change.
-
-The GPU has its own kill switch beside the selection (ADR-0033 section 8):
-`gpu` in `/etc/irlume/settings.conf` and `IRLUME_GPU` on the daemon.
-An absent source leaves admission and certification to decide. An off,
-empty, malformed, non-UTF-8, duplicate or unreadable source disables GPU
-use; either disabling source wins, including against an enabling value
-from the other source. Both default and accelerator builds report the
-GPU-disabled reason from the governing startup snapshot. The NPU-named
-keys never leak into it.
+startup settings snapshot as the NPU switch and the provider selection, and a
+restart applies a change. GPU inference was removed (ADR-0038): a stored `gpu`
+is an unknown value, and a `gpu` key or `IRLUME_GPU` left behind is not read.
 
 Root and ordinary status callers receive these fixed public selection and
 switch reasons. Native provider error text remains privileged; ordinary
 callers receive its categorical projection.
-
-GPU groundwork ships behind the same closed loading admission as the NPU
-(ADR-0033 sections 2 to 4): discovery refuses before `dlopen`, a system
-exposing more than one GPU refuses placement until a reviewed rule selects
-one device. The identity observation is the complete ADR-0033 section 3
-set: runtime and GPU plugin builds (`Core::versions("GPU")`),
-plugin-reported name, capabilities, architecture, execution units,
-memory, and the provider endpoint, plus the loaded GuC/HuC firmware.
-Firmware reads walk every tile and GT, reject unreadable or conflicting
-reports, and allow xe's documented GuC-only GTs only alongside a complete
-agreeing pair. The plugin's `DEVICE_PCI_INFO` is parsed and must bind
-exactly one render node whose sysfs address and `vendor`/`device`
-attributes (`/sys/class/drm/renderD*/device`) match it; the firmware
-belongs to that node. The loader family the plugin resolved (`libOpenCL`
-or `libze_loader`, from `/proc/self/maps`) and the fixed compile
-configuration `batch=1;PERFORMANCE_HINT=LATENCY;INFERENCE_PRECISION_HINT=f32`
-are identity fields. The precision is `f32` since the 2026-10-21 amendment
-of ADR-0033: the plugin's `f16` default drifted outside the ADR-0022
-section 7 budget on both measured identities, while `f32` reproduced the
-CPU reference within 1e-6 ([the precision
-record](research/2026-10-21-gpu-f32-precision.md)). Every native library
-the enumeration mapped is
-hashed through one open file whose inode is kept, under ADR-0022's
-inode discipline: the whole file-backed executable inventory (minus the
-process executable, as the NPU execution inventory excludes it) plus
-the IR and ONNX frontends beside the core, because ICD enumeration maps
-foreign ICD libraries (a Mesa Rusticl ICD ran in the measured
-processes). `GPU_DRIVER_VERSION` is never read: reading it through the
-C API kills the process on the measured 2026.2.1 builds, so driver
-identity comes from the hashed mapped-library manifest.
-`GPU_DEVICE_TOTAL_MEM_SIZE` is reported but not hashed: the plugin answers
-it with `CL_DEVICE_GLOBAL_MEM_SIZE`, which the compute runtime derives on
-integrated GPUs from the boot's physical pages and GTT size, so it moves
-between boots of one platform (on the UX5406S `ec747155` under the earlier
-definition, which hashed it, is `1f570994` under this one; the
-[precision record](research/2026-10-21-gpu-f32-precision.md) has the
-recomputation). Every lane prints `<lane> identity field name=value` lines
-after its digest, one per hashed field and one per library, then the
-unhashed memory size; archive them with the run so a changed digest can be
-traced to the field that moved.
-
-This observation cannot key certification; the loading-admission and
-certification gates decide. The ignored `gpu_hw_*` tests collect the
-evidence. `gpu_hw_identity_binds_plugin_render_node_and_libraries` runs
-as root (debugfs joins the identity) and checks the binding, firmware,
-loader family and manifest on a real GPU;
-`gpu_hw_compile_parity_and_retirement_under_the_fixed_configuration`
-compiles the recognizer on `GPU.0` under the fixed configuration,
-requires `EXECUTION_DEVICES` to name the GPU, checks a parity canary
-against the CPU reference and re-verifies the mapped libraries after
-the compile (the retirement trigger). Run them like the `npu_hw_*` lane:
-
-```sh
-ulimit -c 0; cargo test -p irlume-vision --features npu --release \
-  --lib -- --ignored gpu_hw_ --test-threads 1 --nocapture
-```
-
-On a hybrid CPU, pin the process to performance cores (for example
-`taskset -c 0-3` on the UX5406S) or leave the affinity unrestricted: an
-affinity mask of two or more efficiency cores and no performance core
-aborts the 2026.2.1 GPU plugin's compile inside OpenVINO's stream
-executor configuration ([the precision
-record](research/2026-10-21-gpu-f32-precision.md)).
-
-`IRLUME_NPU_LIBRARY` selects a non-standard C API file, with
-`LD_LIBRARY_PATH` pointing the test process at that runtime root. Both
-lanes need the recognizer weights, from `IRLUME_NPU_TEST_MODELS`, an
-installed `/usr/share/irlume/models` tree or the repository `models/`
-tree. No certification table entry or loading profile exists.
-
-### Explicit cache controls
-
-Run all three cache-control processes from a root shell so GPU identity can
-read debugfs. Set the selected provider/model and CPU/TFLite runtime variables
-explicitly in that shell, as described in
-[the identity research note](research/2026-10-11-gpu-identity.md); privilege
-elevation may otherwise discard them. The recipe creates a private root-owned
-directory for the miss and subsequent hit.
-
-The opt-in cache control is outside the generic `gpu_hw_` sweep. Select it
-separately with an explicit mode. Miss and hit require an existing absolute
-UTF-8, caller-owned directory; the first miss refuses a nonempty directory
-without clearing it. Retain that directory unchanged for the subsequent
-automatic import. Bypass requires the directory variable to be unset.
-Use the same provider, models and GPU configuration for all three processes.
-
-```sh
-ulimit -c 0
-control=onnx::gpu_tests::gpu_groundwork_tests::gpu_cache_hw_model_cache_provenance_control
-cache_dir="$(mktemp -d /tmp/irlume-gpu-cache.XXXXXX)"
-IRLUME_GPU_CACHE_CONTROL_MODE=miss IRLUME_GPU_CACHE_CONTROL_DIR="$cache_dir" \
-  cargo test -p irlume-vision --features npu --release --lib -- \
-  --ignored --exact "$control" --test-threads 1 --nocapture
-IRLUME_GPU_CACHE_CONTROL_MODE=hit IRLUME_GPU_CACHE_CONTROL_DIR="$cache_dir" \
-  cargo test -p irlume-vision --features npu --release --lib -- \
-  --ignored --exact "$control" --test-threads 1 --nocapture
-env -u IRLUME_GPU_CACHE_CONTROL_DIR IRLUME_GPU_CACHE_CONTROL_MODE=bypass \
-  cargo test -p irlume-vision --features npu --release --lib -- \
-  --ignored --exact "$control" --test-threads 1 --nocapture
-```
-
-Require exact Core and compiled cache-directory readbacks, `NO` for miss
-and bypass, and `YES` for the automatic import. These are separate-process
-model-cache observations, not globally cold driver/compiler/OS state, a
-performance result or full certification. Each control makes twelve
-recognizer reference calls and counts zero endurance inferences; platform
-identity warm-up is separate. The recipe makes no power transition and
-does not supply the retained-model endurance or suspend protocols.
-The historical campaign remains bound to its recorded source and binary
-in [the cache receipt](research/2026-10-12-gpu-cache-provenance.md).
-
-### Retained-process reliability control
-
-The separate ignored control
-`onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control`
-keeps one recognizer request and four immutable synthetic references through
-400 pre-event, 300 runtime-event and 300 system-event calls. The first calls
-after each event count; setup, platform warm-up and CPU canaries do not. Every
-counted result must reproduce all finite output bits. An error or failed
-CPU/inventory/device-binding boundary stops the run without replacement calls.
-
-From the same root/provider/model/CPU/TFLite environment used for the cache
-controls, set `IRLUME_GPU_RELIABILITY_REFERENCE` to a regular JSON file with
-exactly these five fields (maximum 8192 bytes):
-
-| Field | Required value |
-|---|---|
-| `identity` | Prior matching GPU identity digest, 64 lowercase hex characters |
-| `cpu_reference` | Prior matching CPU reference digest, 64 lowercase hex characters |
-| `gpu_bits` | Array of four prior raw GPU output digests for `chip(0..3)`, in order |
-| `runtime_wait_secs` | Integer 0 through 600 |
-| `system_wait_secs` | Integer 0 through 600 |
-
-Use digests from the same previously verified synthetic receipt; the control
-refuses a changed identity or baseline. It compiles with verified model-cache
-bypass, fixed batch 1/LATENCY/f32 and explicit placement on the platform's sole
-enumerated device; the accepted assignment is that device's name (for example
-`GPU.0`) or the generic `GPU` some `EXECUTION_DEVICES` answers report. Do not
-derive a replacement reference from a failed run.
-
-Zero system wait supports unattended operational evidence only. A nonzero
-system wait additionally requires `IRLUME_GPU_RELIABILITY_ATTENDED=1`, set only
-after the operator is ready for this particular retained process. At the
-`RELIABILITY_READY` line after 700 counted calls, the operator initiates system
-suspend/resume. The control never invokes suspend or changes runtime-PM policy.
-
-```sh
-ulimit -c 0
-: "${IRLUME_GPU_RELIABILITY_REFERENCE:?set the prior-reference JSON path}"
-export IRLUME_GPU_RELIABILITY_REFERENCE
-control=onnx::gpu_tests::gpu_reliability_hardware_tests::gpu_retained_hw_reliability_control
-cargo test -p irlume-vision --features npu --release --lib -- \
-  --ignored --exact "$control" --test-threads 1 --nocapture
-```
-
-The runtime witness reads the bound PCI device's power metadata and counters,
-requiring active/suspended/suspended/active endpoints and positive suspended
-growth, with conservative clock bounds excluding material system sleep across
-the whole leg and its first four post-wait calls. System evidence requires a
-fresh clock-offset increase strictly greater than 1 ms. Neither idle delay nor
-historical counter totals suffice. Missing events yield explicitly inconclusive
-coverage even if all 1000 operational calls succeed; unavailable observations
-can refuse the run without attributing a GPU failure.
-
-On the `xe` driver the runtime witness is inconclusive by design while the
-model is retained: the Intel compute runtime creates its VM in long-running
-mode at device discovery and the kernel holds a runtime-PM reference for
-every such VM until the process exits, so the device never reads
-`suspended` while the OpenVINO GPU plugin is loaded (measured on the UX5406S
-on 2026-10-21, [the precision record](research/2026-10-21-gpu-f32-precision.md)).
-Prove the system arm there and archive the hold witness of the ADR-0033
-amendment of 2026-10-22: the lifetime diagnostic below with the display off,
-the retained control's runtime window with the device `active`, and the
-device suspending again after the process exits. `i915` hosts prove both
-arms.
-
-Archive actual phase counts, witnesses, identity, source and binary hashes.
-`RELIABILITY_COVERAGE_READY=true` is conditional evidence after owned resources
-are dropped, with `NORMAL_PROCESS_EXIT=PENDING`. Accept it only together with
-the exact process's normal exit and one passed selected test, no timeout/crash.
-Cargo exit zero alone is insufficient. This control supplies neither full
-certification nor production admission; CPU remains authoritative.
-
-### Runtime-PM lifetime diagnosis
-
-For an unexplained missing runtime event, the separate ignored selector
-`onnx::gpu_tests::gpu_pm_diagnostic_tests::gpu_pm_hw_lifetime_diagnostic`
-compares CPU-only baseline, warmed GPU platform/Core, retained recognizer request,
-request dropped, and platform dropped. Library-global state can survive Core
-destruction; observe a separate `baseline` process after the `lifetime` process
-has exited as well. This intentionally changes object lifetimes and counts **zero
-qualification/endurance calls**. It never initiates system sleep, changes power
-policy, blanks the display or stops other clients.
-
-Use the same root/runtime/model environment and current prior-reference JSON as
-the retained control, with its system wait set to0. Supply all four additional
-settings explicitly:
-
-- `IRLUME_GPU_PM_MODE=baseline` or `lifetime`;
-- `IRLUME_GPU_PM_RENDER_NODE=renderD128` (the selected device's actual node);
-- `IRLUME_GPU_PM_IDLE_SECONDS=60` (integer1 through120, identical across phases);
-- `IRLUME_GPU_PM_OUTPUT_DIR` naming an existing empty absolute directory owned
-  by the test's effective user and inaccessible to group/other users.
-
-Run with `--ignored --exact` and `--test-threads 1 --nocapture`. Each phase saves
-every valid metadata sample, clock bounds, counters and owned device handles in
-private JSON. Console output stays quiet inside each window to avoid per-sample
-rendering activity. Missing/changed metadata, non-AUTO control, counter decreases,
-unexcluded system sleep or changed reference/inventory refuses the comparison.
-Keep the external desktop conditions comparable; a difference or lack of one is
-diagnostic evidence, not automatic attribution to the provider or certification.
 
 ## Select a C API file
 
@@ -355,71 +126,11 @@ observation, and its audit interval must have no related AppArmor denial.
 An admitted runtime additionally needs actual NPU identity, cache and marker
 coverage under enforce before it is qualified.
 
-## GPU runtime paths and launch environment
-
-The GPU recognizer (ADR-0033) reuses the OpenVINO, Level Zero, process-maps
-and cache rules above; its compile cache nests in `/var/cache/irlume/npu/gpu`.
-Both executable-path profiles add, for the GPU stack only:
-
-- render nodes, found the way the Intel compute runtime enumerates them: a
-  listing of `/dev/dri/by-path/`, and read and write access to
-  `/dev/dri/renderD*`. Card nodes stay closed.
-- the `/sys/class/drm/` render-node walk. Device attributes, including the
-  runtime-PM counter the GPU guard reads, resolve under `/sys/devices`, which
-  is already readable.
-- read-only GuC and HuC reports under `/sys/kernel/debug/dri/`: i915
-  `gt*/uc/` and xe `tile*/gt*/uc/`.
-- the OpenCL ICD registrations in `/etc/OpenCL/vendors/`. The system layer
-  directory `/etc/OpenCL/layers/` is denied without an audit record, so no
-  OpenCL layer loads.
-- read and executable map of the compute runtime (`libigdrcl`, also in an
-  `intel-opencl/` subdirectory), IGC (`libigc`, `libigdfcl`,
-  `libopencl-clang`), gmmlib (`libigdgmm`) and the ICD loader (`libOpenCL`) in
-  the three `/usr/local` library directories. Copies under `/usr/lib*` are
-  already covered by the distribution's `abstractions/base`.
-
-Both runtimes share one more rule: oneTBB's allocator, loaded by the OpenVINO
-core and both device plugins, reads `/proc/sys/vm/nr_hugepages` once per
-process, and the #1046 enforcing NPU attempt recorded that denial. The same
-initialization reads `/sys/kernel/mm/transparent_hugepage/enabled`, which
-`abstractions/base` grants only from AppArmor 5.0, so both profiles allow it. As with the
-NPU rules, none of this establishes loading admission, model certification or
-enforcing GPU coverage; the GPU loading admission stays closed.
-
-The packaged unit, the NixOS module and the unit `scripts/install-host.sh`
-writes set `NEO_CACHE_PERSISTENT=0`, the cache-off intent of the
-`gpu-candidate-inputs-v1` policy; otherwise the compute runtime keeps a
-persistent compiler cache under `NEO_CACHE_DIR`, `XDG_CACHE_HOME` or `HOME`.
-They also unset `OCL_ICD_VENDORS`, `OPENCL_VENDOR_PATH`, `OPENCL_LAYERS`,
-`OPENCL_LAYER_PATH`, `OCL_ICD_PLATFORM_SORT`, `OCL_ICD_DEFAULT_PLATFORM`,
-`OCL_ICD_ASSUME_ICD_EXTENSION` and `NEO_CACHE_DIR`. systemd applies
-`UnsetEnvironment=` after every other environment source, so an
-`Environment=` line in a drop-in does not bring these back; a drop-in that
-resets the list with an empty `UnsetEnvironment=` does. Generic loader
-variables such as `LD_LIBRARY_PATH` are left alone, so a drop-in for the CPU
-path keeps working.
-
-For a compute runtime under an administrator-selected prefix, both
-executable-path profiles include the optional
-`/etc/apparmor.d/local/irlumed-gpu` file. Keep it separate from
-`irlumed-npu`, root-owned without group/other writes, and limited to the
-libraries the registered `.icd` file and its dependencies load. For a runtime
-built into `/opt/intel-gpu` whose `/etc/OpenCL/vendors/intel.icd` names
-`/opt/intel-gpu/lib/intel-opencl/libigdrcl.so`:
-
-```text
-/opt/intel-gpu/lib/intel-opencl/libigdrcl.so mr,
-/opt/intel-gpu/lib/libigc.so.2* mr,
-/opt/intel-gpu/lib/libigdfcl.so.2* mr,
-/opt/intel-gpu/lib/libopencl-clang*.so* mr,
-/opt/intel-gpu/lib/libigdgmm.so.12* mr,
-```
-
-Adjust these to the files the runtime actually maps, and avoid a blanket
-`/opt/** mr,`. Parse and reload the profile as above, then restart the daemon.
-Once an admitted GPU runtime exists, validate under enforce: discovery must
-read back the render node and firmware, and the audit interval must have no
-related AppArmor denial.
+oneTBB's allocator, loaded by the OpenVINO core and the NPU plugin, reads
+`/proc/sys/vm/nr_hugepages` once per process, and the #1046 enforcing NPU attempt
+recorded that denial. The same initialization reads
+`/sys/kernel/mm/transparent_hugepage/enabled`, which `abstractions/base` grants only
+from AppArmor 5.0, so both profiles allow it.
 
 ## Loading admission remains future work
 
@@ -475,25 +186,6 @@ live CPU/NPU reference checks remain binding under
 does not prove native dependency closure or replace loading admission. Real
 installation relocation and model certification still need their own evidence.
 
-### GPU certification key and placement
-
-A GPU entry keys on the numerics set (ADR-0033 amendment of 2026-10-22,
-`irlume-gpu-numerics-v1`): the device, firmware and configuration fields of
-the identity and the content of the OpenVINO libraries, the compute runtime's
-OpenCL and Level Zero drivers and gmmlib, IGC, opencl-clang, clang, LLVM and
-the SPIR-V translator, by library name. Every other mapped library must be on
-the reviewed support list (`crates/irlume-vision/src/npu/gpu_certification.rs`);
-an unlisted one refuses GPU placement and doctor names it. The support set's
-digest is recorded in the entry, and when the live one differs the engine
-build runs an extended reference set (sixteen more fixed inputs, each twice,
-bit-identical) before the GPU answers. An entry certified through the driver
-hold also arms a guard on the bound PCI device's
-`power/runtime_suspended_time`: growth with the model retained retires the
-GPU to CPU for the rest of the process and names re-certification. The exact
-identity digest still names the GPU cache, which lives in `gpu/` under the
-NPU cache directory, and the markers. The GPU loading admission refuses
-before any of this runs in every build so far.
-
 ## Read the status
 
 `irlume doctor` and `irlume status --json` report separate engine facts:
@@ -503,12 +195,8 @@ before any of this runs in every build so far.
 | `npu-runtime` | `recognizer.runtime_available` | `true` when discovery completed with a runtime/platform identity; `false` when discovery returned an error other than loading-admission refusal; omitted when unreported |
 | `npu-qualification` | `recognizer.qualified` | When runtime availability is `true`, whether the recognizer is currently placed on NPU after qualification and placement checks; otherwise omitted |
 | `recognizer-device` | `recognizer.device` | Current engine placement: `cpu` or `npu` |
-| `recognizer-selection` | `recognizer.selection` | The governing device selection (`recognizer_device`): `auto`, `cpu`, `npu` or `gpu` |
+| `recognizer-selection` | `recognizer.selection` | The governing device selection (`recognizer_device`): `auto`, `cpu` or `npu` |
 | `npu-platform` | `recognizer.platform` | Exact platform identity digest, when discovery obtained one |
-| `gpu-runtime` | `recognizer.gpu_runtime_available` | As `npu-runtime`, for GPU discovery |
-| `gpu-qualification` | `recognizer.gpu_qualified` | As `npu-qualification`, for GPU placement |
-| `gpu-platform` | `recognizer.gpu_platform` | Exact GPU identity digest, when GPU discovery obtained one |
-| `recognizer-device` (`GPU`) | `recognizer.accelerator` | `npu` or `gpu` when the probes run on that accelerator. A GPU placement keeps `recognizer.device` at `cpu`, which every released client knows, with a fixed reason |
 
 A loading-admission refusal reports no runtime observation. So does a failure
 in cache or marker preparation before discovery runs. Successful discovery
@@ -524,8 +212,7 @@ also keeps the recognizer on CPU.
 
 Apart from the fixed public selection/switch reasons above, non-root Health
 replies use fixed CPU-fallback categories: discovery not reported, runtime
-unavailable, or recognizer unavailable, named for the GPU when the GPU is
-selected. Native error details
+unavailable, or recognizer unavailable. Native error details
 are available only to root peers; the privileged journal also retains bounded
 detailed reasons. Consumers should use the fields, not parse reason text. See
 [Machine API](MACHINE-API.md) for the reporting contract.

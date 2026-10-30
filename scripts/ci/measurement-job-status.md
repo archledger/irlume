@@ -79,8 +79,26 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   another tree and a one-byte change in a copy of the tree were each
   refused. Without `--library-path` the laptop's tree loader maps the
   host's libraries, which H refuses; on archhost the host's libc does not
-  load at all. Still open: H2 (HostOwner from the tree, with the witness
-  bound into admission), H3 (the real admission directory, after owner
+  load at all. Second slice (H2), in source: a startup-only request, which
+  names the inert selection (`boot-only`, `supervisor-only`, the base and
+  payload digests), makes the entry run HostOwner's startup-only path in
+  the same process once its self-check has passed. HostOwner refuses to
+  run without that process's witness for exactly its selection. It writes
+  the witness to the attempt as `host-witness.json` (0400, fsynced) before
+  the claim and binds its digest into the intent (v2) and the completion
+  proof (v2); the resolver refuses an attempt whose witness is missing or
+  differs. H rechecks its process six times: before admission, immediately
+  before the claim, at the prestart and postservice phase rechecks, in the
+  connect recheck and before COMMIT. A module import or rebinding, or any
+  added, moved or removed file mapping since the self-check's second pass,
+  refuses; a change during admission refuses before the claim, so no
+  blocker is left. Jeepney is imported before the witness's last pass, and
+  the terminal check moved into `measurement-job-rooted-host.py`, so
+  HostOwner's graph needs neither `measurement-job-guardian-host.py` nor
+  `measurement-job.py`, `tomllib` or `shutil`; the witness's module list
+  asserts this. Tests run the tree process on a re-pinned copy with a
+  scratch admission directory patched in and a refusing manager. Still
+  open: the native H2 runs, H3 (the real admission directory, after owner
   confirmation), H4 (H loss) and the guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
@@ -145,7 +163,7 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 37 `scripts/ci/test-measurement-*.py` suites pass (872 tests), with
+All 37 `scripts/ci/test-measurement-*.py` suites pass (907 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. `test-measurement-job-host.py`
 needs a prepared runtime named by `IRLUME_HOST_RUNTIME` and fails without
 one. G runs with `KeyringMode=private`,

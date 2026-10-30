@@ -30,7 +30,8 @@ controller = load("rooted_handshake", "measurement-job-rooted-handshake.py")
 proof_tests = load("handshake_proof", "test-measurement-job-startup-witness.py")
 protocol = load("handshake_protocol", "measurement-job-rooted-protocol.py")
 artifact = load("handshake_artifact", "measurement-job-witness-file.py")
-host = load("handshake_host", "measurement-job-guardian-host.py")
+# H's terminal check (rooted-host), which the controller runs after DONE.
+host = load("handshake_host", "measurement-job-rooted-host.py")
 
 
 class Collected(NamedTuple):

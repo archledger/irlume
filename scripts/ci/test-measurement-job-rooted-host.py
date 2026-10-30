@@ -5,8 +5,10 @@
 
 import copy
 import hashlib
+import importlib
 import importlib.util
 import json
+import mmap
 import os
 import subprocess
 import sys
@@ -32,17 +34,58 @@ host = load("rooted_host", "measurement-job-rooted-host.py")
 native = load("h_native", "measurement-job-guardian-native.py")
 rooted_native = load("h_rooted_native", "measurement-job-rooted-native.py")
 inputs_module = load("h_inputs", "measurement-job-rooted-host-inputs.py")
+# R4's coordinator keeps its own copy of the terminal check; only the
+# agreement test below loads it.
 legacy_host = load("h_terminal", "measurement-job-guardian-host.py")
+entry = load("h_host_entry", "measurement-job-host.py")
 fixtures = load("h_fixtures", "test-measurement-job-rooted-bus.py")
 input_fixtures = load("h_input_fixtures", "test-measurement-job-rooted-host-inputs.py")
 channel_fixtures = load("h_channel_fixtures", "test-measurement-job-guardian.py")
+# Imported by no H module; an import of it inside the window must refuse.
+UNUSED = "colorsys"
+
+
+def witness_data(root, selection, facts=None, **changes):
+    """A canonical startup witness of this process for exactly selection.
+
+    facts are added to its observation; changes replace wire fields.
+    """
+    request = root.closure.canonical(host.host_request(selection))
+    wire = {
+        "scope": host.HOST_WITNESS_SCOPE,
+        "runtime": selection.runtime,
+        "request_sha256": hashlib.sha256(request).hexdigest(),
+        "manifest_sha256": selection.manifest_sha256,
+        "observation": {
+            "pid": os.getpid(),
+            "request_data": {"$bytes": request.hex()},
+            **(facts or {}),
+        },
+        "accepted": False,
+        "native_authorized": False,
+        "full_contract_proven": False,
+    }
+    wire.update(changes)
+    return root.closure.canonical(wire)
+
+
+def unchanged(deadline):
+    """A process recheck that finds the witnessed modules and mappings."""
+
+
+def refused_in_time(test, function, *args, **keywords):
+    """A refusal of a valid attempt is an assertion failure, not an error."""
+    try:
+        return function(*args, **keywords)
+    except (ValueError, OSError) as error:
+        test.fail(f"refused: {error!r}")
 
 
 class LeaseBusTests(unittest.TestCase):
     def setUp(self):
         self.runtime = rooted_native.load_runtime(native, rooted_native)
         self.support = host.Dependencies(
-            self.runtime, inputs_module, legacy_host.verify_service_terminal
+            self.runtime, inputs_module, host.verify_service_terminal
         )
         fixture = fixtures.protocol_tests.ProtocolTests()
         fixture.setUp()
@@ -308,7 +351,7 @@ class FactoryTests(unittest.TestCase):
         self.runtime = rooted_native.load_runtime(native, rooted_native)
         self.root = self.runtime.preflight.root
         self.support = host.Dependencies(
-            self.runtime, inputs_module, legacy_host.verify_service_terminal
+            self.runtime, inputs_module, host.verify_service_terminal
         )
         self.gate_path = self.path / "gate"
         self.gate_path.mkdir(mode=0o700)
@@ -325,9 +368,19 @@ class FactoryTests(unittest.TestCase):
             # H's own bus node, a stability coordinate only it observes.
             "bus": {"device": 1, "inode": 900},
         }
+        # Deadlines each process recheck saw; refuse_check refuses that call.
+        self.process_checks, self.refuse_check = [], None
+
+        def check(deadline):
+            self.process_checks.append(deadline)
+            if self.refuse_check == len(self.process_checks) - 1:
+                raise ValueError("host modules changed after the self-check")
+
+        self.witness = host.HostWitness(witness_data(self.root, self.selection), check)
         self.owner = host.HostOwner(
             self.selection,
             self.support,
+            witness=self.witness,
             gate_factory=lambda deadline: native.service.AdmissionGate(
                 self.gate_path, deadline
             ),
@@ -1372,7 +1425,12 @@ class FactoryTests(unittest.TestCase):
             (plan["root"]["device"], plan["root"]["inode"]): "native-root",
             key(Path(plan["root"]["path"] + plan["launcher"]["path"])): "launcher",
         }
-        for name in ("control.sock", "guardian-config.json", "host-intent.json"):
+        for name in (
+            "control.sock",
+            "guardian-config.json",
+            "host-intent.json",
+            "host-witness.json",
+        ):
             expected[key(attempt / name)] = f"{attempt.name}/{name}"
         self.assertEqual(
             self.scanned,
@@ -1404,7 +1462,12 @@ class FactoryTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry[0] for entry in record["attempt"]["entries"]],
-            ["control.sock", "guardian-config.json", "host-intent.json"],
+            [
+                "control.sock",
+                "guardian-config.json",
+                "host-intent.json",
+                "host-witness.json",
+            ],
         )
         self.assertEqual(
             record["failure_record"]["scope"], "contained-job-rooted-host-failure-v2"
@@ -1790,22 +1853,39 @@ class FactoryTests(unittest.TestCase):
         self.assertFalse((self.gate_path / "active.json").exists())
         self.assertIsNone(self.owner.gate.lock_fd)
 
-    def test_run_uses_real_host_controller_with_closed_artifact_and_stub_decoder(self):
-        messages, buses, options = [], [], []
+    def owner_start(self, factories):
+        """The owner as an embedder builds it, with its witness."""
+        self.owner = host.HostOwner(
+            self.selection, self.support, witness=self.witness, **factories
+        )
+        return self.owner.run()
+
+    def fake_run(self, start, bus_hook=None, decode_hook=None):
+        """start(factories) against a fake manager and peer; the kinds H sent.
+
+        bus_hook runs in the manager's creation, decode_hook in G's witness
+        decode: both inside the startup window. start's errors propagate.
+        """
+        messages, self.sent, self.buses, self.bus_options = [], [], [], []
         real_listener = host.socket.socket(host.socket.AF_UNIX, host.socket.SOCK_STREAM)
         self.addCleanup(real_listener.close)
         channel, listener = mock.Mock(), mock.Mock(wraps=real_listener)
         listener.accept.return_value = (mock.Mock(), None)
         channel.peer_fd = os.pidfd_open(os.getpid())
         self.addCleanup(os.close, channel.peer_fd)
+        channel.send.side_effect = lambda data, *args, **kwargs: self.sent.append(
+            self.root.guardian.decode(data)["kind"]
+        )
+        self.channel = channel
 
         def bus_factory(*args, **kwargs):
-            options.append(kwargs["fds"])
+            self.bus_options.append(kwargs["fds"])
             bus = self.make_bus(install=False)
-            buses.append(bus)
+            bus.stop = mock.Mock(return_value="/org/freedesktop/systemd1/job/77")
+            self.buses.append(bus)
+            if bus_hook is not None:
+                bus_hook()
             return bus
-
-        self.owner.bus_factory = bus_factory
 
         def make_channel(connected, peer):
             self.assertEqual(peer, (self.owner.identity.pid, os.getuid(), os.getgid()))
@@ -1841,7 +1921,7 @@ class FactoryTests(unittest.TestCase):
         channel.receive.side_effect = lambda *args, **kwargs: messages.pop(0)
 
         def terminal(*args):
-            bus = buses[0]
+            bus = self.buses[0]
             bus.service.update(
                 MainPID=("u", 0),
                 ExecMainCode=("i", 1),
@@ -1855,8 +1935,23 @@ class FactoryTests(unittest.TestCase):
 
         def decode(data, *args, **kwargs):
             self.assertEqual(data, b"{}")
+            if decode_hook is not None:
+                decode_hook()
             return {"started_ns": self.owner.value["origin_ns"]}
 
+        built = host.HostOwner
+
+        def capture(*args, **kwargs):
+            self.owner = built(*args, **kwargs)
+            return self.owner
+
+        factories = {
+            "gate_factory": lambda deadline: native.service.AdmissionGate(
+                self.gate_path, deadline
+            ),
+            "bus_factory": bus_factory,
+            "host_observer": lambda deadline: self.coordinates,
+        }
         with (
             mock.patch.object(host.socket, "socket", return_value=listener),
             mock.patch.object(
@@ -1869,8 +1964,15 @@ class FactoryTests(unittest.TestCase):
             mock.patch.object(
                 native, "ChildOwner", side_effect=AssertionError("legacy child path")
             ),
+            mock.patch.object(host, "HostOwner", side_effect=capture),
         ):
-            result = self.owner.run()
+            self.decoder = decoder
+            self.result = start(factories)
+        return self.sent
+
+    def test_run_uses_real_host_controller_with_closed_artifact_and_stub_decoder(self):
+        refused_in_time(self, self.fake_run, self.owner_start)
+        result, decoder, channel = self.result, self.decoder, self.channel
         self.assertEqual(result["outcome"], "startup-only-complete")
         self.assertIs(result["native_authorized"], False)
         self.assertIs(result["full_contract_proven"], False)
@@ -1880,10 +1982,10 @@ class FactoryTests(unittest.TestCase):
         self.assertIs(pages, self.owner.inputs.runtime.pages)
         self.assertIs(type(pages), types.MappingProxyType)
         self.assertIn("/usr/bin/python3", pages)
-        self.assertEqual(options, [True])
+        self.assertEqual(self.bus_options, [True])
         # Connect, its recheck and the recheck before COMMIT bind the peer.
         self.assertEqual(
-            [call[4] for call in buses[0].calls if call[2] == "GetUnitByPIDFD"],
+            [call[4] for call in self.buses[0].calls if call[2] == "GetUnitByPIDFD"],
             [(channel.peer_fd,)] * 3,
         )
         self.assertFalse((self.gate_path / "active.json").exists())
@@ -1892,6 +1994,23 @@ class FactoryTests(unittest.TestCase):
         self.assertTrue(
             all(value.fd is None for value in self.owner.inputs.files.values())
         )
+        self.assertEqual(self.sent, ["launch", "commit"])
+        self.buses[0].stop.assert_not_called()
+        # The process is rechecked before admission, before the claim, at both
+        # phases and in the connect and pre-COMMIT rechecks.
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.assertEqual(len(self.process_checks), 6)
+        self.assertEqual(
+            self.process_checks[1:],
+            [deadline] * 4 + [deadline + self.root.guardian.STOP_NS],
+        )
+        proof = json.loads((self.gate_path / "terminal-run-01.json").read_bytes())
+        self.assertEqual(proof.get("scope"), "contained-job-rooted-host-completion-v2")
+        self.assertEqual(
+            proof.get("host_witness_sha256"),
+            hashlib.sha256(self.witness.data).hexdigest(),
+        )
+        self.assertEqual(proof.get("startup"), result)
 
     def test_run_preparation_failure_closes_partial_owners(self):
         self.owner.selection = self.selection._replace(payload_sha256="0" * 64)
@@ -1920,6 +2039,7 @@ class FactoryTests(unittest.TestCase):
         another = host.HostOwner(
             self.selection,
             self.support,
+            witness=self.witness,
             gate_factory=mock.Mock(side_effect=AssertionError("must not reacquire")),
         )
         with self.assertRaises(ValueError):
@@ -2150,12 +2270,13 @@ class FactoryTests(unittest.TestCase):
         self.acquire()
         intent = self.root.closure.canonical(
             {
-                "scope": "contained-job-rooted-host-intent-v1",
+                "scope": "contained-job-rooted-host-intent-v2",
                 "config_sha256": self.owner.config.sha256,
                 "run_id": self.owner.spec.run_id,
                 "unit": self.root.guardian.unit_name(self.owner.spec),
                 "path": str(self.owner.path),
                 "client": self.owner.value["client"],
+                "host_witness_sha256": hashlib.sha256(self.witness.data).hexdigest(),
             }
         )
         allowance = self.root.guardian.HOST_RECEIPT_BUDGET - 48 * 1024
@@ -2179,6 +2300,644 @@ class FactoryTests(unittest.TestCase):
         self.assertLessEqual(self.owner.output_bytes + 512, allowance)
         self.assertGreater(self.owner.output_bytes + 2 * len(intent) + 512, allowance)
         self.assertFalse(self.owner.claim_attempted)
+
+    def owner_with(self, witness, **factories):
+        return host.HostOwner(
+            self.selection,
+            self.support,
+            witness=witness,
+            **{
+                "gate_factory": lambda deadline: native.service.AdmissionGate(
+                    self.gate_path, deadline
+                ),
+                "bus_factory": mock.Mock(side_effect=AssertionError("unexpected bus")),
+                "host_observer": lambda deadline: self.coordinates,
+                **factories,
+            },
+        )
+
+    def test_owner_refuses_to_run_without_this_process_witness(self):
+        gate = mock.Mock(side_effect=AssertionError("admission without a witness"))
+        data = self.witness.data
+        other = self.selection._replace(base_sha256="0" * 64)
+        self_check = self.root.closure.canonical(
+            {
+                "scope": host.HOST_REQUEST_SCOPE,
+                "mode": "self-check",
+                "runtime": self.selection.runtime,
+                "manifest": self.selection.manifest,
+                "manifest_sha256": self.selection.manifest_sha256,
+            }
+        )
+
+        def wire(facts=None, **changes):
+            return host.HostWitness(
+                witness_data(self.root, self.selection, facts, **changes),
+                unchanged,
+            )
+
+        cases = {
+            "none": None,
+            "bytes-only": data,
+            "text": host.HostWitness(data.decode(), unchanged),
+            "empty": host.HostWitness(b"", unchanged),
+            "oversized": host.HostWitness(
+                b" " * (host.HOST_WITNESS_LIMIT + 1), unchanged
+            ),
+            "no-check": host.HostWitness(data, None),
+            "mock-check": host.HostWitness(data, mock.Mock()),
+            "not-json": host.HostWitness(b"[" + data, unchanged),
+            "not-canonical": host.HostWitness(data + b"\n", unchanged),
+            "scope": wire(scope="contained-job-host-startup-witness-v2"),
+            "accepted": wire(accepted=True),
+            "native-authorized": wire(native_authorized=True),
+            "full-contract": wire(full_contract_proven=True),
+            "other-runtime": wire(runtime=self.selection.runtime + "x"),
+            "other-manifest": wire(manifest_sha256="0" * 64),
+            "other-process": wire({"pid": os.getpid() + 1}),
+            "pid-text": wire({"pid": str(os.getpid())}),
+            "observation-list": wire(observation=[{"pid": os.getpid()}]),
+            "other-selection": host.HostWitness(
+                witness_data(self.root, other), unchanged
+            ),
+            "self-check-request": wire(
+                {"request_data": {"$bytes": self_check.hex()}},
+                request_sha256=hashlib.sha256(self_check).hexdigest(),
+            ),
+            "request-digest": wire(request_sha256="0" * 64),
+            "request-text": wire({"request_data": self_check.decode()}),
+        }
+        # The shape is checked before the bytes are decoded.
+        shape = {
+            "none",
+            "bytes-only",
+            "text",
+            "empty",
+            "oversized",
+            "no-check",
+            "mock-check",
+        }
+        for label, witness in cases.items():
+            reason = "rooted host witness" + ("" if label in shape else " binding")
+            with (
+                self.subTest(label),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                host.HostOwner(
+                    self.selection, self.support, witness=witness, gate_factory=gate
+                )
+        gate.assert_not_called()
+        refused_in_time(self, self.owner_with, self.witness, gate_factory=gate)
+
+    def test_owner_refuses_a_bus_bridge_that_is_not_a_module(self):
+        gate = mock.Mock(side_effect=AssertionError("admission"))
+        for bridge in (object(), types.SimpleNamespace(RootedBus=None)):
+            with (
+                self.subTest(type(bridge).__name__),
+                self.assertRaisesRegex(ValueError, "^rooted host dependencies$"),
+            ):
+                self.owner_with(self.witness, gate_factory=gate, bus_bridge=bridge)
+        gate.assert_not_called()
+
+    def test_owner_preloads_jeepney_before_admission(self):
+        # SystemdBus imports Jeepney when it connects (guardian-service.py:82-83).
+        gate = mock.Mock(side_effect=AssertionError("admission"))
+        with mock.patch.dict(sys.modules):
+            for name in [
+                name
+                for name in sys.modules
+                if name == "jeepney" or name.startswith("jeepney.")
+            ]:
+                del sys.modules[name]
+            self.owner_with(self.witness, gate_factory=gate)
+            self.assertIn("jeepney", sys.modules)
+            self.assertIn("jeepney.io.blocking", sys.modules)
+            self.assertEqual(sys.modules["jeepney"].__version__, "0.9.0")
+        gate.assert_not_called()
+
+    def test_witness_is_written_and_bound_before_the_claim(self):
+        self.acquire()
+        digest = hashlib.sha256(self.witness.data).hexdigest()
+        claim, seen = self.owner.gate.claim, []
+
+        def checked_claim(run_id, intent, deadline):
+            path = self.owner.path / "host-witness.json"
+            info = path.lstat() if path.exists() else None
+            seen.append((path, info, json.loads(intent)))
+            return claim(run_id, intent, deadline)
+
+        with mock.patch.object(self.owner.gate, "claim", side_effect=checked_claim):
+            self.owner.prepare(
+                self.owner.config,
+                self.owner.inputs.manifest,
+                self.owner.value["startup_deadline_ns"],
+            )
+        self.assertEqual(len(seen), 1)
+        path, info, intent = seen[0]
+        self.assertIsNotNone(info, "no witness before the claim")
+        self.assertEqual((info.st_mode & 0o7777, info.st_nlink), (0o400, 1))
+        self.assertTrue(stat_is_file(info))
+        self.assertEqual(path.read_bytes(), self.witness.data)
+        self.assertEqual(intent.get("scope"), "contained-job-rooted-host-intent-v2")
+        self.assertEqual(intent.get("host_witness_sha256"), digest)
+        self.assertEqual(
+            set(intent),
+            {
+                "scope",
+                "config_sha256",
+                "run_id",
+                "unit",
+                "path",
+                "client",
+                "host_witness_sha256",
+            },
+        )
+        blocker = json.loads((self.gate_path / "active.json").read_bytes())
+        self.assertEqual(
+            json.loads(bytes.fromhex(blocker["intent_hex"])).get("host_witness_sha256"),
+            digest,
+        )
+        # The witness is no receipt: only config, intent and claim count.
+        written = (self.owner.path / "host-intent.json").read_bytes()
+        self.assertEqual(
+            self.owner.output_bytes,
+            len(self.owner.config.data) + len(written) + len(self.owner.gate.record),
+        )
+
+    def test_witness_has_its_own_cap_outside_the_receipt_budget(self):
+        data = witness_data(
+            self.root,
+            self.selection,
+            {"padding": "x" * (host.HOST_WITNESS_LIMIT - 4096)},
+        )
+        self.assertGreater(len(data), self.root.guardian.HOST_RECEIPT_BUDGET)
+        self.assertLessEqual(len(data), host.HOST_WITNESS_LIMIT)
+        self.owner = self.owner_with(host.HostWitness(data, unchanged))
+        self.acquire()
+        refused_in_time(
+            self,
+            self.owner.prepare,
+            self.owner.config,
+            self.owner.inputs.manifest,
+            self.owner.value["startup_deadline_ns"],
+        )
+        self.assertEqual((self.owner.path / "host-witness.json").read_bytes(), data)
+        with self.assertRaisesRegex(ValueError, "rooted host receipt selection"):
+            self.owner.write(
+                "host-witness", b"x", self.owner.value["startup_deadline_ns"]
+            )
+
+    def test_the_witness_receipt_takes_only_the_witness_bytes(self):
+        self.owner = self.owner_with(self.witness)
+        self.acquire()
+        with self.assertRaisesRegex(ValueError, "^rooted host receipt selection$"):
+            self.owner.write(
+                "host-witness", b"x", self.owner.value["startup_deadline_ns"]
+            )
+        self.assertFalse((self.owner.path / "host-witness.json").exists())
+
+    def test_a_changed_process_refuses_before_admission(self):
+        self.refuse_check = 0
+        with self.assertRaisesRegex(ValueError, "host modules changed"):
+            self.acquire()
+        self.assertEqual(len(self.process_checks), 1)
+        self.assertIsNone(self.owner.gate)
+        self.assertFalse((self.gate_path / "admission.lock").exists())
+
+    def test_a_changed_process_refuses_before_the_claim(self):
+        # A change during admission or input preparation (an NSS module the
+        # gate's getpwuid loads) refuses before the blocker is written, so the
+        # gate closes with nothing for the resolver to clear.
+        self.refuse_check = 1
+        with self.assertRaisesRegex(ValueError, "^host modules changed"):
+            self.owner.run()
+        self.assertEqual(len(self.process_checks), 2)
+        self.assertFalse(self.owner.claim_attempted)
+        self.assertIsNone(self.owner.gate.record)
+        self.assertEqual(
+            sorted(os.listdir(self.gate_path)), ["admission.lock", "attempt-run-01"]
+        )
+        self.assertTrue((self.owner.path / "host-intent.json").is_file())
+        self.assertNotIn(self.spec.run_id, host.UNRESOLVED)
+        self.owner.bus_factory.assert_not_called()
+        native.service.AdmissionGate(
+            self.gate_path, time.monotonic_ns() + 5_000_000_000
+        ).close()
+
+    def test_a_changed_process_refuses_before_the_manager(self):
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+        self.refuse_check = 2
+        with self.assertRaisesRegex(ValueError, "host modules changed"):
+            self.owner.start(self.owner.config, deadline)
+        self.assertEqual(self.process_checks[1:], [deadline] * 2)
+        self.owner.bus_factory.assert_not_called()
+
+    def test_a_changed_process_refuses_before_commit(self):
+        self.refuse_check = 4
+        with self.assertRaisesRegex(ValueError, "host modules changed"):
+            self.fake_run(self.owner_start)
+        self.assertEqual(self.sent, ["launch"])
+        self.assertEqual(len(self.process_checks), 5)
+        self.assertTrue((self.gate_path / "active.json").is_file())
+        self.assertFalse(list(self.gate_path.glob("terminal-*")))
+
+    def test_a_changed_process_blocks_the_commit_after_the_service(self):
+        _, record = self.terminal_owner()
+        self.refuse_check = len(self.process_checks)
+        with (
+            mock.patch.object(
+                self.owner.gate,
+                "complete",
+                side_effect=AssertionError("changed-process commit"),
+            ),
+            self.assertRaisesRegex(ValueError, "host modules changed"),
+        ):
+            self.owner.complete(record)
+        self.assertTrue((self.gate_path / "active.json").is_file())
+
+    def checked(self, check=None, request=None):
+        """A passed self-check of this process for the fixture selection."""
+        self.bridge = getattr(self, "bridge", None) or host.load_bus_bridge(
+            self.runtime
+        )
+        return entry.Checked(
+            self.selection.runtime,
+            request or host.host_request(self.selection),
+            self.witness.data,
+            check or self.witness.check,
+            self.runtime,
+            inputs_module,
+            host,
+            self.bridge,
+        )
+
+    def live_check(self):
+        """The entry's recheck of this process from a baseline taken now.
+
+        Jeepney is imported first, as the entry does before its passes.
+        """
+        importlib.import_module("jeepney.io.blocking")
+        self.checked()
+        roots = (*self.runtime.roots, inputs_module, host, self.bridge)
+        proc = self.runtime.preflight.filesystem.startup
+        reader = proc.ProcCollector(time.monotonic_ns() + 5_000_000_000)
+        modules = self.runtime.startup.module_snapshot(
+            roots, sys.modules, reader._after
+        )
+        with reader._open(f"/proc/{os.getpid()}", directory=True) as fd:
+            maps = reader._read(fd, "maps", proc.LIMITS["maps"])
+        return entry.process_check(roots, modules, maps, self.runtime.startup, proc)
+
+    def startup_only(self, factories, live=False):
+        return entry.startup_only(
+            self.checked(self.live_check() if live else None), **factories
+        )
+
+    def test_startup_only_mode_runs_the_owner_with_its_witness_bound(self):
+        refused_in_time(self, self.fake_run, self.startup_only)
+        self.assertEqual(self.sent, ["launch", "commit"])
+        self.assertEqual(self.result["outcome"], "startup-only-complete")
+        self.assertEqual(self.owner.selection, self.selection)
+        # The bridge and terminal check the witness covers, not reloaded ones.
+        self.assertIs(self.owner.bus_bridge, self.bridge)
+        self.assertIs(self.owner.support.terminal_check, host.verify_service_terminal)
+        self.assertIs(self.owner.support.inputs, inputs_module)
+        digest = hashlib.sha256(self.witness.data).hexdigest()
+        attempt = self.gate_path / "attempt-run-01"
+        self.assertEqual(
+            (attempt / "host-witness.json").read_bytes(), self.witness.data
+        )
+        intent = json.loads((attempt / "host-intent.json").read_bytes())
+        self.assertEqual(intent.get("host_witness_sha256"), digest)
+        proof = json.loads((self.gate_path / "terminal-run-01.json").read_bytes())
+        self.assertEqual(proof.get("host_witness_sha256"), digest)
+        self.assertEqual(len(self.process_checks), 6)
+        self.buses[0].stop.assert_not_called()
+
+    def test_startup_only_admits_only_through_the_production_gate(self):
+        # main()'s call: no factories, so no request field can name the gate.
+        # The manager is refused in case admission were reached another way.
+        service = self.runtime.native.service
+        production = mock.Mock(side_effect=ValueError("production gate"))
+        manager = mock.Mock(side_effect=AssertionError("production manager"))
+        built, owners = host.HostOwner, []
+
+        def capture(*args, **kwargs):
+            owners.append(built(*args, **kwargs))
+            return owners[-1]
+
+        with (
+            mock.patch.object(service.AdmissionGate, "for_current_user", production),
+            mock.patch.object(service, "SystemdBus", manager),
+            mock.patch.object(host, "HostOwner", side_effect=capture),
+            self.assertRaisesRegex(ValueError, "^production gate$"),
+        ):
+            entry.startup_only(self.checked())
+        production.assert_called_once()
+        self.assertEqual(len(owners), 1)
+        self.assertIs(owners[0].gate_factory, production)
+        self.assertIs(owners[0].bus_factory, manager)
+        manager.assert_not_called()
+        self.assertEqual(os.listdir(self.gate_path), [])
+
+    def test_main_writes_only_the_canonical_result_to_stdout(self):
+        record = {"outcome": "startup-only-complete", "native_authorized": False}
+        self_check = {
+            "scope": host.HOST_REQUEST_SCOPE,
+            "mode": "self-check",
+            "runtime": self.selection.runtime,
+            "manifest": self.selection.manifest,
+            "manifest_sha256": self.selection.manifest_sha256,
+        }
+        for checked, expected in (
+            (self.checked(), self.root.closure.canonical(record)),
+            (self.checked(request=self_check), self.witness.data),
+        ):
+            mode = checked.request["mode"]
+            with self.subTest(mode):
+                startup = mock.Mock(return_value=record)
+                path = self.path / ("stdout-" + mode)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                sys.stdout.flush()
+                saved = os.dup(1)
+                try:
+                    os.dup2(fd, 1)
+                    with (
+                        mock.patch.object(entry, "run", return_value=checked),
+                        mock.patch.object(entry, "startup_only", startup),
+                    ):
+                        code = entry.main()
+                finally:
+                    os.dup2(saved, 1)
+                    os.close(saved)
+                    os.close(fd)
+                self.assertEqual(code, 0)
+                self.assertEqual(path.read_bytes(), expected)
+                if mode == "startup-only":
+                    # No factories: production admission and manager.
+                    startup.assert_called_once_with(checked)
+                else:
+                    startup.assert_not_called()
+
+    def test_startup_only_mode_needs_its_own_startup_only_request(self):
+        gate = mock.Mock(side_effect=AssertionError("admission"))
+        self_check = {
+            "scope": host.HOST_REQUEST_SCOPE,
+            "mode": "self-check",
+            "runtime": self.selection.runtime,
+            "manifest": self.selection.manifest,
+            "manifest_sha256": self.selection.manifest_sha256,
+        }
+        # A request other than the one the witness names is refused by H.
+        other = dict(host.host_request(self.selection), payload_sha256="0" * 64)
+        for checked, reason in (
+            (self.checked(request=self_check), "host startup without"),
+            (self.checked(request=other), "rooted host witness"),
+            (tuple(self.checked()), "host startup without"),
+        ):
+            with self.subTest(reason=reason):
+                # A lookup or type error past the gate, or an acceptance, is a
+                # failure, not an error.
+                try:
+                    entry.startup_only(checked, gate_factory=gate)
+                except ValueError as error:
+                    self.assertRegex(str(error), "^" + reason)
+                except (KeyError, TypeError, AttributeError) as error:
+                    self.fail(f"not a refusal: {error!r}")
+                else:
+                    self.fail("accepted")
+        gate.assert_not_called()
+
+    def test_startup_only_mode_rechecks_the_live_process(self):
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop(UNUSED, None)
+            refused_in_time(
+                self,
+                self.fake_run,
+                lambda factories: self.startup_only(factories, True),
+            )
+            self.assertEqual(self.sent, ["launch", "commit"])
+            self.assertNotIn(UNUSED, sys.modules)
+
+    def live_refusal(self, reason, **hooks):
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop(UNUSED, None)
+            with self.assertRaisesRegex(ValueError, "^" + reason + "$"):
+                self.fake_run(
+                    lambda factories: self.startup_only(factories, True), **hooks
+                )
+        self.assertTrue((self.gate_path / "active.json").is_file())
+        self.assertFalse(list(self.gate_path.glob("terminal-*")))
+        return self.sent
+
+    def test_an_import_by_the_manager_connection_refuses_before_launch(self):
+        sent = self.live_refusal(
+            "host modules changed after the self-check",
+            bus_hook=lambda: importlib.import_module(UNUSED),
+        )
+        self.assertEqual(sent, [])
+
+    def test_an_import_inside_the_window_refuses_before_commit(self):
+        sent = self.live_refusal(
+            "host modules changed after the self-check",
+            decode_hook=lambda: importlib.import_module(UNUSED),
+        )
+        self.assertEqual(sent, ["launch"])
+
+    def test_a_new_file_mapping_inside_the_window_refuses_before_commit(self):
+        path = self.path / "mapped.bin"
+        path.write_bytes(b"\0" * mmap.PAGESIZE)
+        held = []
+
+        def map_file():
+            with path.open("rb") as file:
+                held.append(mmap.mmap(file.fileno(), 0, prot=mmap.PROT_READ))
+
+        self.addCleanup(lambda: [view.close() for view in held])
+        sent = self.live_refusal(
+            "host file mappings changed after the self-check", decode_hook=map_file
+        )
+        self.assertEqual(sent, ["launch"])
+        self.assertEqual(len(held), 1)
+
+    def rewrite_intent(self, value):
+        """Replace the attempt's intent and the claim naming it, consistently."""
+        run = self.spec.run_id
+        intent = self.root.closure.canonical(value)
+        path = self.gate_path / f"attempt-{run}" / "host-intent.json"
+        path.chmod(0o600)
+        path.write_bytes(intent)
+        path.chmod(0o400)
+        (self.gate_path / "active.json").write_bytes(
+            native.service.AdmissionGate.encode_claim(run, intent)
+        )
+
+    def test_resolver_binds_the_host_witness_a_v2_intent_names(self):
+        bus, _ = self.retained_failure()
+        attempt = self.gate_path / f"attempt-{self.spec.run_id}"
+        data = (attempt / "host-witness.json").read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        self.assertEqual(data, self.witness.data)
+        result = refused_in_time(self, self.resolve, bus)
+        entries = {
+            row[0]: row for row in json.loads(result.record)["attempt"]["entries"]
+        }
+        self.assertEqual(
+            entries.get("host-witness.json"),
+            ["host-witness.json", "file", len(data), digest],
+        )
+        intent = json.loads((attempt / "host-intent.json").read_bytes())
+        self.assertEqual(intent.get("host_witness_sha256"), digest)
+
+    def test_resolver_refuses_a_missing_extra_or_changed_witness(self):
+        bus, _ = self.retained_failure()
+        attempt = self.gate_path / f"attempt-{self.spec.run_id}"
+        witness = attempt / "host-witness.json"
+        data = witness.read_bytes()
+        original = json.loads((attempt / "host-intent.json").read_bytes())
+
+        def rewrite(new):
+            witness.chmod(0o600)
+            witness.write_bytes(new)
+            witness.chmod(0o400)
+
+        v1 = {key: original[key] for key in original if key != "host_witness_sha256"}
+        cases = {
+            "missing": (
+                "resolver host witness",
+                lambda: os.rename(witness, self.gate_path / "kept-witness"),
+                lambda: os.rename(self.gate_path / "kept-witness", witness),
+            ),
+            "changed": (
+                "resolver host witness",
+                lambda: rewrite(data + b" "),
+                lambda: rewrite(data),
+            ),
+            "other-digest": (
+                "resolver host witness",
+                lambda: self.rewrite_intent(
+                    dict(original, host_witness_sha256="0" * 64)
+                ),
+                lambda: self.rewrite_intent(original),
+            ),
+            "mode": (
+                "host-witness.json",
+                lambda: witness.chmod(0o600),
+                lambda: witness.chmod(0o400),
+            ),
+            "second-witness": (
+                "resolver attempt entry",
+                lambda: (
+                    (attempt / "host-witness-2.json").write_bytes(data),
+                    (attempt / "host-witness-2.json").chmod(0o400),
+                ),
+                lambda: (attempt / "host-witness-2.json").unlink(),
+            ),
+            "intent-extra-field": (
+                "resolver intent binding",
+                lambda: self.rewrite_intent(dict(original, witness_count=1)),
+                lambda: self.rewrite_intent(original),
+            ),
+            "intent-without-witness": (
+                "resolver intent binding",
+                lambda: self.rewrite_intent(v1),
+                lambda: self.rewrite_intent(original),
+            ),
+            # Recorded v1 attempts are not resolved by this resolver.
+            "intent-v1": (
+                "resolver intent binding",
+                lambda: self.rewrite_intent(
+                    dict(v1, scope="contained-job-rooted-host-intent-v1")
+                ),
+                lambda: self.rewrite_intent(original),
+            ),
+        }
+        for label, (pattern, apply, undo) in cases.items():
+            apply()
+            with self.subTest(label):
+                self.assert_refused(bus, pattern, (ValueError, OSError))
+            undo()
+        refused_in_time(self, self.resolve, bus)
+
+
+class TerminalCheckTests(unittest.TestCase):
+    """H's terminal check, moved from R4's coordinator, which keeps a copy."""
+
+    def setUp(self):
+        self.identity = native.guardian.ServiceIdentity(
+            "irlume-job-guardian-run-01.service", "d" * 32, 4242, "/x", 9_000_000_000
+        )
+        self.row = {
+            "Id": self.identity.unit,
+            "InvocationID": self.identity.invocation_id,
+            "MainPID": 0,
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": 1,
+            "ExecMainStatus": 0,
+            "ExecMainStartTimestampMonotonic": 2_000_000,
+            "ExecMainExitTimestampMonotonic": 3_000_000,
+        }
+
+    def cases(self):
+        proof = {"unit": self.row, "processes": ()}
+        yield "exact", proof, 2_000_000_000, 4_000_000_000
+        yield "extra-field", dict(proof, extra=1), 2_000_000_000, 4_000_000_000
+        yield "not-dict", [proof], 2_000_000_000, 4_000_000_000
+        yield (
+            "processes",
+            dict(proof, processes=((1, "x"),)),
+            2_000_000_000,
+            4_000_000_000,
+        )
+        yield "process-list", dict(proof, processes=[]), 2_000_000_000, 4_000_000_000
+        for key, value in (
+            ("Id", "other.service"),
+            ("InvocationID", "e" * 32),
+            ("MainPID", 7),
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "signal"),
+            ("ExecMainCode", 2),
+            ("ExecMainStatus", True),
+            ("ExecMainStartTimestampMonotonic", "2000000"),
+        ):
+            yield (
+                key,
+                dict(proof, unit=dict(self.row, **{key: value})),
+                2_000_000_000,
+                4_000_000_000,
+            )
+        yield "other-start", proof, 2_000_000_001, 4_000_000_000
+        yield "exit-after-now", proof, 2_000_000_000, 2_999_999_999
+        yield (
+            "exit-at-deadline",
+            dict(proof, unit=dict(self.row, ExecMainExitTimestampMonotonic=9_000_000)),
+            2_000_000_000,
+            10_000_000_000,
+        )
+
+    def outcome(self, check, proof, started, now):
+        try:
+            check(copy.deepcopy(proof), self.identity, started, now)
+        except ValueError as error:
+            return str(error)
+        return None
+
+    def test_terminal_proof_is_exact_and_agrees_with_the_r4_copy(self):
+        for label, proof, started, now in self.cases():
+            with self.subTest(label):
+                result = self.outcome(host.verify_service_terminal, proof, started, now)
+                self.assertEqual(result is None, label == "exact", result)
+                self.assertEqual(
+                    result,
+                    self.outcome(
+                        legacy_host.verify_service_terminal, proof, started, now
+                    ),
+                )
 
 
 if __name__ == "__main__":

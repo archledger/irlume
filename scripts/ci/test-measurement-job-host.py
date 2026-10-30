@@ -9,9 +9,12 @@ and a launcher built from them. Without it they refuse; no host fallback.
 """
 
 import copy
+import errno
 import hashlib
+import importlib
 import importlib.util
 import json
+import mmap
 import os
 import py_compile
 import re
@@ -21,8 +24,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+from builtins import BaseExceptionGroup
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 
@@ -39,6 +45,10 @@ state = load("host_runtime_state", "measurement-job-runtime-state.py")
 root = load("host_root", "measurement-job-root.py")
 witness = load("host_witness", "measurement-job-startup-witness.py")
 state_tests = load("host_state_fixtures", "test-measurement-job-runtime-state.py")
+owner = load("host_owner", "measurement-job-rooted-host.py")
+inputs_module = load("host_inputs", "measurement-job-rooted-host-inputs.py")
+startup_check = load("host_startup_check", "measurement-job-startup-check.py")
+proc = load("host_proc", "measurement-job-startup.py")
 closure = root.closure
 DEPS = host.Dependencies(state, root, witness)
 ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
@@ -118,6 +128,41 @@ def request_bytes(tree=TREE, manifest_sha256=None, **changes):
         "runtime": tree,
         "manifest": MANIFEST,
         "manifest_sha256": manifest_sha256 or synthetic_manifest()[2],
+    }
+    value.update(changes)
+    return closure.canonical(value)
+
+
+def specification(**changes):
+    """An inert startup selection as a startup-only request names it."""
+    value = {
+        "run_id": "run-01",
+        "boot_input_sha256": "a" * 64,
+        "build_sha256": "b" * 64,
+        "input_manifest_sha256": "c" * 64,
+        "mode": "boot-only",
+        "cases": ["supervisor-only"],
+        "first_epoch": 1,
+        "qemu": "/usr/bin/qemu-system-x86_64",
+        "base": "/home/u/.cache/run/inputs/base",
+        "payload": "/home/u/.cache/run/inputs/payload",
+        "overlay": "/home/u/.local/state/irlume-job-runner/attempt-run-01/overlay.qcow2",
+        "cpus": [0, 1],
+    }
+    value.update(changes)
+    return value
+
+
+def startup_request(tree=TREE, manifest_sha256=None, **changes):
+    value = {
+        "scope": host.REQUEST_SCOPE,
+        "mode": "startup-only",
+        "runtime": tree,
+        "manifest": MANIFEST,
+        "manifest_sha256": manifest_sha256 or synthetic_manifest()[2],
+        "specification": specification(),
+        "base_sha256": "d" * 64,
+        "payload_sha256": "e" * 64,
     }
     value.update(changes)
     return closure.canonical(value)
@@ -312,7 +357,10 @@ class HostRequestTests(unittest.TestCase):
                 None,
                 "host request scope or mode",
             ),
-            (request_bytes(mode="startup-only"), None, "host request scope or mode"),
+            # A startup-only request without its selection.
+            (request_bytes(mode="startup-only"), None, "invalid fields"),
+            (request_bytes(mode="other"), None, "host request scope or mode"),
+            (request_bytes(mode=["self-check"]), None, "host request scope or mode"),
             (
                 request_bytes(tree="/home/u/.cache/other/root"),
                 None,
@@ -343,6 +391,108 @@ class HostRequestTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "^" + reason + "$"),
             ):
                 host.decode_request(data_, digest or sha(data_), TREE, root)
+
+    def test_startup_only_request_names_one_inert_selection(self):
+        data = startup_request()
+        value = accepted(self, host.decode_request, data, sha(data), TREE, root)
+        self.assertEqual(value["mode"], "startup-only")
+        spec = accepted(self, host.specification, value, root)
+        self.assertEqual(
+            spec,
+            root.guardian.Specification(
+                **dict(specification(), cases=("supervisor-only",), cpus=(0, 1))
+            ),
+        )
+        cases = [
+            (startup_request(specification=None), "host request specification"),
+            (
+                startup_request(specification=specification(extra=1)),
+                "host request specification",
+            ),
+            (
+                startup_request(
+                    specification={**specification(), "cases": "supervisor-only"}
+                ),
+                "host request specification",
+            ),
+            (
+                startup_request(
+                    specification={
+                        **specification(),
+                        "cases": {"supervisor-only": 0},
+                    }
+                ),
+                "host request specification",
+            ),
+            (
+                startup_request(
+                    specification=specification(
+                        mode="runtime-candidate", cases=["normal"]
+                    )
+                ),
+                "host request specification",
+            ),
+            (
+                startup_request(
+                    specification=specification(cases=["supervisor-only", "normal"])
+                ),
+                "host request specification",
+            ),
+            (
+                startup_request(
+                    specification=specification(
+                        qemu="/usr/local/bin/qemu-system-x86_64"
+                    )
+                ),
+                "host request specification",
+            ),
+            (
+                startup_request(specification=specification(base="inputs/base")),
+                "host request specification",
+            ),
+            (
+                startup_request(specification=specification(cpus=[0, 0])),
+                "host request specification",
+            ),
+            (
+                startup_request(specification=specification(cpus=[[0], 1])),
+                "host request specification",
+            ),
+            (
+                startup_request(specification=specification(run_id="Run 01")),
+                "host request specification",
+            ),
+            (startup_request(base_sha256="D" * 64), "host request input digest"),
+            (startup_request(payload_sha256=1), "host request input digest"),
+            (startup_request(extra=1), "invalid fields"),
+            (startup_request(tree=TREE + "x"), "host request runtime"),
+        ]
+        for data_, reason in cases:
+            with (
+                self.subTest(reason=reason, data=data_[-120:]),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                host.decode_request(data_, sha(data_), TREE, root)
+
+    def test_request_and_witness_formats_are_the_ones_h_binds(self):
+        self.assertEqual(host.REQUEST_SCOPE, owner.HOST_REQUEST_SCOPE)
+        self.assertEqual(host.SCOPE, owner.HOST_WITNESS_SCOPE)
+        self.assertEqual(host.WITNESS_LIMIT, owner.HOST_WITNESS_LIMIT)
+        value = json.loads(startup_request())
+        spec = root.guardian.Specification(
+            **dict(value["specification"], cases=("supervisor-only",), cpus=(0, 1))
+        )
+        selection = inputs_module.Selection(
+            spec,
+            value["runtime"],
+            value["manifest"],
+            value["manifest_sha256"],
+            value["base_sha256"],
+            value["payload_sha256"],
+        )
+        self.assertEqual(
+            closure.canonical(owner.host_request(selection)), startup_request()
+        )
 
     def test_private_read_is_bounded_no_follow_and_owner_only(self):
         inputs = closure.inputs
@@ -504,6 +654,142 @@ class HostHookTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(result.stdout), {key: key != changed for key in keys}
                 )
+
+
+class HostProcessCheckTests(unittest.TestCase):
+    """The recheck HostOwner runs: the witness's module table and file mappings."""
+
+    def baseline(self):
+        roots = (host, state, root)
+        reader = proc.ProcCollector(deadline())
+        modules = startup_check.module_snapshot(roots, sys.modules, reader._after)
+        with reader._open(f"/proc/{os.getpid()}", directory=True) as fd:
+            maps = reader._read(fd, "maps", proc.LIMITS["maps"])
+        return host.process_check(roots, modules, maps, startup_check, proc)
+
+    def test_an_unchanged_process_passes_every_recheck(self):
+        check = self.baseline()
+        self.assertIs(type(check), types.FunctionType)
+        for _ in range(3):
+            accepted(self, check, deadline())
+
+    def test_an_import_or_a_rebound_module_refuses(self):
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("colorsys", None)
+            check = self.baseline()
+            importlib.import_module("colorsys")
+            with self.assertRaisesRegex(
+                ValueError, "^host modules changed after the self-check$"
+            ):
+                check(deadline())
+        check = self.baseline()
+        with (
+            mock.patch.object(host, "re", copy),
+            self.assertRaisesRegex(
+                ValueError, "^host modules changed after the self-check$"
+            ),
+        ):
+            check(deadline())
+        accepted(self, check, deadline())
+
+    def test_a_new_file_mapping_refuses_until_it_is_gone(self):
+        check = self.baseline()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mapped.bin"
+            path.write_bytes(b"\0" * mmap.PAGESIZE)
+            with (
+                path.open("rb") as file,
+                mmap.mmap(file.fileno(), 0, prot=mmap.PROT_READ),
+                self.assertRaisesRegex(
+                    ValueError, "^host file mappings changed after the self-check$"
+                ),
+            ):
+                check(deadline())
+        accepted(self, check, deadline())
+
+    def test_a_removed_file_mapping_refuses(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mapped.bin"
+            path.write_bytes(b"\0" * mmap.PAGESIZE)
+            with path.open("rb") as file:
+                view = mmap.mmap(file.fileno(), 0, prot=mmap.PROT_READ)
+            check = self.baseline()
+            view.close()
+            with self.assertRaisesRegex(
+                ValueError, "^host file mappings changed after the self-check$"
+            ):
+                check(deadline())
+
+    def test_a_mapping_with_a_non_ascii_path_refuses_with_the_fixed_reason(self):
+        check = self.baseline()
+        with tempfile.TemporaryDirectory() as folder:
+            name = os.path.join(os.fsencode(folder), b"mapped-\xc3\xa9.bin")
+            fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, b"\0" * mmap.PAGESIZE)
+                view = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
+            finally:
+                os.close(fd)
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "^host file mappings changed after the self-check$"
+                ):
+                    check(deadline())
+            finally:
+                view.close()
+        accepted(self, check, deadline())
+
+    def test_file_rows_are_the_file_backed_lines_as_printed(self):
+        maps = (
+            b"00400000-00401000 r-xp 00000000 00:01 7 /t/lib64/libc.so.6\n"
+            b"00401000-00402000 rw-p 00000000 00:00 0 [heap]\n"
+            b"00402000-00403000 rw-p 00000000 00:00 0\n"
+            b"00403000-00404000 r-xp 00000000 00:00 0 [vdso]\n"
+            b"00404000-00405000 r--p 00000000 00:05 9 /memfd:x (deleted)\n"
+        )
+        self.assertEqual(
+            host.file_rows(maps),
+            frozenset(
+                {
+                    "00400000-00401000 r-xp 00000000 00:01 7 /t/lib64/libc.so.6",
+                    "00404000-00405000 r--p 00000000 00:05 9 /memfd:x (deleted)",
+                }
+            ),
+        )
+        with self.assertRaises(ValueError):
+            host.file_rows(b"00400000-00401000 r-xp 00000000 00:01 7 /\xff\n")
+
+
+class HostReasonTests(unittest.TestCase):
+    def test_a_check_keeps_its_message_and_a_kernel_error_only_its_errno(self):
+        receipt = OSError("short rooted host receipt")
+        cases = (
+            (ValueError("host descriptors"), "host descriptors"),
+            (
+                TimeoutError("rooted host operation deadline"),
+                "rooted host operation deadline",
+            ),
+            # Raised by a check with a message and no errno.
+            (
+                FileExistsError("prior rooted ownership unresolved"),
+                "prior rooted ownership unresolved",
+            ),
+            (receipt, "short rooted host receipt"),
+            (
+                BaseExceptionGroup("cleanup", [receipt, ValueError("x")]),
+                "short rooted host receipt",
+            ),
+            # From the kernel: never its path.
+            (
+                FileNotFoundError(errno.ENOENT, "No such file", "/home/u/x"),
+                "OSError ENOENT",
+            ),
+            (OSError(), "OSError unknown"),
+            (KeyError("/home/u/x"), "KeyError"),
+        )
+        for error, expected in cases:
+            with self.subTest(expected):
+                self.assertEqual(host.reason(error), expected)
 
 
 def mount_line(number, parent, device, point, kind="ext4"):
@@ -719,6 +1005,28 @@ class HostValidateTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.refuses(reason, change)
 
+    def test_a_startup_only_request_is_bound_like_a_self_check(self):
+        def using(request):
+            def change(o):
+                o.update(
+                    request_data=request,
+                    argv=o["argv"][:3] + (sha(request),),
+                    orig_argv=o["orig_argv"][:-1] + (sha(request),),
+                )
+
+            return change
+
+        observation, data, digest, pages = synthetic()
+        using(startup_request(manifest_sha256=digest))(observation)
+        accepted(self, host.validate, observation, TREE, data, digest, pages, DEPS)
+        active = specification(mode="runtime-candidate", cases=["normal"])
+        self.refuses(
+            "host request specification",
+            using(
+                startup_request(manifest_sha256=synthetic()[2], specification=active)
+            ),
+        )
+
     def test_mount_view_maps_and_mapped_bytes(self):
         libc = b"0000000000009000-000000000000a000 r-xp 00000000 00:01 9 /usr/lib64/libc.so.6\n"
         cases = (
@@ -899,6 +1207,35 @@ def collect_python_state(*args, **keywords):
 """
 
 
+# The entry's call into HostOwner. A diagnostic runtime replaces this line to
+# name a scratch admission directory, never a request field; these tests
+# replace it the same way and refuse the manager, so no unit is created. Run
+# h2-import also imports a module after the self-check.
+STARTUP_LINE = (
+    "        selection, support, witness=witness, bus_bridge=checked.bridge, "
+    "**factories\n"
+)
+STARTUP_TEST = (
+    "        selection, support, witness=witness, bus_bridge=checked.bridge, "
+    "gate_factory=lambda deadline: test_gate({gates!r}, checked, deadline), "
+    "bus_factory=refuse_manager\n"
+)
+STARTUP_HELPERS = """
+
+def test_gate(gates, checked, deadline):
+    run_id = checked.request["specification"]["run_id"]
+    if run_id == "h2-import":
+        importlib.import_module("colorsys")
+    service = checked.runtime.native.service
+    return service.AdmissionGate(gates + "/" + run_id, deadline)
+
+
+def refuse_manager(*args, **keywords):
+    raise ValueError("test manager refused")
+"""
+MAIN = '\n\nif __name__ == "__main__":\n'
+
+
 def remove(path):
     """Remove a throwaway tree whose directories are read-only."""
     if not os.path.lexists(path):
@@ -1021,10 +1358,11 @@ class HostRuntimeTests(unittest.TestCase):
             cls.files = host.file_facts(snapshot, cls.tree)
 
     @classmethod
-    def copy_tree(cls, name, inputs_name, replaced=None):
+    def copy_tree(cls, name, inputs_name, replaced=None, qemu=False):
         """A re-pinned copy of the source tree at work/name, without the QEMU
-        member, with this checkout's modules and launcher; replaced maps a
-        member path to the bytes it gets instead."""
+        member unless qemu (a startup configuration selects it), with this
+        checkout's modules and launcher; replaced maps a member path to the
+        bytes it gets instead."""
         tree = cls.work / name
         tree.mkdir(mode=0o700)
         added = {
@@ -1036,7 +1374,7 @@ class HostRuntimeTests(unittest.TestCase):
         modes = {}
         for row in cls.pinned["members"]:
             path = row["path"]
-            if path == QEMU or path in added or REPLACED.fullmatch(path):
+            if (path == QEMU and not qemu) or path in added or REPLACED.fullmatch(path):
                 continue
             target = tree / path
             if row["kind"] == "directory":
@@ -1497,6 +1835,212 @@ class HostRuntimeTests(unittest.TestCase):
             dict(ENVIRONMENT),
         )
         self.refused(result, "host descriptors")
+
+    @classmethod
+    def startup_tree(cls):
+        """A re-pinned copy whose entry admits to scratch gates and refuses
+        the manager, with the QEMU member a startup configuration selects."""
+        if getattr(cls, "h2", None) is None:
+            # Short whatever TMPDIR is: control.sock must fit sun_path.
+            gates = tempfile.mkdtemp(prefix="irlume-h2-", dir="/tmp")
+            cls.addClassCleanup(remove, gates)
+            source = (HERE / Path(host.ENTRY).name).read_text()
+            if source.count(STARTUP_LINE) != 1 or source.count(MAIN) != 1:
+                raise RuntimeError("the entry's HostOwner call changed")
+            patched = source.replace(
+                STARTUP_LINE, STARTUP_TEST.format(gates=gates)
+            ).replace(MAIN, STARTUP_HELPERS + MAIN)
+            tree, manifest, data, digest = cls.copy_tree(
+                "h2-root", "h2-inputs", {host.ENTRY: patched.encode()}, qemu=True
+            )
+            with closure.RuntimeSnapshot.open(
+                str(tree), data, digest, deadline=deadline()
+            ) as snapshot:
+                pages = host.page_digests(snapshot, str(tree))
+            cls.h2 = types.SimpleNamespace(
+                gates=Path(gates),
+                tree=str(tree),
+                manifest=manifest,
+                data=data,
+                sha256=digest,
+                pages=pages,
+            )
+        return cls.h2
+
+    def startup_request(self, run_id):
+        """A startup-only request for run_id's own scratch gate and inputs."""
+        h2 = self.startup_tree()
+        gate = h2.gates / run_id
+        gate.mkdir(mode=0o700)
+        folder = self.work / ("h2-inputs-" + run_id)
+        folder.mkdir(mode=0o700)
+        inputs = {}
+        for name in ("base", "payload"):
+            data = f"inert {name} {run_id}\n".encode()
+            (folder / name).write_bytes(data)
+            (folder / name).chmod(0o400)
+            inputs[name] = str(folder / name), sha(data)
+        selection = {
+            "run_id": run_id,
+            "boot_input_sha256": inputs["base"][1],
+            "build_sha256": "b" * 64,
+            "input_manifest_sha256": h2.sha256,
+            "mode": "boot-only",
+            "cases": ["supervisor-only"],
+            "first_epoch": 1,
+            "qemu": "/usr/bin/qemu-system-x86_64",
+            "base": inputs["base"][0],
+            "payload": inputs["payload"][0],
+            "overlay": f"{gate}/attempt-{run_id}/overlay.qcow2",
+            "cpus": [0, 1],
+        }
+        path, digest = self.write_request(
+            "h2-request-" + run_id,
+            mode="startup-only",
+            runtime=h2.tree,
+            manifest=str(h2.manifest),
+            manifest_sha256=h2.sha256,
+            specification=selection,
+            base_sha256=inputs["base"][1],
+            payload_sha256=inputs["payload"][1],
+        )
+        return gate, path, digest
+
+    def test_startup_only_runs_the_owner_from_the_tree_with_its_witness_bound(self):
+        h2 = self.startup_tree()
+        gate, path, digest = self.startup_request("h2-tree-run")
+        poison = {**ENVIRONMENT, "LD_PRELOAD": "/untrusted.so", "PYTHONPATH": "/x"}
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 9, inheritable=True)
+            result = self.run_command(
+                "startup-only-scratch-gate",
+                [h2.tree + "/opt/irlume/launcher", "--host", path, digest],
+                poison,
+                pass_fds=(9,),
+            )
+        finally:
+            os.close(9)
+            os.close(inherited)
+        # H was admitted, wrote and bound its witness, passed the prestart
+        # recheck and only then reached the (refusing) manager.
+        self.refused(result, "test manager refused")
+        attempt = gate / "attempt-h2-tree-run"
+        self.assertEqual(
+            sorted(os.listdir(attempt)),
+            [
+                "control.sock",
+                "guardian-config.json",
+                "host-intent.json",
+                "host-witness.json",
+            ],
+        )
+        witness = attempt / "host-witness.json"
+        info = witness.lstat()
+        self.assertEqual(
+            (stat.S_IMODE(info.st_mode), info.st_nlink, info.st_uid),
+            (0o400, 1, os.getuid()),
+        )
+        data = witness.read_bytes()
+        self.assertLessEqual(len(data), host.WITNESS_LIMIT)
+        wire = accepted(self, host.decode, data, DEPS, deadline())
+        self.assertEqual((wire["runtime"], wire["request_sha256"]), (h2.tree, digest))
+        observation = wire["observation"]
+        accepted(
+            self,
+            host.validate,
+            observation,
+            h2.tree,
+            h2.data,
+            h2.sha256,
+            h2.pages,
+            DEPS,
+        )
+        intent_data = (attempt / "host-intent.json").read_bytes()
+        intent = json.loads(intent_data)
+        self.assertEqual(intent.get("scope"), "contained-job-rooted-host-intent-v2")
+        self.assertEqual(intent.get("host_witness_sha256"), sha(data))
+        claim = json.loads((gate / "active.json").read_bytes())
+        self.assertEqual(bytes.fromhex(claim["intent_hex"]), intent_data)
+        failure = json.loads((gate / "failed-h2-tree-run.json").read_bytes())
+        self.assertEqual(
+            (failure["reason"], failure["creation_attempted"], failure["created"]),
+            ("ValueError", False, False),
+        )
+        # Neither R4's coordinator nor what it imports ran in this process.
+        modules = observation["python"]["modules"]
+        names = {row["name"] for row in modules}
+        self.assertFalse(
+            names & {"tomllib", "shutil", "zlib", "_bz2", "_lzma", "_zstd"}, names
+        )
+        self.assertFalse(
+            [
+                row["origin"]
+                for row in modules
+                if str(row["origin"]).endswith(
+                    ("/measurement-job-guardian-host.py", "/measurement-job.py")
+                )
+            ]
+        )
+        self.assertIn("jeepney.io.blocking", names)
+        record = {
+            "witness_sha256": sha(data),
+            "witness_bytes": len(data),
+            "intent": intent,
+            "failure": failure,
+        }
+        (self.evidence / "startup-only-scratch-gate-attempt.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n"
+        )
+
+    def test_an_import_after_the_self_check_refuses_before_the_manager(self):
+        h2 = self.startup_tree()
+        gate, path, digest = self.startup_request("h2-import")
+        result = self.run_command(
+            "startup-only-import-after-self-check",
+            self.through_loader(tree=h2.tree, request=path, digest=digest),
+            dict(ENVIRONMENT),
+        )
+        # The gate factory imported a module; the recheck before the claim
+        # refused, so no blocker or failure record was written and the
+        # manager was never asked for anything.
+        self.refused(result, "host modules changed after the self-check")
+        self.assertEqual(
+            sorted(os.listdir(gate)), ["admission.lock", "attempt-h2-import"]
+        )
+        self.assertEqual(
+            sorted(os.listdir(gate / "attempt-h2-import")),
+            [
+                "control.sock",
+                "guardian-config.json",
+                "host-intent.json",
+                "host-witness.json",
+            ],
+        )
+
+    def test_a_failed_self_check_never_reaches_admission(self):
+        h2 = self.startup_tree()
+        gate, path, digest = self.startup_request("h2-unchecked")
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 5, inheritable=True)
+            result = self.run_command(
+                "startup-only-inherited-fd",
+                self.through_loader(tree=h2.tree, request=path, digest=digest),
+                dict(ENVIRONMENT),
+                pass_fds=(5,),
+            )
+        finally:
+            os.close(5)
+            os.close(inherited)
+        self.refused(result, "host descriptors")
+        result = self.run_command(
+            "startup-only-wrong-digest",
+            [h2.tree + "/opt/irlume/launcher", "--host", path, "0" * 64],
+            dict(ENVIRONMENT),
+        )
+        self.refused(result, "host request digest")
+        self.assertEqual(os.listdir(gate), [])
 
     def test_tree_loader_with_the_exact_environment_passes_without_the_launcher(self):
         # The control for the refusals above: the checks, not the launcher, decide.

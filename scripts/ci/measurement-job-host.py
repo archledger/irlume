@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""H's startup self-check from its selected runtime tree; no admission or bus.
+"""H from its selected runtime tree: a startup self-check, then HostOwner.
 
 The launcher's --host role execs the tree's own loader with the tree's
 interpreter and this entry, in the host namespaces. The entry loads the
-module graph HostOwner uses, proves its own process against the selected
+module graph HostOwner uses and proves its own process against the selected
 manifest (Python state, descriptors, every file mapping by identity and page
-bytes) and writes a canonical witness to fd 1. It never coordinates; the
-witness is evidence, not authority.
+bytes). A self-check request then writes the canonical witness to fd 1. A
+startup-only request runs HostOwner's startup-only path in this process, only
+after that check passed: H writes the witness to its attempt directory, binds
+its digest into the intent and completion proof, and refuses when a module or
+file mapping changes later. The witness is evidence, not authority.
 """
 
 import errno
@@ -39,6 +42,21 @@ PREFIX = str(PurePosixPath(PYTHON).parents[1])
 FLAGS = ("-I", "-S", "-B", "-X", "pycache_prefix=/dev/null")
 ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
 REQUEST_SCOPE = "contained-job-host-request-v1"
+REQUEST_FIELDS = {
+    "self-check": ("scope", "mode", "runtime", "manifest", "manifest_sha256"),
+    # rooted-host.py host_request: the fields of HostOwner's Selection.
+    "startup-only": (
+        "scope",
+        "mode",
+        "runtime",
+        "manifest",
+        "manifest_sha256",
+        "specification",
+        "base_sha256",
+        "payload_sha256",
+    ),
+}
+QEMU = "/usr/bin/qemu-system-x86_64"
 SCOPE = "contained-job-host-startup-witness-v1"
 REQUEST_LIMIT = 65536
 WITNESS_LIMIT = 1024**2
@@ -120,6 +138,19 @@ class Dependencies(NamedTuple):
     state: types.ModuleType
     root: types.ModuleType
     witness: types.ModuleType
+
+
+class Checked(NamedTuple):
+    """A passed self-check: its request, witness, recheck and graph."""
+
+    tree: str
+    request: dict
+    witness: bytes
+    check: object
+    runtime: object
+    inputs: types.ModuleType
+    owner: types.ModuleType
+    bridge: types.ModuleType
 
 
 def canonical_path(value):
@@ -264,10 +295,10 @@ def decode_request(data, digest, tree, root):
     ):
         raise ValueError("host request digest")
     value = root.runtime._json(data)
-    root.runtime._fields(
-        value, ("scope", "mode", "runtime", "manifest", "manifest_sha256")
-    )
-    if value["scope"] != REQUEST_SCOPE or value["mode"] != "self-check":
+    mode = value.get("mode") if type(value) is dict else None
+    fields = REQUEST_FIELDS.get(mode) if type(mode) is str else None
+    root.runtime._fields(value, fields or REQUEST_FIELDS["self-check"])
+    if value["scope"] != REQUEST_SCOPE or fields is None:
         raise ValueError("host request scope or mode")
     if value["runtime"] != tree:
         raise ValueError("host request runtime")
@@ -280,9 +311,43 @@ def decode_request(data, digest, tree, root):
         root.absolute_path(value["manifest"])
     except ValueError as error:
         raise ValueError("host request manifest") from error
+    if mode == "startup-only":
+        specification(value, root)
     if root.closure.canonical(value) != data:
         raise ValueError("host request encoding")
     return value
+
+
+def specification(value, root):
+    """The inert Specification a startup-only request names, and its digests."""
+    guardian = root.guardian
+    selected = value["specification"]
+    try:
+        root.runtime._fields(selected, guardian.Specification._fields)
+        if type(selected["cases"]) is not list or type(selected["cpus"]) is not list:
+            raise ValueError("host request specification arrays")
+        spec = guardian.Specification(
+            **dict(
+                selected, cases=tuple(selected["cases"]), cpus=tuple(selected["cpus"])
+            )
+        )
+        guardian.validate_spec(spec)
+    except (TypeError, ValueError) as error:
+        raise ValueError("host request specification") from error
+    # rooted-protocol.py validate_header: startup-only is inert.
+    if (
+        spec.mode != "boot-only"
+        or spec.cases != ("supervisor-only",)
+        or spec.qemu != QEMU
+    ):
+        raise ValueError("host request specification")
+    for name in ("base_sha256", "payload_sha256"):
+        if (
+            type(value[name]) is not str
+            or re.fullmatch("[0-9a-f]{64}", value[name]) is None
+        ):
+            raise ValueError("host request input digest")
+    return spec
 
 
 def read_private(inputs, path, limit, deadline):
@@ -597,6 +662,44 @@ def inventory(collector):
         raise ValueError("host descriptors") from error
 
 
+def file_rows(maps):
+    """Every file-backed line of a maps read, as the kernel printed it."""
+    rows = set()
+    for line in maps.decode("ascii").splitlines():
+        fields = line.split(None, 5)
+        if len(fields) == 6 and fields[4] != "0":
+            rows.add(line)
+    return frozenset(rows)
+
+
+def process_check(roots, modules, maps, checker, proc):
+    """HostOwner's recheck of this process against the witness's last pass.
+
+    modules and maps are the second pass's module snapshot and maps read,
+    which that pass checked. Any later import, rebound module or new, moved
+    or removed file mapping (a lazy import or dlopen) refuses: HostOwner runs
+    it before admission, before the claim, at each phase recheck and before
+    COMMIT.
+    """
+    baseline = file_rows(maps)
+
+    def check(deadline):
+        reader = proc.ProcCollector(deadline)
+        current = checker.module_snapshot(roots, sys.modules, reader._after)
+        if not checker.same_modules(modules, current):
+            raise ValueError("host modules changed after the self-check")
+        with reader._open(f"/proc/{os.getpid()}", directory=True) as fd:
+            data = reader._read(fd, "maps", proc.LIMITS["maps"])
+        # The witness's maps were ASCII (runtime-state.py:270).
+        if not data.isascii():
+            raise ValueError("host file mappings changed after the self-check")
+        if file_rows(data) != baseline:
+            raise ValueError("host file mappings changed after the self-check")
+        reader._after()
+
+    return check
+
+
 def run(initial):
     started = time.monotonic_ns()
     deadline = started + HOST_NS
@@ -718,6 +821,7 @@ def run(initial):
         sources = source_digests(last_modules)
         hooks = import_hooks()
         snapshot.check()
+    check = process_check(roots, last_modules, last[2], runtime.startup, startup)
     descriptors["final"] = inventory(reader)
     stdio["final"] = reader._stdio()
     observation = {
@@ -756,14 +860,47 @@ def run(initial):
         pages,
         dependencies,
     )
-    return encode(observation, tree, request["manifest_sha256"], dependencies, deadline)
+    data = encode(observation, tree, request["manifest_sha256"], dependencies, deadline)
+    return Checked(tree, request, data, check, runtime, host_inputs, owner, bridge)
+
+
+def startup_only(checked, **factories):
+    """HostOwner's startup-only path, in a process whose self-check passed.
+
+    main() passes no factories: admission is AdmissionGate.for_current_user
+    and the manager SystemdBus. HostOwner gets the bridge and terminal check
+    the witness covers, so no module is loaded after the witness.
+    """
+    if type(checked) is not Checked or checked.request.get("mode") != "startup-only":
+        raise ValueError("host startup without a startup-only self-check")
+    request, owner = checked.request, checked.owner
+    selection = checked.inputs.Selection(
+        specification(request, checked.runtime.preflight.root),
+        request["runtime"],
+        request["manifest"],
+        request["manifest_sha256"],
+        request["base_sha256"],
+        request["payload_sha256"],
+    )
+    support = owner.Dependencies(
+        checked.runtime, checked.inputs, owner.verify_service_terminal
+    )
+    witness = owner.HostWitness(checked.witness, checked.check)
+    return owner.run_startup(
+        selection, support, witness=witness, bus_bridge=checked.bridge, **factories
+    )
 
 
 def reason(error):
     """A fixed refusal reason: messages of the checks, never paths or values."""
     if isinstance(error, BaseExceptionGroup) and error.exceptions:
         return reason(error.exceptions[0])
-    if isinstance(error, (ValueError, TimeoutError)) and str(error):
+    # A check's own OSError has a message and no errno (rooted-host.py
+    # "prior rooted ownership unresolved"); a kernel one is named by errno.
+    own = isinstance(error, (ValueError, TimeoutError)) or (
+        isinstance(error, OSError) and error.errno is None
+    )
+    if own and str(error):
         text = str(error)
     elif isinstance(error, OSError):
         text = "OSError " + errno.errorcode.get(error.errno, "unknown")
@@ -789,7 +926,13 @@ def main():
         ),
     }
     try:
-        data = memoryview(run(initial))
+        checked = run(initial)
+        if checked.request["mode"] == "self-check":
+            data = checked.witness
+        else:
+            record = startup_only(checked)
+            data = checked.runtime.preflight.root.closure.canonical(record)
+        data = memoryview(data)
         while data:
             data = data[os.write(1, data) :]
     except CLEANUP_FAILURES as error:

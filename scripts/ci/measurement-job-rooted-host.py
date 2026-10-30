@@ -4,6 +4,7 @@
 """Concrete startup-only H ownership. No child or virtual machine is created."""
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -23,6 +24,31 @@ class Dependencies(NamedTuple):
 
 
 PREPARE_NS = 60_000_000_000
+# The host entry's startup request and witness (measurement-job-host.py
+# REQUEST_SCOPE, SCOPE and WITNESS_LIMIT). H runs only with its own process's
+# witness for exactly its selection, and binds the witness into the attempt.
+HOST_REQUEST_SCOPE = "contained-job-host-request-v1"
+HOST_WITNESS_SCOPE = "contained-job-host-startup-witness-v1"
+HOST_WITNESS_LIMIT = 1024**2
+INTENT_SCOPE = "contained-job-rooted-host-intent-v2"
+INTENT_FIELDS = frozenset(
+    (
+        "scope",
+        "config_sha256",
+        "run_id",
+        "unit",
+        "path",
+        "client",
+        "host_witness_sha256",
+    )
+)
+RECEIPTS = (
+    "guardian-config",
+    "host-intent",
+    "host-started",
+    "host-finished",
+    "host-witness",
+)
 UNRESOLVED = {}
 CLEANUP_FAILURES = (BaseException,)
 # Abort keeps this part of its window (STOP_NS after the startup deadline) to
@@ -112,6 +138,82 @@ def load_bus_bridge(runtime):
     return runtime.native.load(
         "rooted_host_bus", runtime.native.HERE / "measurement-job-rooted-bus.py"
     )
+
+
+def preload_jeepney():
+    """Jeepney as SystemdBus imports it when it connects (guardian-service.py:82-86)."""
+    jeepney = importlib.import_module("jeepney")
+    importlib.import_module("jeepney.io.blocking")
+    if jeepney.__version__ != "0.9.0":
+        raise ValueError("unreviewed Jeepney version")
+
+
+class HostWitness(NamedTuple):
+    """The entry's canonical startup witness and its process recheck.
+
+    check(deadline) refuses when this process's module table or file
+    mappings differ from the witness's last pass.
+    """
+
+    data: bytes
+    check: object
+
+
+def host_request(selection):
+    """The startup-only request that names exactly this selection."""
+    spec = selection.spec
+    return {
+        "scope": HOST_REQUEST_SCOPE,
+        "mode": "startup-only",
+        "runtime": selection.runtime,
+        "manifest": selection.manifest,
+        "manifest_sha256": selection.manifest_sha256,
+        "specification": dict(
+            spec._asdict(), cases=list(spec.cases), cpus=list(spec.cpus)
+        ),
+        "base_sha256": selection.base_sha256,
+        "payload_sha256": selection.payload_sha256,
+    }
+
+
+def check_witness(witness, selection, root):
+    """This process's witness for this selection; returns its digest.
+
+    Only the binding is checked here: the entry validated the observation
+    against its manifest before H was built, and a checker can repeat that
+    from host-witness.json.
+    """
+    if (
+        type(witness) is not HostWitness
+        or type(witness.data) is not bytes
+        or not 0 < len(witness.data) <= HOST_WITNESS_LIMIT
+        or type(witness.check) is not types.FunctionType
+    ):
+        raise ValueError("rooted host witness")
+    try:
+        wire = root.runtime._json(witness.data)
+    except ValueError as error:
+        raise ValueError("rooted host witness binding") from error
+    if type(wire) is not dict or root.closure.canonical(wire) != witness.data:
+        raise ValueError("rooted host witness binding")
+    observation = wire.get("observation")
+    request = root.closure.canonical(host_request(selection))
+    if (
+        wire.get("scope") != HOST_WITNESS_SCOPE
+        or any(
+            wire.get(name) is not False
+            for name in ("accepted", "native_authorized", "full_contract_proven")
+        )
+        or wire.get("runtime") != selection.runtime
+        or wire.get("manifest_sha256") != selection.manifest_sha256
+        or wire.get("request_sha256") != hashlib.sha256(request).hexdigest()
+        or type(observation) is not dict
+        or type(observation.get("pid")) is not int
+        or observation["pid"] != os.getpid()
+        or observation.get("request_data") != {"$bytes": request.hex()}
+    ):
+        raise ValueError("rooted host witness binding")
+    return hashlib.sha256(witness.data).hexdigest()
 
 
 class LeaseBus:
@@ -207,6 +309,49 @@ class LeaseBus:
         self.bus.close()
 
 
+def verify_service_terminal(proof, identity, started_ns, now):
+    """G's unit ended cleanly and in time, with no process left.
+
+    The controller's terminal_check. Moved from guardian-host.py, whose R4
+    coordinator keeps its own copy, so HostOwner's graph needs neither that
+    file nor measurement-job.py, tomllib, shutil and their compression modules.
+    """
+    if type(proof) is not dict or set(proof) != {"unit", "processes"}:
+        raise ValueError("invalid fields")
+    row = proof["unit"]
+    if (
+        type(row) is not dict
+        or type(proof["processes"]) is not tuple
+        or proof["processes"]
+    ):
+        raise ValueError("guardian service domain not terminal")
+    expected = {
+        "Id": identity.unit,
+        "InvocationID": identity.invocation_id,
+        "MainPID": 0,
+        "ActiveState": "inactive",
+        "SubState": "dead",
+        "Result": "success",
+        "ExecMainCode": 1,
+        "ExecMainStatus": 0,
+    }
+    for key, value in expected.items():
+        if type(row.get(key)) is not type(value) or row[key] != value:
+            raise ValueError("guardian service termination mismatch")
+    start, end = (
+        row.get("ExecMainStartTimestampMonotonic"),
+        row.get("ExecMainExitTimestampMonotonic"),
+    )
+    if (
+        type(start) is not int
+        or type(end) is not int
+        or start * 1000 != started_ns
+        or not started_ns <= end * 1000 <= now
+        or end * 1000 >= identity.deadline_ns
+    ):
+        raise ValueError("guardian service terminal timestamps")
+
+
 class HostOwner:
     """Retain admission, inputs and exact service ownership until gate commit."""
 
@@ -215,6 +360,8 @@ class HostOwner:
         selection,
         support,
         *,
+        witness=None,
+        bus_bridge=None,
         gate_factory=None,
         bus_factory=None,
         host_observer=None,
@@ -227,17 +374,27 @@ class HostOwner:
             raise ValueError("rooted host dependencies")
         if type(selection) is not support.inputs.Selection:
             raise ValueError("rooted host selection")
+        if bus_bridge is not None and type(bus_bridge) is not types.ModuleType:
+            raise ValueError("rooted host dependencies")
         self.selection, self.support = selection, support
         self.runtime = support.runtime
         self.root = self.runtime.preflight.root
         self.spec = selection.spec
         self.root.guardian.validate_spec(self.spec)
+        self.witness_sha256 = check_witness(witness, selection, self.root)
+        self.witness = witness
         self.gate_factory = (
             gate_factory or self.runtime.native.service.AdmissionGate.for_current_user
         )
         self.bus_factory = bus_factory or self.runtime.native.service.SystemdBus
-        # Loaded before admission, so no code is read inside the startup window.
-        self.bus_bridge = load_bus_bridge(self.runtime)
+        # Loaded before admission, so no code is read inside the startup
+        # window: the bus bridge (the embedder's, which its witness covers)
+        # and Jeepney, which SystemdBus imports only when it connects
+        # (guardian-service.py:82-86). The witness's process check refuses an
+        # import or a new file mapping after the witness's last pass, so an
+        # embedder imports both before that pass.
+        self.bus_bridge = bus_bridge or load_bus_bridge(self.runtime)
+        preload_jeepney()
         self.host_observer = host_observer or (
             lambda deadline: observe_host(self.runtime, deadline)
         )
@@ -285,6 +442,8 @@ class HostOwner:
     def acquire(self, deadline):
         if self.gate is not None:
             raise ValueError("rooted host already acquired")
+        self.before(deadline)
+        self.witness.check(deadline)
         self.before(deadline)
         self.gate = self.gate_factory(deadline)
         self.gate_ancestors, self.gate_identity, self.lock_identity = admission_path(
@@ -363,15 +522,17 @@ class HostOwner:
 
     def write(self, name, data, deadline):
         if (
-            name
-            not in ("guardian-config", "host-intent", "host-started", "host-finished")
+            name not in RECEIPTS
             or type(data) is not bytes
+            or (name == "host-witness" and data is not self.witness.data)
         ):
             raise ValueError("rooted host receipt selection")
         self.check_attempt(deadline)
-        if self.output_bytes + len(data) > self.root.guardian.HOST_RECEIPT_BUDGET:
-            raise ValueError("rooted host receipt budget")
-        self.output_bytes += len(data)
+        # The witness has its own cap (HOST_WITNESS_LIMIT), outside the budget.
+        if name != "host-witness":
+            if self.output_bytes + len(data) > self.root.guardian.HOST_RECEIPT_BUDGET:
+                raise ValueError("rooted host receipt budget")
+            self.output_bytes += len(data)
         with self.runtime.artifact.owned(
             os.open(
                 name + ".json",
@@ -400,6 +561,7 @@ class HostOwner:
             or self.claim_attempted
         ):
             raise ValueError("rooted host preparation binding")
+        self.write("host-witness", self.witness.data, deadline)
         self.write("guardian-config", config.data, deadline)
         endpoint = str(self.path / "control.sock")
         if len(os.fsencode(endpoint)) >= 108:
@@ -413,12 +575,13 @@ class HostOwner:
         self.listener.listen(1)
         intent = self.root.closure.canonical(
             {
-                "scope": "contained-job-rooted-host-intent-v1",
+                "scope": INTENT_SCOPE,
                 "config_sha256": config.sha256,
                 "run_id": self.spec.run_id,
                 "unit": self.root.guardian.unit_name(self.spec),
                 "path": str(self.path),
                 "client": self.value["client"],
+                "host_witness_sha256": self.witness_sha256,
             }
         )
         self.write("host-intent", intent, deadline)
@@ -429,6 +592,10 @@ class HostOwner:
         ):
             raise ValueError("rooted host diagnostic reserve")
         self.check_attempt(deadline)
+        # A change during admission or input preparation (an NSS module for
+        # getpwuid, guardian-service.py:661) refuses before the blocker
+        # exists, so abort closes the gate.
+        self.witness.check(deadline)
         self.claim_attempted = True
         self.gate.claim(self.spec.run_id, intent, deadline)
         self.output_bytes += len(self.gate.record)
@@ -443,6 +610,7 @@ class HostOwner:
         self.check_attempt(deadline)
         if self.host_observer(deadline) != self.coordinates:
             raise ValueError("rooted host coordinates changed")
+        self.witness.check(deadline)
         self.before(deadline)
         self.phases[name] = {
             "started_ns": start,
@@ -579,6 +747,8 @@ class HostOwner:
         ):
             raise ValueError("rooted host recheck identity")
         self.check_attempt(deadline)
+        # A lazy import or dlopen in the window refuses before COMMIT.
+        self.witness.check(deadline)
         row = self.lease.observe(deadline)
         if (
             self.active_identity(row) != identity
@@ -681,8 +851,9 @@ class HostOwner:
         self.runtime.native.raise_errors("rooted completion cleanup", errors)
         proof = self.root.closure.canonical(
             {
-                "scope": "contained-job-rooted-host-completion-v1",
+                "scope": "contained-job-rooted-host-completion-v2",
                 "startup": record,
+                "host_witness_sha256": self.witness_sha256,
                 "phase_checks": self.phases,
                 "non_gate_handles_closed": True,
             }
@@ -895,6 +1066,7 @@ ATTEMPT_ENTRIES = {
     "host-finished.json": stat.S_ISREG,
     "host-intent.json": stat.S_ISREG,
     "host-started.json": stat.S_ISREG,
+    "host-witness.json": stat.S_ISREG,
     "startup-witness.json": stat.S_ISREG,
 }
 FAILURE_V1 = frozenset(
@@ -1413,20 +1585,30 @@ def _resolve(
         config_data, _ = read_owned(
             directory, "guardian-config.json", runtime.protocol.CONFIG_LIMIT, 0o400
         )
+        try:
+            witness_data, _ = read_owned(
+                directory, "host-witness.json", HOST_WITNESS_LIMIT, 0o400
+            )
+        except FileNotFoundError as error:
+            raise ValueError("resolver host witness") from error
     finally:
         os.close(directory)
 
+    # v2 intents only: an attempt left unresolved with a v1 intent is
+    # resolved by the resolver of the commit that wrote it.
     plan_intent = root.runtime._json(intent_data)
     if (
         intent_data != intent
         or root.closure.canonical(plan_intent) != intent
-        or set(plan_intent)
-        != {"scope", "config_sha256", "run_id", "unit", "path", "client"}
-        or plan_intent["scope"] != "contained-job-rooted-host-intent-v1"
+        or type(plan_intent) is not dict
+        or set(plan_intent) != INTENT_FIELDS
+        or plan_intent["scope"] != INTENT_SCOPE
         or plan_intent["run_id"] != run_id
         or plan_intent["path"] != attempt_path
     ):
         raise ValueError("resolver intent binding")
+    if plan_intent["host_witness_sha256"] != hashlib.sha256(witness_data).hexdigest():
+        raise ValueError("resolver host witness")
     value = runtime.protocol.decode_header(
         config_data,
         plan_intent["config_sha256"],
@@ -1555,7 +1737,11 @@ def _resolve(
 
 
 def run_startup(selection, support, **factories):
-    """Explicit trusted embedding API only; it can never start a virtual machine."""
+    """Explicit trusted embedding API only; it can never start a virtual machine.
+
+    factories carry the witness (required) and, for tests, the gate, bus and
+    observer; measurement-job-host.py's startup-only mode is the embedder.
+    """
     return HostOwner(selection, support, **factories).run()
 
 

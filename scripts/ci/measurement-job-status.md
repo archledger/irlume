@@ -42,7 +42,10 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   observation used 1104 and 1096 of its 1536 operations. Both hosts reached
   `startup-only-complete` again with `KeyringMode=private` and
   `ProtectControlGroupsEx=strict`, with the same operation counts and 3 of 3
-  lookups.
+  lookups. With the mapped-bytes check (startup witness v2) both reached it
+  again on 2026-10-30, using 1170 and 1172 operations, and H accepted G's
+  rows: 72 mappings of 18 files, 4019 pages, of which 3684 were compared and
+  335 were private copies, none in a code mapping.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
@@ -63,7 +66,7 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
 
 ### Open containment items
 
-- Mapped bytes, narrowed in source and still open: on btrfs an inode number
+- Mapped bytes, narrowed and still open: on btrfs an inode number
   is unique per subvolume only, so maps alone cannot tell a runtime file from
   a snapshot copy. G now reads each readable mapping of a runtime file from
   its own `/proc/self/mem`, then its `/proc/self/pagemap` entries; every page
@@ -77,8 +80,7 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   differs only in those pages is caught by the tree checks at each scan and
   not by this check. The binding holds at each maps read; code that ran
   before the check could have replaced its own mappings. Active uprobes or
-  breakpoints on runtime files make G refuse. The operation budget still
-  needs a recount from native runs.
+  breakpoints on runtime files make G refuse.
 - Restrict path-socket connects from the future QEMU child with Landlock
   (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's

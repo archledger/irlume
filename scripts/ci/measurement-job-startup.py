@@ -23,19 +23,19 @@ NAMESPACES = ("pid", "user", "mnt", "net", "cgroup")
 START_NS = 5_000_000_000
 # One hard budget for a whole startup observation (collect_startup): the proc
 # snapshot, both filesystem views, the proc reads between them and the mapped
-# reads of both maps passes. Without mapped reads G's native views spend 1104
-# operations on the laptop (systemd 259.10) and 1096 on archhost (262.1); with
-# every optional kernel view and /run/credentials present and one more page of
-# maps and mountinfo they would spend 1128. Each maps pass adds 6 for opening
-# mem and pagemap, one mem read per started 1 MiB of each run of adjacent
-# mappings and one pagemap read per run (up to 512 MiB). The recorded native
-# maps (72 mappings in 10 runs) give 39 per pass on the laptop and 40 on
-# archhost, so an estimated 1182 and 1176, and about 1208 for the case above;
-# 1536 is about 27% above that. These estimates are pending a native recount.
-# Mapped reads grow with the runtime's readable mapped bytes and only this cap
-# bounds them; the other operations follow the fixed node list, at most 128
-# directory entries, the exact descriptor inventory and the LIMITS-capped proc
-# reads, not the host's process count.
+# reads of both maps passes. G's native views spent 1170 operations on the
+# laptop (systemd 259.10) and 1172 on archhost (262.1), 1104 and 1096 of them
+# without mapped reads. Each maps pass adds 6 for opening mem and pagemap, one
+# mem read per started 1 MiB of each run of adjacent mappings and one pagemap
+# read per run (up to 512 MiB); the runtime's 72 readable mappings fell into 7
+# and 9 runs. Each file's mappings were adjacent on both hosts, so with one
+# run per file the laptop would spend 1214, and 1238 with every optional
+# kernel view and /run/credentials present and one more page of maps and
+# mountinfo; 1536 is 24% above that. With no two mappings adjacent it would
+# be 1446. Mapped reads grow with the runtime's readable mapped bytes and only
+# this cap bounds them; the other operations follow the fixed node list, at
+# most 128 directory entries, the exact descriptor inventory and the
+# LIMITS-capped proc reads, not the host's process count.
 MAX_OPERATIONS = 1536
 MAX_FDS = 128
 PAGE = 4096

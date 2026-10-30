@@ -49,7 +49,9 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   Landlock domain both reached it again on 2026-10-30, using 1176 and 1172
   operations, with the same mapped rows. With the launcher that adds the
   host role (H1 below) both reached it again on 2026-10-30, using 1178
-  operations each, with the same mapped rows.
+  operations each, with the same mapped rows. With H started from the tree
+  (H2 below) both reached it again on 2026-10-30, using 1170 and 1172
+  operations, with the same mapped rows.
 - [ ] Close the open containment items below before claiming containment.
 - [ ] Complete and qualify the full H/E runtime closure required by the runner.
   First slice (H1): the launcher's `--host
@@ -97,9 +99,19 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   HostOwner's graph needs neither `measurement-job-guardian-host.py` nor
   `measurement-job.py`, `tomllib` or `shutil`; the witness's module list
   asserts this. Tests run the tree process on a re-pinned copy with a
-  scratch admission directory patched in and a refusing manager. Still
-  open: the native H2 runs, H3 (the real admission directory, after owner
-  confirmation), H4 (H loss) and the guest side.
+  scratch admission directory patched in and a refusing manager. On
+  2026-10-30 H2 ran natively on both hosts from a diagnostic copy of the
+  pinned runtime whose entry admits to a scratch directory, after the same
+  `getpwuid` lookup the production gate makes. Started only by `launcher
+  --host`, with a poisoned caller environment and an inherited descriptor,
+  H reached `startup-only-complete`. A separate checker accepted its
+  witness (76 mapped rows of 19 tree files, host namespaces, none of the
+  modules above), whose digest the intent and the completion proof both
+  name; every recheck passed, so the lookup loaded nothing. An inherited
+  descriptor, a `runtime-candidate` or non-`supervisor-only` specification
+  and an upper-case input digest were each refused before admission, with
+  no blocker left. Still open: H3 (the real admission directory, after
+  owner confirmation), H4 (H loss) and the guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
 - [ ] Implement exclusive writable-overlay ownership and freeze it only after

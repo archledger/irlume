@@ -6,8 +6,6 @@ license.workspace = true
 
 [features]
 default = ["onnx", "tflite"]
-# Supplied-byte ELF inspection only; not native loading or evidence opt-in.
-native-metadata = ["dep:elf"]
 # ONNX inference (AuraFace embedder, YuNet detector). Off => align/cosine only.
 # FaceMesh dispatches to the TFLite backend for the production mesh, so
 # enabling onnx requires the tflite binding (MR !3 review: the independent
@@ -25,7 +23,6 @@ tflite = ["dep:edgefirst-tflite"]
 npu = ["onnx", "dep:openvino", "dep:openvino-sys"]
 
 [dependencies]
-elf = { version = "=0.8.0", optional = true, default-features = false }
 libc.workspace = true   # dlopen/dlsym probe: prove a library is loadable ort BEFORE ort can park on it (#266)
 irlume-common.workspace = true
 thiserror.workspace = true

@@ -28,7 +28,6 @@ irlume-core = { path = "../crates/irlume-core" }
 # For the MS-XU illumination parser (#568): camera bytes are attacker-reachable
 # input to the root daemon, same as the three above.
 irlume-camera = { path = "../crates/irlume-camera" }
-irlume-vision = { path = "../crates/irlume-vision", default-features = false, features = ["native-metadata"] }
 
 # Detach from the parent workspace so `cargo build` at the repo root ignores it.
 # Because it is its own workspace it does not inherit the root's [patch], so
@@ -91,20 +90,6 @@ bench = false
 [[bin]]
 name = "ek_certificate"
 path = "fuzz_targets/ek_certificate.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "native_metadata"
-path = "fuzz_targets/native_metadata.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "native_generation"
-path = "fuzz_targets/native_generation.rs"
 test = false
 doc = false
 bench = false

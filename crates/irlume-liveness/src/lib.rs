@@ -10,18 +10,6 @@
 //! The gate is HARD: any failing cue rejects. The signals are computed upstream
 //! (camera + detector); this crate applies the decision thresholds.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-/// Whether this library or a dependency contains non-shippable evidence code.
-pub const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence)
-    || irlume_common::HARDWARE_EVIDENCE_BUILD
-    || irlume_vision::HARDWARE_EVIDENCE_BUILD;
-#[cfg(not(irlume_hw_evidence))]
-const _: () = assert!(
-    !HARDWARE_EVIDENCE_BUILD,
-    "irlume evidence build refused: irlume-liveness/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Live,

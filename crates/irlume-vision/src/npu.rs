@@ -28,9 +28,7 @@ use std::time::Duration;
 
 mod identity;
 mod maps;
-pub(crate) mod runtime;
-#[cfg(irlume_hw_evidence)]
-pub(crate) use runtime::{fixture_trusted_metadata, fixture_trusted_path};
+mod runtime;
 pub use runtime::{library_setting, LibrarySetting, RuntimeSelection};
 
 /// The original reviewed OpenVINO C API soname (2026.2.0), retained for

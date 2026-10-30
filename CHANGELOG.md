@@ -19,83 +19,20 @@ All notable changes to irlume are documented here. This project adheres to
 - The `irlume-vision` features `cuda`, `openvino`, `coreml` and `tensorrt`, which
   custom builds of 0.15.0 could enable, and the `IRLUME_TEST_ALLOW_UNCERTIFIED_EP`
   escape behind them (ADR-0038 section 2). The NPU's `npu` feature is unaffected.
-  Evidence builds still refuse that variable, and still refuse an ONNX Runtime
-  provider enabled directly or through another dependency.
+- The private measurement tooling built for the GPU campaign, which no shipped
+  program used (ADR-0038, amendment 2026-10-30): the `irlume_hw_evidence` build,
+  measurement profiles and fixtures, `native-metadata`, its fuzz targets and the
+  contained-job scripts. The `elf` dependency goes with it.
 
 ### Added
 
 - Both daemon AppArmor profiles let oneTBB, which the NPU runtime loads, read
   `/proc/sys/vm/nr_hugepages` and the transparent huge page mode (#1046).
 
-- A private kernel namespace observation probe (ADR-0022, Kernel namespace
-  observation, #1164). It uses `listns` to check for the initial user
-  namespace without trusting procfs or UID 0. Explicit kernel tests cover
-  nested namespaces, fake procfs and a wrong-owner false-positive control;
-  ordinary builds refuse. This grants no native-loading permission.
-
-- A private CPU-only generation publication and retention experiment
-  (ADR-0022, Generation publication and retention experiment, #1164).
-  Isolated consumers reopen complete read-only generations after replacement
-  and publisher exit. Kernel tests cover partial publication, cancellation,
-  late-byte corruption and independent filesystem/mount protections; normal
-  builds remain refusal stubs. This grants no native-loading permission.
-
-- Sealed copies of observed measurement fixture bytes (ADR-0022, Sealed
-  fixture copies, #1164). Evidence builds verify write and size seals,
-  execute-mode restrictions, close-on-exec and exact byte readback under
-  bounded I/O. The copies expose no descriptor or native-loading authority.
-
-- A private static fixture bootstrap test for verification before fixture
-  startup (ADR-0022, Static fixture startup experiment, #1164). It checks
-  sealed executable bytes, fixed descriptor and environment rules, and
-  isolated process cleanup. It cannot launch a provider or grant loading
-  admission; normal builds contain refusal stubs only.
-
-- Declared fixture dependency graphs built from the exact hashed ELF buffers
-  (ADR-0033, Declared fixture graph, #1162). The checker enforces bounded
-  roots, aliases, interpreter bindings and active metadata under an explicit
-  fixture policy. It does not prove loader behavior or permit native loading.
-
-- Constrained acquisition of regular measurement fixture files through a
-  supplied directory handle (ADR-0022, Constrained fixture acquisition,
-  #1164). Evidence builds keep full `openat2` restrictions and refuse
-  unsupported kernels, observed identity changes and unsafe file types.
-  The result remains descriptive and grants no native-loading permission.
-
-- Bounded ELF metadata inspection behind the default-off `native-metadata`
-  feature (ADR-0033, Supplied-byte ELF metadata, #1162). It reads supplied
-  program-header bytes, preserves raw loading metadata and rejects ambiguous
-  string-table mappings. It does not resolve dependencies or permit loading.
-
 - Selection-source and parsing-issue reporting in Health, `status --json`
   and doctor (#1163). Missing provenance remains unreported;
   rejected raw settings are not exposed. Selection and accelerator placement
   behavior are unchanged.
-
-- Descriptor-backed measurement observations for explicitly supplied local
-  fixture files (ADR-0022, Fixture file observations, #1164). Evidence builds
-  retain the hashed bytes and file handles, check original and resolved
-  paths, and refuse observed changes or inconsistent aliases. This does not
-  establish immutable files, complete native dependencies or launch permission.
-
-- A non-authorizing measurement-profile description checker in evidence
-  builds (ADR-0022, Measurement-launch admission, #1164). It checks supplied
-  inventories, file observations and exact environment entries for internal
-  consistency. It does not observe the host, establish a complete native
-  closure or grant launch permission.
-
-- CPU-reference isolation for non-shippable evidence builds (ADR-0022,
-  Reference isolation, #1164). These builds reject ORT provider features,
-  including features enabled through another dependency, and refuse any
-  presence of the uncertified-provider escape. ORT sessions require one
-  exact default CPU provider; ordinary builds keep their existing behavior.
-  This adds no measurement runner, native loading permission or certification.
-
-- Build-boundary guards for measurement-only evidence tooling (ADR-0022,
-  amendment 2026-10-22, #1164). All seven shipped Rust artifacts reject the
-  evidence cfg, and normal consumers reject marked library dependencies.
-  CLI and daemon startup also refuse an evidence-marked build before other
-  work. This adds no measurement runtime, loading permission or certification.
 
 - The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
   control (unit 8, selector 6, D1 on interface 1), validated by maurerr's
@@ -482,13 +419,6 @@ All notable changes to irlume are documented here. This project adheres to
   calibration provenance (ADR-0022, amendment 2026-10-23, #1164). Invalid
   coverage keeps the recognizer on CPU. This changes no authentication
   threshold, loading admission or certification entry.
-
-- Specify a non-shippable measurement-build boundary for GPU certification
-  (ADR-0022 and ADR-0033, amendments 2026-10-22, #1164). The planned build
-  requires compile-time artifact guards, an isolated CPU reference, a
-  separate pre-native launch admission, an owned temporary cache and strict
-  production-path evidence. This documentation adds no loading permission,
-  certification entry, package feature or authentication behavior.
 
 - Keep experimental IR-only recognition probes on the CPU reference even
   when a recognizer is placed on an accelerator (ADR-0022, amendment

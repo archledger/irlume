@@ -47,9 +47,6 @@ authors = ["Wisbendji Fimerlus <archledger236@gmail.com>"]
 # a later undocumented unsafe block in that same function ride along on an
 # already-fulfilled expectation and reach CI unflagged. Per-expression
 # placement is what makes a new unsafe block a build failure.
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(irlume_hw_evidence)'] }
-
 [workspace.lints.clippy]
 missing_errors_doc = "warn"
 missing_panics_doc = "warn"

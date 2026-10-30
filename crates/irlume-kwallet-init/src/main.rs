@@ -25,15 +25,6 @@
 //! Spawned from the daemon it would live in `irlumed.service`, and restarting
 //! irlume would take the user's wallet daemon down with it.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-#[cfg(irlume_hw_evidence)]
-compile_error!("irlume evidence build refused: irlume-kwallet-init/direct");
-const _: () = assert!(
-    !(cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD),
-    "irlume evidence build refused: irlume-kwallet-init/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
 use irlume_common::kwallet_wire::{
     KEY_LEN, LOGIN_ENV, SALT_ABSENT_EXIT, SALT_LEN, SESSION_NOT_READY_EXIT, SOCKET_NAME,
 };

@@ -608,10 +608,12 @@ def run(initial):
     check_environment(initial["environment"])
     argv = initial["argv"]
     check_arguments(tree, argv, initial["file"], initial["orig_argv"])
-    check_prefixes(tree, initial["prefixes"])
+    # The executable first: the prefixes come from whichever libpython the
+    # process loaded, so another loader's refusal would depend on the host.
     loader = os.lstat(tree + "/" + LOADER)
     exe = process_executable()
     check_executable(exe, tree + "/" + LOADER, (loader.st_dev, loader.st_ino))
+    check_prefixes(tree, initial["prefixes"])
     preload = preload_present()
     check_preload(preload)
 

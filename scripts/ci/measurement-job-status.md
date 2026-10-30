@@ -58,8 +58,8 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   options are not a boundary (glibc-hwcaps directories, the host's default
   directories for a missing name, `LD_*` and `/etc/ld.so.preload` stay
   reachable), so the entry checks its own process. Before any tree module
-  loads it checks the environment, exact argv, interpreter prefixes,
-  `/proc/self/exe` identity and that `/etc/ld.so.preload` is absent; then
+  loads it checks the environment, exact argv, `/proc/self/exe` identity,
+  interpreter prefixes and that `/etc/ld.so.preload` is absent; then
   the exact initial search path; then, in two passes, module identity,
   Python state, every file mapping by identity and page bytes, the mount
   chain to `<T>`, status and namespaces, with descriptors before and after.
@@ -134,7 +134,7 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 37 `scripts/ci/test-measurement-*.py` suites pass (871 tests), with
+All 37 `scripts/ci/test-measurement-*.py` suites pass (872 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. `test-measurement-job-host.py`
 needs a prepared runtime named by `IRLUME_HOST_RUNTIME` and fails without
 one. G runs with `KeyringMode=private`,

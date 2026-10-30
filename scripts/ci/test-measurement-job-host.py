@@ -1109,13 +1109,10 @@ class HostRuntimeTests(unittest.TestCase):
         )
         return result
 
-    def through_loader(
-        self, *, tree=None, library_path=True, request=None, digest=None
-    ):
+    def through_loader(self, *, tree=None, libraries=None, request=None, digest=None):
         tree = tree or self.tree
         argv = [tree + "/" + LOADER, "--inhibit-cache"]
-        if library_path:
-            argv += ["--library-path", tree + "/lib64"]
+        argv += ["--library-path", libraries or tree + "/lib64"]
         return argv + [
             tree + "/usr/bin/python3",
             *FLAGS,
@@ -1265,6 +1262,12 @@ class HostRuntimeTests(unittest.TestCase):
         # load, tells this tree from the one it names.
         linked = self.work / "linked-root"
         linked.symlink_to(self.tree)
+        # A byte-identical copy of a tree library outside the tree is mapped
+        # by its own path, which no member names. Unlike the host's libraries
+        # it loads on any host.
+        foreign = self.work / "foreign"
+        foreign.mkdir(mode=0o700)
+        shutil.copyfile(self.tree + "/lib64/libc.so.6", foreign / "libc.so.6")
         cases = (
             (
                 "linked-tree",
@@ -1300,21 +1303,8 @@ class HostRuntimeTests(unittest.TestCase):
                 "host runtime root",
             ),
             (
-                "direct-exec",
-                [
-                    self.python,
-                    *FLAGS,
-                    self.entry,
-                    "--request",
-                    self.request,
-                    self.request_sha256,
-                ],
-                ENVIRONMENT,
-                "host process executable",
-            ),
-            (
-                "loader-without-library-path",
-                self.through_loader(library_path=False),
+                "loader-foreign-library",
+                self.through_loader(libraries=f"{foreign}:{self.tree}/lib64"),
                 ENVIRONMENT,
                 "runtime unlisted mapped file",
             ),
@@ -1336,6 +1326,53 @@ class HostRuntimeTests(unittest.TestCase):
                 self.refused(
                     self.run_command(label, command, dict(environment)), reason
                 )
+        # These start the tree's python with the host's loader or libraries,
+        # which may not start it at all (no such loader, another glibc, no
+        # libpython3.14 in the host's default directories). A start that fails
+        # must fail the same way without H. Run directly, the host's loader is
+        # refused first. Through the tree's loader, the prefix the host's
+        # libpython computes decides whether the prefix gate or the maps check
+        # refuses.
+        hosted = (
+            ("direct-exec", [self.python], lambda prefix: "host process executable"),
+            (
+                "loader-without-library-path",
+                [self.loader, "--inhibit-cache", self.python],
+                lambda prefix: (
+                    "runtime unlisted mapped file"
+                    if prefix == self.tree + "/usr"
+                    else "host interpreter prefix"
+                ),
+            ),
+        )
+        for label, start, expected in hosted:
+            with self.subTest(case=label):
+                probe = [*start, "-I", "-S", "-c", "import sys; print(sys.prefix)"]
+                command = [
+                    *start,
+                    *FLAGS,
+                    self.entry,
+                    "--request",
+                    self.request,
+                    self.request_sha256,
+                ]
+                try:
+                    probed = self.run_command(
+                        label + "-probe", probe, dict(ENVIRONMENT)
+                    )
+                except OSError as error:
+                    with self.assertRaises(OSError) as raised:
+                        self.run_command(label, command, dict(ENVIRONMENT))
+                    self.assertEqual(raised.exception.errno, error.errno)
+                    continue
+                result = self.run_command(label, command, dict(ENVIRONMENT))
+                if probed.returncode == 0:
+                    prefix = probed.stdout.decode("ascii", "replace").strip()
+                    self.refused(result, expected(prefix))
+                else:
+                    self.assertEqual(result.returncode, probed.returncode)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertNotIn(b"measurement-job-host:", result.stderr)
         inherited = os.open("/dev/null", os.O_RDONLY)
         try:
             os.dup2(inherited, 5, inheritable=True)
@@ -1416,6 +1453,27 @@ class HostRuntimeTests(unittest.TestCase):
             self.pages,
             DEPS,
         )
+
+    def test_the_executable_is_checked_before_the_library_dependent_prefixes(self):
+        # Another loader may map a libpython that computes other prefixes
+        # (Arch: platlibdir lib); the refusal still names the executable.
+        # This process's own executable is not the tree loader.
+        argv = (self.entry, "--request", self.request, self.request_sha256)
+        initial = {
+            "path": (),
+            "environment": dict(ENVIRONMENT),
+            "orig_argv": (self.python, *FLAGS, *argv),
+            "argv": argv,
+            "file": self.entry,
+            "executable": self.python,
+            "prefixes": ("/usr",) * 4,
+        }
+        folder = os.getcwd()
+        try:
+            with self.assertRaisesRegex(ValueError, "^host process executable$"):
+                host.run(initial)
+        finally:
+            os.chdir(folder)
 
     def test_a_descriptor_left_open_during_the_passes_refuses(self):
         # python-state's collector runs only between the two inventories; in

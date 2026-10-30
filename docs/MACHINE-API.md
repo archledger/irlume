@@ -121,6 +121,13 @@ available. Capability names are not removed once published; a capability that
 becomes unavailable on a given machine simply stops being listed by that
 machine.
 
+One exception is on record, for surfaces no tagged release carried. Nightly
+builds reported a `gpu` selection, the `recognizer` fields `accelerator`,
+`gpu_platform`, `gpu_runtime_available` and `gpu_qualified`, and the doctor ids
+`gpu-platform`, `gpu-runtime` and `gpu-qualification`. They left contract 1 with
+GPU inference, before any release (ADR-0038 section 4). `device: "npu"` reports an
+NPU placement. The three doctor ids are never reused.
+
 ## Commands
 
 ### `irlume version --json`

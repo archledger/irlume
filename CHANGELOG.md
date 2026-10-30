@@ -16,6 +16,11 @@ All notable changes to irlume are documented here. This project adheres to
   are never reused. The AppArmor profiles lose their render-node, OpenCL and
   compute-runtime rules, and the units lose the GPU launch environment. The
   recognizer ranking API goes with them.
+- The `irlume-vision` features `cuda`, `openvino`, `coreml` and `tensorrt`, which
+  custom builds of 0.15.0 could enable, and the `IRLUME_TEST_ALLOW_UNCERTIFIED_EP`
+  escape behind them (ADR-0038 section 2). The NPU's `npu` feature is unaffected.
+  Evidence builds still refuse that variable, and still refuse an ONNX Runtime
+  provider enabled directly or through another dependency.
 
 ### Added
 
@@ -736,28 +741,11 @@ All notable changes to irlume are documented here. This project adheres to
   `forbid_external_cameras=1` still refuses every external camera
   (ADR-0032 amendment 2026-10-13 section 3, #1030).
 
-- Custom builds of `irlume-vision` compiled with the `cuda`, `openvino`,
-  `tensorrt` or `coreml` execution-provider features no longer register
-  those providers in ONNX sessions: the registrations placed
-  authentication-adjacent computation outside the per-model certification
-  regime and defaulted to silent CPU execution when the provider library
-  could not load. The providers now register only behind the exact
-  escape `IRLUME_TEST_ALLOW_UNCERTIFIED_EP=1` (an unconditional warning,
-  not the opt-in debug log) and strictly there: a provider that cannot
-  load is an error, and CPU fallback for operations the providers cannot
-  cover is disabled, so no session runs on the CPU unannounced; TensorRT
-  registers ahead of CUDA under the escape and the OpenVINO provider is
-  pinned to the GPU device; CoreML is never registered (every
-  MLComputeUnits combination admits the CPU) and a build that compiled it
-  is told it stays inactive; and every session outside the escape
-  registers the runtime's exact default CPU execution provider, which
-  names the reference CPU EP and suppresses the crate's armed
-  NPU-preferring automatic device selection (the policy would otherwise
-  rank any other CPU-type provider ahead of the default), so a runtime
-  with built-in accelerators cannot auto-place or substitute these
-  models. A compiled provider without the escape, and the escape in a
-  build without a provider feature, both warn their actual outcome
-  (ADR-0033 section 7).
+- Every ONNX session registers the runtime's exact default CPU execution
+  provider and refuses providers a host registered on the process environment
+  (ADR-0038 section 2). This names the reference CPU provider and suppresses the
+  crate's armed NPU-preferring automatic device selection, so a runtime with
+  built-in accelerators cannot auto-place or substitute these models.
 
 - Ordinary-only requests with a saved split selection and no explicit ordinary
   override report the ordinary camera path's limitation. Dual-sensor

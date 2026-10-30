@@ -132,14 +132,38 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   the claim behave as designed. Before the claim, no blocker remains. After
   it the blocker stays (a new owner refuses admission in the in-process test),
   an early resolver run refuses, and after the real 10 s a dry run and a
-  commit clear it; the next admission then proceeds. Not yet qualified
-  natively; kills after the manager call, and unit collection after a killed
-  client, are for that round. Still refused: failure records with
-  `creation_attempted` or `created` false, or with the unit gone (H4b, before
-  H3), and kills inside a file write, `gate.complete` or the resolver's
-  commit. Still open: the native H4 round on both hosts, H3 (the real
-  admission directory, approved by the owner on 2026-10-30, after H4b) and the
-  guest side.
+  commit clear it; the next admission then proceeds. Native round on
+  2026-10-30, on the laptop and archhost: a diagnostic copy of the pinned
+  runtime whose entry admits to a scratch directory and whose H kills itself
+  at a chosen point, started only by `launcher --host`, nine points on one
+  directory. All gave the designed state: `none` reached
+  `startup-only-complete`; `after-intent` left no blocker; `after-claim` was
+  refused before origin + 10 s, then cleared as an absent unit; `after-create`
+  was cleared as a failed unit from the manager's row; `after-started`,
+  `before-commit` and `after-commit` as a failed unit from H's receipt, whose
+  real form the stricter check accepted; `after-eof` and `after-finish` as an
+  absent unit from H's receipt. A killed client's reference does drop: a unit
+  that exited cleanly was gone 4 to 15 ms after H died, and no failed unit kept
+  a reference. Rows name the manager's forked pid while `activating` under
+  `PrivatePIDs=`; every `active` and `failed` row names the receipt's pid. Both
+  error names are exact on systemd 259.10 and 262.1. Found by that round:
+  `/proc`'s `st_nlink` follows the host's process count, also from a new PID
+  namespace, and G's and H's tree rechecks compare it. On the evidence, though
+  G's own reason was not captured, a process start or exit during G's
+  observation makes G exit 77 before connecting: 7 of 17 starts on the laptop
+  and 10 of 21 on archhost with a process per poll, 3 of 13 with only a
+  `/usr/bin/true` loop, 0 of 22 on idle archhost. The laptop's one exit in 22
+  starts with nothing spawned beside it came at 407 ms, before the observation
+  normally starts, and is unexplained, so the rate in ordinary use is not
+  known. H then writes a failure record, which the resolver cleared. H's walk
+  through `/tmp` and `/run` compares `mtime` and `ctime`, so unrelated `/tmp`
+  activity can refuse H too, and at the prestart recheck, by reading, that
+  leaves a record the resolver refuses. Both are to be fixed before H3. Still
+  refused: failure records with `creation_attempted` or `created` false, or
+  with the unit gone (H4b, before H3), and kills inside a file write,
+  `gate.complete` or the resolver's commit. Still open: those fixes, H3 (the
+  real admission directory, approved by the owner on 2026-10-30, after H4b)
+  and the guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
 - [ ] Implement exclusive writable-overlay ownership and freeze it only after

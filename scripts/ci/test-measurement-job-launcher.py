@@ -3,6 +3,8 @@
 # Copyright the irlume contributors.
 """Static launcher tests in an empty root; no actual Python actor is executed."""
 
+import ctypes
+import errno
 import hashlib
 import importlib.util
 import json
@@ -29,15 +31,92 @@ SPEC.loader.exec_module(elf)
 
 PROBE = r"""
 use std::fs::File;
-use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-unsafe extern "C" { fn getppid() -> i32; fn getpgrp() -> i32; fn dup2(old: i32, new: i32) -> i32; fn prctl(option: i32, ...) -> i32; }
+unsafe extern "C" { fn getppid() -> i32; fn getpgrp() -> i32; fn dup2(old: i32, new: i32) -> i32; fn prctl(option: i32, ...) -> i32;
+                    fn fork() -> i32; fn pipe(fds: *mut i32) -> i32; fn fcntl(fd: i32, command: i32, ...) -> i32;
+                    fn kill(pid: i32, signal: i32) -> i32; }
 #[repr(C)] struct Filter { code: u16, jt: u8, jf: u8, k: u32 }
 #[repr(C)] struct Program { len: u16, filter: *const Filter }
 fn hex(data: &[u8]) -> String { data.iter().map(|byte| format!("{byte:02x}")).collect() }
+fn open_descriptors() -> String {
+    // SAFETY: F_GETFD (1) only reads the descriptor flags of each number.
+    (3..4096).filter(|&fd| unsafe { fcntl(fd, 1) } >= 0).map(|fd| fd.to_string()).collect::<Vec<_>>().join(",")
+}
+fn errno<T>(result: std::io::Result<T>) -> i32 { result.map_or_else(|error| error.raw_os_error().unwrap_or(-1), |_| 0) }
+fn signal_helper() -> i32 {
+    let Some(pid) = std::fs::read_to_string("/private/helper.pid").ok().and_then(|text| text.parse().ok()) else { return -1 };
+    // SAFETY: Signal 0 sends nothing; the kernel only checks the permission.
+    if unsafe { kill(pid, 0) } == 0 { 0 } else { errno::<()>(Err(std::io::Error::last_os_error())) }
+}
+fn abstract_name() -> SocketAddr { SocketAddr::from_abstract_name(b"irlume-launcher-abstract").unwrap() }
+fn mode(path: &str, bits: u32) { std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap(); }
+fn listen(variant: &str) {
+    // Listeners live in a helper created before the launcher runs, so they are
+    // outside any Landlock domain and survive the launcher's close_range.
+    let mut fds = [0_i32; 2];
+    // SAFETY: The kernel writes two descriptors into the live array.
+    assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+    let parent = std::process::id() as i32;
+    // SAFETY: The feeder is single-threaded; the helper only binds and sleeps.
+    let pid = unsafe { fork() };
+    assert!(pid >= 0);
+    // SAFETY: Each pipe end is owned exactly once in each process.
+    let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    if pid > 0 {
+        drop(write);
+        let mut byte = [0_u8; 1];
+        (&read).read_exact(&mut byte).unwrap();
+        return;
+    }
+    drop(read);
+    // SAFETY: PR_SET_PDEATHSIG (1) with SIGKILL takes no pointer.
+    assert_eq!(unsafe { prctl(1, 9_usize, 0_usize, 0_usize, 0_usize) }, 0);
+    // SAFETY: getppid has no arguments; a changed parent means the feeder died.
+    if unsafe { getppid() } != parent { std::process::exit(92); }
+    let _other = UnixListener::bind("/private/other.sock").unwrap();
+    let _datagram = UnixDatagram::bind("/private/datagram.sock").unwrap();
+    let _abstract = UnixListener::bind_addr(&abstract_name()).unwrap();
+    // The sandbox has its own network namespace, so the fixed port is free.
+    let _tcp = TcpListener::bind("127.0.0.1:4000").unwrap();
+    std::fs::write("/private/helper.pid", std::process::id().to_string()).unwrap();
+    let _control = match variant {
+        "socket" | "mode" => {
+            let control = UnixListener::bind("/private/control.sock").unwrap();
+            mode("/private/control.sock", if variant == "socket" { 0o600 } else { 0o644 });
+            Some(control)
+        }
+        "symlink" => {
+            let target = UnixListener::bind("/private/target.sock").unwrap();
+            mode("/private/target.sock", 0o600);
+            std::os::unix::fs::symlink("target.sock", "/private/control.sock").unwrap();
+            Some(target)
+        }
+        "regular" => { File::create("/private/control.sock").unwrap(); mode("/private/control.sock", 0o600); None }
+        "missing" => None,
+        _ => std::process::exit(93),
+    };
+    let null = File::options().read(true).write(true).open("/dev/null").unwrap();
+    // SAFETY: The helper replaces only its own stdio with /dev/null.
+    for fd in 0..=2 { assert_eq!(unsafe { dup2(null.as_raw_fd(), fd) }, fd); }
+    (&write).write_all(b"1").unwrap();
+    drop(write);
+    loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
+}
+fn seccomp(filters: &[Filter]) {
+    let program = Program{len:filters.len() as u16,filter:filters.as_ptr()};
+    // SAFETY: Kernel copies the live repr(C) filter array; the fixed x86-64
+    // fixture filters only this process and its exec.
+    assert_eq!(unsafe { prctl(38,1_usize,0_usize,0_usize,0_usize) },0);
+    assert_eq!(unsafe { prctl(22,2_usize,&program as *const Program,0_usize,0_usize) },0);
+}
 fn ids(label: &str) {
     // SAFETY: Pure process identity syscalls have no pointer arguments.
     println!("{label}={},{},{}", std::process::id(), unsafe {getppid()}, unsafe {getpgrp()});
@@ -63,19 +142,38 @@ fn main() {
         ids("before");
         standard("before");
         for fd in [3,9,511] { println!("before_fd{fd}={}",std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok()); }
+        println!("before_open={}", open_descriptors());
         std::io::stdout().flush().unwrap();
         let mut offset = 1;
-        if args.get(1).and_then(|a| a.to_str()) == Some("--deny-close") {
-            let errno: u32 = args[2].to_str().unwrap().parse().unwrap();
-            assert!(errno == 1 || errno == 38);
-            let filters = [Filter{code:0x20,jt:0,jf:0,k:0}, Filter{code:0x15,jt:0,jf:1,k:436},
-                           Filter{code:0x06,jt:0,jf:0,k:0x00050000|errno}, Filter{code:0x06,jt:0,jf:0,k:0x7fff0000}];
-            let program = Program{len:4,filter:filters.as_ptr()};
-            // SAFETY: Kernel copies the live repr(C) filter array; fixed x86-64
-            // fixture denies only close_range in this process and its exec.
-            assert_eq!(unsafe { prctl(38,1_usize,0_usize,0_usize,0_usize) },0);
-            assert_eq!(unsafe { prctl(22,2_usize,&program as *const Program,0_usize,0_usize) },0);
-            offset = 3;
+        if args.get(offset).and_then(|a| a.to_str()) == Some("--listen") {
+            listen(args[offset + 1].to_str().unwrap());
+            offset += 2;
+        }
+        let number = |index: usize| -> u32 { args[index].to_str().unwrap().parse().unwrap() };
+        if args.get(offset).and_then(|a| a.to_str()) == Some("--deny") {
+            let (syscall, errno) = (number(offset + 1), number(offset + 2));
+            assert!([436, 444, 445, 446].contains(&syscall) && [1, 22, 38].contains(&errno));
+            seccomp(&[Filter{code:0x20,jt:0,jf:0,k:0}, Filter{code:0x15,jt:0,jf:1,k:syscall},
+                      Filter{code:0x06,jt:0,jf:0,k:0x00050000|errno}, Filter{code:0x06,jt:0,jf:0,k:0x7fff0000}]);
+            offset += 3;
+        } else if args.get(offset).and_then(|a| a.to_str()) == Some("--restrict-flags") {
+            // EPERM from landlock_restrict_self (446) unless args[1] is exactly this value.
+            let flags = number(offset + 1);
+            seccomp(&[Filter{code:0x20,jt:0,jf:0,k:0}, Filter{code:0x15,jt:0,jf:5,k:446},
+                      Filter{code:0x20,jt:0,jf:0,k:24}, Filter{code:0x15,jt:0,jf:2,k:flags},
+                      Filter{code:0x20,jt:0,jf:0,k:28}, Filter{code:0x15,jt:1,jf:0,k:0},
+                      Filter{code:0x06,jt:0,jf:0,k:0x00050001}, Filter{code:0x06,jt:0,jf:0,k:0x7fff0000}]);
+            offset += 2;
+        } else if args.get(offset).and_then(|a| a.to_str()) == Some("--deny-version") {
+            // The errno only for landlock_create_ruleset (444) with args[2] exactly
+            // LANDLOCK_CREATE_RULESET_VERSION (1); the ruleset call itself passes.
+            let errno = number(offset + 1);
+            assert!([38, 95].contains(&errno));
+            seccomp(&[Filter{code:0x20,jt:0,jf:0,k:0}, Filter{code:0x15,jt:0,jf:5,k:444},
+                      Filter{code:0x20,jt:0,jf:0,k:32}, Filter{code:0x15,jt:0,jf:3,k:1},
+                      Filter{code:0x20,jt:0,jf:0,k:36}, Filter{code:0x15,jt:0,jf:1,k:0},
+                      Filter{code:0x06,jt:0,jf:0,k:0x00050000|errno}, Filter{code:0x06,jt:0,jf:0,k:0x7fff0000}]);
+            offset += 2;
         }
         let mut command = Command::new("/launcher");
         if args.get(offset).and_then(|arg| arg.to_str()) == Some("--raw-invalid") {
@@ -86,15 +184,49 @@ fn main() {
         let _error = command.exec();
         std::process::exit(91);
     }
+    if args.first().and_then(|a| a.to_str()) == Some("--child-connect") {
+        std::process::exit(errno(UnixStream::connect(&args[1])));
+    }
     ids("after");
     standard("after");
     for fd in [3,9,511] { println!("after_fd{fd}={}",std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok()); }
+    println!("after_open={}", open_descriptors());
+    println!("probe_control={}", errno(UnixStream::connect("/private/control.sock")));
+    println!("probe_other={}", errno(UnixStream::connect("/private/other.sock")));
+    println!("probe_abstract={}", errno(UnixStream::connect_addr(&abstract_name())));
+    println!("probe_datagram={}", errno(UnixDatagram::unbound().and_then(|s| s.send_to(b"x", "/private/datagram.sock"))));
+    println!("probe_bind={}", errno(UnixListener::bind("/private/new.sock")));
+    println!("probe_pair={}", errno(UnixStream::pair()));
+    let child = Command::new("/usr/bin/python3").args(["--child-connect", "/private/other.sock"]).status().unwrap();
+    println!("probe_child_other={}", child.code().unwrap_or(-1));
+    println!("probe_tcp_bind={}", errno(TcpListener::bind("127.0.0.1:0")));
+    println!("probe_tcp_connect={}", errno(TcpStream::connect("127.0.0.1:4000")));
+    println!("probe_udp_send={}", errno(UdpSocket::bind("127.0.0.1:0").and_then(|s| s.send_to(b"x", "127.0.0.1:4000"))));
+    println!("probe_signal_helper={}", signal_helper());
     for arg in std::env::args_os() { println!("arg={}",hex(arg.as_bytes())); }
     let mut env: Vec<_> = std::env::vars_os().collect();
     env.sort();
     for (key,value) in env { println!("env={}:{}",hex(key.as_bytes()),hex(value.as_bytes())); }
 }
 """
+GUARDIAN = ["--guardian", "/private/guardian-config.json", "c" * 64]
+# Expected errno per probe inside the guardian's Landlock domain. Listeners are
+# live, so EACCES is Landlock's (net/unix/af_unix.c:1223-1236 run first). The
+# domain handles no network access and no signal scope, so TCP, UDP and signals
+# to the helper outside the domain pass (landlock.h:465-468, 493).
+CONFINED = {
+    "control": 0,
+    "other": errno.EACCES,
+    "abstract": errno.EPERM,
+    "datagram": errno.EACCES,
+    "bind": errno.EACCES,
+    "pair": 0,
+    "child_other": errno.EACCES,
+    "tcp_bind": 0,
+    "tcp_connect": 0,
+    "udp_send": 0,
+    "signal_helper": 0,
+}
 
 
 class LauncherTests(unittest.TestCase):
@@ -136,6 +268,14 @@ class LauncherTests(unittest.TestCase):
             raise RuntimeError(
                 "pinned Rust and bubblewrap are required; no host fallback"
             )
+        # x86-64 landlock_create_ruleset (444) with NULL, 0 and the version flag
+        # returns the ABI (security/landlock/syscalls.c:223-228); RESOLVE_UNIX
+        # needs 9 (landlock.h:329).
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        version = ctypes.c_uint(1)
+        if libc.syscall(ctypes.c_long(444), None, ctypes.c_size_t(0), version) < 9:
+            raise RuntimeError("Landlock ABI 9 or later is required; no host fallback")
         cls.launcher, cls.probe = cls.work / "launcher", cls.work / "probe"
         launcher_source = cls.work / "launcher.rs"
         launcher_source.write_bytes((HERE / "measurement-job-launcher.rs").read_bytes())
@@ -246,7 +386,16 @@ class LauncherTests(unittest.TestCase):
             label, time.monotonic() + seconds, emit, limit=1024 * 1024
         ).run(command, cls.environment, cwd=str(cls.work))
 
-    def execute(self, arguments, *, interpreter="probe", denial=None):
+    def execute(
+        self,
+        arguments,
+        *,
+        interpreter="probe",
+        denial=None,
+        listen=None,
+        restrict_flags=None,
+        version_denial=None,
+    ):
         for path, expected in self.binary_facts.items():
             self.check_file(path, expected)
         command = [
@@ -290,6 +439,8 @@ class LauncherTests(unittest.TestCase):
                 target.write_text("not an executable image\n")
                 target.chmod(0o500 if interpreter == "invalid" else 0o400)
             command += ["--ro-bind", str(target), "/usr/bin/python3"]
+        if listen is not None:
+            command += ["--tmpfs", "/private"]
         poison = {
             "LD_PRELOAD": "/untrusted.so",
             "LD_AUDIT": "/audit.so",
@@ -301,8 +452,14 @@ class LauncherTests(unittest.TestCase):
         for key, value in poison.items():
             command += ["--setenv", key, value]
         command += ["/feeder", "--feed"]
+        if listen is not None:
+            command += ["--listen", listen]
         if denial is not None:
-            command += ["--deny-close", str(denial)]
+            command += ["--deny", *map(str, denial)]
+        if restrict_flags is not None:
+            command += ["--restrict-flags", str(restrict_flags)]
+        if version_denial is not None:
+            command += ["--deny-version", str(version_denial)]
         command += arguments
         info_path = self.work / f"bwrap-info-{self.counter + 1}.json"
         wrapper = """import os,sys
@@ -396,13 +553,75 @@ os.execv(sys.argv[2],sys.argv[2:])
                 self.assertEqual(result.stderr, "")
 
     def test_denied_or_unsupported_descriptor_sweep_refuses_before_exec(self):
-        for errno in (1, 38):
-            with self.subTest(errno=errno):
-                result = self.execute(["--host"], denial=errno)
+        for code in (errno.EPERM, errno.ENOSYS):
+            with self.subTest(errno=code):
+                result = self.execute(["--host"], denial=(436, code))
                 self.assertIn("before_fd9=true", result.stdout)
                 self.assertEqual(result.returncode, 77, result.stderr)
                 self.assertNotIn("after=", result.stdout)
                 self.assertEqual(result.stderr, "")
+
+    def probes(self, result):
+        return {
+            key: int(value)
+            for key, value in re.findall(
+                r"^probe_([a-z_]+)=(-?\d+)$", result.stdout, re.MULTILINE
+            )
+        }
+
+    def assert_started(self, result, probes):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before = re.search(r"^before_open=([0-9,]*)$", result.stdout, re.MULTILINE)
+        self.assertIsNotNone(before, result.stdout)
+        self.assertLessEqual({"3", "9", "511"}, set(before.group(1).split(",")))
+        # The ruleset and O_PATH descriptors must not reach the new image.
+        self.assertRegex(result.stdout, r"(?m)^after_open=$")
+        self.assertEqual(self.probes(result), probes)
+
+    def assert_refused(self, result):
+        self.assertIn("before_fd9=true", result.stdout)
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertNotIn("after=", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_guardian_resolves_only_the_bound_control_socket(self):
+        result = self.execute(GUARDIAN, listen="socket")
+        self.assert_started(result, CONFINED)
+
+    def test_guardian_passes_exactly_log_new_exec_on_to_restrict_self(self):
+        # LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON (landlock.h:197); any other
+        # flags value makes the filter return EPERM and the launcher refuse.
+        result = self.execute(GUARDIAN, listen="socket", restrict_flags=2)
+        self.assert_started(result, CONFINED)
+
+    def test_host_role_is_not_confined_and_does_not_query_landlock(self):
+        for denial in (None, (444, errno.ENOSYS)):
+            with self.subTest(denial=denial):
+                result = self.execute(["--host"], listen="socket", denial=denial)
+                self.assert_started(result, dict.fromkeys(CONFINED, 0))
+
+    def test_guardian_refuses_without_a_private_control_socket_node(self):
+        for variant in ("missing", "regular", "mode", "symlink"):
+            with self.subTest(variant=variant):
+                self.assert_refused(self.execute(GUARDIAN, listen=variant))
+
+    def test_denied_or_unsupported_landlock_refuses_before_exec(self):
+        # 444-446 are landlock_create_ruleset/add_rule/restrict_self
+        # (arch/x86/entry/syscalls/syscall_64.tbl:371-373).
+        for number in (444, 445, 446):
+            for code in (errno.ENOSYS, errno.EPERM, errno.EINVAL):
+                with self.subTest(syscall=number, errno=code):
+                    result = self.execute(
+                        GUARDIAN, listen="socket", denial=(number, code)
+                    )
+                    self.assert_refused(result)
+
+    def test_guardian_refuses_when_only_the_abi_query_fails(self):
+        # As without Landlock (syscalls.c:220-221); the ruleset call would pass.
+        for code in (errno.ENOSYS, errno.EOPNOTSUPP):
+            with self.subTest(errno=code):
+                result = self.execute(GUARDIAN, listen="socket", version_denial=code)
+                self.assert_refused(result)
 
     def test_bad_arguments_refuse_without_loading_actor(self):
         for args in (
@@ -419,21 +638,21 @@ os.execv(sys.argv[2],sys.argv[2:])
                 self.assertNotIn("after=", result.stdout)
 
     def test_guest_and_guardian_forward_only_the_selected_arguments(self):
-        digest = "c" * 64
-        for request, expected in (
-            (["--guest"], ["/opt/irlume/measurement-job-boot.py"]),
+        for request, expected, listen in (
+            (["--guest"], ["/opt/irlume/measurement-job-boot.py"], None),
             (
-                ["--guardian", "/private/guardian-config.json", digest],
+                GUARDIAN,
                 [
                     "/opt/irlume/measurement-job-guardian-native.py",
                     "--service",
                     "/private/guardian-config.json",
-                    digest,
+                    GUARDIAN[2],
                 ],
+                "socket",
             ),
         ):
             with self.subTest(request=request):
-                result = self.execute(request)
+                result = self.execute(request, listen=listen)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 args = [
                     bytes.fromhex(value).decode()

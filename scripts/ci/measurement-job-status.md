@@ -81,8 +81,23 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   not by this check. The binding holds at each maps read; code that ran
   before the check could have replaced its own mappings. Active uprobes or
   breakpoints on runtime files make G refuse.
-- Restrict path-socket connects from the future QEMU child with Landlock
-  (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
+- Path-socket connects, narrowed and still open: before it execs G, the
+  launcher's `--guardian` arm enforces a Landlock domain. It exits 77 unless
+  the ABI is 9 or later (both hosts report 10) and `control.sock` beside the
+  config, opened `O_PATH|O_NOFOLLOW`, is a socket with mode 0600. The domain
+  handles `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` and `MAKE_SOCK` with one rule,
+  `RESOLVE_UNIX` on that node's inode, and scopes abstract UNIX sockets. G
+  and every descendant get EACCES on connect(2) or addressed sendmsg(2) to
+  any other pathname socket created outside the domain and on bind(2) of a
+  pathname socket, and EPERM on abstract sockets created outside it. Like
+  any Landlock domain it also makes renames and links across directories
+  fail with EXDEV; G does neither. Not covered: inherited or connected
+  descriptors, socketpairs, SCM_RIGHTS and other socket families. The
+  unit's `NoNewPrivileges=` is the prerequisite; systemd 259 and 262 have no
+  Landlock option. Bubblewrap tests with live listeners outside the domain
+  check each case and fail all 30 mutation controls. Still open: a witness
+  of the denials from inside G's unit, and a nested layer with no rules for
+  the future QEMU child.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
   uid, gid, namespace, liveness and socket node, and H stays the verifier of
   G's unit, invocation and start time.
@@ -93,7 +108,7 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 36 `scripts/ci/test-measurement-*.py` suites pass (829 tests), with
+All 36 `scripts/ci/test-measurement-*.py` suites pass (835 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. G runs with `KeyringMode=private`,
 read back by H: a user manager's services otherwise share its session
 keyring, which G's private user namespace does not replace (probed on

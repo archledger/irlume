@@ -2,6 +2,9 @@
 
 ## Status
 
+Withdrawn 2026-10-30 by [ADR-0038](0038-remove-gpu-inference.md), except section 7
+as narrowed there. The text below is kept as the record.
+
 Proposed 2026-10-10. Amended 2026-10-11 (driver identity), 2026-10-21
 (precision `f32`, ranking evidence, measured hosts) and 2026-10-22 (the
 runtime-suspend arm where the driver holds the device; the certification

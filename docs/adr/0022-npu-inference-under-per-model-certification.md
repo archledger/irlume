@@ -238,6 +238,9 @@ Amended 2026-10-10 by ADR-0033: the "no GPU" clause of this prohibition
 is superseded there; the GPU is eligible under this table's regime, one
 explicit device, while `AUTO`, `HETERO` and `MULTI` remain refused.
 
+Amended 2026-10-30 by ADR-0038: ADR-0033 is withdrawn, and the GPU is out of
+scope again. This prohibition again includes the GPU.
+
 Only the recognizer is eligible. The PAD cues are deny-only evidence with
 attack margins of 0.041 to 0.044; on the qualified stack their NPU drift
 is a third (FLIR) and a sixteenth (ViT) of those margins, one ViT attack
@@ -510,6 +513,9 @@ the #1053 measurements (which show the accelerator faster, not a failed
 user-facing latency budget), and ADR-0033 admits the GPU under this ADR's
 regime, keeps CPU the default until a certification passes, and leaves the
 execution-provider (CUDA, TensorRT) lane inert.
+
+Amended 2026-10-30 by ADR-0038: GPU inference is removed. GPU devices are out of
+scope, and this section's revisit condition applies again.
 
 ## Consequences
 

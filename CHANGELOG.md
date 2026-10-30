@@ -528,6 +528,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- GPU inference is withdrawn (ADR-0038, #1053): the recognizer runs on the CPU, or
+  on the NPU once a certification passes. ADR-0033 is withdrawn except its CPU
+  execution-provider rule, and ADR-0022 returns to no GPU. No login has ever run
+  on a GPU, so nothing changes yet; the code leaves in following changes.
 - The f32 precision record and the ADR-0033 amendment of 2026-10-21 now
   name the cause of the ThinkPad identity change from `f592e9bc` to
   `d689e37d` (#1164). The two identities differ only in the memory size

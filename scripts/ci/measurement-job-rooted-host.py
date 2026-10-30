@@ -29,6 +29,10 @@ PREPARE_NS = 60_000_000_000
 # witness for exactly its selection, and binds the witness into the attempt.
 HOST_REQUEST_SCOPE = "contained-job-host-request-v1"
 HOST_WITNESS_SCOPE = "contained-job-host-startup-witness-v1"
+# measurement-job-host.py REQUEST_FIELDS["resolve-failed-startup"].
+RESOLVER_REQUEST_FIELDS = frozenset(
+    ("scope", "mode", "runtime", "manifest", "manifest_sha256", "run_id", "commit")
+)
 HOST_WITNESS_LIMIT = 1024**2
 INTENT_SCOPE = "contained-job-rooted-host-intent-v2"
 INTENT_FIELDS = frozenset(
@@ -176,13 +180,8 @@ def host_request(selection):
     }
 
 
-def check_witness(witness, selection, root):
-    """This process's witness for this selection; returns its digest.
-
-    Only the binding is checked here: the entry validated the observation
-    against its manifest before H was built, and a checker can repeat that
-    from host-witness.json.
-    """
+def witness_wire(witness, root):
+    """The canonical, non-authoritative wire of this process's witness."""
     if (
         type(witness) is not HostWitness
         or type(witness.data) is not bytes
@@ -197,20 +196,62 @@ def check_witness(witness, selection, root):
     if type(wire) is not dict or root.closure.canonical(wire) != witness.data:
         raise ValueError("rooted host witness binding")
     observation = wire.get("observation")
-    request = root.closure.canonical(host_request(selection))
     if (
         wire.get("scope") != HOST_WITNESS_SCOPE
         or any(
             wire.get(name) is not False
             for name in ("accepted", "native_authorized", "full_contract_proven")
         )
-        or wire.get("runtime") != selection.runtime
-        or wire.get("manifest_sha256") != selection.manifest_sha256
-        or wire.get("request_sha256") != hashlib.sha256(request).hexdigest()
         or type(observation) is not dict
         or type(observation.get("pid")) is not int
         or observation["pid"] != os.getpid()
-        or observation.get("request_data") != {"$bytes": request.hex()}
+    ):
+        raise ValueError("rooted host witness binding")
+    return wire
+
+
+def check_witness(witness, selection, root):
+    """This process's witness for this selection; returns its digest.
+
+    Only the binding is checked here: the entry validated the observation
+    against its manifest before H was built, and a checker can repeat that
+    from host-witness.json.
+    """
+    wire = witness_wire(witness, root)
+    request = root.closure.canonical(host_request(selection))
+    if (
+        wire.get("runtime") != selection.runtime
+        or wire.get("manifest_sha256") != selection.manifest_sha256
+        or wire.get("request_sha256") != hashlib.sha256(request).hexdigest()
+        or wire["observation"].get("request_data") != {"$bytes": request.hex()}
+    ):
+        raise ValueError("rooted host witness binding")
+    return hashlib.sha256(witness.data).hexdigest()
+
+
+def check_resolver_witness(witness, run_id, commit, root):
+    """This process's witness for resolving exactly this run; returns its digest.
+
+    The request differs from any host_request, so a resolver witness cannot
+    start HostOwner and a startup witness cannot resolve.
+    """
+    wire = witness_wire(witness, root)
+    try:
+        request = bytes.fromhex(wire["observation"]["request_data"]["$bytes"])
+        value = root.runtime._json(request)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("rooted host witness binding") from error
+    if (
+        type(value) is not dict
+        or root.closure.canonical(value) != request
+        or set(value) != RESOLVER_REQUEST_FIELDS
+        or value.get("scope") != HOST_REQUEST_SCOPE
+        or value.get("mode") != "resolve-failed-startup"
+        or value.get("run_id") != run_id
+        or value.get("commit") is not commit
+        or wire.get("runtime") != value.get("runtime")
+        or wire.get("manifest_sha256") != value.get("manifest_sha256")
+        or wire.get("request_sha256") != hashlib.sha256(request).hexdigest()
     ):
         raise ValueError("rooted host witness binding")
     return hashlib.sha256(witness.data).hexdigest()
@@ -1053,7 +1094,7 @@ class HostOwner:
 
 
 RESOLVE_NS = 30_000_000_000
-RESOLUTION_SCOPE = "contained-job-rooted-failed-attempt-resolution-v1"
+RESOLUTION_SCOPE = "contained-job-rooted-failed-attempt-resolution-v2"
 PROC_LIMIT = 65536
 FD_LIMIT = 1 << 20
 HEX32 = "[0-9a-f]{32}"
@@ -1092,6 +1133,13 @@ FAILURE_V2 = FAILURE_V1 | {
     "stop_reply",
     "stop_error",
 }
+# H's receipt of the invocation it bound (HostOwner.start). A killed H writes
+# no failure record, so this is what it leaves.
+STARTED_FIELDS = frozenset(("service", "cgroup_id", "creation_reply"))
+# The manager's errors for a name it does not know, as SystemdBus raises them
+# (guardian-service.py:196-200). Any other error refuses.
+NO_UNIT = "user-bus error: org.freedesktop.systemd1.NoSuchUnit"
+NO_INVOCATION = "user-bus error: org.freedesktop.systemd1.NoUnitForInvocationID"
 SERVICE_FIELDS = (
     "Id",
     "InvocationID",
@@ -1261,6 +1309,20 @@ def check_failed_unit(row, unit, invocation, argv, value, main_pid, tick):
         raise ValueError("resolver unit main process")
 
 
+def observe_unit_again(bus, transport, unit, deadline):
+    """observe_failed_unit for a unit the manager answered for a moment ago.
+
+    NoSuchUnit now means it changed. As a ValueError the refusal keeps that
+    reason; reason() in measurement-job-host.py names a RuntimeError by class.
+    """
+    try:
+        return observe_failed_unit(bus, transport, unit, deadline)
+    except RuntimeError as error:
+        if str(error) != NO_UNIT:
+            raise
+        raise ValueError("resolver unit changed during resolution") from error
+
+
 def bind_invocation(bus, transport, unit, invocation, deadline):
     path = bus.call(
         transport.MANAGER_PATH,
@@ -1282,6 +1344,69 @@ def bind_invocation(bus, transport, unit, invocation, deadline):
     ):
         raise ValueError("resolver invocation binding")
     return path
+
+
+def started_invocation(data, root, unit):
+    """Invocation and main PID from H's host-started.json for this unit."""
+    try:
+        value = root.runtime._json(data)
+    except ValueError as error:
+        raise ValueError("resolver host start receipt") from error
+    service = value.get("service") if type(value) is dict else None
+    if (
+        type(value) is not dict
+        or root.closure.canonical(value) != data
+        or set(value) != STARTED_FIELDS
+        or type(value["creation_reply"]) is not str
+        or re.fullmatch(JOB_PATH, value["creation_reply"]) is None
+        or type(value["cgroup_id"]) is not int
+        or value["cgroup_id"] <= 0
+        or type(service) is not dict
+        or set(service) != set(root.guardian.ServiceIdentity._fields)
+        or service["unit"] != unit
+        or type(service["invocation_id"]) is not str
+        or re.fullmatch(HEX32, service["invocation_id"]) is None
+        or service["invocation_id"] == "0" * 32
+        or type(service["pid"]) is not int
+        or service["pid"] <= 1
+    ):
+        raise ValueError("resolver host start receipt")
+    return service["invocation_id"], service["pid"]
+
+
+def unit_absent(bus, transport, unit, invocation, deadline):
+    """The manager knows neither the unit nor the invocation a receipt names.
+
+    False when the unit answers. True only on the manager's exact errors; any
+    other error propagates and refuses. A running or failed unit stays loaded,
+    so this means a unit that never started or ended without failing and lost
+    its reference; the caller's window guard covers one still being created.
+    """
+    try:
+        bus.call(
+            transport.MANAGER_PATH, transport.MANAGER, "GetUnit", "s", (unit,), deadline
+        )
+    except RuntimeError as error:
+        if str(error) != NO_UNIT:
+            raise
+    else:
+        return False
+    if invocation is None:
+        return True
+    try:
+        bus.call(
+            transport.MANAGER_PATH,
+            transport.MANAGER,
+            "GetUnitByInvocationID",
+            "ay",
+            (bytes.fromhex(invocation),),
+            deadline,
+        )
+    except RuntimeError as error:
+        if str(error) != NO_INVOCATION:
+            raise
+        return True
+    raise ValueError("resolver invocation without its unit")
 
 
 def unit_cgroups(unit, uid, base="/sys/fs/cgroup"):
@@ -1399,6 +1524,7 @@ def resolve_failed_startup(
     run_id,
     runtime,
     *,
+    witness=None,
     invocation_id=None,
     commit=False,
     gate_factory=None,
@@ -1409,11 +1535,17 @@ def resolve_failed_startup(
     namespaces=None,
     now=time.monotonic_ns,
 ):
-    """Clear the admission blocker of a failed startup attempt whose H has exited.
+    """Clear the admission blocker of a startup attempt whose H has exited.
 
-    Everything is read-only until the final non-accepting resolved-<run>.json
-    write and blocker unlink; with commit=False nothing is written. A v1 failure
-    record needs the caller's invocation evidence, which the manager must bind.
+    witness is this process's witness for exactly this run and commit flag;
+    None (the default) refuses. Everything is read-only until the final writes
+    of the witness and the non-accepting resolved-<run>.json and the blocker
+    unlink; with commit=False nothing is written. A v1 failure record needs the
+    caller's invocation evidence, which the manager must bind.
+
+    With no failure record H was lost: a SIGKILL never reaches abort. Then its
+    host-started.json or the manager's row binds a failed unit, or the manager
+    knows none and G's startup window has passed.
     """
     transport = runtime.native.service
     deadline = now() + RESOLVE_NS
@@ -1431,6 +1563,10 @@ def resolve_failed_startup(
         or invocation_id == "0" * 32
     ):
         raise ValueError("resolver invocation ID")
+    witness_sha256 = check_resolver_witness(
+        witness, run_id, commit, runtime.preflight.root
+    )
+    witness.check(deadline)
     gate = (gate_factory or transport.AdmissionGate.for_current_user)(deadline)
     owned, errors, result = {"bus": None}, [], None
     try:
@@ -1439,6 +1575,8 @@ def resolve_failed_startup(
             runtime,
             gate,
             owned,
+            witness,
+            witness_sha256,
             invocation_id,
             commit,
             deadline,
@@ -1466,6 +1604,8 @@ def _resolve(
     runtime,
     gate,
     owned,
+    witness,
+    witness_sha256,
     invocation_id,
     commit,
     deadline,
@@ -1485,7 +1625,10 @@ def _resolve(
             raise TimeoutError("resolver deadline")
 
     gate_path = admission_path(root, gate)
-    blocker, blocker_identity = gate.read_blocker(deadline)
+    try:
+        blocker, blocker_identity = gate.read_blocker(deadline)
+    except FileNotFoundError as error:
+        raise ValueError("resolver found no blocker") from error
     try:
         claim = json.loads(blocker)
         intent = bytes.fromhex(claim["intent_hex"])
@@ -1504,44 +1647,59 @@ def _resolve(
         raise FileExistsError("resolver outcome already recorded")
 
     failure_name = "failed-" + run_id + ".json"
-    failure_data, failure_info = read_owned(gate.root_fd, failure_name, 65536, 0o600)
-    failure = root.runtime._json(failure_data)
-    keys = {
-        "contained-job-rooted-host-failure-v1": FAILURE_V1,
-        "contained-job-rooted-host-failure-v2": FAILURE_V2,
-    }.get(failure.get("scope") if type(failure) is dict else None)
-    if (
-        keys is None
-        or root.closure.canonical(failure) != failure_data
-        or set(failure) != keys
-        or failure["run_id"] != run_id
-        or failure["admission_state"] != "present"
-        or failure["creation_attempted"] is not True
-        or failure["native_authorized"] is not False
-        or failure["full_contract_proven"] is not False
-    ):
-        raise ValueError("resolver failure record shape")
-    main_pid = None
-    if keys is FAILURE_V2:
-        # Uncertain creation (created false) is never resolved here.
-        if (
-            invocation_id is not None
-            or failure["created"] is not True
-            or type(failure["invocation_id"]) is not str
-            or re.fullmatch(HEX32, failure["invocation_id"]) is None
-            or failure["invocation_id"] == "0" * 32
-            or failure["boot_id"] != boot_id()
-        ):
-            raise ValueError("resolver v2 failure record")
-        invocation, source = failure["invocation_id"], "failure-record"
-        observed = failure["observed"]
-        # MainPID 0 means no main process at that moment, not a pid claim.
-        if type(observed) is dict and type(observed.get("MainPID")) is int:
-            main_pid = observed["MainPID"] if observed["MainPID"] > 1 else None
-    elif invocation_id is None:
-        raise ValueError("resolver needs caller invocation evidence for a v1 record")
+    # A failure record always wins. Only a missing one means a lost owner; a
+    # symlink (ELOOP) or a bad record refuses.
+    try:
+        failure_data, failure_info = read_owned(
+            gate.root_fd, failure_name, 65536, 0o600
+        )
+    except FileNotFoundError:
+        failure_data = failure_info = None
+    lost = failure_data is None
+    invocation = source = main_pid = None
+    if lost:
+        if invocation_id is not None:
+            raise ValueError("resolver lost owner with caller evidence")
     else:
-        invocation, source = invocation_id, "caller-evidence"
+        failure = root.runtime._json(failure_data)
+        keys = {
+            "contained-job-rooted-host-failure-v1": FAILURE_V1,
+            "contained-job-rooted-host-failure-v2": FAILURE_V2,
+        }.get(failure.get("scope") if type(failure) is dict else None)
+        if (
+            keys is None
+            or root.closure.canonical(failure) != failure_data
+            or set(failure) != keys
+            or failure["run_id"] != run_id
+            or failure["admission_state"] != "present"
+            or failure["creation_attempted"] is not True
+            or failure["native_authorized"] is not False
+            or failure["full_contract_proven"] is not False
+        ):
+            raise ValueError("resolver failure record shape")
+        if keys is FAILURE_V2:
+            # A record with uncertain creation (created false) is never resolved
+            # here. This covers records only: a missing record is a lost owner.
+            if (
+                invocation_id is not None
+                or failure["created"] is not True
+                or type(failure["invocation_id"]) is not str
+                or re.fullmatch(HEX32, failure["invocation_id"]) is None
+                or failure["invocation_id"] == "0" * 32
+                or failure["boot_id"] != boot_id()
+            ):
+                raise ValueError("resolver v2 failure record")
+            invocation, source = failure["invocation_id"], "failure-record"
+            observed = failure["observed"]
+            # MainPID 0 means no main process at that moment, not a pid claim.
+            if type(observed) is dict and type(observed.get("MainPID")) is int:
+                main_pid = observed["MainPID"] if observed["MainPID"] > 1 else None
+        elif invocation_id is None:
+            raise ValueError(
+                "resolver needs caller invocation evidence for a v1 record"
+            )
+        else:
+            invocation, source = invocation_id, "caller-evidence"
 
     attempt_name = "attempt-" + run_id
     attempt_path = str(gate.root / attempt_name)
@@ -1549,9 +1707,11 @@ def _resolve(
         gate_path[1]: "admission-directory",
         gate_path[2]: "admission.lock",
         blocker_identity: "active.json",
-        (failure_info.st_dev, failure_info.st_ino): failure_name,
     }
+    if not lost:
+        targets[(failure_info.st_dev, failure_info.st_ino)] = failure_name
     entries = []
+    started_data = None
     directory = os.open(
         attempt_name,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -1591,6 +1751,13 @@ def _resolve(
             )
         except FileNotFoundError as error:
             raise ValueError("resolver host witness") from error
+        if lost:
+            try:
+                started_data, _ = read_owned(
+                    directory, "host-started.json", 65536, 0o400
+                )
+            except FileNotFoundError:
+                pass
     finally:
         os.close(directory)
 
@@ -1630,6 +1797,9 @@ def _resolve(
         or spec.run_id != run_id
     ):
         raise ValueError("resolver configuration binding")
+    if started_data is not None:
+        invocation, main_pid = started_invocation(started_data, root, unit)
+        source = "host-started"
     argv = root.entry_argv(plan, plan_intent["config_sha256"])
     # /proc and pid checks prove nothing from another namespace than H's.
     if namespaces(tuple(plan["host_namespaces"])) != plan["host_namespaces"]:
@@ -1656,11 +1826,26 @@ def _resolve(
     check()
 
     owned["bus"] = bus = ReadOnlyBus(bus_factory(uid, deadline=deadline))
-    row = observe_failed_unit(bus, transport, unit, deadline)
-    check_failed_unit(
-        row, unit, invocation, argv, value, main_pid, root.guardian.START_TICK_NS
-    )
-    manager_path = bind_invocation(bus, transport, unit, invocation, deadline)
+    absent = lost and unit_absent(bus, transport, unit, invocation, deadline)
+    row = manager_path = None
+    if absent:
+        # Past G's own deadline a late-created G refuses before any write
+        # (rooted-native.py:465-467), and a bound unit cannot be mid-startup.
+        if now() < value["startup_deadline_ns"] + root.guardian.STOP_NS:
+            raise ValueError("resolver startup window still open")
+    else:
+        observe = observe_unit_again if lost else observe_failed_unit
+        row = observe(bus, transport, unit, deadline)
+        if invocation is None:
+            # H died before its receipt. ExecStart, compared below, carries the
+            # config digest (measurement-job-root.py:297-305).
+            invocation, source = row["InvocationID"], "manager"
+            if re.fullmatch(HEX32, invocation) is None or invocation == "0" * 32:
+                raise ValueError("resolver manager invocation")
+        check_failed_unit(
+            row, unit, invocation, argv, value, main_pid, root.guardian.START_TICK_NS
+        )
+        manager_path = bind_invocation(bus, transport, unit, invocation, deadline)
     if cgroup_scan(unit, uid):
         raise ValueError("resolver unit cgroup remains")
     check()
@@ -1669,19 +1854,41 @@ def _resolve(
         raise ValueError("resolver found attempt processes")
     check()
 
-    if observe_failed_unit(bus, transport, unit, deadline) != row:
+    if absent:
+        if not unit_absent(bus, transport, unit, invocation, deadline):
+            raise ValueError("resolver unit changed during resolution")
+    elif observe_unit_again(bus, transport, unit, deadline) != row:
         raise ValueError("resolver unit changed during resolution")
+    # G does not check H while it binds, encodes and writes its witness
+    # (rooted-handshake.py:176-205), so a lost owner allows a late file.
+    directory = os.open(
+        attempt_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=gate.root_fd,
+    )
+    try:
+        current = os.fstat(directory)
+        names = sorted(os.listdir(directory))
+    finally:
+        os.close(directory)
+    if names != [entry[0] for entry in entries] or (
+        current.st_dev,
+        current.st_ino,
+    ) != (attempt.st_dev, attempt.st_ino):
+        raise ValueError("resolver attempt entries changed")
     if admission_path(root, gate) != gate_path:
         raise ValueError("resolver admission path changed")
     again, identity = gate.read_blocker(deadline, len(blocker))
     if again != blocker or identity != blocker_identity:
         raise ValueError("resolver blocker changed")
     check()
+    witness_name = f"resolver-witness-{run_id}-{witness_sha256[:16]}.json"
     record = root.closure.canonical(
         {
             "scope": RESOLUTION_SCOPE,
             "run_id": run_id,
-            "outcome": "failed-attempt-resolved",
+            "outcome": "lost-owner-resolved" if lost else "failed-attempt-resolved",
+            "unit_state": "absent" if absent else "failed",
             "accepted": False,
             "startup_complete": False,
             "native_authorized": False,
@@ -1701,7 +1908,9 @@ def _resolve(
                 "inode": attempt.st_ino,
                 "entries": entries,
             },
-            "failure_record": {
+            "failure_record": None
+            if lost
+            else {
                 "name": failure_name,
                 "sha256": hashlib.sha256(failure_data).hexdigest(),
                 "scope": failure["scope"],
@@ -1717,17 +1926,27 @@ def _resolve(
                 "starttime": client["starttime"],
                 "state": client_state,
             },
-            "service": {key: row[key] for key in SERVICE_FIELDS},
+            "service": None if absent else {key: row[key] for key in SERVICE_FIELDS},
             "service_processes": [],
             "cgroups": [],
             "host_scan": scan,
             "observed_monotonic_ns": now(),
             "boot_id": boot_id(),
+            "resolver_witness": {
+                "name": witness_name,
+                "sha256": witness_sha256,
+                "size": len(witness.data),
+            },
         }
     )
     digest = hashlib.sha256(record).hexdigest()
+    # An NSS module from the gate factory (guardian-service.py:661) or anything
+    # else loaded while resolving refuses here, so a dry run predicts the commit.
+    witness.check(deadline)
     if not commit:
         return Resolution(record, digest, False, "present")
+    # Unique per process and read by no code: a dead resolver's copy blocks no retry.
+    gate.write(witness_name, witness.data, deadline)
     gate.resolve_failed(blocker, blocker_identity, record, deadline)
     try:
         os.stat("active.json", dir_fd=gate.root_fd, follow_symlinks=False)

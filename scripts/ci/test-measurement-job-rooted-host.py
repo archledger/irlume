@@ -4,6 +4,7 @@
 """Concrete H tests with fake manager/peer endpoints; no service or VM."""
 
 import copy
+import errno
 import hashlib
 import importlib
 import importlib.util
@@ -43,6 +44,41 @@ input_fixtures = load("h_input_fixtures", "test-measurement-job-rooted-host-inpu
 channel_fixtures = load("h_channel_fixtures", "test-measurement-job-guardian.py")
 # Imported by no H module; an import of it inside the window must refuse.
 UNUSED = "colorsys"
+# The manager's errors as SystemdBus raises them (guardian-service.py:196-200).
+NO_UNIT = "user-bus error: org.freedesktop.systemd1.NoSuchUnit"
+NO_INVOCATION = "user-bus error: org.freedesktop.systemd1.NoUnitForInvocationID"
+# Exactly the fields of a v2 resolution record: v1's, unit_state, resolver_witness.
+RESOLUTION_V2 = {
+    "scope",
+    "run_id",
+    "outcome",
+    "accepted",
+    "startup_complete",
+    "native_authorized",
+    "full_contract_proven",
+    "blocker",
+    "intent_sha256",
+    "config_sha256",
+    "attempt",
+    "failure_record",
+    "invocation",
+    "client",
+    "service",
+    "service_processes",
+    "cgroups",
+    "host_scan",
+    "observed_monotonic_ns",
+    "boot_id",
+    "unit_state",
+    "resolver_witness",
+}
+# What H leaves in its attempt before host-started.json.
+PREPARED_ENTRIES = [
+    "control.sock",
+    "guardian-config.json",
+    "host-intent.json",
+    "host-witness.json",
+]
 
 
 def witness_data(root, selection, facts=None, **changes):
@@ -1272,6 +1308,11 @@ class FactoryTests(unittest.TestCase):
         self.close_owned()
         self.owner.inputs = self.owner.gate = None
         host.UNRESOLVED.pop(self.spec.run_id)
+        self.dead_unit(bus, "signal", 2, 9, observed["MainPID"])
+        return bus, len(bus.calls)
+
+    def dead_unit(self, bus, result, code, status, main_pid):
+        """The fake manager's row of a unit that ended and left no reference."""
         start = bus.service["ExecMainStartTimestampMonotonic"][1]
         bus.unit.update(
             ActiveState=("s", "failed"),
@@ -1284,10 +1325,10 @@ class FactoryTests(unittest.TestCase):
             MainPID=("u", 0),
             ControlGroup=("s", ""),
             ExecMainExitTimestampMonotonic=("t", start + 50),
-            Result=("s", "signal"),
-            ExecMainCode=("i", 2),
-            ExecMainStatus=("i", 9),
-            ExecMainPID=("u", observed["MainPID"]),
+            Result=("s", result),
+            ExecMainCode=("i", code),
+            ExecMainStatus=("i", status),
+            ExecMainPID=("u", main_pid),
         )
         bus.leftover, bus.by_invocation, bus.get_unit = [], self.FOREIGN, None
         self.scanned, self.cgroups = [], []
@@ -1312,7 +1353,6 @@ class FactoryTests(unittest.TestCase):
             return call(path, interface, method, signature, args, deadline)
 
         bus.call = manager
-        return bus, len(bus.calls)
 
     def resolve(self, bus, **options):
         defaults = {
@@ -1334,9 +1374,51 @@ class FactoryTests(unittest.TestCase):
             "namespaces": lambda names: dict(
                 self.owner.value["root_plan"]["host_namespaces"]
             ),
+            "witness": self.resolver_witness(options.get("commit", False)),
         }
         defaults.update(options)
         return host.resolve_failed_startup(self.spec.run_id, self.runtime, **defaults)
+
+    def resolver_witness(
+        self, commit=False, facts=None, check=unchanged, wire=None, **request
+    ):
+        """A canonical witness of this process for resolving the fixture run.
+
+        request replaces fields of its request, wire of the witness, facts are
+        added to its observation.
+        """
+        data = self.root.closure.canonical(
+            {
+                "scope": host.HOST_REQUEST_SCOPE,
+                "mode": "resolve-failed-startup",
+                "runtime": self.selection.runtime,
+                "manifest": self.selection.manifest,
+                "manifest_sha256": self.selection.manifest_sha256,
+                "run_id": self.spec.run_id,
+                "commit": commit,
+                **request,
+            }
+        )
+        return host.HostWitness(
+            self.root.closure.canonical(
+                {
+                    "scope": host.HOST_WITNESS_SCOPE,
+                    "runtime": self.selection.runtime,
+                    "request_sha256": hashlib.sha256(data).hexdigest(),
+                    "manifest_sha256": self.selection.manifest_sha256,
+                    "observation": {
+                        "pid": os.getpid(),
+                        "request_data": {"$bytes": data.hex()},
+                        **(facts or {}),
+                    },
+                    "accepted": False,
+                    "native_authorized": False,
+                    "full_contract_proven": False,
+                    **(wire or {}),
+                }
+            ),
+            check,
+        )
 
     def gate_state(self):
         rows = {}
@@ -1363,13 +1445,18 @@ class FactoryTests(unittest.TestCase):
         dry = self.resolve(bus)
         self.assertEqual((dry.committed, dry.admission_state), (False, "present"))
         self.assertEqual(self.gate_state(), before)
-        result = self.resolve(bus, commit=True)
+        witness = self.resolver_witness(True)
+        result = self.resolve(bus, commit=True, witness=witness)
         self.assertEqual((result.committed, result.admission_state), (True, "absent"))
         after = self.gate_state()
         name = f"resolved-{self.spec.run_id}.json"
+        witness_sha256 = hashlib.sha256(witness.data).hexdigest()
+        kept = f"resolver-witness-{self.spec.run_id}-{witness_sha256[:16]}.json"
         self.assertEqual(set(before) - set(after), {"active.json"})
-        self.assertEqual(set(after) - set(before), {name})
-        self.assertTrue(all(after[key] == before[key] for key in after if key != name))
+        self.assertEqual(set(after) - set(before), {name, kept})
+        self.assertTrue(
+            all(after[key] == before[key] for key in after if key not in (name, kept))
+        )
         self.assertFalse(list(self.gate_path.glob("terminal-*")))
         path = self.gate_path / name
         self.assertEqual(path.read_bytes(), result.record)
@@ -1380,8 +1467,28 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(dry.record).hexdigest(), dry.sha256)
         first = json.loads(dry.record)
         first.pop("observed_monotonic_ns")
+        # The dry run's own witness names its own request.
+        dry_witness = self.resolver_witness(False)
+        dry_sha256 = hashlib.sha256(dry_witness.data).hexdigest()
         self.assertEqual(
-            first, {k: v for k, v in record.items() if k != "observed_monotonic_ns"}
+            first.pop("resolver_witness"),
+            {
+                "name": f"resolver-witness-{self.spec.run_id}-{dry_sha256[:16]}.json",
+                "sha256": dry_sha256,
+                "size": len(dry_witness.data),
+            },
+        )
+        self.assertEqual(
+            record["resolver_witness"],
+            {"name": kept, "sha256": witness_sha256, "size": len(witness.data)},
+        )
+        self.assertEqual(
+            first,
+            {
+                k: v
+                for k, v in record.items()
+                if k not in ("observed_monotonic_ns", "resolver_witness")
+            },
         )
         run = self.spec.run_id
         attempt = self.gate_path / f"attempt-{run}"
@@ -1439,11 +1546,13 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(
             {key: record[key] for key in ("scope", "run_id", "outcome")},
             {
-                "scope": "contained-job-rooted-failed-attempt-resolution-v1",
+                "scope": "contained-job-rooted-failed-attempt-resolution-v2",
                 "run_id": self.spec.run_id,
                 "outcome": "failed-attempt-resolved",
             },
         )
+        self.assertEqual(set(record), RESOLUTION_V2)
+        self.assertEqual(record["unit_state"], "failed")
         for flag in (
             "accepted",
             "startup_complete",
@@ -1652,10 +1761,6 @@ class FactoryTests(unittest.TestCase):
             "failure-other-boot": (
                 record(boot_id="0" * 8 + "-0000-0000-0000-" + "0" * 12),
                 restore_failure,
-            ),
-            "failure-missing": (
-                lambda: os.rename(failure, gate / "kept-failure"),
-                lambda: os.rename(gate / "kept-failure", failure),
             ),
             "failure-symlink": (
                 lambda: (
@@ -2860,6 +2965,1166 @@ class FactoryTests(unittest.TestCase):
                 self.assert_refused(bus, pattern, (ValueError, OSError))
             undo()
         refused_in_time(self, self.resolve, bus)
+
+    def lost_owner(self, point):
+        """H as a SIGKILL at point leaves it: no abort, no failure record.
+
+        Returns the fake manager its unit would be on; no process holds the
+        gate or the attempt any more. The on-disk state is what a real kill
+        leaves (test-measurement-job-host.py runs real ones).
+        """
+        self.acquire()
+        deadline = self.owner.value["startup_deadline_ns"]
+        bus = None
+        if point == "after-intent":
+            with (
+                mock.patch.object(
+                    self.owner.gate, "claim", side_effect=KeyError("kill")
+                ),
+                self.assertRaises(KeyError),
+            ):
+                self.owner.prepare(
+                    self.owner.config, self.owner.inputs.manifest, deadline
+                )
+        else:
+            self.owner.prepare(self.owner.config, self.owner.inputs.manifest, deadline)
+            bus = self.make_bus()
+        if point == "after-create":
+            write = self.owner.write
+
+            def killed_before_receipt(name, data, end):
+                if name == "host-started":
+                    raise KeyError("kill")
+                return write(name, data, end)
+
+            with (
+                mock.patch.object(
+                    self.owner, "write", side_effect=killed_before_receipt
+                ),
+                self.assertRaises(KeyError),
+            ):
+                self.owner.start(self.owner.config, deadline)
+            self.assertTrue(self.owner.lease.created)
+        elif point in ("after-started", "after-commit", "after-eof", "after-finish"):
+            identity = self.owner.start(self.owner.config, deadline)
+            if point != "after-started":
+                self.guardian_witness()
+            if point == "after-finish":
+                self.owner.lease.terminal = True
+                self.owner.lease.unresolved = False
+                self.owner.finish(
+                    self.root.closure.canonical(
+                        {"service": identity._asdict(), "outcome": "finished"}
+                    ),
+                    deadline,
+                )
+        self.close_owned()
+        self.owner.inputs = self.owner.gate = None
+        self.assertEqual(list(self.gate_path.glob("failed-*")), [])
+        self.scanned, self.cgroups = [], []
+        return bus
+
+    def guardian_witness(self):
+        """G's startup-witness.json, as it stays in the attempt after COMMIT."""
+        path = self.gate_path / f"attempt-{self.spec.run_id}/startup-witness.json"
+        path.write_bytes(b"{}")
+        path.chmod(0o400)
+
+    def gone_unit(self, bus, unit=NO_UNIT, invocation=NO_INVOCATION):
+        """The manager knows neither name. A callable answers each GetUnit."""
+        self.scanned, self.cgroups = [], []
+        bus.calls = []
+
+        def manager(path, interface, method, signature, args, deadline):
+            bus.calls.append((path, interface, method, signature, args, deadline))
+            if method == "GetUnit":
+                answer = unit() if callable(unit) else unit
+            elif method == "GetUnitByInvocationID":
+                answer = invocation
+            else:
+                raise AssertionError("gone unit call " + method)
+            if isinstance(answer, str) and answer.startswith("user-bus error"):
+                raise RuntimeError(answer)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        bus.call = manager
+
+    def failed_unit(self, bus):
+        """The manager's row after G exited 77 and H's reference went."""
+        self.dead_unit(bus, "exit-code", 1, 77, bus.service["MainPID"][1])
+        bus.calls = []
+
+    def past_window(self, offset=0):
+        """A clock fixed offset after origin + 10 s, G's deadline plus its stop time."""
+        moment = self.owner.value["origin_ns"] + 10_000_000_000 + offset
+        return lambda: moment
+
+    def refused_by(self, bus, reason, **options):
+        """Refused with exactly reason whatever its type; the gate is unchanged."""
+        before = self.gate_state()
+        options.setdefault("commit", True)
+        try:
+            self.resolve(bus, **options)
+        except (ValueError, OSError, RuntimeError, KeyError, TypeError) as error:
+            self.assertEqual(str(error), reason)
+        else:
+            self.fail("accepted: " + reason)
+        self.assertEqual(self.gate_state(), before)
+
+    def manager_methods(self, bus):
+        return [call[2] for call in bus.calls]
+
+    def record(self, result):
+        record = json.loads(result.record)
+        self.assertEqual(self.root.closure.canonical(record), result.record)
+        self.assertEqual(set(record), RESOLUTION_V2)
+        self.assertEqual(
+            record["scope"], "contained-job-rooted-failed-attempt-resolution-v2"
+        )
+        for flag in (
+            "accepted",
+            "startup_complete",
+            "native_authorized",
+            "full_contract_proven",
+        ):
+            self.assertIs(record[flag], False)
+        self.assertEqual((record["service_processes"], record["cgroups"]), ([], []))
+        self.assertFalse(list(self.gate_path.glob("terminal-*")))
+        return record
+
+    def test_lost_owner_before_the_claim_leaves_no_blocker(self):
+        self.lost_owner("after-intent")
+        run = self.spec.run_id
+        self.assertEqual(
+            sorted(os.listdir(self.gate_path)), ["admission.lock", f"attempt-{run}"]
+        )
+        self.assertEqual(
+            sorted(os.listdir(self.gate_path / f"attempt-{run}")), PREPARED_ENTRIES
+        )
+        self.refused_by(
+            None,
+            "resolver found no blocker",
+            bus_factory=mock.Mock(side_effect=AssertionError("manager")),
+        )
+        self.refused_by(
+            None,
+            "resolver found no blocker",
+            commit=False,
+            bus_factory=mock.Mock(side_effect=AssertionError("manager")),
+        )
+        end = time.monotonic_ns() + 2_000_000_000
+        gate = native.service.AdmissionGate(self.gate_path, end)
+        try:
+            gate.claim("run-02", b"next", end)
+        finally:
+            gate.close()
+
+    def test_lost_owner_after_the_claim_keeps_blocking_admission(self):
+        self.lost_owner("after-claim")
+        run = self.spec.run_id
+        self.assertEqual(
+            sorted(os.listdir(self.gate_path / f"attempt-{run}")), PREPARED_ENTRIES
+        )
+        blocker = (self.gate_path / "active.json").read_bytes()
+        before = self.gate_state()
+        other = self.owner_with(self.witness)
+        self.addCleanup(lambda: other.gate is not None and other.gate.close())
+        with self.assertRaisesRegex(
+            FileExistsError, "^prior rooted ownership unresolved$"
+        ):
+            other.acquire(time.monotonic_ns() + 5_000_000_000)
+        self.assertEqual((self.gate_path / "active.json").read_bytes(), blocker)
+        self.assertEqual(self.gate_state(), before)
+
+    def test_absent_unit_resolves_only_after_the_startup_window(self):
+        bus = self.lost_owner("after-claim")
+        self.gone_unit(bus)
+        self.refused_by(
+            bus,
+            "resolver startup window still open",
+            now=self.past_window(-1),
+        )
+        self.assertEqual(self.manager_methods(bus), ["GetUnit"])
+        self.assertEqual((self.scanned, self.cgroups), ([], []))
+        blocker = (self.gate_path / "active.json").read_bytes()
+        before = self.gate_state()
+        bus.calls = []
+        dry = refused_in_time(self, self.resolve, bus, now=self.past_window())
+        self.assertEqual((dry.committed, dry.admission_state), (False, "present"))
+        self.assertEqual(self.gate_state(), before)
+        self.assertEqual(self.manager_methods(bus), ["GetUnit", "GetUnit"])
+        self.assertEqual(len(self.scanned), 1)
+        self.assertEqual(len(self.cgroups), 1)
+        bus.calls = []
+        witness = self.resolver_witness(True)
+        result = refused_in_time(
+            self,
+            self.resolve,
+            bus,
+            commit=True,
+            witness=witness,
+            now=self.past_window(),
+        )
+        self.assertEqual((result.committed, result.admission_state), (True, "absent"))
+        self.assertEqual(self.manager_methods(bus), ["GetUnit", "GetUnit"])
+        after = self.gate_state()
+        run = self.spec.run_id
+        digest = hashlib.sha256(witness.data).hexdigest()
+        kept = f"resolver-witness-{run}-{digest[:16]}.json"
+        self.assertEqual(set(before) - set(after), {"active.json"})
+        self.assertEqual(set(after) - set(before), {f"resolved-{run}.json", kept})
+        record = self.record(result)
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+        self.assertEqual(record["unit_state"], "absent")
+        self.assertIsNone(record["failure_record"])
+        self.assertIsNone(record["service"])
+        self.assertEqual(
+            record["invocation"], {"id": None, "source": None, "manager_path": None}
+        )
+        self.assertEqual(record["blocker"]["hex"], blocker.hex())
+        self.assertEqual(
+            [row[0] for row in record["attempt"]["entries"]], PREPARED_ENTRIES
+        )
+        self.assertEqual(record["client"]["state"], "absent")
+        self.assertEqual(
+            record["resolver_witness"],
+            {"name": kept, "sha256": digest, "size": len(witness.data)},
+        )
+        # No failure record among what the scan looks for.
+        self.assertNotIn(f"failed-{run}.json", self.scanned[-1][0].values())
+        end = time.monotonic_ns() + 2_000_000_000
+        gate = native.service.AdmissionGate(self.gate_path, end)
+        try:
+            gate.claim("run-02", b"next", end)
+        finally:
+            gate.close()
+
+    def test_manager_row_binds_a_unit_no_receipt_names(self):
+        bus = self.lost_owner("after-create")
+        self.failed_unit(bus)
+        result = refused_in_time(self, self.resolve, bus)
+        record = self.record(result)
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+        self.assertEqual(record["unit_state"], "failed")
+        self.assertIsNone(record["failure_record"])
+        self.assertEqual(
+            record["invocation"],
+            {"id": "d" * 32, "source": "manager", "manager_path": self.FOREIGN},
+        )
+        self.assertEqual(record["service"]["ExecMainStatus"], 77)
+        self.assertEqual(
+            [row[0] for row in record["attempt"]["entries"]], PREPARED_ENTRIES
+        )
+        value = self.owner.value
+        cases = {
+            "other-exec-start": (
+                "resolver unit state: ExecStart",
+                {
+                    "service": {
+                        "ExecStart": (
+                            "a(sasbttttuii)",
+                            [["/x", ["/x"], False, 0, 0, 0, 0, 0, 0, 0]],
+                        )
+                    }
+                },
+            ),
+            "early-start": (
+                "resolver unit start window",
+                {
+                    "service": {
+                        "ExecMainStartTimestampMonotonic": (
+                            "t",
+                            (value["origin_ns"] - self.root.guardian.START_TICK_NS)
+                            // 1000
+                            - 1,
+                        )
+                    }
+                },
+            ),
+            "zero-invocation": (
+                "resolver manager invocation",
+                {"unit": {"InvocationID": bus.variant("ay", tuple(bytes(16)))}},
+            ),
+            "short-invocation": (
+                "resolver manager invocation",
+                {"unit": {"InvocationID": bus.variant("ay", tuple(b"\xdd" * 8))}},
+            ),
+        }
+        saved = copy.deepcopy((bus.unit, bus.service))
+        for label, (reason, change) in cases.items():
+            bus.unit.update(change.get("unit", {}))
+            bus.after = dict(bus.unit)
+            bus.service.update(change.get("service", {}))
+            with self.subTest(label):
+                self.refused_by(bus, reason)
+            bus.unit, bus.service = copy.deepcopy(saved)
+            bus.after = dict(bus.unit)
+        refused_in_time(self, self.resolve, bus, commit=True)
+        self.assertFalse((self.gate_path / "active.json").exists())
+
+    def test_an_unbound_unit_not_yet_failed_refuses(self):
+        bus = self.lost_owner("after-create")
+        self.failed_unit(bus)
+        saved = copy.deepcopy(bus.unit)
+        for active, sub in (
+            ("active", "running"),
+            ("activating", "start"),
+            ("inactive", "dead"),
+        ):
+            bus.unit.update(ActiveState=("s", active), SubState=("s", sub))
+            bus.after = dict(bus.unit)
+            with self.subTest(active):
+                self.refused_by(bus, "resolver unit state: ActiveState")
+        bus.unit = copy.deepcopy(saved)
+        bus.after = dict(bus.unit)
+        result = refused_in_time(self, self.resolve, bus, commit=True)
+        self.assertEqual(self.record(result)["invocation"]["source"], "manager")
+
+    def test_lost_owner_with_a_failed_unit_uses_its_started_receipt(self):
+        bus = self.lost_owner("after-started")
+        self.failed_unit(bus)
+        result = refused_in_time(self, self.resolve, bus)
+        record = self.record(result)
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+        self.assertEqual(record["unit_state"], "failed")
+        self.assertEqual(
+            record["invocation"],
+            {"id": "d" * 32, "source": "host-started", "manager_path": self.FOREIGN},
+        )
+        self.assertEqual(
+            [row[0] for row in record["attempt"]["entries"]],
+            sorted([*PREPARED_ENTRIES, "host-started.json"]),
+        )
+        saved = copy.deepcopy((bus.unit, bus.service))
+        bus.service["ExecMainPID"] = ("u", 77)
+        self.refused_by(bus, "resolver unit main process")
+        bus.unit, bus.service = copy.deepcopy(saved)
+        other = bus.variant("ay", tuple(bytes.fromhex("e" * 32)))
+        bus.unit["InvocationID"] = other
+        bus.after = dict(bus.unit)
+        self.refused_by(bus, "resolver unit state: InvocationID")
+        bus.unit, bus.service = copy.deepcopy(saved)
+        bus.after = dict(bus.unit)
+        # H lost before COMMIT, with G's witness already written.
+        self.guardian_witness()
+        result = refused_in_time(self, self.resolve, bus, commit=True)
+        record = self.record(result)
+        self.assertEqual(record["invocation"]["source"], "host-started")
+        self.assertIn(
+            "startup-witness.json", [row[0] for row in record["attempt"]["entries"]]
+        )
+
+    def test_lost_owner_with_a_failed_unit_passes_the_shared_checks(self):
+        bus = self.lost_owner("after-started")
+        self.failed_unit(bus)
+        attempt = self.gate_path / f"attempt-{self.spec.run_id}"
+        plan = self.owner.value["root_plan"]["host_namespaces"]
+        blocker = self.gate_path / "active.json"
+        data = blocker.read_bytes()
+
+        def changing(targets, unit, before):
+            bus.service["MainPID"] = ("u", 99)
+            return {"matches": []}
+
+        def replacing(targets, unit, before):
+            blocker.unlink()
+            blocker.write_bytes(data)
+            blocker.chmod(0o600)
+            return {"matches": []}
+
+        def rewrite(name, new):
+            path = attempt / name
+            old, mode = path.read_bytes(), path.stat().st_mode & 0o777
+            path.chmod(0o600)
+            path.write_bytes(new)
+            path.chmod(mode)
+            return old, mode
+
+        saved = copy.deepcopy(bus.service)
+        for label, reason, options in (
+            (
+                "cgroup",
+                "resolver unit cgroup remains",
+                {"cgroup_scan": lambda unit, uid: ["app.slice/" + unit]},
+            ),
+            (
+                "process",
+                "resolver found attempt processes",
+                {
+                    "process_scan": lambda targets, unit, before: {
+                        "matches": [{"pid": 7, "via": ["fd"]}]
+                    }
+                },
+            ),
+            (
+                "namespaces",
+                "resolver must run in the attempt owner's namespaces",
+                {"namespaces": lambda names: dict(plan, pid=plan["pid"] + 1)},
+            ),
+            (
+                "owner",
+                "resolver attempt owner is alive",
+                {"process_start": lambda pid: self.owner.value["client"]["starttime"]},
+            ),
+        ):
+            with self.subTest(label):
+                self.refused_by(bus, reason, **options)
+        with self.subTest("changed"):
+            self.refused_by(
+                bus, "resolver unit changed during resolution", process_scan=changing
+            )
+        bus.service = copy.deepcopy(saved)
+        for name, new, reason in (
+            ("host-witness.json", b"{}", "resolver host witness"),
+            (
+                "host-intent.json",
+                (attempt / "host-intent.json").read_bytes() + b"\n",
+                "resolver intent binding",
+            ),
+        ):
+            old, _ = rewrite(name, new)
+            with self.subTest(name):
+                self.refused_by(bus, reason)
+            rewrite(name, old)
+        with (
+            self.subTest("blocker"),
+            self.assertRaisesRegex(ValueError, "^resolver blocker changed$"),
+        ):
+            self.resolve(bus, commit=True, process_scan=replacing)
+        self.assertFalse(list(self.gate_path.glob("resolved-*")))
+        real_path = host.admission_path
+        paths = [real_path, lambda root, gate: (None, None, None)]
+        with (
+            self.subTest("admission path"),
+            mock.patch.object(
+                host,
+                "admission_path",
+                side_effect=lambda root, gate: paths.pop(0)(root, gate),
+            ),
+            self.assertRaisesRegex(ValueError, "^resolver admission path changed$"),
+        ):
+            self.resolve(bus, commit=True)
+        self.assertFalse(list(self.gate_path.glob("resolved-*")))
+
+    def assert_named_refusal(self, bus, reason, **options):
+        """Refused as ValueError: reason() on fd 2 names only those by message."""
+        before = self.gate_state()
+        with self.assertRaises((ValueError, RuntimeError)) as caught:
+            self.resolve(bus, commit=True, **options)
+        self.assertIs(type(caught.exception), ValueError)
+        self.assertEqual(str(caught.exception), reason)
+        self.assertEqual(self.gate_state(), before)
+
+    def test_a_unit_gone_during_resolution_is_named(self):
+        changed = "resolver unit changed during resolution"
+        denied = "user-bus error: org.freedesktop.DBus.Error.AccessDenied"
+
+        def going(bus, error=NO_UNIT):
+            def scan(targets, unit, before):
+                bus.get_unit = RuntimeError(error)
+                return {"matches": []}
+
+            return scan
+
+        bus = self.lost_owner("after-started")
+        self.failed_unit(bus)
+        with self.subTest("lost, second observation"):
+            self.assert_named_refusal(bus, changed, process_scan=going(bus))
+        for other in (
+            denied,
+            "user-bus error: org.example.NoSuchUnit",
+            NO_UNIT + ".Other",
+        ):
+            bus.get_unit = None
+            with self.subTest("other errors stay as they are", error=other):
+                self.refused_by(bus, other, process_scan=going(bus, other))
+        bus.get_unit = None
+        refused_in_time(self, self.resolve, bus)
+        answers = iter((self.FOREIGN, NO_UNIT))
+        self.gone_unit(bus, unit=lambda: next(answers))
+        with self.subTest("lost, right after the absence check"):
+            self.assert_named_refusal(bus, changed)
+
+    def test_a_failure_records_unit_gone_during_resolution_is_named(self):
+        bus, _ = self.retained_failure()
+
+        def scan(targets, unit, before):
+            bus.get_unit = RuntimeError(NO_UNIT)
+            return {"matches": []}
+
+        self.assert_named_refusal(
+            bus, "resolver unit changed during resolution", process_scan=scan
+        )
+
+    def test_a_blocker_read_error_is_not_a_missing_blocker(self):
+        self.lost_owner("after-claim")
+        manager = mock.Mock(side_effect=AssertionError("manager"))
+        blocker = self.gate_path / "active.json"
+        data = blocker.read_bytes()
+        blocker.unlink()
+        blocker.symlink_to(self.gate_path / "elsewhere")
+
+        def refused(expected):
+            before = self.gate_state()
+            with self.assertRaises((OSError, ValueError)) as caught:
+                self.resolve(None, commit=True, bus_factory=manager)
+            self.assertIs(type(caught.exception), OSError)
+            self.assertEqual(caught.exception.errno, expected)
+            self.assertEqual(self.gate_state(), before)
+
+        with self.subTest("symlink"):
+            refused(errno.ELOOP)
+        blocker.unlink()
+        blocker.write_bytes(data)
+        blocker.chmod(0o600)
+        with (
+            self.subTest("input/output error"),
+            mock.patch.object(
+                native.service.AdmissionGate,
+                "read_blocker",
+                side_effect=OSError(errno.EIO, "read"),
+            ),
+        ):
+            refused(errno.EIO)
+        manager.assert_not_called()
+        self.assertEqual(blocker.read_bytes(), data)
+
+    def test_lost_owner_with_an_absent_unit_needs_both_exact_errors(self):
+        bus = self.lost_owner("after-eof")
+        self.gone_unit(bus)
+        self.refused_by(
+            bus,
+            "resolver startup window still open",
+            now=self.past_window(-1),
+        )
+        self.assertEqual(
+            self.manager_methods(bus), ["GetUnit", "GetUnitByInvocationID"]
+        )
+        self.assertEqual((self.scanned, self.cgroups), ([], []))
+        bus.calls = []
+        result = refused_in_time(self, self.resolve, bus, now=self.past_window())
+        self.assertEqual(
+            self.manager_methods(bus), ["GetUnit", "GetUnitByInvocationID"] * 2
+        )
+        self.assertEqual(
+            [call[4] for call in bus.calls if call[2] == "GetUnitByInvocationID"],
+            [(bytes.fromhex("d" * 32),)] * 2,
+        )
+        self.assertEqual(len(self.cgroups), 1)
+        self.assertEqual(len(self.scanned), 1)
+        record = self.record(result)
+        self.assertEqual(record["unit_state"], "absent")
+        self.assertIsNone(record["service"])
+        self.assertEqual(
+            record["invocation"],
+            {"id": "d" * 32, "source": "host-started", "manager_path": None},
+        )
+        result = refused_in_time(
+            self, self.resolve, bus, commit=True, now=self.past_window()
+        )
+        self.assertEqual(self.record(result)["outcome"], "lost-owner-resolved")
+        self.assertFalse((self.gate_path / "active.json").exists())
+
+    def test_absent_unit_refuses_what_it_cannot_prove(self):
+        bus = self.lost_owner("after-eof")
+        denied = "user-bus error: org.freedesktop.DBus.Error.AccessDenied"
+        path = "/org/freedesktop/systemd1/unit/other_2eservice"
+        attempt = self.gate_path / f"attempt-{self.spec.run_id}"
+        starttime = self.owner.value["client"]["starttime"]
+
+        def reappearing():
+            answers = iter((NO_UNIT, path))
+            return lambda: next(answers)
+
+        def cases():
+            yield "bare", "NoSuchUnit", {"unit": RuntimeError("NoSuchUnit")}, {}
+            for text in ("user-bus error: org.example.NoSuchUnit", NO_UNIT + ".Other"):
+                yield "other-name: " + text, text, {"unit": text}, {}
+            yield "denied-unit", denied, {"unit": denied}, {}
+            yield (
+                "reappears",
+                "resolver unit changed during resolution",
+                {"unit": reappearing()},
+                {},
+            )
+            yield (
+                "cgroup",
+                "resolver unit cgroup remains",
+                {},
+                {"cgroup_scan": lambda unit, uid: ["app.slice/" + unit]},
+            )
+            yield (
+                "process",
+                "resolver found attempt processes",
+                {},
+                {
+                    "process_scan": lambda targets, unit, before: {
+                        "matches": [{"pid": 7, "via": ["fd"]}]
+                    }
+                },
+            )
+            yield (
+                "owner",
+                "resolver attempt owner is alive",
+                {},
+                {"process_start": lambda pid: starttime},
+            )
+
+        for label, reason, manager, options in (
+            *cases(),
+            ("denied-lookup", denied, {"invocation": denied}, {}),
+            (
+                "bare-lookup",
+                "NoUnitForInvocationID",
+                {"invocation": RuntimeError("NoUnitForInvocationID")},
+                {},
+            ),
+            (
+                "found-invocation",
+                "resolver invocation without its unit",
+                {"invocation": path},
+                {},
+            ),
+            (
+                "other-lookup-name",
+                "user-bus error: org.example.NoUnitForInvocationID",
+                {"invocation": "user-bus error: org.example.NoUnitForInvocationID"},
+                {},
+            ),
+            (
+                "longer-lookup-name",
+                NO_INVOCATION + ".Other",
+                {"invocation": NO_INVOCATION + ".Other"},
+                {},
+            ),
+        ):
+            self.gone_unit(bus, **manager)
+            with self.subTest(label, receipt=True):
+                self.refused_by(bus, reason, now=self.past_window(), **options)
+        # The same absence without a receipt: nothing names an invocation.
+        (attempt / "host-started.json").unlink()
+        (attempt / "startup-witness.json").unlink()
+        for label, reason, manager, options in cases():
+            self.gone_unit(bus, **manager)
+            with self.subTest(label, receipt=False):
+                self.refused_by(bus, reason, now=self.past_window(), **options)
+        self.gone_unit(bus)
+        refused_in_time(self, self.resolve, bus, now=self.past_window())
+
+    def test_lost_owner_after_commit_resolves_either_unit_state(self):
+        bus = self.lost_owner("after-commit")
+        self.failed_unit(bus)
+        result = refused_in_time(self, self.resolve, bus)
+        self.assertEqual(self.record(result)["unit_state"], "failed")
+        saved = copy.deepcopy(bus.unit)
+        bus.unit.update(ActiveState=("s", "inactive"), SubState=("s", "dead"))
+        bus.after = dict(bus.unit)
+        self.refused_by(bus, "resolver unit state: ActiveState")
+        bus.unit = saved
+        bus.after = dict(bus.unit)
+        self.gone_unit(bus)
+        result = refused_in_time(
+            self, self.resolve, bus, commit=True, now=self.past_window()
+        )
+        record = self.record(result)
+        self.assertEqual(record["unit_state"], "absent")
+        self.assertEqual(record["invocation"]["source"], "host-started")
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+
+    def test_a_finished_receipt_is_not_a_completion(self):
+        bus = self.lost_owner("after-finish")
+        self.gone_unit(bus)
+        result = refused_in_time(
+            self, self.resolve, bus, commit=True, now=self.past_window()
+        )
+        record = self.record(result)
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+        self.assertEqual(
+            [row[0] for row in record["attempt"]["entries"]],
+            sorted(
+                [
+                    *PREPARED_ENTRIES,
+                    "host-finished.json",
+                    "host-started.json",
+                    "startup-witness.json",
+                ]
+            ),
+        )
+        self.assertFalse(list(self.gate_path.glob("terminal-*")))
+        self.assertFalse((self.gate_path / "active.json").exists())
+
+    def test_bad_started_receipt_refuses(self):
+        bus = self.lost_owner("after-eof")
+        self.gone_unit(bus)
+        path = self.gate_path / f"attempt-{self.spec.run_id}/host-started.json"
+        data = path.read_bytes()
+        value = json.loads(data)
+        canonical = self.root.closure.canonical
+        service = value["service"]
+        self.assertEqual(set(service), set(self.root.guardian.ServiceIdentity._fields))
+
+        def changed(**fields):
+            return canonical(dict(service, **fields))
+
+        def row(new_service):
+            return canonical(dict(value, service=json.loads(new_service)))
+
+        without_field = {k: v for k, v in value.items() if k != "cgroup_id"}
+        without_service = {k: v for k, v in service.items() if k != "pid"}
+        cases = {
+            "not-canonical": data + b"\n",
+            "not-json": b"not json",
+            "list": b"[]",
+            "extra-field": canonical(dict(value, extra=1)),
+            "missing-field": canonical(without_field),
+            "service-list": canonical(dict(value, service=[])),
+            "extra-service-field": row(changed(extra=1)),
+            "missing-service-field": canonical(dict(value, service=without_service)),
+            "other-unit": row(changed(unit="irlume-job-guardian-other.service")),
+            "zero-invocation": row(changed(invocation_id="0" * 32)),
+            "short-invocation": row(changed(invocation_id="d" * 31)),
+            "upper-invocation": row(changed(invocation_id="D" * 32)),
+            "number-invocation": row(changed(invocation_id=1)),
+            "pid-one": row(changed(pid=1)),
+            "pid-zero": row(changed(pid=0)),
+            "pid-text": row(changed(pid="4242")),
+            "pid-flag": row(changed(pid=True)),
+            "reply-number": canonical(dict(value, creation_reply=123)),
+            "reply-none": canonical(dict(value, creation_reply=None)),
+            "reply-other-path": canonical(dict(value, creation_reply="/x")),
+            "reply-job-zero": canonical(
+                dict(value, creation_reply="/org/freedesktop/systemd1/job/0")
+            ),
+            "reply-longer": canonical(
+                dict(value, creation_reply="/org/freedesktop/systemd1/job/1/x")
+            ),
+            "cgroup-text": canonical(dict(value, cgroup_id="1")),
+            "cgroup-flag": canonical(dict(value, cgroup_id=True)),
+            "cgroup-zero": canonical(dict(value, cgroup_id=0)),
+            "cgroup-negative": canonical(dict(value, cgroup_id=-1)),
+        }
+
+        def rewrite(new, mode=0o400):
+            path.chmod(0o600)
+            path.write_bytes(new)
+            path.chmod(mode)
+
+        for label, bad in cases.items():
+            rewrite(bad)
+            with self.subTest(label):
+                self.refused_by(
+                    bus, "resolver host start receipt", now=self.past_window()
+                )
+        rewrite(data, 0o600)
+        self.refused_by(
+            bus, "resolver input file: host-started.json", now=self.past_window()
+        )
+        rewrite(data)
+        refused_in_time(self, self.resolve, bus, now=self.past_window())
+
+    def test_failure_record_takes_precedence_over_host_started(self):
+        bus, _ = self.retained_failure()
+        path = self.gate_path / f"attempt-{self.spec.run_id}/host-started.json"
+        receipt = self.root.closure.canonical(
+            {
+                "service": self.root.guardian.ServiceIdentity(
+                    self.owner.adapter.name, "e" * 32, 7, "/x", 1
+                )._asdict(),
+                "cgroup_id": 1,
+                "creation_reply": "/x",
+            }
+        )
+        for label, data in (("valid", receipt), ("not-a-receipt", b"{}")):
+            if path.exists():
+                path.chmod(0o600)
+            path.write_bytes(data)
+            path.chmod(0o400)
+            with self.subTest(label):
+                result = refused_in_time(self, self.resolve, bus)
+                record = self.record(result)
+                self.assertEqual(record["outcome"], "failed-attempt-resolved")
+                self.assertEqual(record["invocation"]["id"], "d" * 32)
+                self.assertEqual(record["invocation"]["source"], "failure-record")
+                self.assertEqual(
+                    record["failure_record"]["name"],
+                    f"failed-{self.spec.run_id}.json",
+                )
+
+    def test_failure_record_with_an_absent_unit_refuses_as_today(self):
+        # no-unit above uses bare text; the manager's exact errors change nothing
+        # when a record exists, so the absent path is for a lost owner only.
+        bus, _ = self.retained_failure()
+        bus.get_unit = RuntimeError(NO_UNIT)
+        bus.by_invocation = RuntimeError(NO_INVOCATION)
+        self.refused_by(bus, NO_UNIT, now=self.past_window())
+
+    def test_lost_owner_refuses_caller_evidence(self):
+        bus = self.lost_owner("after-started")
+        self.failed_unit(bus)
+        self.refused_by(
+            bus,
+            "resolver lost owner with caller evidence",
+            invocation_id="d" * 32,
+            bus_factory=mock.Mock(side_effect=AssertionError("manager")),
+        )
+
+    def test_attempt_entries_are_listed_again_after_the_final_observation(self):
+        bus = self.lost_owner("after-started")
+        self.failed_unit(bus)
+        late = self.gate_path / f"attempt-{self.spec.run_id}/startup-witness.json"
+
+        def refused_late(**options):
+            with self.assertRaisesRegex(
+                ValueError, "^resolver attempt entries changed$"
+            ):
+                self.resolve(bus, commit=True, **options)
+            self.assertTrue((self.gate_path / "active.json").exists())
+            self.assertFalse(list(self.gate_path.glob("resolved-*")))
+            self.assertFalse(list(self.gate_path.glob("resolver-witness-*")))
+            late.unlink()
+
+        def scan_adds(targets, unit, before):
+            self.guardian_witness()
+            return {"matches": []}
+
+        refused_late(process_scan=scan_adds)
+        # Written while the last observation runs: only a later listing sees it.
+        answers = iter((NO_UNIT, NO_UNIT))
+
+        def final_adds():
+            answer = next(answers)
+            if self.manager_methods(bus).count("GetUnit") == 2:
+                self.guardian_witness()
+            return answer
+
+        self.gone_unit(bus, unit=final_adds)
+        refused_late(now=self.past_window())
+        # Another directory with the same names is no longer this attempt.
+        attempt = late.parent
+        kept = self.gate_path / "kept-attempt"
+
+        def scan_swaps(targets, unit, before):
+            os.rename(attempt, kept)
+            attempt.mkdir(0o700)
+            for item in kept.iterdir():
+                (attempt / item.name).write_bytes(b"")
+            return {"matches": []}
+
+        self.gone_unit(bus)
+        with self.assertRaisesRegex(ValueError, "^resolver attempt entries changed$"):
+            self.resolve(
+                bus, commit=True, process_scan=scan_swaps, now=self.past_window()
+            )
+        self.assertTrue((self.gate_path / "active.json").exists())
+        for item in attempt.iterdir():
+            item.unlink()
+        attempt.rmdir()
+        os.rename(kept, attempt)
+        self.gone_unit(bus)
+        refused_in_time(self, self.resolve, bus, now=self.past_window())
+
+    def test_attempt_entries_are_listed_again_with_a_failure_record(self):
+        bus, _ = self.retained_failure()
+
+        def scan_adds(targets, unit, before):
+            self.guardian_witness()
+            return {"matches": []}
+
+        with self.assertRaisesRegex(ValueError, "^resolver attempt entries changed$"):
+            self.resolve(bus, commit=True, process_scan=scan_adds)
+        self.assertTrue((self.gate_path / "active.json").exists())
+        self.assertFalse(list(self.gate_path.glob("resolved-*")))
+
+    def test_resolver_witness_is_required_and_bound(self):
+        bus = self.lost_owner("after-claim")
+        self.gone_unit(bus)
+        gate = mock.Mock(side_effect=AssertionError("admission without a witness"))
+        data = self.resolver_witness(False).data
+        request = {
+            "scope": host.HOST_REQUEST_SCOPE,
+            "mode": "resolve-failed-startup",
+            "runtime": self.selection.runtime,
+            "manifest": self.selection.manifest,
+            "manifest_sha256": self.selection.manifest_sha256,
+            "run_id": self.spec.run_id,
+            "commit": False,
+        }
+        spaced = json.dumps(request).encode()
+        short = self.root.closure.canonical(
+            {k: v for k, v in request.items() if k != "manifest"}
+        )
+        cases = {
+            "none": ("rooted host witness", None),
+            "bytes-only": ("rooted host witness", data),
+            "text": ("rooted host witness", host.HostWitness(data.decode(), unchanged)),
+            "empty": ("rooted host witness", host.HostWitness(b"", unchanged)),
+            "no-check": ("rooted host witness", host.HostWitness(data, None)),
+            "mock-check": ("rooted host witness", host.HostWitness(data, mock.Mock())),
+            "not-json": (
+                "rooted host witness binding",
+                host.HostWitness(b"[" + data, unchanged),
+            ),
+            "not-canonical": (
+                "rooted host witness binding",
+                host.HostWitness(data + b"\n", unchanged),
+            ),
+            "other-process": (
+                "rooted host witness binding",
+                self.resolver_witness(False, {"pid": os.getpid() + 1}),
+            ),
+            "startup-only-request": ("rooted host witness binding", self.witness),
+            "self-check-request": (
+                "rooted host witness binding",
+                self.resolver_witness(False, mode="self-check"),
+            ),
+            "other-run": (
+                "rooted host witness binding",
+                self.resolver_witness(False, run_id="run-02"),
+            ),
+            "other-commit-flag": (
+                "rooted host witness binding",
+                self.resolver_witness(True),
+            ),
+            "commit-number": (
+                "rooted host witness binding",
+                self.resolver_witness(0),
+            ),
+            "other-request-scope": (
+                "rooted host witness binding",
+                self.resolver_witness(False, scope="contained-job-host-request-v2"),
+            ),
+            "extra-request-field": (
+                "rooted host witness binding",
+                self.resolver_witness(False, gate="/x"),
+            ),
+            "missing-request-field": (
+                "rooted host witness binding",
+                self.resolver_witness(
+                    False,
+                    {"request_data": {"$bytes": short.hex()}},
+                    wire={"request_sha256": hashlib.sha256(short).hexdigest()},
+                ),
+            ),
+            "request-text": (
+                "rooted host witness binding",
+                self.resolver_witness(False, {"request_data": "x"}),
+            ),
+            "request-not-hex": (
+                "rooted host witness binding",
+                self.resolver_witness(False, {"request_data": {"$bytes": "x"}}),
+            ),
+            "request-not-canonical": (
+                "rooted host witness binding",
+                self.resolver_witness(
+                    False,
+                    {"request_data": {"$bytes": spaced.hex()}},
+                    wire={"request_sha256": hashlib.sha256(spaced).hexdigest()},
+                ),
+            ),
+            "request-digest": (
+                "rooted host witness binding",
+                self.resolver_witness(False, wire={"request_sha256": "0" * 64}),
+            ),
+            "other-runtime": (
+                "rooted host witness binding",
+                self.resolver_witness(False, wire={"runtime": "/x"}),
+            ),
+            "other-manifest": (
+                "rooted host witness binding",
+                self.resolver_witness(False, wire={"manifest_sha256": "0" * 64}),
+            ),
+            "scope": (
+                "rooted host witness binding",
+                self.resolver_witness(False, wire={"scope": "other"}),
+            ),
+            "accepted": (
+                "rooted host witness binding",
+                self.resolver_witness(False, wire={"accepted": True}),
+            ),
+        }
+        for label, (reason, witness) in cases.items():
+            with self.subTest(label):
+                self.refused_by(
+                    bus,
+                    reason,
+                    commit=False,
+                    witness=witness,
+                    gate_factory=gate,
+                    now=self.past_window(),
+                )
+        with self.subTest("commit against a dry-run witness"):
+            self.refused_by(
+                bus,
+                "rooted host witness binding",
+                commit=True,
+                witness=self.resolver_witness(False),
+                gate_factory=gate,
+                now=self.past_window(),
+            )
+        gate.assert_not_called()
+        refused_in_time(self, self.resolve, bus, now=self.past_window())
+
+    def test_a_resolver_witness_cannot_start_the_owner(self):
+        for commit in (False, True):
+            witness = self.resolver_witness(commit)
+            with (
+                self.subTest(commit=commit),
+                self.assertRaisesRegex(ValueError, "^rooted host witness binding$"),
+            ):
+                host.check_witness(witness, self.selection, self.root)
+            with (
+                self.subTest(commit=commit, at="owner"),
+                self.assertRaisesRegex(ValueError, "^rooted host witness binding$"),
+            ):
+                self.owner_with(witness)
+
+    def test_resolver_rechecks_the_process(self):
+        bus = self.lost_owner("after-claim")
+        self.gone_unit(bus)
+        seen, refuse = [], [None]
+
+        def check(deadline):
+            seen.append((deadline, self.manager_methods(bus), len(self.scanned)))
+            if refuse[0] == len(seen) - 1:
+                raise ValueError("host modules changed after the self-check")
+
+        for commit in (False, True):
+            witness = self.resolver_witness(commit, check=check)
+            with self.subTest("before the gate", commit=commit):
+                seen.clear()
+                refuse[0] = 0
+                bus.calls = []
+                gate = mock.Mock(side_effect=AssertionError("gate"))
+                self.refused_by(
+                    bus,
+                    "host modules changed after the self-check",
+                    commit=commit,
+                    witness=witness,
+                    gate_factory=gate,
+                    now=self.past_window(),
+                )
+                gate.assert_not_called()
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(bus.calls, [])
+            with self.subTest("before the commit decision", commit=commit):
+                seen.clear()
+                refuse[0] = 1
+                bus.calls = []
+                self.scanned = []
+                self.refused_by(
+                    bus,
+                    "host modules changed after the self-check",
+                    commit=commit,
+                    witness=witness,
+                    now=self.past_window(),
+                )
+                self.assertEqual(len(seen), 2)
+                # The second comes after the final observation and the scans.
+                self.assertEqual(seen[1][1], ["GetUnit", "GetUnit"])
+                self.assertEqual(seen[1][2], 1)
+        seen.clear()
+        refuse[0] = None
+        moment = self.past_window()
+        dry = refused_in_time(
+            self,
+            self.resolve,
+            bus,
+            witness=self.resolver_witness(False, check=check),
+            now=moment,
+        )
+        self.assertFalse(dry.committed)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual({row[0] for row in seen}, {moment() + host.RESOLVE_NS})
+        seen.clear()
+        result = refused_in_time(
+            self,
+            self.resolve,
+            bus,
+            commit=True,
+            witness=self.resolver_witness(True, check=check),
+            now=moment,
+        )
+        self.assertTrue(result.committed)
+        self.assertEqual(len(seen), 2)
+
+    def test_commit_writes_the_witness_and_a_dry_run_writes_nothing(self):
+        bus = self.lost_owner("after-claim")
+        self.gone_unit(bus)
+        before = self.gate_state()
+        dry_witness = self.resolver_witness(False)
+        dry = refused_in_time(
+            self, self.resolve, bus, witness=dry_witness, now=self.past_window()
+        )
+        self.assertEqual(self.gate_state(), before)
+        digest = hashlib.sha256(dry_witness.data).hexdigest()
+        self.assertEqual(
+            self.record(dry)["resolver_witness"],
+            {
+                "name": f"resolver-witness-{self.spec.run_id}-{digest[:16]}.json",
+                "sha256": digest,
+                "size": len(dry_witness.data),
+            },
+        )
+        witness = self.resolver_witness(True, {"padding": "x" * 4096})
+        digest = hashlib.sha256(witness.data).hexdigest()
+        name = f"resolver-witness-{self.spec.run_id}-{digest[:16]}.json"
+        real = native.service.AdmissionGate.resolve_failed
+        order = []
+
+        def before_resolution(gate, *args):
+            order.append((self.gate_path / name).read_bytes())
+            return real(gate, *args)
+
+        with mock.patch.object(
+            native.service.AdmissionGate, "resolve_failed", before_resolution
+        ):
+            result = refused_in_time(
+                self,
+                self.resolve,
+                bus,
+                commit=True,
+                witness=witness,
+                now=self.past_window(),
+            )
+        self.assertEqual(order, [witness.data])
+        path = self.gate_path / name
+        info = path.lstat()
+        self.assertEqual((info.st_mode & 0o7777, info.st_nlink), (0o600, 1))
+        self.assertEqual(path.read_bytes(), witness.data)
+        self.assertEqual(
+            self.record(result)["resolver_witness"],
+            {"name": name, "sha256": digest, "size": len(witness.data)},
+        )
+
+    def test_a_dead_resolvers_witness_does_not_block_a_retry(self):
+        bus = self.lost_owner("after-claim")
+        self.gone_unit(bus)
+        with (
+            mock.patch.object(
+                native.service.AdmissionGate,
+                "resolve_failed",
+                side_effect=KeyError("kill"),
+            ),
+            self.assertRaises(KeyError),
+        ):
+            self.resolve(bus, commit=True, now=self.past_window())
+        self.assertEqual(len(list(self.gate_path.glob("resolver-witness-*"))), 1)
+        self.assertTrue((self.gate_path / "active.json").exists())
+        # The next process's witness differs, so its name does too.
+        retry = self.resolver_witness(True, {"started_ns": 2})
+        result = refused_in_time(
+            self,
+            self.resolve,
+            bus,
+            commit=True,
+            witness=retry,
+            now=self.past_window(),
+        )
+        self.assertTrue(result.committed)
+        self.assertEqual(len(list(self.gate_path.glob("resolver-witness-*"))), 2)
+        self.assertFalse((self.gate_path / "active.json").exists())
 
 
 class TerminalCheckTests(unittest.TestCase):

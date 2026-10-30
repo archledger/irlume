@@ -110,8 +110,36 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
   name; every recheck passed, so the lookup loaded nothing. An inherited
   descriptor, a `runtime-candidate` or non-`supervisor-only` specification
   and an upper-case input digest were each refused before admission, with
-  no blocker left. Still open: H3 (the real admission directory, after
-  owner confirmation), H4 (H loss) and the guest side.
+  no blocker left. Fourth slice (H4, H loss): a killed H leaves no failure
+  record, so the resolver now also accepts a missing `failed-<run>.json`. A
+  present record always wins and its evidence rule is unchanged; like every
+  path it now needs the resolver witness, both rechecks, the relist and the
+  v2 record. H's own `host-started.json` (0400, exact fields) or, when H died
+  before that receipt, the manager's row names the invocation, and a failed
+  unit passes the existing checks. A unit the manager does not know needs the
+  exact `NoSuchUnit` error, the exact `NoUnitForInvocationID` when a receipt
+  names an invocation, and a time past origin + 10 s, when a late-created G
+  refuses before any write; the scans and a second absence check still run,
+  and the attempt is listed again afterwards. The resolver runs from the tree
+  through `launcher --host` in a new `resolve-failed-startup` mode (run ID and
+  commit flag, no admission directory, no invocation ID), only after the full
+  self-check, with a witness bound to exactly that run and flag, rechecked
+  before its gate and before its commit decision. A commit writes that witness
+  beside a v2 record, `lost-owner-resolved` or `failed-attempt-resolved`, all
+  flags false. Tests build each point's on-disk state with the real owner
+  against a fake manager. Through the launcher on a re-pinned copy with a
+  scratch gate and a read-only test manager, real SIGKILLs before and after
+  the claim behave as designed. Before the claim, no blocker remains. After
+  it the blocker stays (a new owner refuses admission in the in-process test),
+  an early resolver run refuses, and after the real 10 s a dry run and a
+  commit clear it; the next admission then proceeds. Not yet qualified
+  natively; kills after the manager call, and unit collection after a killed
+  client, are for that round. Still refused: failure records with
+  `creation_attempted` or `created` false, or with the unit gone (H4b, before
+  H3), and kills inside a file write, `gate.complete` or the resolver's
+  commit. Still open: the native H4 round on both hosts, H3 (the real
+  admission directory, approved by the owner on 2026-10-30, after H4b) and the
+  guest side.
 - [ ] Prepare and verify descriptor-bound VM base/payload images and required
   firmware; preserve original inputs and failed-attempt evidence.
 - [ ] Implement exclusive writable-overlay ownership and freeze it only after
@@ -175,7 +203,7 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 37 `scripts/ci/test-measurement-*.py` suites pass (907 tests), with
+All 37 `scripts/ci/test-measurement-*.py` suites pass (940 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. `test-measurement-job-host.py`
 needs a prepared runtime named by `IRLUME_HOST_RUNTIME` and fails without
 one. G runs with `KeyringMode=private`,

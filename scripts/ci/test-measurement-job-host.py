@@ -10,6 +10,7 @@ and a launcher built from them. Without it they refuse; no host fallback.
 
 import copy
 import errno
+import fcntl
 import hashlib
 import importlib
 import importlib.util
@@ -163,6 +164,20 @@ def startup_request(tree=TREE, manifest_sha256=None, **changes):
         "specification": specification(),
         "base_sha256": "d" * 64,
         "payload_sha256": "e" * 64,
+    }
+    value.update(changes)
+    return closure.canonical(value)
+
+
+def resolve_request(tree=TREE, manifest_sha256=None, **changes):
+    value = {
+        "scope": host.REQUEST_SCOPE,
+        "mode": "resolve-failed-startup",
+        "runtime": tree,
+        "manifest": MANIFEST,
+        "manifest_sha256": manifest_sha256 or synthetic_manifest()[2],
+        "run_id": "run-01",
+        "commit": False,
     }
     value.update(changes)
     return closure.canonical(value)
@@ -473,6 +488,59 @@ class HostRequestTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "^" + reason + "$"),
             ):
                 host.decode_request(data_, sha(data_), TREE, root)
+
+    def test_resolution_request_names_one_run_and_a_commit_flag(self):
+        # The owner's witness check repeats the entry's field set.
+        self.assertEqual(
+            owner.RESOLVER_REQUEST_FIELDS,
+            set(host.REQUEST_FIELDS["resolve-failed-startup"]),
+        )
+        for commit in (False, True):
+            data = resolve_request(commit=commit)
+            value = accepted(self, host.decode_request, data, sha(data), TREE, root)
+            self.assertEqual(
+                (value["mode"], value["run_id"]),
+                ("resolve-failed-startup", "run-01"),
+            )
+            self.assertIs(value["commit"], commit)
+        full = json.loads(resolve_request())
+
+        def without(name):
+            return closure.canonical({k: v for k, v in full.items() if k != name})
+
+        cases = [
+            (resolve_request(invocation_id="d" * 32), "invalid fields"),
+            (resolve_request(gate="/home/u/.cache/gate"), "invalid fields"),
+            (without("commit"), "invalid fields"),
+            (without("run_id"), "invalid fields"),
+            (without("manifest"), "invalid fields"),
+            (resolve_request(commit=1), "host request commit flag"),
+            (resolve_request(commit=0), "host request commit flag"),
+            (resolve_request(commit="true"), "host request commit flag"),
+            (resolve_request(commit=None), "host request commit flag"),
+            (resolve_request(run_id=""), "host request run ID"),
+            (resolve_request(run_id="Run-01"), "host request run ID"),
+            (resolve_request(run_id="-run"), "host request run ID"),
+            (resolve_request(run_id="r" * 65), "host request run ID"),
+            (resolve_request(run_id="run/01"), "host request run ID"),
+            (resolve_request(run_id=1), "host request run ID"),
+            (resolve_request(run_id=None), "host request run ID"),
+            (resolve_request(tree=TREE + "x"), "host request runtime"),
+            (resolve_request(manifest_sha256="A" * 64), "host request manifest"),
+            (
+                resolve_request().replace(b",", b", ", 1),
+                "host request encoding",
+            ),
+        ]
+        for data, reason in cases:
+            with (
+                self.subTest(reason=reason, data=data[-90:]),
+                self.assertRaisesRegex(ValueError, "^" + reason + "$"),
+            ):
+                host.decode_request(data, sha(data), TREE, root)
+        # The longest run ID the resolver takes.
+        data = resolve_request(run_id="r" * 64)
+        accepted(self, host.decode_request, data, sha(data), TREE, root)
 
     def test_request_and_witness_formats_are_the_ones_h_binds(self):
         self.assertEqual(host.REQUEST_SCOPE, owner.HOST_REQUEST_SCOPE)
@@ -790,6 +858,154 @@ class HostReasonTests(unittest.TestCase):
         for error, expected in cases:
             with self.subTest(expected):
                 self.assertEqual(host.reason(error), expected)
+
+
+class HostResolveTests(unittest.TestCase):
+    """The entry's resolve mode in process.
+
+    Each test's runtime is a namespace whose only gate and manager are mocks,
+    so nothing here can reach AdmissionGate.for_current_user, which creates
+    and locks the real admission directory.
+    """
+
+    def setUp(self):
+        self.production = mock.Mock(side_effect=ValueError("production gate"))
+        self.manager = mock.Mock(side_effect=AssertionError("production manager"))
+        service = types.SimpleNamespace(
+            AdmissionGate=types.SimpleNamespace(for_current_user=self.production),
+            SystemdBus=self.manager,
+        )
+        self.runtime = types.SimpleNamespace(
+            native=types.SimpleNamespace(service=service),
+            preflight=types.SimpleNamespace(root=root),
+        )
+
+    def checked(self, request, check=None):
+        """A passed self-check of this process for request's bytes."""
+        wire = {
+            "scope": host.SCOPE,
+            "runtime": TREE,
+            "request_sha256": sha(request),
+            "manifest_sha256": json.loads(request)["manifest_sha256"],
+            "observation": {
+                "pid": os.getpid(),
+                "request_data": {"$bytes": request.hex()},
+            },
+            "accepted": False,
+            "native_authorized": False,
+            "full_contract_proven": False,
+        }
+
+        def unchanged(deadline):
+            pass
+
+        return host.Checked(
+            TREE,
+            json.loads(request),
+            closure.canonical(wire),
+            check or unchanged,
+            self.runtime,
+            inputs_module,
+            owner,
+            None,
+        )
+
+    def test_resolve_refuses_without_a_resolve_self_check(self):
+        gate = mock.Mock(side_effect=AssertionError("admission"))
+        for label, checked in (
+            ("startup-only", self.checked(startup_request())),
+            ("self-check", self.checked(request_bytes())),
+            ("tuple", tuple(self.checked(resolve_request()))),
+            ("none", None),
+        ):
+            with self.subTest(label):
+                # A lookup or type error past the gate, or an acceptance, is a
+                # failure, not an error.
+                try:
+                    host.resolve_failed(checked, gate_factory=gate)
+                except ValueError as error:
+                    self.assertEqual(
+                        str(error), "host resolve without a resolve self-check"
+                    )
+                except (KeyError, TypeError, AttributeError) as error:
+                    self.fail(f"not a refusal: {error!r}")
+                else:
+                    self.fail("accepted")
+        gate.assert_not_called()
+        self.production.assert_not_called()
+
+    def test_resolve_admits_only_through_the_production_gate(self):
+        # main()'s call: no factories, so no request field can name the gate.
+        real = owner.resolve_failed_startup
+        for commit in (False, True):
+            checked = self.checked(resolve_request(commit=commit))
+            self.production.reset_mock()
+            resolver = mock.Mock(side_effect=real)
+            with (
+                self.subTest(commit=commit),
+                mock.patch.object(owner, "resolve_failed_startup", resolver),
+                self.assertRaisesRegex(ValueError, "^production gate$"),
+            ):
+                host.resolve_failed(checked)
+            self.production.assert_called_once()
+            resolver.assert_called_once()
+            args, keywords = resolver.call_args
+            self.assertEqual(args, ("run-01", self.runtime))
+            self.assertEqual(set(keywords), {"witness", "commit"})
+            self.assertIs(keywords["commit"], commit)
+            self.assertEqual(
+                keywords["witness"], owner.HostWitness(checked.witness, checked.check)
+            )
+            self.assertIs(type(keywords["witness"]), owner.HostWitness)
+        self.manager.assert_not_called()
+
+    def test_main_writes_only_the_canonical_resolution_result(self):
+        record = b'{"outcome":"lost-owner-resolved"}'
+        for commit, state in ((False, "present"), (True, "absent")):
+            checked = self.checked(resolve_request(commit=commit))
+            result = owner.Resolution(record, sha(record), commit, state)
+            resolver = mock.Mock(return_value=result)
+            startup = mock.Mock(side_effect=AssertionError("startup"))
+            with tempfile.TemporaryFile() as output, self.subTest(commit=commit):
+                sys.stdout.flush()
+                saved = os.dup(1)
+                try:
+                    os.dup2(output.fileno(), 1)
+                    with (
+                        mock.patch.object(host, "run", return_value=checked),
+                        mock.patch.object(host, "startup_only", startup),
+                        mock.patch.object(owner, "resolve_failed_startup", resolver),
+                    ):
+                        code = host.main()
+                finally:
+                    os.dup2(saved, 1)
+                    os.close(saved)
+                output.seek(0)
+                data = output.read()
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    data,
+                    closure.canonical(
+                        {
+                            "scope": "contained-job-host-resolution-result-v1",
+                            "run_id": "run-01",
+                            "committed": commit,
+                            "admission_state": state,
+                            "record": {"$bytes": record.hex()},
+                            "record_sha256": sha(record),
+                            "witness": {"$bytes": checked.witness.hex()},
+                            "witness_sha256": sha(checked.witness),
+                            "accepted": False,
+                            "native_authorized": False,
+                            "full_contract_proven": False,
+                        }
+                    ),
+                )
+                startup.assert_not_called()
+                resolver.assert_called_once()
+                # No factories: production admission and manager.
+                self.assertEqual(set(resolver.call_args.kwargs), {"witness", "commit"})
+                self.assertIs(resolver.call_args.kwargs["commit"], commit)
 
 
 def mount_line(number, parent, device, point, kind="ext4"):
@@ -1234,6 +1450,57 @@ def refuse_manager(*args, **keywords):
     raise ValueError("test manager refused")
 """
 MAIN = '\n\nif __name__ == "__main__":\n'
+# Slice H4: the entry's call into the resolver, replaced the same way. The test
+# manager is read-only and knows no unit, the scans are fixed: real scans could
+# flake on a busy host, and no unit is ever created. The last part of a run ID
+# names its gate, so a later run can use the gate an earlier one left. Every
+# real-kernel resolve run goes through this tree: an unpatched entry would reach
+# AdmissionGate.for_current_user, which creates and locks the real directory.
+RESOLVE_LINE = "        **factories,\n"
+RESOLVE_TEST = (
+    "        gate_factory=lambda deadline: test_gate({gates!r}, checked, deadline),\n"
+    "        bus_factory=lambda uid, deadline: AbsentManager(),\n"
+    "        process_scan=no_process,\n"
+    "        cgroup_scan=lambda unit, uid: [],\n"
+)
+RESOLVE_HELPERS = """
+
+def test_gate(gates, checked, deadline):
+    request = checked.request
+    run_id = request["run_id"] if "run_id" in request else request["specification"]["run_id"]
+    service = checked.runtime.native.service
+    return service.AdmissionGate(gates + "/" + run_id.rpartition("-")[2], deadline)
+
+
+def refuse_manager(*args, **keywords):
+    raise ValueError("test manager refused")
+
+
+class AbsentManager:
+    def call(self, path, interface, method, signature, args, deadline):
+        if method == "GetUnit":
+            raise RuntimeError("user-bus error: org.freedesktop.systemd1.NoSuchUnit")
+        raise RuntimeError("test manager call")
+
+    def close(self):
+        pass
+
+
+def no_process(targets, unit, before):
+    return {"processes": 1, "same_uid": 1, "unreadable_before_owner": 0, "matches": []}
+"""
+# DIAGNOSTIC BUILD ONLY, as the native round's kill patch: H kills itself right
+# after its anchor when the run ID selects that point, so a real SIGKILL leaves
+# the state; other run IDs pass the same bytes.
+KILL_ANCHORS = {
+    "after-intent": '        self.write("host-intent", intent, deadline)\n',
+    "after-claim": "        self.gate.claim(self.spec.run_id, intent, deadline)\n",
+}
+KILL_LINE = (
+    '        if self.spec.run_id.startswith("r5-h4-{point}-"): '
+    "os.kill(os.getpid(), 9)  # DIAGNOSTIC BUILD ONLY\n"
+)
+OWNER_ENTRY = "opt/irlume/measurement-job-rooted-host.py"
 
 
 def remove(path):
@@ -1867,11 +2134,60 @@ class HostRuntimeTests(unittest.TestCase):
             )
         return cls.h2
 
-    def startup_request(self, run_id):
-        """A startup-only request for run_id's own scratch gate and inputs."""
-        h2 = self.startup_tree()
-        gate = h2.gates / run_id
-        gate.mkdir(mode=0o700)
+    @classmethod
+    def kill_tree(cls):
+        """A re-pinned copy with the startup tree's refusing manager, whose owner
+        kills itself at KILL_ANCHORS and whose resolver uses a scratch gate and
+        a fake read-only manager."""
+        if getattr(cls, "h4", None) is None:
+            # Short whatever TMPDIR is: control.sock must fit sun_path.
+            gates = tempfile.mkdtemp(prefix="irlume-h4-", dir="/tmp")
+            cls.addClassCleanup(remove, gates)
+            source = (HERE / Path(host.ENTRY).name).read_text()
+            if (
+                source.count(STARTUP_LINE) != 1
+                or source.count(RESOLVE_LINE) != 1
+                or source.count(MAIN) != 1
+            ):
+                raise RuntimeError("the entry's HostOwner or resolver call changed")
+            entry = (
+                source.replace(STARTUP_LINE, STARTUP_TEST.format(gates=gates))
+                .replace(RESOLVE_LINE, RESOLVE_TEST.format(gates=gates))
+                .replace(MAIN, RESOLVE_HELPERS + MAIN)
+            )
+            killing = (HERE / Path(OWNER_ENTRY).name).read_text()
+            for point, anchor in KILL_ANCHORS.items():
+                if killing.count(anchor) != 1:
+                    raise RuntimeError("the owner's kill anchor changed: " + point)
+                killing = killing.replace(
+                    anchor, anchor + KILL_LINE.format(point=point)
+                )
+            tree, manifest, data, digest = cls.copy_tree(
+                "h4-root",
+                "h4-inputs",
+                {host.ENTRY: entry.encode(), OWNER_ENTRY: killing.encode()},
+                qemu=True,
+            )
+            with closure.RuntimeSnapshot.open(
+                str(tree), data, digest, deadline=deadline()
+            ) as snapshot:
+                pages = host.page_digests(snapshot, str(tree))
+            cls.h4 = types.SimpleNamespace(
+                gates=Path(gates),
+                tree=str(tree),
+                manifest=manifest,
+                data=data,
+                sha256=digest,
+                pages=pages,
+            )
+        return cls.h4
+
+    def startup_request(self, run_id, built=None, gate_name=None):
+        """A startup-only request for run_id's own scratch gate and inputs,
+        on the startup tree or built, in the gate gate_name if it is shared."""
+        h2 = built or self.startup_tree()
+        gate = h2.gates / (gate_name or run_id)
+        gate.mkdir(mode=0o700, exist_ok=gate_name is not None)
         folder = self.work / ("h2-inputs-" + run_id)
         folder.mkdir(mode=0o700)
         inputs = {}
@@ -2041,6 +2357,255 @@ class HostRuntimeTests(unittest.TestCase):
         )
         self.refused(result, "host request digest")
         self.assertEqual(os.listdir(gate), [])
+
+    def resolve_file(self, label, run_id, commit):
+        """A resolve request for the kill tree, the only tree it may run on."""
+        h4 = self.kill_tree()
+        return self.write_request(
+            "h4-resolve-" + label,
+            mode="resolve-failed-startup",
+            runtime=h4.tree,
+            manifest=str(h4.manifest),
+            manifest_sha256=h4.sha256,
+            run_id=run_id,
+            commit=commit,
+        )
+
+    def resolve_tree(self, label, run_id, commit):
+        """The resolve mode through the kill tree's launcher."""
+        path, digest = self.resolve_file(label, run_id, commit)
+        return self.run_command(
+            "h4-" + label,
+            [self.kill_tree().tree + "/opt/irlume/launcher", "--host", path, digest],
+            dict(ENVIRONMENT),
+        )
+
+    def killed(self, label, run_id, gate_name):
+        """H started through the launcher, killed by its own kill line."""
+        h4 = self.kill_tree()
+        gate, path, digest = self.startup_request(run_id, h4, gate_name)
+        poison = {**ENVIRONMENT, "LD_PRELOAD": "/untrusted.so", "PYTHONPATH": "/x"}
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 9, inheritable=True)
+            result = self.run_command(
+                "h4-" + label,
+                [h4.tree + "/opt/irlume/launcher", "--host", path, digest],
+                poison,
+                pass_fds=(9,),
+            )
+        finally:
+            os.close(9)
+            os.close(inherited)
+        self.assertEqual(result.returncode, -9, result.stderr)
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+        return gate
+
+    def gate_state(self, gate):
+        rows = {}
+        for path in sorted(gate.rglob("*")):
+            info = path.lstat()
+            data = path.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+            rows[str(path.relative_to(gate))] = (info.st_ino, info.st_mode, sha(data))
+        return rows
+
+    def test_an_owner_killed_before_the_claim_leaves_no_blocker(self):
+        run_id = "r5-h4-after-intent-g1"
+        gate = self.killed("killed-before-claim", run_id, "g1")
+        self.assertEqual(
+            sorted(os.listdir(gate)), ["admission.lock", "attempt-" + run_id]
+        )
+        self.assertEqual(
+            sorted(os.listdir(gate / ("attempt-" + run_id))),
+            [
+                "control.sock",
+                "guardian-config.json",
+                "host-intent.json",
+                "host-witness.json",
+            ],
+        )
+        before = self.gate_state(gate)
+        result = self.resolve_tree("before-claim-resolve", run_id, True)
+        self.refused(result, "resolver found no blocker")
+        self.assertEqual(self.gate_state(gate), before)
+
+    def test_an_owner_killed_after_the_claim_is_resolved_through_the_launcher(self):
+        h4 = self.kill_tree()
+        run_id = "r5-h4-after-claim-g2"
+        gate = self.killed("killed-after-claim", run_id, "g2")
+        self.assertEqual(
+            sorted(os.listdir(gate)),
+            ["active.json", "admission.lock", "attempt-" + run_id],
+        )
+        attempt = gate / ("attempt-" + run_id)
+        self.assertEqual(
+            sorted(os.listdir(attempt)),
+            [
+                "control.sock",
+                "guardian-config.json",
+                "host-intent.json",
+                "host-witness.json",
+            ],
+        )
+        config = json.loads((attempt / "guardian-config.json").read_bytes())
+        end = config["origin_ns"] + 10_000_000_000
+        self.assertEqual(
+            config["startup_deadline_ns"], config["origin_ns"] + 5_000_000_000
+        )
+        before = self.gate_state(gate)
+        early = self.resolve_tree("after-claim-early", run_id, True)
+        # An early run that finished after the window would prove nothing.
+        self.assertLess(time.monotonic_ns(), end, "host too slow for the early run")
+        self.refused(early, "resolver startup window still open")
+        self.assertEqual(self.gate_state(gate), before)
+        # The window really passes once, here.
+        time.sleep(max(0, end - time.monotonic_ns()) / 1_000_000_000)
+        dry = self.resolve_tree("after-claim-dry", run_id, False)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self.gate_state(gate), before)
+        result = self.resolve_tree("after-claim-commit", run_id, True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        value = json.loads(result.stdout)
+        self.assertEqual(closure.canonical(value), result.stdout)
+        self.assertEqual(
+            set(value),
+            {
+                "scope",
+                "run_id",
+                "committed",
+                "admission_state",
+                "record",
+                "record_sha256",
+                "witness",
+                "witness_sha256",
+                "accepted",
+                "native_authorized",
+                "full_contract_proven",
+            },
+        )
+        self.assertEqual(value["scope"], "contained-job-host-resolution-result-v1")
+        self.assertEqual(
+            (value["run_id"], value["committed"], value["admission_state"]),
+            (run_id, True, "absent"),
+        )
+        for flag in ("accepted", "native_authorized", "full_contract_proven"):
+            self.assertIs(value[flag], False)
+        record_data = bytes.fromhex(value["record"]["$bytes"])
+        witness_data = bytes.fromhex(value["witness"]["$bytes"])
+        self.assertEqual(value["record_sha256"], sha(record_data))
+        self.assertEqual(value["witness_sha256"], sha(witness_data))
+        wire = accepted(self, host.decode, witness_data, DEPS, deadline())
+        accepted(
+            self,
+            host.validate,
+            wire["observation"],
+            h4.tree,
+            h4.data,
+            h4.sha256,
+            h4.pages,
+            DEPS,
+        )
+        request = json.loads(wire["observation"]["request_data"])
+        self.assertEqual(
+            (request["mode"], request["run_id"], request["commit"]),
+            ("resolve-failed-startup", run_id, True),
+        )
+        record = json.loads(record_data)
+        self.assertEqual(
+            record["scope"], "contained-job-rooted-failed-attempt-resolution-v2"
+        )
+        self.assertEqual(record["outcome"], "lost-owner-resolved")
+        self.assertEqual(record["unit_state"], "absent")
+        self.assertEqual(
+            record["invocation"], {"id": None, "source": None, "manager_path": None}
+        )
+        self.assertEqual((record["service"], record["failure_record"]), (None, None))
+        self.assertEqual(record["client"]["state"], "absent")
+        name = f"resolver-witness-{run_id}-{sha(witness_data)[:16]}.json"
+        self.assertEqual(
+            record["resolver_witness"],
+            {"name": name, "sha256": sha(witness_data), "size": len(witness_data)},
+        )
+        self.assertEqual(
+            sorted(os.listdir(gate)),
+            sorted(
+                [
+                    "admission.lock",
+                    "attempt-" + run_id,
+                    "resolved-" + run_id + ".json",
+                    name,
+                ]
+            ),
+        )
+        self.assertEqual(
+            (gate / ("resolved-" + run_id + ".json")).read_bytes(), record_data
+        )
+        self.assertEqual((gate / name).read_bytes(), witness_data)
+        self.assertEqual(stat.S_IMODE((gate / name).lstat().st_mode), 0o600)
+        again = self.resolve_tree("after-claim-again", run_id, True)
+        self.refused(again, "resolver found no blocker")
+        # The next admission proceeds to its (refusing) manager, on the same bytes.
+        following = "r5-h4-none-g2"
+        _, path, digest = self.startup_request(following, h4, "g2")
+        next_run = self.run_command(
+            "h4-after-claim-next",
+            [h4.tree + "/opt/irlume/launcher", "--host", path, digest],
+            dict(ENVIRONMENT),
+        )
+        self.refused(next_run, "test manager refused")
+        self.assertIn("active.json", os.listdir(gate))
+        (self.evidence / "h4-after-claim-resolution.json").write_text(
+            json.dumps(
+                {
+                    "witness_bytes": len(witness_data),
+                    "stdout_bytes": len(result.stdout),
+                    "record": record,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    def test_a_failed_self_check_never_reaches_the_resolver(self):
+        h4 = self.kill_tree()
+        run_id = "r5-h4-unchecked-g3"
+        gate = h4.gates / "g3"
+        gate.mkdir(mode=0o700)
+        path, digest = self.resolve_file("unchecked", run_id, True)
+        inherited = os.open("/dev/null", os.O_RDONLY)
+        try:
+            os.dup2(inherited, 5, inheritable=True)
+            result = self.run_command(
+                "h4-resolve-inherited-fd",
+                self.through_loader(tree=h4.tree, request=path, digest=digest),
+                dict(ENVIRONMENT),
+                pass_fds=(5,),
+            )
+        finally:
+            os.close(5)
+            os.close(inherited)
+        self.refused(result, "host descriptors")
+        result = self.run_command(
+            "h4-resolve-wrong-digest",
+            [h4.tree + "/opt/irlume/launcher", "--host", path, "0" * 64],
+            dict(ENVIRONMENT),
+        )
+        self.refused(result, "host request digest")
+        self.assertEqual(os.listdir(gate), [])
+
+    def test_a_held_gate_refuses_the_resolver(self):
+        run_id = "r5-h4-held-g4"
+        gate = self.kill_tree().gates / "g4"
+        gate.mkdir(mode=0o700)
+        lock = os.open(gate / "admission.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = self.gate_state(gate)
+        result = self.resolve_tree("resolve-held-gate", run_id, True)
+        self.refused(result, "OSError EAGAIN")
+        self.assertEqual(self.gate_state(gate), before)
 
     def test_tree_loader_with_the_exact_environment_passes_without_the_launcher(self):
         # The control for the refusals above: the checks, not the launcher, decide.

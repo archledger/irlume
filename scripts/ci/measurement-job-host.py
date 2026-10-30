@@ -11,7 +11,9 @@ bytes). A self-check request then writes the canonical witness to fd 1. A
 startup-only request runs HostOwner's startup-only path in this process, only
 after that check passed: H writes the witness to its attempt directory, binds
 its digest into the intent and completion proof, and refuses when a module or
-file mapping changes later. The witness is evidence, not authority.
+file mapping changes later. A resolve-failed-startup request runs the
+failed-attempt resolver the same way, for one run ID and a commit flag, and
+writes its record and witness to fd 1. The witness is evidence, not authority.
 """
 
 import errno
@@ -55,7 +57,19 @@ REQUEST_FIELDS = {
         "base_sha256",
         "payload_sha256",
     ),
+    # rooted-host.py resolve_failed_startup: one run and whether to commit. It
+    # opens no inputs. The admission directory is never a request field.
+    "resolve-failed-startup": (
+        "scope",
+        "mode",
+        "runtime",
+        "manifest",
+        "manifest_sha256",
+        "run_id",
+        "commit",
+    ),
 }
+RESOLUTION_SCOPE = "contained-job-host-resolution-result-v1"
 QEMU = "/usr/bin/qemu-system-x86_64"
 SCOPE = "contained-job-host-startup-witness-v1"
 REQUEST_LIMIT = 65536
@@ -313,6 +327,14 @@ def decode_request(data, digest, tree, root):
         raise ValueError("host request manifest") from error
     if mode == "startup-only":
         specification(value, root)
+    if mode == "resolve-failed-startup":
+        if (
+            type(value["run_id"]) is not str
+            or re.fullmatch("[a-z0-9][a-z0-9-]{0,63}", value["run_id"]) is None
+        ):
+            raise ValueError("host request run ID")
+        if type(value["commit"]) is not bool:
+            raise ValueError("host request commit flag")
     if root.closure.canonical(value) != data:
         raise ValueError("host request encoding")
     return value
@@ -679,7 +701,7 @@ def process_check(roots, modules, maps, checker, proc):
     which that pass checked. Any later import, rebound module or new, moved
     or removed file mapping (a lazy import or dlopen) refuses: HostOwner runs
     it before admission, before the claim, at each phase recheck and before
-    COMMIT.
+    COMMIT; the resolver before its gate and before its commit decision.
     """
     baseline = file_rows(maps)
 
@@ -891,6 +913,43 @@ def startup_only(checked, **factories):
     )
 
 
+def resolve_failed(checked, **factories):
+    """The failed-attempt resolver, in a process whose self-check passed.
+
+    main() passes no factories: admission is AdmissionGate.for_current_user
+    and the manager SystemdBus, which the resolver only reads. Returns fd 1's
+    canonical result; on a dry run the witness exists only there.
+    """
+    if (
+        type(checked) is not Checked
+        or checked.request.get("mode") != "resolve-failed-startup"
+    ):
+        raise ValueError("host resolve without a resolve self-check")
+    request, owner = checked.request, checked.owner
+    result = owner.resolve_failed_startup(
+        request["run_id"],
+        checked.runtime,
+        witness=owner.HostWitness(checked.witness, checked.check),
+        commit=request["commit"],
+        **factories,
+    )
+    return checked.runtime.preflight.root.closure.canonical(
+        {
+            "scope": RESOLUTION_SCOPE,
+            "run_id": request["run_id"],
+            "committed": result.committed,
+            "admission_state": result.admission_state,
+            "record": {"$bytes": result.record.hex()},
+            "record_sha256": result.sha256,
+            "witness": {"$bytes": checked.witness.hex()},
+            "witness_sha256": hashlib.sha256(checked.witness).hexdigest(),
+            "accepted": False,
+            "native_authorized": False,
+            "full_contract_proven": False,
+        }
+    )
+
+
 def reason(error):
     """A fixed refusal reason: messages of the checks, never paths or values."""
     if isinstance(error, BaseExceptionGroup) and error.exceptions:
@@ -929,6 +988,8 @@ def main():
         checked = run(initial)
         if checked.request["mode"] == "self-check":
             data = checked.witness
+        elif checked.request["mode"] == "resolve-failed-startup":
+            data = resolve_failed(checked)
         else:
             record = startup_only(checked)
             data = checked.runtime.preflight.root.closure.canonical(record)

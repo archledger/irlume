@@ -1,5 +1,9 @@
 # GPU certification key: which mapped libraries can change the output
 
+> **Superseded (2026-10-30):** GPU inference was removed by
+> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> conclusions below remain historical evidence for that decision.
+
 Research record for the ADR-0033 amendment of 2026-10-22 ("the
 certification key binds the numerics set"), #1164. Analysis only: no
 loading admission, no `CERTIFIED` entry, CPU authentication stays

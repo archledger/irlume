@@ -354,10 +354,7 @@ fn metadata_success_does_not_authorize_loading() {
         .iter()
         .any(|n| matches!(n, Notice::UninterpretedDynamicTag { .. })));
     #[cfg(feature = "npu")]
-    assert!(matches!(
-        crate::npu::gpu::discover(&crate::npu::RuntimeSelection::Automatic),
-        crate::npu::gpu::Discovery::NotAdmitted
-    ));
+    assert!(crate::npu::runtime::admit_loading().is_err());
     // This ordinary feature does not add an evidence opt-in. An independently
     // selected evidence cfg retains the existing propagation contract.
     assert_eq!(

@@ -38,7 +38,6 @@ pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;
 pub mod detect;
-pub mod gpu;
 pub mod light;
 pub mod moire;
 #[cfg(feature = "native-metadata")]
@@ -1040,12 +1039,6 @@ mod onnx {
             .map_err(err)
     }
 
-    /// A GPU refusal as the reason the recognizer runs on CPU.
-    #[cfg(feature = "npu")]
-    fn gpu_cpu_reason(reason: crate::npu::gpu::GpuReason) -> crate::npu::CpuReason {
-        crate::npu::CpuReason::Gpu(reason)
-    }
-
     /// AuraFace embedder (ONNX). Loaded once in the daemon.
     pub struct Embedder {
         session: Session,
@@ -1125,133 +1118,6 @@ mod onnx {
             Ok(())
         }
 
-        /// [`Self::place_on_npu`] for the GPU (ADR-0033 phase 3): the slot
-        /// the GPU context gives, then the GPU parity check. An error of the
-        /// parity check's CPU session leaves the model on CPU.
-        ///
-        /// # Errors
-        ///
-        /// When the CPU session fails on the parity check's reference
-        /// inputs.
-        #[cfg(feature = "npu")]
-        pub fn place_on_gpu(
-            &mut self,
-            model: &irlume_common::HashedModel,
-            gpu: &mut crate::npu::gpu::Context,
-        ) -> irlume_common::Result<()> {
-            self.npu = gpu.slot(model.bytes(), model.sha256());
-            if let Err(error) = self.check_gpu_parity() {
-                self.npu = crate::npu::Slot::cpu(gpu_cpu_reason(
-                    crate::npu::gpu::GpuReason::ParityMismatch(format!(
-                        "the parity check failed: {error}"
-                    )),
-                ));
-                return Err(error);
-            }
-            Ok(())
-        }
-
-        /// The GPU's engine-build check (ADR-0033 section 5 and its
-        /// amendments of 2026-10-22): the live CPU reference digest, the GPU
-        /// reference digest, the extended reference set when the support
-        /// set differs from the certified one, and the runtime-suspend
-        /// guard of an entry certified through the driver hold. Any
-        /// mismatch keeps the model on CPU.
-        #[cfg(feature = "npu")]
-        fn check_gpu_parity(&mut self) -> irlume_common::Result<()> {
-            let Some((entry, extended)) = self.npu.gpu_certification() else {
-                return Ok(());
-            };
-            let cpu = self.cpu_reference_digest()?;
-            if cpu != entry.cpu_reference_digest {
-                self.npu = crate::npu::Slot::cpu(gpu_cpu_reason(
-                    crate::npu::gpu::GpuReason::ParityMismatch(format!(
-                        "CPU reference digest {cpu}, certified {}",
-                        entry.cpu_reference_digest
-                    )),
-                ));
-                return Ok(());
-            }
-            self.check_gpu_digest("");
-            if extended && self.npu.gpu_certification().is_some() {
-                self.check_gpu_extended();
-            }
-            self.npu.check_runtime_guard();
-            Ok(())
-        }
-
-        /// The GPU half of the parity check: the exact reference digest, at
-        /// engine build and again after every system resume.
-        #[cfg(feature = "npu")]
-        fn check_gpu_digest(&mut self, when: &str) {
-            let Some((entry, _)) = self.npu.gpu_certification() else {
-                return;
-            };
-            let baseline = crate::npu::suspended(crate::npu::Bound::AtMost);
-            let Some(digest) = self.npu_reference_digest() else {
-                return; // the GPU failed and the slot retired itself
-            };
-            if digest == entry.gpu_reference_digest {
-                self.npu.note_checked(baseline);
-            } else {
-                self.npu = crate::npu::Slot::cpu(gpu_cpu_reason(
-                    crate::npu::gpu::GpuReason::ParityMismatch(format!(
-                        "{when}reference output digest {digest}, certified {}",
-                        entry.gpu_reference_digest
-                    )),
-                ));
-            }
-        }
-
-        /// The extended reference set, required when the support set
-        /// differs from the certified one: every input must repeat its bits
-        /// and the whole set must reproduce the certified digest.
-        #[cfg(feature = "npu")]
-        fn check_gpu_extended(&mut self) {
-            let Some((entry, _)) = self.npu.gpu_certification() else {
-                return;
-            };
-            let outcome = match self.extended_reference_digest() {
-                None => return, // the GPU failed and the slot retired itself
-                Some(Err(why)) => Err(why),
-                Some(Ok(digest)) if digest == entry.extended_reference_digest => Ok(()),
-                Some(Ok(digest)) => Err(format!(
-                    "extended reference digest {digest}, certified {}",
-                    entry.extended_reference_digest
-                )),
-            };
-            if let Err(why) = outcome {
-                self.npu = crate::npu::Slot::cpu(gpu_cpu_reason(
-                    crate::npu::gpu::GpuReason::ExtendedParityMismatch(why),
-                ));
-            }
-        }
-
-        /// SHA-256 of the accelerator's raw output bits for the extended
-        /// reference set, each input run twice in a row; `None` when the
-        /// model is not on the accelerator or it failed, `Some(Err)` when an
-        /// input did not repeat its bits. Certification records this digest
-        /// with the same function.
-        #[cfg(feature = "npu")]
-        pub(crate) fn extended_reference_digest(&mut self) -> Option<Result<String, String>> {
-            let mut bits = Vec::new();
-            for k in npu_reference::EXTENDED {
-                let chip = npu_reference::chip(k);
-                let first = self.npu.run(&chip, |raw| Ok(raw.to_vec()))?;
-                let second = self.npu.run(&chip, |raw| Ok(raw.to_vec()))?;
-                if first.len() != second.len()
-                    || first
-                        .iter()
-                        .zip(&second)
-                        .any(|(a, b)| a.to_bits() != b.to_bits())
-                {
-                    return Some(Err(format!("reference input {k} did not repeat its bits")));
-                }
-                bits.extend(first.iter().chain(&second).flat_map(|v| v.to_le_bytes()));
-            }
-            Some(Ok(irlume_common::sha256_hex(&bits)))
-        }
-
         /// Before the NPU answers a request, require it to reproduce the
         /// exact output bits its certification recorded for the reference
         /// inputs, and keep the model on CPU otherwise. The NPU is
@@ -1310,34 +1176,17 @@ mod onnx {
         #[cfg(feature = "npu")]
         fn npu_embed_all(&mut self, inputs: &[&[f32]]) -> Option<Vec<(Embedding, f32)>> {
             if self.npu.resumed_since_check() {
-                self.check_accelerator_digest("after a system resume, ");
+                self.check_npu_digest("after a system resume, ");
             }
             let mut embedded = Vec::with_capacity(inputs.len());
             for input in inputs {
                 embedded.push(self.npu.run(input, embedding_and_norm)?);
             }
             if self.npu.resumed_since_check() {
-                self.check_accelerator_digest("after a system resume, ");
-                return None;
-            }
-            // A GPU entry certified through the driver hold never measured
-            // a runtime suspend with the model retained: if one happened,
-            // these outputs are not used and the model leaves the GPU
-            // (ADR-0033 amendment of 2026-10-22).
-            if !self.npu.check_runtime_guard() {
+                self.check_npu_digest("after a system resume, ");
                 return None;
             }
             Some(embedded)
-        }
-
-        /// The resume recheck of whichever accelerator the model is on.
-        #[cfg(feature = "npu")]
-        fn check_accelerator_digest(&mut self, when: &str) {
-            if self.npu.gpu_certification().is_some() {
-                self.check_gpu_digest(when);
-            } else {
-                self.check_npu_digest(when);
-            }
         }
 
         /// SHA-256 of the NPU's raw output bits for the reference inputs, or
@@ -1416,10 +1265,7 @@ mod onnx {
             // Both halves come from one device: certification measured whole
             // NPU probes and whole CPU probes, never a mix (ADR-0022 §9).
             #[cfg(feature = "npu")]
-            if matches!(
-                self.npu.device(),
-                crate::npu::Device::Npu | crate::npu::Device::Gpu
-            ) {
+            if matches!(self.npu.device(), crate::npu::Device::Npu) {
                 let a = align::preprocess_arcface(chip_rgb);
                 let b = align::preprocess_arcface(&crate::align::flip_h(chip_rgb));
                 if let Some(both) = self.npu_embed_all(&[&a, &b]) {
@@ -3623,21 +3469,11 @@ mod onnx {
     #[path = "npu_tests.rs"]
     mod npu_tests;
 
-    #[cfg(all(test, feature = "npu"))]
-    #[path = "gpu_tests.rs"]
-    mod gpu_tests;
-
     /// Fixed synthetic inputs of the CPU reference fingerprint and digests
     /// (ADR-0022 §3), shared with the hardware tests. The digest inputs are
     /// in every build: enrollment records the CPU reference that produced a
     /// template whether or not this build can use an NPU.
     mod npu_reference {
-        /// The extended reference set of a GPU entry (ADR-0033 amendment of
-        /// 2026-10-22): sixteen more patterns after the three of the
-        /// startup canary, each run twice.
-        #[cfg(feature = "npu")]
-        pub(super) const EXTENDED: std::ops::Range<usize> = 3..19;
-
         /// A preprocessed 112x112 recognizer input; `k` varies the pattern.
         pub(super) fn chip(k: usize) -> Vec<f32> {
             let n = crate::align::OUT_SIZE as usize;

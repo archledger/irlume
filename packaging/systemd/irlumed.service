@@ -23,15 +23,6 @@ Environment="IRLUME_BLAZE_MODEL=/usr/share/irlume/models/blaze_face_short_range.
 Environment="IRLUME_VIT_PAD_MODEL=/usr/share/irlume/models/liveness_vit.onnx"
 Environment="IRLUME_PAD_IR_MODEL=/usr/share/irlume/models/flir.onnx"
 Environment="IRLUME_SOCKET=/run/irlume.sock"
-# GPU recognizer launch environment (ADR-0033, #1162). The Intel compute
-# runtime keeps a persistent compiler cache unless NEO_CACHE_PERSISTENT=0;
-# this is the cache-off intent of the gpu-candidate-inputs-v1 policy. The
-# OpenCL ICD loader's vendor, layer and platform overrides and the runtime's
-# cache directory are removed after every other environment source. Generic
-# loader variables stay, so a drop-in for the CPU path keeps working.
-# Nothing reads these while the GPU loading admission refuses.
-Environment="NEO_CACHE_PERSISTENT=0"
-UnsetEnvironment=OCL_ICD_VENDORS OPENCL_VENDOR_PATH OPENCL_LAYERS OPENCL_LAYER_PATH OCL_ICD_PLATFORM_SORT OCL_ICD_DEFAULT_PLATFORM OCL_ICD_ASSUME_ICD_EXTENSION NEO_CACHE_DIR
 # Account state is stored under /var/lib/irlume (irlume_common::STATE_DIR).
 # Each request selects its account within that root; no HOME-derived state path.
 Restart=on-failure

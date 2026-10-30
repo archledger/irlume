@@ -132,12 +132,6 @@ pub struct Engine {
     npu_platform: Option<String>,
     #[cfg(feature = "npu")]
     npu_runtime_available: Option<bool>,
-    /// The GPU platform identity digest the recognizer was placed for, when
-    /// GPU discovery read one (ADR-0033 phase 3).
-    #[cfg(feature = "npu")]
-    gpu_platform: Option<String>,
-    #[cfg(feature = "npu")]
-    gpu_runtime_available: Option<bool>,
     /// Whether this request's probes may run on the NPU: set only by an
     /// authentication whose enrollment admits it, and cleared when that
     /// request's scope ends (ADR-0022 §2). Every other path embeds on CPU.
@@ -323,8 +317,6 @@ mod npu_probe;
 pub use authentication_window::AuthenticationWindow;
 pub use identity_arms::decision_fingerprint;
 use identity_arms::{ir_match_in, IrMatch};
-/// The GPU kill switch available in every build (ADR-0033 section 8).
-pub use irlume_vision::gpu;
 /// The NPU runtime the daemon opens for the recognizer (ADR-0022).
 #[cfg(feature = "npu")]
 pub use irlume_vision::npu;
@@ -4242,10 +4234,6 @@ impl Engine {
             npu_platform: None,
             #[cfg(feature = "npu")]
             npu_runtime_available: None,
-            #[cfg(feature = "npu")]
-            gpu_platform: None,
-            #[cfg(feature = "npu")]
-            gpu_runtime_available: None,
             npu_probe: false,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
             mesh: None,
@@ -15931,50 +15919,6 @@ mod engine_tests {
             .place_recognizer_on_npu(&weights, &mut context)
             .unwrap();
         assert_eq!(engine.recognizer_placement().runtime_available, None);
-    }
-
-    /// A GPU selection under the closed loading admission reports the
-    /// GPU-worded refusal, observes no runtime and writes nothing; the
-    /// legacy device stays a value released clients know.
-    #[cfg(feature = "npu")]
-    #[test]
-    fn gpu_probe_placement_reports_the_admission_refusal_without_an_observation() {
-        let _g = env_guard();
-        let _s = shared();
-        let weights =
-            irlume_common::HashedModel::new(std::fs::read(model_path("glintr100.onnx")).unwrap());
-        let mut engine = Engine::load_with_recognizer_weights(
-            &model_path("face_detection_yunet_2023mar.onnx"),
-            &weights,
-        )
-        .unwrap();
-        struct Sandbox(std::path::PathBuf);
-        impl Drop for Sandbox {
-            fn drop(&mut self) {
-                teardown_sandbox(&self.0);
-            }
-        }
-        let directory = Sandbox(state_sandbox("gpu-observation"));
-        let base = directory.0.join("gpu");
-        let mut context = engine
-            .open_gpu_context_with_runtime(&base, &irlume_vision::npu::RuntimeSelection::Automatic);
-        engine
-            .place_recognizer_on_gpu(&weights, &mut context)
-            .unwrap();
-        let placement = engine.recognizer_placement();
-        assert_eq!(placement.device, "cpu");
-        assert_eq!(placement.accelerator, None);
-        assert_eq!(placement.gpu_runtime_available, None);
-        assert_eq!(placement.gpu_qualified, None);
-        assert_eq!(placement.gpu_platform, None);
-        let reason = placement.reason.unwrap();
-        assert!(reason.contains("GPU loading profile"), "{reason}");
-        assert!(!reason.contains("NPU"), "{reason}");
-        assert!(!base.exists(), "the refused admission wrote nothing");
-        let other = irlume_common::HashedModel::new(b"other weights".to_vec());
-        assert!(engine
-            .place_recognizer_on_gpu(&other, &mut context)
-            .is_err());
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # GPU inference precision: f16 against f32 under the ADR-0022 gates
 
+> **Superseded (2026-10-30):** GPU inference was removed by
+> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> conclusions below remain historical evidence for that decision.
+
 Measurement record for the ADR-0033 amendment of 2026-10-21. Everything
 here is measurement only: loading admission stays closed, `CERTIFIED`
 stays empty and CPU authentication stays authoritative. No biometric data

@@ -25,7 +25,7 @@ fn selection_provenance_status_omits_unreported_data() {
 fn selection_provenance_status_reports_known_and_future_values() {
     for (source, issue) in [("settings", "none"), ("future-source", "future-issue")] {
         let placement: RecognizerPlacement = serde_json::from_value(json!({
-            "device":"cpu", "selection":"gpu", "accelerator":"gpu",
+            "device":"cpu", "selection":"npu",
             "selection_provenance":{"source":source,"issue":issue}
         }))
         .unwrap();
@@ -37,7 +37,6 @@ fn selection_provenance_status_reports_known_and_future_values() {
         };
         assert_eq!(value["selection_provenance"], expected);
         assert_eq!(value["device"], "cpu");
-        assert_eq!(value["accelerator"], "gpu");
     }
 }
 

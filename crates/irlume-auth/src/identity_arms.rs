@@ -906,15 +906,4 @@ mod tests {
             assert_eq!(entry.decision_fingerprint, now, "{}", entry.model_sha256);
         }
     }
-
-    /// The same for the GPU table (ADR-0033 section 5): an entry judged
-    /// through other decision code never applies.
-    #[cfg(feature = "npu")]
-    #[test]
-    fn certified_gpu_entries_carry_this_decision_fingerprint() {
-        let now = decision_fingerprint();
-        for entry in irlume_vision::npu::gpu::certification::CERTIFIED {
-            assert_eq!(entry.decision_fingerprint, now, "{}", entry.model_sha256);
-        }
-    }
 }

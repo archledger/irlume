@@ -144,6 +144,13 @@ class Dependencies(NamedTuple):
     python_state: types.ModuleType
 
 
+class Startup(NamedTuple):
+    """One startup observation and the page digests of the tree it checked."""
+
+    observation: dict
+    pages: object
+
+
 def collect_startup(
     plan,
     manifest_data,
@@ -183,10 +190,15 @@ def collect_startup(
             source_loader_types=snapshot.loaders,
         )
 
-    def fresh_process(core):
+    def fresh_process(core, files, mounts):
         with reader._open(f"/proc/{os.getpid()}", directory=True) as fd:
             maps = reader._read(
                 fd, "maps", dependencies.preflight.filesystem.startup.LIMITS["maps"]
+            )
+            # The checker's own parser picks the mappings whose pages to read.
+            _, readable = dependencies.runtime_state.file_mappings(maps, files, mounts)
+            mapped = reader._mapped(
+                fd, tuple((mapping.start, mapping.end) for mapping in readable)
             )
             status = reader._read(
                 fd, "status", dependencies.preflight.filesystem.startup.LIMITS["status"]
@@ -194,7 +206,7 @@ def collect_startup(
             dependencies.preflight.root.check_status(status, plan["uid"], plan["gid"])
             if reader._namespaces(fd) != core["namespaces"]:
                 raise ValueError("startup namespaces changed")
-        return maps, status
+        return maps, mapped, status
 
     initial = reader.collect(plan)
     first_core = dependencies.preflight.core_witness(
@@ -205,14 +217,14 @@ def collect_startup(
     with dependencies.runtime_tree.RootedRuntimeSnapshot.open(
         plan, manifest_data, first_core, deadline=reader.deadline
     ) as tree:
-        files, manifest = tree.file_facts(), tree.manifest
+        files, manifest, pages = tree.file_facts(), tree.manifest, tree.pages
         first_modules = capture()
         first_python = python_state(first_modules)
         if not same_modules(first_modules, capture()):
             raise ValueError("startup module identities changed")
-        first_maps, _ = fresh_process(first_core)
+        first_maps, first_mapped, _ = fresh_process(first_core, files, mounts)
         dependencies.runtime_state.check_runtime_state(
-            manifest, files, first_python, first_maps, mounts
+            manifest, files, first_python, first_maps, mounts, first_mapped, pages
         )
         last_modules = capture()
         if not same_modules(first_modules, last_modules):
@@ -220,9 +232,9 @@ def collect_startup(
         last_python = python_state(last_modules)
         if not same_modules(first_modules, capture()) or first_python != last_python:
             raise ValueError("startup Python state changed")
-        maps, _ = fresh_process(first_core)
+        maps, mapped, _ = fresh_process(first_core, files, mounts)
         dependencies.runtime_state.check_runtime_state(
-            manifest, files, last_python, maps, mounts
+            manifest, files, last_python, maps, mounts, mapped, pages
         )
         tree.check()
     # The root snapshot FD must be closed before reobserving the complete table.
@@ -245,7 +257,7 @@ def collect_startup(
         or reader._stdio() != initial["proc"]["stdio"]
     ):
         raise ValueError("startup descriptors changed")
-    return {
+    observation = {
         "initial_filesystem": initial,
         "filesystem": final,
         "core": final_core,
@@ -253,7 +265,9 @@ def collect_startup(
         "files": files,
         "python": last_python,
         "maps": maps,
+        "mapped": mapped,
         "status": status,
         "started_ns": reader.started,
         "finished_ns": reader._after(),
     }
+    return Startup(observation, pages)

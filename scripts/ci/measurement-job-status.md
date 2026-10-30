@@ -63,11 +63,22 @@ service or VM. `native_authorized` and `full_contract_proven` remain false.
 
 ### Open containment items
 
-- G sees the inode, the containing mount's device and the path of each
-  runtime mapping, but not the mapped bytes. On btrfs an inode number is
-  unique per subvolume only, and the tree checks (root device and
-  same-device members) hold at each scan, not between scans. Binding the
-  mapped bytes to the hashed file would close this.
+- Mapped bytes, narrowed in source and still open: on btrfs an inode number
+  is unique per subvolume only, so maps alone cannot tell a runtime file from
+  a snapshot copy. G now reads each readable mapping of a runtime file from
+  its own `/proc/self/mem`, then its `/proc/self/pagemap` entries; every page
+  still backed by a file must equal the hashed file's page (zero-filled past
+  the end), and an executable mapping may have no private copies. H checks
+  G's rows with its own runtime's page digests (startup witness v2), but G
+  reports which pages are private copies, so H's check is not an independent
+  measurement. Still open: pages the loader or G wrote before the check
+  (RELRO, `.got`, `.data`; about 190 to 310 pages of a Python 3.14 process,
+  mostly libpython) are counted, not compared, so a snapshot copy that
+  differs only in those pages is caught by the tree checks at each scan and
+  not by this check. The binding holds at each maps read; code that ran
+  before the check could have replaced its own mappings. Active uprobes or
+  breakpoints on runtime files make G refuse. The operation budget still
+  needs a recount from native runs.
 - Restrict path-socket connects from the future QEMU child with Landlock
   (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) through the launcher.
 - With a private PID namespace, G sees H's peer PID as 0. G checks the peer's
@@ -80,7 +91,7 @@ close #1164 on the strength of this source checkpoint.
 
 ## Validation retained with this checkpoint
 
-All 36 `scripts/ci/test-measurement-*.py` suites pass (793 tests), with
+All 36 `scripts/ci/test-measurement-*.py` suites pass (829 tests), with
 `TMPDIR` unset and with a long `TMPDIR`. G runs with `KeyringMode=private`,
 read back by H: a user manager's services otherwise share its session
 keyring, which G's private user namespace does not replace (probed on

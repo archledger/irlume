@@ -1875,6 +1875,11 @@ class FactoryTests(unittest.TestCase):
         self.assertIs(result["native_authorized"], False)
         self.assertIs(result["full_contract_proven"], False)
         decoder.assert_called_once()
+        # H re-verifies G's rows with its own runtime's page digests.
+        pages = decoder.call_args.kwargs["pages"]
+        self.assertIs(pages, self.owner.inputs.runtime.pages)
+        self.assertIs(type(pages), types.MappingProxyType)
+        self.assertIn("/usr/bin/python3", pages)
         self.assertEqual(options, [True])
         # Connect, its recheck and the recheck before COMMIT bind the peer.
         self.assertEqual(

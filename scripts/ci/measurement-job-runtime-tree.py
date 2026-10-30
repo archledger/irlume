@@ -39,6 +39,7 @@ class RootedRuntimeSnapshot(closure.RuntimeSnapshot):
         self.deadline = min(deadline, core["started_ns"] + root.guardian.STOP_NS)
         self.fd = None
         self.observations = None
+        self.pages = None
         self._manifest_data = None
         try:
             closure.inputs.before(self.deadline)
@@ -80,7 +81,7 @@ class RootedRuntimeSnapshot(closure.RuntimeSnapshot):
         manifest = root.check_selection(plan, data)
         snapshot = cls(plan, core, deadline)
         try:
-            members, images, snapshot.observations = snapshot.scan(contents=True)
+            members, images, snapshot.observations, pages = snapshot.scan(contents=True)
             static_members = [
                 member
                 for member in manifest["members"]
@@ -90,6 +91,7 @@ class RootedRuntimeSnapshot(closure.RuntimeSnapshot):
                 raise ValueError("mounted runtime manifest mismatch")
             snapshot.graph = MappingProxyType(closure.verify_linkage(manifest, images))
             snapshot._manifest_data = data
+            snapshot.pages = MappingProxyType(pages)
             snapshot.check()
             closure.inputs.before(snapshot.deadline)
             return snapshot

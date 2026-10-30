@@ -14,6 +14,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -42,6 +43,44 @@ G_MAPS = b"".join(
     + b"\n"
     for i in range(93)
 )
+# Page counts of G's readable runtime file mappings, run by run (adjacent
+# mappings form one run), from the final maps in the 2026-10-29 strict-cgroup
+# startup witnesses: 72 mappings of 18 files, 16461824 bytes, on each host.
+LAPTOP_RUNS = (
+    (1, 1, 1, 1),
+    (9, 7, 1, 1),
+    (898, 362, 119, 3),
+    (7, 6, 1, 1, 7, 4, 1, 1, 1, 2, 1, 1, 11, 7, 1, 1, 4, 3, 1, 1, 2, 3, 1, 1),
+    (15, 13, 1, 1, 29, 11, 1, 1),
+    (370, 121, 4, 2),
+    (873, 483, 94, 141),
+    (4, 4, 1, 1, 19, 3, 1, 1, 7, 6, 1, 1),
+    (143, 134, 1, 1),
+    (43, 12, 2, 1),
+)
+ARCHHOST_RUNS = (
+    (1, 1, 1, 1),
+    (9, 7, 1, 1),
+    (7, 6, 1, 1, 7, 4, 1, 1, 11, 7, 1, 1),
+    (15, 13, 1, 1),
+    (1, 2, 1, 1, 4, 3, 1, 1, 2, 3, 1, 1, 4, 4, 1, 1, 898, 362, 119, 3),
+    (19, 3, 1, 1, 29, 11, 1, 1),
+    (143, 134, 1, 1, 370, 121, 4, 2),
+    (873, 483, 94, 141),
+    (7, 6, 1, 1),
+    (43, 12, 2, 1),
+)
+
+
+def mappings(runs):
+    """Readable mappings with these page counts, each run apart from the next."""
+    result = []
+    for number, run in enumerate(runs, start=1):
+        start = number << 32
+        for pages in run:
+            result.append(types.SimpleNamespace(start=start, end=start + pages * 4096))
+            start += pages * 4096
+    return tuple(result)
 
 
 def module(name):
@@ -162,6 +201,9 @@ class CompositionTests(unittest.TestCase):
         self.deadlines = []
         self.plan_observations = []
         self.runtime_args = []
+        self.mapping_args = []
+        self.region_args = []
+        self.tree_pages = MappingProxyType({"/usr/bin/python3": (b"p" * 32,)})
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.tree_file = Path(directory.name) / "runtime.py"
@@ -206,9 +248,15 @@ class CompositionTests(unittest.TestCase):
                 yield 9
 
             def _read(self, fd, name, limit):
+                events.append("read-" + name)
                 if fail == "status" and name == "status":
                     return b"bad"
                 return b"status" if name == "status" else b"maps"
+
+            def _mapped(self, fd, regions):
+                events.append("mapped")
+                test.region_args.append(regions)
+                return (("rows", len(test.region_args)),)
 
             def _namespaces(self, fd):
                 return {"bad": 1} if fail == "namespaces" else {}
@@ -225,6 +273,7 @@ class CompositionTests(unittest.TestCase):
         class Tree:
             def __init__(self):
                 self.manifest = {"selected": True}
+                self.pages = test.tree_pages
 
             def __enter__(self):
                 events.append("tree-open")
@@ -292,6 +341,15 @@ class CompositionTests(unittest.TestCase):
 
         state.check_runtime_state = validate
 
+        def file_mappings(maps, files, mounts):
+            events.append("file-mappings")
+            test.mapping_args.append((maps, files, mounts))
+            if fail == "mappings":
+                raise ValueError("injected maps refusal")
+            return set(), mappings(((1, 2),))
+
+        state.file_mappings = file_mappings
+
         python_calls = [0]
 
         def collect_python(deadline, **kwargs):
@@ -320,9 +378,10 @@ class CompositionTests(unittest.TestCase):
         self.assertLess(
             self.events.index("tree-close"), self.events.index("filesystem-final")
         )
-        self.assertIs(result["initial_filesystem"], self.initial)
-        self.assertIs(result["filesystem"], self.final)
-        self.assertNotIn("native_authorized", result)
+        self.assertIs(type(result), startup.Startup)
+        self.assertIs(result.observation["initial_filesystem"], self.initial)
+        self.assertIs(result.observation["filesystem"], self.final)
+        self.assertNotIn("native_authorized", result.observation)
         self.assertTrue(self.deadlines)
         self.assertEqual(set(self.deadlines), {500})
 
@@ -342,9 +401,66 @@ class CompositionTests(unittest.TestCase):
         # The mount table the first core witness checked; the final view
         # refuses any change to it.
         self.assertEqual(
-            [args[4:] for args in self.runtime_args],
-            [({"view of": b"mountinfo 1"},)] * 2,
+            [args[4] for args in self.runtime_args],
+            [{"view of": b"mountinfo 1"}] * 2,
         )
+
+    def test_each_maps_pass_reads_and_checks_its_own_mapped_pages(self):
+        deps = self.setup_dependencies()
+        main = module("main")
+        table = {"main": main}
+        with mock.patch.object(startup.os, "stat", side_effect=root_stat()):
+            result = startup.collect_startup(
+                {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
+                b"manifest",
+                deps,
+                (main,),
+                1000,
+                _module_table=lambda: table,
+            )
+        # One maps parser for collection and checking, under the first core's
+        # mount view; mem and pagemap are read in the same proc directory.
+        self.assertEqual(
+            self.mapping_args,
+            [(b"maps", {"selected": True}, {"view of": b"mountinfo 1"})] * 2,
+        )
+        base = 1 << 32
+        self.assertEqual(
+            self.region_args,
+            [((base, base + 4096), (base + 4096, base + 3 * 4096))] * 2,
+        )
+        passes = [
+            self.events[index : index + 4]
+            for index, event in enumerate(self.events)
+            if event == "read-maps"
+        ]
+        self.assertEqual(
+            passes, [["read-maps", "file-mappings", "mapped", "read-status"]] * 2
+        )
+        self.assertEqual(
+            [args[5] for args in self.runtime_args],
+            [(("rows", 1),), (("rows", 2),)],
+        )
+        self.assertTrue(all(args[6] is self.tree_pages for args in self.runtime_args))
+        self.assertEqual(result.observation["mapped"], (("rows", 2),))
+        self.assertIs(result.pages, self.tree_pages)
+
+    def test_maps_refusal_reads_no_mapped_pages(self):
+        deps = self.setup_dependencies(fail="mappings")
+        main = module("main")
+        table = {"main": main}
+        with self.assertRaisesRegex(ValueError, "injected maps refusal"):
+            startup.collect_startup(
+                {"uid": 1000, "gid": 1000, "manifest": {"sha256": "a" * 64}},
+                b"manifest",
+                deps,
+                (main,),
+                1000,
+                _module_table=lambda: table,
+            )
+        self.assertNotIn("mapped", self.events)
+        self.assertEqual(self.runtime_args, [])
+        self.assertIn("tree-close", self.events)
 
     def test_runtime_failure_closes_tree_without_final_filesystem_acceptance(self):
         deps = self.setup_dependencies(fail="runtime")
@@ -509,7 +625,7 @@ class CompositionTests(unittest.TestCase):
             result = startup.collect_startup(
                 plan, b"manifest", deps, (main,), 1000, _module_table=lambda: table
             )
-        self.assertEqual(result["runtime_manifest_sha256"], "a" * 64)
+        self.assertEqual(result.observation["runtime_manifest_sha256"], "a" * 64)
         self.assertEqual(
             [(row["uid"], row["manifest"]["sha256"]) for row in self.plan_observations],
             [(1000, "a" * 64)] * 2,
@@ -562,7 +678,8 @@ class NativeBudgetTests(unittest.TestCase):
     its /dev/char links and /dev/core, every kernel view but smackfs under a
     cover, selinux only on the laptop, no /run/credentials. Each read of a
     /proc file returns whole lines up to one page, as a seq_file read does.
-    The other startup dependencies are inert.
+    The other startup dependencies are inert; the runtime state lists no
+    mapped file pages unless a test gives their page counts.
     """
 
     def view(self, selinux):
@@ -618,9 +735,16 @@ class NativeBudgetTests(unittest.TestCase):
             (self.proc / "ns" / name).touch()
         return plan
 
-    def observe(self, mountinfo, selinux):
-        """Return the operations collect_startup spent on one native view."""
+    def observe(self, mountinfo, selinux, runs=()):
+        """Return the operations collect_startup spent on one native view.
+
+        runs are the page counts of G's readable runtime mappings; the inert
+        runtime state lists them and their mem and pagemap reads return
+        zeros, so each costs what its native read would.
+        """
         plan = self.view(selinux)
+        for name in ("mem", "pagemap"):
+            (self.proc / name).touch()
         files = {
             "mountinfo": mountinfo,
             "maps": G_MAPS,
@@ -632,6 +756,7 @@ class NativeBudgetTests(unittest.TestCase):
             (self.proc / name).write_bytes(data)
         real_open, real_stat, real_read = os.open, os.stat, os.read
         real_metadata, pid, pages = filesystem.metadata, os.getpid(), set()
+        memory, real_pread = set(), os.pread
 
         def open_view(path, flags, *args, **kwargs):
             path = {"/": self.root, f"/proc/{pid}": self.proc}.get(path, path)
@@ -640,7 +765,14 @@ class NativeBudgetTests(unittest.TestCase):
                 pages.add(fd)
             else:
                 pages.discard(fd)
+            if kwargs.get("dir_fd") is not None and path in ("mem", "pagemap"):
+                memory.add(fd)
+            else:
+                memory.discard(fd)
             return fd
+
+        def pread_view(fd, size, offset):
+            return bytes(size) if fd in memory else real_pread(fd, size, offset)
 
         def stat_view(path, *args, **kwargs):
             return real_stat(self.root if path == "/" else path, *args, **kwargs)
@@ -673,7 +805,10 @@ class NativeBudgetTests(unittest.TestCase):
         @contextlib.contextmanager
         def runtime_tree(*args, **kwargs):
             yield types.SimpleNamespace(
-                manifest={}, file_facts=dict, check=lambda: None
+                manifest={},
+                file_facts=dict,
+                check=lambda: None,
+                pages=MappingProxyType({}),
             )
 
         preflight, tree, state, python = (
@@ -692,6 +827,7 @@ class NativeBudgetTests(unittest.TestCase):
         }
         tree.RootedRuntimeSnapshot = types.SimpleNamespace(open=runtime_tree)
         state.check_runtime_state = lambda *args: None
+        state.file_mappings = lambda *args: (set(), mappings(runs))
         python.collect_python_state = lambda deadline, **kwargs: {}
         main = module("main")
         table = {"main": main}
@@ -699,6 +835,7 @@ class NativeBudgetTests(unittest.TestCase):
             mock.patch.object(os, "open", side_effect=open_view),
             mock.patch.object(os, "stat", side_effect=stat_view),
             mock.patch.object(os, "read", side_effect=read_page),
+            mock.patch.object(os, "pread", side_effect=pread_view),
             mock.patch.object(filesystem, "metadata", side_effect=device_metadata),
         ):
             try:
@@ -728,6 +865,19 @@ class NativeBudgetTests(unittest.TestCase):
                 self.assertEqual(self.observe(mountinfo, selinux), spent)
                 self.assertLess(spent, filesystem.startup.MAX_OPERATIONS)
                 self.assertLessEqual(filesystem.startup.MAX_OPERATIONS, 1104 * 3 // 2)
+
+    def test_native_mapped_reads_fit_the_operation_budget(self):
+        # Each maps pass opens mem and pagemap (three operations each) and
+        # reads every run once from pagemap and in 1 MiB pieces from mem:
+        # 10 runs and 23 pieces on the laptop, 10 and 24 on archhost. The
+        # views above without them spend 1104 and 1096.
+        for label, mountinfo, selinux, runs, spent in (
+            ("laptop", root_tests.R5_STRICT, True, LAPTOP_RUNS, 1104 + 2 * 39),
+            ("archhost", root_tests.R5_ARCHHOST, False, ARCHHOST_RUNS, 1096 + 2 * 40),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(self.observe(mountinfo, selinux, runs), spent)
+                self.assertLess(spent, filesystem.startup.MAX_OPERATIONS)
 
     def test_operation_budget_is_a_hard_cap_at_the_native_count(self):
         budget = filesystem.startup

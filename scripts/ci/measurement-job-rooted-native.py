@@ -236,13 +236,17 @@ class GuardianEffects:
         dependencies = runtime.startup.Dependencies(
             runtime.preflight, runtime.tree, runtime.state, runtime.python
         )
-        return runtime.startup.collect_startup(
+        result = runtime.startup.collect_startup(
             self.value["root_plan"],
             manifest,
             dependencies,
             runtime.roots,
             min(deadline, self.value["startup_deadline_ns"]),
         )
+        # G encodes its witness with the page digests of the tree it checked.
+        if type(result) is not runtime.startup.Startup:
+            raise ValueError("rooted startup collection")
+        return result
 
     def read_cgroup(self, deadline):
         self.before(deadline)

@@ -852,12 +852,14 @@ class HostOwner:
                 witness_deps,
                 self.runtime.artifact,
             )
+            # H checks G's mapped rows with its own runtime's page digests.
             controller = self.runtime.handshake.Host(
                 self.config,
                 self.inputs.manifest,
                 support,
                 self,
                 self.support.terminal_check,
+                pages=self.inputs.runtime.pages,
             )
             record = controller.run()
             self.complete(record)

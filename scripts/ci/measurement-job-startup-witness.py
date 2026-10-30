@@ -12,6 +12,7 @@ from typing import NamedTuple
 LIMIT = 1024**2
 MAX_NODES = 65536
 MAX_DEPTH = 32
+SCOPE = "contained-job-startup-witness-v2"
 
 
 class Dependencies(NamedTuple):
@@ -148,7 +149,8 @@ def check_binding(binding, dependencies):
     return dict(binding)
 
 
-def validate(observation, plan, manifest_data, binding, dependencies, timer):
+def validate(observation, plan, manifest_data, binding, dependencies, timer, *, pages):
+    """pages: the caller's own page digests of the runtime, never decoded."""
     preflight = dependencies.preflight
     runtime = preflight.runtime
     manifest = preflight.root.check_selection(plan, manifest_data)
@@ -164,6 +166,7 @@ def validate(observation, plan, manifest_data, binding, dependencies, timer):
             "files",
             "python",
             "maps",
+            "mapped",
             "status",
             "started_ns",
             "finished_ns",
@@ -199,6 +202,8 @@ def validate(observation, plan, manifest_data, binding, dependencies, timer):
         observation["python"],
         observation["maps"],
         preflight.root.parse_mountinfo(final_core["mountinfo"]),
+        observation["mapped"],
+        pages,
     )
     timer.check()
 
@@ -221,14 +226,15 @@ def encode(
     binding,
     dependencies,
     *,
+    pages,
     clock=time.monotonic_ns,
 ):
     binding, timer = context(dependencies, binding, clock)
     packed = transform(observation, Budget(timer))
     frozen = transform(packed, Budget(timer), decode=True)
-    validate(frozen, plan, manifest_data, binding, dependencies, timer)
+    validate(frozen, plan, manifest_data, binding, dependencies, timer, pages=pages)
     wire = {
-        "scope": "contained-job-startup-witness-v1",
+        "scope": SCOPE,
         "binding": binding,
         "observation": packed,
         "native_authorized": False,
@@ -250,6 +256,7 @@ def decode(
     binding,
     dependencies,
     *,
+    pages,
     clock=time.monotonic_ns,
 ):
     binding, timer = context(dependencies, binding, clock)
@@ -275,7 +282,7 @@ def decode(
         ),
     )
     if (
-        wire["scope"] != "contained-job-startup-witness-v1"
+        wire["scope"] != SCOPE
         or wire["native_authorized"] is not False
         or wire["full_contract_proven"] is not False
     ):
@@ -286,7 +293,7 @@ def decode(
     ):
         raise ValueError("startup witness binding or canonical encoding")
     frozen = transform(wire["observation"], Budget(timer), decode=True)
-    validate(frozen, plan, manifest_data, binding, dependencies, timer)
+    validate(frozen, plan, manifest_data, binding, dependencies, timer, pages=pages)
     timer.check()
     return frozen
 

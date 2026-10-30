@@ -18,6 +18,7 @@ MAX_MANIFEST = 2 * 1024 * 1024
 MAX_MEMBERS = 8192
 MAX_FILE = 256 * 1024 * 1024
 MAX_TOTAL = 512 * 1024 * 1024
+PAGE = 4096
 FLAGS = ["-I", "-S", "-B", "-X", "pycache_prefix=/dev/null"]
 PLATFORM = {"os": "linux", "machine": "x86_64", "bits": 64, "byte_order": "little"}
 ENVIRONMENT = {"LC_ALL": "C", "PATH": "/usr/bin:/bin"}
@@ -269,6 +270,7 @@ class RuntimeSnapshot:
         self.root, self.deadline = Path(root), deadline
         self.fd = None
         self.observations = None
+        self.pages = None
         self._manifest_data = None
         inputs.before(deadline)
         try:
@@ -322,7 +324,7 @@ class RuntimeSnapshot:
 
     def _scan(self, contents, deadline, root_check):
         root_check()
-        members, images, observations = [], {}, {}
+        members, images, observations, pages = [], {}, {}, {}
         count = total = 0
 
         def visit(directory, prefix, depth):
@@ -413,7 +415,12 @@ class RuntimeSnapshot:
                         raise ValueError("runtime member replaced during open")
                     digest = None
                     if contents:
+                        # One digest per page as a mapping shows it, from the
+                        # bytes the member hash covers: a read may end inside
+                        # a page, and the last page is zero-filled past the
+                        # end of the file.
                         sha, remaining = hashlib.sha256(), before.st_size
+                        digests, pending = [], bytearray()
                         while remaining:
                             inputs.before(deadline)
                             data = os.read(file, min(1024 * 1024, remaining))
@@ -421,6 +428,17 @@ class RuntimeSnapshot:
                                 raise ValueError("short runtime member")
                             sha.update(data)
                             remaining -= len(data)
+                            pending += data
+                            whole = len(pending) - len(pending) % PAGE
+                            digests.extend(
+                                hashlib.sha256(pending[offset : offset + PAGE]).digest()
+                                for offset in range(0, whole, PAGE)
+                            )
+                            del pending[:whole]
+                        if pending:
+                            digests.append(
+                                hashlib.sha256(pending.ljust(PAGE, b"\0")).digest()
+                            )
                         digest = sha.hexdigest()
                         if os.pread(file, 4, 0) == b"\x7fELF":
                             inputs.before(deadline)
@@ -428,6 +446,7 @@ class RuntimeSnapshot:
                             if len(data) != before.st_size:
                                 raise ValueError("short runtime ELF")
                             images[path] = elf.inspect(data)
+                            pages["/" + path] = tuple(digests)
                     if inputs.identity(os.fstat(file)) != inputs.identity(before):
                         raise ValueError("runtime member changed during observation")
                 observations[path] = inputs.identity(before)
@@ -447,18 +466,19 @@ class RuntimeSnapshot:
         visit(self.fd, "", 0)
         members.sort(key=lambda row: row["path"])
         root_check()
-        return members, images, observations
+        return members, images, observations, pages
 
     @classmethod
     def open(cls, root, data, expected, *, deadline):
         manifest = decode_manifest(data, expected)
         snapshot = cls(root, deadline)
         try:
-            members, images, snapshot.observations = snapshot.scan(contents=True)
+            members, images, snapshot.observations, pages = snapshot.scan(contents=True)
             if members != manifest["members"]:
                 raise ValueError("runtime tree does not match selected manifest")
             snapshot.graph = MappingProxyType(verify_linkage(manifest, images))
             snapshot._manifest_data = data
+            snapshot.pages = MappingProxyType(pages)
             snapshot.check()
             inputs.before(deadline)
             return snapshot
@@ -472,7 +492,7 @@ class RuntimeSnapshot:
             raise
 
     def check(self):
-        _, _, current = self.scan(contents=False)
+        _, _, current, _ = self.scan(contents=False)
         if self.observations is None or current != self.observations:
             raise ValueError("runtime membership or metadata changed")
         inputs.before(self.deadline)
@@ -489,13 +509,13 @@ class RuntimeSnapshot:
         def root_check():
             self._root_check_at(deadline)
 
-        members, images, observations = self._scan(True, deadline, root_check)
+        members, images, observations, _ = self._scan(True, deadline, root_check)
         manifest = self.manifest
         if observations != self.observations or members != manifest["members"]:
             raise ValueError("runtime phase content or identity changed")
         verify_linkage(manifest, images)
         # A member hashed early can change during a later read or linkage check.
-        _, _, current = self._scan(False, deadline, root_check)
+        _, _, current, _ = self._scan(False, deadline, root_check)
         if current != self.observations:
             raise ValueError("runtime phase membership or metadata changed")
         inputs.before(deadline)
@@ -531,7 +551,7 @@ def prepare_manifest(root, profile, *, deadline):
         profile, ("scope", "platform", "python", "native", "environment", "bootstrap")
     )
     with RuntimeSnapshot(root, deadline) as snapshot:
-        members, images, snapshot.observations = snapshot.scan(contents=True)
+        members, images, snapshot.observations, _ = snapshot.scan(contents=True)
         value = dict(profile, members=members)
         check_manifest(value)
         verify_linkage(value, images)

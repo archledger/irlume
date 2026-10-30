@@ -3,11 +3,14 @@
 # Copyright the irlume contributors.
 """Pure Python/native-map checks. Supplied facts do not prove provenance."""
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import re
 import stat
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 
 class SourceLoader(importlib.machinery.SourceFileLoader):
@@ -22,6 +25,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 closure = importlib.util.module_from_spec(spec)
 loader.exec_module(closure)
 runtime = closure.runtime
+PAGE = closure.PAGE
 FLAGS = {
     "isolated": 1,
     "no_site": 1,
@@ -209,7 +213,22 @@ def mount_device(mounts, path):
     return device
 
 
-def check_maps(data, files, mounts):
+class Mapping(NamedTuple):
+    """A readable mapping of a selected runtime file, as maps shows it."""
+
+    start: int
+    end: int
+    offset: int
+    path: str
+    execute: bool
+
+
+def file_mappings(data, files, mounts):
+    """Parse maps for collection and checking alike.
+
+    Return the paths with an executable mapping and, in maps order, every
+    readable mapping of a selected runtime file.
+    """
     if (
         type(data) is not bytes
         or not 0 < len(data) <= 1024**2
@@ -224,7 +243,7 @@ def check_maps(data, files, mounts):
         raise ValueError("runtime maps encoding") from error
     if not 1 <= len(lines) <= 8192:
         raise ValueError("runtime maps line cap")
-    executable, previous, vdso, vsyscall = set(), 0, 0, 0
+    executable, readable, previous, vdso, vsyscall = set(), [], 0, 0, 0
     for line in lines:
         fields = line.split(None, 5)
         if len(fields) not in (5, 6):
@@ -299,35 +318,90 @@ def check_maps(data, files, mounts):
         # mount (fs/proc_namespace.c show_mountinfo). stat can differ: btrfs
         # reports the subvolume's anonymous device (fs/btrfs/inode.c
         # btrfs_getattr), so the snapshot's stat device stays its own pin.
-        # On btrfs the maps device names the filesystem and an inode number
-        # is unique only per subvolume, so a file in another subvolume or
-        # snapshot can carry the same device and inode here. This check does
-        # not bind a mapping to the runtime's subvolume; that rests on the
-        # tree pins, the root's device and the scan's refusal of members on
-        # any other device (measurement-job-closure.py), which hold at each
-        # scan and check, not between them.
+        # On btrfs an inode number is unique only per subvolume, so a file
+        # in another subvolume or snapshot can carry this device and inode.
+        # What binds a mapping to the runtime is its bytes: check_mapped
+        # compares every page still backed by a file with the hashed file.
         if inode != selected["inode"] or (major, minor) != mount_device(mounts, path):
             raise ValueError("runtime mapped file identity")
-        # A private PROT_NONE loader reservation exposes no file bytes.
-        if (
-            permissions != "---p"
-            and offset + end - start > (selected["size"] + 4095) // 4096 * 4096
-        ):
+        if permissions[0] != "r":
+            # A private PROT_NONE loader reservation exposes no file bytes.
+            if permissions != "---p":
+                raise ValueError("runtime unreadable file mapping")
+            continue
+        if offset + end - start > (selected["size"] + PAGE - 1) // PAGE * PAGE:
             raise ValueError("runtime mapped file extent")
         if execute:
             executable.add(path)
+        readable.append(Mapping(start, end, offset, path, execute))
     if vdso != 1:
         raise ValueError("runtime vdso absent")
+    return executable, tuple(readable)
+
+
+def check_mapped(readable, files, mapped, pages):
+    """Bind each readable mapping's file-backed pages to the hashed file.
+
+    mapped holds G's rows, one per readable mapping in maps order; pages
+    holds the checker's own page digests of each selected ELF file, never
+    values decoded from a request or a witness. A page that is anonymous
+    (copied on write: RELRO, .data, .got) is counted, not compared, and
+    an executable mapping may have none. The binding holds at the maps read.
+    """
+    if type(pages) is not MappingProxyType:
+        raise ValueError("runtime page digests")
+    if type(mapped) is not tuple or len(mapped) != len(readable):
+        raise ValueError("runtime mapped row count")
+    checked = set()
+    for mapping, row in zip(readable, mapped):
+        runtime._fields(row, ("start", "end", "anonymous", "sha256"))
+        if (
+            type(row["start"]) is not int
+            or type(row["end"]) is not int
+            or (row["start"], row["end"]) != (mapping.start, mapping.end)
+        ):
+            raise ValueError("runtime mapped row range")
+        count = (mapping.end - mapping.start) // PAGE
+        anonymous = row["anonymous"]
+        if type(anonymous) is not bytes or len(anonymous) != (count + 7) // 8:
+            raise ValueError("runtime mapped page bitmap")
+        if count % 8 and anonymous[-1] >> (count % 8):
+            raise ValueError("runtime mapped page bitmap padding")
+        if mapping.execute and any(anonymous):
+            raise ValueError("runtime anonymous page in executable mapping")
+        digests = pages.get(mapping.path)
+        if mapping.path not in checked:
+            if (
+                type(digests) is not tuple
+                or len(digests) != (files[mapping.path]["size"] + PAGE - 1) // PAGE
+                or any(type(item) is not bytes or len(item) != 32 for item in digests)
+            ):
+                raise ValueError("runtime page digests")
+            checked.add(mapping.path)
+        first = mapping.offset // PAGE
+        expected = hashlib.sha256()
+        for index in range(count):
+            if not (anonymous[index // 8] >> (index % 8)) & 1:
+                expected.update(digests[first + index])
+        if row["sha256"] != expected.hexdigest():
+            raise ValueError("runtime mapped bytes differ")
+
+
+def check_maps(data, files, mounts, mapped, pages):
+    executable, readable = file_mappings(data, files, mounts)
+    check_mapped(readable, files, mapped, pages)
     return executable
 
 
-def check_runtime_state(manifest, files, state, maps, mounts):
+def check_runtime_state(manifest, files, state, maps, mounts, mapped, pages):
     """Check supplied observations; callers must prove collection and freshness.
 
-    mounts is the parsed mount view of the process whose maps these are.
+    mounts is the parsed mount view of the process whose maps these are;
+    mapped holds that process's rows for those maps and pages the checker's
+    own page digests of the selected runtime (check_mapped).
     """
     extensions = check_python(manifest, files, state)
-    executable = check_maps(maps, files, mounts)
+    executable = check_maps(maps, files, mounts, mapped, pages)
     required = {
         "/" + manifest["python"]["executable"],
         "/" + manifest["native"]["interpreter"],

@@ -384,6 +384,9 @@ class EffectsTests(unittest.TestCase):
         return fd
 
     def test_constructor_and_collect_do_not_open_output_or_bus(self):
+        collected = self.runtime.startup.Startup(
+            {"test": True}, types.MappingProxyType({})
+        )
         with (
             mock.patch.object(
                 native.service,
@@ -396,16 +399,28 @@ class EffectsTests(unittest.TestCase):
                 side_effect=AssertionError("output before collection"),
             ),
             mock.patch.object(
-                self.runtime.startup, "collect_startup", return_value={"test": True}
+                self.runtime.startup, "collect_startup", return_value=collected
             ) as collect,
         ):
             effects = rooted.GuardianEffects(self.config, self.manifest, self.runtime)
-            self.assertEqual(
+            self.assertIs(
                 effects.collect(self.config, self.manifest, self.deadline),
-                {"test": True},
+                collected,
             )
         self.assertEqual(collect.call_args.args[-1], self.deadline)
         self.assertIsNone(effects.attempt_fd)
+
+    def test_collect_returns_only_an_observation_with_its_tree_pages(self):
+        effects = rooted.GuardianEffects(self.config, self.manifest, self.runtime)
+        for value in ({"test": True}, ({"test": True}, types.MappingProxyType({}))):
+            with (
+                self.subTest(value=type(value).__name__),
+                mock.patch.object(
+                    self.runtime.startup, "collect_startup", return_value=value
+                ),
+                self.assertRaisesRegex(ValueError, "^rooted startup collection$"),
+            ):
+                effects.collect(self.config, self.manifest, self.deadline)
 
     def local(
         self,

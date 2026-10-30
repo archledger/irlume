@@ -10,6 +10,7 @@ import importlib.util
 import os
 import tempfile
 import time
+import types
 import unittest
 from builtins import BaseExceptionGroup
 from pathlib import Path
@@ -55,6 +56,7 @@ class RootedTreeTests(unittest.TestCase):
         new = "opt/irlume/measurement-job-guardian-native.py"
         self.manifest["python"]["entry"] = new
         files[new] = files.pop(old)
+        self.files = files
         for row in self.manifest["members"]:
             if row["path"] == old:
                 row["path"] = new
@@ -127,6 +129,31 @@ class RootedTreeTests(unittest.TestCase):
                     (fact["device"], fact["inode"], fact["mode"], fact["size"]),
                     (info.st_dev, info.st_ino, info.st_mode, info.st_size),
                 )
+
+    def test_mounted_elf_members_carry_their_page_digests(self):
+        with self.open() as snapshot:
+            pages = snapshot.pages
+            snapshot.check()
+            self.assertIs(snapshot.pages, pages)
+        self.assertIs(type(pages), types.MappingProxyType)
+        elf = {
+            "/" + name: data
+            for name, data in self.files.items()
+            if data.startswith(b"\x7fELF")
+        }
+        self.assertEqual(
+            set(elf),
+            {"/usr/bin/python3", "/usr/bin/bootstrap", "/lib64/ld-linux-x86-64.so.2"},
+        )
+        self.assertEqual(set(pages), set(elf))
+        for path, data in elf.items():
+            self.assertEqual(
+                pages[path],
+                tuple(
+                    hashlib.sha256(data[offset : offset + 4096]).digest()
+                    for offset in range(0, len(data), 4096)
+                ),
+            )
 
     def test_unknown_static_file_and_changed_file_bytes_refuse(self):
         self.path.chmod(0o700)

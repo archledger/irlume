@@ -258,8 +258,8 @@ class PhaseTests(unittest.TestCase):
             scan = owner._scan
 
             def unchanged_metadata(*args):
-                members, images, _ = scan(*args)
-                return members, images, owner.observations
+                members, images, _, pages = scan(*args)
+                return members, images, owner.observations, pages
 
             with (
                 mock.patch.object(owner, "_scan", side_effect=unchanged_metadata),

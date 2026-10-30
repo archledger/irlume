@@ -152,12 +152,13 @@ class Guardian(_Controller):
 
     def execute(self):
         support, protocol = self.support, self.support.protocol
+        # The observation and the page digests of G's own runtime tree.
         snapshot = self.call(self.io.collect, self.config, self.manifest, self.deadline)
         self.state = "collected"
         # Kernel-local checks only; the effects keep the view for bind_service.
         self.call(self.io.preflight, self.config, self.manifest, self.deadline)
         self.root.runtime._integer(
-            snapshot["started_ns"], self.value["origin_ns"], self.check()
+            snapshot.observation["started_ns"], self.value["origin_ns"], self.check()
         )
         directory = self.io.open_attempt(self.config, self.deadline)
         if type(directory) is not int or directory < 3:
@@ -184,11 +185,12 @@ class Guardian(_Controller):
             # Still inside the witness window that starts at the snapshot.
             data, digest = self.call(
                 support.witness.encode,
-                snapshot,
+                snapshot.observation,
                 self.value["root_plan"],
                 self.manifest,
                 binding,
                 support.witness_deps,
+                pages=snapshot.pages,
                 clock=self.io.now,
             )
             self.check()
@@ -241,15 +243,22 @@ class Guardian(_Controller):
 
 
 class Host(_Controller):
-    """Caller retains admission/attempt ownership; this controller never releases it."""
+    """Caller retains admission/attempt ownership; this controller never releases it.
+
+    pages are the page digests of H's own prepared runtime; H checks G's
+    mapped rows with them, never with anything G sends.
+    """
 
     host = True
 
-    def __init__(self, config, manifest, support, effects, terminal_check):
+    def __init__(self, config, manifest, support, effects, terminal_check, *, pages):
         super().__init__(config, manifest, support, effects)
         if type(terminal_check) is not types.FunctionType:
             raise ValueError("startup terminal checker")
+        if type(pages) is not types.MappingProxyType:
+            raise ValueError("startup controller runtime pages")
         self.terminal_check = terminal_check
+        self.pages = pages
 
     def execute(self):
         support, protocol = self.support, self.support.protocol
@@ -294,6 +303,7 @@ class Host(_Controller):
             self.manifest,
             binding,
             support.witness_deps,
+            pages=self.pages,
             clock=self.io.now,
         )
         self.root.runtime._integer(

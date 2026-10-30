@@ -4,7 +4,9 @@
 """Read-only self-proc observations and fault injection; never a service or VM."""
 
 import errno
+import hashlib
 import importlib.util
+import mmap
 import os
 import subprocess
 import sys
@@ -44,6 +46,31 @@ def await_single_thread(limit_ns=2_000_000_000):
     while kernel_threads() != 1 and time.monotonic_ns() < end:
         time.sleep(0.001)
     return kernel_threads()
+
+
+PAGE = 4096
+# Linux v7.2 fs/proc/task_mmu.c:1951-1957.
+SOFT_DIRTY, EXCLUSIVE, GUARD = 1 << 55, 1 << 56, 1 << 58
+PM_FILE, PM_SWAP, PM_PRESENT = 1 << 61, 1 << 62, 1 << 63
+
+
+def page_digest(data):
+    return hashlib.sha256(data.ljust(PAGE, b"\0")).digest()
+
+
+def mapping_of(path):
+    """(start, end) of path's only mapping in this process."""
+    # maps shows the resolved path, also when TMPDIR is a symbolic link.
+    resolved = str(Path(path).resolve())
+    rows = [
+        line.split()[0]
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if line.endswith(" " + resolved)
+    ]
+    if len(rows) != 1:
+        raise AssertionError(f"{len(rows)} mappings of {path}")
+    start, end = (int(value, 16) for value in rows[0].split("-"))
+    return start, end
 
 
 class ProcTests(unittest.TestCase):
@@ -509,6 +536,297 @@ raise SystemExit(1)
         ):
             collector._inventory()
         self.assertEqual(collector.owned, {})
+
+
+class MappedTests(unittest.TestCase):
+    """G's own mapped pages: mem first, then pagemap, digests only."""
+
+    def private_mapping(self, data):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "member"
+        path.write_bytes(data)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            view = mmap.mmap(
+                fd,
+                len(data),
+                flags=mmap.MAP_PRIVATE,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        finally:
+            os.close(fd)
+        self.addCleanup(view.close)
+        return path, view
+
+    def collect(self, collector, regions):
+        try:
+            with collector._open(f"/proc/{os.getpid()}", directory=True) as proc:
+                return collector._mapped(proc, regions)
+        finally:
+            self.assertEqual(collector.owned, {})
+
+    def fake_proc(self, pages, *, short_pagemap=False):
+        """A directory whose mem and pagemap hold pages at kernel offsets."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = Path(directory.name)
+        with open(base / "mem", "wb") as mem, open(base / "pagemap", "wb") as table:
+            for address, (data, entry) in sorted(pages.items()):
+                mem.seek(address)
+                mem.write(data)
+                table.seek(address // PAGE * 8)
+                table.write(entry.to_bytes(8, sys.byteorder))
+        if short_pagemap:
+            os.truncate(base / "pagemap", (base / "pagemap").stat().st_size - 1)
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, fd)
+        return base, fd
+
+    def test_real_private_mapping_counts_written_pages_and_digests_the_rest(self):
+        # Ten pages, the last partial: a two-byte bitmap with six padding bits.
+        data = b"".join(bytes([65 + index]) * PAGE for index in range(9)) + b"tail"
+        path, view = self.private_mapping(data)
+        self.assertEqual(view[PAGE], 66)
+        view[2 * PAGE + 1] = 0  # Page 2 is copied on write.
+        start, end = mapping_of(path)
+        self.assertEqual(end - start, 10 * PAGE)
+        collector = startup.ProcCollector(deadline())
+        (row,) = self.collect(collector, ((start, end),))
+        self.assertEqual(set(row), {"start", "end", "anonymous", "sha256"})
+        self.assertEqual((row["start"], row["end"]), (start, end))
+        self.assertEqual(row["anonymous"], bytes([0b100, 0]))
+        expected = b"".join(
+            page_digest(data[index * PAGE : (index + 1) * PAGE])
+            for index in range(10)
+            if index != 2
+        )
+        self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
+        self.assertEqual(collector.partial["mapped"], (row,))
+
+    def test_real_unreadable_page_refuses_a_short_or_failed_read(self):
+        path, _ = self.private_mapping(b"x" * (3 * PAGE))
+        start, end = mapping_of(path)
+        os.truncate(path, PAGE)  # Pages 1 and 2 now lie past the end.
+        with self.assertRaisesRegex(ValueError, "^startup mapped read short$"):
+            self.collect(startup.ProcCollector(deadline()), ((start, end),))
+        with self.assertRaises(OSError) as caught:
+            self.collect(startup.ProcCollector(deadline()), ((start + PAGE, end),))
+        self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_page_kinds_follow_the_kernel_file_swap_and_present_bits(self):
+        entries = (
+            0,  # pte_none: the next fault reads the file
+            PM_PRESENT | PM_FILE,
+            PM_PRESENT,  # a private copy
+            PM_SWAP,  # a swapped private copy has no page, so no PM_FILE
+            PM_SWAP | PM_FILE,  # a migrating file page
+            PM_PRESENT | PM_FILE | SOFT_DIRTY | EXCLUSIVE,
+            PM_PRESENT | EXCLUSIVE,
+            SOFT_DIRTY,
+            PM_SWAP | GUARD,
+        )
+        address = 0x40000
+        pages = {
+            address + index * PAGE: (bytes([index + 1]) * PAGE, entry)
+            for index, entry in enumerate(entries)
+        }
+        _, fd = self.fake_proc(pages)
+        end = address + len(entries) * PAGE
+        (row,) = startup.ProcCollector(deadline())._mapped(fd, ((address, end),))
+        anonymous = {2, 3, 6, 8}
+        self.assertEqual(row["anonymous"], bytes([0b01001100, 0b1]))
+        expected = b"".join(
+            page_digest(bytes([index + 1]) * PAGE)
+            for index in range(len(entries))
+            if index not in anonymous
+        )
+        self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
+
+    def test_adjacent_regions_share_a_run_read_mem_first_in_bounded_chunks(self):
+        base = 0x100000
+        regions = (
+            (base, base + 0x80000),
+            (base + 0x80000, base + 0x180000),
+            (base + 0x200000, base + 0x201000),
+        )
+        pages = {
+            address: (bytes([address >> 12 & 0xFF]) * PAGE, PM_PRESENT | PM_FILE)
+            for start, end in regions
+            for address in range(start, end, PAGE)
+        }
+        _, fd = self.fake_proc(pages)
+        reads, real = [], os.pread
+
+        def record(descriptor, size, offset):
+            name = os.readlink(f"/proc/self/fd/{descriptor}").rpartition("/")[2]
+            reads.append((name, size, offset))
+            return real(descriptor, size, offset)
+
+        collector = startup.ProcCollector(deadline())
+        before = collector.operations
+        with mock.patch.object(startup.os, "pread", side_effect=record):
+            rows = collector._mapped(fd, regions)
+        self.assertEqual(
+            reads,
+            [
+                ("mem", 1024**2, base),
+                ("mem", 0x80000, base + 0x100000),
+                ("pagemap", 0x180 * 8, base // PAGE * 8),
+                ("mem", PAGE, base + 0x200000),
+                ("pagemap", 8, (base + 0x200000) // PAGE * 8),
+            ],
+        )
+        # Two opens of three counted operations each, and one per read.
+        self.assertEqual(collector.operations - before, 6 + len(reads))
+        self.assertEqual(collector.owned, {})
+        self.assertEqual([(row["start"], row["end"]) for row in rows], list(regions))
+        for (start, end), row in zip(regions, rows):
+            count = (end - start) // PAGE
+            self.assertEqual(row["anonymous"], bytes((count + 7) // 8))
+            expected = b"".join(
+                page_digest(pages[address][0]) for address in range(start, end, PAGE)
+            )
+            self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
+
+    def test_later_regions_of_a_run_read_their_own_page_kinds(self):
+        # One run of two regions, private copies at different positions: each
+        # region's bitmap must come from its own pagemap entries.
+        first, second = (0x40000, 0x42000), (0x42000, 0x44000)
+        entries = (PM_PRESENT, PM_PRESENT | PM_FILE, PM_PRESENT | PM_FILE, PM_PRESENT)
+        pages = {
+            first[0] + index * PAGE: (bytes([index + 1]) * PAGE, entry)
+            for index, entry in enumerate(entries)
+        }
+        _, fd = self.fake_proc(pages)
+        rows = startup.ProcCollector(deadline())._mapped(fd, (first, second))
+        self.assertEqual([row["anonymous"] for row in rows], [b"\x01", b"\x02"])
+        for row, kept in zip(rows, (1, 2)):
+            self.assertEqual(
+                row["sha256"],
+                hashlib.sha256(page_digest(bytes([kept + 1]) * PAGE)).hexdigest(),
+            )
+
+    def test_pagemap_entries_past_one_read_come_from_their_own_offset(self):
+        base, count = 0x100000, 600
+        pages = {
+            base + index * PAGE: (bytes([index % 251 + 1]) * PAGE, PM_PRESENT | PM_FILE)
+            for index in range(count)
+        }
+        # Private copies before and after the first 512 entries (one read).
+        for index in (100, 520):
+            pages[base + index * PAGE] = (pages[base + index * PAGE][0], PM_PRESENT)
+        _, fd = self.fake_proc(pages)
+        reads, real = [], os.pread
+
+        def record(descriptor, size, offset):
+            name = os.readlink(f"/proc/self/fd/{descriptor}").rpartition("/")[2]
+            reads.append((name, size, offset))
+            return real(descriptor, size, offset)
+
+        collector = startup.ProcCollector(deadline())
+        with (
+            mock.patch.object(startup, "CHUNK", PAGE),
+            mock.patch.object(startup.os, "pread", side_effect=record),
+        ):
+            (row,) = collector._mapped(fd, ((base, base + count * PAGE),))
+        table = base // PAGE * 8
+        self.assertEqual(
+            reads,
+            [("mem", PAGE, base + index * PAGE) for index in range(count)]
+            + [("pagemap", PAGE, table), ("pagemap", count * 8 - PAGE, table + PAGE)],
+        )
+        anonymous = bytearray((count + 7) // 8)
+        for index in (100, 520):
+            anonymous[index // 8] |= 1 << (index % 8)
+        self.assertEqual(row["anonymous"], bytes(anonymous))
+        expected = b"".join(
+            page_digest(pages[base + index * PAGE][0])
+            for index in range(count)
+            if index not in (100, 520)
+        )
+        self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
+
+    def test_each_call_clears_the_rows_of_the_previous_one_first(self):
+        _, fd = self.fake_proc({0x10000: (b"a" * PAGE, PM_PRESENT | PM_FILE)})
+        collector = startup.ProcCollector(deadline())
+        region = ((0x10000, 0x11000),)
+        for regions, refusal in (
+            ((), None),
+            (((PAGE, PAGE),), "^startup mapped regions$"),
+        ):
+            with self.subTest(regions=regions):
+                rows = collector._mapped(fd, region)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(collector.partial["mapped"], rows)
+                if refusal is None:
+                    self.assertEqual(collector._mapped(fd, regions), ())
+                else:
+                    with self.assertRaisesRegex(ValueError, refusal):
+                        collector._mapped(fd, regions)
+                self.assertEqual(collector.partial["mapped"], ())
+                self.assertEqual(collector.owned, {})
+
+    def test_short_pagemap_read_refuses_and_keeps_only_complete_rows(self):
+        pages = {
+            0x10000: (b"a" * PAGE, PM_PRESENT | PM_FILE),
+            0x20000: (b"c" * PAGE, PM_PRESENT | PM_FILE),
+            0x30000: (b"b" * PAGE, PM_PRESENT | PM_FILE),
+        }
+        _, fd = self.fake_proc(pages, short_pagemap=True)
+        collector = startup.ProcCollector(deadline())
+        regions = ((0x10000, 0x11000), (0x20000, 0x21000), (0x30000, 0x31000))
+        with self.assertRaisesRegex(ValueError, "^startup mapped read short$"):
+            collector._mapped(fd, regions)
+        self.assertEqual(collector.owned, {})
+        # The rows of every run completed before the failure, not only the last.
+        self.assertEqual(
+            [(row["start"], row["end"]) for row in collector.partial["mapped"]],
+            list(regions[:2]),
+        )
+
+    def test_nonregular_mem_or_pagemap_refuses(self):
+        for name in ("mem", "pagemap"):
+            base, fd = self.fake_proc({0x10000: (b"a" * PAGE, PM_FILE)})
+            (base / name).unlink()
+            os.mkfifo(base / name)
+            collector = startup.ProcCollector(deadline())
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(ValueError, "not regular"),
+            ):
+                collector._mapped(fd, ((0x10000, 0x11000),))
+            self.assertEqual(collector.owned, {})
+
+    def test_invalid_regions_refuse_before_any_open(self):
+        for regions in (
+            [(PAGE, 2 * PAGE)],
+            ((PAGE, 2 * PAGE, 0),),
+            ([PAGE, 2 * PAGE],),
+            ((PAGE, PAGE),),
+            ((PAGE + 1, 2 * PAGE),),
+            ((PAGE, 2 * PAGE + 1),),
+            ((3 * PAGE, 4 * PAGE), (PAGE, 2 * PAGE)),
+            ((PAGE, 3 * PAGE), (2 * PAGE, 4 * PAGE)),
+            ((False, PAGE),),
+            ((PAGE, 2**63 + PAGE),),
+        ):
+            collector = startup.ProcCollector(deadline())
+            with (
+                self.subTest(regions=regions),
+                # A mock descriptor would index as 1: refuse any open instead.
+                mock.patch.object(
+                    startup.os, "open", side_effect=AssertionError("opened")
+                ) as opened,
+                self.assertRaisesRegex(ValueError, "^startup mapped regions$"),
+            ):
+                collector._mapped(3, regions)
+            opened.assert_not_called()
+        with mock.patch.object(
+            startup.os, "open", side_effect=AssertionError("opened")
+        ) as opened:
+            self.assertEqual(startup.ProcCollector(deadline())._mapped(3, ()), ())
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -49,6 +50,8 @@ class WitnessTests(unittest.TestCase):
         files[new] = files.pop(old)
         python["modules"][0]["origin"] = new
         initial["proc"]["maps"] = maps
+        # G's own digests of its runtime's pages, never decoded from a witness.
+        self.pages = state_tests.page_digests(files)
         final = copy.deepcopy(initial)
         final["finished_ns"] = 450
         core = self.deps.preflight.core_witness(self.plan, final, 1000, 500)
@@ -60,6 +63,7 @@ class WitnessTests(unittest.TestCase):
             "files": files,
             "python": python,
             "maps": maps,
+            "mapped": state_tests.mapped_rows(maps, self.pages),
             "status": final["status_after"],
             "started_ns": 100,
             "finished_ns": 500,
@@ -73,17 +77,18 @@ class WitnessTests(unittest.TestCase):
             "startup_deadline_ns": 1000,
         }
 
-    def encode(self, observation=None, clock=lambda: 600):
+    def encode(self, observation=None, clock=lambda: 600, pages=None):
         return codec.encode(
             self.observation if observation is None else observation,
             self.plan,
             self.manifest,
             self.binding,
             self.deps,
+            pages=self.pages if pages is None else pages,
             clock=clock,
         )
 
-    def decode(self, data, digest=None, clock=lambda: 600):
+    def decode(self, data, digest=None, clock=lambda: 600, pages=None):
         return codec.decode(
             data,
             hashlib.sha256(data).hexdigest() if digest is None else digest,
@@ -91,6 +96,7 @@ class WitnessTests(unittest.TestCase):
             self.manifest,
             self.binding,
             self.deps,
+            pages=self.pages if pages is None else pages,
             clock=clock,
         )
 
@@ -122,6 +128,90 @@ class WitnessTests(unittest.TestCase):
         observation["maps"] = stat_device
         with self.assertRaisesRegex(ValueError, "^runtime mapped file identity$"):
             self.encode(observation)
+
+    def test_mapped_rows_round_trip_and_bind_to_the_callers_pages(self):
+        data, _ = self.encode()
+        decoded = self.decode(data)
+        self.assertIs(type(decoded["mapped"]), tuple)
+        self.assertEqual(len(decoded["mapped"]), 2)
+        self.assertIs(type(decoded["mapped"][0]["anonymous"]), bytes)
+        self.assertEqual(decoded["mapped"], self.observation["mapped"])
+        python3 = "/usr/bin/python3"
+        other = MappingProxyType(
+            {
+                **self.pages,
+                python3: (hashlib.sha256(b"other").digest(), *self.pages[python3][1:]),
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "^runtime mapped bytes differ$"):
+            self.decode(data, pages=other)
+        with self.assertRaisesRegex(ValueError, "^runtime mapped bytes differ$"):
+            self.encode(pages=other)
+        for pages in (dict(self.pages), {}, ()):
+            with (
+                self.subTest(pages=type(pages).__name__),
+                self.assertRaisesRegex(ValueError, "^runtime page digests$"),
+            ):
+                self.decode(data, pages=pages)
+        for call in (
+            lambda: codec.encode(
+                self.observation, self.plan, self.manifest, self.binding, self.deps
+            ),
+            lambda: codec.decode(
+                data,
+                hashlib.sha256(data).hexdigest(),
+                self.plan,
+                self.manifest,
+                self.binding,
+                self.deps,
+            ),
+        ):
+            with self.assertRaises(TypeError):
+                call()
+
+    def test_wire_rows_cannot_drop_a_mapping_or_claim_code_pages_copied(self):
+        row = self.observation["mapped"][1]
+        copied = {
+            "$tuple": [
+                {
+                    "start": row["start"],
+                    "end": row["end"],
+                    "anonymous": {"$bytes": "01"},
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                }
+            ]
+        }
+        for name, edit, error in (
+            (
+                "dropped",
+                lambda wire: wire["observation"]["mapped"]["$tuple"].pop(),
+                "^runtime mapped row count$",
+            ),
+            (
+                "copied code",
+                lambda wire: wire["observation"]["mapped"]["$tuple"].__setitem__(
+                    slice(1, 2), copied["$tuple"]
+                ),
+                "^runtime anonymous page in executable mapping$",
+            ),
+            (
+                "absent",
+                lambda wire: wire["observation"].pop("mapped"),
+                "^invalid fields$",
+            ),
+        ):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                self.decode(self.altered(edit))
+
+    def test_first_witness_scope_is_refused(self):
+        data, _ = self.encode()
+        self.assertEqual(json.loads(data)["scope"], "contained-job-startup-witness-v2")
+        with self.assertRaisesRegex(ValueError, "^startup witness scope or authority$"):
+            self.decode(
+                self.altered(
+                    lambda wire: wire.update(scope="contained-job-startup-witness-v1")
+                )
+            )
 
     def test_wrong_hash_binding_or_authority_refuses(self):
         data, _ = self.encode()
@@ -165,7 +255,7 @@ class WitnessTests(unittest.TestCase):
         data, _ = self.encode()
         for candidate in (
             b" " + data,
-            data[:-1] + b',"scope":"contained-job-startup-witness-v1"}',
+            data[:-1] + b',"scope":"contained-job-startup-witness-v2"}',
         ):
             with (
                 self.subTest(candidate_bytes=len(candidate)),
@@ -265,7 +355,7 @@ class WitnessTests(unittest.TestCase):
             result = real(value)
             if (
                 type(value) is dict
-                and value.get("scope") == "contained-job-startup-witness-v1"
+                and value.get("scope") == "contained-job-startup-witness-v2"
             ):
                 clock[0] = 1000
             return result
@@ -281,8 +371,8 @@ class WitnessTests(unittest.TestCase):
         real_validate = codec.validate
         clock[0] = 600
 
-        def late_validate(*args):
-            real_validate(*args)
+        def late_validate(*args, **kwargs):
+            real_validate(*args, **kwargs)
             clock[0] = 1000
 
         with (

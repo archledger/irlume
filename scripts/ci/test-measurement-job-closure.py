@@ -7,11 +7,13 @@ import contextlib
 import copy
 import hashlib
 import importlib.util
+import itertools
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -376,6 +378,152 @@ class TreeTests(unittest.TestCase):
                 self.assertIn("usr/bin/python3", owned.graph)
                 owned.check()
             self.assertIsNone(owned.fd)
+
+    def test_page_digests_cover_elf_members_and_zero_pad_the_last_page(self):
+        files = manifest()[1]
+        # An ELF member whose last page is partial, as mapped past its end.
+        files["usr/bin/python3"] += b"tail"
+        elf = {name for name, data in files.items() if data.startswith(b"\x7fELF")}
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_tree(directory, files)
+            end = time.monotonic_ns() + 2_000_000_000
+            data, digest = closure.prepare_manifest(root, profile(), deadline=end)
+            with closure.RuntimeSnapshot.open(
+                root, data, digest, deadline=end
+            ) as owned:
+                pages = owned.pages
+                self.assertIs(type(pages), types.MappingProxyType)
+                self.assertEqual(set(pages), {"/" + name for name in elf})
+                for name in elf:
+                    value = files[name]
+                    self.assertEqual(
+                        pages["/" + name],
+                        tuple(
+                            hashlib.sha256(
+                                value[offset : offset + 4096].ljust(4096, b"\0")
+                            ).digest()
+                            for offset in range(0, len(value), 4096)
+                        ),
+                    )
+                python = pages["/usr/bin/python3"]
+                self.assertIs(type(python), tuple)
+                self.assertEqual(len(python), 5)
+                self.assertEqual(
+                    python[-1], hashlib.sha256(b"tail" + bytes(4092)).digest()
+                )
+                self.assertNotEqual(python[-1], hashlib.sha256(b"tail").digest())
+                with self.assertRaises(TypeError):
+                    pages["/opt/irlume/entry.py"] = ()
+                owned.check()
+                owned.recheck(end)
+                self.assertIs(owned.pages, pages)
+                self.assertEqual(owned.scan(contents=True)[3], dict(pages))
+                self.assertEqual(owned.scan(contents=False)[3], {})
+
+    def test_page_digests_carry_partial_pages_across_short_reads(self):
+        files = manifest()[1]
+        files["usr/bin/python3"] += (
+            b"".join(bytes([index]) * 4096 for index in range(1, 4)) + b"tail"
+        )
+        value = files["usr/bin/python3"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_tree(directory, files)
+            end = time.monotonic_ns() + 2_000_000_000
+            data, digest = closure.prepare_manifest(root, profile(), deadline=end)
+            with closure.RuntimeSnapshot.open(
+                root, data, digest, deadline=end
+            ) as owned:
+                plain = owned.pages
+            # os.read may return less than asked: page edges fall inside reads.
+            sizes = itertools.cycle((1, 4095, 4097, 7, 3001, 12289))
+            reads, real = [], os.read
+
+            def short(fd, size):
+                chunk = real(fd, min(size, next(sizes)))
+                reads.append(len(chunk))
+                return chunk
+
+            with (
+                mock.patch.object(closure.os, "read", side_effect=short),
+                closure.RuntimeSnapshot.open(root, data, digest, deadline=end) as owned,
+            ):
+                pages = owned.pages
+            self.assertTrue(any(size % 4096 for size in reads))
+            self.assertEqual(pages, plain)
+            self.assertEqual(
+                pages["/usr/bin/python3"],
+                tuple(
+                    hashlib.sha256(
+                        value[offset : offset + 4096].ljust(4096, b"\0")
+                    ).digest()
+                    for offset in range(0, len(value), 4096)
+                ),
+            )
+
+    def test_page_digests_come_from_the_bytes_the_member_hash_covers(self):
+        files = manifest()[1]
+        files["usr/bin/python3"] += b"tail"
+        value = files["usr/bin/python3"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_tree(directory, files)
+            end = time.monotonic_ns() + 2_000_000_000
+            data, digest = closure.prepare_manifest(root, profile(), deadline=end)
+            served, real = [], os.pread
+
+            def other(fd, size, offset):
+                chunk = real(fd, size, offset)
+                if (size, offset) == (len(value), 0) and chunk == value:
+                    # The whole-file read for the ELF inspector sees a later
+                    # page change; the inspector reads only the first 16 KiB.
+                    chunk = chunk[: 4 * 4096] + b"TAIL"
+                    served.append(chunk)
+                return chunk
+
+            with (
+                mock.patch.object(closure.os, "pread", side_effect=other),
+                closure.RuntimeSnapshot.open(root, data, digest, deadline=end) as owned,
+            ):
+                python = owned.pages["/usr/bin/python3"]
+            self.assertEqual(len(served), 1)
+            self.assertEqual(len(python), 5)
+            self.assertEqual(python[4], hashlib.sha256(b"tail" + bytes(4092)).digest())
+            self.assertNotEqual(
+                python[4], hashlib.sha256(b"TAIL" + bytes(4092)).digest()
+            )
+
+    def test_deadline_is_checked_between_chunks_of_one_member(self):
+        files = manifest()[1]
+        files["usr/bin/python3"] += bytes(1024 * 1024)
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.make_tree(directory, files)
+            reads, expired = [], []
+            real_read, real_before = os.read, closure.inputs.before
+
+            def read(fd, size):
+                chunk = real_read(fd, size)
+                reads.append(len(chunk))
+                if len(chunk) == 1024 * 1024:
+                    expired.append(fd)
+                return chunk
+
+            def before(deadline):
+                if expired:
+                    raise TimeoutError("input deadline")
+                real_before(deadline)
+
+            descriptors = set(os.listdir("/proc/self/fd"))
+            with (
+                mock.patch.object(closure.os, "read", side_effect=read),
+                mock.patch.object(closure.inputs, "before", side_effect=before),
+                self.assertRaises(TimeoutError),
+            ):
+                closure.prepare_manifest(
+                    root, profile(), deadline=time.monotonic_ns() + 2_000_000_000
+                )
+            # The deadline stopped the member after its first 1 MiB chunk.
+            self.assertEqual(len(expired), 1)
+            self.assertEqual(reads[-1], 1024 * 1024)
+            self.assertEqual(set(os.listdir("/proc/self/fd")), descriptors)
 
     def test_content_and_new_members_invalidate_existing_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

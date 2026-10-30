@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from builtins import BaseExceptionGroup
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -29,6 +31,13 @@ proof_tests = load("handshake_proof", "test-measurement-job-startup-witness.py")
 protocol = load("handshake_protocol", "measurement-job-rooted-protocol.py")
 artifact = load("handshake_artifact", "measurement-job-witness-file.py")
 host = load("handshake_host", "measurement-job-guardian-host.py")
+
+
+class Collected(NamedTuple):
+    """collect_startup's result: the observation and G's own page digests."""
+
+    observation: dict
+    pages: object
 
 
 class Effects:
@@ -67,7 +76,7 @@ class Effects:
 
     def collect(self, config, manifest, deadline):
         self.mark("collect")
-        return copy.deepcopy(self.f.observation)
+        return Collected(copy.deepcopy(self.f.observation), self.f.pages)
 
     def preflight(self, config, manifest, deadline):
         self.mark("preflight")
@@ -197,6 +206,8 @@ class HandshakeTests(unittest.TestCase):
             path=str(self.path), device=info.st_dev, inode=info.st_ino
         )
         self.observation = fixture.observation
+        # One prepared runtime: G's tree and H's inputs hash the same bytes.
+        self.pages = fixture.pages
         for fs in (
             self.observation["initial_filesystem"],
             self.observation["filesystem"],
@@ -389,6 +400,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         runner.run()
         self.assertEqual(
@@ -415,6 +427,82 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(payload["cgroup_id"], self.cgroup_id)
         effects.release(runner.deadline)
 
+    def test_guardian_encodes_with_its_own_collected_pages(self):
+        runner, _ = self.guardian_run()
+        with mock.patch.object(
+            proof_tests.codec, "encode", wraps=proof_tests.codec.encode
+        ) as encode:
+            runner.run()
+        encode.assert_called_once()
+        self.assertIs(encode.call_args.kwargs["pages"], self.pages)
+        self.assertEqual(encode.call_args.args[0], self.observation)
+
+    def test_host_decodes_with_its_own_pages_and_refuses_other_bytes(self):
+        guardian, g_effects = self.guardian_run()
+        guardian.run()
+        effects = Effects(self, "H", g_effects.sent)
+        pages = MappingProxyType(dict(self.pages))
+        runner = controller.Host(
+            self.config,
+            self.manifest,
+            self.support,
+            effects,
+            host.verify_service_terminal,
+            pages=pages,
+        )
+        with mock.patch.object(
+            proof_tests.codec, "decode", wraps=proof_tests.codec.decode
+        ) as decode:
+            runner.run()
+        self.assertIs(decode.call_args.kwargs["pages"], pages)
+        effects.release(runner.deadline)
+        # H's runtime holds other bytes for a page G has mapped.
+        python3 = "/usr/bin/python3"
+        other = MappingProxyType(
+            {
+                **self.pages,
+                python3: (b"\0" * 32, *self.pages[python3][1:]),
+            }
+        )
+        effects = Effects(self, "H", g_effects.sent)
+        runner = controller.Host(
+            self.config,
+            self.manifest,
+            self.support,
+            effects,
+            host.verify_service_terminal,
+            pages=other,
+        )
+        with self.assertRaisesRegex(ValueError, "^runtime mapped bytes differ$"):
+            runner.run()
+        self.assertNotIn("send-commit", effects.calls)
+        self.assertIn("abort", effects.calls)
+
+    def test_host_requires_read_only_runtime_pages(self):
+        for pages in (dict(self.pages), None, ()):
+            with (
+                self.subTest(pages=type(pages).__name__),
+                self.assertRaisesRegex(
+                    ValueError, "^startup controller runtime pages$"
+                ),
+            ):
+                controller.Host(
+                    self.config,
+                    self.manifest,
+                    self.support,
+                    Effects(self, "H"),
+                    host.verify_service_terminal,
+                    pages=pages,
+                )
+        with self.assertRaises(TypeError):
+            controller.Host(
+                self.config,
+                self.manifest,
+                self.support,
+                Effects(self, "H"),
+                host.verify_service_terminal,
+            )
+
     def test_host_sends_no_launch_without_a_cgroup_id(self):
         guardian, g_effects = self.guardian_run()
         guardian.run()
@@ -427,6 +515,7 @@ class HandshakeTests(unittest.TestCase):
                 self.support,
                 effects,
                 host.verify_service_terminal,
+                pages=self.pages,
             )
             with self.subTest(value=value), self.assertRaises(ValueError):
                 runner.run()
@@ -443,6 +532,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         result = runner.run()
         self.assertFalse(result["native_authorized"])
@@ -492,6 +582,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()
@@ -511,6 +602,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()
@@ -561,6 +653,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()
@@ -585,6 +678,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()
@@ -601,6 +695,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()
@@ -640,6 +735,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(TimeoutError):
             runner.run()
@@ -705,6 +801,7 @@ class HandshakeTests(unittest.TestCase):
             self.manifest,
             binding,
             self.support.witness_deps,
+            pages=self.pages,
             clock=lambda: 1_006_000,
         )
         fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -734,6 +831,7 @@ class HandshakeTests(unittest.TestCase):
             self.support,
             effects,
             host.verify_service_terminal,
+            pages=self.pages,
         )
         with self.assertRaises(ValueError):
             runner.run()

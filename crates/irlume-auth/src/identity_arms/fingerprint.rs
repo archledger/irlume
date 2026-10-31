@@ -248,7 +248,7 @@ fn public_value(result: Result<DecisionFingerprint, FingerprintError>) -> String
 /// A changed fingerprint invalidates a certification bound to the old one.
 ///
 /// Returns an empty string if construction cannot provide a valid digest.
-/// Accelerator admission uses the checked result instead of this wrapper.
+/// NPU admission uses the checked result instead of this wrapper.
 pub fn decision_fingerprint() -> String {
     public_value(try_decision_fingerprint())
 }

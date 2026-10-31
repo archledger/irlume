@@ -81,7 +81,7 @@ impl Engine {
         &mut self,
         enrollment: &irlume_core::storage::Enrollment,
     ) -> bool {
-        let refusal = if !self.recognizer_on_accelerator() {
+        let refusal = if !self.recognizer_on_npu() {
             Some("the recognizer is on CPU")
         } else if self.ir_adapter.is_some() || self.ir_adapter_required {
             Some("an IR adapter is configured")
@@ -95,10 +95,7 @@ impl Engine {
             }
         };
         match refusal {
-            None => irlume_common::dlog!(
-                "npu: this authentication's probes run on the {}",
-                self.accelerator_name()
-            ),
+            None => irlume_common::dlog!("npu: this authentication's probes run on the NPU"),
             Some(why) => {
                 irlume_common::dlog!("npu: this authentication's probes run on CPU: {why}")
             }
@@ -116,23 +113,13 @@ impl Engine {
     /// Whether the recognizer is placed on the NPU: the producer and
     /// IR-adapter rules of ADR-0022 §2 govern its probes.
     #[cfg(feature = "npu")]
-    fn recognizer_on_accelerator(&self) -> bool {
+    fn recognizer_on_npu(&self) -> bool {
         matches!(self.emb.npu_device(), irlume_vision::npu::Device::Npu)
     }
 
     #[cfg(not(feature = "npu"))]
-    fn recognizer_on_accelerator(&self) -> bool {
+    fn recognizer_on_npu(&self) -> bool {
         false
-    }
-
-    #[cfg(feature = "npu")]
-    fn accelerator_name(&self) -> &'static str {
-        "NPU"
-    }
-
-    #[cfg(not(feature = "npu"))]
-    fn accelerator_name(&self) -> &'static str {
-        "CPU"
     }
 
     /// The wired thresholds that consume the recognizer's output, by
@@ -515,7 +502,7 @@ mod tests {
         assert!(include_str!("authentication_window.rs").contains("self.engine.npu_probe = false;"));
     }
 
-    /// The experimental IR-only route has no certified accelerator decision.
+    /// The experimental IR-only route has no certified NPU decision.
     #[test]
     fn ir_only_embeddings_use_the_cpu_reference() {
         let source: String = include_str!("ir_assessment.rs")
@@ -528,7 +515,7 @@ mod tests {
         );
         assert!(
             !source.contains("self.npu_probe="),
-            "the IR-only route must not admit accelerator probes"
+            "the IR-only route must not admit NPU probes"
         );
     }
 

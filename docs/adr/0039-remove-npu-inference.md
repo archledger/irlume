@@ -70,9 +70,11 @@ or without an accelerator, because the runtime crate can otherwise arm its own d
 selection.
 
 The identity arms stay, as the pure functions authentication calls, with their tests
-and the characterization golden. The decision fingerprint and its witnesses are removed:
-their only purpose was to bind a certification entry to the decision code it was
-measured through.
+and the characterization golden. The decision fingerprint, its witnesses and the
+threshold enumeration leave production and stay as test-only code, with their pinned
+digests. They were built to bind a certification entry to the decision code it was
+measured through, and they also pin the CPU's grant decisions at their boundaries, which
+is what performance work on the CPU path needs.
 
 ### 3. Settings
 
@@ -138,7 +140,8 @@ replaces the revisit rule of ADR-0038 section 7, which named the NPU as the firs
   conformance suite passes in strict mode. The doctor registry test passes with the five
   ids gone.
 - The execution-provider test still proves the environment cutoff and the CPU pin.
-- The characterization golden is unchanged.
+- The characterization golden and the pinned decision and arm-grid digests are unchanged.
 - No crate in `Cargo.lock` remains from OpenVINO, and no source file outside the ADRs,
-  research records and CHANGELOG mentions the NPU, apart from the changelog-style retired
-  id list in `docs/MACHINE-API.md`.
+  research records and CHANGELOG describes the NPU as present. The retired ids in
+  `docs/MACHINE-API.md` and the list of forbidden libraries in `scripts/ci/isolated-cli.py`
+  stay.

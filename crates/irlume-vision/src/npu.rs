@@ -545,7 +545,7 @@ impl Default for Slot {
 }
 
 /// Growth of [`suspended`] below this is read jitter, not a suspend.
-pub(crate) const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
+const RESUME_GRANULARITY: Duration = Duration::from_millis(1);
 
 /// Which side of the true value a [`suspended`] reading may fall on.
 #[derive(Clone, Copy, Debug)]
@@ -695,8 +695,8 @@ impl Cache {
     /// # Errors
     ///
     /// When a directory cannot be created, restricted to 0700 or listed.
-    pub fn prepare(base: &Path, identity: &impl PlatformDigest, boot_id: &str) -> io::Result<Self> {
-        let digest = identity.platform_digest();
+    pub fn prepare(base: &Path, identity: &Identity, boot_id: &str) -> io::Result<Self> {
+        let digest = identity.digest();
         private_dir(base)?;
         for entry in fs::read_dir(base)? {
             let entry = entry?;
@@ -750,24 +750,6 @@ impl Cache {
     pub fn marker(&self, model_sha256: &str) -> Marker {
         self.marker_file(model_sha256).state()
     }
-}
-
-/// An exact platform identity whose digest names its cache directory and
-/// markers.
-pub trait PlatformDigest: Clone {
-    /// The exact identity digest.
-    fn platform_digest(&self) -> String;
-}
-
-impl PlatformDigest for Identity {
-    fn platform_digest(&self) -> String {
-        self.digest()
-    }
-}
-
-/// An admission refusal observed no runtime.
-fn is_admission_refusal(reason: &CpuReason) -> bool {
-    matches!(reason, CpuReason::LoadingNotAdmitted)
 }
 
 /// A boot ID as the kernel writes it (a UUID), or as the tests name one.
@@ -1037,9 +1019,9 @@ fn firmware_build(debugfs_accel: &Path, bus_address: &str) -> Result<String, Cpu
 /// on the measured host). An update renames a new file into place, created
 /// while the old inode is still allocated, so it always has a new inode.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HashedLibrary {
-    pub(crate) path: PathBuf,
-    pub(crate) inode: u64,
+struct HashedLibrary {
+    path: PathBuf,
+    inode: u64,
 }
 
 fn is_runtime_library(path: &str) -> bool {
@@ -1857,10 +1839,10 @@ impl Context {
 
 /// Run the real marker/cache state machine around a discovery boundary. The
 /// generic payload lets filesystem regressions exercise it without native code.
-fn prepare_runtime<P, I: PlatformDigest>(
+fn prepare_runtime<P>(
     cache_base: &Path,
-    observation: &mut Option<Result<I, CpuReason>>,
-    discover: impl FnOnce() -> Result<(P, I), CpuReason>,
+    observation: &mut Option<Result<Identity, CpuReason>>,
+    discover: impl FnOnce() -> Result<(P, Identity), CpuReason>,
 ) -> Result<(P, Cache), CpuReason> {
     *observation = None;
     let state = (|| {
@@ -1881,7 +1863,7 @@ fn prepare_runtime<P, I: PlatformDigest>(
             // Record the observation at its boundary, before marker cleanup
             // or cache preparation can fail. Admission refusal observed no
             // runtime; a discovery failure did attempt it.
-            if !result.as_ref().is_err_and(is_admission_refusal) {
+            if !matches!(result, Err(CpuReason::LoadingNotAdmitted)) {
                 *observation = Some(
                     result
                         .as_ref()
@@ -2536,15 +2518,8 @@ mod tests {
     type Calls = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
     fn fake(replies: Vec<Result<Vec<f32>, String>>) -> (Slot, Calls) {
-        fake_on(Slot::npu, replies)
-    }
-
-    fn fake_on(
-        place: fn(Box<dyn Infer>) -> Slot,
-        replies: Vec<Result<Vec<f32>, String>>,
-    ) -> (Slot, Calls) {
         let calls = Calls::default();
-        let slot = place(Box::new(Fake {
+        let slot = Slot::npu(Box::new(Fake {
             replies,
             calls: calls.clone(),
             seen: None,
@@ -3396,15 +3371,13 @@ mod tests {
         let mut observation = None;
         let failed = CpuReason::RuntimeAbsent("no runtime".into());
         assert!(
-            prepare_runtime::<(), Identity>(directory.path(), &mut observation, || Err(
-                failed.clone()
-            ))
-            .is_err()
+            prepare_runtime::<()>(directory.path(), &mut observation, || Err(failed.clone()))
+                .is_err()
         );
         assert_eq!(observation, Some(Err(failed)));
         observation = None;
         assert!(
-            prepare_runtime::<(), Identity>(directory.path(), &mut observation, || Err(
+            prepare_runtime::<()>(directory.path(), &mut observation, || Err(
                 CpuReason::LoadingNotAdmitted
             ))
             .is_err()

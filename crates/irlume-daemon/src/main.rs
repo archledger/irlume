@@ -445,8 +445,8 @@ mod recognizer_selection {
     /// One selected device target.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Selection {
-        /// Rank the certified devices; today that is the CPU reference,
-        /// because no accelerator is admitted and certified.
+        /// The switch-gated NPU path; today that is the CPU reference, because
+        /// no NPU placement is admitted and certified.
         Auto,
         /// Every probe stays on its CPU session.
         Cpu,
@@ -676,7 +676,7 @@ mod recognizer_selection {
         if plan.selection() == Selection::Npu {
             irlume_common::jout_info!(
                 "irlumed: recognizer_device={} is selected, but this build has no \
-                 accelerator support; the recognizer stays on CPU",
+                 NPU support; the recognizer stays on CPU",
                 plan.selection().as_str()
             );
         }

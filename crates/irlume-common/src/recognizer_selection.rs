@@ -33,7 +33,7 @@ impl<'de> Deserialize<'de> for RecognizerSelectionSource {
     }
 }
 
-/// A selection parsing issue, independent of accelerator availability.
+/// A selection parsing issue, independent of NPU availability.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecognizerSelectionIssue {

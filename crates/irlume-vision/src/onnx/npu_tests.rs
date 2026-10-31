@@ -6,9 +6,9 @@
 //! A child of `onnx`, so the tests can place a model on the NPU directly.
 
 use super::*;
-/// The recorded-frame readers and the CPU-vs-accelerator drift statistics of
-/// the NPU evidence harness.
-pub(super) fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {
+/// The recorded-frame readers and the CPU-vs-NPU drift statistics of the NPU
+/// evidence harness.
+fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {
     let kind = match raw.get(..2)? {
         b"P5" => 'g',
         b"P6" => 'c',
@@ -44,20 +44,20 @@ pub(super) fn pnm(raw: &[u8]) -> Option<(char, u32, u32, &[u8])> {
 }
 
 #[derive(Default)]
-pub(super) struct Stats {
-    pub(super) n: usize,
-    pub(super) max_delta: f32,
+struct Stats {
+    n: usize,
+    max_delta: f32,
     sum_delta: f64,
-    pub(super) flips: usize,
+    flips: usize,
     /// Flips where the CPU score was at or above the threshold and
     /// the NPU score below it.
-    pub(super) flips_down: usize,
+    flips_down: usize,
     /// Closest CPU score to the threshold, as a distance.
     nearest: f32,
 }
 
 impl Stats {
-    pub(super) fn add(&mut self, cpu: f32, npu: f32, threshold: f32) {
+    fn add(&mut self, cpu: f32, npu: f32, threshold: f32) {
         if self.n == 0 {
             self.nearest = f32::INFINITY;
         }
@@ -74,18 +74,12 @@ impl Stats {
         self.nearest = self.nearest.min((cpu - threshold).abs());
     }
 
-    pub(super) fn line(&self, name: &str) -> String {
-        self.line_as(name, "NPU")
-    }
-
-    /// [`Self::line`] naming the accelerator the CPU outputs are compared
-    /// against.
-    pub(super) fn line_as(&self, name: &str, device: &str) -> String {
+    fn line(&self, name: &str) -> String {
         if self.n == 0 {
             return format!("{name}: no samples");
         }
         format!(
-                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, {device} below: {}) nearest CPU score to threshold {:.4}",
+                "{name}: n {} max |delta| {:.6} mean |delta| {:.6} flips {} (CPU at or above, NPU below: {}) nearest CPU score to threshold {:.4}",
                 self.n,
                 self.max_delta,
                 self.sum_delta / self.n as f64,
@@ -96,7 +90,7 @@ impl Stats {
     }
 }
 
-pub(super) fn is_attack(dir: &str) -> bool {
+fn is_attack(dir: &str) -> bool {
     dir.starts_with("spoof-")
         || dir.contains("banner")
         || dir.contains("phone")

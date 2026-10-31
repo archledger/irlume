@@ -5,6 +5,9 @@
 Accepted 2026-10-30, on the maintainer's decision. Implementation follows in
 separate pull requests.
 
+Amended 2026-10-31 by [ADR-0039](0039-remove-npu-inference.md): NPU inference is
+removed too, so sections 1, 3, 6 and 7 no longer describe the current state.
+
 Withdraws ADR-0033, except its section 7 as narrowed below. Amends ADR-0022
 sections 3 and 15, which return to "no GPU". Closes #1053, #1162, #1163 and
 #1164 as not planned.

@@ -908,6 +908,30 @@ fn included_landing(
     Some(landing_of(&lines, at, offset.min(lines.len())))
 }
 
+/// Where an included jump goes on to, past any of irlume's session lines it
+/// lands on. Those are all `optional`: they never end the stack, and what a
+/// session stack returns grants nothing. So a jump that lands on one runs the
+/// same other lines it did. Fedora's `password-auth` ends with such a jump, past
+/// `pam_unix.so` for crond, and irlume's line goes right after that include.
+/// `pam_irlume.so` lines of the auth phase can decide the stack, so they do not
+/// count here.
+fn past_session_lines(
+    text: &str,
+    phase: &str,
+    include: &str,
+    ordinal: usize,
+    offset: usize,
+) -> Option<Landing> {
+    let mut at = offset;
+    loop {
+        let landing = included_landing(text, phase, include, ordinal, at)?;
+        match &landing {
+            Landing::Line { key, .. } if key.starts_with("irlume session ") => at += 1,
+            _ => return Some(landing),
+        }
+    }
+}
+
 /// An included stack may jump onto lines after its include. Compare those
 /// actual landing lines, rather than every later irlume line: adding a line
 /// beyond the jump's reach does not move it. For the enable check, compare
@@ -951,9 +975,10 @@ fn included_shifts(
                 let next = included_landing(after, phase_name, &key, ordinal, offset);
                 if let (Some(old_bare), Some(new_bare)) = (&old_bare, &new_bare) {
                     let bare = included_landing(new_bare, phase_name, &key, ordinal, offset);
+                    let through = past_session_lines(after, phase_name, &key, ordinal, offset);
                     let moved_by_irlume = bare
                         .as_ref()
-                        .is_some_and(|bare| next.as_ref() != Some(bare));
+                        .is_some_and(|bare| through.as_ref() != Some(bare));
                     let already = prior == next
                         && included_landing(old_bare, phase_name, &key, ordinal, offset) == bare;
                     if !moved_by_irlume || already {

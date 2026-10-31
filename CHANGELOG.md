@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` wires GDM and SDDM on a stock Fedora again. The check for jumps in
+  included stacks (#934) also refused irlume's session line right after `session include
+  password-auth`, whose crond jump lands there, so neither greeter could be wired on a machine
+  using authselect's `local` profile. That line is `optional` and decides nothing, and a jump
+  that lands on it goes on to the line it landed on before. The check came after 0.15.0.
+
 - `irlume uninstall` and `irlume update` now read a deb822 `.sources` stanza
   the way apt does: one disabled by `Enabled: no` (in any zero spelling apt
   reads) is not a source apt lists, so a release `.deb` cleanup no longer

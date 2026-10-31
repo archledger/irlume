@@ -107,8 +107,7 @@ pub(crate) fn test_tmp_dir(name: &str) -> String {
 /// (docs/recognition-results/2026-08-05-buffalo-l.md, "Instrument validation")
 /// carried an AuraFace anchor run that landed on that floor, which clears 0.55.
 /// Real-world FAR stays above Windows Hello's stated 1e-5 bar; the mandatory
-/// password fallback bounds the residual. Certification judges every value
-/// scaled from this base (ADR-0022 amendment 2026-10-22).
+/// password fallback bounds the residual.
 /// Do NOT assume buffalo_l's 0.60; AuraFace scale differs.
 pub const RGB_MATCH_THRESHOLD: f32 = 0.55;
 
@@ -138,7 +137,7 @@ pub const IR_MATCH_THRESHOLD: f32 = 0.55;
 /// - CBSR OR-arm of the sweep (best-of-N OR the raw centroid, 197 ids /
 ///   347,508 impostor decisions): 0.635 -> FAR 1.24e-4 / FRR 0.68% (0.60 ->
 ///   4.03e-4). Not a production decision: production forms no centroid
-///   without a fitted IR calibration (ADR-0022 amendment 2026-10-22).
+///   without a fitted IR calibration.
 /// - Tufts cross-spectral sweep at shipped ridge lambda 0.5: best-of-N FAR
 ///   6.10e-5 (k=3) / 6.60e-5 (k=5) at flat 0.635. These separate-arm rates
 ///   do not measure the full scaled production decision; the former ~4.9e-5

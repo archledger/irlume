@@ -241,14 +241,13 @@ fn public_value(result: Result<DecisionFingerprint, FingerprintError>) -> String
     result.map(String::from).unwrap_or_default()
 }
 
-/// The recognition decision's fingerprint (ADR-0022 §3): the SHA-256 of
-/// a versioned transcript binding the legacy arm grid, bounded threshold
+/// The recognition decision's fingerprint, a test golden (ADR-0039 section 2):
+/// the SHA-256 of a versioned transcript binding the legacy arm grid, bounded threshold
 /// records and projections, and checked composed-decision witnesses. Each
 /// named section binds its SHA-256 digest with explicit length framing.
-/// A changed fingerprint invalidates a certification bound to the old one.
+/// A changed fingerprint means a grant decision changed.
 ///
 /// Returns an empty string if construction cannot provide a valid digest.
-/// NPU admission uses the checked result instead of this wrapper.
 pub fn decision_fingerprint() -> String {
     public_value(try_decision_fingerprint())
 }

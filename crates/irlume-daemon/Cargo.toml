@@ -22,9 +22,6 @@ dbus.workspace = true
 
 [features]
 default = []
-# Optional NPU inference for the recognizer's authentication probes
-# (ADR-0022): the daemon opens the NPU runtime when the switch allows it.
-npu = ["irlume-auth/npu"]
 
 [dev-dependencies]
 irlume-auth = { workspace = true, features = ["test-support"] }

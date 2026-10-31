@@ -430,31 +430,24 @@ pub fn status(args: &[String]) -> ExitCode {
     };
     // Observe Health once. Management status never needs to open cameras; a
     // configured-path fallback remains explicitly unobserved.
-    let (camera, recognizer) = match observe(&Request::Health) {
+    let camera = match observe(&Request::Health) {
         Some(Response::Health {
             tier,
             rgb_dev,
             ir_dev,
-            recognizer,
             ..
-        }) => (
-            json!({
+        }) => json!({
                 "known": true,
                 "rgb": (rgb_dev.is_some() || tier == "secure") && rgb_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
                 "ir": tier == "secure" && ir_dev.as_deref().is_some_and(|p| std::path::Path::new(p).exists()),
-            }),
-            recognizer_json(recognizer),
-        ),
+        }),
         _ => {
             let pair = irlume_camera::configured_pair_no_probe();
-            (
-                json!({
-                    "known": false,
-                    "rgb": pair.as_ref().is_some_and(|(rgb, _)| std::path::Path::new(rgb).exists()),
-                    "ir": pair.as_ref().is_some_and(|(_, ir)| std::path::Path::new(ir).exists()),
-                }),
-                recognizer_json(None),
-            )
+            json!({
+                "known": false,
+                "rgb": pair.as_ref().is_some_and(|(rgb, _)| std::path::Path::new(rgb).exists()),
+                "ir": pair.as_ref().is_some_and(|(_, ir)| std::path::Path::new(ir).exists()),
+            })
         }
     };
     let keyring = match observe(&Request::KeyringMetadata { user: user.clone() }) {
@@ -520,189 +513,11 @@ pub fn status(args: &[String]) -> ExitCode {
                 // the device is a narrower question and disagreed with both.
                 "fingerprint": fingerprint.unwrap_or(false),
                 "fingerprint_known": fingerprint.is_some(),
-                "recognizer": recognizer,
             }),
             contract,
         ),
         ExitCode::SUCCESS,
     )
-}
-
-/// Where the daemon's recognizer computes authentication probes
-/// (ADR-0022 §13). Unknown is not CPU: without the daemon's answer the
-/// device is absent rather than guessed.
-pub(super) fn recognizer_json(
-    placement: Option<irlume_common::RecognizerPlacement>,
-) -> serde_json::Value {
-    match placement {
-        Some(placement) => {
-            let mut value = json!({ "known": true });
-            // Contract 1 permits added fields, not new enum values: only the
-            // device values it names reach `status --json` (MACHINE-API.md).
-            if matches!(placement.device.as_str(), "npu" | "cpu") {
-                value["device"] = json!(placement.device);
-            }
-            if let Some(reason) = placement.reason {
-                value["reason"] = json!(reason);
-            }
-            if let Some(platform) = placement.platform {
-                value["platform"] = json!(platform);
-            }
-            if let Some(available) = placement.runtime_available {
-                value["runtime_available"] = json!(available);
-            }
-            if let Some(qualified) = placement.qualified {
-                value["qualified"] = json!(qualified);
-            }
-            // Only the contract's own values reach the machine API: a newer
-            // daemon may report a selection this schema does not know, and a
-            // released CLI must not copy it into `status --json`.
-            if matches!(placement.selection.as_deref(), Some("auto" | "cpu" | "npu")) {
-                value["selection"] = json!(placement.selection);
-            }
-            if let Some(provenance) = placement.selection_provenance {
-                value["selection_provenance"] = json!(provenance);
-            }
-            value
-        }
-        None => json!({ "known": false }),
-    }
-}
-
-#[cfg(test)]
-mod provider_runtime_reporting_tests {
-    use super::*;
-
-    #[test]
-    fn available_provider_runtime_and_unqualified_model_are_distinct_json_facts() {
-        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
-            device: "cpu".into(),
-            reason: Some("not qualified".into()),
-            platform: Some("opaque".into()),
-            runtime_available: Some(true),
-            qualified: Some(false),
-            selection: Some("npu".into()),
-            ..Default::default()
-        }));
-        assert_eq!(value["device"], "cpu");
-        assert_eq!(value["runtime_available"], true);
-        assert_eq!(value["qualified"], false);
-        assert_eq!(value["selection"], "npu");
-    }
-
-    #[test]
-    fn older_provider_reports_leave_new_status_facts_absent() {
-        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
-            device: "cpu".into(),
-            reason: Some("legacy".into()),
-            platform: None,
-            runtime_available: None,
-            qualified: None,
-            selection: None,
-            ..Default::default()
-        }));
-        assert!(value.get("runtime_available").is_none());
-        assert!(value.get("qualified").is_none());
-        assert!(value.get("selection").is_none());
-        for absent in [
-            "accelerator",
-            "gpu_platform",
-            "gpu_runtime_available",
-            "gpu_qualified",
-        ] {
-            assert!(value.get(absent).is_none(), "{absent}");
-        }
-    }
-
-    #[test]
-    fn an_unknown_selection_word_stays_out_of_the_machine_api() {
-        // A newer daemon may report a value this contract does not know; the
-        // released CLI must not copy it into `status --json`.
-        let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
-            device: "cpu".into(),
-            reason: None,
-            platform: None,
-            runtime_available: None,
-            qualified: None,
-            selection: Some("tpu".into()),
-            ..Default::default()
-        }));
-        assert!(value.get("selection").is_none());
-    }
-
-    /// The words the schema's `recognizer.<field>` enum lists.
-    fn recognizer_schema_enum(field: &str) -> Vec<String> {
-        let schema: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../schemas/machine-api-v1.schema.json"
-            ))
-            .expect("schemas/machine-api-v1.schema.json readable from the workspace"),
-        )
-        .unwrap();
-        schema
-            .pointer(&format!(
-                "/$defs/statusData/properties/recognizer/properties/{field}/enum"
-            ))
-            .and_then(|words| words.as_array())
-            .unwrap_or_else(|| panic!("the schema lists the {field} words"))
-            .iter()
-            .map(|word| word.as_str().unwrap().to_owned())
-            .collect()
-    }
-
-    /// The selection words `status --json` passes through are exactly the
-    /// schema's `recognizer.selection` enum (#1053): contract 1 adds no enum
-    /// value, and a word the schema lists must not be dropped.
-    #[test]
-    fn passed_selection_words_are_the_schema_enum() {
-        let words = recognizer_schema_enum("selection");
-        assert_eq!(words, ["auto", "cpu", "npu"]);
-        let listed: Vec<&str> = words.iter().map(String::as_str).collect();
-        for word in listed.iter().copied().chain(["gpu", "tpu", "AUTO", ""]) {
-            let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
-                device: "cpu".into(),
-                reason: Some("NPU discovery not reported; using CPU".into()),
-                platform: None,
-                runtime_available: None,
-                qualified: None,
-                selection: Some(word.into()),
-                ..Default::default()
-            }));
-            let expected = listed.contains(&word).then_some(word);
-            assert_eq!(
-                value.get("selection").and_then(|v| v.as_str()),
-                expected,
-                "{word:?}"
-            );
-        }
-    }
-
-    /// The device words `status --json` passes through are exactly the
-    /// schema's `recognizer.device` enum: contract 1 names `npu` and `cpu`
-    /// only (MACHINE-API.md).
-    #[test]
-    fn passed_device_words_are_the_schema_enum() {
-        let words = recognizer_schema_enum("device");
-        assert_eq!(words, ["npu", "cpu"]);
-        let listed: Vec<&str> = words.iter().map(String::as_str).collect();
-        for word in listed
-            .iter()
-            .copied()
-            .chain(["gpu", "tpu", "NPU", "CPU", ""])
-        {
-            let value = recognizer_json(Some(irlume_common::RecognizerPlacement {
-                device: word.into(),
-                ..Default::default()
-            }));
-            let expected = listed.contains(&word).then_some(word);
-            assert_eq!(
-                value.get("device").and_then(|v| v.as_str()),
-                expected,
-                "{word:?}"
-            );
-        }
-    }
 }
 
 fn valid_status_args(args: &[String]) -> bool {

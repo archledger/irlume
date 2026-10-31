@@ -603,29 +603,7 @@ APPARMOR_RUNTIME_RULES=(
   "/sys/fs/cgroup/{,**/}cpu.max r,"
   # ONNX Runtime falls back to PCI enumeration during hardware discovery.
   "/sys/bus/pci/devices/ r,"
-  # ADR-0022: optional NPU cache, identity reads and provider loading. The
-  # local include supports administrator-selected prefixes without granting
-  # arbitrary /opt or home-directory code loading in the shipped profile.
-  "/var/cache/ r,"
-  "/var/cache/irlume/ r,"
-  "/var/cache/irlume/npu/ rwk,"
-  "/var/cache/irlume/npu/** rwk,"
   "/proc/sys/kernel/random/boot_id r,"
-  "/sys/class/accel/ r,"
-  "/sys/class/accel/** r,"
-  "/sys/kernel/debug/accel/*/fw_version r,"
-  "/dev/accel/accel[0-9]* rw,"
-  "owner /proc/@{pid}/maps r,"
-  "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/ r,"
-  "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/libopenvino*.so* mr,"
-  "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/openvino-*/ r,"
-  "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/openvino-*/libopenvino*.so* mr,"
-  "/usr/{lib,lib64,lib/x86_64-linux-gnu,local/lib,local/lib64,local/lib/x86_64-linux-gnu}/libze_*.so* mr,"
-  "include if exists <local/irlumed-npu>"
-  # The NPU runtime loads oneTBB, whose allocator reads this sysctl;
-  # the #1046 enforcing NPU attempt recorded the denial.
-  "@{PROC}/sys/vm/nr_hugepages r,"
-  "/sys/kernel/mm/transparent_hugepage/enabled r,"
 )
 for profile in "${APPARMOR_PROFILES[@]}"; do
   executable="${profile##*/}"

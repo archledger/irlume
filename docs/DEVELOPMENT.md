@@ -239,8 +239,7 @@ Ubuntu CI installs `pax-utils`, `python3-pyelftools` and `python3-jsonschema`.
 Missing tools or failed namespace setup fail the test; there is no host
 execution fallback.
 
-Use `bash scripts/test-selection-provenance.sh` for the named unit and
-integration checks. Run the generic machine API checks with
+Run the generic machine API checks with
 `bash scripts/test-machine-api-isolated.sh target/release/irlume` after
 building the release binary. The latter keeps the fixture/schema checks
 outside the namespace and isolates every invocation of the compiled CLI.

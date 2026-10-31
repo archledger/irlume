@@ -546,62 +546,6 @@
         "fingerprint_known": {
           "description": "Whether the bounded tooling and reader probe completed. When false, fingerprint=false means unknown, not confirmed absent. Optional for compatibility with older contract 1 engines.",
           "type": "boolean"
-        },
-        "recognizer": {
-          "description": "Where the daemon's recognizer computes authentication probes (ADR-0022). Optional for compatibility with older contract 1 engines.",
-          "type": "object",
-          "required": [
-            "known"
-          ],
-          "properties": {
-            "known": {
-              "description": "Whether the daemon reported the placement. When false, no other field is present.",
-              "type": "boolean"
-            },
-            "device": {
-              "type": "string",
-              "enum": [
-                "npu",
-                "cpu"
-              ]
-            },
-            "reason": {
-              "description": "On CPU, why.",
-              "type": "string"
-            },
-            "platform": {
-              "description": "The NPU platform identity digest, when one was read.",
-              "type": "string"
-            },
-            "runtime_available": {
-              "description": "Whether this engine discovered an accessible NPU runtime/platform, independent of provider branding. Optional; absence means not attempted/reported, not false. This is not model qualification.",
-              "type": "boolean"
-            },
-            "qualified": {
-              "description": "Whether the engine currently passed the model's qualification and NPU placement checks. Optional; absence means unreported or no available runtime. Actual device and reason still describe fallback or retirement.",
-              "type": "boolean"
-            },
-            "selection": {
-              "description": "The device selection that governs this placement (recognizer_device in settings.conf). Optional; absence means the daemon did not report one.",
-              "type": "string",
-              "enum": ["auto", "cpu", "npu"]
-            },
-            "selection_provenance": {
-              "description": "Source and parsing issue of the successfully published governing selection, not placement or eligibility. Absent means unreported; unknown members are not defaults.",
-              "type": "object",
-              "required": ["source", "issue"],
-              "properties": {
-                "source": {
-                  "type": "string",
-                  "enum": ["default", "settings", "environment", "unknown"]
-                },
-                "issue": {
-                  "type": "string",
-                  "enum": ["none", "invalid_value", "duplicate_key", "unreadable_settings", "unknown"]
-                }
-              }
-            }
-          }
         }
       }
     },

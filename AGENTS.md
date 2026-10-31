@@ -77,7 +77,6 @@ matching rows below.
 
 ```sh
 cargo fmt --all --check
-bash scripts/test-selection-provenance.sh
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --all-targets -- -D warnings
 cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples
@@ -90,7 +89,7 @@ cargo build --release --locked
 
 | When you touch | Also run |
 |---|---|
-| `irlume-vision` features, any dependency bump | `cargo check -p irlume-vision --all-features --locked`; for the `npu` feature (ADR-0022) also `cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-vision --features npu --lib` and `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps`; with the `npu` features of `irlume-auth` and `irlume-daemon` also `cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings`, `cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization` and the guarded daemon provider-selection/Health/unit command in the "Optional NPU inference checks (no NPU)" step of `ci.yml` (nine exact test names, each required, floor 9; synthetic state/config, no CLI helper needed) |
+| `irlume-vision` features, any dependency bump | `cargo check -p irlume-vision --all-features --locked` |
 | `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback) |
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs`, `crates/irlume-cli/src/uninstall.rs` | `bash scripts/check-packaging-parity.sh` (needs `desktop-file-validate`); for `packaging/apparmor/` also `apparmor_parser -QK <profile>`; for maintainer scripts also `python3 scripts/test-package-service-hooks.py` and `python3 scripts/test-ppa-service-hooks.py` (CI runs it in an Ubuntu container) |

@@ -23,7 +23,6 @@ fn enrollment() -> Enrollment {
             ir: Some(vec![1.0, 0.0]),
             ir_space: Some("raw".into()),
             embed_space: Some("test-recognizer".into()),
-            embed_producer: None,
             ir_center_edge_ratio: 1.5,
             ir_brightness: 100.0,
             pitch: 0.5,

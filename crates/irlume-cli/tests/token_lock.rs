@@ -283,9 +283,25 @@ fn helper_transfers_exclusion_only_after_proving_session_delivery() {
                 std::io::ErrorKind::WouldBlock
             );
             drop(guard);
-            // SAFETY: same live descriptor, now after the guard lifetime ends.
-            let free = unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            assert_eq!(free, 0);
+            // A flock lasts until every copy of its descriptor closes. A child
+            // another test forks holds a copy until its exec, so the release
+            // may take a moment. A lock that stays held fails at the deadline.
+            let release = Instant::now() + Duration::from_secs(5);
+            loop {
+                // SAFETY: same live descriptor, now after the guard lifetime ends.
+                let free =
+                    unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if free == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+                assert!(
+                    Instant::now() < release,
+                    "the transferred lock stayed held after its guard was dropped"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         } else {
             assert!(irlume_common::pam_lock_handoff::receive(&parent, owner, deadline).is_err());
         }

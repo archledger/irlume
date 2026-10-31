@@ -2,6 +2,9 @@
 
 ## Status
 
+Withdrawn 2026-10-31 by [ADR-0039](0039-remove-npu-inference.md). NPU inference is
+removed. The text below is kept as the record and no longer binds.
+
 Proposed 2026-10-08. First drafted 2026-09-15 and held unpublished;
 revised after the 1.38.0 platform retest and the root cause of the NPU
 compile crash ([intel-npu-stack#20]), then audited the same day against

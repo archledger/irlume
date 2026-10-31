@@ -16,17 +16,6 @@
 //!
 //! Ported from linhello (archledger/linhello, the predecessor project).
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-/// Whether this library or a dependency contains non-shippable evidence code.
-pub const HARDWARE_EVIDENCE_BUILD: bool =
-    cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD;
-#[cfg(not(irlume_hw_evidence))]
-const _: () = assert!(
-    !HARDWARE_EVIDENCE_BUILD,
-    "irlume evidence build refused: irlume-fingerprint/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;

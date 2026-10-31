@@ -17,33 +17,12 @@
 //! in InsightFace buffalo_l/antelopev2 or YuNet's bundled SCRFD: their weights
 //! are non-commercial, which CONFLICTS with GPL's downstream-commercial freedom.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-/// Whether this library or a dependency contains non-shippable evidence code.
-pub const HARDWARE_EVIDENCE_BUILD: bool =
-    cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD;
-#[cfg(not(irlume_hw_evidence))]
-const _: () = assert!(
-    !HARDWARE_EVIDENCE_BUILD,
-    "irlume evidence build refused: irlume-vision/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
-#[cfg(irlume_hw_evidence)]
-mod reference_isolation;
-
-#[cfg(irlume_hw_evidence)]
-pub mod measurement_profile;
-
 pub mod align;
 #[cfg(feature = "tflite")]
 pub mod blaze_full;
 pub mod detect;
 pub mod light;
 pub mod moire;
-#[cfg(feature = "native-metadata")]
-pub mod native_generation;
-#[cfg(feature = "native-metadata")]
-pub mod native_metadata;
 #[cfg(feature = "npu")]
 pub mod npu;
 #[cfg(feature = "tflite")]
@@ -266,14 +245,8 @@ pub type Embedding = [f32; EMBED_DIM];
 
 #[cfg(feature = "onnx")]
 mod onnx {
-    #[cfg(all(test, irlume_hw_evidence))]
-    mod reference_isolation_api_tests;
-    #[cfg(all(test, irlume_hw_evidence))]
-    mod reference_isolation_tests;
-
     use super::{Detection, Embedding, EMBED_DIM};
     use crate::align;
-    #[cfg(not(irlume_hw_evidence))]
     use ort::session::builder::AutoDevicePolicy;
     use ort::session::{
         builder::{GraphOptimizationLevel, SessionBuilder},
@@ -696,9 +669,6 @@ mod onnx {
     /// any other thread exists, and this crate's constructors are public API
     /// with no single-threaded guarantee.
     fn ensure_ort_resolvable() -> irlume_common::Result<()> {
-        #[cfg(irlume_hw_evidence)]
-        crate::reference_isolation::require_clean_environment()
-            .map_err(|reason| irlume_common::Error::Hardware(reason.into()))?;
         ORT_VERDICT
             .get_or_init(|| {
                 let explicit = std::env::var_os("ORT_DYLIB_PATH");
@@ -781,10 +751,6 @@ mod onnx {
     pub fn runtime_resolution() -> (Option<std::path::PathBuf>, Result<String, String>) {
         let explicit = std::env::var_os("ORT_DYLIB_PATH");
         let candidate = configured_ort(explicit.as_deref(), |p| p.is_file());
-        #[cfg(irlume_hw_evidence)]
-        if let Err(reason) = crate::reference_isolation::require_clean_environment() {
-            return (candidate, Err(reason.into()));
-        }
         let name = candidate
             .as_deref()
             .unwrap_or(std::path::Path::new("libonnxruntime.so"));
@@ -801,16 +767,10 @@ mod onnx {
     /// device-selection policy the builder arms (upstream has no API to
     /// disarm it; the policy otherwise ranks any other CPU-type EP ahead of
     /// the default, which the NPU parity reference and the CPU-session
-    /// warnings must not silently rely on). Ordinary builds retain the CPU
-    /// preference fallback. Evidence builds require one unambiguous default
-    /// CPU device and refuse unavailable or failed registration.
+    /// warnings must not silently rely on), with the CPU preference policy as
+    /// the fallback.
     fn pin_default_cpu_ep(b: SessionBuilder) -> irlume_common::Result<SessionBuilder> {
-        let env = ort::environment::Environment::current();
-        #[cfg(irlume_hw_evidence)]
-        let env = env.map_err(err)?;
-        #[cfg(not(irlume_hw_evidence))]
-        let Ok(env) = env
-        else {
+        let Ok(env) = ort::environment::Environment::current() else {
             return b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err);
         };
         let mut default_cpus = env.devices().filter(|device| {
@@ -823,27 +783,8 @@ mod onnx {
                 && matches!(device.hardware_device().ty(), ort::memory::DeviceType::CPU)
         });
         match default_cpus.next() {
-            Some(device) => {
-                #[cfg(irlume_hw_evidence)]
-                if default_cpus.next().is_some() {
-                    return Err(irlume_common::Error::Hardware(
-                        "evidence reference has ambiguous exact default CPU providers".into(),
-                    ));
-                }
-                b.with_devices([device], None).map_err(err)
-            }
-            None => {
-                #[cfg(irlume_hw_evidence)]
-                {
-                    Err(irlume_common::Error::Hardware(
-                        "evidence reference requires one exact default CPU provider".into(),
-                    ))
-                }
-                #[cfg(not(irlume_hw_evidence))]
-                {
-                    b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err)
-                }
-            }
+            Some(device) => b.with_devices([device], None).map_err(err),
+            None => b.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(err),
         }
     }
 
@@ -887,9 +828,6 @@ mod onnx {
 
     /// The same session configuration for production commits and C API tests.
     fn session_options(pool: &IntraPool) -> irlume_common::Result<SessionBuilder> {
-        #[cfg(irlume_hw_evidence)]
-        crate::reference_isolation::require_clean_environment()
-            .map_err(|reason| irlume_common::Error::Hardware(reason.into()))?;
         // Never inherit execution providers a custom host registered on the
         // process `ort::Environment`: they would place this build's sessions
         // outside the per-model certification regime (ADR-0038 section 2).

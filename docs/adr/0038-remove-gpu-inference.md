@@ -132,3 +132,16 @@ target, the NPU is the first answer.
 - `execution_providers_stay_escape_gated_and_strict`, rewritten for the single CPU
   pin, still proves the environment cutoff and the pin.
 - The NPU test lanes keep their strength.
+
+## Amendment 2026-10-30: the measurement tooling is removed
+
+Section 2 left the ELF metadata, the declared fixture graph and the measurement-only
+build boundary undecided. On the maintainer's decision they are removed: the
+`irlume_hw_evidence` build and its guards in every crate, `measurement_profile`,
+`native_generation`, `native_metadata`, the measurement fixtures, their fuzz targets
+and the contained-job scripts. They were built for the GPU campaign, and no shipped
+program used them. ADR-0022's amendment of 2026-10-22 "measurement-only evidence builds"
+stays as the record, and no longer binds.
+
+If the NPU is certified later, its measurement path is decided then and sized to what
+it needs. The corpus extent rule in ADR-0022 still applies to that certification.

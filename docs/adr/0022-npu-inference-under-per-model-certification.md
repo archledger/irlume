@@ -1331,6 +1331,9 @@ give this route; it does not qualify an accelerator.
 
 ## Amendment 2026-10-22: measurement-only evidence builds
 
+Withdrawn 2026-10-30 by ADR-0038's amendment of that date: this tooling is removed.
+The text below is kept as the record.
+
 The full-extent runs need the production preprocessing, probe, compile and
 guard paths. The existing `#[cfg(test)]` hardware helpers do not supply
 that proof. This amendment specifies a separate, non-shippable evidence

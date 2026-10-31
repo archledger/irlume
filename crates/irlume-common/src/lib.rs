@@ -10,14 +10,8 @@
 //! with `SO_PEERCRED` (verify uid/gid of the peer) before honouring privileged
 //! requests such as enrollment.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-/// Whether this library was compiled for non-shippable hardware evidence.
-pub const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence);
-// END HARDWARE EVIDENCE BOUNDARY
-
 pub mod artifact;
 pub mod binding_key;
-pub mod build_mode;
 pub mod client;
 pub mod config;
 pub mod dbglog;

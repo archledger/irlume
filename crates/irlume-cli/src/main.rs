@@ -18,23 +18,6 @@
 //!   irlume login <status|enable|disable|reconcile> wire face auth into PAM (+--with-polkit for apps)
 //!   irlume logs [-f] [debug on|off]              face-auth journal view + tracing switch
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-#[cfg(irlume_hw_evidence)]
-compile_error!("irlume evidence build refused: irlume-cli/direct");
-const HARDWARE_EVIDENCE_BUILD: bool = cfg!(irlume_hw_evidence)
-    || irlume_auth::HARDWARE_EVIDENCE_BUILD
-    || irlume_camera::HARDWARE_EVIDENCE_BUILD
-    || irlume_common::HARDWARE_EVIDENCE_BUILD
-    || irlume_core::HARDWARE_EVIDENCE_BUILD
-    || irlume_fingerprint::HARDWARE_EVIDENCE_BUILD
-    || irlume_liveness::HARDWARE_EVIDENCE_BUILD
-    || irlume_vision::HARDWARE_EVIDENCE_BUILD;
-const _: () = assert!(
-    !HARDWARE_EVIDENCE_BUILD,
-    "irlume evidence build refused: irlume-cli/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
 mod bitwarden;
 mod commands;
 mod consent;
@@ -117,7 +100,6 @@ const DEV_CMDS: &[&str] = &[
 ];
 
 fn main() -> std::process::ExitCode {
-    irlume_common::build_mode::refuse_evidence_startup(HARDWARE_EVIDENCE_BUILD);
     // Rust ignores SIGPIPE by default, turning a closed stdout (`irlume … | head`,
     // `| less` then quit, `| grep -q`) into a "failed printing to stdout: Broken
     // pipe" panic + exit 101. Restore the Unix default so we exit quietly like any

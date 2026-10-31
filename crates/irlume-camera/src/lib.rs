@@ -30,17 +30,6 @@
 //! RGB8. FOOTGUN: enumerate V4L2 controls defensively; naive control queries
 //! panic on some drivers. Probe, don't assume.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-/// Whether this library or a dependency contains non-shippable evidence code.
-pub const HARDWARE_EVIDENCE_BUILD: bool =
-    cfg!(irlume_hw_evidence) || irlume_common::HARDWARE_EVIDENCE_BUILD;
-#[cfg(not(irlume_hw_evidence))]
-const _: () = assert!(
-    !HARDWARE_EVIDENCE_BUILD,
-    "irlume evidence build refused: irlume-camera/dependency"
-);
-// END HARDWARE EVIDENCE BOUNDARY
-
 mod backend;
 #[cfg(feature = "test-support")]
 pub use backend::test_support;

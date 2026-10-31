@@ -28,45 +28,10 @@ pages, so it must never move.
 | `check-packaging-parity.sh` | Every systemd unit and AppArmor rule must ship in every lane, every lane must agree on the version, and CI, the lanes and the developer guide must check the same ONNX Runtime sha256. |
 | `check-action-pins.sh` | Enforces SHA-pinning on every GitHub Action, with one documented exception for the SLSA provenance generator. |
 | `check-agents-md.py` | Fails when an `AGENTS.md` cites a path git no longer lists, has a broken relative link or an unclosed code fence, or lists a gate command the `check` job in `ci.yml` no longer runs. Needs PyYAML (`python3-yaml`); `test-check-agents-md.py` covers it. |
-| `test-measurement-job.sh` | Runs the contained-job portable/controller contracts with bounded receipts; `--build` compiles the private static backend and runs only pure tests and inactive entries. Kernel execution remains unavailable. |
 | `gkr-token-waiter-check.sh` | Drives the release `irlume-gkr-unlock` against a real `gnome-keyring-daemon --login` in a throwaway home and private bus: the token must arrive only once gnome-keyring is initialized, with no unlock prompt, and never to an impostor. A missing tool fails it. |
 | `ir-node-from-doctor.sh` | Names the IR capture node from `irlume doctor` output, so the nightly hardware suite can point `burst_dump` at it; given a node (the capture approval's device), it requires that node to be classified IR. Separates "no camera" from "no IR camera" from "this no longer parses", which the inline version it replaces could not. `--self-test` runs on every PR. |
 | `machine-api-conformance.py` | Checks a build answers contract 1 the way `docs/MACHINE-API.md` says. Written for consumers, so it needs only Python 3 and an irlume binary. |
 | `capture-machine-fixtures.py` | Regenerates `schemas/fixtures/` from a real engine, so consumers develop against documents irlume actually emitted. |
-
-### Contained-job proof gates
-
-Run `bash scripts/test-measurement-job.sh` for portable Python contracts and
-mocked controller tests. This POSIX/Linux runner needs Python 3.11+ and PyYAML.
-Each child reports an exact completed test inventory bound to its suite and a
-fresh run ID; exit zero without that record fails the gate. The run ID is
-correlation data, not an authorization credential.
-
-Run `bash scripts/test-measurement-job.sh --build` for the Rust 1.88.0
-static-musl build gate. Install the `x86_64-unknown-linux-musl` target and fetch
-the locked dependencies first. The gate builds/lints/documents the native
-backend but executes only pure Rust tests and inactive entries. Native rlib
-and code-generation artifacts never enter its executable allowlist.
-
-Both modes print their receipt directory. `--build` accepts an explicit output
-path; otherwise `IRLUME_JOB_OUTPUT` selects it. With neither set, a private
-temporary parent is created using the standard `TMPDIR` selection. Output must
-be fresh, below an existing privately owned parent, and use the existing safe
-path grammar (absolute paths with letters, digits, `_`, `-` and `.` components).
-Existing directories and symlinks are refused. Outputs are retained on failure
-and are never automatically deleted or reused.
-
-Portable subprocess output is capped at 1 MiB per suite with a 300-second
-monotonic-clock aggregate deadline. File I/O remains cooperative rather than
-a hard kernel-I/O bound. Receipts record test outcomes; the wrapper's exit status is also required
-for success, including output-close errors. CI uploads only root-level JSON
-receipts/streams, excluding binaries, dependency caches and VM artifacts.
-
-The reserved `--kernel --execute-disposable-vm --profile FILE` route requires an
-unprivileged caller and currently exits 77 through the inactive VM controller.
-Supplying flags or a profile does not enable it. Guest boot/collector integration,
-real containment, final native ELF linkage, runtime timing and manager recovery
-remain unqualified. These gates grant no native-loading or production authority.
 
 ## Diagnosing one machine
 

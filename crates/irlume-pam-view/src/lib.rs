@@ -5,11 +5,6 @@
 //! No authentication or credential entry point is exported. LightDM 1.32's
 //! session-child calls pam_open_session as root before forking/dropping uid.
 
-// BEGIN HARDWARE EVIDENCE BOUNDARY
-#[cfg(irlume_hw_evidence)]
-compile_error!("irlume evidence build refused: irlume-pam-view/direct");
-// END HARDWARE EVIDENCE BOUNDARY
-
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
 

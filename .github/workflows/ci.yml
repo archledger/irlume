@@ -168,7 +168,6 @@ jobs:
           # name the toolchain explicitly (it is a required input then).
           toolchain: "1.88.0"
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -198,126 +197,11 @@ jobs:
       - name: rustfmt
         run: cargo fmt --all --check
 
-      - name: Non-shippable evidence build boundary
-        timeout-minutes: 15
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          cargo fetch --locked
-          python3 scripts/test-evidence-build-boundary.py --self-test
-          python3 scripts/test-evidence-build-boundary.py --check
-          python3 scripts/test-reference-isolation.py --self-test
-          python3 scripts/test-reference-isolation.py --check
-
-      - name: CPU reference isolation runtime checks (no accelerator)
-        timeout-minutes: 10
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          runtime_dir="$(mktemp -d)"
-          curl --fail --location --retry 3 --max-time 120 \
-            https://github.com/archledger/irlume/releases/download/tflite-runtime-v2.19.0/libtensorflowlite_c-v2.19.0-linux-x64.tar.gz \
-            --output "$runtime_dir/tflite.tgz"
-          printf '%s  %s\n' \
-            dd3abcdbc0f35a9466a682358955ac3826a9a81590cd6b8abcf98548e17bd311 \
-            "$runtime_dir/tflite.tgz" | sha256sum --check --strict
-          tar -xzf "$runtime_dir/tflite.tgz" -C "$runtime_dir" --strip-components=2 \
-            libtensorflowlite_c-v2.19.0-linux-x64/lib/libtensorflowlite_c.so
-          export IRLUME_TFLITE_LIB="$runtime_dir/libtensorflowlite_c.so"
-          RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
-            --require escape_presence_precedes_ort_work \
-            --require escape_presence_precedes_tflite_work \
-            --require exact_cpu_selection_refuses_missing_ambiguous_and_failed_devices \
-            --require pinned_native_reference_executes_only_on_default_cpu \
-            -- cargo test --locked -p irlume-vision --features npu --lib reference_isolation_
-
-      - name: Upload evidence-build compiler receipts
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: evidence-build-compiler-receipts
-          path: |
-            ${{ runner.temp }}/irlume-evidence-build-*
-            ${{ runner.temp }}/irlume-reference-isolation-*
-          if-no-files-found: ignore
-          retention-days: 3
-
       - name: clippy (warnings are errors)
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Measurement profile descriptions (no native loading)
-        run: bash scripts/test-measurement-profile.sh
-
-      - name: Measurement file observations (local fixtures only)
-        run: bash scripts/test-measurement-observations.sh
-
-      - name: Fixture acquisition policy (portable, no kernel-support claim)
-        run: bash scripts/test-measurement-acquisition.sh
-
-      - name: Sealed fixture copies (portable, no launch authority)
-        run: bash scripts/test-measurement-sealing.sh
-
       - name: Selection provenance (unit and isolated CLI)
         run: bash scripts/test-selection-provenance.sh
-
-      - name: Native ELF metadata (supplied bytes only)
-        run: bash scripts/test-native-metadata.sh
-
-      - name: Declared fixture graph (no loader)
-        run: bash scripts/test-native-generation.sh
-
-      - name: Private static fixture bootstrap (no provider or host fallback)
-        timeout-minutes: 10
-        env:
-          IRLUME_GENERATION_OUTPUT: ${{ runner.temp }}/irlume-generation
-        run: |
-          python3 scripts/test-measurement-fixture-boundary.py --self-test
-          python3 scripts/test-measurement-fixture-boundary.py --check
-          bash scripts/test-measurement-fixture-bootstrap.sh
-          bash scripts/test-measurement-fixture-bootstrap.sh --kernel
-          bash scripts/test-measurement-generation.sh
-          bash scripts/test-measurement-generation.sh --kernel
-          bash scripts/test-measurement-namespace.sh
-          bash scripts/test-measurement-namespace.sh --build
-
-      - name: Retain generation fixture receipts
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: generation-fixture-receipts
-          path: |
-            ${{ runner.temp }}/irlume-generation/**/*.json
-            ${{ runner.temp }}/irlume-generation/**/*.log
-            !${{ runner.temp }}/irlume-generation/**/dependencies/**
-            ~/.cache/irlume-namespace-probe/**/*.json
-            ~/.cache/irlume-namespace-probe/**/*.log
-            !~/.cache/irlume-namespace-probe/**/dependencies/**
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: Contained-job portable contracts
-        timeout-minutes: 10
-        env:
-          IRLUME_JOB_OUTPUT: ${{ runner.temp }}/irlume-job-portable
-        run: bash scripts/test-measurement-job.sh
-
-      - name: Contained-job static build (no native execution)
-        timeout-minutes: 20
-        env:
-          IRLUME_JOB_OUTPUT: ${{ runner.temp }}/irlume-job-build
-        run: bash scripts/test-measurement-job.sh --build
-
-      - name: Retain contained-job receipts
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: contained-job-receipts
-          path: |
-            ${{ runner.temp }}/irlume-job-portable/*.json
-            ${{ runner.temp }}/irlume-job-build/*.json
-          if-no-files-found: ignore
-          include-hidden-files: false
-          retention-days: 3
 
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
@@ -1049,20 +933,16 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log, EK-certificate, ELF-metadata and declared-graph parsers
+      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log and EK-certificate parsers
         working-directory: fuzz
         run: |
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
-          python3 test-generate-native-metadata-seeds.py
-          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate native_metadata native_generation; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true
-            if [ "$t" = native_metadata ]; then
-              python3 generate-native-metadata-seeds.py "corpus/$t"
-            fi
             cargo fuzz run "$t" -- -max_total_time=45 -rss_limit_mb=4096
             echo "::endgroup::"
           done

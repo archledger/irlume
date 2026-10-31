@@ -77,34 +77,7 @@ matching rows below.
 
 ```sh
 cargo fmt --all --check
-cargo fetch --locked
-python3 scripts/test-evidence-build-boundary.py --self-test
-python3 scripts/test-evidence-build-boundary.py --check
-python3 scripts/test-reference-isolation.py --self-test
-python3 scripts/test-reference-isolation.py --check
-bash scripts/test-measurement-profile.sh
-bash scripts/test-measurement-observations.sh
-bash scripts/test-measurement-acquisition.sh
-bash scripts/test-measurement-sealing.sh
 bash scripts/test-selection-provenance.sh
-bash scripts/test-native-metadata.sh
-bash scripts/test-native-generation.sh
-python3 scripts/test-measurement-fixture-boundary.py --self-test
-python3 scripts/test-measurement-fixture-boundary.py --check
-bash scripts/test-measurement-fixture-bootstrap.sh
-bash scripts/test-measurement-fixture-bootstrap.sh --kernel
-bash scripts/test-measurement-generation.sh
-bash scripts/test-measurement-generation.sh --kernel
-bash scripts/test-measurement-namespace.sh
-bash scripts/test-measurement-namespace.sh --build
-bash scripts/test-measurement-job.sh
-bash scripts/test-measurement-job.sh --build
-RUSTFLAGS="--cfg irlume_hw_evidence" scripts/run-tests-guarded.sh --min 4 \
-  --require escape_presence_precedes_ort_work \
-  --require escape_presence_precedes_tflite_work \
-  --require exact_cpu_selection_refuses_missing_ambiguous_and_failed_devices \
-  --require pinned_native_reference_executes_only_on_default_cpu \
-  -- cargo test --locked -p irlume-vision --features npu --lib reference_isolation_
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --all-targets -- -D warnings
 cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples
@@ -117,18 +90,13 @@ cargo build --release --locked
 
 | When you touch | Also run |
 |---|---|
-| The private measurement fixture examples or their controller | The `--kernel` bootstrap gate above requires Rust 1.88.0's `x86_64-unknown-linux-musl` target, bubblewrap, a C compiler and the isolated CLI runner's test tools. It executes only synthetic static fixtures in a private namespace; unsupported setup must fail without host fallback. |
-| The private namespace probe or its controller | Also run `bash scripts/test-measurement-namespace.sh --kernel` from a trusted non-root initial user/PID namespace on a qualified Linux x86-64 `listns` host. This explicitly observes host, user-only and user+PID contexts; it never falls back to the host after failed isolation. The CI `--build` gate tests compilation, pure logic and inactive stubs, not kernel namespace support. |
-| The private contained-job fixture or its controller | The portable wrapper requires Python 3.11+ and PyYAML; `--build` needs the pinned Rust 1.88.0 static-musl target and cached locked dependencies. It compiles the native backend but executes only pure tests and inactive entries. The fully flagged `--kernel` route still refuses with 77 because no qualified M/E runtime exists. See `scripts/README.md` for fresh receipt outputs and proof limits. |
-| `crates/irlume-vision/src/measurement_profile/acquire.rs`, `crates/irlume-vision/src/measurement_profile/acquire_tests.rs` | `bash scripts/test-measurement-acquisition.sh --kernel` on the supported Linux x86-64 measurement hosts after the final material change. It requires real full-flag `openat2` support; portable CI does not qualify the kernel. |
-| `crates/irlume-vision/src/measurement_profile/seal.rs`, `crates/irlume-vision/src/measurement_profile/seal_tests.rs` | `bash scripts/test-measurement-sealing.sh --kernel` after the final material change on a supported Linux x86-64 host. It requires actual no-exec-mode memfd creation and all named seals; portable fault tests do not qualify kernel support. |
 | `irlume-vision` features, any dependency bump | `cargo check -p irlume-vision --all-features --locked`; for the `npu` feature (ADR-0022) also `cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-vision --features npu --lib` and `RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps`; with the `npu` features of `irlume-auth` and `irlume-daemon` also `cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings`, `cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings`, `cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization` and the guarded daemon provider-selection/Health/unit command in the "Optional NPU inference checks (no NPU)" step of `ci.yml` (nine exact test names, each required, floor 9; synthetic state/config, no CLI helper needed) |
 | `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback) |
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs`, `crates/irlume-cli/src/uninstall.rs` | `bash scripts/check-packaging-parity.sh` (needs `desktop-file-validate`); for `packaging/apparmor/` also `apparmor_parser -QK <profile>`; for maintainer scripts also `python3 scripts/test-package-service-hooks.py` and `python3 scripts/test-ppa-service-hooks.py` (CI runs it in an Ubuntu container) |
 | systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `packaging/systemd/irlume-reconcile.service`) |
 | dependencies | `cargo deny check advisories bans licenses sources`, `cargo deny --manifest-path fuzz/Cargo.toml check advisories` (`audit.yml` scans the fuzz lockfile) and `(cd fuzz && cargo fetch --locked)` |
-| fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`; for `native_metadata` also run `python3 generate-native-metadata-seeds.py corpus/native_metadata` and `python3 test-generate-native-metadata-seeds.py`; then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`, seed details in `fuzz/README.md`) |
+| fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`; then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`, seed details in `fuzz/README.md`) |
 | `.github/workflows/` | `bash scripts/check-action-pins.sh`, `zizmor .github/workflows` and `actionlint` (as in `workflow-audit.yml`); for `hardware-suite.yml` also `python3 scripts/test-nightly-ir-capture.py`, `python3 scripts/ci/test-setup-coverage-tools.py` and `python3 scripts/ci/test-nightly-coverage-contract.py`; use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |
 | `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the bridge, page and load test, `kcmshell6` and qmllint steps of `kcm.yml` |

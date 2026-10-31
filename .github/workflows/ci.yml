@@ -200,9 +200,6 @@ jobs:
       - name: clippy (warnings are errors)
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Selection provenance (unit and isolated CLI)
-        run: bash scripts/test-selection-provenance.sh
-
       # Required-feature examples and cfg-gated library code are skipped by the
       # default workspace checks. Exercise the non-granting diagnostic explicitly.
       - name: Optional IR diagnostic checks (no camera)
@@ -211,43 +208,6 @@ jobs:
           cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples
           cargo test --locked -p irlume-camera --features capture-timing --lib
           RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --no-deps
-
-      # The default-off NPU backend (ADR-0022) is cfg-gated, so the default
-      # workspace checks skip it. Its tests need no NPU and no OpenVINO: an
-      # absent runtime is one of the CPU answers they check; the hardware
-      # test is ignored.
-      - name: Optional NPU inference checks (no NPU)
-        run: |
-          cargo clippy --locked -p irlume-vision --features npu --all-targets -- -D warnings
-          cargo test --locked -p irlume-vision --features npu --lib
-          RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-vision --features npu --no-deps
-          cargo clippy --locked -p irlume-auth --features npu --all-targets -- -D warnings
-          cargo clippy --locked -p irlume-daemon --features npu --all-targets -- -D warnings
-          cargo test --locked -p irlume-auth --features npu --lib -- npu_probe new_scans_record_the_cpu_reference identity_arms identity_characterization
-          # Synthetic published state, sandboxed config and the shipped unit's
-          # text only; these exact tests need neither model loading nor the
-          # token-delivery CLI helper.
-          # Require every name so a renamed or ignored regression fails CI.
-          ./scripts/run-tests-guarded.sh --min 9 \
-            --require tests::retired_gpu_settings_have_no_effect \
-            --require tests::npu_settings_snapshot_survives_atomic_replacement \
-            --require tests::administrator_provider_selection_reads_machine_config_and_environment_only \
-            --require tests::recognizer_device_selection_reads_machine_config_and_environment_only \
-            --require tests::recognizer_device_selection_skips_or_attempts_npu_placement \
-            --require selection_provenance_tests::selection_provenance_retirement_preserves_intent_and_peer_privacy \
-            --require tests::health_reports_the_published_engine_bits \
-            --require tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
-            --require selection_provenance_tests::selection_provenance_stamps_one_copied_plan_despite_newer_publication \
-            -- cargo test --locked -p irlume-daemon --features npu --bin irlumed -- --exact \
-            tests::retired_gpu_settings_have_no_effect \
-            tests::npu_settings_snapshot_survives_atomic_replacement \
-            tests::administrator_provider_selection_reads_machine_config_and_environment_only \
-            tests::recognizer_device_selection_reads_machine_config_and_environment_only \
-            tests::recognizer_device_selection_skips_or_attempts_npu_placement \
-            selection_provenance_tests::selection_provenance_retirement_preserves_intent_and_peer_privacy \
-            tests::health_reports_the_published_engine_bits \
-            tests::health_projects_provider_errors_for_non_root_and_preserves_root_detail \
-            selection_provenance_tests::selection_provenance_stamps_one_copied_plan_despite_newer_publication
 
       - name: irlume-vision with every feature compiles
         run: cargo check -p irlume-vision --all-features --locked

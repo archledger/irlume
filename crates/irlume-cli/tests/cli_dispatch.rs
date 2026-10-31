@@ -806,7 +806,6 @@ fn setup_already_enrolled_skips_reenroll_and_reports_arm_failure() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
-            recognizer: None,
             split_trust: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -853,7 +852,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
-            recognizer: None,
             split_trust: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {
@@ -898,7 +896,6 @@ fn setup_enroll_merge_and_enroll_failure_paths() {
             ir_pad: Some(irlume_common::PadModelStatus::Loaded),
             version: env!("CARGO_PKG_VERSION").into(),
             apparmor: None,
-            recognizer: None,
             split_trust: None,
         },
         Request::ListProfiles { .. } => Response::Enrollment {

@@ -39,8 +39,6 @@ mod recovery;
 mod retry;
 mod seal_storage;
 mod secrets;
-#[cfg(test)]
-mod selection_provenance_tests;
 mod sensor_policy;
 mod split;
 mod strays;
@@ -6036,66 +6034,6 @@ fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
     }
 }
 
-/// The `recognizer-selection` row when the daemon reported its placement
-/// (#1053): `info` naming the governing `recognizer_device` word and what it
-/// still leaves to admission and certification, or `unknown` when the daemon
-/// reported no selection or one this build does not know. Pure so the
-/// wording is testable without a daemon.
-fn recognizer_selection_row(selection: Option<&str>) -> (crate::doctor_report::State, String) {
-    use crate::doctor_report::State;
-    match selection {
-        Some("auto") => (
-            State::Info,
-            "auto; only a certified device can take the recognizer off CPU".to_owned(),
-        ),
-        Some("cpu") => (
-            State::Info,
-            "cpu; every probe stays on the CPU reference".to_owned(),
-        ),
-        Some("npu") => (
-            State::Info,
-            "npu; admission and certification still decide".to_owned(),
-        ),
-        Some(other) => (
-            State::Unknown,
-            format!("the daemon reported an unrecognized selection ({other})"),
-        ),
-        None => (
-            State::Unknown,
-            "the daemon did not report a device selection".to_owned(),
-        ),
-    }
-}
-
-/// Extend the existing selection row without changing its severity. All new
-/// text comes from closed enums; a rejected raw setting is never displayed.
-fn recognizer_selection_report(
-    selection: Option<&str>,
-    provenance: Option<&irlume_common::recognizer_selection::RecognizerSelectionProvenance>,
-) -> (crate::doctor_report::State, String) {
-    use irlume_common::recognizer_selection::{
-        RecognizerSelectionIssue as Issue, RecognizerSelectionSource as Source,
-    };
-    let (state, line) = recognizer_selection_row(selection);
-    let Some(provenance) = provenance else {
-        return (state, format!("{line}; source not reported"));
-    };
-    let source = match provenance.source {
-        Source::Default => "default",
-        Source::Settings => "settings",
-        Source::Environment => "environment",
-        Source::Unknown => "unknown",
-    };
-    let issue = match provenance.issue {
-        Issue::None => "none",
-        Issue::InvalidValue => "invalid value",
-        Issue::DuplicateKey => "duplicate key",
-        Issue::UnreadableSettings => "unreadable settings",
-        Issue::Unknown => "unknown",
-    };
-    (state, format!("{line}; source: {source}; issue: {issue}"))
-}
-
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -6642,81 +6580,6 @@ fn doctor_run(
         };
         dout!(report, "  {}: {line}", s.stage);
         report.check_detail(id, state, line);
-    }
-    // --- recognizer placement (ADR-0022 §13) --------------------------------
-    // Where the daemon's recognizer computes authentication probes, as the
-    // daemon reports it. Without its answer this is unknown, not CPU.
-    match irlume_common::client::request_poll(&irlume_common::Request::Health) {
-        Ok(irlume_common::Response::Health {
-            recognizer: Some(placement),
-            ..
-        }) => {
-            let line = match &placement.reason {
-                None => "NPU".to_owned(),
-                Some(reason) => format!("CPU: {reason}"),
-            };
-            dout!(report, "[doctor] recognizer: {line}");
-            report.check_detail("recognizer-device", State::Info, line);
-            let (selection_state, selection_line) = recognizer_selection_report(
-                placement.selection.as_deref(),
-                placement.selection_provenance.as_ref(),
-            );
-            dout!(report, "[doctor] recognizer selection: {selection_line}");
-            report.check_detail("recognizer-selection", selection_state, selection_line);
-            let (runtime_state, runtime_line) = match placement.runtime_available {
-                Some(true) => (
-                    State::Info,
-                    "available to this engine; provider-neutral discovery succeeded",
-                ),
-                Some(false) => (
-                    State::Info,
-                    "unavailable to this engine; see the recognizer reason",
-                ),
-                None => (
-                    State::Unknown,
-                    "runtime discovery was not attempted or reported",
-                ),
-            };
-            dout!(report, "[doctor] NPU runtime: {runtime_line}");
-            report.check_detail("npu-runtime", runtime_state, runtime_line);
-            let (qualification_state, qualification_line) = match placement.qualified {
-                Some(true) => (State::Info, "qualified for this engine's NPU placement"),
-                Some(false) => (
-                    State::Info,
-                    "not qualified for current placement; CPU reference active",
-                ),
-                None => (State::Unknown, "no model qualification was reported"),
-            };
-            dout!(report, "[doctor] NPU qualification: {qualification_line}");
-            report.check_detail("npu-qualification", qualification_state, qualification_line);
-            let platform = placement
-                .platform
-                .unwrap_or_else(|| "no NPU platform identity was read".to_owned());
-            dout!(report, "[doctor] NPU platform: {platform}");
-            report.check_detail("npu-platform", State::Info, platform);
-        }
-        Ok(irlume_common::Response::Health { .. }) => {
-            report.check_detail(
-                "recognizer-device",
-                State::Unknown,
-                "the daemon predates this report",
-            );
-            report.check("recognizer-selection", State::Unknown);
-            report.check("npu-platform", State::Unknown);
-            report.check("npu-runtime", State::Unknown);
-            report.check("npu-qualification", State::Unknown);
-        }
-        _ => {
-            report.check_detail(
-                "recognizer-device",
-                State::Unknown,
-                "the daemon did not answer",
-            );
-            report.check("recognizer-selection", State::Unknown);
-            report.check("npu-platform", State::Unknown);
-            report.check("npu-runtime", State::Unknown);
-            report.check("npu-qualification", State::Unknown);
-        }
     }
     // --- companion factors / data-at-rest ----------------------------------
     let fp_names = irlume_fingerprint::device_names();
@@ -8870,29 +8733,6 @@ mod tests {
         );
         assert!(!line.contains("sudo irlume login enable --apply"), "{line}");
         assert!(!line.contains('\u{2014}'), "{line}");
-    }
-
-    /// #1053: each selection word contract 1 knows is an `info` row naming
-    /// it. A placement reported without a selection (a daemon that predates
-    /// the report) is `unknown`, and so is a word this build does not know.
-    #[test]
-    fn doctor_recognizer_selection_row_names_the_governing_selection() {
-        use crate::doctor_report::State;
-        for word in ["auto", "cpu", "npu"] {
-            let (state, line) = recognizer_selection_row(Some(word));
-            assert_eq!(state, State::Info, "{word}");
-            assert!(line.starts_with(&format!("{word}; ")), "{line}");
-        }
-        assert_eq!(
-            recognizer_selection_row(None),
-            (
-                State::Unknown,
-                "the daemon did not report a device selection".to_owned()
-            )
-        );
-        let (state, line) = recognizer_selection_row(Some("tpu"));
-        assert_eq!(state, State::Unknown);
-        assert!(line.contains("(tpu)"), "{line}");
     }
 
     fn argv(args: &[&str]) -> Vec<String> {

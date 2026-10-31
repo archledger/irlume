@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_domains_keep_records_and_certification_projections_separate() {
+    fn generated_domains_keep_records_and_projections_separate() {
         let enrolled = generate(Domain::Enrollable).unwrap();
         let complete = generate(Domain::Complete).unwrap();
         assert_eq!(enrolled.saturation, 102);
@@ -444,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn certification_projections_equal_independent_raw_count_series() {
+    fn projections_equal_independent_raw_count_series() {
         for (domain, last) in [(Domain::Enrollable, 90), (Domain::Complete, 102)] {
             let set = generate(domain).unwrap();
             let mut rgb: Vec<_> = (1..=last)

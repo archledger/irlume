@@ -3,7 +3,7 @@
 
 //! Fixed, synthetic inputs through the unchanged engine decision boundary.
 //! The golden preserves outcomes and trace order for a later refactor; it is
-//! neither a biometric corpus nor NPU certification evidence.
+//! not a biometric corpus.
 
 use super::*;
 use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind};

@@ -126,8 +126,8 @@ whose images are the deep-funneled alignment; any copy with the standard
 `Person_Name_NNNN.jpg` filenames runs. No committed run compares copies for
 this figure, and the deep-funneled copy scores differently from the original
 images for the ViT PAD cue ([the dim-room
-record](research/2026-10-21-vit-dim-room-cue-evaluation.md)), so
-certification runs both ([ADR-0022 amendment
+record](research/2026-10-21-vit-dim-room-cue-evaluation.md)), so a comparison
+names its copy (as in the withdrawn [ADR-0022 amendment
 2026-10-22](adr/0022-npu-inference-under-per-model-certification.md#amendment-2026-10-22-certification-corpora-and-decisions-at-full-extent)).
 Then run the all-pairs benchmark against the bundled recognizer:
 

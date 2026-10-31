@@ -2,9 +2,9 @@
 // Copyright the irlume contributors.
 
 //! The identity arms that turn match scores into a grant, as pure
-//! functions. Authentication calls them, and [`decision_fingerprint`] runs
-//! exactly this code on fixed synthetic inputs, so a certified NPU entry is
-//! bound to the decision it was measured through (ADR-0022 §3).
+//! functions. Authentication calls them, and the tests' decision fingerprint
+//! runs exactly this code on fixed synthetic inputs and pins the result, so a
+//! change to a grant decision has to show up in review (ADR-0039 section 2).
 //!
 //! Gates (liveness, PAD, the per-user IR floor, scene routing) run before
 //! these arms and stay in the engine: they decide whether an attempt may be
@@ -13,10 +13,14 @@
 use super::rgb_primary_grant_admissible;
 use irlume_core::fusion::{self, Fusion};
 use irlume_vision::align;
+#[cfg(test)]
 pub(super) mod fingerprint;
+#[cfg(test)]
 mod thresholds;
+#[cfg(test)]
 mod witnesses;
-pub use fingerprint::decision_fingerprint;
+#[cfg(test)]
+use fingerprint::decision_fingerprint;
 
 /// The identity arm whose comparison consumes the threshold.
 #[derive(Clone, Copy, Debug)]
@@ -466,6 +470,7 @@ pub(super) fn lit_verdict(
     LitVerdict { rgb, ir }
 }
 
+#[cfg(test)]
 /// How often each arm granted and denied over the fingerprint's grid, so a
 /// test can show the grid crosses every boundary.
 #[derive(Debug, Default)]
@@ -479,15 +484,18 @@ pub(super) struct Coverage {
     pub(super) calibrated: usize,
 }
 
+#[cfg(test)]
 /// Count a grid outcome for [`Coverage`] and return it as a byte.
 fn count(value: bool, counts: &mut [usize; 2]) -> u8 {
     counts[usize::from(value)] += 1;
     u8::from(value)
 }
 
+#[cfg(test)]
 /// The recognizer space the fingerprint's synthetic templates live in.
 const SPACE: &str = "embed:decision-fingerprint";
 
+#[cfg(test)]
 /// A unit vector of `dim` components, varied by `seed`.
 fn unit(dim: usize, seed: usize) -> Vec<f32> {
     let mut v: Vec<f32> = (0..dim)
@@ -500,6 +508,7 @@ fn unit(dim: usize, seed: usize) -> Vec<f32> {
     v
 }
 
+#[cfg(test)]
 fn scan(name: &str, seed: usize, dim: usize) -> irlume_core::storage::FaceScan {
     irlume_core::storage::FaceScan {
         name: name.into(),
@@ -507,7 +516,6 @@ fn scan(name: &str, seed: usize, dim: usize) -> irlume_core::storage::FaceScan {
         ir: Some(unit(dim, seed + 40)),
         ir_space: Some(irlume_core::storage::IR_RAW_SPACE.into()),
         embed_space: Some(SPACE.into()),
-        embed_producer: None,
         ir_center_edge_ratio: 0.0,
         ir_brightness: 0.0,
         pitch: 0.0,
@@ -515,6 +523,7 @@ fn scan(name: &str, seed: usize, dim: usize) -> irlume_core::storage::FaceScan {
     }
 }
 
+#[cfg(test)]
 /// A synthetic enrollment: one profile with an IR calibration fitted as
 /// enrollment fits it, and one without.
 fn enrollment(dim: usize) -> irlume_core::storage::Enrollment {
@@ -541,6 +550,7 @@ fn enrollment(dim: usize) -> irlume_core::storage::Enrollment {
     enrollment
 }
 
+#[cfg(test)]
 /// Run the production decision code over a fixed synthetic grid, writing
 /// every output to `out`.
 pub(super) fn decision_grid(out: &mut dyn FnMut(&[u8]), coverage: &mut Coverage) {
@@ -825,7 +835,7 @@ mod tests {
     // Pin the pre-refactor grid from 9954e65a. Its stream contains native-size
     // counts and libm results; this baseline was checked on GNU/Linux x86_64
     // with Rust 1.88 (Ubuntu 24.04 and Fedora 44) and stable 1.96 (Fedora 44).
-    // This preserves the existing grid, not complete certification coverage.
+    // This preserves the existing grid.
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
     #[test]
     fn the_existing_arm_grid_fingerprint_matches_the_recorded_reference() {
@@ -894,16 +904,5 @@ mod tests {
         let none = lit_ir_arms(0.30, 120.0, &matched(0.40, 10, None), 60.0, true, false, 1);
         assert_eq!(none.grant, None);
         assert_eq!(none.centroid_threshold, None);
-    }
-
-    /// A certification entry applies only through the decision code it was
-    /// measured with (ADR-0022 §3).
-    #[cfg(feature = "npu")]
-    #[test]
-    fn certified_entries_carry_this_decision_fingerprint() {
-        let now = decision_fingerprint();
-        for entry in irlume_vision::npu::CERTIFIED {
-            assert_eq!(entry.decision_fingerprint, now, "{}", entry.model_sha256);
-        }
     }
 }

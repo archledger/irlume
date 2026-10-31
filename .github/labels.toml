@@ -172,10 +172,10 @@ issue_area = ["Face recognition or matching"]
 
 [labels.vision]
 color = "f9d0c4"
-description = "Face detection, landmarks and recognition inference; CPU and NPU execution"
-title_tokens = ["vision", "npu", "detection", "recognition", "ort", "openvino"]
-paths = ["crates/irlume-vision/*", "docs/NPU.md", "docs/recognition-results/*", "scripts/fetch-ort.sh", "scripts/build-tflite-runtime*"]
-issue_title = '\b(NPU|OpenVINO|onnxruntime|execution providers?|inference|face detect\w*|landmarks?|face mesh)\b'
+description = "Face detection, landmarks and recognition inference"
+title_tokens = ["vision", "detection", "recognition", "ort"]
+paths = ["crates/irlume-vision/*", "docs/recognition-results/*", "scripts/fetch-ort.sh", "scripts/build-tflite-runtime*"]
+issue_title = '\b(onnxruntime|execution providers?|inference|face detect\w*|landmarks?|face mesh)\b'
 
 [labels.enrollment]
 color = "fbca04"

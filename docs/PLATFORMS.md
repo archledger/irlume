@@ -20,7 +20,7 @@ anywhere not listed, an issue report with your distro, camera, and
 | Login keyring and app vaults | TPM-backed GNOME/KDE keyring paths; measured Bitwarden polkit quick unlock | First vault unlock and keyring unlock are different operations. No direct KeePassXC/1Password qualification ([app integration](APP-INTEGRATION.md)) |
 | KDE settings | Shipped KCM dashboard and deep-linked TUI actions | Native privileged controls are optional future work; NixOS KCM runtime loading remains unverified and default-off ([KCM](KCM.md)) |
 | MIPI/IPU and other cameras | Census can identify unsupported pipelines | Detection is not a qualified capture/illumination backend. Usable UVC IR needs an accepted 8-bit grey stream and illumination evidence |
-| Optional acceleration | CPU default; optional NPU under ADR-0022 | Compile success, including external NPU research, does not establish device execution, inference parity or end-to-end speedup |
+| Acceleration | CPU only | GPU and NPU inference were removed before any release (ADR-0038, ADR-0039) |
 
 ## Unreleased: RGB-only shared-greeter admission
 

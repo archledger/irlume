@@ -108,19 +108,6 @@ pub struct Engine {
     /// weights. Stamped onto every scan enrolled and required to match at
     /// verification: cosine scores are only meaningful inside one space.
     embed_space: String,
-    /// The producer tag of the scans this engine embeds (ADR-0022 §2),
-    /// computed once from the CPU reference; `None` until computed or when
-    /// it cannot be.
-    embed_producer: Option<String>,
-    /// The NPU platform identity digest the recognizer was placed for, when
-    /// discovery read one (ADR-0022 §13).
-    npu_platform: Option<String>,
-    #[cfg(feature = "npu")]
-    npu_runtime_available: Option<bool>,
-    /// Whether this request's probes may run on the NPU: set only by an
-    /// authentication whose enrollment admits it, and cleared when that
-    /// request's scope ends (ADR-0022 §2). Every other path embeds on CPU.
-    npu_probe: bool,
     /// The RGB match threshold for THIS recognizer. Always the shipped
     /// constant for the shipped model (the third-party recognizer lane was
     /// removed by ADR-0015); a threshold is a property of one model's cosine
@@ -298,13 +285,8 @@ impl Assessment {
 // Its identity inputs carry actual detected faces, not placeholder embeddings.
 mod authentication_window;
 mod identity_arms;
-mod npu_probe;
 pub use authentication_window::AuthenticationWindow;
-pub use identity_arms::decision_fingerprint;
 use identity_arms::{ir_match_in, IrMatch};
-/// The NPU runtime the daemon opens for the recognizer (ADR-0022).
-#[cfg(feature = "npu")]
-pub use irlume_vision::npu;
 mod grouped_auth;
 mod managed_pad;
 
@@ -1970,7 +1952,6 @@ mod adapter_match_tests {
                 ir: Some(template),
                 ir_space: Some("adapter-test".into()),
                 embed_space: None,
-                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -4215,11 +4196,6 @@ impl Engine {
             ir_adapter_required: false,
             ir_space: "raw".into(),
             embed_space,
-            embed_producer: None,
-            npu_platform: None,
-            #[cfg(feature = "npu")]
-            npu_runtime_available: None,
-            npu_probe: false,
             rgb_threshold: irlume_core::RGB_MATCH_THRESHOLD,
             mesh: None,
             blaze: None,
@@ -5229,7 +5205,10 @@ impl Engine {
                     width: image.width,
                     height: image.height,
                 };
-                Some(self.embed_rgb_probe(&align::align_to_arcface(&view, &image.face.landmarks)?)?)
+                Some(
+                    self.emb
+                        .embed_tta(&align::align_to_arcface(&view, &image.face.landmarks)?)?,
+                )
             }
             None => None,
         };
@@ -6720,7 +6699,7 @@ impl Engine {
                     height: image.height,
                 };
                 let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
-                Some(self.embed_rgb_probe(&chip)?)
+                Some(self.emb.embed_tta(&chip)?)
             }
             None => None,
         };
@@ -6735,7 +6714,7 @@ impl Engine {
                     height: image.height,
                 };
                 let chip = align::align_to_arcface(&view, &image.face.landmarks)?;
-                let raw = self.embed_ir_probe(&chip)?;
+                let raw = self.emb.embed(&chip)?;
                 Some(match &mut self.ir_adapter {
                     Some(a) => a.apply(&raw)?,
                     None => raw.to_vec(),
@@ -7248,10 +7227,6 @@ impl Engine {
                 Err(outcome) => return Ok(outcome),
             }
         };
-        // Probes may run on the NPU only for an enrollment whose every scan
-        // came from the certified CPU reference (ADR-0022 §2); the request's
-        // scope clears this on every return path.
-        self.npu_probe = self.npu_probe_admitted(&enr);
         let request_window = request_window.clipped_to(self.authentication_window_from(
             request_window.origin(),
             service,
@@ -8133,8 +8108,8 @@ impl Engine {
                     ));
                 }
             }
-            // The decisions are identity_arms' pure functions (the decision
-            // fingerprint of ADR-0022 §3 runs the same code); this block
+            // The decisions are identity_arms' pure functions (the tests' decision
+            // fingerprint runs the same code); this block
             // traces them in the order they are reached.
             let verdict = identity_arms::lit_verdict(
                 &self.decision_context(),
@@ -8707,8 +8682,8 @@ impl Engine {
             ));
         };
         let chip = align::align_to_arcface(&view, &f.landmarks)?;
-        let emb_first = self.emb.on_cpu().embed(&chip)?;
-        let emb_second = self.emb.on_cpu().embed(&chip)?;
+        let emb_first = self.emb.embed(&chip)?;
+        let emb_second = self.emb.embed(&chip)?;
         let cos = align::cosine(&emb_first, &emb_second);
         Ok((
             cos > 0.999,
@@ -9632,8 +9607,6 @@ impl Engine {
             let mut ambient_lit = 0usize;
             // One capture session, one date (ADR-0030 §2).
             let captured_at = irlume_core::storage::capture_time_now();
-            // The CPU reference that embedded these scans (ADR-0022 §2).
-            let embed_producer = self.embed_producer();
             for s in captured.into_iter().take(room) {
                 if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                     ambient_lit += 1;
@@ -9647,7 +9620,6 @@ impl Engine {
                     ir: s.ir,
                     ir_space,
                     embed_space: Some(self.embed_space.clone()),
-                    embed_producer: embed_producer.clone(),
                     ir_center_edge_ratio: s.center_edge_ratio,
                     ir_brightness: s.brightness,
                     pitch: s.pitch,
@@ -9688,8 +9660,6 @@ impl Engine {
         // One capture session, one date (ADR-0030 §2); an added camera's
         // scans are captured here too and keep it in the camera store.
         let captured_at = irlume_core::storage::capture_time_now();
-        // The CPU reference that embedded these scans (ADR-0022 §2).
-        let embed_producer = self.embed_producer();
         for s in captured {
             if s.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -9702,7 +9672,6 @@ impl Engine {
                 ir: s.ir,
                 ir_space,
                 embed_space: Some(self.embed_space.clone()),
-                embed_producer: embed_producer.clone(),
                 ir_center_edge_ratio: s.center_edge_ratio,
                 ir_brightness: s.brightness,
                 pitch: s.pitch,
@@ -10089,8 +10058,6 @@ impl Engine {
         let mut ambient_lit = 0usize;
         // One capture session, one date (ADR-0030 §2).
         let captured_at = storage::capture_time_now();
-        // The CPU reference that embedded these scans (ADR-0022 §2).
-        let embed_producer = self.embed_producer();
         for c in captured {
             if c.ambient_share.is_some_and(|v| v >= AMBIENT_LIT_SHARE) {
                 ambient_lit += 1;
@@ -10103,7 +10070,6 @@ impl Engine {
                 ir: c.ir,
                 ir_space,
                 embed_space: Some(self.embed_space.clone()),
-                embed_producer: embed_producer.clone(),
                 ir_center_edge_ratio: c.center_edge_ratio,
                 ir_brightness: c.brightness,
                 pitch: c.pitch,
@@ -11506,7 +11472,6 @@ mod tests {
                 ir: Some(ir.clone()),
                 ir_space: Some("raw".into()),
                 embed_space: None,
-                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -12421,7 +12386,6 @@ mod tests {
             ir: None,
             ir_space: None,
             embed_space: None,
-            embed_producer: None,
             ir_center_edge_ratio: 0.0,
             ir_brightness: 0.0,
             pitch: 0.0,
@@ -13426,7 +13390,6 @@ mod tests {
                 ir: Some(v.to_vec()),
                 ir_space: Some("raw".into()),
                 embed_space: None,
-                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.0,
@@ -14376,7 +14339,6 @@ mod engine_tests {
             ir: ir.then(|| unit512(seed + 100)),
             ir_space: space.map(String::from),
             embed_space: None,
-            embed_producer: None,
             ir_center_edge_ratio: 1.3,
             ir_brightness: 90.0,
             pitch: 0.5,
@@ -14398,7 +14360,6 @@ mod engine_tests {
                 ir: None,
                 ir_space: None,
                 embed_space: None,
-                embed_producer: None,
                 ir_center_edge_ratio: 0.0,
                 ir_brightness: 0.0,
                 pitch: 0.5,
@@ -15786,124 +15747,6 @@ mod engine_tests {
         s.engine.refit_profile_calib(&mut fresh);
         assert!(fresh.ir_calib.is_none(), "adapter mode must not fit anew");
         s.engine.ir_adapter = None; // restore the shared baseline
-    }
-
-    #[test]
-    fn new_scans_record_the_cpu_reference_that_embedded_them() {
-        // ADR-0022 §2: the producer names the recognizer, the loaded ONNX
-        // Runtime and the CPU session's exact outputs; it is computed once.
-        let _g = env_guard();
-        let _s = shared();
-        let bytes = std::fs::read(model_path("glintr100.onnx")).unwrap();
-        let sha = irlume_common::sha256_hex(&bytes);
-        let mut engine = Engine::load_with_recognizer_weights(
-            &model_path("face_detection_yunet_2023mar.onnx"),
-            &irlume_common::HashedModel::new(bytes),
-        )
-        .expect("engine from bytes");
-        let runtime = irlume_vision::onnx_runtime_version().expect("ONNX Runtime");
-        assert!(
-            !runtime.is_empty() && runtime.chars().all(|c| c.is_ascii_digit() || c == '.'),
-            "the version alone, without the library path: {runtime}"
-        );
-        let producer = engine.embed_producer().expect("a producer");
-        assert!(
-            producer.starts_with(&format!("cpu:{sha}:ort-{runtime}:")),
-            "{producer}"
-        );
-        assert_eq!(
-            producer.len(),
-            format!("cpu:{sha}:ort-{runtime}:").len() + 64
-        );
-        assert_eq!(engine.embed_producer().as_deref(), Some(producer.as_str()));
-        // Without a recognizer placed on the NPU, no enrollment admits an
-        // NPU probe, even one made entirely by this producer.
-        let mut enr = Enrollment::new("u");
-        enr.profiles.push(irlume_core::storage::FaceProfile {
-            name: "p".into(),
-            scans: vec![FaceScan {
-                name: "s".into(),
-                rgb: vec![0.0; EMBED_DIM],
-                ir: None,
-                ir_space: None,
-                embed_space: Some(engine.embed_space().to_owned()),
-                embed_producer: Some(producer),
-                ir_center_edge_ratio: 0.0,
-                ir_brightness: 0.0,
-                pitch: 0.0,
-                captured_at: None,
-            }],
-            ir_calib: None,
-            ir_calibs: std::collections::BTreeMap::new(),
-        });
-        assert!(!engine.npu_probe_admitted(&enr));
-        assert!(!engine.npu_probe);
-    }
-
-    #[test]
-    fn the_npu_thresholds_are_the_wired_ones() {
-        let _g = env_guard();
-        let _s = shared();
-        let engine = Engine::load(
-            &model_path("face_detection_yunet_2023mar.onnx"),
-            &model_path("glintr100.onnx"),
-        )
-        .expect("engine");
-        let thresholds = engine.npu_thresholds();
-        assert_eq!(
-            thresholds[0],
-            ("RGB_MATCH_THRESHOLD", irlume_core::RGB_MATCH_THRESHOLD)
-        );
-        let names: Vec<&str> = thresholds.iter().map(|(name, _)| *name).collect();
-        let mut unique = names.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), names.len(), "each name once");
-    }
-
-    #[cfg(feature = "npu")]
-    #[test]
-    fn npu_probe_placement_preserves_unreported_and_failed_discovery() {
-        let _g = env_guard();
-        let _s = shared();
-        let weights =
-            irlume_common::HashedModel::new(std::fs::read(model_path("glintr100.onnx")).unwrap());
-        let mut engine = Engine::load_with_recognizer_weights(
-            &model_path("face_detection_yunet_2023mar.onnx"),
-            &weights,
-        )
-        .unwrap();
-        struct Sandbox(std::path::PathBuf);
-        impl Drop for Sandbox {
-            fn drop(&mut self) {
-                teardown_sandbox(&self.0);
-            }
-        }
-        let directory = Sandbox(state_sandbox("npu-observation"));
-        let bad_cache = directory.0.join("not-a-directory");
-        std::fs::write(&bad_cache, b"fixture").unwrap();
-        let mut context = engine.open_npu_context(&bad_cache);
-        engine
-            .place_recognizer_on_npu(&weights, &mut context)
-            .unwrap();
-        let placement = engine.recognizer_placement();
-        assert_eq!(placement.device, "cpu");
-        assert_eq!(placement.runtime_available, None);
-        assert_eq!(placement.platform, None);
-        assert_eq!(placement.qualified, None);
-        let mut context = engine.open_npu_context_with_runtime(
-            &directory.0,
-            &irlume_vision::npu::RuntimeSelection::Rejected("fixture rejected"),
-        );
-        engine
-            .place_recognizer_on_npu(&weights, &mut context)
-            .unwrap();
-        assert_eq!(engine.recognizer_placement().runtime_available, Some(false));
-        let mut context = irlume_vision::npu::Context::disabled();
-        engine
-            .place_recognizer_on_npu(&weights, &mut context)
-            .unwrap();
-        assert_eq!(engine.recognizer_placement().runtime_available, None);
     }
 
     #[test]

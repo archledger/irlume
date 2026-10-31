@@ -80,8 +80,6 @@ pub(super) struct Scope<'a> {
 impl Drop for Scope<'_> {
     fn drop(&mut self) {
         self.engine.authentication_deadline = self.previous;
-        // An NPU admission belongs to this request only (ADR-0022 §2).
-        self.engine.npu_probe = false;
     }
 }
 

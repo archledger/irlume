@@ -74,7 +74,6 @@ fn scan(rgb: Vec<f32>, ir: Vec<f32>) -> FaceScan {
         ir: Some(ir),
         ir_space: Some(IR_SPACE.into()),
         embed_space: Some(SPACE.into()),
-        embed_producer: None,
         ir_center_edge_ratio: 0.0,
         ir_brightness: 0.0,
         pitch: 0.0,

@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Removed
 
+- NPU inference, which no tagged release carried (ADR-0039, #1244). The runtime,
+  certification table, loading admission, provider and device selection and the
+  `npu` feature are gone, with the `openvino` crates. Every model runs on the CPU,
+  as every release has. `recognizer_device`, `npu`, `npu_library` and their
+  `IRLUME_` variables are no longer read, so a line left behind does nothing. A
+  scan's `embed_producer` from a nightly build still loads and is dropped on the
+  next write. The `recognizer` status object and the `recognizer-device`,
+  `recognizer-selection`, `npu-platform`, `npu-runtime` and `npu-qualification`
+  doctor ids leave contract 1, and those ids are never reused. The AppArmor
+  profiles, unit and Nix module lose their NPU cache, device and library rules.
+  Earlier entries in this section that describe NPU placement, selection or
+  reporting describe work that never shipped.
 - GPU inference, which no tagged release carried (ADR-0038, #1053). A nightly
   build's `recognizer_device=gpu` now takes the invalid-value path to `auto`
   with a journal warning, and its `gpu` key and `IRLUME_GPU` are no longer read.
@@ -18,21 +30,13 @@ All notable changes to irlume are documented here. This project adheres to
   recognizer ranking API goes with them.
 - The `irlume-vision` features `cuda`, `openvino`, `coreml` and `tensorrt`, which
   custom builds of 0.15.0 could enable, and the `IRLUME_TEST_ALLOW_UNCERTIFIED_EP`
-  escape behind them (ADR-0038 section 2). The NPU's `npu` feature is unaffected.
+  escape behind them (ADR-0038 section 2).
 - The private measurement tooling built for the GPU campaign, which no shipped
   program used (ADR-0038, amendment 2026-10-30): the `irlume_hw_evidence` build,
   measurement profiles and fixtures, `native-metadata`, its fuzz targets and the
   contained-job scripts. The `elf` dependency goes with it.
 
 ### Added
-
-- Both daemon AppArmor profiles let oneTBB, which the NPU runtime loads, read
-  `/proc/sys/vm/nr_hugepages` and the transparent huge page mode (#1046).
-
-- Selection-source and parsing-issue reporting in Health, `status --json`
-  and doctor (#1163). Missing provenance remains unreported;
-  rejected raw settings are not exposed. Selection and accelerator placement
-  behavior are unchanged.
 
 - The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
   control (unit 8, selector 6, D1 on interface 1), validated by maurerr's

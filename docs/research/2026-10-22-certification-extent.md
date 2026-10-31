@@ -1,5 +1,8 @@
 # Certification extent: corpora, decision arms and the difference record
 
+> **Superseded (2026-10-31):** NPU inference was removed by
+> [ADR-0039](../adr/0039-remove-npu-inference.md). This record remains historical evidence for that decision.
+
 Research record for the ADR-0022 amendment of 2026-10-22 ("certification
 corpora and decisions at full extent"), #1164. Reading and counting only: no
 measurement ran for this record, no loading profile is admitted, `CERTIFIED`

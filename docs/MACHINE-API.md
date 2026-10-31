@@ -125,8 +125,14 @@ One exception is on record, for surfaces no tagged release carried. Nightly
 builds reported a `gpu` selection, the `recognizer` fields `accelerator`,
 `gpu_platform`, `gpu_runtime_available` and `gpu_qualified`, and the doctor ids
 `gpu-platform`, `gpu-runtime` and `gpu-qualification`. They left contract 1 with
-GPU inference, before any release (ADR-0038 section 4). `device: "npu"` reports an
-NPU placement. The three doctor ids are never reused.
+GPU inference, before any release (ADR-0038 section 4). The three doctor ids are
+never reused.
+
+A second exception, on the same grounds. Nightly builds reported a `recognizer`
+object with its selection provenance, and the doctor ids `recognizer-device`,
+`recognizer-selection`, `npu-platform`, `npu-runtime` and `npu-qualification`. They
+left contract 1 with NPU inference, before any release (ADR-0039 section 5). The
+five doctor ids are never reused.
 
 ## Commands
 
@@ -184,68 +190,6 @@ nodes. `fingerprint_known` says the bounded tooling/reader probe completed; when
 false, the retained `fingerprint: false` boolean is an unobserved fallback rather
 than confirmed absence. These added fields are optional for older contract-1
 producers; consumers should not infer an observation when they are absent.
-
-`recognizer` reports the daemon's engine placement for authentication probes
-(ADR-0022): `device` is `npu` or `cpu`, with `reason` on CPU and `platform`, the
-NPU platform identity digest, when one was read. `known` is false, with no other
-field, when the daemon did not answer or predates the report. It is optional for
-older contract-1 producers.
-
-Optional `recognizer.runtime_available` is `true` when discovery completed with
-a runtime/platform identity, or `false` when discovery returned an error other
-than loading-admission refusal. It is omitted when discovery is unreported,
-including a loading-admission refusal or a cache/marker preparation failure
-before discovery runs. Successful discovery retains availability and `platform`
-across later marker-cleanup, cache or placement errors.
-
-Optional `recognizer.qualified` is reported only when `runtime_available` is
-`true`: it is `true` for current NPU placement after qualification and placement
-checks, and `false` when the recognizer stays on or retires to CPU. Missing
-fields from older peers remain absent; clients must not infer `false`.
-
-Optional `recognizer.selection` is the device selection governing the placement
-(`recognizer_device` in `settings.conf`): `auto`, `cpu` or `npu`. It is the
-administrator's configured target, not a placement claim: `auto` and `npu` still
-leave admission and certification to decide, and `cpu` keeps every probe on the
-CPU reference. It is omitted when the daemon does not report one.
-
-Optional `recognizer.selection_provenance` describes the source and parsing
-result of that governing selection, not a ranking result or actual execution:
-
-```json
-"selection_provenance": { "source": "environment", "issue": "invalid_value" }
-```
-
-`source` is `default`, `settings`, `environment` or `unknown`. `default` means
-the daemon observed no authoritative selection value; `settings` includes a
-refused or unreadable settings snapshot; a present environment value remains
-authoritative even when invalid. `issue` is `none`, `invalid_value`,
-`duplicate_key`, `unreadable_settings` or `unknown`. `none` explicitly reports
-no parsing issue. Invalid values still resolve to `auto` under the existing
-selection policy. No rejected raw value is carried.
-
-An absent or null outer field means provenance was not reported. Missing object
-members and future string values decode as `unknown`, never as `default` or
-`none`; wrong JSON types remain decoding errors. The CLI emits both members
-when it reports the object. The metadata belongs to the successfully published
-engine: a failed rebuild keeps the previous metadata, while retirement changes
-actual execution, not selection provenance. Doctor includes the same metadata
-in its existing `recognizer-selection` row without changing its severity just
-because an older daemon omits it. Existing `device` semantics are unchanged, and
-this field does not imply a resolver ran.
-
-These are engine facts, not a per-account guarantee. Matchable scans with
-missing or different CPU-producer tags, including legacy enrollments, require
-CPU probes even if the engine reports NPU placement. Non-root Health replies
-expose fixed CPU-fallback categories (discovery not reported, runtime unavailable,
-or recognizer unavailable). Only root peers receive bounded native error details;
-the privileged journal also retains detailed reasons. Reason text is diagnostic,
-not a stable value for clients to match.
-
-Native loading is currently closed, no installation/launch profile is admitted,
-and the `CERTIFIED` table is empty. No setting bypasses native-entry refusal;
-CPU remains authoritative. These fields describe selection/reporting groundwork,
-not enabled generic NPU runtime support. See [NPU provider selection](NPU.md).
 
 `templates` is `encrypted`, `plaintext`, or `unknown`.
 
@@ -328,11 +272,6 @@ reused for a different meaning. The registry as of this contract:
 | `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
 | `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
 | `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
-| `recognizer-device` | the daemon's engine placement for authentication probes (ADR-0022): `NPU`, or `CPU:` with a peer-appropriate reason. Enrollment producer checks can still require CPU probes. `info`; `unknown` when the daemon did not answer or predates the report |
-| `recognizer-selection` | the device selection governing that placement (`recognizer_device`): `auto`, `cpu` or `npu`, with what each still leaves to admission and certification. `info`; `unknown` when the daemon did not answer or predates the report |
-| `npu-platform` | the NPU platform identity digest the daemon read for the recognizer, or that none was read. `info`; `unknown` as for `recognizer-device` |
-| `npu-runtime` | the engine's runtime discovery observation. `info` for reported availability or failure; `unknown` for unreported discovery, loading-admission refusal, or an older/non-answering daemon |
-| `npu-qualification` | whether the recognizer is currently placed on NPU after qualification/placement checks. `info` for a reported fact; `unknown` when runtime availability is not `true` or qualification is unreported. Discovery alone never implies NPU authentication |
 | `fingerprint-reader` | whether a fingerprint reader was found |
 | `templates` | face templates encrypted at rest for the account asked about |
 | `recovery-passphrase` | whether a recovery passphrase is set |

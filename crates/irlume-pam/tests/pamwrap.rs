@@ -1277,7 +1277,6 @@ fn pamwrap_privileged_tier_observation_preserves_policy_and_older_daemons() {
                 ir_pad: None,
                 version: String::new(),
                 apparmor: None,
-                recognizer: None,
                 split_trust,
             },
             Request::FaceSensorStatus { user: None } => match policy {

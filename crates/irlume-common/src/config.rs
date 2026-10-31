@@ -1357,6 +1357,26 @@ mod tests {
     use super::*;
     use crate::testenv;
 
+    /// ADR-0039 section 3: the NPU settings a nightly build wrote are unknown
+    /// lines now, and the settings around them still read.
+    #[test]
+    fn retired_npu_settings_leave_other_settings_alone() {
+        let _g = testenv::lock();
+        let dir = std::env::temp_dir().join(format!("irlume-cfg-retired-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("IRLUME_CONFIG_DIR", &dir);
+        std::env::remove_var("IRLUME_PRIVILEGED_FACE_CONSENT");
+        std::fs::write(
+            dir.join("settings.conf"),
+            "recognizer_device=npu\nnpu=on\nnpu_library=/opt/x\nprivileged_face_consent=0\n",
+        )
+        .unwrap();
+        assert_eq!(privileged_face_consent_visible(), Some(false));
+        std::env::remove_var("IRLUME_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The privileged-consent key reads env-over-settings like its neighbours,
     /// but Absent means ON: it exists to switch a protection off, so anything
     /// that fails to say otherwise has to leave it standing.

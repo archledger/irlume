@@ -1,5 +1,8 @@
 # NPU measurements for ADR-0022
 
+> **Superseded (2026-10-31):** NPU inference was removed by
+> [ADR-0039](../adr/0039-remove-npu-inference.md). The measurements below remain historical evidence for that decision.
+
 - **What:** measurement 4 of ADR-0022. The implementation of that ADR
   (`irlume-vision` built with its `npu` feature) ran the shipped models on
   an Intel NPU and on their ONNX Runtime CPU sessions, through irlume's own

@@ -41,8 +41,7 @@ Frontend work needs selected-user binding, an independently usable password
 path, explicit start/cancel and no grant after cancellation; it is a design
 candidate, not a shipped integration. Targeted model-interface tests, MIPI/IPU
 diagnostics, accessibility and localization follow their own evidence and user
-needs. Compile-only NPU experiments do not establish inference parity or a
-shipped acceleration guarantee.
+needs.
 
 ## Ongoing
 

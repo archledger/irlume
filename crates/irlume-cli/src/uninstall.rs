@@ -3334,6 +3334,73 @@ mod tests {
         assert_eq!(failed, Err("no tool".to_owned()), "the caller warns");
     }
 
+    /// A local .deb cleanup is driven by what apt actually lists, read from
+    /// the entries themselves: `Enabled: no` PPA entries are disabled, so no
+    /// removal is invoked on their behalf and the user's files keep their
+    /// bytes, while an active own PPA still removes through the same path and
+    /// unrelated entries never enter the decision.
+    #[test]
+    fn local_deb_cleanup_spares_disabled_ppas_and_unrelated_entries() {
+        use crate::commands::{configured_ppa_lanes_in, PpaLane};
+        let apt =
+            std::env::temp_dir().join(format!("irlume-deb822-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&apt);
+        let list_d = apt.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let foreign =
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n";
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let off_list =
+            "# deb https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main\n";
+        let calls = || {
+            let mut seen = Vec::new();
+            let configured = configured_ppa_lanes_in(&apt);
+            remove_install_channel_with(&InstallOrigin::LocalDeb, &configured, |bin, args| {
+                seen.push(format!("{bin} {}", args.join(" ")));
+                Ok(())
+            })
+            .unwrap();
+            (configured, seen)
+        };
+        let disabled_sources = format!("{foreign}\n{ours}Enabled: no\n");
+        std::fs::write(list_d.join("irlume.sources"), &disabled_sources).unwrap();
+        std::fs::write(list_d.join("nightly.list"), off_list).unwrap();
+        let (configured, seen) = calls();
+        assert_eq!(
+            configured,
+            Vec::<PpaLane>::new(),
+            "a disabled PPA is not listed"
+        );
+        assert!(seen.is_empty(), "so no removal runs: {seen:?}");
+        assert_eq!(
+            std::fs::read(list_d.join("irlume.sources")).unwrap(),
+            disabled_sources.as_bytes(),
+            "the disabled entry keeps its bytes"
+        );
+        assert_eq!(
+            std::fs::read(list_d.join("nightly.list")).unwrap(),
+            off_list.as_bytes(),
+            "the commented entry keeps its bytes"
+        );
+        // The same files with the PPA entry active again: exactly its own
+        // removal runs, through the installer's tool, and the unrelated
+        // entries beside it are still only read.
+        std::fs::write(list_d.join("irlume.sources"), format!("{foreign}\n{ours}")).unwrap();
+        let (configured, seen) = calls();
+        assert_eq!(configured, vec![PpaLane::Release]);
+        assert_eq!(
+            seen,
+            vec!["add-apt-repository -y --remove --ppa ppa:archledger/irlume"]
+        );
+        assert!(
+            std::fs::read_to_string(list_d.join("irlume.sources"))
+                .unwrap()
+                .contains("example.org"),
+            "the foreign entry is still there, unread"
+        );
+        std::fs::remove_dir_all(&apt).unwrap();
+    }
+
     // Repository/key directories are shared ownership domains. A filename is
     // not proof that irlume or either channel manager owns an entry.
     #[test]

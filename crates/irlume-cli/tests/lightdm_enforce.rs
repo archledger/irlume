@@ -484,13 +484,50 @@ fn prepare_view(bed: &Bed, remote: bool) -> std::process::Output {
 }
 
 fn prepare_view_with_state(bed: &Bed, remote: bool, state: &str) -> std::process::Output {
+    prepare_view_with_delay(bed, remote, state, None)
+}
+
+fn prepare_view_with_delay(
+    bed: &Bed,
+    remote: bool,
+    state: &str,
+    slow: Option<&str>,
+) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt as _;
+    let pause = if slow.is_some() {
+        let output = Command::new("sh")
+            .args(["-c", "command -v sleep"])
+            .output()
+            .expect("find the test delay utility");
+        assert!(output.status.success());
+        let source = String::from_utf8(output.stdout).unwrap();
+        let utility = bed.root.join("delay-sleep");
+        std::fs::copy(source.trim(), &utility).unwrap();
+        std::fs::set_permissions(&utility, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!(
+            "'{}' 0.75\n",
+            utility.to_str().unwrap().replace('\'', "'\\''")
+        )
+    } else {
+        String::new()
+    };
     for (tool, script) in [
         ("busctl", format!("if [ \"$7\" = ActiveState ]; then printf '%s\\n' '{{\"type\":\"s\",\"data\":\"{state}\"}}'; else printf '%s\\n' '{{\"type\":\"a(sasbttttuii)\",\"data\":[[\"/usr/bin/lightdm\",[\"/usr/bin/lightdm\"],false,0,0,0,0,0,0,0]]}}'; fi")),
         ("lightdm", format!("[ \"$1\" = --show-config ] || exit 99\nprintf '%s\\n' '   [Seat:*]' 'A  pam-service=lightdm' '   [XDMCPServer]' 'A  enabled={remote}' 'Sources:' 'A  /etc/lightdm/lightdm.conf' >&2")),
     ] {
         let path = bed.root.join("bin").join(tool);
-        std::fs::write(&path, format!("#!/bin/sh\n[ \"$#\" -ne 0 ] || exit 0\n{script}\n")).unwrap();
+        let delay = match (slow, tool) {
+            (Some("state"), "busctl") => {
+                format!("if [ \"$7\" = ActiveState ]; then {pause}fi\n")
+            }
+            (Some(wanted), actual) if wanted == actual => pause.clone(),
+            _ => String::new(),
+        };
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$#\" -ne 0 ] || exit 0\n{delay}{script}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let module = bed.root.join("pam_irlume_view.so");
@@ -518,6 +555,39 @@ fn prepare_view_with_state(bed: &Bed, remote: bool, state: &str) -> std::process
         ],
         &["busctl", "lightdm"],
     )
+}
+
+#[test]
+fn prestart_waits_for_a_slow_manager_observation() {
+    let bed = Bed::new("slow-manager", false);
+    let output = prepare_view_with_delay(&bed, false, "inactive", Some("busctl"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(std::fs::read_to_string(bed.root.join("view/pam.d/lightdm"))
+        .unwrap()
+        .contains(WIRED));
+}
+
+#[test]
+fn prestart_waits_for_a_slow_configuration_observation() {
+    let bed = Bed::new("slow-config", false);
+    let output = prepare_view_with_delay(&bed, true, "inactive", Some("lightdm"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        !std::fs::read_to_string(bed.root.join("view/pam.d/lightdm"))
+            .unwrap()
+            .contains("pam_irlume.so unseal")
+    );
+}
+
+#[test]
+fn prestart_waits_for_a_slow_stopped_state_before_relaxing_the_view() {
+    let bed = Bed::new("slow-state", false);
+    assert!(prepare_view(&bed, true).status.success());
+    let output = prepare_view_with_delay(&bed, false, "inactive", Some("state"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(std::fs::read_to_string(bed.root.join("view/pam.d/lightdm"))
+        .unwrap()
+        .contains(WIRED));
 }
 
 #[test]

@@ -5,7 +5,8 @@ Documentation=https://github.com/archledger/irlume
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/irlume login lightdm-refresh
-TimeoutStartSec=3s
+# Allow the same cold executable and configuration reads as preparation.
+TimeoutStartSec=90s
 KillMode=control-group
 PrivateDevices=yes
 PrivateTmp=yes

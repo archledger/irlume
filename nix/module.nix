@@ -398,7 +398,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${cfg.package}/bin/irlume login lightdm-prestart ${pkgs.lightdm}/sbin/lightdm --permit-module ${config.security.pam.package}/lib/security/pam_permit.so --session-module ${cfg.package}/lib/security/pam_irlume_view.so";
-        TimeoutStartSec = "3s";
+        TimeoutStartSec = "90s";
         KillMode = "control-group";
         PrivateDevices = true;
         PrivateTmp = true;
@@ -409,7 +409,7 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${cfg.package}/bin/irlume login lightdm-refresh";
-        TimeoutStartSec = "3s";
+        TimeoutStartSec = "90s";
         KillMode = "control-group";
         PrivateDevices = true;
         PrivateTmp = true;

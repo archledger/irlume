@@ -623,7 +623,12 @@ its servers) and republishes the private, read-only PAM view that the unit
 binds over `/etc/pam.d`. A configuration replaced by rename can therefore not
 produce an unprotected start, and a failed or masked preparation stops the
 LightDM start instead of allowing one; nothing in that hook waits for
-`irlumed`. A path unit watching the PAM directories (`PathModified`, which
+`irlumed`. The private-view services have a 90-second startup allowance for
+cold executable and configuration reads on slow storage, with a 60-second
+deadline for each manager or configuration observation. These are startup
+bounds, not changes to an authentication attempt's budget; a preparation
+failure still blocks the LightDM start. A path unit watching the PAM
+directories (`PathModified`, which
 renames cannot escape) refreshes the view of a running LightDM when the
 distribution regenerates the shared stacks.
 

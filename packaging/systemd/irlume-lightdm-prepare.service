@@ -5,7 +5,9 @@ Documentation=https://github.com/archledger/irlume
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/irlume login lightdm-prestart lightdm.service
-TimeoutStartSec=3s
+# A cold preparation took 34 s on simulated slow storage. Keep a finite budget
+# with room for executable loading and configuration reads during boot.
+TimeoutStartSec=90s
 KillMode=control-group
 PrivateDevices=yes
 PrivateTmp=yes

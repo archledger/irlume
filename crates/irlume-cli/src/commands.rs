@@ -348,13 +348,63 @@ fn is_nightly_copr_repo(repo: &str) -> bool {
 
 /// Which of irlume's PPAs an apt origin line names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PpaLane {
+pub(crate) enum PpaLane {
     Release,
     Nightly,
 }
 
 const RELEASE_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume/ubuntu";
 const NIGHTLY_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu";
+
+/// Which of irlume's PPAs this machine's apt is told to use.
+pub(crate) fn configured_ppa_lanes() -> Vec<PpaLane> {
+    configured_ppa_lanes_in(std::path::Path::new("/etc/apt"))
+}
+
+/// [`configured_ppa_lanes`] over a directory: the active entries decide, never
+/// a file's name, and only the files apt itself reads are looked at.
+pub(crate) fn configured_ppa_lanes_in(apt: &std::path::Path) -> Vec<PpaLane> {
+    let list_d = std::fs::read_dir(apt.join("sources.list.d"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|suffix| suffix == "list" || suffix == "sources")
+        });
+    let mut text = String::new();
+    for path in std::iter::once(apt.join("sources.list")).chain(list_d) {
+        text.push_str(&std::fs::read_to_string(path).unwrap_or_default());
+        text.push('\n');
+    }
+    let active = |ppa: &str| {
+        text.lines()
+            .any(|line| !line.trim_start().starts_with('#') && line.contains(ppa))
+    };
+    let mut lanes = Vec::new();
+    if active(RELEASE_PPA) {
+        lanes.push(PpaLane::Release);
+    }
+    if active(NIGHTLY_PPA) {
+        lanes.push(PpaLane::Nightly);
+    }
+    lanes
+}
+
+/// What to say when the release PPA serves this series nothing and apt still
+/// lists it, as an older `scripts/install.sh` left it: it added the PPA on every
+/// Ubuntu release and fell back to the .deb. Where the PPA has no Release file
+/// for the series, every `apt update` then fails.
+fn stray_ppa_note(codename: &str, configured: &[PpaLane]) -> Option<String> {
+    configured.contains(&PpaLane::Release).then(|| {
+        format!(
+            "  apt still lists that PPA, which has nothing for `{codename}`, and where it has no \
+             Release file `apt update` fails on it. To remove it:\n    \
+             sudo add-apt-repository --remove ppa:archledger/irlume"
+        )
+    })
+}
 
 /// The PPA `apt-cache policy irlume` shows the installed version came from:
 /// the origins listed under the version table's `***` line, matched by whole
@@ -451,6 +501,9 @@ fn recommend_channel(origin: &InstallOrigin) {
                 Some(false) => {
                     println!("  The PPA carries only the current Ubuntu LTS; for `{codename}` the release");
                     println!("  .deb IS your update channel; re-run `irlume update` when a new one is out.");
+                    if let Some(note) = stray_ppa_note(&codename, &configured_ppa_lanes()) {
+                        println!("{note}");
+                    }
                 }
                 None => {
                     println!("  If the PPA serves your Ubuntu series, switching makes future updates automatic:");
@@ -2380,6 +2433,83 @@ mod origin_tests {
             !ort_on_disk(|_| false),
             "nothing on disk anywhere is still absent"
         );
+    }
+
+    /// What apt is told to use decides, read from the entries: a file name proves
+    /// nothing, a commented line is off, and neither PPA is taken for the other.
+    #[test]
+    fn configured_ppas_are_read_from_the_entries_not_the_file_names() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        assert_eq!(lanes(), Vec::<PpaLane>::new(), "nothing there");
+
+        std::fs::write(
+            list_d.join("archledger-ubuntu-irlume-jammy.list"),
+            "# deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("archledger-ubuntu-irlume-noble.sources"),
+            "Types: deb\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "a comment and a name say nothing"
+        );
+
+        std::fs::write(
+            list_d.join("anything.list"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Release], "the old one-line format");
+
+        std::fs::remove_file(list_d.join("anything.list")).unwrap();
+        std::fs::write(
+            list_d.join("nightly.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/\n",
+        )
+        .unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Nightly], "deb822, the other PPA");
+
+        std::fs::write(
+            dir.join("sources.list"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ noble main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release, PpaLane::Nightly],
+            "the main file too, and each lane once"
+        );
+        std::fs::write(
+            list_d.join("not-a-source.save"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("sources.list")).unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Nightly], "apt reads no other suffix");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ppa_that_serves_nothing_here_gets_a_note_only_when_apt_lists_it() {
+        use super::{stray_ppa_note, PpaLane};
+        let note = stray_ppa_note("jammy", &[PpaLane::Release]).expect("apt lists it");
+        assert!(note.contains("jammy"), "{note}");
+        assert!(
+            note.contains("sudo add-apt-repository --remove ppa:archledger/irlume"),
+            "{note}"
+        );
+        assert_eq!(stray_ppa_note("jammy", &[]), None);
+        // The note is about the release PPA, the one this check found serves nothing.
+        assert_eq!(stray_ppa_note("jammy", &[PpaLane::Nightly]), None);
     }
 
     use super::{

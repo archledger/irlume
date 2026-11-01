@@ -594,18 +594,34 @@ fn install_channel_command(
     }
 }
 
+/// `configured` is what apt lists. It matters for a release .deb only: the
+/// installer used to add the PPA on every Ubuntu release and fall back to the
+/// .deb, which leaves a source no package came from, so the origin reads as local.
 fn remove_install_channel_with(
     origin: &InstallOrigin,
+    configured: &[crate::commands::PpaLane],
     mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
-    let Some((bin, args)) = install_channel_command(origin) else {
-        return Ok(());
-    };
-    run(bin, args)
+    if let Some((bin, args)) = install_channel_command(origin) {
+        return run(bin, args);
+    }
+    if matches!(origin, InstallOrigin::LocalDeb) {
+        for lane in configured {
+            let lane_origin = match lane {
+                crate::commands::PpaLane::Release => InstallOrigin::Ppa,
+                crate::commands::PpaLane::Nightly => InstallOrigin::PpaNightly,
+            };
+            if let Some((bin, args)) = install_channel_command(&lane_origin) {
+                run(bin, args)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn remove_install_channel(origin: &InstallOrigin) -> Result<(), String> {
-    remove_install_channel_with(origin, |bin, args| {
+    let configured = crate::commands::configured_ppa_lanes();
+    remove_install_channel_with(origin, &configured, |bin, args| {
         match Command::new(bin).args(args).status() {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(format!("{bin} exited with {status}")),
@@ -3267,6 +3283,57 @@ mod tests {
         assert!(arch_packages_for(&InstallOrigin::Source).is_empty());
     }
 
+    /// A release .deb can sit beside a PPA source the installer added and then fell
+    /// back from: it never served this machine, so its origin reads as a local .deb,
+    /// and a series with no Release file fails every `apt update` on it. Uninstalling
+    /// removes what apt lists, through the tool that made it, and no more.
+    #[test]
+    fn a_local_deb_beside_a_ppa_source_removes_what_apt_lists() {
+        use crate::commands::PpaLane;
+        let calls = |origin: &InstallOrigin, configured: &[PpaLane]| {
+            let mut seen = Vec::new();
+            remove_install_channel_with(origin, configured, |bin, args| {
+                seen.push(format!("{bin} {}", args.join(" ")));
+                Ok(())
+            })
+            .unwrap();
+            seen
+        };
+        let release = "add-apt-repository -y --remove --ppa ppa:archledger/irlume";
+        let nightly = "add-apt-repository -y --remove --ppa ppa:archledger/irlume-nightly";
+        assert_eq!(
+            calls(&InstallOrigin::LocalDeb, &[PpaLane::Release]),
+            vec![release]
+        );
+        assert_eq!(
+            calls(&InstallOrigin::LocalDeb, &[PpaLane::Nightly]),
+            vec![nightly]
+        );
+        assert_eq!(
+            calls(
+                &InstallOrigin::LocalDeb,
+                &[PpaLane::Release, PpaLane::Nightly]
+            ),
+            vec![release, nightly]
+        );
+        assert_eq!(calls(&InstallOrigin::LocalDeb, &[]), Vec::<String>::new());
+        // A source install owes apt nothing, and a PPA install removes its own lane
+        // as before, whatever else is listed.
+        assert_eq!(
+            calls(&InstallOrigin::Source, &[PpaLane::Release]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            calls(&InstallOrigin::Ppa, &[PpaLane::Nightly]),
+            vec![release]
+        );
+        let failed =
+            remove_install_channel_with(&InstallOrigin::LocalDeb, &[PpaLane::Release], |_, _| {
+                Err("no tool".into())
+            });
+        assert_eq!(failed, Err("no tool".to_owned()), "the caller warns");
+    }
+
     // Repository/key directories are shared ownership domains. A filename is
     // not proof that irlume or either channel manager owns an entry.
     #[test]
@@ -3289,7 +3356,7 @@ mod tests {
         std::fs::create_dir(dir.join("irlume-repository.d")).unwrap();
 
         let mut invoked = None;
-        remove_install_channel_with(&InstallOrigin::Ppa, |bin, args| {
+        remove_install_channel_with(&InstallOrigin::Ppa, &[], |bin, args| {
             invoked = Some((
                 bin.to_owned(),
                 args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),

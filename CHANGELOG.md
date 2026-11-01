@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `scripts/install.sh` adds the PPA only on an Ubuntu release it serves. It added it on every
+  release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with
+  `does not have a Release file`. `irlume uninstall` now removes such an entry, and `irlume
+  update` says how; by hand, `sudo add-apt-repository --remove ppa:archledger/irlume`.
+
 - irlumed can open cameras and the TPM on systemd before 252, Ubuntu 22.04 and its
   derivatives among them. `ProtectClock=yes` closes the device list on those versions, so
   every open failed with EPERM: the daemon reported no camera, and nothing could be sealed.

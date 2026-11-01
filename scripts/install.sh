@@ -10,8 +10,9 @@
 #                           Copr is the only Fedora lane: releases carry no RPM
 #                           assets (the release-RPM fallback code path exists
 #                           but finds none today).
-#   Ubuntu (current LTS)  : add the signed PPA, then apt install irlume.
-#                           PPA unavailable -> verified universal .deb.
+#   Ubuntu                : where the PPA serves this release (the current LTS),
+#                           add it, then apt install irlume. Elsewhere, or when
+#                           it is down, the verified universal .deb.
 #   Debian / Ubuntu deriv : download the universal .deb from the latest GitHub
 #                           release, verify it, then install.
 #   Arch                  : install from the AUR (yay/paru when present;
@@ -234,6 +235,25 @@ update_from_release() {
   exit 0
 }
 
+# Does the PPA publish an installable irlume for Ubuntu series $1? Asked the way
+# `irlume update` asks it: of the binary index, as a Release file outlives a
+# series' packages. Exits 0 for yes, 1 for no, 2 when it cannot tell: curl -f
+# exits 22 on an HTTP error, the PPA's own answer that it has no such series.
+ppa_serves() {
+  index="$(mktemp)"
+  answer=2
+  if curl -fsS --max-time 15 -o "$index" \
+      "https://ppa.launchpadcontent.net/${REPO}/ubuntu/dists/$1/main/binary-amd64/Packages.gz" 2>/dev/null; then
+    if gzip -t "$index" 2>/dev/null; then
+      if gzip -dc "$index" | grep -qx 'Package: irlume'; then answer=0; else answer=1; fi
+    fi
+  elif [ $? -eq 22 ]; then
+    answer=1
+  fi
+  rm -f "$index"
+  return "$answer"
+}
+
 main() {
   # Privilege: run package commands as root, via sudo when not already root.
   SUDO=""
@@ -277,7 +297,15 @@ main() {
   # Ubuntu series); derivatives (Pop!_OS, Mint, Zorin, elementary) and Debian
   # take the checksum-verified universal .deb.
   if [ "${ID:-}" = ubuntu ]; then
-    if command -v add-apt-repository >/dev/null 2>&1 \
+    # A series the PPA does not serve must not get it added: where the PPA has no
+    # Release file for it, which is 22.04's case, the source would fail every
+    # later `apt update` on this machine, long after this script has finished.
+    ppa_answer=0
+    ppa_serves "${VERSION_CODENAME:-}" || ppa_answer=$?
+    if [ "$ppa_answer" -eq 1 ]; then
+      say "the PPA carries only the current Ubuntu LTS, not ${VERSION_CODENAME:-this release}; using the checksum-verified .deb."
+      install_deb_release
+    elif command -v add-apt-repository >/dev/null 2>&1 \
        && $SUDO add-apt-repository -y "ppa:${REPO}" 2>/dev/null \
        && $SUDO apt-get update \
        && $SUDO apt-get install -y irlume; then

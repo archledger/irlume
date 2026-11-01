@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlumed can open cameras and the TPM on systemd before 252, Ubuntu 22.04 and its
+  derivatives among them. `ProtectClock=yes` closes the device list on those versions, so
+  every open failed with EPERM: the daemon reported no camera, and nothing could be sealed.
+  The unit now sets `DeviceAllow=char-* rw`, which also refuses block devices everywhere.
+  Measured with a software TPM and the `vivid` test driver, not with a real camera.
+
 - The NPU execution identity loads the compiler loader, the compiler and
   the IR and ONNX frontends before it reads the mapped libraries, so the
   libraries those four need are hashed too (ADR-0022 §4, #1238). A compile

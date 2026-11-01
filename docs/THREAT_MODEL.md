@@ -346,7 +346,8 @@ with a fabricated print.
 The packaged unit (`packaging/systemd/irlumed.service`, which the Debian,
 Ubuntu, Fedora and Arch packages install) and the NixOS module run irlumed as
 root with systemd sandboxing: a reduced capability set, `ProtectSystem=full`
-and more. `PrivateDevices` is not set, since it opens cameras and the TPM, and
+and more. `PrivateDevices` is not set, since it opens cameras and the TPM;
+`DeviceAllow=char-* rw` leaves it character devices and refuses block devices.
 `ProtectHome` is not set, since it reads users' home directories: the keyring
 an account keeps there (a GNOME login keyring, oo7's keyrings or a KDE wallet)
 decides what `irlume keyring arm` seals, and an explicit token arm checks that

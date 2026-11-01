@@ -159,3 +159,14 @@ The daemon's AppArmor profile already allows `/dev/tpm[0-9] rw` alongside
   workflow it runs unprivileged and proves the fallback branch.
 - Field confirmation: one attended archhost trial after the candidate
   install, expecting `enrollment_load` below 100 ms in the schema 4 trace.
+
+## Amendment 2026-10-31: the unit does have a device list
+
+Context says the unit sets neither `PrivateDevices` nor a `DeviceAllow` list, so
+no confinement change is needed. That holds on systemd 252 and later only.
+`ProtectClock=yes` implies `DeviceAllow=char-rtc r`, and before 252 systemd adds
+that entry whatever else the unit says (`unit_patch_contexts`), which closes the
+list. On Ubuntu 22.04 (systemd 249) both transports of section 1 fail with EPERM
+in the daemon's cgroup, and so does every camera, so nothing can be sealed and no
+camera is found. The unit now sets `DeviceAllow=char-* rw`, which keeps character
+devices open on every version and refuses block devices.

@@ -19378,21 +19378,50 @@ mod tests {
             unit.lines().any(|line| line.trim() == "LimitCORE=0"),
             "packaging/systemd/irlumed.service must set LimitCORE=0"
         );
-        let module = include_str!("../../../nix/module.nix");
-        let service = module
-            .split_once("systemd.services.irlumed = {")
-            .map(|(_, rest)| rest)
-            .expect("nix/module.nix defines systemd.services.irlumed");
-        let service_config = service
-            .split_once("serviceConfig = {")
-            .and_then(|(_, rest)| rest.split_once("environment = {"))
-            .map(|(config, _)| config)
-            .expect("irlumed's serviceConfig precedes its environment");
         assert!(
-            service_config
+            nix_irlumed_service_config()
                 .lines()
                 .any(|line| line.trim() == "LimitCORE = 0;"),
             "nix/module.nix irlumed serviceConfig must set LimitCORE = 0"
+        );
+    }
+
+    /// irlumed's `serviceConfig` in the NixOS module.
+    fn nix_irlumed_service_config() -> &'static str {
+        include_str!("../../../nix/module.nix")
+            .split_once("systemd.services.irlumed = {")
+            .map(|(_, rest)| rest)
+            .expect("nix/module.nix defines systemd.services.irlumed")
+            .split_once("serviceConfig = {")
+            .and_then(|(_, rest)| rest.split_once("environment = {"))
+            .map(|(config, _)| config)
+            .expect("irlumed's serviceConfig precedes its environment")
+    }
+
+    /// `ProtectClock=yes` implies `DeviceAllow=char-rtc r`, and before systemd 252
+    /// it adds that whatever else the unit says, and one entry closes the device
+    /// list. On Ubuntu 22.04 (systemd 249) every open of a camera or the TPM in the
+    /// daemon's cgroup then fails with EPERM, so face never works and nothing can
+    /// be sealed. The wildcard is not a class list on purpose: a class is looked up
+    /// when the unit starts, before a USB camera's driver may have loaded.
+    #[test]
+    fn irlumed_units_keep_cameras_and_the_tpm_open_under_protect_clock() {
+        let unit = include_str!("../../../packaging/systemd/irlumed.service");
+        let set = |line: &str| unit.lines().any(|l| l.trim() == line);
+        assert!(set("ProtectClock=yes"), "this test is about ProtectClock");
+        assert!(
+            set("DeviceAllow=char-* rw"),
+            "packaging/systemd/irlumed.service must keep character devices open"
+        );
+        let service_config = nix_irlumed_service_config();
+        let set = |line: &str| service_config.lines().any(|l| l.trim() == line);
+        assert!(
+            set("ProtectClock = true;"),
+            "this test is about ProtectClock"
+        );
+        assert!(
+            set("DeviceAllow = \"char-* rw\";"),
+            "nix/module.nix must keep character devices open as the packaged unit does"
         );
     }
 

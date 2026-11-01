@@ -534,6 +534,8 @@ in
         ProtectKernelLogs = true;
         ProtectControlGroups = true;
         ProtectClock = true;
+        # As the packaged unit, which says why.
+        DeviceAllow = "char-* rw";
         ProtectHostname = true;
         RestrictNamespaces = true;
         RestrictRealtime = true;

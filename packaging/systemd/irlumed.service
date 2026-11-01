@@ -121,6 +121,13 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
+# ProtectClock=yes implies DeviceAllow=char-rtc r, and before systemd 252 that one
+# entry closes the device list (Ubuntu 22.04 has 249): every node but the RTC and the
+# pseudo devices answers EPERM, cameras and the TPM among them. This keeps character
+# devices open on every version, including a class whose driver loads after the daemon
+# starts, as a USB camera's can. Naming classes instead would miss that one, since a
+# class is looked up when the unit starts. Block devices are refused; irlumed opens none.
+DeviceAllow=char-* rw
 ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes

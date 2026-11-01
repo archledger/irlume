@@ -429,31 +429,84 @@ fn ppa_lane_of_uri(uri: &str) -> Option<PpaLane> {
 }
 
 /// The URIs of one-line-style entry lines (sources.list(5)): a `#` comments
-/// out the rest of the line, anywhere on it (inside an options group aside, as
-/// apt's `ParseFileOldStyle` keeps it), the type is `deb` or `deb-src`, and
-/// the URI is the first word after the type and its `[options]` group.
+/// out the rest of the line, anywhere on it (inside an options group aside,
+/// as apt's `ParseFileOldStyle` keeps it), the type is `deb` or `deb-src`,
+/// the URI is the first word after the type and its `[options]` group, and a
+/// suite follows (with components, unless the suite is an absolute path). A
+/// line apt would refuse (unknown type, a missing word, a suite/components
+/// mismatch, a URI without even a colon) stops the file, which then
+/// contributes nothing, as in the deb822 reader.
 fn one_line_style_uris(text: &str) -> impl Iterator<Item = &str> {
-    text.lines().filter_map(one_line_style_uri)
+    let mut uris = Vec::new();
+    for line in text.lines() {
+        match one_line_style_uri(line) {
+            LineLanes::Active(uri) => uris.push(uri),
+            LineLanes::NoOp => {}
+            LineLanes::Refused => {
+                uris.clear();
+                break;
+            }
+        }
+    }
+    uris.into_iter()
 }
 
-/// The URI word of one one-line-style entry, `None` for anything else.
-fn one_line_style_uri(line: &str) -> Option<&str> {
-    let line = strip_one_line_comment(line).trim_start();
-    let mut words = line.split_ascii_whitespace();
-    let entry_type = words.next()?;
-    if entry_type != "deb" && entry_type != "deb-src" {
-        return None;
+/// What one one-line-style line means for the lanes.
+enum LineLanes<'a> {
+    /// The entry's URI word, in a line apt will load.
+    Active(&'a str),
+    /// Blank after its comment: no entry, file unharmed.
+    NoOp,
+    /// Apt refuses the file at this line.
+    Refused,
+}
+
+/// One line of a one-line-style file, read the way `ParseFileOldStyle` and
+/// `ParseLine` read it.
+fn one_line_style_uri(line: &str) -> LineLanes<'_> {
+    let line = strip_one_line_comment(line).trim();
+    if line.is_empty() {
+        return LineLanes::NoOp;
     }
-    let mut word = words.next()?;
+    let mut words = line.split_ascii_whitespace();
+    let Some(entry_type) = words.next() else {
+        return LineLanes::NoOp;
+    };
+    if entry_type != "deb" && entry_type != "deb-src" {
+        return LineLanes::Refused;
+    }
+    let Some(mut word) = words.next() else {
+        return LineLanes::Refused;
+    };
     if word.starts_with('[') {
         // The group can be one word or several; the last one carries the `]`
         // (apt's ParseLine accepts it glued to the final option).
         while !word.ends_with(']') {
-            word = words.next()?;
+            let Some(next) = words.next() else {
+                return LineLanes::Refused;
+            };
+            word = next;
         }
-        word = words.next()?;
+        let Some(next) = words.next() else {
+            return LineLanes::Refused;
+        };
+        word = next;
     }
-    Some(word.trim_matches('"'))
+    let uri = word.trim_matches('"');
+    // FixupURI wants a scheme's colon; a suite and, for a suite that is not
+    // an absolute path, components must follow it.
+    if !uri.contains(':') {
+        return LineLanes::Refused;
+    }
+    let Some(suite) = words.next() else {
+        return LineLanes::Refused;
+    };
+    // An absolute suite (a trailing slash) takes no components; any other
+    // suite takes them.
+    if suite.ends_with('/') == words.next().is_some() {
+        return LineLanes::Refused;
+    }
+    LineLanes::Active(uri)
 }
 
 /// The line up to its comment: the first `#` not inside an unclosed `[`
@@ -484,7 +537,7 @@ fn deb822_active_uris(text: &str) -> impl Iterator<Item = &str> {
     for stanza in deb822_stanzas(text) {
         match deb822_stanza_lanes(&stanza) {
             StanzaLanes::Active(found) => uris.extend(found),
-            StanzaLanes::Disabled => {}
+            StanzaLanes::Skipped => {}
             StanzaLanes::Refused => {
                 uris.clear();
                 break;
@@ -521,8 +574,10 @@ fn deb822_stanzas(text: &str) -> impl Iterator<Item = Vec<&str>> {
 enum StanzaLanes<'a> {
     /// The stanza's URIs, in a stanza apt will load.
     Active(Vec<&'a str>),
-    /// `Enabled:` names a false value: skipped whole, like ParseStanza.
-    Disabled,
+    /// Not an entry: disabled by `Enabled:`, a zero-tag record of only
+    /// continuation lines, or an empty `Types` list, whose per-type loop
+    /// runs zero times.
+    Skipped,
     /// Apt refuses the file: a field line with no colon, no `Types` field,
     /// an unknown type, or an enabled stanza missing a required field or
     /// naming a URI `FixupURI` rejects.
@@ -532,16 +587,18 @@ enum StanzaLanes<'a> {
 /// One stanza read the way ParseFileDeb822 and ParseStanza read it: field
 /// names are case-insensitive with their pre-colon whitespace trimmed, a
 /// continuation line extends the field it follows, and a repeated field is
-/// last-wins. `Types` must exist and be a type apt knows before `Enabled`
+/// last-wins. `Types` must exist and name a type apt knows before `Enabled`
 /// is even read; an enabled stanza must then carry URIs, suites and the
 /// components a non-absolute suite needs, and every URI a colon.
 fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
     let mut types: Vec<&str> = Vec::new();
+    let mut types_present = false;
     let mut uris: Vec<&str> = Vec::new();
     let mut suites: Vec<&str> = Vec::new();
     let mut components: Vec<&str> = Vec::new();
     let mut enabled: Vec<&str> = Vec::new();
     let mut field = "";
+    let mut saw_field = false;
     for line in stanza {
         let (name, value, replaces) = if line.starts_with([' ', '\t']) {
             (field, line.trim_start(), false)
@@ -552,6 +609,7 @@ fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
             let name = name.trim_end();
             // The field the continuation lines after this one extend.
             field = name;
+            saw_field = true;
             (name, value, true)
         };
         if name.eq_ignore_ascii_case("URIs") {
@@ -561,6 +619,7 @@ fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
         } else if name.eq_ignore_ascii_case("Components") {
             set_words(&mut components, value, replaces);
         } else if name.eq_ignore_ascii_case("Types") {
+            types_present = true;
             set_words(&mut types, value, replaces);
         } else if name.eq_ignore_ascii_case("Enabled") {
             if replaces {
@@ -569,12 +628,25 @@ fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
             enabled.push(value);
         }
     }
-    if types.is_empty() || types.iter().any(|t| *t != "deb" && *t != "deb-src") {
+    if !saw_field {
+        // A record of only continuation lines has no fields to read: apt's
+        // scanner skips a zero-tag record and keeps going.
+        return StanzaLanes::Skipped;
+    }
+    if !types_present {
+        return StanzaLanes::Refused;
+    }
+    if types.is_empty() {
+        // `Types:` present but empty: the per-type loop runs zero times, so
+        // the stanza is simply not an entry.
+        return StanzaLanes::Skipped;
+    }
+    if types.iter().any(|t| *t != "deb" && *t != "deb-src") {
         return StanzaLanes::Refused;
     }
     // Enabled joins its folded lines and trims, as the tag value does.
     if apt_bool_is_false(&enabled.join("\n")) {
-        return StanzaLanes::Disabled;
+        return StanzaLanes::Skipped;
     }
     if uris.is_empty() || suites.is_empty() || uris.iter().any(|u| !u.contains(':')) {
         return StanzaLanes::Refused;
@@ -3123,6 +3195,132 @@ Components: main
             vec![PpaLane::Release],
             "a disabled stanza is skipped, not a refusal"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One-line `.list` files get apt's refusals too: a content line whose
+    /// type word is unknown, a missing URI or suite word, a suite that is
+    /// not an absolute path without components, an absolute suite with them,
+    /// or a URI without even a colon makes apt stop reading the file, so a
+    /// valid PPA line in it is not something this machine's apt lists
+    /// either. Blank and comment lines stay no-ops, and the valid shapes
+    /// still count.
+    #[test]
+    fn a_one_line_file_apt_refuses_contributes_no_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir =
+            std::env::temp_dir().join(format!("irlume-apt-list-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu noble main\n";
+        let refused = [
+            // A type word apt does not know, before the valid entry.
+            format!("garbage line here\n{ppa}"),
+            // No suite after the URI.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n".to_owned(),
+            // No components for a suite that is not an absolute path.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu noble\n".to_owned(),
+            // An absolute suite with a component.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu dists/noble/main/ extra\n".to_owned(),
+            // FixupURI: a URI without even a colon.
+            "deb ppa.launchpadcontent.net/archledger/irlume/ubuntu noble main\n".to_owned(),
+        ];
+        for (index, content) in refused.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), format!("{content}\n{ppa}")).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                Vec::<PpaLane>::new(),
+                "refused case {index}: {content}"
+            );
+        }
+        // The valid shapes still count: an options group, deb-src with
+        // several components, an absolute suite without components.
+        let valid: [(String, Vec<PpaLane>); 3] = [
+            (
+                "deb [arch=amd64 signed-by=/etc/apt/keyrings/irlume.gpg] https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ noble main\n".to_owned(),
+                vec![PpaLane::Release],
+            ),
+            (
+                "deb-src https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main universe\n".to_owned(),
+                vec![PpaLane::Nightly],
+            ),
+            (
+                "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu dists/noble/main/\n".to_owned(),
+                vec![PpaLane::Release],
+            ),
+        ];
+        for (index, (content, expected)) in valid.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), content).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                *expected,
+                "valid case {index}: {content}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record of only continuation lines carries no field apt would read:
+    /// its scanner skips a zero-tag record (a trailing spaces-only leftover,
+    /// or one sitting between valid stanzas) and keeps the surrounding
+    /// entries. A field line with no colon still refuses the file.
+    #[test]
+    fn a_zero_tag_record_is_skipped_not_a_refusal() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-zerotag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let release = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let nightly = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu\nSuites: noble\nComponents: main\n";
+        std::fs::write(
+            list_d.join("trailing.sources"),
+            format!("{release}\n   \n   \n"),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "a trailing spaces-only record is no entry at all"
+        );
+        std::fs::write(
+            list_d.join("between.sources"),
+            format!("{release}\n\n   \n\n{nightly}"),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release, PpaLane::Nightly],
+            "a spaces-only record between stanzas is skipped, not a refusal"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `Types:` present but empty is a no-op in apt, not an error: the
+    /// per-type loop runs zero times, so the stanza is simply not an entry
+    /// and valid stanzas around it keep their lanes. The field absent still
+    /// refuses the file (a_file_apt_refuses_contributes_no_lanes).
+    #[test]
+    fn an_empty_types_list_is_a_no_op_not_a_refusal() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-notypes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        for empty in ["", "Enabled: no\n"] {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!("{ours}\nTypes:\n{empty}URIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                vec![PpaLane::Release],
+                "an empty Types list ({empty:?} beside it) is a no-op"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

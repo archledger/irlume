@@ -4,9 +4,9 @@
 """Execute package hooks with isolated command shims; never change host services.
 
 Requires dpkg and vercmp so migration decisions use the native comparators.
-The shell executes a copy with only /var/lib/irlume relocated into the fixture
-to isolate the reconcile timer marker; service commands and branches are
-unchanged. Fedora's %post is taken from the spec with its one macro,
+The shell executes a copy with /var/lib/irlume and /run/systemd/system relocated
+into the fixture to isolate the timer marker and manager-presence check;
+service commands and branches are unchanged. Fedora's %post uses its one macro,
 %systemd_post, replaced by the preset call it makes on a first install.
 All external commands use a private PATH.
 These tests cover hook decisions, not systemd's dependency/activation engine.
@@ -26,6 +26,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DAEMON = "irlumed.service"
 SOCKET = "irlumed.socket"
 RECONCILE = ("irlume-reconcile.path", "irlume-reconcile.timer", "irlume-reconcile.service")
+LIGHTDM_REFRESH = ("irlume-lightdm-refresh.path", "irlume-lightdm-refresh.timer",
+                   "irlume-lightdm-refresh.service")
 FEDORA_PRESET = [line.split()[1] for line in
                  (ROOT / "packaging/fedora/90-irlume.preset").read_text().splitlines()
                  if line.startswith("enable ")]
@@ -49,12 +51,24 @@ def unexpected():
     state["errors"].append([name, *args])
     return 99
 
-if name == "systemctl":
+if name == "systemctl" and state.get("fail_systemctl", False):
+    status = 1
+elif name == "systemctl":
     verb = args[0] if args else ""
     flags = [arg for arg in args[1:] if arg.startswith("-")]
     units = [arg for arg in args[1:] if not arg.startswith("-")]
     if verb == "daemon-reload" and not flags and not units:
         pass
+    elif verb in {"disable", "stop"} and units and flags in ([], ["--now"]):
+        for unit_name in units:
+            unit = state["units"].get(unit_name)
+            if unit is None:
+                status = unexpected()
+            else:
+                if verb == "disable":
+                    unit["enabled"] = "disabled"
+                if verb == "stop" or "--now" in flags:
+                    unit["active"] = False
     elif args[:2] == ["--no-reload", "preset"] and len(args) > 2:
         # What %systemd_post runs on a first install; a mask stays.
         for unit_name in args[2:]:
@@ -138,7 +152,8 @@ class PackageServiceHookTests(unittest.TestCase):
         return "\n".join(lines) + "\n"
 
     def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False),
-                 timer_armed=True):
+                 timer_armed=True, hook="postinstall", action="configure", systemd=True,
+                 fail_systemctl=False, dpkg_root=False):
         # reconcile is one (enabled, active) pair for all three units, or a
         # dict giving each unit its own. timer_armed=False leaves out the
         # one-time timer marker, as on an install from before 0.7.0 or an
@@ -151,25 +166,33 @@ class PackageServiceHookTests(unittest.TestCase):
             # Do not override shell builtins: dash rejects a function named [.
             fixture_state = directory / "var/lib/irlume"
             fixture_state.mkdir(parents=True)
+            runtime = directory / "run/systemd/system"
+            if systemd:
+                runtime.mkdir(parents=True)
             marker = fixture_state / ".reconcile-timer-armed"
             if timer_armed:
                 marker.touch()
             if family == "fedora":
                 text = self.fedora_post()
             else:
-                text = (ROOT / ("packaging/debian/postinstall.sh" if family == "debian"
+                text = (ROOT / (f"packaging/debian/{hook}.sh" if family == "debian"
                                 else "packaging/arch/irlume.install")).read_text()
-            hook = directory / "hook.sh"
-            hook.write_text(text.replace("/var/lib/irlume", str(fixture_state)))
+            script = directory / "hook.sh"
+            script.write_text(text.replace("/var/lib/irlume", str(fixture_state))
+                              .replace("/run/systemd/system", str(runtime)))
             state_path = directory / "state.json"
             state_path.write_text(json.dumps({
                 "units": {
                     DAEMON: {"enabled": service[0], "active": service[1], "starts": 0, "restarts": 0},
                     SOCKET: {"enabled": socket[0], "active": socket[1], "starts": 0, "restarts": 0},
                     **{unit: {"enabled": reconcile[unit][0], "active": reconcile[unit][1],
-                              "starts": 0, "restarts": 0} for unit in RECONCILE},
+                               "starts": 0, "restarts": 0} for unit in RECONCILE},
+                    **{unit: {"enabled": "enabled", "active": True,
+                               "starts": 0, "restarts": 0} for unit in (
+                                   *LIGHTDM_REFRESH, "irlume-lightdm-prepare.service", "lightdm.service")},
                 },
                 "preset": FEDORA_PRESET, "calls": [], "errors": [],
+                "fail_systemctl": fail_systemctl,
             }))
             for name in ("systemctl", "systemd-tmpfiles", "apparmor_parser", "mkdir", "touch"):
                 shim = directory / name
@@ -181,19 +204,20 @@ class PackageServiceHookTests(unittest.TestCase):
                 "PATH": str(directory), "HOOK_STATE": str(state_path),
                 "HOOK_STATE_DIR": str(fixture_state),
                 "LC_ALL": "C", "PYTHONDONTWRITEBYTECODE": "1",
+                "DPKG_ROOT": str(directory / "offline-root") if dpkg_root else "",
             }
             if family == "debian":
-                command = [self.commands["sh"], str(hook), "configure"]
+                command = [self.commands["sh"], str(script), action]
                 if old is not None:
                     command.append(old)
             elif family == "fedora":
                 # rpm runs %post with /bin/sh, which is Bash on Fedora, and $1
                 # counts the installed instances: 1 on a first install, 2 on
                 # an upgrade.
-                command = [self.commands["bash"], "--posix", "--noprofile", "--norc", str(hook),
+                command = [self.commands["bash"], "--posix", "--noprofile", "--norc", str(script),
                            "1" if old is None else "2"]
             else:
-                env["HOOK_SCRIPT"] = str(hook)
+                env["HOOK_SCRIPT"] = str(script)
                 function = "post_install" if old is None else "post_upgrade"
                 # Bash can read .bashrc for noninteractive remote invocations,
                 # even with a clean environment. Never run the user's startup.
@@ -225,6 +249,47 @@ class PackageServiceHookTests(unittest.TestCase):
         self.assertEqual(state["units"][unit], {
             "enabled": enabled, "active": active, "starts": starts, "restarts": restarts,
         }, state["calls"])
+
+    def test_debian_removal_stops_refresh_without_stopping_lightdm(self):
+        state = self.run_hook("debian", ("enabled", True), ("enabled", True),
+                              hook="preremove", action="remove")
+        for unit in (DAEMON, SOCKET, *RECONCILE, *LIGHTDM_REFRESH):
+            self.assertFalse(state["units"][unit]["active"], unit)
+        for unit in ("lightdm.service", "irlume-lightdm-prepare.service"):
+            self.assert_unit(state, unit, "enabled", True)
+        triggers = state["calls"].index(["systemctl", "stop", *LIGHTDM_REFRESH[:2]])
+        worker = state["calls"].index(["systemctl", "stop", LIGHTDM_REFRESH[2]])
+        self.assertLess(triggers, worker)
+
+    def test_debian_postremove_reloads_only_after_removal_or_purge(self):
+        manifest = (ROOT / "packaging/debian/nfpm.yaml").read_text()
+        self.assertIn("  postremove: ./postremove.sh", manifest)
+        for action in ("remove", "purge", "upgrade", "failed-upgrade", "abort-install", "disappear"):
+            with self.subTest(action=action):
+                state = self.run_hook("debian", ("enabled", True), ("enabled", True),
+                                      hook="postremove", action=action)
+                self.assertEqual(state["calls"], [["systemctl", "daemon-reload"]]
+                                 if action in ("remove", "purge") else [])
+
+    def test_debian_removal_hooks_leave_offline_managers_alone(self):
+        for hook in ("preremove", "postremove"):
+            for options in ({"systemd": False}, {"dpkg_root": True}):
+                with self.subTest(hook=hook, options=options):
+                    state = self.run_hook("debian", ("enabled", True), ("enabled", True),
+                                          hook=hook, action="remove", **options)
+                    self.assertEqual(state["calls"], [])
+
+    def test_debian_preremove_upgrade_preserves_every_unit(self):
+        state = self.run_hook("debian", ("enabled", True), ("enabled", True),
+                              hook="preremove", action="upgrade")
+        self.assertEqual(state["calls"], [])
+
+    def test_debian_removal_tolerates_an_unavailable_manager(self):
+        for hook in ("preremove", "postremove"):
+            with self.subTest(hook=hook):
+                state = self.run_hook("debian", ("enabled", True), ("enabled", True),
+                                      hook=hook, action="remove", fail_systemctl=True)
+                self.assertTrue(state["calls"])
 
     def test_modern_upgrade_preserves_enabled_stopped_units(self):
         for family in ("debian", "arch"):

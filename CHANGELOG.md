@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Removing the universal Debian package reloads systemd after the LightDM
+  drop-in is gone, so later LightDM starts do not depend on the removed
+  irlume executable. Removal stops the private-view refresh units without
+  stopping the running greeter; upgrades leave those units alone.
+
 - `irlume login enable` wires GDM and SDDM on a stock Fedora again. The check for jumps in
   included stacks (#934) also refused irlume's session line right after `session include
   password-auth`, whose crond jump lands there, so neither greeter could be wired on a machine

@@ -171,3 +171,4 @@ contents:
 scripts:
   postinstall: ./postinstall.sh
   preremove: ./preremove.sh
+  postremove: ./postremove.sh

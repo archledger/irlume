@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
+  the install script now demotes an Ubuntu series to the release `.deb` only
+  on a reported 404, or, defensively, when curl reports an HTTP error with no
+  code.
+
 - `scripts/install.sh` adds the PPA only on an Ubuntu release it serves. It added it on every
   release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with
   `does not have a Release file`. `irlume uninstall` now removes such an entry, and `irlume

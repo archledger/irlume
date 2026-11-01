@@ -237,18 +237,30 @@ update_from_release() {
 
 # Does the PPA publish an installable irlume for Ubuntu series $1? Asked the way
 # `irlume update` asks it: of the binary index, as a Release file outlives a
-# series' packages. Exits 0 for yes, 1 for no, 2 when it cannot tell: curl -f
-# exits 22 on an HTTP error, the PPA's own answer that it has no such series.
+# series' packages. Exits 0 for yes, 1 for no, 2 when it cannot tell. curl -f
+# uses 22 for any HTTP error; only a separately reported 404 proves the
+# series absent. An error that reports no code at all fails safe the same
+# way: a machine the PPA does not serve must not be left a source apt cannot
+# use.
 ppa_serves() {
   index="$(mktemp)"
   answer=2
-  if curl -fsS --max-time 15 -o "$index" \
-      "https://ppa.launchpadcontent.net/${REPO}/ubuntu/dists/$1/main/binary-amd64/Packages.gz" 2>/dev/null; then
+  curl_status=0
+  http_status=$(curl -fsS --max-time 15 -w '%{http_code}' -o "$index" \
+      "https://ppa.launchpadcontent.net/${REPO}/ubuntu/dists/$1/main/binary-amd64/Packages.gz" 2>/dev/null) || curl_status=$?
+  if [ "$curl_status" -eq 0 ]; then
     if gzip -t "$index" 2>/dev/null; then
       if gzip -dc "$index" | grep -qx 'Package: irlume'; then answer=0; else answer=1; fi
     fi
-  elif [ $? -eq 22 ]; then
-    answer=1
+  elif [ "$curl_status" -eq 22 ]; then
+    # A reported 404 is the PPA itself saying the series is absent. A reported
+    # 429/500/503 is an outage: not proof of absence, so the PPA is still
+    # tried (answer stays 2). No code reported at all proves nothing either
+    # way: do not add the PPA on the chance the series is unserved, as that
+    # leaves a source that fails every later apt-get update on this machine.
+    if [ "$http_status" = 404 ] || [ -z "$http_status" ]; then
+      answer=1
+    fi
   fi
   rm -f "$index"
   return "$answer"

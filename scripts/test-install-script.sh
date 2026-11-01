@@ -17,6 +17,12 @@
 #     packages) never gets it added either
 #   - when the PPA cannot answer (offline, or bytes that are not gzip), the
 #     script still tries it, as an outage should not change the channel
+#   - a transient HTTP 429/500/503 is the same: a server error is not proof
+#     the PPA has no such series, so the script still tries it
+#   - a curl that exits on an HTTP error without reporting a code never gets
+#     the PPA added either: it cannot prove the series exists, and a source
+#     apt cannot use outlives this script. Defensive only: known curl
+#     versions report the code on -f errors, so no_code pins the contract
 # Elsewhere:
 #   - Debian and an Ubuntu derivative go straight to the release .deb, without
 #     asking the PPA at all
@@ -46,9 +52,11 @@ cat > "$work/bin/curl" <<'EOF'
 # release's SHA256SUMS, which ends the run at the .deb path with no download.
 out=""
 url=""
+write_out=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift ;;
+    -w) write_out="$2"; shift ;;
     http*) url="$1" ;;
   esac
   shift
@@ -56,12 +64,25 @@ done
 printf 'curl %s\n' "$url" >> "$TEST_LOG"
 case "$url" in
   *Packages.gz)
+    code=200
+    status=0
+    case "$TEST_PPA" in
+      absent) code=404; status=22 ;;
+      server_error) code=500; status=22 ;;
+      unavailable) code=503; status=22 ;;
+      rate_limited) code=429; status=22 ;;
+      no_code) code=""; status=22 ;;
+      offline) code=000; status=6 ;;
+    esac
+    if [ -n "$write_out" ]; then
+      [ "$write_out" = '%{http_code}' ] || exit 99
+      printf '%s' "$code"
+    fi
+    [ "$status" = 0 ] || exit "$status"
     case "$TEST_PPA" in
       lists) cat "$TEST_DIR/lists.gz" > "$out" ;;
       empty) cat "$TEST_DIR/empty.gz" > "$out" ;;
       garbage) cat "$TEST_DIR/garbage" > "$out" ;;
-      absent) exit 22 ;;
-      offline) exit 6 ;;
     esac
     ;;
   *) exit 22 ;;
@@ -108,6 +129,10 @@ grep -q 'irlume/ubuntu/dists/jammy/main/binary-amd64/Packages.gz' "$work/log" \
 run "$ubuntu" absent no yes "a series the PPA has no index for"
 run "$ubuntu" empty no yes "a series whose index does not list irlume"
 run "$ubuntu" offline yes no "the PPA cannot be reached"
+run "$ubuntu" server_error yes no "the PPA temporarily returns HTTP 500"
+run "$ubuntu" unavailable yes no "the PPA temporarily returns HTTP 503"
+run "$ubuntu" rate_limited yes no "the PPA temporarily returns HTTP 429"
+run "$ubuntu" no_code no yes "a curl that reports an HTTP error but no code"
 run "$ubuntu" garbage yes no "bytes that are not an index"
 
 run 'ID=debian

@@ -364,9 +364,9 @@ pub(crate) fn configured_ppa_lanes() -> Vec<PpaLane> {
 /// [`configured_ppa_lanes`] over a directory: the active entries decide, never
 /// a file's name, and only the files apt itself reads are looked at. Each file
 /// is parsed in its own format (sources.list(5)): one-line-style `.list` (and
-/// the main `sources.list`), deb822 `.sources`, where a stanza disabled by
-/// `Enabled:` naming a false value is not active, a comment never is, and only
-/// the URIs an entry actually names count.
+/// the main `sources.list`), deb822 `.sources`, where only a stanza apt would
+/// load counts, a comment never does, and only the URIs an entry actually
+/// names count.
 pub(crate) fn configured_ppa_lanes_in(apt: &std::path::Path) -> Vec<PpaLane> {
     let mut release = false;
     let mut nightly = false;
@@ -411,12 +411,13 @@ fn sources_list_files(apt: &std::path::Path) -> impl Iterator<Item = std::path::
     std::iter::once(apt.join("sources.list")).chain(list_d)
 }
 
-/// Which PPA a URI names, the way apt compares sources: scheme aside, host and
-/// path to the archive root, with apt's `FixupURI` trailing slash aside, so
-/// neither PPA is taken for the other and a URI that merely contains the
-/// archive's text, or extends its path, is foreign.
+/// Which PPA a URI names, the way apt compares sources: a scheme separator
+/// `FixupURI` can find, then host and path to the archive root exactly, with
+/// the trailing slash it appends aside, so neither PPA is taken for the
+/// other and a URI that merely contains the archive's text, or extends its
+/// path, is foreign.
 fn ppa_lane_of_uri(uri: &str) -> Option<PpaLane> {
-    let uri = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    let (_, uri) = uri.split_once("://")?;
     let uri = uri.trim_end_matches('/');
     if uri == RELEASE_PPA {
         Some(PpaLane::Release)
@@ -470,21 +471,39 @@ fn strip_one_line_comment(line: &str) -> &str {
     line
 }
 
-/// The URIs of a deb822 `.sources` text's active stanzas: stanzas are
-/// separated by empty lines, a `#` as a line's first character is a comment
-/// that does not end a stanza, a field's value folds onto lines that start
-/// with a space or tab, `URIs` holds whitespace-separated values, and a
-/// stanza whose `Enabled` field names a false value is off entirely (apt's
-/// `ParseStanza`). Field names are case-insensitive, as apt's tag lookup is;
-/// the first of a repeated field is the one read.
+/// The URIs of a deb822 `.sources` text's active stanzas: a stanza ends only
+/// at a truly empty line (a whitespace-only line continues the field), a `#`
+/// as a line's first character is a comment that never ends a stanza, a
+/// field's value folds onto lines that start with a space or tab, a repeated
+/// field is last-wins with its continuations, and `URIs` holds
+/// whitespace-separated values. A stanza disabled by a false `Enabled` value
+/// is skipped; a stanza or line apt refuses stops the file, which then
+/// contributes nothing, because this machine's apt would load none of it.
 fn deb822_active_uris(text: &str) -> impl Iterator<Item = &str> {
+    let mut uris = Vec::new();
+    for stanza in deb822_stanzas(text) {
+        match deb822_stanza_lanes(&stanza) {
+            StanzaLanes::Active(found) => uris.extend(found),
+            StanzaLanes::Disabled => {}
+            StanzaLanes::Refused => {
+                uris.clear();
+                break;
+            }
+        }
+    }
+    uris.into_iter()
+}
+
+/// Stanzas as lines: comment lines are dropped and only a truly empty line
+/// separates stanzas, as apt's record scanner reads a file.
+fn deb822_stanzas(text: &str) -> impl Iterator<Item = Vec<&str>> {
     let mut stanzas: Vec<Vec<&str>> = Vec::new();
     let mut stanza: Vec<&str> = Vec::new();
     for line in text.lines() {
         if line.starts_with('#') {
             continue;
         }
-        if line.trim().is_empty() {
+        if line.is_empty() {
             if !stanza.is_empty() {
                 stanzas.push(std::mem::take(&mut stanza));
             }
@@ -495,42 +514,115 @@ fn deb822_active_uris(text: &str) -> impl Iterator<Item = &str> {
     if !stanza.is_empty() {
         stanzas.push(stanza);
     }
-    stanzas
-        .into_iter()
-        .filter_map(|stanza| active_stanza_uris(&stanza))
-        .flatten()
+    stanzas.into_iter()
 }
 
-/// One stanza's URI values, or none when the stanza is disabled. A line that
-/// is neither a field nor a continuation makes the stanza contribute nothing:
-/// apt refuses such a file rather than acting on a guess.
-fn active_stanza_uris<'a>(stanza: &[&'a str]) -> Option<Vec<&'a str>> {
-    let mut enabled = true;
-    let mut uris = Vec::new();
+/// What one deb822 stanza means for the lanes.
+enum StanzaLanes<'a> {
+    /// The stanza's URIs, in a stanza apt will load.
+    Active(Vec<&'a str>),
+    /// `Enabled:` names a false value: skipped whole, like ParseStanza.
+    Disabled,
+    /// Apt refuses the file: a field line with no colon, no `Types` field,
+    /// an unknown type, or an enabled stanza missing a required field or
+    /// naming a URI `FixupURI` rejects.
+    Refused,
+}
+
+/// One stanza read the way ParseFileDeb822 and ParseStanza read it: field
+/// names are case-insensitive with their pre-colon whitespace trimmed, a
+/// continuation line extends the field it follows, and a repeated field is
+/// last-wins. `Types` must exist and be a type apt knows before `Enabled`
+/// is even read; an enabled stanza must then carry URIs, suites and the
+/// components a non-absolute suite needs, and every URI a colon.
+fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
+    let mut types: Vec<&str> = Vec::new();
+    let mut uris: Vec<&str> = Vec::new();
+    let mut suites: Vec<&str> = Vec::new();
+    let mut components: Vec<&str> = Vec::new();
+    let mut enabled: Vec<&str> = Vec::new();
     let mut field = "";
     for line in stanza {
-        let (name, value) = if line.starts_with([' ', '\t']) {
-            // A continuation line extends the previous field's value.
-            (field, line.trim_start())
+        let (name, value, replaces) = if line.starts_with([' ', '\t']) {
+            (field, line.trim_start(), false)
         } else {
-            let (name, value) = line.split_once(':')?;
-            // Apt trims the field name's whitespace before the colon.
-            field = name.trim_end();
-            (field, value)
+            let Some((name, value)) = line.split_once(':') else {
+                return StanzaLanes::Refused;
+            };
+            let name = name.trim_end();
+            // The field the continuation lines after this one extend.
+            field = name;
+            (name, value, true)
         };
         if name.eq_ignore_ascii_case("URIs") {
-            uris.extend(value.split_ascii_whitespace());
+            set_words(&mut uris, value, replaces);
+        } else if name.eq_ignore_ascii_case("Suites") {
+            set_words(&mut suites, value, replaces);
+        } else if name.eq_ignore_ascii_case("Components") {
+            set_words(&mut components, value, replaces);
+        } else if name.eq_ignore_ascii_case("Types") {
+            set_words(&mut types, value, replaces);
         } else if name.eq_ignore_ascii_case("Enabled") {
-            // Apt's StringToBool, with its -1 default for anything it does
-            // not recognize: only these values are false, so every other
-            // spelling leaves the stanza on.
-            enabled = !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "no" | "false" | "without" | "off" | "disable"
-            );
+            if replaces {
+                enabled.clear();
+            }
+            enabled.push(value);
         }
     }
-    enabled.then_some(uris)
+    if types.is_empty() || types.iter().any(|t| *t != "deb" && *t != "deb-src") {
+        return StanzaLanes::Refused;
+    }
+    // Enabled joins its folded lines and trims, as the tag value does.
+    if apt_bool_is_false(&enabled.join("\n")) {
+        return StanzaLanes::Disabled;
+    }
+    if uris.is_empty() || suites.is_empty() || uris.iter().any(|u| !u.contains(':')) {
+        return StanzaLanes::Refused;
+    }
+    // An absolute suite (a trailing slash) takes no components; any other
+    // suite takes them.
+    for suite in &suites {
+        if suite.ends_with('/') != components.is_empty() {
+            return StanzaLanes::Refused;
+        }
+    }
+    StanzaLanes::Active(uris)
+}
+
+/// Replace a multivalue field's words, or extend them when the line
+/// continues the field: the value is its whitespace-separated words.
+fn set_words<'a>(words: &mut Vec<&'a str>, value: &'a str, replaces: bool) {
+    if replaces {
+        words.clear();
+    }
+    words.extend(value.split_ascii_whitespace());
+}
+
+/// Apt's `StringToBool`: a false value is one of its false words, or a
+/// number strtol with base 0 reads whole and as zero, which for an optional
+/// sign and 0x/0X hex or leading-zero octal spelling means every digit is a
+/// zero. Anything else, including an unrecognized word, is not false and
+/// leaves the stanza on (apt's -1 default).
+fn apt_bool_is_false(value: &str) -> bool {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "no" | "false" | "without" | "off" | "disable"
+    ) {
+        return true;
+    }
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (radix, digits) = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => (16, hex),
+        None if digits.len() > 1 && digits.starts_with('0') => (8, &digits[1..]),
+        None => (10, digits),
+    };
+    !digits.is_empty()
+        && digits.chars().all(|d| d.is_digit(radix))
+        && digits.chars().all(|d| d == '0')
 }
 
 /// What to say when the release PPA serves this series nothing and apt still
@@ -2614,7 +2706,7 @@ mod origin_tests {
         std::fs::remove_file(list_d.join("anything.list")).unwrap();
         std::fs::write(
             list_d.join("nightly.sources"),
-            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/\n",
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/\nSuites: noble\nComponents: main\n",
         )
         .unwrap();
         assert_eq!(lanes(), vec![PpaLane::Nightly], "deb822, the other PPA");
@@ -2805,6 +2897,232 @@ Components: main
             );
             std::fs::remove_file(list_d.join(format!("case-{index}.list"))).unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A whitespace-only line continues the stanza's open field instead of
+    /// ending the stanza: apt's tag scanner ends a record only at a truly
+    /// empty line, so hand-edited files with trailing-space lines keep
+    /// `Enabled: no` attached to the URIs it disables, in either field order.
+    #[test]
+    fn a_whitespace_only_line_continues_a_stanza_it_does_not_end_it() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-wsline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let stanza = |enabled_first: bool| {
+            let ppa = "URIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n";
+            let enabled = "Enabled: no\n";
+            let rest = "Types: deb\nSuites: noble\nComponents: main\n";
+            if enabled_first {
+                format!("{enabled}{ppa}   \n{rest}")
+            } else {
+                format!("Types: deb\n{ppa}   \n{enabled}Suites: noble\nComponents: main\n")
+            }
+        };
+        std::fs::write(list_d.join("first.sources"), stanza(false)).unwrap();
+        std::fs::write(list_d.join("second.sources"), stanza(true)).unwrap();
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "the spaces-only line keeps Enabled with the URIs it disables"
+        );
+        // With the field on, folding across a spaces-only line still names
+        // the archive: continuation, not boundary, is not a refusal.
+        std::fs::write(
+            list_d.join("first.sources"),
+            "Types: deb\nURIs: https://example.org/ubuntu\n   \n      https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::remove_file(list_d.join("second.sources")).unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "a spaces-only line inside a folded value is still one field"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A repeated field is last-wins, with continuation lines extending the
+    /// field they follow: apt's tag lookup reads the newest store of a field,
+    /// so a second `URIs` replaces the first and a second `Enabled` replaces
+    /// the first, however the file got that way.
+    #[test]
+    fn repeated_deb822_fields_are_last_wins_with_their_continuations() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-repeat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let write = |uris: &str| {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!("Types: deb\n{uris}Suites: noble\nComponents: main\n"),
+            )
+            .unwrap();
+        };
+        let ppa = "URIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n";
+        let foreign = "URIs: https://example.org/ubuntu\n";
+        write(&format!("{ppa}{foreign}"));
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "the last URIs field is the one apt reads"
+        );
+        write(&format!("{foreign}{ppa}"));
+        assert_eq!(lanes(), vec![PpaLane::Release], "also when it names ours");
+        write(&format!(
+            "{ppa}{foreign}\n  https://mirror.example.org/ubuntu\n"
+        ));
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "a continuation extends the field it follows, the replaced one stays replaced"
+        );
+        // Enabled repeats the same way, in either order.
+        for (first, second, expected) in [
+            ("yes", "no", Vec::<PpaLane>::new()),
+            ("no", "yes", vec![PpaLane::Release]),
+        ] {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!(
+                    "Types: deb\nEnabled: {first}\n{ppa}Enabled: {second}\nSuites: noble\nComponents: main\n"
+                ),
+            )
+            .unwrap();
+            assert_eq!(lanes(), expected, "Enabled: {first} then Enabled: {second}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The zero spellings strtol reads whole are false in apt's StringToBool,
+    /// not just the bare `0`: `00` (octal), `0x0` (hex) and a signed `0` all
+    /// disable the stanza, while nonzero numbers and anything unrecognized
+    /// leave it on.
+    #[test]
+    fn apt_zero_spellings_of_enabled_disable_the_stanza() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-zeros-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let stanza = |enabled: &str| {
+            format!(
+                "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\nEnabled: {enabled}\n"
+            )
+        };
+        for zero in ["0", "00", "0x0", "0X0", "-0", "+0", "000"] {
+            std::fs::write(list_d.join("zero.sources"), stanza(zero)).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                Vec::<PpaLane>::new(),
+                "Enabled: {zero} is a strtol zero, so off"
+            );
+        }
+        for on in ["1", "01", "0x1", "2", "0x2"] {
+            std::fs::write(list_d.join("zero.sources"), stanza(on)).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                vec![PpaLane::Release],
+                "Enabled: {on} is not a zero, so on"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A URI without a scheme separator is nothing apt loads: `FixupURI`
+    /// rejects it, so neither format's bare host-and-path spelling is an
+    /// active lane, however exactly it spells ours.
+    #[test]
+    fn a_scheme_less_uri_is_not_an_active_lane() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-scheme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        std::fs::write(
+            list_d.join("bare.sources"),
+            "Types: deb\nURIs: ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("bare.list"),
+            "deb ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            Vec::<PpaLane>::new(),
+            "no scheme, no archive apt will read"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file apt refuses contributes no lanes at all: apt stops at a stanza
+    /// with no `Types` field, an unknown type, a missing required field, or a
+    /// scheme-less URI, so a perfectly valid own PPA stanza beside any of
+    /// those is not something this machine's apt lists either. An absolute
+    /// suite (trailing slash) needs no components and stays a valid entry.
+    #[test]
+    fn a_file_apt_refuses_contributes_no_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let refused = [
+            // No Types at all.
+            "URIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // A type apt does not know.
+            "Types: rpm\nURIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // Required fields missing on a stanza that is on.
+            "Types: deb\nURIs: https://example.org/ubuntu\nComponents: main\n",
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\n",
+            // A suite that is not an absolute path wants components.
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\n",
+            // FixupURI: a URI without even a colon.
+            "Types: deb\nURIs: example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // A field line with no colon.
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites noble\n",
+        ];
+        for (index, bad) in refused.iter().enumerate() {
+            std::fs::write(list_d.join("one.sources"), format!("{ours}\n{bad}")).unwrap();
+            assert_eq!(
+                lanes(),
+                Vec::<PpaLane>::new(),
+                "refused case {index}: {bad}"
+            );
+        }
+        // An absolute suite (a path ending in /) needs no components.
+        std::fs::write(
+            list_d.join("one.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble/pond/main/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "an absolute suite is a valid entry without components"
+        );
+        // And a disabled stanza skips the required-field checks that follow
+        // its `Enabled`: only the Types gate comes before Enabled, so a
+        // stanza disabled first is skipped however incomplete after that.
+        std::fs::write(
+            list_d.join("one.sources"),
+            format!("{ours}\nTypes: deb\nEnabled: no\nURIs: https://example.org/ubuntu\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "a disabled stanza is skipped, not a refusal"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

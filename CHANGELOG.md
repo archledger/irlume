@@ -841,11 +841,13 @@ All notable changes to irlume are documented here. This project adheres to
 ### Fixed
 
 - `irlume uninstall` and `irlume update` now read a deb822 `.sources` stanza
-  the way apt does: one disabled by `Enabled: no` is not a source apt lists,
-  so a release `.deb` cleanup no longer offers to remove that PPA and update
-  no longer calls it a stray to clean up. A URI mentioned in a comment,
-  another field's value, or a lookalike address is likewise not a configured
-  PPA; comments, disabled entries and unrelated sources keep their bytes.
+  the way apt does: one disabled by `Enabled: no` (in any zero spelling apt
+  reads) is not a source apt lists, so a release `.deb` cleanup no longer
+  offers to remove that PPA and update no longer calls it a stray to clean
+  up. A URI needs its scheme, repeated fields count once (the last), a
+  whitespace-only line continues its stanza, and a file apt would refuse
+  contributes nothing; comments, disabled entries and unrelated sources keep
+  their bytes.
 
 - Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
   the install script now demotes an Ubuntu series to the release `.deb` only

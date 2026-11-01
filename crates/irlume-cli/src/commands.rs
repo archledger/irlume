@@ -492,14 +492,23 @@ fn one_line_style_uri(line: &str) -> LineLanes<'_> {
         };
         word = next;
     }
-    let uri = word.trim_matches('"');
+    let uri = match dequote_word(word) {
+        Some(uri) => uri,
+        None => return LineLanes::Refused,
+    };
     // FixupURI wants a scheme's colon; a suite and, for a suite that is not
     // an absolute path, components must follow it.
     if !uri.contains(':') {
         return LineLanes::Refused;
     }
-    let Some(suite) = words.next() else {
-        return LineLanes::Refused;
+    let suite_word = match words.next() {
+        Some(suite) => suite,
+        None => return LineLanes::Refused,
+    };
+    // The suite dequotes before its absolute-path shape is judged.
+    let suite = match dequote_word(suite_word) {
+        Some(suite) => suite,
+        None => return LineLanes::Refused,
     };
     // An absolute suite (a trailing slash) takes no components; any other
     // suite takes them.
@@ -507,6 +516,21 @@ fn one_line_style_uri(line: &str) -> LineLanes<'_> {
         return LineLanes::Refused;
     }
     LineLanes::Active(uri)
+}
+
+/// A whole word with its double quotes read the way ParseQuoteWord reads
+/// them: a balanced pair around the word comes off, a word without quotes
+/// passes through, and anything else (an unterminated quote, quotes inside
+/// the word, an empty pair) is a malformed entry, because trimming a lone
+/// quote could turn a broken word into an active PPA. Apt also decodes
+/// percent escapes and dequotes interior pairs; those forms stay written as
+/// they are and so never name one of ours, the conservative direction.
+fn dequote_word(word: &str) -> Option<&str> {
+    if word.len() >= 2 && word.starts_with('"') && word.ends_with('"') {
+        let inner = &word[1..word.len() - 1];
+        return (!inner.is_empty() && !inner.contains('"')).then_some(inner);
+    }
+    (!word.contains('"')).then_some(word)
 }
 
 /// The line up to its comment: the first `#` not inside an unclosed `[`
@@ -3319,6 +3343,60 @@ Components: main
                 configured_ppa_lanes_in(&dir),
                 vec![PpaLane::Release],
                 "an empty Types list ({empty:?} beside it) is a no-op"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A whole word in quotes reads the same in the suite position as in the
+    /// URI position: the balanced pair comes off before the word is judged,
+    /// so a quoted absolute suite without components is a valid entry and one
+    /// with a component refuses, while a plain quoted non-absolute suite
+    /// keeps needing its components. An unbalanced quote anywhere is a
+    /// malformed entry that refuses the file rather than trimming its way
+    /// into an active PPA.
+    #[test]
+    fn quoted_words_dequote_before_their_shape_is_judged() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-quoted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu";
+        let cases: [(&str, Vec<PpaLane>); 7] = [
+            // A quoted absolute suite without components is valid (apt
+            // dequotes the word before its trailing-slash check).
+            (
+                &format!("deb {ppa} \"dists/noble/main/\"\n"),
+                vec![PpaLane::Release],
+            ),
+            // ... and with a component it refuses, quoted or not.
+            (
+                &format!("deb {ppa} \"dists/noble/main/\" extra\n"),
+                Vec::new(),
+            ),
+            // An unterminated quote on the URI is a malformed entry.
+            (&format!("deb \"{ppa} noble main\n"), Vec::new()),
+            // A plain quoted non-absolute suite: components still required.
+            (
+                &format!("deb {ppa} \"noble\" main\n"),
+                vec![PpaLane::Release],
+            ),
+            (&format!("deb {ppa} \"noble\"\n"), Vec::new()),
+            // An unterminated quote on the suite likewise refuses.
+            (&format!("deb {ppa} \"noble main\n"), Vec::new()),
+            // A balanced pair on the URI still reads through.
+            (
+                &format!("deb \"{ppa}\" noble main\n"),
+                vec![PpaLane::Release],
+            ),
+        ];
+        for (index, (content, expected)) in cases.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), content).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                *expected,
+                "case {index}: {content}"
             );
         }
         std::fs::remove_dir_all(&dir).unwrap();

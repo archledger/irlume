@@ -172,6 +172,12 @@ should_install_deb() {
 }
 
 install_deb_release() {
+  # The archive's lists must be present for the .deb's dependencies
+  # (libtss2-tctildr0 and friends come from the Ubuntu repositories), so
+  # refresh what this machine already has configured - never the unserved
+  # PPA - before anything else on this path. A failed refresh warns and
+  # continues: the existing lists may already satisfy the dependencies.
+  $SUDO apt-get update || warn "apt-get update failed; installing with the current package lists."
   deb="$(fetch_verified '_amd64.deb')"
   cand="$(basename "$deb" | sed -n 's/^irlume_\(.*\)_amd64.deb$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release .deb filename: $(basename "$deb")"

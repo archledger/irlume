@@ -872,6 +872,9 @@ All notable changes to irlume are documented here. This project adheres to
   release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with
   `does not have a Release file`. `irlume uninstall` now removes such an entry, and `irlume
   update` says how; by hand, `sudo add-apt-repository --remove ppa:archledger/irlume`.
+  Every release-`.deb` path now refreshes the machine's existing repositories first, so the
+  package's dependencies (for example `libtss2-tctildr0`) resolve on a machine with empty or
+  stale package lists.
 
 - irlumed can open cameras and the TPM on systemd before 252, Ubuntu 22.04 and its
   derivatives among them. `ProtectClock=yes` closes the device list on those versions, so

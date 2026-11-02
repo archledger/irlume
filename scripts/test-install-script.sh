@@ -118,6 +118,17 @@ run() {
   deb=no; grep -q 'SHA256SUMS' "$work/log" && deb=yes
   [ "$added" = "$3" ] || fail "$5: PPA added: got $added, want $3"
   [ "$deb" = "$4" ] || fail "$5: release .deb tried: got $deb, want $4"
+  if [ "$4" = yes ]; then
+    # A local .deb still needs the archive's dependency lists, so the
+    # machine's existing repositories are refreshed BEFORE the .deb lane
+    # starts (the harness's curl refuses SHA256SUMS, which is the first
+    # thing the lane fetches, so refresh-before-fetch is what is pinned).
+    up=$({ grep -n '^apt-get update$' "$work/log" || true; } | head -n1 | cut -d: -f1)
+    fetch=$({ grep -n 'SHA256SUMS' "$work/log" || true; } | head -n1 | cut -d: -f1)
+    if [ -z "$up" ] || [ -z "$fetch" ] || [ "$up" -ge "$fetch" ]; then
+      fail "$5: release .deb path must refresh apt lists before its first fetch (update=$up fetch=$fetch)"
+    fi
+  fi
 }
 
 ubuntu='ID=ubuntu

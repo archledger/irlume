@@ -475,6 +475,13 @@ pub(crate) fn ppa_sources_mixing_foreign_uris_in(
         let mut ours = false;
         let mut in_uris_field = false;
         for line in text.lines() {
+            // A comment line does not end the field it sits in: the
+            // vendor's deb822 reader drops comments and keeps the
+            // continuation (matrix3 R13a/R13b), so the scanner skips them
+            // without touching the field state.
+            if line.starts_with('#') {
+                continue;
+            }
             let value = if line.starts_with([' ', '\t']) {
                 if !in_uris_field {
                     continue;
@@ -3144,6 +3151,20 @@ mod origin_tests {
             format!("Types: deb\nURIs: {ppa}\n {foreign}\nSuites: noble\nComponents: main\n"),
         )
         .unwrap();
+        // Comment lines inside a folded URIs field do not end the field for
+        // the vendor (matrix3 R13a/R13b: the entry carries every URI and the
+        // stanza is matched), so the scanner must skip them without losing
+        // the continuation state.
+        std::fs::write(
+            list_d.join("commented.sources"),
+            format!("Types: deb\nURIs: {ppa}\n# a comment line\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("commented2.sources"),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\n# mid comment\n https://third.test/ubuntu\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
         let mut reported = ppa_sources_mixing_foreign_uris_in(&dir);
         reported.sort();
         let mut expected: Vec<_> = [
@@ -3156,6 +3177,7 @@ mod origin_tests {
             "crlf-ours-first.sources",
             "crlf-foreign-first.sources",
             ".sources",
+            "commented.sources",
         ]
         .iter()
         .map(|n| (list_d.join(n), vec![foreign.to_string()]))
@@ -3164,6 +3186,10 @@ mod origin_tests {
         expected.push((
             list_d.join("filetoken.sources"),
             vec!["file:/srv/mirror".to_string()],
+        ));
+        expected.push((
+            list_d.join("commented2.sources"),
+            vec![foreign.to_string(), "https://third.test/ubuntu".to_string()],
         ));
         expected.sort();
         assert_eq!(reported, expected, "the whole vendor domain is reported");
@@ -3202,6 +3228,8 @@ mod origin_tests {
         }
         std::fs::remove_file(list_d.join(bad_name)).unwrap();
         std::fs::remove_file(list_d.join("filetoken.sources")).unwrap();
+        std::fs::remove_file(list_d.join("commented.sources")).unwrap();
+        std::fs::remove_file(list_d.join("commented2.sources")).unwrap();
         assert_eq!(
             ppa_sources_mixing_foreign_uris_in(&dir),
             Vec::<(std::path::PathBuf, Vec<String>)>::new(),

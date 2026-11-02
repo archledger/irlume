@@ -32,6 +32,10 @@ rustfft.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile = "3"
+# Test-only: the dependency-graph guard parses the committed Cargo.lock
+# files. Already a workspace dependency (irlume-camera, irlume-cli), so this
+# adds nothing to the resolved graph.
+toml.workspace = true
 
 [[example]]
 name = "tflite_runtime_probe"

@@ -3958,3 +3958,138 @@ mod model_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tflite_dependency_graph_tests {
+    //! Guards the resolved dependency graph behind the tflite zip-9 pin
+    //! (#1103). The `[patch.crates-io]` entries in `Cargo.toml` and
+    //! `fuzz/Cargo.toml` pin `edgefirst-tflite`/`-sys` to an upstream
+    //! revision whose build-only zip dependency is 9.x; the three zip
+    //! advisory exceptions in `deny.toml` were dropped together with that
+    //! pin. A reverted patch section, or a lockfile refresh that quietly
+    //! falls back to the crates.io 0.10.3 pair, restores zip 8 and the
+    //! advisories with it. Reading the committed lockfiles here turns that
+    //! into a same-day test failure instead of a red advisory gate later.
+
+    use toml::Value;
+
+    const ROOT_LOCK: &str = include_str!("../../../Cargo.lock");
+    const FUZZ_LOCK: &str = include_str!("../../../fuzz/Cargo.lock");
+
+    /// The EdgeFirstAI/tflite-rs commit both tflite crates are pinned to.
+    /// It is merged upstream main that moves edgefirst-tflite-sys's
+    /// build-only zip dependency to 9; review
+    /// docs/research/tflite-zip9-pin.md before changing it.
+    const PINNED_TFLITE_REV: &str = "43c7a741818866bd7e4dc209f504430540c8711f";
+
+    /// Every zip advisory tracked on this path is closed at or before this
+    /// version: RUSTSEC-2026-0367/0368/0369 and RUSTSEC-2026-0429 are
+    /// patched in 9.0.0, and GHSA-m665-v7pm-7grj (Zip Cloaking, no RustSec
+    /// id, tracked in #1103) in 9.0.5. cargo-deny with a current advisory
+    /// database stays the authoritative audit; this floor keeps the
+    /// resolved graph honest between audits.
+    const ZIP_FLOOR: (u64, u64, u64) = (9, 0, 5);
+
+    fn packages(lock: &str) -> Vec<toml::map::Map<String, Value>> {
+        let parsed: toml::map::Map<String, Value> =
+            lock.parse().expect("Cargo.lock must parse as TOML");
+        parsed
+            .get("package")
+            .and_then(Value::as_array)
+            .expect("Cargo.lock must carry a [[package]] array")
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_table()
+                    .expect("each [[package]] is a table")
+                    .clone()
+            })
+            .collect()
+    }
+
+    fn version_of(entry: &toml::map::Map<String, Value>) -> &str {
+        entry
+            .get("version")
+            .and_then(Value::as_str)
+            .expect("version string")
+    }
+
+    fn source_of(entry: &toml::map::Map<String, Value>) -> Option<&str> {
+        entry.get("source").and_then(Value::as_str)
+    }
+
+    fn version_tuple(version: &str) -> (u64, u64, u64) {
+        // A lockfile version is plain `major.minor.patch` here; anything
+        // else is a parsing bug worth failing on, not papering over.
+        let mut parts = version.split('.');
+        let major = parts.next().expect("major").parse().expect("numeric major");
+        let minor = parts.next().expect("minor").parse().expect("numeric minor");
+        let patch = parts.next().expect("patch").parse().expect("numeric patch");
+        (major, minor, patch)
+    }
+
+    fn assert_zip_above_floor(lock: &str, label: &str) {
+        let zips: Vec<_> = packages(lock)
+            .into_iter()
+            .filter(|entry| entry.get("name").and_then(Value::as_str) == Some("zip"))
+            .collect();
+        assert!(
+            !zips.is_empty(),
+            "{label}: no zip package in the lock; the tflite build dependency \
+             that pulls it is gone, which this guard was not updated for"
+        );
+        for entry in zips {
+            let version = version_of(&entry);
+            assert!(
+                version_tuple(version) >= ZIP_FLOOR,
+                "{label}: zip {version} is below the advisory floor \
+                 {ZIP_FLOOR:?}; the tflite patch is stale or was reverted \
+                 (see docs/research/tflite-zip9-pin.md)"
+            );
+        }
+    }
+
+    fn assert_tflite_pinned(lock: &str, label: &str) {
+        let expected_source = format!(
+            "git+https://github.com/EdgeFirstAI/tflite-rs?rev={PINNED_TFLITE_REV}#{PINNED_TFLITE_REV}"
+        );
+        for name in ["edgefirst-tflite", "edgefirst-tflite-sys"] {
+            let matches: Vec<_> = packages(lock)
+                .into_iter()
+                .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "{label}: expected exactly one {name} entry"
+            );
+            let source = source_of(&matches[0]).unwrap_or_default().to_owned();
+            assert_eq!(
+                source, expected_source,
+                "{label}: {name} does not resolve to the pinned upstream \
+                 revision; a crates.io or drifted-rev resolution reintroduces \
+                 the zip 8 build dependency (see docs/research/tflite-zip9-pin.md)"
+            );
+        }
+    }
+
+    #[test]
+    fn root_lock_zip_is_at_or_above_the_advisory_floor() {
+        assert_zip_above_floor(ROOT_LOCK, "Cargo.lock");
+    }
+
+    #[test]
+    fn fuzz_lock_zip_is_at_or_above_the_advisory_floor() {
+        assert_zip_above_floor(FUZZ_LOCK, "fuzz/Cargo.lock");
+    }
+
+    #[test]
+    fn root_lock_resolves_both_tflite_crates_from_the_pinned_rev() {
+        assert_tflite_pinned(ROOT_LOCK, "Cargo.lock");
+    }
+
+    #[test]
+    fn fuzz_lock_resolves_both_tflite_crates_from_the_pinned_rev() {
+        assert_tflite_pinned(FUZZ_LOCK, "fuzz/Cargo.lock");
+    }
+}

@@ -204,8 +204,23 @@ fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
                     &["apt", "install", "--only-upgrade", "irlume"],
                 ])
             };
-            println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
-            println!("    && sudo add-apt-repository ppa:archledger/irlume");
+            // Where the nightly PPA shares a stanza with a repository that is
+            // not ours, the removal command would take that repository with
+            // it (verified on software-properties 0.99.49.4), so the switch
+            // advice starts with the manual edit instead.
+            let mixed_ppa = ppa_sources_mixing_foreign_uris_in(std::path::Path::new("/etc/apt"));
+            if let Some((file, _)) = mixed_ppa.first() {
+                println!(
+                    "  Back to releases: {} mixes the nightly PPA with another repository;\n \
+                     remove only the irlume-nightly URI value by hand first:\n    sudoedit {}",
+                    file.display(),
+                    file.display()
+                );
+                println!("  then: sudo add-apt-repository ppa:archledger/irlume");
+            } else {
+                println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
+                println!("    && sudo add-apt-repository ppa:archledger/irlume");
+            }
             // irlume-kcm depends on the exact irlume version, so it moves too.
             println!("    && sudo apt install --allow-downgrades irlume/<your Ubuntu codename>");
             println!("       (add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed)");
@@ -348,13 +363,548 @@ fn is_nightly_copr_repo(repo: &str) -> bool {
 
 /// Which of irlume's PPAs an apt origin line names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PpaLane {
+pub(crate) enum PpaLane {
     Release,
     Nightly,
 }
 
 const RELEASE_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume/ubuntu";
 const NIGHTLY_PPA: &str = "ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu";
+
+/// Which of irlume's PPAs this machine's apt is told to use.
+pub(crate) fn configured_ppa_lanes() -> Vec<PpaLane> {
+    configured_ppa_lanes_in(std::path::Path::new("/etc/apt"))
+}
+
+/// [`configured_ppa_lanes`] over a directory: the active entries decide, never
+/// a file's name, and only the files apt itself reads are looked at. Each file
+/// is parsed in its own format (sources.list(5)): one-line-style `.list` (and
+/// the main `sources.list`), deb822 `.sources`, where only a stanza apt would
+/// load counts, a comment never does, and only the URIs an entry actually
+/// names count.
+pub(crate) fn configured_ppa_lanes_in(apt: &std::path::Path) -> Vec<PpaLane> {
+    let mut release = false;
+    let mut nightly = false;
+    for path in sources_list_files(apt) {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let deb822 = path.extension().is_some_and(|suffix| suffix == "sources");
+        let uris: Box<dyn Iterator<Item = &str>> = if deb822 {
+            Box::new(deb822_active_uris(&text))
+        } else {
+            Box::new(one_line_style_uris(&text))
+        };
+        for uri in uris {
+            match ppa_lane_of_uri(uri) {
+                Some(PpaLane::Release) => release = true,
+                Some(PpaLane::Nightly) => nightly = true,
+                None => {}
+            }
+        }
+    }
+    let mut lanes = Vec::new();
+    if release {
+        lanes.push(PpaLane::Release);
+    }
+    if nightly {
+        lanes.push(PpaLane::Nightly);
+    }
+    lanes
+}
+
+/// `.sources` files whose content mixes one of our PPA URIs with a
+/// repository that is not ours, as `(file, foreign URIs)`.
+///
+/// This is the SAFETY domain of `add-apt-repository --remove`, not apt's:
+/// on software-properties with deb822 PPA handling (verified on 0.99.49.4
+/// over python3-apt 2.7.7) the tool loads every `sources.list.d` entry
+/// whose name ends `.sources` - hidden names, spaced names, any characters -
+/// parses stanzas python-deb822 accepts regardless of what apt would refuse
+/// (an unknown `Types` word, CR-only line endings), reads repeated fields
+/// last-wins like apt, matches a stanza by superset over
+/// types/comps/suites/uris with the same enabled state, and then removes
+/// the WHOLE stanza, deleting the file when nothing remains. A successful
+/// run also rewrites every sources file it loaded, which can normalize
+/// formatting in files it did not otherwise touch (observed: a folded
+/// `Signed-By:` value written back on one line).
+///
+/// So the scanner deliberately sees MORE than apt: every `.sources` entry
+/// the directory lists (a read failure skips the file the same way the
+/// vendor's loader does), CR characters treated as line breaks the way
+/// Python's universal newlines do, and every `URIs` field occurrence,
+/// folded continuations included, stanza validity irrelevant. A stanza
+/// disabled by `Enabled: no` is reported too: the vendor matcher happens to
+/// skip it, but the refusal costs one manual edit and the parser difference
+/// is exactly the kind of subtlety this guard does not bet a user's
+/// repository on. Over-refusal is the safe direction.
+///
+/// One-line `.list` files are not reported: the deb822 removal loop skips
+/// them (verified), and the legacy one-line path disables single lines and
+/// never deletes a stanza.
+pub(crate) fn ppa_sources_mixing_foreign_uris_in(
+    apt: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<String>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(apt.join("sources.list.d")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // The vendor's loader is os.listdir + endswith(".sources"): any
+        // bytes, hidden names, a bare ".sources", non-UTF-8 names (Python
+        // listdir surrogate-escapes them and still opens the file, matrix2
+        // R12), so the suffix is compared on the raw Unix name bytes.
+        use std::os::unix::ffi::OsStrExt;
+        if !entry.file_name().as_bytes().ends_with(b".sources") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // Unreadable here is unreadable to the vendor's loader too,
+            // which warns and skips the file: not in the removal domain.
+            Err(_) => continue,
+        };
+        // Python's universal newlines: \r\n and a lone \r both become one
+        // \n (matrix2 R10: the vendor reads a CRLF-folded stanza the Rust
+        // reader would otherwise mis-split). CRLF must collapse to a single
+        // newline BEFORE a lone CR is treated as one, or every CRLF becomes
+        // two and the empty line cuts a folded field in half.
+        let text = String::from_utf8_lossy(&bytes)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let mut foreign: Vec<String> = Vec::new();
+        let mut ours = false;
+        let mut in_uris_field = false;
+        for line in text.lines() {
+            // A comment line does not end the field it sits in: the
+            // vendor's deb822 reader drops comments and keeps the
+            // continuation (matrix3 R13a/R13b), so the scanner skips them
+            // without touching the field state.
+            if line.starts_with('#') {
+                continue;
+            }
+            let value = if line.starts_with([' ', '\t']) {
+                if !in_uris_field {
+                    continue;
+                }
+                line.trim_start()
+            } else {
+                in_uris_field = false;
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                if !name.trim_end().eq_ignore_ascii_case("URIs") {
+                    continue;
+                }
+                in_uris_field = true;
+                value
+            };
+            for word in value.split_whitespace() {
+                if ppa_lane_of_uri(word).is_some() {
+                    ours = true;
+                } else {
+                    // Any other URI word is potential collateral: the vendor
+                    // deletes the whole stanza whatever the word looks like,
+                    // scheme or no scheme (matrix2 R11: file:/srv/mirror).
+                    foreign.push(word.to_string());
+                }
+            }
+        }
+        if ours && !foreign.is_empty() {
+            foreign.sort();
+            foreign.dedup();
+            out.push((path, foreign));
+        }
+    }
+    out
+}
+
+/// `sources.list` first, then apt's parts directory, which apt walks as
+/// `GetListOfFilesInDir` does: a regular file (a symlink to one included)
+/// whose name is not hidden and sticks to the run-parts characters before
+/// the `.list`/`.sources` suffix, so a `.irlume.list` rename or an
+/// `irlume copy.sources` backup is a file apt never reads and stays out of
+/// the lanes.
+fn sources_list_files(apt: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf> {
+    let list_d = std::fs::read_dir(apt.join("sources.list.d"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            std::fs::metadata(entry.path())
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(apt_reads_source_file_name)
+        });
+    std::iter::once(apt.join("sources.list")).chain(list_d)
+}
+
+/// apt's own file-name contract for the parts directory
+/// (`GetListOfFilesInDir`): hidden files are skipped, the extension must be
+/// exactly `.list` or `.sources`, and only the run-parts characters are
+/// allowed. Anything else (a space, a `+`, a leading dot) is a file apt
+/// silently ignores, so its bytes must not become a lane. A name that is
+/// not valid UTF-8 is ignored with them: apt's C-locale `isalpha` rejects
+/// those bytes too.
+fn apt_reads_source_file_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        && matches!(
+            std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("list") | Some("sources")
+        )
+}
+
+/// Which PPA a URI names, the way apt compares sources: a scheme separator
+/// `FixupURI` can find, then host and path to the archive root exactly, with
+/// the trailing slash it appends aside, so neither PPA is taken for the
+/// other and a URI that merely contains the archive's text, or extends its
+/// path, is foreign.
+fn ppa_lane_of_uri(uri: &str) -> Option<PpaLane> {
+    let (_, uri) = uri.split_once("://")?;
+    let uri = uri.trim_end_matches('/');
+    if uri == RELEASE_PPA {
+        Some(PpaLane::Release)
+    } else if uri == NIGHTLY_PPA {
+        Some(PpaLane::Nightly)
+    } else {
+        None
+    }
+}
+
+/// The URIs of one-line-style entry lines (sources.list(5)): a `#` comments
+/// out the rest of the line, anywhere on it (inside an options group aside,
+/// as apt's `ParseFileOldStyle` keeps it), the type is `deb` or `deb-src`,
+/// the URI is the first word after the type and its `[options]` group, and a
+/// suite follows (with components, unless the suite is an absolute path). A
+/// line apt would refuse (unknown type, a missing word, a suite/components
+/// mismatch, a URI without even a colon) stops the file, which then
+/// contributes nothing, as in the deb822 reader.
+fn one_line_style_uris(text: &str) -> impl Iterator<Item = &str> {
+    let mut uris = Vec::new();
+    for line in text.lines() {
+        match one_line_style_uri(line) {
+            LineLanes::Active(uri) => uris.push(uri),
+            LineLanes::NoOp => {}
+            LineLanes::Refused => {
+                uris.clear();
+                break;
+            }
+        }
+    }
+    uris.into_iter()
+}
+
+/// What one one-line-style line means for the lanes.
+enum LineLanes<'a> {
+    /// The entry's URI word, in a line apt will load.
+    Active(&'a str),
+    /// Blank after its comment: no entry, file unharmed.
+    NoOp,
+    /// Apt refuses the file at this line.
+    Refused,
+}
+
+/// One line of a one-line-style file, read the way `ParseFileOldStyle` and
+/// `ParseLine` read it.
+fn one_line_style_uri(line: &str) -> LineLanes<'_> {
+    let line = strip_one_line_comment(line).trim();
+    if line.is_empty() {
+        return LineLanes::NoOp;
+    }
+    let mut words = line.split_ascii_whitespace();
+    let Some(entry_type) = words.next() else {
+        return LineLanes::NoOp;
+    };
+    if entry_type != "deb" && entry_type != "deb-src" {
+        return LineLanes::Refused;
+    }
+    let Some(mut word) = words.next() else {
+        return LineLanes::Refused;
+    };
+    if word.starts_with('[') {
+        // The group can be one word or several; the last one carries the `]`
+        // (apt's ParseLine accepts it glued to the final option).
+        while !word.ends_with(']') {
+            let Some(next) = words.next() else {
+                return LineLanes::Refused;
+            };
+            word = next;
+        }
+        let Some(next) = words.next() else {
+            return LineLanes::Refused;
+        };
+        word = next;
+    }
+    let uri = match dequote_word(word) {
+        Some(uri) => uri,
+        None => return LineLanes::Refused,
+    };
+    // FixupURI wants a scheme's colon; a suite and, for a suite that is not
+    // an absolute path, components must follow it.
+    if !uri.contains(':') {
+        return LineLanes::Refused;
+    }
+    let suite_word = match words.next() {
+        Some(suite) => suite,
+        None => return LineLanes::Refused,
+    };
+    // The suite dequotes before its absolute-path shape is judged.
+    let suite = match dequote_word(suite_word) {
+        Some(suite) => suite,
+        None => return LineLanes::Refused,
+    };
+    // An absolute suite (a trailing slash) takes no components; any other
+    // suite takes them.
+    if suite.ends_with('/') == words.next().is_some() {
+        return LineLanes::Refused;
+    }
+    LineLanes::Active(uri)
+}
+
+/// A whole word with its double quotes read the way ParseQuoteWord reads
+/// them: a balanced pair around the word comes off, a word without quotes
+/// passes through, and anything else (an unterminated quote, quotes inside
+/// the word, an empty pair) is a malformed entry, because trimming a lone
+/// quote could turn a broken word into an active PPA. Apt also decodes
+/// percent escapes and dequotes interior pairs; those forms stay written as
+/// they are and so never name one of ours, the conservative direction.
+fn dequote_word(word: &str) -> Option<&str> {
+    if word.len() >= 2 && word.starts_with('"') && word.ends_with('"') {
+        let inner = &word[1..word.len() - 1];
+        return (!inner.is_empty() && !inner.contains('"')).then_some(inner);
+    }
+    (!word.contains('"')).then_some(word)
+}
+
+/// The line up to its comment: the first `#` not inside an unclosed `[`
+/// options group starts it (apt's ParseFileOldStyle).
+fn strip_one_line_comment(line: &str) -> &str {
+    let mut brackets = 0usize;
+    for (index, character) in line.char_indices() {
+        match character {
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            '#' if brackets == 0 => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The URIs of a deb822 `.sources` text's active stanzas: a stanza ends only
+/// at a truly empty line (a whitespace-only line continues the field), a `#`
+/// as a line's first character is a comment that never ends a stanza, a
+/// field's value folds onto lines that start with a space or tab, a repeated
+/// field is last-wins with its continuations, and `URIs` holds
+/// whitespace-separated values. A stanza disabled by a false `Enabled` value
+/// is skipped; a stanza or line apt refuses stops the file, which then
+/// contributes nothing, because this machine's apt would load none of it.
+fn deb822_active_uris(text: &str) -> impl Iterator<Item = &str> {
+    let mut uris = Vec::new();
+    for stanza in deb822_stanzas(text) {
+        match deb822_stanza_lanes(&stanza) {
+            StanzaLanes::Active(found) => uris.extend(found),
+            StanzaLanes::Skipped => {}
+            StanzaLanes::Refused => {
+                uris.clear();
+                break;
+            }
+        }
+    }
+    uris.into_iter()
+}
+
+/// Stanzas as lines: comment lines are dropped and only a truly empty line
+/// separates stanzas, as apt's record scanner reads a file.
+fn deb822_stanzas(text: &str) -> impl Iterator<Item = Vec<&str>> {
+    let mut stanzas: Vec<Vec<&str>> = Vec::new();
+    let mut stanza: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.is_empty() {
+            if !stanza.is_empty() {
+                stanzas.push(std::mem::take(&mut stanza));
+            }
+        } else {
+            stanza.push(line);
+        }
+    }
+    if !stanza.is_empty() {
+        stanzas.push(stanza);
+    }
+    stanzas.into_iter()
+}
+
+/// What one deb822 stanza means for the lanes.
+enum StanzaLanes<'a> {
+    /// The stanza's URIs, in a stanza apt will load.
+    Active(Vec<&'a str>),
+    /// Not an entry: disabled by `Enabled:`, a zero-tag record of only
+    /// continuation lines, or an empty `Types` list, whose per-type loop
+    /// runs zero times.
+    Skipped,
+    /// Apt refuses the file: a field line with no colon, no `Types` field,
+    /// an unknown type, or an enabled stanza missing a required field or
+    /// naming a URI `FixupURI` rejects.
+    Refused,
+}
+
+/// One stanza read the way ParseFileDeb822 and ParseStanza read it: field
+/// names are case-insensitive with their pre-colon whitespace trimmed, a
+/// continuation line extends the field it follows, and a repeated field is
+/// last-wins. `Types` must exist and name a type apt knows before `Enabled`
+/// is even read; an enabled stanza must then carry URIs, suites and the
+/// components a non-absolute suite needs, and every URI a colon.
+fn deb822_stanza_lanes<'a>(stanza: &[&'a str]) -> StanzaLanes<'a> {
+    let mut types: Vec<&str> = Vec::new();
+    let mut types_present = false;
+    let mut uris: Vec<&str> = Vec::new();
+    let mut suites: Vec<&str> = Vec::new();
+    let mut components: Vec<&str> = Vec::new();
+    let mut enabled: Vec<&str> = Vec::new();
+    let mut field = "";
+    let mut saw_field = false;
+    for line in stanza {
+        let (name, value, replaces) = if line.starts_with([' ', '\t']) {
+            (field, line.trim_start(), false)
+        } else {
+            let Some((name, value)) = line.split_once(':') else {
+                return StanzaLanes::Refused;
+            };
+            let name = name.trim_end();
+            // The field the continuation lines after this one extend.
+            field = name;
+            saw_field = true;
+            (name, value, true)
+        };
+        if name.eq_ignore_ascii_case("URIs") {
+            set_words(&mut uris, value, replaces);
+        } else if name.eq_ignore_ascii_case("Suites") {
+            set_words(&mut suites, value, replaces);
+        } else if name.eq_ignore_ascii_case("Components") {
+            set_words(&mut components, value, replaces);
+        } else if name.eq_ignore_ascii_case("Types") {
+            types_present = true;
+            set_words(&mut types, value, replaces);
+        } else if name.eq_ignore_ascii_case("Enabled") {
+            if replaces {
+                enabled.clear();
+            }
+            enabled.push(value);
+        }
+    }
+    if !saw_field {
+        // A record of only continuation lines has no fields to read: apt's
+        // scanner skips a zero-tag record and keeps going.
+        return StanzaLanes::Skipped;
+    }
+    if !types_present {
+        return StanzaLanes::Refused;
+    }
+    if types.is_empty() {
+        // `Types:` present but empty: the per-type loop runs zero times, so
+        // the stanza is simply not an entry.
+        return StanzaLanes::Skipped;
+    }
+    if types.iter().any(|t| *t != "deb" && *t != "deb-src") {
+        return StanzaLanes::Refused;
+    }
+    // Enabled joins its folded lines and trims, as the tag value does.
+    if apt_bool_is_false(&enabled.join("\n")) {
+        return StanzaLanes::Skipped;
+    }
+    if uris.is_empty() || suites.is_empty() || uris.iter().any(|u| !u.contains(':')) {
+        return StanzaLanes::Refused;
+    }
+    // An absolute suite (a trailing slash) takes no components; any other
+    // suite takes them.
+    for suite in &suites {
+        if suite.ends_with('/') != components.is_empty() {
+            return StanzaLanes::Refused;
+        }
+    }
+    StanzaLanes::Active(uris)
+}
+
+/// Replace a multivalue field's words, or extend them when the line
+/// continues the field: the value is its whitespace-separated words.
+fn set_words<'a>(words: &mut Vec<&'a str>, value: &'a str, replaces: bool) {
+    if replaces {
+        words.clear();
+    }
+    words.extend(value.split_ascii_whitespace());
+}
+
+/// Apt's `StringToBool`: a false value is one of its false words, or a
+/// number strtol with base 0 reads whole and as zero, which for an optional
+/// sign and 0x/0X hex or leading-zero octal spelling means every digit is a
+/// zero. Anything else, including an unrecognized word, is not false and
+/// leaves the stanza on (apt's -1 default).
+fn apt_bool_is_false(value: &str) -> bool {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "no" | "false" | "without" | "off" | "disable"
+    ) {
+        return true;
+    }
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let (radix, digits) = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => (16, hex),
+        None if digits.len() > 1 && digits.starts_with('0') => (8, &digits[1..]),
+        None => (10, digits),
+    };
+    !digits.is_empty()
+        && digits.chars().all(|d| d.is_digit(radix))
+        && digits.chars().all(|d| d == '0')
+}
+
+/// What to say when the release PPA serves this series nothing and apt still
+/// lists it, as an older `scripts/install.sh` left it: it added the PPA on every
+/// Ubuntu release and fell back to the .deb. Where the PPA has no Release file
+/// for the series, every `apt update` then fails.
+fn stray_ppa_note(
+    codename: &str,
+    configured: &[PpaLane],
+    mixed: &[(std::path::PathBuf, Vec<String>)],
+) -> Option<String> {
+    if !configured.contains(&PpaLane::Release) {
+        return None;
+    }
+    // Where the PPA shares a stanza with a repository that is not ours, the
+    // same removal command would take that repository with it (verified on
+    // software-properties 0.99.49.4), so the note must not recommend it.
+    if let Some((file, foreign)) = mixed.first() {
+        let foreign = foreign.join(" ");
+        return Some(format!(
+            "  apt still lists that PPA, which has nothing for `{codename}`, mixed with \
+             another repository ({foreign}) in {}. add-apt-repository would remove \
+             the whole stanza; remove only the irlume URI value, keeping the URIs \
+             field, the other values and every other field:\n    sudoedit {}",
+            file.display(),
+            file.display()
+        ));
+    }
+    Some(format!(
+        "  apt still lists that PPA, which has nothing for `{codename}`, and where it has no \
+         Release file `apt update` fails on it. To remove it:\n    \
+         sudo add-apt-repository --remove ppa:archledger/irlume"
+    ))
+}
 
 /// The PPA `apt-cache policy irlume` shows the installed version came from:
 /// the origins listed under the version table's `***` line, matched by whole
@@ -451,6 +1001,13 @@ fn recommend_channel(origin: &InstallOrigin) {
                 Some(false) => {
                     println!("  The PPA carries only the current Ubuntu LTS; for `{codename}` the release");
                     println!("  .deb IS your update channel; re-run `irlume update` when a new one is out.");
+                    if let Some(note) = stray_ppa_note(
+                        &codename,
+                        &configured_ppa_lanes(),
+                        &ppa_sources_mixing_foreign_uris_in(std::path::Path::new("/etc/apt")),
+                    ) {
+                        println!("{note}");
+                    }
                 }
                 None => {
                     println!("  If the PPA serves your Ubuntu series, switching makes future updates automatic:");
@@ -514,14 +1071,23 @@ fn ppa_serves_via(mut curl: std::process::Command, codename: &str) -> Option<boo
     let url = format!(
         "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-{ppa_arch}/Packages.gz"
     );
-    // Distinguish an HTTP error (404 = series genuinely not served) from a
-    // network/tooling failure (offline), so we never tell a CURRENT-LTS user
-    // "the PPA doesn't serve you" just because they happen to be offline.
-    let out = curl.args(["-fsS", "--max-time", "8", &url]).output().ok()?;
-    match out.status.code() {
-        Some(0) => gz_lists_irlume(&out.stdout),
-        Some(22) => Some(false), // curl -f exits 22 on HTTP >= 400 (404) → not served
-        _ => None,               // DNS/connect/timeout → couldn't tell
+    // Distinguish the PPA's own 404 answer that a series is absent from
+    // everything else, so a 429/500/503 outage (also curl -f exit 22) never
+    // turns into "not served" advice to remove a source that is fine. The
+    // same contract install.sh's ppa_serves holds: an outage is not proof
+    // of absence.
+    // `-w` appends "\n%{http_code}" after the body, so the last line of
+    // stdout is the code curl reports for the transfer.
+    let out = curl
+        .args(["-fsS", "--max-time", "8", "-w", "\n%{http_code}", &url])
+        .output()
+        .ok()?;
+    let last_nl = out.stdout.iter().rposition(|&b| b == b'\n')?;
+    let (body, code) = (&out.stdout[..last_nl], &out.stdout[last_nl + 1..]);
+    match (out.status.code(), code) {
+        (Some(0), _) => gz_lists_irlume(body),
+        (Some(22), b"404") => Some(false),
+        _ => None,
     }
 }
 
@@ -2382,6 +2948,912 @@ mod origin_tests {
         );
     }
 
+    /// What apt is told to use decides, read from the entries: a file name proves
+    /// nothing, a commented line is off, and neither PPA is taken for the other.
+    #[test]
+    fn configured_ppas_are_read_from_the_entries_not_the_file_names() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        assert_eq!(lanes(), Vec::<PpaLane>::new(), "nothing there");
+
+        std::fs::write(
+            list_d.join("archledger-ubuntu-irlume-jammy.list"),
+            "# deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("archledger-ubuntu-irlume-noble.sources"),
+            "Types: deb\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "a comment and a name say nothing"
+        );
+
+        std::fs::write(
+            list_d.join("anything.list"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Release], "the old one-line format");
+
+        std::fs::remove_file(list_d.join("anything.list")).unwrap();
+        std::fs::write(
+            list_d.join("nightly.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/\nSuites: noble\nComponents: main\n",
+        )
+        .unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Nightly], "deb822, the other PPA");
+
+        std::fs::write(
+            dir.join("sources.list"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ noble main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release, PpaLane::Nightly],
+            "the main file too, and each lane once"
+        );
+        std::fs::write(
+            list_d.join("not-a-source.save"),
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n",
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("sources.list")).unwrap();
+        assert_eq!(lanes(), vec![PpaLane::Nightly], "apt reads no other suffix");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// apt walks the parts directory with `GetListOfFilesInDir`: a source
+    /// file's name is not hidden and carries only the run-parts characters
+    /// (letters, digits, `_`, `-`, `:`, `.`) before the `.list`/`.sources`
+    /// suffix. A `.irlume.list` disable-by-rename or an
+    /// `irlume copy.sources` desktop backup is a file apt silently ignores,
+    /// so its bytes must never become a lane. Verified against apt 2.4.14
+    /// and 3.3.3 in network-less pinned containers: the same names are read
+    /// and skipped (colon included, space/plus/at/quote/non-ASCII skipped).
+    #[test]
+    fn apt_ignored_file_names_never_make_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let release = "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n";
+        std::fs::write(list_d.join(".irlume.list"), release).unwrap();
+        std::fs::write(
+            list_d.join("irlume copy.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/\nSuites: jammy\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::write(list_d.join("plus+x.list"), release).unwrap();
+        std::fs::write(list_d.join("at@host.list"), release).unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            Vec::<PpaLane>::new(),
+            "names apt never reads are not lanes"
+        );
+        std::fs::write(list_d.join("lap:port.list"), release).unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "a run-parts name with a colon is a lane"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The safety scanner must see at least what `add-apt-repository
+    /// --remove` sees, which is wider than apt (verified on
+    /// software-properties 0.99.49.4 over python3-apt 2.7.7, transcript in
+    /// the review evidence): every directory entry named `*.sources` - a
+    /// hidden `.backup.sources`, a spaced `irlume copy.sources` - parsed by
+    /// python-deb822 whatever apt would refuse (an unknown `Types` word,
+    /// CR-only line endings), with repeated `URIs` fields last-wins but
+    /// every occurrence reported here to stay conservative. A real disabled
+    /// mixed stanza is reported too: the vendor matcher happens to skip it,
+    /// but the refusal costs one manual edit and the parser difference is
+    /// not something to bet a user's repository on. Not reported: one
+    /// stanza naming only our two PPAs, foreign-only files, and one-line
+    /// `.list` files, which the deb822 remover skips entirely.
+    #[test]
+    fn the_vendor_removal_domain_decides_what_may_not_be_removed_automatically() {
+        use super::{configured_ppa_lanes_in, ppa_sources_mixing_foreign_uris_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-vendor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/";
+        let nightly = "https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/";
+        let foreign = "https://example.test/ubuntu";
+        let mixed =
+            |uris: &str| format!("Types: deb\nURIs: {uris}\nSuites: noble\nComponents: main\n");
+
+        // apt ignores both names; the vendor remover loads and deletes both.
+        std::fs::write(
+            list_d.join(".backup.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("irlume copy.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")),
+        )
+        .unwrap();
+        // An unknown Types word: apt refuses the file, the vendor matches.
+        std::fs::write(
+            list_d.join("typed.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")).replace("Types: deb", "Types: deb rpm"),
+        )
+        .unwrap();
+        // CR-only line endings: apt's reader sees one line, the vendor's
+        // universal newlines see a stanza (transcript R5).
+        std::fs::write(
+            list_d.join("cr.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")).replace('\n', "\r"),
+        )
+        .unwrap();
+        // A real disabled mixed stanza (Enabled inside the stanza).
+        std::fs::write(
+            list_d.join("off.sources"),
+            format!("{}Enabled: no\n", mixed(&format!("{ppa}\n      {foreign}"))),
+        )
+        .unwrap();
+        // A shadowed first URIs field: last-wins for both readers, but the
+        // safety scanner reports every occurrence.
+        std::fs::write(
+            list_d.join("dup.sources"),
+            format!("Types: deb\nURIs: {foreign}\nSuites: noble\nComponents: main\nURIs: {ppa}\n"),
+        )
+        .unwrap();
+        // CRLF line endings: Python's universal newlines collapse \r\n to one
+        // newline, so the vendor reads the folded stanza and deletes it
+        // (matrix2 R10a/R10b); the scanner must read it the same way, in
+        // either URIs ordering.
+        for name in ["crlf-ours-first.sources", "crlf-foreign-first.sources"] {
+            let (first, second) = if name.starts_with("crlf-ours") {
+                (ppa, foreign)
+            } else {
+                (foreign, ppa)
+            };
+            let crlf = format!(
+                "Types: deb\r\nURIs: {first}\r\n {second}\r\nSuites: noble\r\nComponents: main\r\n"
+            );
+            std::fs::write(list_d.join(name), crlf).unwrap();
+        }
+        // A URI word without a scheme separator is still a repository the
+        // vendor would delete with the stanza (matrix2 R11: file:/srv/mirror).
+        std::fs::write(
+            list_d.join("filetoken.sources"),
+            format!(
+                "Types: deb\nURIs: {ppa}\n file:/srv/mirror\nSuites: noble\nComponents: main\n"
+            ),
+        )
+        .unwrap();
+        // A non-UTF-8 filename is loaded and deleted by the vendor
+        // (matrix2 R12, surrogate-escaped listdir name), and the bare hidden
+        // name `.sources` is in the vendor's domain too.
+        use std::os::unix::ffi::OsStrExt;
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xff.sources");
+        std::fs::write(
+            list_d.join(bad_name),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join(".sources"),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        // Comment lines inside a folded URIs field do not end the field for
+        // the vendor (matrix3 R13a/R13b: the entry carries every URI and the
+        // stanza is matched), so the scanner must skip them without losing
+        // the continuation state.
+        std::fs::write(
+            list_d.join("commented.sources"),
+            format!("Types: deb\nURIs: {ppa}\n# a comment line\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("commented2.sources"),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\n# mid comment\n https://third.test/ubuntu\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        let mut reported = ppa_sources_mixing_foreign_uris_in(&dir);
+        reported.sort();
+        let mut expected: Vec<_> = [
+            ".backup.sources",
+            "irlume copy.sources",
+            "typed.sources",
+            "cr.sources",
+            "off.sources",
+            "dup.sources",
+            "crlf-ours-first.sources",
+            "crlf-foreign-first.sources",
+            ".sources",
+            "commented.sources",
+        ]
+        .iter()
+        .map(|n| (list_d.join(n), vec![foreign.to_string()]))
+        .collect();
+        expected.push((list_d.join(bad_name), vec![foreign.to_string()]));
+        expected.push((
+            list_d.join("filetoken.sources"),
+            vec!["file:/srv/mirror".to_string()],
+        ));
+        expected.push((
+            list_d.join("commented2.sources"),
+            vec![foreign.to_string(), "https://third.test/ubuntu".to_string()],
+        ));
+        expected.sort();
+        assert_eq!(reported, expected, "the whole vendor domain is reported");
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "sanity: apt itself only sees the active valid-name stanzas"
+        );
+
+        // One stanza naming only our two PPAs is a clean removal.
+        std::fs::write(
+            list_d.join("ours.sources"),
+            mixed(&format!("{ppa}\n      {nightly}")),
+        )
+        .unwrap();
+        // A foreign-only .sources file and a one-line .list with both a PPA
+        // line and a foreign line: never reasons to refuse.
+        std::fs::write(list_d.join("theirs.sources"), mixed(foreign)).unwrap();
+        std::fs::write(
+            list_d.join("lines.list"),
+            format!("deb {ppa} noble main\ndeb {foreign} noble main\n"),
+        )
+        .unwrap();
+        for n in [
+            ".backup.sources",
+            "irlume copy.sources",
+            "typed.sources",
+            "cr.sources",
+            "off.sources",
+            "dup.sources",
+            "crlf-ours-first.sources",
+            "crlf-foreign-first.sources",
+            ".sources",
+        ] {
+            std::fs::remove_file(list_d.join(n)).unwrap();
+        }
+        std::fs::remove_file(list_d.join(bad_name)).unwrap();
+        std::fs::remove_file(list_d.join("filetoken.sources")).unwrap();
+        std::fs::remove_file(list_d.join("commented.sources")).unwrap();
+        std::fs::remove_file(list_d.join("commented2.sources")).unwrap();
+        assert_eq!(
+            ppa_sources_mixing_foreign_uris_in(&dir),
+            Vec::<(std::path::PathBuf, Vec<String>)>::new(),
+            "ours-only, foreign-only and one-line shapes stay unreported"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where the PPA shares a stanza with a repository that is not ours, the
+    /// update advice must not recommend the removal command that would take
+    /// that repository with it; it says how to remove only the irlume URI
+    /// value. Without mixing, the plain advice stands.
+    #[test]
+    fn stray_note_for_a_mixed_source_recommends_an_edit_not_the_removal() {
+        use super::stray_ppa_note;
+        use crate::commands::PpaLane;
+        let mixed = vec![(
+            std::path::PathBuf::from("/etc/apt/sources.list.d/mixed.sources"),
+            vec!["https://example.test/ubuntu".to_string()],
+        )];
+        let note = stray_ppa_note("jammy", &[PpaLane::Release], &mixed).expect("listed");
+        assert!(
+            note.contains("mixed.sources")
+                && note.contains("sudoedit")
+                && note.contains("URI value")
+                && !note.contains("sudo add-apt-repository"),
+            "no removal command recommended for a mixed source: {note}"
+        );
+        let plain = stray_ppa_note("jammy", &[PpaLane::Release], &[]).expect("listed");
+        assert!(
+            plain.contains("add-apt-repository --remove"),
+            "the plain case keeps its advice: {plain}"
+        );
+    }
+
+    /// A deb822 `Enabled:` naming a false value switches its whole stanza off,
+    /// on either side of the URIs: apt's `ParseStanza` skips such a stanza
+    /// entirely (sources.list(5)), so the PPA is not something apt is told to
+    /// use, it must not reach the uninstaller's removal list, and it must not
+    /// draw the update stray note. Any other value is not false (apt's
+    /// `StringToBool` answers its -1 default, which is not false), so the
+    /// stanza stays on exactly as apt reads it.
+    #[test]
+    fn deb822_enabled_false_disables_a_ppa_stanza_in_any_field_order() {
+        use super::{configured_ppa_lanes_in, stray_ppa_note, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-deb822-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let stanza = |enabled: &str, after_uris: bool| {
+            let body = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+            if after_uris {
+                format!("{body}Enabled: {enabled}\n")
+            } else {
+                format!("Enabled: {enabled}\n{body}")
+            }
+        };
+        for off in ["no", "false", "0", "off", "disable", "without"] {
+            std::fs::write(list_d.join("before.sources"), stanza(off, false)).unwrap();
+            std::fs::write(list_d.join("after.sources"), stanza(off, true)).unwrap();
+            assert_eq!(
+                lanes(),
+                Vec::<PpaLane>::new(),
+                "Enabled: {off} is off on either side of the URIs"
+            );
+        }
+        assert_eq!(
+            stray_ppa_note("jammy", &lanes(), &[]),
+            None,
+            "no active-stray advice for a disabled PPA"
+        );
+        for on in ["yes", "1", "true", "maybe"] {
+            std::fs::write(list_d.join("before.sources"), stanza(on, false)).unwrap();
+            std::fs::write(list_d.join("after.sources"), stanza(on, true)).unwrap();
+            assert_eq!(
+                lanes(),
+                vec![PpaLane::Release],
+                "Enabled: {on} keeps the stanza on"
+            );
+        }
+        std::fs::remove_file(list_d.join("before.sources")).unwrap();
+        std::fs::remove_file(list_d.join("after.sources")).unwrap();
+        assert_eq!(lanes(), Vec::<PpaLane>::new(), "clean again");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stanzas are read the way apt reads them: a comment line never acts and
+    /// never ends a stanza, a field's value folds onto lines that start with a
+    /// space, one `URIs` field can name several archives, and only the URIs
+    /// field makes a lane: a URI mentioned in another field's value is data,
+    /// not configuration. A disabled stanza among enabled ones switches only
+    /// itself off, and a foreign owner's PPA is not ours.
+    #[test]
+    fn deb822_lanes_follow_stanzas_folding_and_the_uris_field_only() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-stanzas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let disabled_nightly = r#"Types: deb
+URIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu
+Suites: noble
+Components: main
+Enabled: false
+"#;
+        std::fs::write(
+            list_d.join("mixed.sources"),
+            format!(
+                r#"# moved from https://ppa.launchpadcontent.net/archledger/irlume/ubuntu
+Types: deb
+URIs: https://example.org/ubuntu https://ppa.launchpadcontent.net/archledger/irlume/ubuntu
+Suites: noble
+Components: main
+Description: former home of https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu
+
+{disabled_nightly}
+Types: deb
+URIs: https://ppa.launchpadcontent.net/someoneelse/elsewhere/ubuntu
+Suites: noble
+Components: main
+"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "one-line multivalue URIs count; comments, Description and foreign owners do not"
+        );
+        let enabled_nightly = disabled_nightly.replace("Enabled: false\n", "");
+        std::fs::write(
+            list_d.join("mixed.sources"),
+            format!(
+                r#"Types: deb
+URIs: https://example.org/ubuntu
+      https://ppa.launchpadcontent.net/archledger/irlume/ubuntu
+Suites: noble
+Components: main
+
+{enabled_nightly}
+Types: deb
+URIs: https://ppa.launchpadcontent.net/someoneelse/elsewhere/ubuntu
+Suites: noble
+Components: main
+"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release, PpaLane::Nightly],
+            "a folded URIs continuation counts, and nightly on means nightly"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A one-line entry yields a lane only through its URI token: an options
+    /// group keeps its place between the type and the URI, `deb-src` counts
+    /// like `deb`, http matches https and a missing trailing slash is nothing,
+    /// while a URI mentioned in an inline comment, a longer path under ours,
+    /// and a URI that merely contains the archive's text stay foreign.
+    #[test]
+    fn one_line_entries_name_lanes_only_through_their_uri_token() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-tokens-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let cases: &[(&str, Vec<PpaLane>)] = &[
+            (
+                "deb [arch=amd64 signed-by=/etc/apt/keyrings/irlume.gpg] https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ noble main\n",
+                vec![PpaLane::Release],
+            ),
+            (
+                "deb-src http://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main\n",
+                vec![PpaLane::Nightly],
+            ),
+            (
+                "deb https://example.org/ubuntu noble main # now at https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n",
+                Vec::new(),
+            ),
+            (
+                "deb https://ppa.launchpadcontent.net/archledger/irlume-extra/ubuntu noble main\n",
+                Vec::new(),
+            ),
+            (
+                "deb https://evil.example/mirror/ppa.launchpadcontent.net/archledger/irlume/ubuntu noble main\n",
+                Vec::new(),
+            ),
+        ];
+        for (index, (content, expected)) in cases.iter().enumerate() {
+            std::fs::write(list_d.join(format!("case-{index}.list")), content).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                *expected,
+                "case {index}: {content}"
+            );
+            std::fs::remove_file(list_d.join(format!("case-{index}.list"))).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A whitespace-only line continues the stanza's open field instead of
+    /// ending the stanza: apt's tag scanner ends a record only at a truly
+    /// empty line, so hand-edited files with trailing-space lines keep
+    /// `Enabled: no` attached to the URIs it disables, in either field order.
+    #[test]
+    fn a_whitespace_only_line_continues_a_stanza_it_does_not_end_it() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-wsline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let stanza = |enabled_first: bool| {
+            let ppa = "URIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n";
+            let enabled = "Enabled: no\n";
+            let rest = "Types: deb\nSuites: noble\nComponents: main\n";
+            if enabled_first {
+                format!("{enabled}{ppa}   \n{rest}")
+            } else {
+                format!("Types: deb\n{ppa}   \n{enabled}Suites: noble\nComponents: main\n")
+            }
+        };
+        std::fs::write(list_d.join("first.sources"), stanza(false)).unwrap();
+        std::fs::write(list_d.join("second.sources"), stanza(true)).unwrap();
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "the spaces-only line keeps Enabled with the URIs it disables"
+        );
+        // With the field on, folding across a spaces-only line still names
+        // the archive: continuation, not boundary, is not a refusal.
+        std::fs::write(
+            list_d.join("first.sources"),
+            "Types: deb\nURIs: https://example.org/ubuntu\n   \n      https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::remove_file(list_d.join("second.sources")).unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "a spaces-only line inside a folded value is still one field"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A repeated field is last-wins, with continuation lines extending the
+    /// field they follow: apt's tag lookup reads the newest store of a field,
+    /// so a second `URIs` replaces the first and a second `Enabled` replaces
+    /// the first, however the file got that way.
+    #[test]
+    fn repeated_deb822_fields_are_last_wins_with_their_continuations() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-repeat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let write = |uris: &str| {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!("Types: deb\n{uris}Suites: noble\nComponents: main\n"),
+            )
+            .unwrap();
+        };
+        let ppa = "URIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n";
+        let foreign = "URIs: https://example.org/ubuntu\n";
+        write(&format!("{ppa}{foreign}"));
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "the last URIs field is the one apt reads"
+        );
+        write(&format!("{foreign}{ppa}"));
+        assert_eq!(lanes(), vec![PpaLane::Release], "also when it names ours");
+        write(&format!(
+            "{ppa}{foreign}\n  https://mirror.example.org/ubuntu\n"
+        ));
+        assert_eq!(
+            lanes(),
+            Vec::<PpaLane>::new(),
+            "a continuation extends the field it follows, the replaced one stays replaced"
+        );
+        // Enabled repeats the same way, in either order.
+        for (first, second, expected) in [
+            ("yes", "no", Vec::<PpaLane>::new()),
+            ("no", "yes", vec![PpaLane::Release]),
+        ] {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!(
+                    "Types: deb\nEnabled: {first}\n{ppa}Enabled: {second}\nSuites: noble\nComponents: main\n"
+                ),
+            )
+            .unwrap();
+            assert_eq!(lanes(), expected, "Enabled: {first} then Enabled: {second}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The zero spellings strtol reads whole are false in apt's StringToBool,
+    /// not just the bare `0`: `00` (octal), `0x0` (hex) and a signed `0` all
+    /// disable the stanza, while nonzero numbers and anything unrecognized
+    /// leave it on.
+    #[test]
+    fn apt_zero_spellings_of_enabled_disable_the_stanza() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-zeros-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let stanza = |enabled: &str| {
+            format!(
+                "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\nEnabled: {enabled}\n"
+            )
+        };
+        for zero in ["0", "00", "0x0", "0X0", "-0", "+0", "000"] {
+            std::fs::write(list_d.join("zero.sources"), stanza(zero)).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                Vec::<PpaLane>::new(),
+                "Enabled: {zero} is a strtol zero, so off"
+            );
+        }
+        for on in ["1", "01", "0x1", "2", "0x2"] {
+            std::fs::write(list_d.join("zero.sources"), stanza(on)).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                vec![PpaLane::Release],
+                "Enabled: {on} is not a zero, so on"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A URI without a scheme separator is nothing apt loads: `FixupURI`
+    /// rejects it, so neither format's bare host-and-path spelling is an
+    /// active lane, however exactly it spells ours.
+    #[test]
+    fn a_scheme_less_uri_is_not_an_active_lane() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-scheme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        std::fs::write(
+            list_d.join("bare.sources"),
+            "Types: deb\nURIs: ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("bare.list"),
+            "deb ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            Vec::<PpaLane>::new(),
+            "no scheme, no archive apt will read"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file apt refuses contributes no lanes at all: apt stops at a stanza
+    /// with no `Types` field, an unknown type, a missing required field, or a
+    /// scheme-less URI, so a perfectly valid own PPA stanza beside any of
+    /// those is not something this machine's apt lists either. An absolute
+    /// suite (trailing slash) needs no components and stays a valid entry.
+    #[test]
+    fn a_file_apt_refuses_contributes_no_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let lanes = || configured_ppa_lanes_in(&dir);
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let refused = [
+            // No Types at all.
+            "URIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // A type apt does not know.
+            "Types: rpm\nURIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // Required fields missing on a stanza that is on.
+            "Types: deb\nURIs: https://example.org/ubuntu\nComponents: main\n",
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\n",
+            // A suite that is not an absolute path wants components.
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\n",
+            // FixupURI: a URI without even a colon.
+            "Types: deb\nURIs: example.org/ubuntu\nSuites: noble\nComponents: main\n",
+            // A field line with no colon.
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites noble\n",
+        ];
+        for (index, bad) in refused.iter().enumerate() {
+            std::fs::write(list_d.join("one.sources"), format!("{ours}\n{bad}")).unwrap();
+            assert_eq!(
+                lanes(),
+                Vec::<PpaLane>::new(),
+                "refused case {index}: {bad}"
+            );
+        }
+        // An absolute suite (a path ending in /) needs no components.
+        std::fs::write(
+            list_d.join("one.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble/pond/main/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "an absolute suite is a valid entry without components"
+        );
+        // And a disabled stanza skips the required-field checks that follow
+        // its `Enabled`: only the Types gate comes before Enabled, so a
+        // stanza disabled first is skipped however incomplete after that.
+        std::fs::write(
+            list_d.join("one.sources"),
+            format!("{ours}\nTypes: deb\nEnabled: no\nURIs: https://example.org/ubuntu\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            lanes(),
+            vec![PpaLane::Release],
+            "a disabled stanza is skipped, not a refusal"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// One-line `.list` files get apt's refusals too: a content line whose
+    /// type word is unknown, a missing URI or suite word, a suite that is
+    /// not an absolute path without components, an absolute suite with them,
+    /// or a URI without even a colon makes apt stop reading the file, so a
+    /// valid PPA line in it is not something this machine's apt lists
+    /// either. Blank and comment lines stay no-ops, and the valid shapes
+    /// still count.
+    #[test]
+    fn a_one_line_file_apt_refuses_contributes_no_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir =
+            std::env::temp_dir().join(format!("irlume-apt-list-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu noble main\n";
+        let refused = [
+            // A type word apt does not know, before the valid entry.
+            format!("garbage line here\n{ppa}"),
+            // No suite after the URI.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\n".to_owned(),
+            // No components for a suite that is not an absolute path.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu noble\n".to_owned(),
+            // An absolute suite with a component.
+            "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu dists/noble/main/ extra\n".to_owned(),
+            // FixupURI: a URI without even a colon.
+            "deb ppa.launchpadcontent.net/archledger/irlume/ubuntu noble main\n".to_owned(),
+        ];
+        for (index, content) in refused.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), format!("{content}\n{ppa}")).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                Vec::<PpaLane>::new(),
+                "refused case {index}: {content}"
+            );
+        }
+        // The valid shapes still count: an options group, deb-src with
+        // several components, an absolute suite without components.
+        let valid: [(String, Vec<PpaLane>); 3] = [
+            (
+                "deb [arch=amd64 signed-by=/etc/apt/keyrings/irlume.gpg] https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ noble main\n".to_owned(),
+                vec![PpaLane::Release],
+            ),
+            (
+                "deb-src https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main universe\n".to_owned(),
+                vec![PpaLane::Nightly],
+            ),
+            (
+                "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu dists/noble/main/\n".to_owned(),
+                vec![PpaLane::Release],
+            ),
+        ];
+        for (index, (content, expected)) in valid.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), content).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                *expected,
+                "valid case {index}: {content}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A record of only continuation lines carries no field apt would read:
+    /// its scanner skips a zero-tag record (a trailing spaces-only leftover,
+    /// or one sitting between valid stanzas) and keeps the surrounding
+    /// entries. A field line with no colon still refuses the file.
+    #[test]
+    fn a_zero_tag_record_is_skipped_not_a_refusal() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-zerotag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let release = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let nightly = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu\nSuites: noble\nComponents: main\n";
+        std::fs::write(
+            list_d.join("trailing.sources"),
+            format!("{release}\n   \n   \n"),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "a trailing spaces-only record is no entry at all"
+        );
+        std::fs::write(
+            list_d.join("between.sources"),
+            format!("{release}\n\n   \n\n{nightly}"),
+        )
+        .unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release, PpaLane::Nightly],
+            "a spaces-only record between stanzas is skipped, not a refusal"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `Types:` present but empty is a no-op in apt, not an error: the
+    /// per-type loop runs zero times, so the stanza is simply not an entry
+    /// and valid stanzas around it keep their lanes. The field absent still
+    /// refuses the file (a_file_apt_refuses_contributes_no_lanes).
+    #[test]
+    fn an_empty_types_list_is_a_no_op_not_a_refusal() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-notypes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        for empty in ["", "Enabled: no\n"] {
+            std::fs::write(
+                list_d.join("one.sources"),
+                format!("{ours}\nTypes:\n{empty}URIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n"),
+            )
+            .unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                vec![PpaLane::Release],
+                "an empty Types list ({empty:?} beside it) is a no-op"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A whole word in quotes reads the same in the suite position as in the
+    /// URI position: the balanced pair comes off before the word is judged,
+    /// so a quoted absolute suite without components is a valid entry and one
+    /// with a component refuses, while a plain quoted non-absolute suite
+    /// keeps needing its components. An unbalanced quote anywhere is a
+    /// malformed entry that refuses the file rather than trimming its way
+    /// into an active PPA.
+    #[test]
+    fn quoted_words_dequote_before_their_shape_is_judged() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-quoted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu";
+        let cases: [(&str, Vec<PpaLane>); 7] = [
+            // A quoted absolute suite without components is valid (apt
+            // dequotes the word before its trailing-slash check).
+            (
+                &format!("deb {ppa} \"dists/noble/main/\"\n"),
+                vec![PpaLane::Release],
+            ),
+            // ... and with a component it refuses, quoted or not.
+            (
+                &format!("deb {ppa} \"dists/noble/main/\" extra\n"),
+                Vec::new(),
+            ),
+            // An unterminated quote on the URI is a malformed entry.
+            (&format!("deb \"{ppa} noble main\n"), Vec::new()),
+            // A plain quoted non-absolute suite: components still required.
+            (
+                &format!("deb {ppa} \"noble\" main\n"),
+                vec![PpaLane::Release],
+            ),
+            (&format!("deb {ppa} \"noble\"\n"), Vec::new()),
+            // An unterminated quote on the suite likewise refuses.
+            (&format!("deb {ppa} \"noble main\n"), Vec::new()),
+            // A balanced pair on the URI still reads through.
+            (
+                &format!("deb \"{ppa}\" noble main\n"),
+                vec![PpaLane::Release],
+            ),
+        ];
+        for (index, (content, expected)) in cases.iter().enumerate() {
+            std::fs::write(list_d.join("one.list"), content).unwrap();
+            assert_eq!(
+                configured_ppa_lanes_in(&dir),
+                *expected,
+                "case {index}: {content}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ppa_that_serves_nothing_here_gets_a_note_only_when_apt_lists_it() {
+        use super::{stray_ppa_note, PpaLane};
+        let note = stray_ppa_note("jammy", &[PpaLane::Release], &[]).expect("apt lists it");
+        assert!(note.contains("jammy"), "{note}");
+        assert!(
+            note.contains("sudo add-apt-repository --remove ppa:archledger/irlume"),
+            "{note}"
+        );
+        assert_eq!(stray_ppa_note("jammy", &[], &[]), None);
+        // The note is about the release PPA, the one this check found serves nothing.
+        assert_eq!(stray_ppa_note("jammy", &[PpaLane::Nightly], &[]), None);
+    }
+
     use super::{
         arch_names, arch_origin, gz_lists_irlume, installed_version_via, is_copr_repo,
         is_nightly_copr_repo, latest_release_via, ppa_lane, ppa_serves_via, ubuntu_codename,
@@ -2691,19 +4163,51 @@ mod origin_tests {
         // empty index (the lingering-Release case) is NOT.
         assert_eq!(
             ppa_serves_via(
-                fake("printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; exit 0"),
+                fake("printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; printf '\\n200'"),
                 "resolute"
             ),
             Some(true)
         );
         assert_eq!(
-            ppa_serves_via(fake("printf '' | gzip -c; exit 0"), "noble"),
+            ppa_serves_via(fake("printf '' | gzip -c; printf '\\n200'"), "noble"),
             Some(false)
         );
-        // (b) a genuine HTTP 404 (curl -f exit 22) is "not served".
-        assert_eq!(ppa_serves_via(fake("exit 22"), "trusty"), Some(false));
+        // (b) a genuine HTTP 404 (curl -f exit 22, code reported) is "not served".
+        assert_eq!(
+            ppa_serves_via(fake("printf '\\n404'; exit 22"), "trusty"),
+            Some(false)
+        );
         // (c) ee54b23: offline / connect failure is unknown, never false.
         assert_eq!(ppa_serves_via(no_tool(), "resolute"), None);
+    }
+
+    /// A transient PPA outage (curl -f exit 22 carrying 429/500/503) is not
+    /// a verdict: `update` must not tell the user the PPA has nothing for
+    /// their series (which also arms the stray/removal note), while the
+    /// PPA's own 404 answer stays a real "not served". Mirrors install.sh's
+    /// ppa_serves: an outage is not proof of absence. An exit 22 that
+    /// reports no code at all proves nothing either way, so it reads as
+    /// cannot-tell as well.
+    #[test]
+    fn ppa_outages_are_not_verdicts_on_the_series() {
+        use super::ppa_serves_via;
+        for code in ["429", "500", "503"] {
+            assert_eq!(
+                ppa_serves_via(fake(&format!("printf '\\n{code}'; exit 22")), "resolute"),
+                None,
+                "an outage ({code}) must read as cannot-tell"
+            );
+        }
+        assert_eq!(
+            ppa_serves_via(fake("exit 22"), "resolute"),
+            None,
+            "an HTTP error with no code reported is cannot-tell"
+        );
+        assert_eq!(
+            ppa_serves_via(fake("printf '\\n404'; exit 22"), "resolute"),
+            Some(false),
+            "the PPA's own 404 answer stays authoritative"
+        );
     }
 
     #[test]

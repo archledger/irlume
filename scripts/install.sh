@@ -10,8 +10,9 @@
 #                           Copr is the only Fedora lane: releases carry no RPM
 #                           assets (the release-RPM fallback code path exists
 #                           but finds none today).
-#   Ubuntu (current LTS)  : add the signed PPA, then apt install irlume.
-#                           PPA unavailable -> verified universal .deb.
+#   Ubuntu                : where the PPA serves this release (the current LTS),
+#                           add it, then apt install irlume. Elsewhere, or when
+#                           it is down, the verified universal .deb.
 #   Debian / Ubuntu deriv : download the universal .deb from the latest GitHub
 #                           release, verify it, then install.
 #   Arch                  : install from the AUR (yay/paru when present;
@@ -171,6 +172,12 @@ should_install_deb() {
 }
 
 install_deb_release() {
+  # The archive's lists must be present for the .deb's dependencies
+  # (libtss2-tctildr0 and friends come from the Ubuntu repositories), so
+  # refresh what this machine already has configured - never the unserved
+  # PPA - before anything else on this path. A failed refresh warns and
+  # continues: the existing lists may already satisfy the dependencies.
+  $SUDO apt-get update || warn "apt-get update failed; installing with the current package lists."
   deb="$(fetch_verified '_amd64.deb')"
   cand="$(basename "$deb" | sed -n 's/^irlume_\(.*\)_amd64.deb$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release .deb filename: $(basename "$deb")"
@@ -234,6 +241,37 @@ update_from_release() {
   exit 0
 }
 
+# Does the PPA publish an installable irlume for Ubuntu series $1? Asked the way
+# `irlume update` asks it: of the binary index, as a Release file outlives a
+# series' packages. Exits 0 for yes, 1 for no, 2 when it cannot tell. curl -f
+# uses 22 for any HTTP error; only a separately reported 404 proves the
+# series absent. An error that reports no code at all fails safe the same
+# way: a machine the PPA does not serve must not be left a source apt cannot
+# use.
+ppa_serves() {
+  index="$(mktemp)"
+  answer=2
+  curl_status=0
+  http_status=$(curl -fsS --max-time 15 -w '%{http_code}' -o "$index" \
+      "https://ppa.launchpadcontent.net/${REPO}/ubuntu/dists/$1/main/binary-amd64/Packages.gz" 2>/dev/null) || curl_status=$?
+  if [ "$curl_status" -eq 0 ]; then
+    if gzip -t "$index" 2>/dev/null; then
+      if gzip -dc "$index" | grep -qx 'Package: irlume'; then answer=0; else answer=1; fi
+    fi
+  elif [ "$curl_status" -eq 22 ]; then
+    # A reported 404 is the PPA itself saying the series is absent. A reported
+    # 429/500/503 is an outage: not proof of absence, so the PPA is still
+    # tried (answer stays 2). No code reported at all proves nothing either
+    # way: do not add the PPA on the chance the series is unserved, as that
+    # leaves a source that fails every later apt-get update on this machine.
+    if [ "$http_status" = 404 ] || [ -z "$http_status" ]; then
+      answer=1
+    fi
+  fi
+  rm -f "$index"
+  return "$answer"
+}
+
 main() {
   # Privilege: run package commands as root, via sudo when not already root.
   SUDO=""
@@ -277,7 +315,15 @@ main() {
   # Ubuntu series); derivatives (Pop!_OS, Mint, Zorin, elementary) and Debian
   # take the checksum-verified universal .deb.
   if [ "${ID:-}" = ubuntu ]; then
-    if command -v add-apt-repository >/dev/null 2>&1 \
+    # A series the PPA does not serve must not get it added: where the PPA has no
+    # Release file for it, which is 22.04's case, the source would fail every
+    # later `apt update` on this machine, long after this script has finished.
+    ppa_answer=0
+    ppa_serves "${VERSION_CODENAME:-}" || ppa_answer=$?
+    if [ "$ppa_answer" -eq 1 ]; then
+      say "the PPA carries only the current Ubuntu LTS, not ${VERSION_CODENAME:-this release}; using the checksum-verified .deb."
+      install_deb_release
+    elif command -v add-apt-repository >/dev/null 2>&1 \
        && $SUDO add-apt-repository -y "ppa:${REPO}" 2>/dev/null \
        && $SUDO apt-get update \
        && $SUDO apt-get install -y irlume; then

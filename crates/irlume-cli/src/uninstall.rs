@@ -594,24 +594,80 @@ fn install_channel_command(
     }
 }
 
+/// `configured` is what apt lists. It matters for a release .deb only: the
+/// installer used to add the PPA on every Ubuntu release and fall back to the
+/// .deb, which leaves a source no package came from, so the origin reads as local.
 fn remove_install_channel_with(
     origin: &InstallOrigin,
+    configured: &[crate::commands::PpaLane],
+    mixed: &[(std::path::PathBuf, Vec<String>)],
     mut run: impl FnMut(&str, &[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
-    let Some((bin, args)) = install_channel_command(origin) else {
-        return Ok(());
-    };
-    run(bin, args)
+    // `add-apt-repository --remove` matches a deb822 stanza our PPA is in
+    // and removes the WHOLE stanza (software-properties with deb822 PPA
+    // handling; verified on 0.99.49.4), so a stanza that also carries a
+    // repository that is not ours must never go through it. Only the paths
+    // that invoke add-apt-repository check this - a PPA origin's own
+    // cleanup and the local-.deb lane sweep - so a Copr cleanup is never
+    // refused for apt's sake. The refusal runs no command and changes no
+    // bytes; it says how to remove only the PPA URI value by hand (a
+    // successful vendor removal instead rewrites every sources file it
+    // loaded and can normalize formatting in files it did not touch).
+    if matches!(
+        origin,
+        InstallOrigin::Ppa | InstallOrigin::PpaNightly | InstallOrigin::LocalDeb
+    ) {
+        if let Some((file, foreign)) = mixed.first() {
+            let foreign = foreign.join(" ");
+            let more = if mixed.len() > 1 {
+                format!(" (and {} more files like it)", mixed.len() - 1)
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "{}{more} mixes the irlume PPA with another repository ({foreign}); \
+                 add-apt-repository would remove the whole stanza. Nothing was \
+                 changed. Remove only the irlume URI value, keeping the URIs \
+                 field, the other values and every other field:\n  sudoedit {}",
+                file.display(),
+                file.display()
+            ));
+        }
+    }
+    if let Some((bin, args)) = install_channel_command(origin) {
+        return run(bin, args);
+    }
+    if matches!(origin, InstallOrigin::LocalDeb) {
+        for lane in configured {
+            let lane_origin = match lane {
+                crate::commands::PpaLane::Release => InstallOrigin::Ppa,
+                crate::commands::PpaLane::Nightly => InstallOrigin::PpaNightly,
+            };
+            if let Some((bin, args)) = install_channel_command(&lane_origin) {
+                run(bin, args)?;
+            }
+        }
+    }
+    Ok(())
 }
 
+/// [`remove_install_channel_with`] for the real machine: what apt lists, and
+/// the `.sources` files that mix our PPA with a repository that is not ours,
+/// which no automatic removal may touch.
 fn remove_install_channel(origin: &InstallOrigin) -> Result<(), String> {
-    remove_install_channel_with(origin, |bin, args| {
-        match Command::new(bin).args(args).status() {
+    let configured = crate::commands::configured_ppa_lanes();
+    let mixed =
+        crate::commands::ppa_sources_mixing_foreign_uris_in(std::path::Path::new("/etc/apt"));
+    remove_install_channel_with(
+        origin,
+        &configured,
+        &mixed,
+        |bin, args| match Command::new(bin).args(args).status() {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(format!("{bin} exited with {status}")),
             Err(e) => Err(format!("could not run {bin} ({e})")),
-        }
-    })
+        },
+    )
 }
 
 /// Where systemd records each timer's last-trigger stamp.
@@ -3267,6 +3323,189 @@ mod tests {
         assert!(arch_packages_for(&InstallOrigin::Source).is_empty());
     }
 
+    /// A release .deb can sit beside a PPA source the installer added and then fell
+    /// back from: it never served this machine, so its origin reads as a local .deb,
+    /// and a series with no Release file fails every `apt update` on it. Uninstalling
+    /// removes what apt lists, through the tool that made it, and no more.
+    #[test]
+    fn a_local_deb_beside_a_ppa_source_removes_what_apt_lists() {
+        use crate::commands::PpaLane;
+        let calls = |origin: &InstallOrigin, configured: &[PpaLane]| {
+            let mut seen = Vec::new();
+            remove_install_channel_with(origin, configured, &[], |bin, args| {
+                seen.push(format!("{bin} {}", args.join(" ")));
+                Ok(())
+            })
+            .unwrap();
+            seen
+        };
+        let release = "add-apt-repository -y --remove --ppa ppa:archledger/irlume";
+        let nightly = "add-apt-repository -y --remove --ppa ppa:archledger/irlume-nightly";
+        assert_eq!(
+            calls(&InstallOrigin::LocalDeb, &[PpaLane::Release]),
+            vec![release]
+        );
+        assert_eq!(
+            calls(&InstallOrigin::LocalDeb, &[PpaLane::Nightly]),
+            vec![nightly]
+        );
+        assert_eq!(
+            calls(
+                &InstallOrigin::LocalDeb,
+                &[PpaLane::Release, PpaLane::Nightly]
+            ),
+            vec![release, nightly]
+        );
+        assert_eq!(calls(&InstallOrigin::LocalDeb, &[]), Vec::<String>::new());
+        // A source install owes apt nothing, and a PPA install removes its own lane
+        // as before, whatever else is listed.
+        assert_eq!(
+            calls(&InstallOrigin::Source, &[PpaLane::Release]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            calls(&InstallOrigin::Ppa, &[PpaLane::Nightly]),
+            vec![release]
+        );
+        let failed = remove_install_channel_with(
+            &InstallOrigin::LocalDeb,
+            &[PpaLane::Release],
+            &[],
+            |_, _| Err("no tool".into()),
+        );
+        assert_eq!(failed, Err("no tool".to_owned()), "the caller warns");
+    }
+
+    /// A stanza that mixes our PPA with a repository that is not ours must
+    /// never go to `add-apt-repository`: with deb822 PPA handling
+    /// (software-properties 0.99.49.4, verified against its own
+    /// `_remove_deb822_source` on synthetic sources) the tool matches the
+    /// stanza and removes it whole, deleting the unrelated repository with
+    /// it. Only the paths that invoke add-apt-repository refuse - the PPA
+    /// origins' own cleanup and the local-.deb lane sweep - and the refusal
+    /// runs no command, changes nothing, and says how to remove only the
+    /// irlume URI value by hand. A Copr cleanup still runs: it calls dnf,
+    /// and apt's predicament must not block it.
+    #[test]
+    fn a_stanza_mixing_the_ppa_with_a_foreign_repository_is_never_removed_automatically() {
+        use crate::commands::PpaLane;
+        let mixed = vec![(
+            std::path::PathBuf::from("/etc/apt/sources.list.d/mixed.sources"),
+            vec!["https://example.test/ubuntu".to_string()],
+        )];
+        for label in ["local-deb", "ppa", "ppa-nightly"] {
+            let origin = match label {
+                "local-deb" => &InstallOrigin::LocalDeb,
+                "ppa" => &InstallOrigin::Ppa,
+                _ => &InstallOrigin::PpaNightly,
+            };
+            let mut ran = false;
+            let refused =
+                remove_install_channel_with(origin, &[PpaLane::Release], &mixed, |_, _| {
+                    ran = true;
+                    Ok(())
+                });
+            assert!(
+                !ran,
+                "no removal tool may run while a stanza is mixed ({label})"
+            );
+            let err = refused.expect_err("the refusal is an error the caller warns with");
+            assert!(
+                err.contains("mixed.sources")
+                    && err.contains("https://example.test/ubuntu")
+                    && err.contains("sudoedit")
+                    && err.contains("URI value")
+                    && err.contains("Nothing was changed"),
+                "guidance names the file, the foreign URI, the URI-value edit and the no-change fact: {err}"
+            );
+        }
+        // The dnf paths are not add-apt-repository: never refused for apt's sake.
+        for label in ["copr", "copr-nightly"] {
+            let origin = if label == "copr" {
+                &InstallOrigin::Copr
+            } else {
+                &InstallOrigin::CoprNightly
+            };
+            let mut ran = Vec::new();
+            remove_install_channel_with(origin, &[], &mixed, |bin, args| {
+                ran.push(format!("{bin} {}", args.join(" ")));
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                ran.iter().all(|c| c.starts_with("dnf")) && !ran.is_empty(),
+                "the dnf cleanup still runs ({label}): {ran:?}"
+            );
+        }
+    }
+
+    /// A local .deb cleanup is driven by what apt actually lists, read from
+    /// the entries themselves: `Enabled: no` PPA entries are disabled, so no
+    /// removal is invoked on their behalf and the user's files keep their
+    /// bytes, while an active own PPA still removes through the same path and
+    /// unrelated entries never enter the decision.
+    #[test]
+    fn local_deb_cleanup_spares_disabled_ppas_and_unrelated_entries() {
+        use crate::commands::{configured_ppa_lanes_in, PpaLane};
+        let apt =
+            std::env::temp_dir().join(format!("irlume-deb822-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&apt);
+        let list_d = apt.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let foreign =
+            "Types: deb\nURIs: https://example.org/ubuntu\nSuites: noble\nComponents: main\n";
+        let ours = "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu\nSuites: noble\nComponents: main\n";
+        let off_list =
+            "# deb https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu noble main\n";
+        let calls = || {
+            let mut seen = Vec::new();
+            let configured = configured_ppa_lanes_in(&apt);
+            remove_install_channel_with(&InstallOrigin::LocalDeb, &configured, &[], |bin, args| {
+                seen.push(format!("{bin} {}", args.join(" ")));
+                Ok(())
+            })
+            .unwrap();
+            (configured, seen)
+        };
+        let disabled_sources = format!("{foreign}\n{ours}Enabled: no\n");
+        std::fs::write(list_d.join("irlume.sources"), &disabled_sources).unwrap();
+        std::fs::write(list_d.join("nightly.list"), off_list).unwrap();
+        let (configured, seen) = calls();
+        assert_eq!(
+            configured,
+            Vec::<PpaLane>::new(),
+            "a disabled PPA is not listed"
+        );
+        assert!(seen.is_empty(), "so no removal runs: {seen:?}");
+        assert_eq!(
+            std::fs::read(list_d.join("irlume.sources")).unwrap(),
+            disabled_sources.as_bytes(),
+            "the disabled entry keeps its bytes"
+        );
+        assert_eq!(
+            std::fs::read(list_d.join("nightly.list")).unwrap(),
+            off_list.as_bytes(),
+            "the commented entry keeps its bytes"
+        );
+        // The same files with the PPA entry active again: exactly its own
+        // removal runs, through the installer's tool, and the unrelated
+        // entries beside it are still only read.
+        std::fs::write(list_d.join("irlume.sources"), format!("{foreign}\n{ours}")).unwrap();
+        let (configured, seen) = calls();
+        assert_eq!(configured, vec![PpaLane::Release]);
+        assert_eq!(
+            seen,
+            vec!["add-apt-repository -y --remove --ppa ppa:archledger/irlume"]
+        );
+        assert!(
+            std::fs::read_to_string(list_d.join("irlume.sources"))
+                .unwrap()
+                .contains("example.org"),
+            "the foreign entry is still there, unread"
+        );
+        std::fs::remove_dir_all(&apt).unwrap();
+    }
+
     // Repository/key directories are shared ownership domains. A filename is
     // not proof that irlume or either channel manager owns an entry.
     #[test]
@@ -3289,7 +3528,7 @@ mod tests {
         std::fs::create_dir(dir.join("irlume-repository.d")).unwrap();
 
         let mut invoked = None;
-        remove_install_channel_with(&InstallOrigin::Ppa, |bin, args| {
+        remove_install_channel_with(&InstallOrigin::Ppa, &[], &[], |bin, args| {
             invoked = Some((
                 bin.to_owned(),
                 args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),

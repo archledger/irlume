@@ -59,6 +59,12 @@ grants remain unqualified. See [the desktop flow](DESKTOP-AUTH.md).
 | NixOS | `nixosModules.irlume` from this flake | declarative daemon + PAM wiring (`irlume login enable` and `disable` refuse there), login password keyring unlock only, see [NIXOS.md](NIXOS.md) |
 | anything else | from source | see [DEVELOPMENT.md](DEVELOPMENT.md); Rust 1.88+, onnxruntime 1.24+ |
 
+`scripts/install.sh` used to add the PPA on every Ubuntu release before falling back
+to the `.deb`. On a release the PPA has no Release file for, such as 22.04, every
+`apt update` then fails with `does not have a Release file`. To remove it:
+`sudo add-apt-repository --remove ppa:archledger/irlume`. `irlume update` says so where
+it finds that entry, and `irlume uninstall` removes it.
+
 Every lane is x86_64 only today (Copr chroots, PPA, `.deb`, and the AUR
 `arch=` line all say so).
 

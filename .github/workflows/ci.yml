@@ -182,6 +182,9 @@ jobs:
       - name: ONNX runtime fetcher test (fixtures only, no network)
         run: bash scripts/test-fetch-ort.sh
 
+      - name: Installer channel choice (no network)
+        run: bash scripts/test-install-script.sh
+
       - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
         run: |
           ver=1.28.1

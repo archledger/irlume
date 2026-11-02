@@ -840,6 +840,42 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume uninstall` and `irlume update` now read a deb822 `.sources` stanza
+  the way apt does: one disabled by `Enabled: no` (in any zero spelling apt
+  reads) is not a source apt lists, so a release `.deb` cleanup no longer
+  offers to remove that PPA and update no longer calls it a stray to clean
+  up. A URI needs its scheme, repeated fields count once (the last), a
+  whitespace-only line continues its stanza, and a file apt would refuse
+  contributes nothing; comments, disabled entries and unrelated sources keep
+  their bytes. The parts directory is walked with apt's own file-name rules
+  (`GetListOfFilesInDir`): hidden, spaced or otherwise run-parts-invalid
+  names (a `.irlume.list` rename, an `irlume copy.sources` backup) are files
+  apt never reads, so they no longer count as an active PPA lane either. And
+  when a `.sources` file mixes the PPA with a repository that is not
+  irlume's, `irlume uninstall` refuses the automatic removal and `irlume
+  update` recommends an edit instead of it: on software-properties with
+  deb822 PPA handling (verified against 0.99.49.4's own
+  `add-apt-repository --remove`, which loads every `*.sources` name and
+  deletes a matched stanza whole, formatting of other files included) that
+  command would take the unrelated repository with it. The refusal runs no
+  command and changes nothing; it says how to remove only the irlume URI
+  value by hand.
+
+- Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
+  the install script now demotes an Ubuntu series to the release `.deb` only
+  on a reported 404, or, defensively, when curl reports an HTTP error with no
+  code. `irlume update`'s own probe answers the same way: an outage is not
+  proof the PPA serves a series nothing, so it no longer prints the
+  "nothing for your series" removal advice while the PPA is merely unreachable.
+
+- `scripts/install.sh` adds the PPA only on an Ubuntu release it serves. It added it on every
+  release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with
+  `does not have a Release file`. `irlume uninstall` now removes such an entry, and `irlume
+  update` says how; by hand, `sudo add-apt-repository --remove ppa:archledger/irlume`.
+  Every release-`.deb` path now refreshes the machine's existing repositories first, so the
+  package's dependencies (for example `libtss2-tctildr0`) resolve on a machine with empty or
+  stale package lists.
+
 - irlumed can open cameras and the TPM on systemd before 252, Ubuntu 22.04 and its
   derivatives among them. `ProtectClock=yes` closes the device list on those versions, so
   every open failed with EPERM: the daemon reported no camera, and nothing could be sealed.

@@ -11252,6 +11252,217 @@ auth required pam_fprintd.so\n\
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 
+    /// A jump past an include's end that would newly run a line it used to skip
+    /// has moved, in the session phase too: this one skipped `pam_a.so`, and with
+    /// irlume's line after the include it would skip that line instead.
+    #[test]
+    fn a_first_enable_refuses_a_session_jump_that_would_run_another_line() {
+        let dir = TestDir::new("first-enable-session-jump");
+        std::fs::write(
+            dir.0.join("password-auth"),
+            "session [success=2 default=ignore] pam_succeed_if.so service in crond quiet\n\
+             session required pam_unix.so\n",
+        )
+        .unwrap();
+        let etc = dir.0.join("sddm");
+        let before = "auth substack password-auth\n\
+                      session include password-auth\n\
+                      session optional pam_a.so\n\
+                      session optional pam_b.so\n";
+        std::fs::write(&etc, before).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let planned = wire_service(&svc, true, false, &wire).unwrap();
+        assert_eq!(
+            planned.change,
+            PlannedChange::KeepEditedOverride,
+            "{planned}"
+        );
+        assert!(
+            planned.message.contains("the include on line 2"),
+            "{planned}"
+        );
+    }
+
+    /// The walk past irlume's session lines may only treat a line as
+    /// transparent when the landing rule itself says so: a `pam_irlume.so`
+    /// session rule with a terminal or required control, sitting in a later
+    /// include's expansion, gets the same `irlume session ` landing key as
+    /// the generated `optional` reseal line, but a jump newly landing on it
+    /// can fail the session dispatch. Here the stock jump used to skip it.
+    #[test]
+    fn a_first_enable_refuses_a_jump_now_landing_on_a_terminal_irlume_session_rule() {
+        for control in ["[default=die]", "required"] {
+            let dir = TestDir::new("first-enable-terminal-irlume-session");
+            std::fs::write(
+                dir.0.join("password-auth"),
+                "session [success=2 default=ignore] pam_succeed_if.so service in crond quiet\n\
+                 session required pam_unix.so\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.0.join("later"),
+                format!(
+                    "session {control} pam_irlume.so reseal\n\
+                     session optional pam_env.so\n"
+                ),
+            )
+            .unwrap();
+            let etc = dir.0.join("sddm");
+            std::fs::write(
+                &etc,
+                "auth substack password-auth\n\
+                 session include password-auth\n\
+                 session include later\n",
+            )
+            .unwrap();
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+            let planned = wire_service(&svc, true, false, &wire).unwrap();
+            assert_eq!(
+                planned.change,
+                PlannedChange::KeepEditedOverride,
+                "{control}: {planned}"
+            );
+            assert!(
+                planned.message.contains("wiring would move a jump"),
+                "{control}: {planned}"
+            );
+        }
+    }
+
+    /// The same later include, with an `optional` `pam_irlume.so` rule first:
+    /// a jump displaced onto it runs it and goes on, exactly as on the
+    /// generated line, so the write is still accepted and taken out again.
+    #[test]
+    fn a_first_enable_walks_past_an_optional_irlume_session_rule_in_a_later_include() {
+        let dir = TestDir::new("first-enable-optional-irlume-session");
+        std::fs::write(
+            dir.0.join("password-auth"),
+            "session [success=2 default=ignore] pam_succeed_if.so service in crond quiet\n\
+             session required pam_unix.so\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.0.join("later"),
+            "session optional pam_irlume.so reseal\n\
+             session optional pam_env.so\n",
+        )
+        .unwrap();
+        let etc = dir.0.join("sddm");
+        let stock = "auth substack password-auth\n\
+                     session include password-auth\n\
+                     session include later\n";
+        std::fs::write(&etc, stock).unwrap();
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let wire = |c: &str| wire_greeter_impl(c, true, false, true);
+        let planned = wire_service(&svc, true, false, &wire).unwrap();
+        assert_eq!(planned.change, PlannedChange::Wire, "{planned}");
+        let applied = wire_service(&svc, true, true, &wire).unwrap();
+        assert_eq!(applied.change, PlannedChange::Wire, "{applied}");
+        let wired = std::fs::read_to_string(&etc).unwrap();
+        assert!(wired.contains("pam_irlume.so"), "{wired}");
+        let again = wire_service(&svc, true, false, &wire).unwrap();
+        assert_eq!(again.change, PlannedChange::AlreadyCorrect, "{again}");
+        let out = wire_service(&svc, false, true, &wire).unwrap();
+        assert!(!out.unmet, "{out}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), stock);
+    }
+
+    /// What `irlume login enable` does on a machine nobody has touched: the path
+    /// through `wire_service`, with its checks, on each real greeter file beside
+    /// the stacks its distribution ships, for both ways a greeter is wired. The
+    /// recipes alone cannot show this, since a stack they wire can still be
+    /// refused before it is written.
+    #[test]
+    fn a_first_enable_wires_every_real_greeter_stack() {
+        let distros: [(&str, &[&str], &[&str]); 5] = [
+            (
+                "debian",
+                &["gdm-password", "sddm", "lightdm"],
+                &[
+                    "common-auth",
+                    "common-account",
+                    "common-password",
+                    "common-session",
+                    "common-session-noninteractive",
+                ],
+            ),
+            (
+                "arch",
+                &["gdm-password", "sddm", "lightdm"],
+                &["system-login", "system-local-login", "system-auth"],
+            ),
+            (
+                "opensuse",
+                &["gdm-password", "sddm", "lightdm"],
+                &[
+                    "common-auth",
+                    "common-account",
+                    "common-password",
+                    "common-session",
+                    "postlogin-auth",
+                    "postlogin-account",
+                    "postlogin-password",
+                    "postlogin-session",
+                ],
+            ),
+            (
+                "fedora",
+                &["gdm-password", "sddm", "lightdm", "cosmic-greeter"],
+                &[],
+            ),
+            ("fedora-45", &["gdm-password"], &[]),
+        ];
+        for (distro, services, shared) in distros {
+            for &service in services {
+                for ondemand in [false, true] {
+                    let dir = TestDir::new(&format!("first-enable-{distro}-{service}-{ondemand}"));
+                    if distro.starts_with("fedora") {
+                        ship_fedora_stacks(&dir.0);
+                    }
+                    for name in shared {
+                        std::fs::write(dir.0.join(name), fixture(distro, name)).unwrap();
+                    }
+                    if distro == "opensuse" {
+                        std::fs::write(dir.0.join("xdm"), OPENSUSE_XDM).unwrap();
+                    }
+                    let etc = dir.0.join(service);
+                    let stock = fixture(distro, service);
+                    std::fs::write(&etc, &stock).unwrap();
+                    let svc = Svc {
+                        etc: leak(&etc),
+                        vendor: None,
+                    };
+                    let wire = |c: &str| wire_greeter_impl(c, true, false, ondemand);
+                    let at = format!("{distro}/{service}, ondemand {ondemand}");
+                    let planned = wire_service(&svc, true, false, &wire).unwrap();
+                    assert_eq!(planned.change, PlannedChange::Wire, "{at}: {planned}");
+                    assert!(!planned.unmet, "{at}: {planned}");
+                    let applied = wire_service(&svc, true, true, &wire).unwrap();
+                    assert_eq!(applied.change, PlannedChange::Wire, "{at}: {applied}");
+                    let wired = std::fs::read_to_string(&etc).unwrap();
+                    assert!(wired.contains("pam_irlume.so"), "{at}: {wired}");
+                    let again = wire_service(&svc, true, false, &wire).unwrap();
+                    assert_eq!(again.change, PlannedChange::AlreadyCorrect, "{at}: {again}");
+                    // A disable takes the same lines out again.
+                    let out = wire_service(&svc, false, true, &wire).unwrap();
+                    assert!(!out.unmet, "{at}: {out}");
+                    assert_eq!(std::fs::read_to_string(&etc).unwrap(), stock, "{at}");
+                }
+            }
+        }
+    }
+
     /// The include dialects (Debian @include, Arch include system-*) take the
     /// `sufficient` line; the substack dialects (Fedora password-auth,
     /// openSUSE common-auth) are atomic for jump counting and take the

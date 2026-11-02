@@ -18,3 +18,9 @@ session	requisite			pam_deny.so
 # prime the stack with a positive return value if there isn't one already;
 # this avoids us returning an error just because nothing sets a success code
 # since the modules above will each just jump around
+session	required			pam_permit.so
+# reset the umask for new sessions
+session optional			pam_umask.so
+# and here are more per-package modules (the "Additional" block)
+session	required	pam_unix.so 
+# end of pam-auth-update config

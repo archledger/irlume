@@ -883,6 +883,23 @@ fn included_landing(
     ordinal: usize,
     offset: usize,
 ) -> Option<Landing> {
+    let (at, expanded) = landing_chain(text, phase, include, ordinal, offset)?;
+    let lines: Vec<&str> = expanded.iter().map(String::as_str).collect();
+    Some(landing_of(&lines, at, offset.min(lines.len())))
+}
+
+/// The chain a landing past an include's end counts lines in, with the jump's
+/// own include kept as its starting marker: the parent file's lines of this
+/// phase up to and including the `ordinal`th `include`, then every later line
+/// with each later include expanded in place, read only as far as `offset`
+/// needs. Later includes whose expansion cannot be read end the whole answer.
+fn landing_chain(
+    text: &str,
+    phase: &str,
+    include: &str,
+    ordinal: usize,
+    offset: usize,
+) -> Option<(usize, Vec<String>)> {
     let chain = chain(text, phase);
     let at = chain
         .iter()
@@ -904,8 +921,58 @@ fn included_landing(
             expanded.push(line.to_string());
         }
     }
-    let lines: Vec<&str> = expanded.iter().map(String::as_str).collect();
-    Some(landing_of(&lines, at, offset.min(lines.len())))
+    Some((at, expanded))
+}
+
+/// Whether a jump that lands on `line` and goes on runs nothing it did not
+/// run before: `line` must be irlume's own, of the session phase, under the
+/// plain `optional` control, which is `[success=ok new_authtok_reqd=ok
+/// default=ignore]` (Linux-PAM `pam.conf(5)`, verified at v1.7.2): it can
+/// never terminate that dispatch, never fail it, never jump, so the jump
+/// continues to the line it landed on before. Every other control a
+/// `pam_irlume.so` session rule can carry (a bracketed one that merely
+/// spells `optional` out included) keeps the strict comparison, and so does
+/// anything irlume does not own, whose normalized text can still begin with
+/// `irlume session`. The module field decides ownership, never a text
+/// prefix, and a session stack's failure can still reject
+/// `pam_open_session`, which is why nothing but `optional` is walked past.
+fn transparent_irlume_session_line(line: &str) -> bool {
+    is_irlume_line(line)
+        && phase(line) == Some("session")
+        && head(line).is_some_and(|h| h.control.eq_ignore_ascii_case("optional"))
+}
+
+/// Where an included jump goes on to, past any of irlume's session lines it
+/// lands on. Those are all `optional`: they never end the stack, and what a
+/// session stack returns grants nothing. So a jump that lands on one runs the
+/// same other lines it did. Fedora's `password-auth` ends with such a jump, past
+/// `pam_unix.so` for crond, and irlume's line goes right after that include.
+/// `pam_irlume.so` lines of the auth phase can decide the stack, so they do not
+/// count here, and neither can a session rule of any other control, which a
+/// later include may hold: the landing rule itself is checked, not the key.
+fn past_session_lines(
+    text: &str,
+    phase: &str,
+    include: &str,
+    ordinal: usize,
+    offset: usize,
+) -> Option<Landing> {
+    let mut at = offset;
+    loop {
+        let (jump_at, expanded) = landing_chain(text, phase, include, ordinal, at)?;
+        let lines: Vec<&str> = expanded.iter().map(String::as_str).collect();
+        let landing = landing_of(&lines, jump_at, at.min(lines.len()));
+        match &landing {
+            Landing::Line { .. }
+                if lines
+                    .get(jump_at + at + 1)
+                    .is_some_and(|line| transparent_irlume_session_line(line)) =>
+            {
+                at += 1
+            }
+            _ => return Some(landing),
+        }
+    }
 }
 
 /// An included stack may jump onto lines after its include. Compare those
@@ -951,9 +1018,10 @@ fn included_shifts(
                 let next = included_landing(after, phase_name, &key, ordinal, offset);
                 if let (Some(old_bare), Some(new_bare)) = (&old_bare, &new_bare) {
                     let bare = included_landing(new_bare, phase_name, &key, ordinal, offset);
+                    let through = past_session_lines(after, phase_name, &key, ordinal, offset);
                     let moved_by_irlume = bare
                         .as_ref()
-                        .is_some_and(|bare| next.as_ref() != Some(bare));
+                        .is_some_and(|bare| through.as_ref() != Some(bare));
                     let already = prior == next
                         && included_landing(old_bare, phase_name, &key, ordinal, offset) == bare;
                     if !moved_by_irlume || already {
@@ -3179,6 +3247,38 @@ session     include       password-auth
             .filter(|l| !is_irlume_line_by_substring(l))
             .collect();
         sha256(&format!("{}\n", kept.join("\n")))
+    }
+
+    /// Only irlume's own session rules under the plain `optional` control are
+    /// transparent to a jump: ownership comes from the module field, never a
+    /// text prefix, and every other control a `pam_irlume.so` rule can carry
+    /// keeps the strict comparison, a bracketed spelling of `optional` too.
+    #[test]
+    fn only_an_optional_irlume_session_rule_is_transparent_to_a_landing() {
+        for (line, expect) in [
+            ("session optional pam_irlume.so reseal", true),
+            ("SESSION    OPTIONAL   pam_irlume.so reseal", true),
+            ("-session   optional   pam_irlume.so reseal", true),
+            ("session    optional   pam_irlume.so", true),
+            ("session [default=die] pam_irlume.so reseal", false),
+            ("session required pam_irlume.so reseal", false),
+            ("session sufficient pam_irlume.so unseal facefirst", false),
+            (
+                "session [success=ok new_authtok_reqd=ok default=ignore] pam_irlume.so reseal",
+                false,
+            ),
+            (
+                "session [success=1 default=ignore] pam_irlume.so unseal facefirst",
+                false,
+            ),
+            ("auth optional pam_irlume.so reseal", false),
+            ("session optional pam_env.so", false),
+            ("session optional pam_gnome_keyring.so auto_start", false),
+            ("irlume session bogus", false),
+            ("irlume session pam_irlume.so reseal", false),
+        ] {
+            assert_eq!(transparent_irlume_session_line(line), expect, "{line:?}");
+        }
     }
 
     /// The chains jumps are counted in are libpam's: a line with a type but

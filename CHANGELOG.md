@@ -850,7 +850,16 @@ All notable changes to irlume are documented here. This project adheres to
   their bytes. The parts directory is walked with apt's own file-name rules
   (`GetListOfFilesInDir`): hidden, spaced or otherwise run-parts-invalid
   names (a `.irlume.list` rename, an `irlume copy.sources` backup) are files
-  apt never reads, so they no longer count as an active PPA lane either.
+  apt never reads, so they no longer count as an active PPA lane either. And
+  when a `.sources` file mixes the PPA with a repository that is not
+  irlume's, `irlume uninstall` refuses the automatic removal and `irlume
+  update` recommends an edit instead of it: on software-properties with
+  deb822 PPA handling (verified against 0.99.49.4's own
+  `add-apt-repository --remove`, which loads every `*.sources` name and
+  deletes a matched stanza whole, formatting of other files included) that
+  command would take the unrelated repository with it. The refusal runs no
+  command and changes nothing; it says how to remove only the irlume URI
+  value by hand.
 
 - Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
   the install script now demotes an Ubuntu series to the release `.deb` only

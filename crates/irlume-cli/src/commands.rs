@@ -204,8 +204,23 @@ fn nightly_update(origin: &InstallOrigin, check_only: bool) -> ExitCode {
                     &["apt", "install", "--only-upgrade", "irlume"],
                 ])
             };
-            println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
-            println!("    && sudo add-apt-repository ppa:archledger/irlume");
+            // Where the nightly PPA shares a stanza with a repository that is
+            // not ours, the removal command would take that repository with
+            // it (verified on software-properties 0.99.49.4), so the switch
+            // advice starts with the manual edit instead.
+            let mixed_ppa = ppa_sources_mixing_foreign_uris_in(std::path::Path::new("/etc/apt"));
+            if let Some((file, _)) = mixed_ppa.first() {
+                println!(
+                    "  Back to releases: {} mixes the nightly PPA with another repository;\n \
+                     remove only the irlume-nightly URI value by hand first:\n    sudoedit {}",
+                    file.display(),
+                    file.display()
+                );
+                println!("  then: sudo add-apt-repository ppa:archledger/irlume");
+            } else {
+                println!("  Back to releases: sudo add-apt-repository --remove ppa:archledger/irlume-nightly");
+                println!("    && sudo add-apt-repository ppa:archledger/irlume");
+            }
             // irlume-kcm depends on the exact irlume version, so it moves too.
             println!("    && sudo apt install --allow-downgrades irlume/<your Ubuntu codename>");
             println!("       (add irlume-kcm/<your Ubuntu codename> when irlume-kcm is installed)");
@@ -394,6 +409,106 @@ pub(crate) fn configured_ppa_lanes_in(apt: &std::path::Path) -> Vec<PpaLane> {
         lanes.push(PpaLane::Nightly);
     }
     lanes
+}
+
+/// `.sources` files whose content mixes one of our PPA URIs with a
+/// repository that is not ours, as `(file, foreign URIs)`.
+///
+/// This is the SAFETY domain of `add-apt-repository --remove`, not apt's:
+/// on software-properties with deb822 PPA handling (verified on 0.99.49.4
+/// over python3-apt 2.7.7) the tool loads every `sources.list.d` entry
+/// whose name ends `.sources` - hidden names, spaced names, any characters -
+/// parses stanzas python-deb822 accepts regardless of what apt would refuse
+/// (an unknown `Types` word, CR-only line endings), reads repeated fields
+/// last-wins like apt, matches a stanza by superset over
+/// types/comps/suites/uris with the same enabled state, and then removes
+/// the WHOLE stanza, deleting the file when nothing remains. A successful
+/// run also rewrites every sources file it loaded, which can normalize
+/// formatting in files it did not otherwise touch (observed: a folded
+/// `Signed-By:` value written back on one line).
+///
+/// So the scanner deliberately sees MORE than apt: every `.sources` entry
+/// the directory lists (a read failure skips the file the same way the
+/// vendor's loader does), CR characters treated as line breaks the way
+/// Python's universal newlines do, and every `URIs` field occurrence,
+/// folded continuations included, stanza validity irrelevant. A stanza
+/// disabled by `Enabled: no` is reported too: the vendor matcher happens to
+/// skip it, but the refusal costs one manual edit and the parser difference
+/// is exactly the kind of subtlety this guard does not bet a user's
+/// repository on. Over-refusal is the safe direction.
+///
+/// One-line `.list` files are not reported: the deb822 removal loop skips
+/// them (verified), and the legacy one-line path disables single lines and
+/// never deletes a stanza.
+pub(crate) fn ppa_sources_mixing_foreign_uris_in(
+    apt: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<String>)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(apt.join("sources.list.d")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // The vendor's loader is os.listdir + endswith(".sources"): any
+        // bytes, hidden names, a bare ".sources", non-UTF-8 names (Python
+        // listdir surrogate-escapes them and still opens the file, matrix2
+        // R12), so the suffix is compared on the raw Unix name bytes.
+        use std::os::unix::ffi::OsStrExt;
+        if !entry.file_name().as_bytes().ends_with(b".sources") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            // Unreadable here is unreadable to the vendor's loader too,
+            // which warns and skips the file: not in the removal domain.
+            Err(_) => continue,
+        };
+        // Python's universal newlines: \r\n and a lone \r both become one
+        // \n (matrix2 R10: the vendor reads a CRLF-folded stanza the Rust
+        // reader would otherwise mis-split). CRLF must collapse to a single
+        // newline BEFORE a lone CR is treated as one, or every CRLF becomes
+        // two and the empty line cuts a folded field in half.
+        let text = String::from_utf8_lossy(&bytes)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let mut foreign: Vec<String> = Vec::new();
+        let mut ours = false;
+        let mut in_uris_field = false;
+        for line in text.lines() {
+            let value = if line.starts_with([' ', '\t']) {
+                if !in_uris_field {
+                    continue;
+                }
+                line.trim_start()
+            } else {
+                in_uris_field = false;
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                if !name.trim_end().eq_ignore_ascii_case("URIs") {
+                    continue;
+                }
+                in_uris_field = true;
+                value
+            };
+            for word in value.split_whitespace() {
+                if ppa_lane_of_uri(word).is_some() {
+                    ours = true;
+                } else {
+                    // Any other URI word is potential collateral: the vendor
+                    // deletes the whole stanza whatever the word looks like,
+                    // scheme or no scheme (matrix2 R11: file:/srv/mirror).
+                    foreign.push(word.to_string());
+                }
+            }
+        }
+        if ours && !foreign.is_empty() {
+            foreign.sort();
+            foreign.dedup();
+            out.push((path, foreign));
+        }
+    }
+    out
 }
 
 /// `sources.list` first, then apt's parts directory, which apt walks as
@@ -755,14 +870,33 @@ fn apt_bool_is_false(value: &str) -> bool {
 /// lists it, as an older `scripts/install.sh` left it: it added the PPA on every
 /// Ubuntu release and fell back to the .deb. Where the PPA has no Release file
 /// for the series, every `apt update` then fails.
-fn stray_ppa_note(codename: &str, configured: &[PpaLane]) -> Option<String> {
-    configured.contains(&PpaLane::Release).then(|| {
-        format!(
-            "  apt still lists that PPA, which has nothing for `{codename}`, and where it has no \
-             Release file `apt update` fails on it. To remove it:\n    \
-             sudo add-apt-repository --remove ppa:archledger/irlume"
-        )
-    })
+fn stray_ppa_note(
+    codename: &str,
+    configured: &[PpaLane],
+    mixed: &[(std::path::PathBuf, Vec<String>)],
+) -> Option<String> {
+    if !configured.contains(&PpaLane::Release) {
+        return None;
+    }
+    // Where the PPA shares a stanza with a repository that is not ours, the
+    // same removal command would take that repository with it (verified on
+    // software-properties 0.99.49.4), so the note must not recommend it.
+    if let Some((file, foreign)) = mixed.first() {
+        let foreign = foreign.join(" ");
+        return Some(format!(
+            "  apt still lists that PPA, which has nothing for `{codename}`, mixed with \
+             another repository ({foreign}) in {}. add-apt-repository would remove \
+             the whole stanza; remove only the irlume URI value, keeping the URIs \
+             field, the other values and every other field:\n    sudoedit {}",
+            file.display(),
+            file.display()
+        ));
+    }
+    Some(format!(
+        "  apt still lists that PPA, which has nothing for `{codename}`, and where it has no \
+         Release file `apt update` fails on it. To remove it:\n    \
+         sudo add-apt-repository --remove ppa:archledger/irlume"
+    ))
 }
 
 /// The PPA `apt-cache policy irlume` shows the installed version came from:
@@ -860,7 +994,11 @@ fn recommend_channel(origin: &InstallOrigin) {
                 Some(false) => {
                     println!("  The PPA carries only the current Ubuntu LTS; for `{codename}` the release");
                     println!("  .deb IS your update channel; re-run `irlume update` when a new one is out.");
-                    if let Some(note) = stray_ppa_note(&codename, &configured_ppa_lanes()) {
+                    if let Some(note) = stray_ppa_note(
+                        &codename,
+                        &configured_ppa_lanes(),
+                        &ppa_sources_mixing_foreign_uris_in(std::path::Path::new("/etc/apt")),
+                    ) {
                         println!("{note}");
                     }
                 }
@@ -2904,6 +3042,201 @@ mod origin_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The safety scanner must see at least what `add-apt-repository
+    /// --remove` sees, which is wider than apt (verified on
+    /// software-properties 0.99.49.4 over python3-apt 2.7.7, transcript in
+    /// the review evidence): every directory entry named `*.sources` - a
+    /// hidden `.backup.sources`, a spaced `irlume copy.sources` - parsed by
+    /// python-deb822 whatever apt would refuse (an unknown `Types` word,
+    /// CR-only line endings), with repeated `URIs` fields last-wins but
+    /// every occurrence reported here to stay conservative. A real disabled
+    /// mixed stanza is reported too: the vendor matcher happens to skip it,
+    /// but the refusal costs one manual edit and the parser difference is
+    /// not something to bet a user's repository on. Not reported: one
+    /// stanza naming only our two PPAs, foreign-only files, and one-line
+    /// `.list` files, which the deb822 remover skips entirely.
+    #[test]
+    fn the_vendor_removal_domain_decides_what_may_not_be_removed_automatically() {
+        use super::{configured_ppa_lanes_in, ppa_sources_mixing_foreign_uris_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-vendor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let ppa = "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/";
+        let nightly = "https://ppa.launchpadcontent.net/archledger/irlume-nightly/ubuntu/";
+        let foreign = "https://example.test/ubuntu";
+        let mixed =
+            |uris: &str| format!("Types: deb\nURIs: {uris}\nSuites: noble\nComponents: main\n");
+
+        // apt ignores both names; the vendor remover loads and deletes both.
+        std::fs::write(
+            list_d.join(".backup.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join("irlume copy.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")),
+        )
+        .unwrap();
+        // An unknown Types word: apt refuses the file, the vendor matches.
+        std::fs::write(
+            list_d.join("typed.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")).replace("Types: deb", "Types: deb rpm"),
+        )
+        .unwrap();
+        // CR-only line endings: apt's reader sees one line, the vendor's
+        // universal newlines see a stanza (transcript R5).
+        std::fs::write(
+            list_d.join("cr.sources"),
+            mixed(&format!("{ppa}\n      {foreign}")).replace('\n', "\r"),
+        )
+        .unwrap();
+        // A real disabled mixed stanza (Enabled inside the stanza).
+        std::fs::write(
+            list_d.join("off.sources"),
+            format!("{}Enabled: no\n", mixed(&format!("{ppa}\n      {foreign}"))),
+        )
+        .unwrap();
+        // A shadowed first URIs field: last-wins for both readers, but the
+        // safety scanner reports every occurrence.
+        std::fs::write(
+            list_d.join("dup.sources"),
+            format!("Types: deb\nURIs: {foreign}\nSuites: noble\nComponents: main\nURIs: {ppa}\n"),
+        )
+        .unwrap();
+        // CRLF line endings: Python's universal newlines collapse \r\n to one
+        // newline, so the vendor reads the folded stanza and deletes it
+        // (matrix2 R10a/R10b); the scanner must read it the same way, in
+        // either URIs ordering.
+        for name in ["crlf-ours-first.sources", "crlf-foreign-first.sources"] {
+            let (first, second) = if name.starts_with("crlf-ours") {
+                (ppa, foreign)
+            } else {
+                (foreign, ppa)
+            };
+            let crlf = format!(
+                "Types: deb\r\nURIs: {first}\r\n {second}\r\nSuites: noble\r\nComponents: main\r\n"
+            );
+            std::fs::write(list_d.join(name), crlf).unwrap();
+        }
+        // A URI word without a scheme separator is still a repository the
+        // vendor would delete with the stanza (matrix2 R11: file:/srv/mirror).
+        std::fs::write(
+            list_d.join("filetoken.sources"),
+            format!(
+                "Types: deb\nURIs: {ppa}\n file:/srv/mirror\nSuites: noble\nComponents: main\n"
+            ),
+        )
+        .unwrap();
+        // A non-UTF-8 filename is loaded and deleted by the vendor
+        // (matrix2 R12, surrogate-escaped listdir name), and the bare hidden
+        // name `.sources` is in the vendor's domain too.
+        use std::os::unix::ffi::OsStrExt;
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad\xff.sources");
+        std::fs::write(
+            list_d.join(bad_name),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            list_d.join(".sources"),
+            format!("Types: deb\nURIs: {ppa}\n {foreign}\nSuites: noble\nComponents: main\n"),
+        )
+        .unwrap();
+        let mut reported = ppa_sources_mixing_foreign_uris_in(&dir);
+        reported.sort();
+        let mut expected: Vec<_> = [
+            ".backup.sources",
+            "irlume copy.sources",
+            "typed.sources",
+            "cr.sources",
+            "off.sources",
+            "dup.sources",
+            "crlf-ours-first.sources",
+            "crlf-foreign-first.sources",
+            ".sources",
+        ]
+        .iter()
+        .map(|n| (list_d.join(n), vec![foreign.to_string()]))
+        .collect();
+        expected.push((list_d.join(bad_name), vec![foreign.to_string()]));
+        expected.push((
+            list_d.join("filetoken.sources"),
+            vec!["file:/srv/mirror".to_string()],
+        ));
+        expected.sort();
+        assert_eq!(reported, expected, "the whole vendor domain is reported");
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "sanity: apt itself only sees the active valid-name stanzas"
+        );
+
+        // One stanza naming only our two PPAs is a clean removal.
+        std::fs::write(
+            list_d.join("ours.sources"),
+            mixed(&format!("{ppa}\n      {nightly}")),
+        )
+        .unwrap();
+        // A foreign-only .sources file and a one-line .list with both a PPA
+        // line and a foreign line: never reasons to refuse.
+        std::fs::write(list_d.join("theirs.sources"), mixed(foreign)).unwrap();
+        std::fs::write(
+            list_d.join("lines.list"),
+            format!("deb {ppa} noble main\ndeb {foreign} noble main\n"),
+        )
+        .unwrap();
+        for n in [
+            ".backup.sources",
+            "irlume copy.sources",
+            "typed.sources",
+            "cr.sources",
+            "off.sources",
+            "dup.sources",
+            "crlf-ours-first.sources",
+            "crlf-foreign-first.sources",
+            ".sources",
+        ] {
+            std::fs::remove_file(list_d.join(n)).unwrap();
+        }
+        std::fs::remove_file(list_d.join(bad_name)).unwrap();
+        std::fs::remove_file(list_d.join("filetoken.sources")).unwrap();
+        assert_eq!(
+            ppa_sources_mixing_foreign_uris_in(&dir),
+            Vec::<(std::path::PathBuf, Vec<String>)>::new(),
+            "ours-only, foreign-only and one-line shapes stay unreported"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where the PPA shares a stanza with a repository that is not ours, the
+    /// update advice must not recommend the removal command that would take
+    /// that repository with it; it says how to remove only the irlume URI
+    /// value. Without mixing, the plain advice stands.
+    #[test]
+    fn stray_note_for_a_mixed_source_recommends_an_edit_not_the_removal() {
+        use super::stray_ppa_note;
+        use crate::commands::PpaLane;
+        let mixed = vec![(
+            std::path::PathBuf::from("/etc/apt/sources.list.d/mixed.sources"),
+            vec!["https://example.test/ubuntu".to_string()],
+        )];
+        let note = stray_ppa_note("jammy", &[PpaLane::Release], &mixed).expect("listed");
+        assert!(
+            note.contains("mixed.sources")
+                && note.contains("sudoedit")
+                && note.contains("URI value")
+                && !note.contains("sudo add-apt-repository"),
+            "no removal command recommended for a mixed source: {note}"
+        );
+        let plain = stray_ppa_note("jammy", &[PpaLane::Release], &[]).expect("listed");
+        assert!(
+            plain.contains("add-apt-repository --remove"),
+            "the plain case keeps its advice: {plain}"
+        );
+    }
+
     /// A deb822 `Enabled:` naming a false value switches its whole stanza off,
     /// on either side of the URIs: apt's `ParseStanza` skips such a stanza
     /// entirely (sources.list(5)), so the PPA is not something apt is told to
@@ -2937,7 +3270,7 @@ mod origin_tests {
             );
         }
         assert_eq!(
-            stray_ppa_note("jammy", &lanes()),
+            stray_ppa_note("jammy", &lanes(), &[]),
             None,
             "no active-stray advice for a disabled PPA"
         );
@@ -3482,15 +3815,15 @@ Components: main
     #[test]
     fn a_ppa_that_serves_nothing_here_gets_a_note_only_when_apt_lists_it() {
         use super::{stray_ppa_note, PpaLane};
-        let note = stray_ppa_note("jammy", &[PpaLane::Release]).expect("apt lists it");
+        let note = stray_ppa_note("jammy", &[PpaLane::Release], &[]).expect("apt lists it");
         assert!(note.contains("jammy"), "{note}");
         assert!(
             note.contains("sudo add-apt-repository --remove ppa:archledger/irlume"),
             "{note}"
         );
-        assert_eq!(stray_ppa_note("jammy", &[]), None);
+        assert_eq!(stray_ppa_note("jammy", &[], &[]), None);
         // The note is about the release PPA, the one this check found serves nothing.
-        assert_eq!(stray_ppa_note("jammy", &[PpaLane::Nightly]), None);
+        assert_eq!(stray_ppa_note("jammy", &[PpaLane::Nightly], &[]), None);
     }
 
     use super::{

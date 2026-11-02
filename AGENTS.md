@@ -243,10 +243,13 @@ cargo build --release --locked
    cooldown or reboot (THREAT_MODEL.md "Intent, throttling, and privilege
    elevation").
 10. **Pinned forks.** `pamsm` and `tss-esapi` are pinned by commit (`rev`) in
-    the root `Cargo.toml` `[patch.crates-io]`, never by branch or tag (ADR-0012).
-    `fuzz/Cargo.toml` repeats the tss-esapi patch by branch, frozen by
-    `fuzz/Cargo.lock`. A tss-esapi bump updates both lockfiles, a pamsm bump
-    only `Cargo.lock`; either updates `nix/package.nix` `outputHashes`.
+    the root `Cargo.toml` `[patch.crates-io]`, never by branch or tag (ADR-0012);
+    so are `edgefirst-tflite`/`-sys`, pinned to the upstream zip-9 revision
+    (#1103, [docs/research/tflite-zip9-pin.md](docs/research/tflite-zip9-pin.md)).
+    `fuzz/Cargo.toml` repeats the tss-esapi patch by branch and both tflite
+    pins by rev, frozen by `fuzz/Cargo.lock`. A tss-esapi or tflite bump
+    updates both lockfiles, a pamsm bump only `Cargo.lock`; each updates
+    `nix/package.nix` `outputHashes`.
 
 ## Security and privacy
 

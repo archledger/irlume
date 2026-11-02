@@ -40,7 +40,11 @@ allow = ["CDLA-Permissive-2.0"]
 version = 2
 # Every entry carries its rationale in the comment above it, and a tracking
 # issue: scripts/generate-vex.py maps that comment to an OpenVEX
-# justification and refuses unmapped wording.
+# justification and refuses unmapped wording. The three zip 8.6.0 build
+# dependency exceptions (RUSTSEC-2026-0367/0368/0369, #1103) were dropped
+# when edgefirst-tflite/-sys were pinned to the upstream zip-9 revision;
+# the graph guard in crates/irlume-vision/src/lib.rs keeps both lockfiles
+# on zip >= 9.0.5 so these cannot silently become applicable again.
 ignore = [
     # rsa (the Marvin attack): a timing side channel in operations with an RSA
     # private key, unpatched in every release. irlume-core's EK certificate
@@ -50,21 +54,6 @@ ignore = [
     # is not reached. The PCR signing key in tpm.rs is still parsed with
     # der/spki alone. Drop this with #1112.
     "RUSTSEC-2023-0071",
-    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
-    # whose build script extracts an archive only for its `vendored`
-    # feature, which irlume does not enable: the vulnerable code is not
-    # reached. Fixed in zip 9; drop this with #1103.
-    "RUSTSEC-2026-0367",
-    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
-    # whose build script extracts an archive only for its `vendored`
-    # feature, which irlume does not enable: the vulnerable code is not
-    # reached. Fixed in zip 9; drop this with #1103.
-    "RUSTSEC-2026-0368",
-    # zip 8.6.0 is only a build dependency of edgefirst-tflite-sys 0.10.3,
-    # whose build script extracts an archive only for its `vendored`
-    # feature, which irlume does not enable: the vulnerable code is not
-    # reached. Fixed in zip 9; drop this with #1103.
-    "RUSTSEC-2026-0369",
 ]
 
 [bans]
@@ -72,13 +61,15 @@ ignore = [
 multiple-versions = "warn"
 
 [sources]
-# The workspace intentionally has exactly two git dependencies: the tss-esapi
-# fork and the pamsm fork (archledger/pam_sm_rust, ADR-0012). Any other git
-# or non-crates.io source appearing in the tree should fail CI until it is
-# reviewed and listed here.
+# The workspace intentionally has exactly three git sources, each pinned by
+# commit: the tss-esapi fork, the pamsm fork (archledger/pam_sm_rust,
+# ADR-0012) and the EdgeFirstAI/tflite-rs zip-9 pin (see the [patch]
+# comments in Cargo.toml). Any other git or non-crates.io source appearing
+# in the tree should fail CI until it is reviewed and listed here.
 unknown-git = "deny"
 unknown-registry = "deny"
 allow-git = [
     "https://github.com/archledger/rust-tss-esapi",
     "https://github.com/archledger/pam_sm_rust",
+    "https://github.com/EdgeFirstAI/tflite-rs",
 ]

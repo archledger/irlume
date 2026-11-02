@@ -164,3 +164,28 @@ strip = true
 # deletion. Bump = re-tag, review the delta, update this rev.
 pamsm = { git = "https://github.com/archledger/pam_sm_rust", rev = "5cd182d42076bd4fd0a8c4367f042c6d641a2457" }
 tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", rev = "7567f6048d2bcb42779e80c0dad90e7eacf6185c" }
+# EdgeFirstAI/tflite-rs @ main 43c7a741 (merged PR #20, 2026-10-28): pins
+# BOTH tflite crates of that workspace to an immutable upstream revision
+# instead of the crates.io 0.10.3 pair, because published 0.10.3 still
+# requires zip 8 (RUSTSEC-2026-0367/0368/0369, later RUSTSEC-2026-0429,
+# all patched only in zip >= 9) while upstream main moved the sys crate's
+# build-only zip dependency to 9. Both crates remain version 0.10.3 at
+# that rev, so irlume-vision's exact `=0.10.3` constraint keeps matching
+# and the resolved versions do not change, only the zip line under them.
+# The whole compiled-crate delta against the published 0.10.3 sources is
+# reviewed in docs/research/tflite-zip9-pin.md: the two zip version bumps
+# plus the zip-9 `file_names` adaptation in the wrapper's feature-gated
+# `archive` module (off in irlume); the sys crate's build script and its
+# vendored download path are byte-identical, so irlume's no-`vendored`,
+# prebuilt-`IRLUME_TFLITE_LIB` posture is unchanged.
+# RESTORE/UPDATE: this pin exists only because no EdgeFirstAI release
+# accepts zip 9 yet (tracked in #1103; upstream issue #21 asks for one).
+# When such a release ships, drop both entries, bump the version pin if
+# needed, rerun the dependency gates in AGENTS.md, and re-audit the
+# published sources the way docs/research/tflite-0.10.1-audit.md did for
+# 0.10.1. Until then a bump means: pick a new immutable merged rev, review
+# the delta, and update both revs here and in fuzz/Cargo.toml together.
+# Cargo.lock pins the exact rev, so this is a frozen dependency: it never
+# moves under a user, only when we bump it.
+edgefirst-tflite = { git = "https://github.com/EdgeFirstAI/tflite-rs", rev = "43c7a741818866bd7e4dc209f504430540c8711f" }
+edgefirst-tflite-sys = { git = "https://github.com/EdgeFirstAI/tflite-rs", rev = "43c7a741818866bd7e4dc209f504430540c8711f" }

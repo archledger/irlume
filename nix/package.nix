@@ -94,6 +94,10 @@ rustPlatform.buildRustPackage {
       "tss-esapi-7.7.0" = "sha256-DMSoJtwvVIUK++Ych15C6EM0hMk15w5oEAkUQoWhJ+A=";
       "tss-esapi-sys-0.6.0" = "sha256-DMSoJtwvVIUK++Ych15C6EM0hMk15w5oEAkUQoWhJ+A=";
       "pamsm-0.5.5" = "sha256-3U6h6GhNhc3jDOZ8HqTFJMe0MepcKek4tk9mAbJ/GvM=";
+      # Both tflite crates share one repo/rev (the upstream zip-9 pin in
+      # Cargo.toml), so like the tss pair both keys carry the same hash.
+      "edgefirst-tflite-0.10.3" = "sha256-94Ib/o9JeaTwcSfttiv5cupl29y/NnSfifYovZ9Fook=";
+      "edgefirst-tflite-sys-0.10.3" = "sha256-94Ib/o9JeaTwcSfttiv5cupl29y/NnSfifYovZ9Fook=";
     };
   };
 

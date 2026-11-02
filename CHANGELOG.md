@@ -1441,6 +1441,20 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
+- Pin `edgefirst-tflite`/`edgefirst-tflite-sys` 0.10.3 to the merged
+  upstream zip-9 revision `43c7a741`
+  ([EdgeFirstAI/tflite-rs](https://github.com/EdgeFirstAI/tflite-rs), PR
+  #20) via `[patch.crates-io]` in both the application and fuzz
+  workspaces, moving the sys crate's build-only zip dependency from 8.6.0
+  to 9.2.2 and dropping the three zip advisory exceptions
+  (RUSTSEC-2026-0367/0368/0369, #1103). No exception replaces them: zip
+  8.6.0, which carried RUSTSEC-2026-0429 as well, is out of both graphs.
+  A lockfile graph guard in `irlume-vision` keeps every zip at or above
+  the 9.0.5 advisory floor and both tflite crates on the reviewed
+  revision. Resolved versions, the upstream delta review and the
+  restore-when-upstream-releases plan are in
+  `docs/research/tflite-zip9-pin.md`.
+
 - Update `crypto-bigint` to 0.7.6 and its `ctutils` dependency to 0.4.5 in
   both lockfiles for [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
   The application interfaces and minimum supported Rust version are unchanged.

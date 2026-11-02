@@ -847,12 +847,17 @@ All notable changes to irlume are documented here. This project adheres to
   up. A URI needs its scheme, repeated fields count once (the last), a
   whitespace-only line continues its stanza, and a file apt would refuse
   contributes nothing; comments, disabled entries and unrelated sources keep
-  their bytes.
+  their bytes. The parts directory is walked with apt's own file-name rules
+  (`GetListOfFilesInDir`): hidden, spaced or otherwise run-parts-invalid
+  names (a `.irlume.list` rename, an `irlume copy.sources` backup) are files
+  apt never reads, so they no longer count as an active PPA lane either.
 
 - Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
   the install script now demotes an Ubuntu series to the release `.deb` only
   on a reported 404, or, defensively, when curl reports an HTTP error with no
-  code.
+  code. `irlume update`'s own probe answers the same way: an outage is not
+  proof the PPA serves a series nothing, so it no longer prints the
+  "nothing for your series" removal advice while the PPA is merely unreachable.
 
 - `scripts/install.sh` adds the PPA only on an Ubuntu release it serves. It added it on every
   release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with

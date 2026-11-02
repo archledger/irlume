@@ -396,19 +396,49 @@ pub(crate) fn configured_ppa_lanes_in(apt: &std::path::Path) -> Vec<PpaLane> {
     lanes
 }
 
-/// `sources.list` first, then apt's parts directory: the files ending in
-/// `.list` or `.sources`, in the order the directory lists them.
+/// `sources.list` first, then apt's parts directory, which apt walks as
+/// `GetListOfFilesInDir` does: a regular file (a symlink to one included)
+/// whose name is not hidden and sticks to the run-parts characters before
+/// the `.list`/`.sources` suffix, so a `.irlume.list` rename or an
+/// `irlume copy.sources` backup is a file apt never reads and stays out of
+/// the lanes.
 fn sources_list_files(apt: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf> {
     let list_d = std::fs::read_dir(apt.join("sources.list.d"))
         .into_iter()
         .flatten()
         .flatten()
+        .filter(|entry| {
+            std::fs::metadata(entry.path())
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+        })
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension()
-                .is_some_and(|suffix| suffix == "list" || suffix == "sources")
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(apt_reads_source_file_name)
         });
     std::iter::once(apt.join("sources.list")).chain(list_d)
+}
+
+/// apt's own file-name contract for the parts directory
+/// (`GetListOfFilesInDir`): hidden files are skipped, the extension must be
+/// exactly `.list` or `.sources`, and only the run-parts characters are
+/// allowed. Anything else (a space, a `+`, a leading dot) is a file apt
+/// silently ignores, so its bytes must not become a lane. A name that is
+/// not valid UTF-8 is ignored with them: apt's C-locale `isalpha` rejects
+/// those bytes too.
+fn apt_reads_source_file_name(name: &str) -> bool {
+    !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
+        && matches!(
+            std::path::Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str()),
+            Some("list") | Some("sources")
+        )
 }
 
 /// Which PPA a URI names, the way apt compares sources: a scheme separator
@@ -896,14 +926,23 @@ fn ppa_serves_via(mut curl: std::process::Command, codename: &str) -> Option<boo
     let url = format!(
         "https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/dists/{codename}/main/binary-{ppa_arch}/Packages.gz"
     );
-    // Distinguish an HTTP error (404 = series genuinely not served) from a
-    // network/tooling failure (offline), so we never tell a CURRENT-LTS user
-    // "the PPA doesn't serve you" just because they happen to be offline.
-    let out = curl.args(["-fsS", "--max-time", "8", &url]).output().ok()?;
-    match out.status.code() {
-        Some(0) => gz_lists_irlume(&out.stdout),
-        Some(22) => Some(false), // curl -f exits 22 on HTTP >= 400 (404) → not served
-        _ => None,               // DNS/connect/timeout → couldn't tell
+    // Distinguish the PPA's own 404 answer that a series is absent from
+    // everything else, so a 429/500/503 outage (also curl -f exit 22) never
+    // turns into "not served" advice to remove a source that is fine. The
+    // same contract install.sh's ppa_serves holds: an outage is not proof
+    // of absence.
+    // `-w` appends "\n%{http_code}" after the body, so the last line of
+    // stdout is the code curl reports for the transfer.
+    let out = curl
+        .args(["-fsS", "--max-time", "8", "-w", "\n%{http_code}", &url])
+        .output()
+        .ok()?;
+    let last_nl = out.stdout.iter().rposition(|&b| b == b'\n')?;
+    let (body, code) = (&out.stdout[..last_nl], &out.stdout[last_nl + 1..]);
+    match (out.status.code(), code) {
+        (Some(0), _) => gz_lists_irlume(body),
+        (Some(22), b"404") => Some(false),
+        _ => None,
     }
 }
 
@@ -2827,6 +2866,44 @@ mod origin_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// apt walks the parts directory with `GetListOfFilesInDir`: a source
+    /// file's name is not hidden and carries only the run-parts characters
+    /// (letters, digits, `_`, `-`, `:`, `.`) before the `.list`/`.sources`
+    /// suffix. A `.irlume.list` disable-by-rename or an
+    /// `irlume copy.sources` desktop backup is a file apt silently ignores,
+    /// so its bytes must never become a lane. Verified against apt 2.4.14
+    /// and 3.3.3 in network-less pinned containers: the same names are read
+    /// and skipped (colon included, space/plus/at/quote/non-ASCII skipped).
+    #[test]
+    fn apt_ignored_file_names_never_make_lanes() {
+        use super::{configured_ppa_lanes_in, PpaLane};
+        let dir = std::env::temp_dir().join(format!("irlume-apt-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let list_d = dir.join("sources.list.d");
+        std::fs::create_dir_all(&list_d).unwrap();
+        let release = "deb https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/ jammy main\n";
+        std::fs::write(list_d.join(".irlume.list"), release).unwrap();
+        std::fs::write(
+            list_d.join("irlume copy.sources"),
+            "Types: deb\nURIs: https://ppa.launchpadcontent.net/archledger/irlume/ubuntu/\nSuites: jammy\nComponents: main\n",
+        )
+        .unwrap();
+        std::fs::write(list_d.join("plus+x.list"), release).unwrap();
+        std::fs::write(list_d.join("at@host.list"), release).unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            Vec::<PpaLane>::new(),
+            "names apt never reads are not lanes"
+        );
+        std::fs::write(list_d.join("lap:port.list"), release).unwrap();
+        assert_eq!(
+            configured_ppa_lanes_in(&dir),
+            vec![PpaLane::Release],
+            "a run-parts name with a colon is a lane"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A deb822 `Enabled:` naming a false value switches its whole stanza off,
     /// on either side of the URIs: apt's `ParseStanza` skips such a stanza
     /// entirely (sources.list(5)), so the PPA is not something apt is told to
@@ -3725,19 +3802,51 @@ Components: main
         // empty index (the lingering-Release case) is NOT.
         assert_eq!(
             ppa_serves_via(
-                fake("printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; exit 0"),
+                fake("printf 'Package: irlume\nVersion: 9.9.9\n' | gzip -c; printf '\\n200'"),
                 "resolute"
             ),
             Some(true)
         );
         assert_eq!(
-            ppa_serves_via(fake("printf '' | gzip -c; exit 0"), "noble"),
+            ppa_serves_via(fake("printf '' | gzip -c; printf '\\n200'"), "noble"),
             Some(false)
         );
-        // (b) a genuine HTTP 404 (curl -f exit 22) is "not served".
-        assert_eq!(ppa_serves_via(fake("exit 22"), "trusty"), Some(false));
+        // (b) a genuine HTTP 404 (curl -f exit 22, code reported) is "not served".
+        assert_eq!(
+            ppa_serves_via(fake("printf '\\n404'; exit 22"), "trusty"),
+            Some(false)
+        );
         // (c) ee54b23: offline / connect failure is unknown, never false.
         assert_eq!(ppa_serves_via(no_tool(), "resolute"), None);
+    }
+
+    /// A transient PPA outage (curl -f exit 22 carrying 429/500/503) is not
+    /// a verdict: `update` must not tell the user the PPA has nothing for
+    /// their series (which also arms the stray/removal note), while the
+    /// PPA's own 404 answer stays a real "not served". Mirrors install.sh's
+    /// ppa_serves: an outage is not proof of absence. An exit 22 that
+    /// reports no code at all proves nothing either way, so it reads as
+    /// cannot-tell as well.
+    #[test]
+    fn ppa_outages_are_not_verdicts_on_the_series() {
+        use super::ppa_serves_via;
+        for code in ["429", "500", "503"] {
+            assert_eq!(
+                ppa_serves_via(fake(&format!("printf '\\n{code}'; exit 22")), "resolute"),
+                None,
+                "an outage ({code}) must read as cannot-tell"
+            );
+        }
+        assert_eq!(
+            ppa_serves_via(fake("exit 22"), "resolute"),
+            None,
+            "an HTTP error with no code reported is cannot-tell"
+        );
+        assert_eq!(
+            ppa_serves_via(fake("printf '\\n404'; exit 22"), "resolute"),
+            Some(false),
+            "the PPA's own 404 answer stays authoritative"
+        );
     }
 
     #[test]

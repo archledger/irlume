@@ -338,8 +338,12 @@ the configuration LightDM is about to load before every start, and while
 XDMCP or VNC is enabled the view replaces `pam_fprintd` and irlume's
 credential rules with inert slots without rewriting the shared stacks.
 Removing irlume takes the `lightdm.service.d` drop-in and the view units away
-with it, and `irlume uninstall` removes its own copies; LightDM then starts
-on the ordinary shared stacks again. Runtime view files under
+with it, and `irlume uninstall` removes its own copies; after the manager
+reloads its unit files, LightDM starts on the ordinary shared stacks again.
+The universal Debian package reloads systemd after removal or purge and stops
+the refresh units without stopping LightDM. If removing a drop-in by hand,
+run `sudo systemctl daemon-reload` before the next LightDM start.
+Runtime view files under
 `/run/irlume-lightdm` stay until reboot so sessions that inherited the view
 keep working.
 

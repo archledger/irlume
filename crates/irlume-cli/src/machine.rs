@@ -2206,10 +2206,21 @@ fn owned_dir(path: &std::path::Path, uid: u32) -> Option<std::fs::File> {
 /// The name is resolved through the open directory descriptor, so the lock
 /// lands in the directory [`owned_dir`] checked even if the path that named it
 /// has changed since. `O_NOFOLLOW` refuses a symlink at the lock's name, and
-/// `O_NONBLOCK` keeps a FIFO there from stalling the open.
+/// `O_NONBLOCK` keeps a FIFO there from stalling the open. After locking, the
+/// descriptor must still name the current file, or a stale opener could
+/// replace a newer session's lock or accept an unlinked private lock.
 fn open_session_lock(
     dir: &std::fs::File,
     uid: u32,
+) -> std::result::Result<std::fs::File, SessionRefusal> {
+    open_session_lock_with(dir, uid, || {})
+}
+
+/// Keep the open-to-lock boundary observable for deterministic concurrency tests.
+fn open_session_lock_with(
+    dir: &std::fs::File,
+    uid: u32,
+    before_lock: impl FnOnce(),
 ) -> std::result::Result<std::fs::File, SessionRefusal> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::os::unix::io::AsRawFd;
@@ -2235,7 +2246,18 @@ fn open_session_lock(
     };
     let file = open(false).map_err(|_| SessionRefusal::Unavailable)?;
     let meta = owned(&file)?;
+    before_lock();
     lock_exclusive(&file)?;
+    let current = std::fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            SessionRefusal::Busy
+        } else {
+            SessionRefusal::Unavailable
+        }
+    })?;
+    if (current.dev(), current.ino()) != (meta.dev(), meta.ino()) {
+        return Err(SessionRefusal::Busy);
+    }
     if meta.mode() & 0o077 == 0 {
         return Ok(file);
     }
@@ -3967,6 +3989,66 @@ mod tests {
         );
         drop(holder);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_lock_rejects_a_stale_opener_after_legacy_replacement() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        if !in_isolated_session_process() {
+            return;
+        }
+        for mode in [0o600, 0o644] {
+            let dir = runtime_sandbox("stale-opener");
+            let path = dir.join(SESSION_LOCK_NAME);
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let directory = owned_dir(&dir, own_uid()).unwrap();
+            let uid = own_uid();
+            let (opened, ready) = mpsc::sync_channel(1);
+            let (resume, wait) = mpsc::sync_channel(1);
+            let stale = std::thread::spawn(move || {
+                open_session_lock_with(&directory, uid, || {
+                    opened.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let current = SessionGuard::acquire_in(Some(&dir), uid, None);
+            resume.send(()).unwrap();
+            let stale = stale.join().unwrap();
+            let current = acquired(current);
+            let held = current._file.metadata().unwrap();
+            let named = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                matches!(stale, Err(SessionRefusal::Busy)),
+                "mode {mode:o}: stale opener acquired a second session"
+            );
+            assert_eq!((named.dev(), named.ino()), (held.dev(), held.ino()));
+            assert_eq!(named.mode() & 0o7777, 0o600);
+            drop(current);
+            drop(acquired(SessionGuard::acquire_in(Some(&dir), uid, None)));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_lock_rejects_a_path_removed_after_open() {
+        let dir = runtime_sandbox("removed-open-lock");
+        let path = dir.join(SESSION_LOCK_NAME);
+        let directory = owned_dir(&dir, own_uid()).unwrap();
+        let result = open_session_lock_with(&directory, own_uid(), || {
+            std::fs::remove_file(&path).unwrap();
+        });
+        assert!(matches!(result, Err(SessionRefusal::Busy)));
+        assert!(!path.exists(), "a stale opener must not recreate the path");
+        drop(acquired(SessionGuard::acquire_in(
+            Some(&dir),
+            own_uid(),
+            None,
+        )));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A symlink at the lock's name is refused, and the path it names is not

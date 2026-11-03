@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Machine sessions refuse stale lock files after a concurrent legacy-lock
+  upgrade, keeping one session per user instead of admitting two callers
+  holding different locks.
+
 - Adding a secondary camera refuses publication when enrollment is cancelled
   or asked to yield after its final capture, including during publication
   preparation. The existing camera and account checks still apply

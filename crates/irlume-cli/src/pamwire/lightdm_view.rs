@@ -22,6 +22,9 @@ const PREFIX: &str = "irlume-lightdm-copy-";
 const MAX_FILE: u64 = 64 * 1024;
 const MAX_FILES: usize = 128;
 const MAX_VIEW: u64 = 32 * 1024 * 1024;
+// Cold executable and configuration reads can take tens of seconds on slow
+// storage. Each observation remains bounded inside the unit's 90 s budget.
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,7 +260,7 @@ fn prospective(unit: &str) -> Result<Policy, String> {
             "org.freedesktop.systemd1.Service",
             "ExecStart",
         ]),
-        Instant::now() + Duration::from_millis(500),
+        Instant::now() + OBSERVATION_TIMEOUT,
     )
     .map_err(|_| "could not read prospective LightDM command within deadline")?;
     if !output.status.success() {
@@ -326,7 +329,7 @@ fn unit_stopped(unit: &str) -> bool {
             "org.freedesktop.systemd1.Unit",
             "ActiveState",
         ]),
-        Instant::now() + Duration::from_millis(500),
+        Instant::now() + OBSERVATION_TIMEOUT,
     ) else {
         return false;
     };
@@ -349,7 +352,7 @@ fn observe_configuration(executable: &str, arguments: &[&str]) -> Result<Policy,
         Command::new(executable)
             .args(arguments)
             .arg("--show-config"),
-        Instant::now() + Duration::from_millis(500),
+        Instant::now() + OBSERVATION_TIMEOUT,
     )
     .map_err(|_| "LightDM configuration observation exceeded deadline")?;
     if !output.status.success() {

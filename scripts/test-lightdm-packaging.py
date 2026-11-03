@@ -22,6 +22,19 @@ EXPECTED = (*UNITS, DROPIN)
 
 
 class Packaging(unittest.TestCase):
+    def test_cold_start_budgets_agree_across_units_and_nix(self):
+        for name in UNITS[:2]:
+            text = (ROOT / "packaging/systemd" / name).read_text()
+            budget = [line for line in text.splitlines() if line.startswith("TimeoutStartSec=")]
+            self.assertEqual(budget, ["TimeoutStartSec=90s"], name)
+        nix = (ROOT / "nix/module.nix").read_text()
+        lightdm = nix.split("systemd.services.irlume-lightdm-prepare =", 1)[1].split(
+            "systemd.paths.irlume-lightdm-refresh =", 1)[0]
+        self.assertEqual(lightdm.count('TimeoutStartSec = "90s";'), 2)
+        source = (ROOT / "crates/irlume-cli/src/pamwire/lightdm_view.rs").read_text()
+        self.assertIn("const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(60);", source)
+        self.assertEqual(source.count("Instant::now() + OBSERVATION_TIMEOUT"), 3)
+
     def test_fhs_lanes_install_every_file_at_the_real_destination(self):
         for lane in ("packaging/fedora/irlume.spec", "packaging/arch/PKGBUILD", "packaging/ppa/debian/rules"):
             with self.subTest(lane=lane), tempfile.TemporaryDirectory() as temp:
@@ -168,7 +181,7 @@ class Packaging(unittest.TestCase):
         prepare = (ROOT / "packaging/systemd" / UNITS[0]).read_text()
         directives = [line for line in prepare.splitlines() if line and not line.startswith(("#", "["))]
         self.assertIn("Type=oneshot", directives)
-        self.assertIn("TimeoutStartSec=3s", directives)
+        self.assertIn("TimeoutStartSec=90s", directives)
         self.assertFalse([line for line in directives if "RemainAfterExit" in line], prepare)
         self.assertIn("login lightdm-prestart", prepare)
         self.assertNotIn("irlumed", prepare)

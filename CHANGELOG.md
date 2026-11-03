@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAM wiring reports derive modes from authentication rules and their own
+  options, so session-only and reseal-only lines no longer claim face wiring
+  or change another rule's reported mode.
+
 - Machine sessions refuse stale lock files after a concurrent legacy-lock
   upgrade, keeping one session per user instead of admitting two callers
   holding different locks.

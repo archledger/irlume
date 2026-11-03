@@ -797,6 +797,7 @@
           "type": "boolean"
         },
         "wired": {
+          "description": "Whether an irlume authentication rule configures face verification or the fingerprint keyring landing marker. Non-authentication and reseal-only rules do not count.",
           "type": "boolean"
         },
         "mode": {

@@ -115,31 +115,44 @@ pub(crate) fn active_login_wired_by_mode() -> bool {
 /// whose polkit-recipe line carries no `unseal`); a keyring-only line is the
 /// fingerprint unlock rather than face at all, and locks never carry one.
 pub(super) fn wiring_mode(role: &str, content: &str) -> Option<&'static str> {
-    if !content_has_module(content) {
-        return None;
-    }
-    // Read from the arguments of irlume's own rules, so a comment or another
-    // module's line that happens to say `unseal` or `ondemand` names no mode.
-    let has = |arg: &str| content.lines().any(|l| irlume_rule_has_arg(l, arg));
-    let unseal = has("unseal");
-    if role == ROLE_SUDO || role == ROLE_POLKIT || (role == ROLE_LOCK && !unseal) {
-        return Some("verify");
-    }
-    if !unseal {
-        if has("keyring") {
-            return Some("keyring");
+    let (mut unseal, mut on_demand_only, mut keyring, mut verify) = (false, true, false, false);
+    for rule in content.lines().filter_map(irlume_rule) {
+        if rule.phase != "auth" {
+            continue;
         }
-        // An older `wait` line or a bare verify line still authenticates; a
-        // stack with only the `reseal` lines does not (`remote_seats`).
-        return content
-            .lines()
-            .any(irlume_auth_rule_beyond_reseal)
-            .then_some("verify");
+        // Match the auth handler's order: keyring is a landing marker, and
+        // reseal only stashes the password, even with other mode arguments.
+        if rule.args.contains(&"keyring") {
+            keyring = true;
+        } else if rule.args.contains(&"reseal") {
+            continue;
+        } else if rule.args.contains(&"unseal") {
+            unseal = true;
+            // Report on-demand only if every unseal rule waits for input.
+            // The auth handler lets facefirst and wait bypass that probe.
+            on_demand_only &= rule.args.contains(&"ondemand")
+                && !rule.args.contains(&"facefirst")
+                && !rule.args.contains(&"wait");
+        } else {
+            verify = true;
+        }
     }
-    if has("ondemand") {
-        return Some("on-demand");
+    if unseal {
+        if role == ROLE_SUDO || role == ROLE_POLKIT {
+            Some("verify")
+        } else if on_demand_only {
+            Some("on-demand")
+        } else {
+            Some("face-first")
+        }
+    } else if verify && matches!(role, ROLE_LOCK | ROLE_SUDO | ROLE_POLKIT) {
+        // A separate keyring landing marker does not replace face verification.
+        Some("verify")
+    } else if keyring {
+        Some("keyring")
+    } else {
+        verify.then_some("verify")
     }
-    Some("face-first")
 }
 
 /// Every surface irlume can wire, present or not, in the order the human report
@@ -498,6 +511,95 @@ mod tests {
         let facefirst = "auth [success=1 default=ignore] pam_irlume.so unseal facefirst\n\
              auth optional pam_exec.so /usr/local/bin/log ondemand\n";
         assert_eq!(wiring_mode(ROLE_LOGIN, facefirst), Some("face-first"));
+    }
+
+    #[test]
+    fn wiring_mode_ignores_non_authentication_rules() {
+        for role in [ROLE_LOGIN, ROLE_LOGIN_FP, ROLE_LOCK, ROLE_SUDO, ROLE_POLKIT] {
+            for phase in ["account", "password", "session"] {
+                for args in ["", "unseal", "unseal ondemand", "keyring", "reseal"] {
+                    let content = format!("{phase} optional pam_irlume.so {args}\n");
+                    let fact = surface_fact_from("/etc/pam.d/example", role, true, &content);
+                    assert!(!fact.wired, "{role}: {content} => {:?}", fact.mode);
+                    assert_eq!(fact.mode, None, "{role}: {content}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wiring_mode_ignores_reseal_only_rules_on_every_role() {
+        let content = "auth optional pam_irlume.so reseal\n\
+                       session optional pam_irlume.so reseal\n";
+        for role in [ROLE_LOGIN, ROLE_LOGIN_FP, ROLE_LOCK, ROLE_SUDO, ROLE_POLKIT] {
+            assert_eq!(wiring_mode(role, content), None, "{role}");
+        }
+    }
+
+    #[test]
+    fn wiring_mode_keeps_options_on_their_authentication_rule() {
+        let face = "auth sufficient pam_irlume.so unseal facefirst\n";
+        for other in [
+            "session optional pam_irlume.so reseal ondemand\n",
+            "auth optional pam_irlume.so reseal ondemand\n",
+            "auth optional pam_irlume.so wait ondemand\n",
+        ] {
+            assert_eq!(
+                wiring_mode(ROLE_LOGIN, &format!("{face}{other}")),
+                Some("face-first"),
+                "{other}"
+            );
+        }
+        let demand = "auth sufficient pam_irlume.so unseal ondemand\n";
+        for content in [format!("{face}{demand}"), format!("{demand}{face}")] {
+            assert_eq!(wiring_mode(ROLE_LOGIN, &content), Some("face-first"));
+        }
+    }
+
+    #[test]
+    fn wiring_mode_keeps_verification_beside_a_keyring_marker() {
+        let verify = "auth sufficient pam_irlume.so\n";
+        let keyring = "auth optional pam_irlume.so keyring\n";
+        for role in [ROLE_LOCK, ROLE_SUDO, ROLE_POLKIT] {
+            for content in [format!("{verify}{keyring}"), format!("{keyring}{verify}")] {
+                assert_eq!(wiring_mode(role, &content), Some("verify"), "{role}");
+            }
+        }
+    }
+
+    #[test]
+    fn wiring_mode_immediate_options_override_on_demand() {
+        for args in ["unseal facefirst ondemand", "unseal wait ondemand"] {
+            assert_eq!(
+                wiring_mode(
+                    ROLE_LOGIN,
+                    &format!("auth sufficient pam_irlume.so {args}\n")
+                ),
+                Some("face-first"),
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn wiring_mode_respects_authentication_handler_precedence() {
+        for args in ["reseal unseal", "unseal reseal ondemand"] {
+            assert_eq!(
+                wiring_mode(ROLE_LOGIN, &format!("auth optional pam_irlume.so {args}\n")),
+                None,
+                "{args}"
+            );
+        }
+        for args in ["keyring reseal", "keyring unseal ondemand"] {
+            assert_eq!(
+                wiring_mode(
+                    ROLE_LOGIN_FP,
+                    &format!("auth optional pam_irlume.so {args}\n")
+                ),
+                Some("keyring"),
+                "{args}"
+            );
+        }
     }
 
     /// A greeter left with only irlume's reseal lines (a LightDM serving

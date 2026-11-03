@@ -361,7 +361,10 @@ capability and not camera nodes.
 
 `present` is whether the service exists on this machine at all, counting a vendor
 copy an override would be materialized from. `wired` is whether it currently
-carries the irlume line.
+carries an irlume authentication rule for face verification or the fingerprint
+keyring landing marker. Non-authentication rules and reseal-only rules do not
+count. Modes use the arguments of those authentication rules, not options
+from other phases or a separate reseal rule.
 
 **The surface array is complete.** A service absent from the machine is still
 reported, with `present: false`, so a consumer that knows an id and cannot find

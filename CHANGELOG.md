@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Adding a secondary camera refuses publication when enrollment is cancelled
+  or asked to yield after its final capture, including during publication
+  preparation. The existing camera and account checks still apply
+  (ADR-0024 section 4).
+
 - Machine commands keep startup account-existence notes off standard error,
   preserving their structured replies for missing or malformed `--user` values.
 

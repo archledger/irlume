@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Fingerprint coverage and the `--fingerprint-only` guard read PAM type and
+  control fields with the shared parser, including case-insensitive and
+  bracketed forms. Sudo fingerprint warnings follow only authentication
+  includes, not session-only paths.
+
 - PAM wiring reports derive modes from authentication rules and their own
   options, so session-only and reseal-only lines no longer claim face wiring
   or change another rule's reported mode.

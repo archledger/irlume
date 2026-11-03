@@ -840,6 +840,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera rate diagnostics retain measured below-floor failures and their
+  evidence instead of reporting them as unknown. Capture admission is unchanged.
+
 - `irlume login enable` declines new wiring when a referenced auth stack uses
   syntax it cannot safely read, including continued lines and CRLF endings.
   The same check now applies throughout nested auth references.

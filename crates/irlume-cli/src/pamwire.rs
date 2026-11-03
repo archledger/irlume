@@ -6869,6 +6869,112 @@ mod tests {
         assert!(changed, "readable nested include: {wired}");
     }
 
+    fn assert_nested_auth_syntax_refused(tag: &str, nested: &str) {
+        for (kind, original) in [
+            ("include", "auth include common-auth\n"),
+            ("substack", "auth substack common-auth\n"),
+            ("at-include", "@include common-auth\n"),
+        ] {
+            for indirect in [false, true] {
+                let dir = TestDir::new(&format!("nested-{tag}-{kind}-{indirect}"));
+                let etc = dir.0.join("kde");
+                let shared = dir.0.join("common-auth");
+                let leaf = dir.0.join("common-auth-leaf");
+                let shared_text = if indirect {
+                    "auth include common-auth-leaf\n"
+                } else {
+                    nested
+                };
+                std::fs::write(&etc, original).unwrap();
+                std::fs::write(&shared, shared_text).unwrap();
+                if indirect {
+                    std::fs::write(&leaf, nested).unwrap();
+                }
+                let svc = Svc {
+                    etc: leak(&etc),
+                    vendor: None,
+                };
+                for apply in [false, true] {
+                    let result = wire_service(&svc, true, apply, &wire_lock).unwrap();
+                    assert_eq!(
+                        result.change,
+                        PlannedChange::NoAnchor,
+                        "{tag}/{kind}/indirect={indirect}/apply={apply}: {result}"
+                    );
+                    assert_eq!(std::fs::read_to_string(&etc).unwrap(), original);
+                    assert_eq!(std::fs::read_to_string(&shared).unwrap(), shared_text);
+                    if indirect {
+                        assert_eq!(std::fs::read_to_string(&leaf).unwrap(), nested);
+                    }
+                    assert!(!dir.0.join(format!("kde{BACKUP}")).exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_auth_unknown_types_leave_the_service_unchanged() {
+        assert_nested_auth_syntax_refused("unknown-type", "autx required pam_deny.so\n");
+    }
+
+    #[test]
+    fn nested_auth_crlf_leaves_the_service_unchanged() {
+        assert_nested_auth_syntax_refused("crlf", "auth required pam_deny.so\r\n");
+    }
+
+    #[test]
+    fn nested_auth_continuations_leave_the_service_unchanged() {
+        assert_nested_auth_syntax_refused("continuation", "auth requisite \\\n  pam_deny.so\n");
+    }
+
+    #[test]
+    fn nested_auth_other_unsupported_syntax_leaves_the_service_unchanged() {
+        for (tag, nested) in [
+            ("nul", "auth required pam_unix.so\0\n"),
+            ("blank", "auth\u{b}required pam_unix.so\n"),
+            ("module-name", "auth required ?.so\n"),
+            ("include-without-file", "@include\n"),
+            ("substack-without-file", "auth substack\n"),
+        ] {
+            assert_nested_auth_syntax_refused(tag, nested);
+        }
+    }
+
+    #[test]
+    fn nested_auth_supported_control_blanks_remain_wirable() {
+        for (tag, nested) in [
+            ("plain", "auth required pam_unix.so\n"),
+            ("cr-control", "auth [success=ok\rdefault=bad] pam_unix.so\n"),
+            (
+                "vt-control",
+                "auth [success=ok\u{b}default=bad] pam_unix.so\n",
+            ),
+            (
+                "ff-control",
+                "auth [success=ok\u{c}default=bad] pam_unix.so\n",
+            ),
+        ] {
+            let dir = TestDir::new(&format!("nested-valid-{tag}"));
+            let etc = dir.0.join("kde");
+            let original = "auth substack common-auth\n";
+            std::fs::write(&etc, original).unwrap();
+            std::fs::write(dir.0.join("common-auth"), "auth include common-auth-leaf\n").unwrap();
+            std::fs::write(dir.0.join("common-auth-leaf"), nested).unwrap();
+            let svc = Svc {
+                etc: leak(&etc),
+                vendor: None,
+            };
+            let result = wire_service(&svc, true, false, &wire_lock).unwrap();
+            assert_eq!(result.change, PlannedChange::Wire, "{tag}: {result}");
+            assert_eq!(std::fs::read_to_string(&etc).unwrap(), original);
+            assert_eq!(
+                std::fs::read_to_string(dir.0.join("common-auth-leaf")).unwrap(),
+                nested
+            );
+            assert!(!dir.0.join(format!("kde{BACKUP}")).exists());
+        }
+    }
+
     #[test]
     fn a_service_is_wired_only_after_its_shared_password_stack_can_be_read() {
         let dir = TestDir::new("missing-password-stack");

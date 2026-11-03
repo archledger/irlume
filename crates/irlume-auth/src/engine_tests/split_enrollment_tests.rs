@@ -491,6 +491,67 @@ fn run_real(
     }
 }
 
+#[test]
+fn split_group_publication_stops_after_last_capture() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let _env = env_guard();
+    let mut shared = shared();
+    let previous_stop = shared.engine.stop_requested.clone();
+    let mut violations = Vec::new();
+    for phase in ["running", "before-capture", "after-capture"] {
+        for target in TARGETS {
+            let fixture = Fixture::new(true);
+            let (guard, publication) = fixture.choice();
+            let _admitted = fixture
+                .recorder
+                .admit_split_trust(&[CameraOperationKind::Enrollment]);
+            let before = fixture.write_primary(&target_primary(target));
+            let (_, authorization) = split_authorization();
+            let stop = Arc::new(AtomicBool::new(phase == "before-capture"));
+            let read_stop = stop.clone();
+            shared
+                .engine
+                .set_stop_signal(Arc::new(move || read_stop.load(Ordering::SeqCst)));
+            let mut calls = 0;
+            let result = {
+                let mut request = shared
+                    .engine
+                    .prepare_split_enrollment_camera(&guard, &publication)
+                    .unwrap();
+                run_injected(&mut request, target, 1, &authorization, |_, count, _, _| {
+                    calls += 1;
+                    let captured = scans(count)?;
+                    if phase == "after-capture" {
+                        stop.store(true, Ordering::SeqCst);
+                    }
+                    Ok(captured)
+                })
+            };
+            shared.engine.stop_requested = previous_stop.clone();
+            if phase == "running" {
+                assert!(result.is_ok(), "{target:?}: {result:?}");
+                assert_eq!(calls, 1);
+            } else {
+                let refused = matches!(result, Err(irlume_common::Error::Preempted(_)));
+                let untouched =
+                    fixture.primary_bytes() == Some(before) && no_secondary_publication();
+                if !refused || !untouched {
+                    violations.push(format!("{phase} {target:?}: {result:?}"));
+                }
+                assert_eq!(calls, usize::from(phase == "after-capture"));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "cancelled publication: {violations:?}"
+    );
+}
+
 // RED: these need the real split entries (plan C8, D4).
 
 #[test]

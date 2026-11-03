@@ -636,6 +636,98 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+fn check_ordinary_group_publication_cancellation(use_stop: bool) {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct Observer<'a>(&'a Cell<bool>);
+    impl EnrollmentObserver for Observer<'_> {
+        fn check(&self) -> irlume_common::Result<()> {
+            if self.0.get() {
+                Err(irlume_common::Error::Preempted("observer cancelled".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let _env = env_guard();
+    let mut shared = shared();
+    for cancel in [false, true] {
+        let sandbox = Sandbox::new("ordinary-group-cancel");
+        let (enrollment, _) = pad_matching_fixture(0.2, false);
+        let before = sandbox.write_primary("pad-contract", &enrollment);
+        let pair = GroupPair::Ordinary {
+            rgb: Some("046d:desk".into()),
+            ir: Some("046d:desk".into()),
+        };
+        let authorization = mint("pad-contract", add_desk_operation());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let read_stop = stopped.clone();
+        let previous_stop = shared.engine.stop_requested.clone();
+        shared
+            .engine
+            .set_stop_signal(Arc::new(move || read_stop.load(Ordering::SeqCst)));
+        let observer_cancelled = Cell::new(false);
+        let result = publish_camera_group_preparing_with(
+            CameraGroupPublication {
+                user: "pad-contract",
+                pair: &pair,
+                group_id: "cam-046d-desk",
+                profile: &desk_profile_payload(),
+                start_enr: &enrollment,
+                start_primary_sha256: &irlume_common::sha256_hex(&before),
+                authorization: &authorization,
+                now_unix: 1_000_300,
+            },
+            |path, next, digest| {
+                let prepared =
+                    irlume_core::multi_camera::commit::prepare_with_intent(path, next, digest)?;
+                // Cancellation arrives after key/payload preparation, before
+                // the first recoverable publication intent can be written.
+                stopped.store(cancel && use_stop, Ordering::SeqCst);
+                observer_cancelled.set(cancel && !use_stop);
+                Ok(prepared)
+            },
+            |prepared| {
+                shared
+                    .engine
+                    .publish_active_camera_group(prepared, &Observer(&observer_cancelled))
+            },
+            || 1_000_300,
+        );
+        shared.engine.stop_requested = previous_stop;
+        let path = secondary_store_path("pad-contract");
+        if cancel {
+            assert!(
+                matches!(result, Err(irlume_common::Error::Preempted(_))),
+                "cancelled publication must refuse: {result:?}"
+            );
+            assert!(!path.exists());
+        } else {
+            assert_eq!(result.unwrap(), "cam-046d-desk");
+            assert!(path.exists());
+        }
+        assert!(!irlume_core::multi_camera::commit::intent_path_for(&path).exists());
+        assert_eq!(
+            std::fs::read(sandbox.primary_path("pad-contract")).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn ordinary_group_publication_observes_late_stop() {
+    check_ordinary_group_publication_cancellation(true);
+}
+
+#[test]
+fn ordinary_group_publication_observes_late_observer_cancellation() {
+    check_ordinary_group_publication_cancellation(false);
+}
+
 #[test]
 fn publish_camera_group_publishes_under_the_exact_authorized_scope() {
     let _g = env_guard();

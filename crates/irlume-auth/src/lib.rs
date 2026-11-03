@@ -10388,16 +10388,31 @@ impl Engine {
                 authorization,
                 now_unix,
             },
-            |prepared| {
-                let publish = || prepared.publish();
-                self.with_prepared_camera_publication(publish)
-            },
+            |prepared| self.publish_active_camera_group(prepared, observer),
             || {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs())
             },
         )
+    }
+
+    /// Recheck cancellation after capture and preparation, before any intent is
+    /// published. Camera and account authority remain independently checked.
+    fn publish_active_camera_group(
+        &self,
+        prepared: PreparedCameraGroupCommit<'_>,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<()> {
+        self.with_prepared_camera_publication(|| {
+            observer.check()?;
+            if self.should_stop() {
+                return Err(irlume_common::Error::Preempted(
+                    "enrollment stopped before publication".into(),
+                ));
+            }
+            prepared.publish()
+        })
     }
 
     /// Removes one secondary camera group (ADR-0024 §4.2): the group's

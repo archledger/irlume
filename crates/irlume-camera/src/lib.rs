@@ -5109,6 +5109,11 @@ fn role_diagnostic(
             .into(),
             evidence: Some(evidence),
         },
+        Err(Error::DeliveredRate(evidence)) => irlume_common::CameraRoleDiagnostic {
+            known,
+            state: "fail".into(),
+            evidence: Some(*evidence),
+        },
         Err(_) => irlume_common::CameraRoleDiagnostic {
             known,
             state: "unknown".into(),
@@ -17251,6 +17256,105 @@ mod tests {
                 );
             }
             Ok(())
+        }
+    }
+
+    fn rate_diagnostic_evidence(
+        role: &str,
+        meets_floor: bool,
+    ) -> irlume_common::CameraStreamRateEvidence {
+        let rate = if role == "rgb" { 30 } else { 15 };
+        let factor = if meets_floor { 1 } else { 2 };
+        let span = 30_000_000 * factor / u64::from(rate);
+        irlume_common::CameraStreamRateEvidence {
+            role: role.into(),
+            requested_num: 1,
+            requested_den: rate,
+            accepted_num: 1,
+            accepted_den: rate,
+            floor_num: rate,
+            floor_den: 1,
+            tolerance_percent: 97,
+            window_count: 30,
+            window_span_us: span,
+            delivered_num: u64::from(rate),
+            delivered_den: factor,
+            meets_floor,
+            sequence_gap: 0,
+            cumulative_drops: 0,
+            clock: "monotonic".into(),
+            source: "end_of_frame".into(),
+            latest_timestamp_us: i64::try_from(span).unwrap() + 1,
+            stream_epoch: 0,
+        }
+    }
+
+    fn assert_rate_diagnostic_shortfall(role: &str) {
+        let evidence = rate_diagnostic_evidence(role, false);
+        let reported = role_diagnostic(true, Err(Error::DeliveredRate(Box::new(evidence.clone()))));
+        assert_eq!(reported.state, "fail");
+        assert!(reported.known);
+        assert_eq!(reported.evidence, Some(evidence));
+    }
+
+    #[test]
+    fn rate_diagnostic_preserves_rgb_shortfall() {
+        assert_rate_diagnostic_shortfall("rgb");
+    }
+
+    #[test]
+    fn rate_diagnostic_preserves_ir_shortfall() {
+        assert_rate_diagnostic_shortfall("ir");
+    }
+
+    #[test]
+    fn rate_diagnostic_serializes_both_measured_failures_with_evidence() {
+        let rgb = rate_diagnostic_evidence("rgb", false);
+        let ir = rate_diagnostic_evidence("ir", false);
+        let report = irlume_common::CameraDiagnosticsReport {
+            rgb: role_diagnostic(true, Err(Error::DeliveredRate(Box::new(rgb.clone())))),
+            ir: role_diagnostic(true, Err(Error::DeliveredRate(Box::new(ir.clone())))),
+            skew_us: None,
+            capture_strategy: "burst".into(),
+            illumination: None,
+        };
+        let json = serde_json::to_value(report).unwrap();
+        for (role, evidence) in [("rgb", rgb), ("ir", ir)] {
+            assert_eq!(json[role]["state"], "fail");
+            assert_eq!(json[role]["known"], true);
+            assert_eq!(
+                json[role]["evidence"],
+                serde_json::to_value(evidence).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rate_diagnostic_preserves_successful_measurements() {
+        for meets_floor in [false, true] {
+            let evidence = rate_diagnostic_evidence("rgb", meets_floor);
+            let reported = role_diagnostic(true, Ok(evidence.clone()));
+            assert_eq!(
+                reported.state,
+                if meets_floor { "measured" } else { "fail" }
+            );
+            assert_eq!(reported.evidence, Some(evidence));
+            assert!(reported.known);
+        }
+    }
+
+    #[test]
+    fn rate_diagnostic_keeps_unmeasured_errors_unknown() {
+        for error in [
+            Error::Hardware("synthetic transport failure".into()),
+            Error::CameraUnavailable("synthetic unavailable device".into()),
+            Error::PrivacyShutter("synthetic engaged shutter".into()),
+            Error::DeadlineExpired,
+        ] {
+            let reported = role_diagnostic(false, Err(error));
+            assert_eq!(reported.state, "unknown");
+            assert!(!reported.known);
+            assert!(reported.evidence.is_none());
         }
     }
 

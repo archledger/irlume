@@ -1027,6 +1027,9 @@ pub(super) fn is_auth_directive(line: &str) -> bool {
 /// `bad` or `die` for every value, such as `[default=die]` on faillock's
 /// `authfail` line, is not one: it is the branch a failed password takes,
 /// and a correct one jumps past it.
+///
+/// Unsupported syntax in this file or any referenced auth stack is refused
+/// too: irlume cannot prove where those rules run, even if PAM can read them.
 pub(super) fn has_failing_auth_line(content: &str) -> bool {
     let reader = STACK_READER.with(|r| r.borrow().clone());
     has_failing_auth_line_in(content, reader.as_ref(), &mut Vec::new(), 0)
@@ -1040,6 +1043,11 @@ fn has_failing_auth_line_in(
     active: &mut Vec<String>,
     depth: usize,
 ) -> bool {
+    // Apply the top-level syntax refusal to every referenced stack too. A
+    // malformed type or continued line can hide an auth rule from this scan.
+    if has_line_continuation(content) || unreadable_line(content).is_some() {
+        return true;
+    }
     content.lines().any(|l| {
         let mut failing_stack = |name: &str| {
             let Some(read) = reader else {

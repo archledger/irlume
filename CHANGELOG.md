@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume login enable` declines new wiring when a referenced auth stack uses
+  syntax it cannot safely read, including continued lines and CRLF endings.
+  The same check now applies throughout nested auth references.
+
 - LightDM managed-start evidence checks the directories traversed through
   symbolic links before treating configuration as readable by both root and
   unprivileged clients. Supported public symlinks remain valid.

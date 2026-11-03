@@ -17,8 +17,12 @@ Every document contains:
 }
 ```
 
-Machine-mode standard output contains exactly one JSON document. Diagnostics
-go to standard error.
+Machine-mode standard output contains exactly one JSON document and standard
+error stays empty. Failures are reported in the JSON error object, including
+invalid arguments and unsupported contracts. Startup account-existence notes
+are human-mode diagnostics only; machine commands let the daemon report their
+per-user state or refusal. This also applies to machine-only commands invoked
+without `--json` or the required streaming flags.
 
 **Streaming capabilities are the exception, and only ever by invitation.** A
 capability whose name ends in `-events` emits newline-delimited JSON: one event

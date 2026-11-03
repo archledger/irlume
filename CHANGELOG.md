@@ -840,6 +840,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Machine commands keep startup account-existence notes off standard error,
+  preserving their structured replies for missing or malformed `--user` values.
+
 - Camera rate diagnostics retain measured below-floor failures and their
   evidence instead of reporting them as unknown. Capture admission is unchanged.
 

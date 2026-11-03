@@ -196,6 +196,235 @@ fn run(cmd: &mut Command) -> (i32, String, String) {
     )
 }
 
+fn assert_machine_startup_error(
+    sandbox: &Sandbox,
+    args: &[&str],
+    code: i32,
+    command: &str,
+    error: &str,
+) {
+    let (actual_code, stdout, stderr) = run(&mut sandbox.cmd(args));
+    assert_eq!(actual_code, code, "{args:?}: {stdout} {stderr}");
+    assert!(stderr.is_empty(), "{args:?}: unexpected stderr: {stderr}");
+    assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["contract_version"], 1, "{args:?}: {document}");
+    assert_eq!(document["command"], command, "{args:?}: {document}");
+    assert_eq!(document["ok"], false, "{args:?}: {document}");
+    assert_eq!(document["error"]["code"], error, "{args:?}: {document}");
+}
+
+#[test]
+fn machine_startup_json_commands_keep_user_notes_off_stderr() {
+    const MISSING: &str = "irlume-f097-missing-account";
+    assert!(!irlume_common::platform::user_exists(MISSING));
+    let sandbox = Sandbox::new("machine-startup-json");
+    for (args, code, command, error) in [
+        (
+            vec!["profiles", "list", "--user", MISSING, "--json"],
+            1,
+            "profiles.list",
+            "daemon-unavailable",
+        ),
+        (
+            vec![
+                "profiles",
+                "list",
+                "--user=irlume-f097-missing-account",
+                "--json",
+            ],
+            2,
+            "profiles.list",
+            "usage-error",
+        ),
+        (
+            vec!["profiles", "list", "--user", "--json"],
+            2,
+            "profiles.list",
+            "usage-error",
+        ),
+        (
+            vec!["profiles", "list", "--json", "--user"],
+            2,
+            "profiles.list",
+            "usage-error",
+        ),
+        (
+            vec![
+                "profiles",
+                "list",
+                "--user",
+                MISSING,
+                "--contract",
+                "999",
+                "--json",
+            ],
+            2,
+            "profiles.list",
+            "unsupported-contract",
+        ),
+        (
+            vec!["status", "--user", MISSING, "--contract", "bad", "--json"],
+            2,
+            "status",
+            "usage-error",
+        ),
+        (
+            vec!["version", "--json", "--user", MISSING],
+            2,
+            "version",
+            "usage-error",
+        ),
+        (
+            vec!["camera", "census", "--json", "--user", MISSING],
+            2,
+            "camera.census",
+            "usage-error",
+        ),
+        (
+            vec!["camera", "diagnostics", "--json", "--user", MISSING],
+            2,
+            "camera.diagnostics",
+            "usage-error",
+        ),
+        (
+            vec!["models", "list", "--json", "--user", MISSING],
+            2,
+            "models.list",
+            "usage-error",
+        ),
+        (
+            vec!["doctor", "--json", "--user", MISSING, "--contract", "999"],
+            2,
+            "doctor",
+            "unsupported-contract",
+        ),
+        (
+            vec![
+                "support-report",
+                "--json",
+                "--user",
+                MISSING,
+                "--contract",
+                "999",
+            ],
+            2,
+            "support-report",
+            "unsupported-contract",
+        ),
+        (
+            vec![
+                "login",
+                "status",
+                "--json",
+                "--user",
+                MISSING,
+                "--contract",
+                "999",
+            ],
+            2,
+            "login.status",
+            "unsupported-contract",
+        ),
+    ] {
+        assert_machine_startup_error(&sandbox, &args, code, command, error);
+    }
+}
+
+#[test]
+fn machine_startup_implicit_commands_keep_user_notes_off_stderr() {
+    const MISSING: &str = "irlume-f097-missing-account";
+    assert!(!irlume_common::platform::user_exists(MISSING));
+    let sandbox = Sandbox::new("machine-startup-implicit");
+    for (args, command, error) in [
+        (
+            vec!["auth", "test", "--user", MISSING],
+            "auth.test",
+            "usage-error",
+        ),
+        (
+            vec![
+                "auth",
+                "test",
+                "--events=jsonl",
+                "--user",
+                MISSING,
+                "--contract",
+                "999",
+            ],
+            "auth.test",
+            "unsupported-contract",
+        ),
+        (
+            vec!["login", "plan", "--user", MISSING],
+            "login.plan",
+            "usage-error",
+        ),
+        (
+            vec!["login", "apply", "--user", MISSING],
+            "login.apply",
+            "usage-error",
+        ),
+        (
+            vec!["login", "verify", "--user", MISSING],
+            "login.verify",
+            "usage-error",
+        ),
+        (
+            vec!["login", "rollback", "--user", MISSING],
+            "login.rollback",
+            "usage-error",
+        ),
+    ] {
+        assert_machine_startup_error(&sandbox, &args, 2, command, error);
+    }
+}
+
+#[test]
+fn machine_startup_human_commands_retain_the_user_note() {
+    const MISSING: &str = "irlume-f097-missing-account";
+    assert!(!irlume_common::platform::user_exists(MISSING));
+    let sandbox = Sandbox::new("machine-startup-human");
+    let (code, _, stderr) = run(&mut sandbox.cmd(&["profiles", "list", "--user", MISSING]));
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains(&format!("no user '{MISSING}'")), "{stderr}");
+    assert!(stderr.contains("irlumed is not running"), "{stderr}");
+}
+
+#[test]
+fn machine_startup_preserves_human_dispatch_precedence() {
+    const MISSING: &str = "irlume-f097-missing-account";
+    assert!(!irlume_common::platform::user_exists(MISSING));
+    let sandbox = Sandbox::new("machine-startup-precedence");
+    for args in [
+        vec!["auth", "consent", "test", "--user", MISSING],
+        vec!["auth", "sensor", "test", "--user", MISSING],
+        vec!["not-a-command", "--json", "--user", MISSING],
+    ] {
+        let (code, stdout, stderr) = run(&mut sandbox.cmd(&args));
+        assert_eq!(code, 2, "{args:?}: {stdout} {stderr}");
+        assert!(
+            stderr.contains(&format!("no user '{MISSING}'")),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+            "{args:?}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn machine_startup_version_control_remains_quiet() {
+    let sandbox = Sandbox::new("machine-startup-control");
+    let (code, stdout, stderr) = run(&mut sandbox.cmd(&["version", "--json"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["command"], "version");
+    assert_eq!(document["ok"], true);
+}
+
 #[test]
 fn support_report_publishes_one_private_inspectable_text_file() {
     use std::os::unix::fs::PermissionsExt as _;

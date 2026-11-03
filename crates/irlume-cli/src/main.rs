@@ -97,6 +97,57 @@ const DEV_CMDS: &[&str] = &[
     "suncal",
 ];
 
+/// Select the machine handler once, for both dispatch and startup diagnostics.
+/// Handlers retain responsibility for validating their complete argument list.
+fn machine_handler(args: &[String]) -> Option<fn(&[String]) -> std::process::ExitCode> {
+    let handler: fn(&[String]) -> std::process::ExitCode = match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
+        // Preserve the existing presence-based routing: a contract flag before
+        // a subcommand must still reach that command's structured refusal.
+        (Some("profiles"), _)
+            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
+        {
+            machine::profiles_list
+        }
+        (Some("login"), _)
+            if args.iter().any(|a| a == "status") && args.iter().any(|a| a == "--json") =>
+        {
+            machine::login_status
+        }
+        // These commands always answer in machine form, even when their
+        // invocation is missing --json or --events and must be refused.
+        (Some("login"), _) if args.iter().any(|a| a == "plan") => machine::login_plan,
+        (Some("login"), _) if args.iter().any(|a| a == "apply") => machine::login_apply,
+        (Some("login"), _) if args.iter().any(|a| a == "verify") => machine::login_verify,
+        (Some("login"), _) if args.iter().any(|a| a == "rollback") => machine::login_rollback,
+        // Human auth subcommands precede the presence-based auth-test route.
+        (Some("auth"), Some("consent" | "sensor")) => return None,
+        (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test,
+        // The capability survives removal of the third-party model lane.
+        (Some("models"), _)
+            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
+        {
+            machine::models_list
+        }
+        (Some("doctor"), _) if args.iter().any(|a| a == "--json") => machine::doctor,
+        (Some("support-report"), _) if args.iter().any(|a| a == "--json") => {
+            machine::support_report
+        }
+        (Some("camera"), Some("diagnostics")) if args.iter().any(|a| a == "--json") => {
+            machine::camera_diagnostics
+        }
+        (Some("camera"), Some("census")) if args.iter().any(|a| a == "--json") => {
+            machine::camera_census
+        }
+        (Some("status"), _) if args.iter().any(|a| a == "--json") => machine::status,
+        (Some("version"), _) if args.iter().any(|a| a == "--json") => machine::version,
+        _ => return None,
+    };
+    Some(handler)
+}
+
 fn main() -> std::process::ExitCode {
     // Rust ignores SIGPIPE by default, turning a closed stdout (`irlume … | head`,
     // `| less` then quit, `| grep -q`) into a "failed printing to stdout: Broken
@@ -114,24 +165,17 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         };
     }
-    // A TYPED `--user` that names nobody is a typo, and every per-user command
-    // answers a typo with the same empty state a real but unenrolled user
-    // produces ("none enrolled", "not armed"), so the operator cannot tell which
-    // they are looking at.
-    //
-    // A NOTE, deliberately, not a refusal. Refusing would contradict the machine
-    // API's own rule that a consumer calls the command and reads the daemon's
-    // error rather than pre-checking existence, and it would preempt the tested
-    // `--user requires a username` guard when the value is itself a flag
-    // (`--user --json`). The daemon keeps accepting unresolvable names for its
-    // own reason: PAM authenticates as root and must survive an NSS outage. So
-    // this only supplies the fact the operator is otherwise missing, on stderr,
-    // where it cannot disturb a consumer parsing stdout.
-    if let Some(named) = flag(&args, "--user").filter(|s| !s.is_empty()) {
-        if !irlume_common::platform::user_exists(named) {
-            eprintln!(
-                "irlume: note: no user '{named}' on this system, so its per-user state reads as empty"
-            );
+    let machine_handler = machine_handler(&args);
+    // Human commands keep the typo note, not a refusal. Machine handlers own
+    // their structured errors and keep stderr empty; they also avoid this NSS
+    // lookup before contract negotiation. This is not an authorization check.
+    if machine_handler.is_none() {
+        if let Some(named) = flag(&args, "--user").filter(|s| !s.is_empty()) {
+            if !irlume_common::platform::user_exists(named) {
+                eprintln!(
+                    "irlume: note: no user '{named}' on this system, so its per-user state reads as empty"
+                );
+            }
         }
     }
     // Gate the developer tools unless IRLUME_DEV is set. Exception:
@@ -160,6 +204,9 @@ fn main() -> std::process::ExitCode {
         }
         return commands::help();
     }
+    if let Some(handler) = machine_handler {
+        return handler(&args);
+    }
     match (
         args.first().map(String::as_str),
         args.get(1).map(String::as_str),
@@ -176,17 +223,6 @@ fn main() -> std::process::ExitCode {
         (Some("suncal"), _) => suncal::run(&args),
         (Some("liveness"), _) => liveness_probe(&args),
         (Some("enroll"), _) => enroll(&args),
-        // Matched on PRESENCE of the subcommand, not on its position. Binding it
-        // to args[1] meant a flag before it displaced it: `profiles --contract 9
-        // list --json` fell through to the human handler and answered a machine
-        // caller with prose on stderr and exit 2, while `doctor`/`status`/
-        // `version` accepted the same flag anywhere. The contract documents no
-        // ordering rule, so all five now behave the same way.
-        (Some("profiles"), _)
-            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
-        {
-            machine::profiles_list(&args)
-        }
         (Some("profiles"), _) => profiles(profiles_sub(&args), &args),
         (Some("verify"), _) => verify(&args),
         (Some("enrolldev"), _) => enrolldev(&args),
@@ -195,40 +231,10 @@ fn main() -> std::process::ExitCode {
         (Some("retry"), _) => retry::run(recovery_sub(&args), &args),
         (Some("bitwarden"), sub) => bitwarden::run(sub, &args),
         (Some("fingerprint"), _) => fingerprint::run(fingerprint_sub(&args), &args),
-        (Some("login"), _)
-            if args.iter().any(|a| a == "status") && args.iter().any(|a| a == "--json") =>
-        {
-            machine::login_status(&args)
-        }
-        // `login plan` exists only as a machine command: it is the read-only
-        // phase of a login transaction, and the human equivalent is the dry run
-        // `login enable` already prints.
-        (Some("login"), _) if args.iter().any(|a| a == "plan") => machine::login_plan(&args),
-        // The mutating half of a login transaction. Machine-only, like `plan`:
-        // the human equivalent is `login enable --apply`.
-        (Some("login"), _) if args.iter().any(|a| a == "apply") => machine::login_apply(&args),
-        (Some("login"), _) if args.iter().any(|a| a == "verify") => machine::login_verify(&args),
-        (Some("login"), _) if args.iter().any(|a| a == "rollback") => {
-            machine::login_rollback(&args)
-        }
-        // `auth test` exists only as a machine command, so it routes here
-        // whatever flags follow and answers a bad invocation with a JSON
-        // usage-error rather than prose. Bare `auth` still falls through to the
-        // help, which is the useful answer to a typo.
         (Some("auth"), Some("consent")) => consent::run(&args[2..]),
         (Some("auth"), Some("sensor")) => sensor_policy::run(&args[2..]),
-        (Some("auth"), _) if args.iter().any(|a| a == "test") => machine::auth_test(&args),
         (Some("login"), sub) => pamwire::run(sub, &args),
         (Some("logs"), sub) => logs::run(sub, &args),
-        // The machine capability survives the lane's removal (ADR-0015):
-        // contract 1 keeps `models list --json` with every stage closed.
-        // Presence-matched like `profiles list --json`: a contract flag
-        // before the subcommand must not displace it.
-        (Some("models"), _)
-            if args.iter().any(|a| a == "list") && args.iter().any(|a| a == "--json") =>
-        {
-            machine::models_list(&args)
-        }
         // Removed with the third-party/BYOM lane (ADR-0015): one clear line
         // for scripts and muscle memory, not silence.
         (Some("models"), _) => models::removed_notice(),
@@ -240,19 +246,7 @@ fn main() -> std::process::ExitCode {
         (Some("set-cameras"), _) => set_cameras(&args),
         (Some("update"), _) => commands::update(&args),
         (Some("uninstall"), _) => uninstall::run(&args),
-        (Some("doctor"), _) if args.iter().any(|arg| arg == "--json") => machine::doctor(&args),
-        (Some("support-report"), _) if args.iter().any(|arg| arg == "--json") => {
-            machine::support_report(&args)
-        }
-        (Some("camera"), Some("diagnostics")) if args.iter().any(|arg| arg == "--json") => {
-            machine::camera_diagnostics(&args)
-        }
-        (Some("camera"), Some("census")) if args.iter().any(|arg| arg == "--json") => {
-            machine::camera_census(&args)
-        }
         (Some("camera"), Some("census")) => camera_census(&args),
-        (Some("status"), _) if args.iter().any(|arg| arg == "--json") => machine::status(&args),
-        (Some("version"), _) if args.iter().any(|arg| arg == "--json") => machine::version(&args),
         (Some("version"), _) | (Some("--version"), _) | (Some("-V"), _) => {
             println!("irlume {}", env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS

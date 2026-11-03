@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- LightDM managed-start evidence checks the directories traversed through
+  symbolic links before treating configuration as readable by both root and
+  unprivileged clients. Supported public symlinks remain valid.
+
 - LightDM preparation allows cold reads on slow storage. Its former
   three-second service limit and half-second observation limits could stop
   the greeter from starting even before face login was configured. The

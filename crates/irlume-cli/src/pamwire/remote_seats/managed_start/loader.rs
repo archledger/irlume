@@ -275,26 +275,63 @@ fn identity(meta: &Metadata) -> String {
 /// every directory on the way, through any symlink, grants others search,
 /// and the object itself grants others read (and search for a directory).
 fn readable_by_anyone(path: &Path, directory: bool) -> Result<(), String> {
-    let mut chains = vec![path.canonicalize().map_err(|e| e.to_string())?];
-    if let Some(parent) = path.parent() {
-        chains.push(parent.canonicalize().map_err(|e| e.to_string())?);
+    if path.as_os_str().is_empty() {
+        return Err("empty configuration path".into());
     }
-    for (index, chain) in chains.iter().enumerate() {
-        for ancestor in chain.ancestors().skip(usize::from(index == 0)) {
-            let mode = std::fs::metadata(ancestor)
-                .map_err(|e| e.to_string())?
-                .mode();
-            if mode & 0o001 == 0 {
-                return Err(format!(
-                    "{} is not searchable by others",
-                    ancestor.display()
-                ));
+    // Keep the kernel's final-component semantics (including a trailing '/').
+    let mode = std::fs::metadata(path).map_err(|e| e.to_string())?.mode();
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let mut remaining: std::collections::VecDeque<_> = absolute
+        .components()
+        .map(|component| component.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = PathBuf::from("/");
+    let mut symlinks = 0;
+    while let Some(component) = remaining.pop_front() {
+        if component.as_bytes() == b"/" {
+            resolved = PathBuf::from("/");
+            continue;
+        }
+        let parent = std::fs::metadata(&resolved).map_err(|e| e.to_string())?;
+        if !parent.is_dir() || parent.mode() & 0o001 == 0 {
+            return Err(format!(
+                "{} is not searchable by others",
+                resolved.display()
+            ));
+        }
+        if component.as_bytes() == b"." {
+            continue;
+        }
+        if component.as_bytes() == b".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(component);
+        if std::fs::symlink_metadata(&next)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
+            // Linux permits at most 40 link resolutions per pathname. Expand
+            // each target here, before dropping any permission-bearing prefix.
+            symlinks += 1;
+            if symlinks > 40 {
+                return Err("too many symlinks in configuration path".into());
             }
+            let target = std::fs::read_link(&next).map_err(|e| e.to_string())?;
+            for part in target.components().rev() {
+                remaining.push_front(part.as_os_str().to_os_string());
+            }
+        } else {
+            resolved = next;
         }
     }
-    let mode = std::fs::metadata(&chains[0])
-        .map_err(|e| e.to_string())?
-        .mode();
     let wanted = if directory { 0o005 } else { 0o004 };
     if mode & wanted != wanted {
         return Err("not readable by others".into());
@@ -580,5 +617,162 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
         assert!(observe(&tree.0, &Profile::standard(), true).is_err());
+    }
+
+    #[test]
+    fn public_reads_reject_private_intermediate_file_links() {
+        let tree = Tree::new("private-file-link");
+        let target = tree.put("public/remote.ini", XDMCP_ON);
+        let hidden = tree.0.join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, hidden.join("hop")).unwrap();
+        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        symlink(hidden.join("hop"), tree.0.join("etc/lightdm/lightdm.conf")).unwrap();
+
+        assert!(
+            tree.observe().unwrap().xdmcp_enabled,
+            "owner can read the fixture"
+        );
+        assert!(
+            observe(&tree.0, &Profile::standard(), true).is_err(),
+            "a public target does not make a private intermediate directory searchable"
+        );
+    }
+
+    #[test]
+    fn public_reads_reject_private_intermediate_directory_links() {
+        let tree = Tree::new("private-directory-link");
+        tree.put("public/remote.conf", XDMCP_ON);
+        let hidden = tree.0.join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink("../public", hidden.join("hop")).unwrap();
+        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        symlink(
+            hidden.join("hop"),
+            tree.0.join("etc/lightdm/lightdm.conf.d"),
+        )
+        .unwrap();
+
+        assert!(
+            tree.observe().unwrap().xdmcp_enabled,
+            "owner can read the fixture"
+        );
+        assert!(
+            observe(&tree.0, &Profile::standard(), true).is_err(),
+            "the directory probe must include every intermediate link's search permissions"
+        );
+    }
+
+    #[test]
+    fn public_reads_preserve_search_checks_before_parent_components() {
+        let tree = Tree::new("private-parent-component");
+        tree.put("public/remote.ini", XDMCP_ON);
+        let hidden = tree.0.join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        symlink(
+            tree.0.join("hidden/../public/remote.ini"),
+            tree.0.join("etc/lightdm/lightdm.conf"),
+        )
+        .unwrap();
+
+        assert!(
+            tree.observe().unwrap().xdmcp_enabled,
+            "owner can traverse the fixture"
+        );
+        assert!(
+            observe(&tree.0, &Profile::standard(), true).is_err(),
+            "parent components do not bypass search permission on the directory being left"
+        );
+    }
+
+    #[test]
+    fn public_reads_accept_searchable_indirect_links() {
+        let tree = Tree::new("public-link-chain");
+        let target = tree.put("public/remote.ini", XDMCP_ON);
+        std::fs::create_dir_all(tree.0.join("links")).unwrap();
+        symlink("../public/remote.ini", tree.0.join("links/relative")).unwrap();
+        symlink(tree.0.join("links/relative"), tree.0.join("links/absolute")).unwrap();
+        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        symlink(
+            tree.0.join("links/absolute"),
+            tree.0.join("etc/lightdm/lightdm.conf"),
+        )
+        .unwrap();
+
+        let direct = tree.observe().unwrap();
+        let public = observe(&tree.0, &Profile::standard(), true).unwrap();
+        assert!(public.xdmcp_enabled);
+        assert_eq!(public, direct);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), XDMCP_ON);
+    }
+
+    #[test]
+    fn public_reads_accept_searchable_indirect_directory_links() {
+        let tree = Tree::new("public-directory-chain");
+        tree.put("public/remote.conf", XDMCP_ON);
+        std::fs::create_dir_all(tree.0.join("links")).unwrap();
+        symlink("../public", tree.0.join("links/directory")).unwrap();
+        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        symlink(
+            tree.0.join("links/directory"),
+            tree.0.join("etc/lightdm/lightdm.conf.d"),
+        )
+        .unwrap();
+        let public = observe(&tree.0, &Profile::standard(), true).unwrap();
+        assert!(public.xdmcp_enabled);
+        assert_eq!(public, tree.observe().unwrap());
+    }
+
+    #[test]
+    fn public_path_checks_keep_link_limits_and_final_object_permissions() {
+        let tree = Tree::new("public-path-boundaries");
+        let target = tree.put("target.ini", XDMCP_OFF);
+        let mut previous = target.clone();
+        for count in 1..=41 {
+            let link = tree.0.join(format!("link-{count}"));
+            symlink(&previous, &link).unwrap();
+            assert_eq!(
+                readable_by_anyone(&link, false).is_ok(),
+                count <= 40,
+                "a chain with {count} links"
+            );
+            previous = link;
+        }
+        symlink("cycle-b", tree.0.join("cycle-a")).unwrap();
+        symlink("cycle-a", tree.0.join("cycle-b")).unwrap();
+        symlink("missing", tree.0.join("broken")).unwrap();
+        for name in ["cycle-a", "broken", "missing", "target.ini/"] {
+            assert!(
+                readable_by_anyone(&tree.0.join(name), false).is_err(),
+                "{name}"
+            );
+        }
+        assert!(readable_by_anyone(Path::new(""), false).is_err());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(readable_by_anyone(&target, false).is_err());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(readable_by_anyone(&target, false).is_ok());
+    }
+
+    #[test]
+    fn public_path_checks_preserve_non_utf8_link_targets() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let tree = Tree::new("public-non-utf8-target");
+        let directory = tree
+            .0
+            .join(std::ffi::OsString::from_vec(b"public-\xff".to_vec()));
+        std::fs::create_dir(&directory).unwrap();
+        let target = directory.join("remote.ini");
+        std::fs::write(&target, XDMCP_OFF).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tree.0.join("public-link");
+        symlink(&target, &link).unwrap();
+        assert!(readable_by_anyone(&link, false).is_ok());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(readable_by_anyone(&link, false).is_err());
     }
 }

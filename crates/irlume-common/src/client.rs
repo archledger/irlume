@@ -314,7 +314,18 @@ pub fn connect_stream(rw_timeout: Duration) -> io::Result<UnixStream> {
 pub fn enrollment_session(
     req: &Request,
     cancelled: &std::sync::atomic::AtomicBool,
+    event: impl FnMut(crate::EnrollmentEvent) -> io::Result<Option<bool>>,
+) -> io::Result<Response> {
+    enrollment_session_with_connect(req, cancelled, event, || {
+        connect_stream(Duration::from_millis(100))
+    })
+}
+
+fn enrollment_session_with_connect(
+    req: &Request,
+    cancelled: &std::sync::atomic::AtomicBool,
     mut event: impl FnMut(crate::EnrollmentEvent) -> io::Result<Option<bool>>,
+    connect: impl FnOnce() -> io::Result<UnixStream>,
 ) -> io::Result<Response> {
     if !matches!(req, Request::EnrollmentSession { .. }) {
         return Err(io::Error::new(
@@ -323,7 +334,7 @@ pub fn enrollment_session(
         ));
     }
     check_cancellation(Some(cancelled))?;
-    let stream = connect_stream(Duration::from_millis(100))?;
+    let stream = connect()?;
     let line = serialize_request(req)?;
     check_cancellation(Some(cancelled))?;
     (&stream).write_all(&line)?;
@@ -474,9 +485,20 @@ fn request_with_timeouts_inner(
     cancelled: Option<&std::sync::atomic::AtomicBool>,
     observation_deadline: Option<std::time::Instant>,
 ) -> io::Result<Response> {
+    request_with_connect(req, rw_timeout, cancelled, observation_deadline, || {
+        connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)
+    })
+}
+
+fn request_with_connect(
+    req: &Request,
+    rw_timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    observation_deadline: Option<std::time::Instant>,
+    connect: impl FnOnce() -> io::Result<UnixStream>,
+) -> io::Result<Response> {
     check_cancellation(cancelled)?;
-    let stream =
-        connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)?;
+    let stream = connect()?;
     stream.set_read_timeout(Some(rw_timeout))?;
     stream.set_write_timeout(Some(rw_timeout))?;
 
@@ -757,6 +779,61 @@ mod tests {
         assert!(
             matches!(result, Err(ref error) if error.kind() == io::ErrorKind::TimedOut),
             "trickled reply must expire, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn cancellation_during_connect_writes_no_request_bytes() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let result = request_with_connect(
+            &Request::Enroll {
+                user: "alice".into(),
+                profile: Some("main".into()),
+                scans: Some(1),
+                reset: false,
+            },
+            Duration::from_secs(1),
+            Some(&cancelled),
+            None,
+            || {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(stream)
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            peer.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "cancelled request wrote bytes"
+        );
+    }
+
+    #[test]
+    fn enrollment_cancellation_during_connect_writes_no_request_bytes() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let result = enrollment_session_with_connect(
+            &Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: Some("main".into()),
+                scans: 1,
+                improve: false,
+            },
+            &cancelled,
+            |_| panic!("cancelled request emitted an event"),
+            || {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(stream)
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            peer.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "cancelled session wrote bytes"
         );
     }
 

@@ -11882,9 +11882,15 @@ fn guide_until_capture(
         if stop.load(Ordering::Relaxed) {
             return GuideOutcome::Halt;
         }
-        match sample(&Request::PositionSample {
+        let result = sample(&Request::PositionSample {
             user: Some(user.to_owned()),
-        }) {
+        });
+        // A blocking sample may finish after the UI has cancelled. Do not
+        // publish its cue or let it advance the countdown in that case.
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        match result {
             Ok(Response::Position(r)) => {
                 *misses = 0;
                 let good = r.well_framed;
@@ -11926,9 +11932,16 @@ fn guide_until_capture(
             return GuideOutcome::Halt;
         }
         std::thread::sleep(Duration::from_millis(650));
-        match sample(&Request::PositionSample {
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        let result = sample(&Request::PositionSample {
             user: Some(user.to_owned()),
-        }) {
+        });
+        if stop.load(Ordering::Relaxed) {
+            return GuideOutcome::Halt;
+        }
+        match result {
             // Still framed: keep counting (don't send a Cue; that would
             // clear the on-screen count). Only surface a cue on abort.
             Ok(Response::Position(r)) if r.well_framed => {
@@ -12004,7 +12017,7 @@ fn enroll_worker(
             return;
         }
     }
-    if !send(WMsg::Authorizing) {
+    if stop.load(Ordering::Relaxed) || !send(WMsg::Authorizing) {
         return;
     }
     let request = Request::EnrollmentSession {
@@ -12134,6 +12147,9 @@ fn legacy_enroll_worker(
                     report_enrollment: true,
                 }
             };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             match irlume_common::client::request_cancellable(
                 &req,
                 std::time::Duration::from_secs(380),
@@ -12204,6 +12220,7 @@ mod tests {
     include!("tui/coexistence_tests.rs");
     include!("tui/bitwarden_action_tests.rs");
     include!("tui/camera_layout_tests.rs");
+    include!("tui/enrollment_cancel_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,

@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Enrollment stops guidance and skips new capture requests when cancellation
+  arrives during framing or the countdown, including the older-daemon fallback.
+  Cancellable enrollment requests recheck cancellation before writing to the
+  daemon; work already dispatched may still complete (ADR-0030 section 1.2).
+
 - Cameras marks truncated list rows with an ellipsis at the actual content
   width, preserving status colours and the full Enter details
   (ADR-0030 section 1.7).

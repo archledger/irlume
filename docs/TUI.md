@@ -239,6 +239,9 @@ follows device identity, and a connection change invalidates an open camera
 switch confirmation rather than silently choosing a replacement.
 
 During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
+The guide checks cancellation after waiting or sampling, and the client checks
+again before sending a new capture request, including the older-daemon fallback.
+Cancellation does not undo work the daemon has already received.
 For a general daemon task, the **quit** control exits the TUI and explicitly says
 the task keeps running. Other page controls stay inactive during these operations.
 

@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Diagnostics retains an observed fingerprint-reader claim error and its
+  confirmed restart action when enrollment cannot be listed. Unknown enrollment
+  stays unknown, and the restart warning names its effect on active sessions
+  (ADR-0030 section 6).
+
 - TUI shortcuts ask for confirmation before writes or administrator commands,
   including login wiring, fingerprint setup, policy changes and diagnostics.
   Cancelling daemon startup also cancels its queued enrollment (ADR-0030 §1.1).

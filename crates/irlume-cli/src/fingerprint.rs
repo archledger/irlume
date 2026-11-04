@@ -883,19 +883,8 @@ pub(crate) fn fprintd_in_sudo(path: &PamSearchPath) -> bool {
     if has_auth_module(&sudo, "pam_fprintd.so") {
         return true;
     }
-    for l in sudo.lines() {
-        // Directive part only, like every other PAM read in this file: a
-        // full-line comment yields "" (no tokens), and a trailing comment can
-        // never contribute an include target.
-        let mut parts = crate::pamwire::directive(l).split_whitespace();
-        // `auth include system-auth` / `auth substack system-auth`, and the
-        // one-word `@include common-auth` Debian form.
-        let target = match (parts.next(), parts.next(), parts.next()) {
-            (Some("@include"), Some(name), _) => Some(name),
-            (Some(_), Some("include" | "substack"), Some(name)) => Some(name),
-            _ => None,
-        };
-        if let Some(name) = target {
+    for line in sudo.lines() {
+        if let Some(name) = crate::pamwire::auth_stack_target(line) {
             if path
                 .read_service(name)
                 .is_some_and(|s| has_auth_module(&s, "pam_fprintd.so"))
@@ -1030,37 +1019,23 @@ fn walk_auth(path: &PamSearchPath, name: &str, seen: &mut Vec<String>) -> AuthWa
         return AuthWalk::Continues;
     }
     for line in text.lines() {
-        let d = crate::pamwire::directive(line);
-        let mut toks = d.split_whitespace();
-        let (t1, t2, t3) = (toks.next(), toks.next(), toks.next());
-        let Some(first) = t1 else { continue };
-        if first == "@include" {
-            if let Some(target) = t2 {
-                match walk_auth(path, target, seen) {
-                    AuthWalk::Continues => {}
-                    ended => return ended,
-                }
-            }
-            continue;
-        }
-        // Only the auth phase authenticates; `-auth` is auth with PAM's
-        // missing-module tolerance.
-        if first.strip_prefix('-').unwrap_or(first) != "auth" {
-            continue;
-        }
-        match (t2, t3) {
-            (Some("include" | "substack"), Some(target)) => match walk_auth(path, target, seen) {
+        if let Some(target) = crate::pamwire::auth_stack_target(line) {
+            match walk_auth(path, target, seen) {
                 AuthWalk::Continues => {}
                 ended => return ended,
-            },
-            // The module-path FIELD, not a substring of the directive: an
-            // argument naming the file (`pam_exec.so log=/x/pam_fprintd.so`)
-            // is not a fingerprint rule.
-            _ if crate::pamwire::directive_has_auth_module(line, "pam_fprintd.so") => {
-                return AuthWalk::ReachesFprintd
             }
-            _ if guaranteed_auth_exit(t2, line) => return AuthWalk::Terminates,
-            _ => {}
+            continue;
+        }
+        let Some(control) = crate::pamwire::auth_control(line) else {
+            continue;
+        };
+        // The canonical parser handles case and brackets without treating a
+        // module named in an argument as the rule's module path.
+        if crate::pamwire::directive_has_auth_module(line, "pam_fprintd.so") {
+            return AuthWalk::ReachesFprintd;
+        }
+        if guaranteed_auth_exit(Some(control), line) {
+            return AuthWalk::Terminates;
         }
     }
     AuthWalk::Continues
@@ -1832,6 +1807,151 @@ auth        include       postlogin\n",
         // The enable gate itself stays satisfied, preserving that flow.
         assert!(pam_fprintd_wired(&PamSearchPath::machine_only(&dir)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_reachability_accepts_uppercase_auth() {
+        for rule in [
+            "AUTH sufficient pam_fprintd.so\n",
+            "-AUTH sufficient pam_fprintd.so\n",
+            "aUtH sufficient pam_fprintd.so\n",
+        ] {
+            let dir = pam_dir("uppercase-auth", &[("login", rule)]);
+            let path = PamSearchPath::machine_only(&dir);
+            assert!(stack_reaches_fprintd(&path, "login"), "{rule}");
+            assert!(fingerprint_only_permitted(&path, true), "{rule}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_reachability_accepts_bracketed_auth() {
+        for rule in [
+            "[auth] sufficient pam_fprintd.so\n",
+            "[AUTH] sufficient pam_fprintd.so\n",
+            "[-auth] sufficient pam_fprintd.so\n",
+        ] {
+            let dir = pam_dir("bracketed-auth", &[("login", rule)]);
+            let path = PamSearchPath::machine_only(&dir);
+            assert!(stack_reaches_fprintd(&path, "login"), "{rule}");
+            assert!(fingerprint_only_permitted(&path, true), "{rule}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_reachability_accepts_uppercase_includes() {
+        for rule in [
+            "auth INCLUDE child\n",
+            "AUTH include child\n",
+            "-AUTH SuBsTaCk child\n",
+        ] {
+            let dir = pam_dir(
+                "uppercase-include",
+                &[
+                    ("login", rule),
+                    ("child", "auth sufficient pam_fprintd.so\n"),
+                ],
+            );
+            let path = PamSearchPath::machine_only(&dir);
+            assert!(stack_reaches_fprintd(&path, "login"), "{rule}");
+            assert!(fingerprint_only_permitted(&path, true), "{rule}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_reachability_accepts_bracketed_includes() {
+        for rule in ["auth [include] child\n", "[auth] [substack] child\n"] {
+            let dir = pam_dir(
+                "bracketed-include",
+                &[
+                    ("login", rule),
+                    ("child", "auth sufficient pam_fprintd.so\n"),
+                ],
+            );
+            let path = PamSearchPath::machine_only(&dir);
+            assert!(stack_reaches_fprintd(&path, "login"), "{rule}");
+            assert!(fingerprint_only_permitted(&path, true), "{rule}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_reachability_stops_at_normalized_requisite_deny() {
+        for deny in [
+            "auth [requisite] pam_deny.so\n",
+            "[auth] ReQuIsItE pam_deny.so\n",
+        ] {
+            let content = format!("{deny}auth sufficient pam_fprintd.so\n");
+            let dir = pam_dir("normalized-deny", &[("login", &content)]);
+            let path = PamSearchPath::machine_only(&dir);
+            assert!(!stack_reaches_fprintd(&path, "login"), "{deny}");
+            assert!(!fingerprint_only_permitted(&path, true), "{deny}");
+            assert!(fingerprint_only_permitted(&path, false));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_sudo_warning_ignores_other_phase_includes() {
+        for phase in ["session", "account", "password"] {
+            let content = format!("{phase} include child\n");
+            let dir = pam_dir(
+                "sudo-other-phase",
+                &[
+                    ("sudo", &content),
+                    ("child", "auth sufficient pam_fprintd.so\n"),
+                ],
+            );
+            assert!(
+                !fprintd_in_sudo(&PamSearchPath::machine_only(&dir)),
+                "{phase}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_sudo_warning_accepts_normalized_auth_includes() {
+        for rule in [
+            "auth INCLUDE child\n",
+            "AUTH substack child\n",
+            "[auth] [include] child\n",
+        ] {
+            let dir = pam_dir(
+                "sudo-normalized",
+                &[
+                    ("sudo", rule),
+                    ("child", "auth sufficient pam_fprintd.so\n"),
+                ],
+            );
+            assert!(
+                fprintd_in_sudo(&PamSearchPath::machine_only(&dir)),
+                "{rule}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn fingerprint_parsing_preserves_module_and_target_case() {
+        let dir = pam_dir(
+            "exact-names",
+            &[
+                ("login", "auth include Child\n"),
+                ("sudo", "auth include Child\n"),
+                ("Child", "auth sufficient pam_FPRINTD.so\n"),
+                ("child", "auth sufficient pam_fprintd.so\n"),
+            ],
+        );
+        let path = PamSearchPath::machine_only(&dir);
+        assert!(!stack_reaches_fprintd(&path, "login"));
+        assert!(!fprintd_in_sudo(&path));
+        std::fs::write(dir.join("Child"), "auth sufficient pam_fprintd.so\n").unwrap();
+        assert!(stack_reaches_fprintd(&path, "login"));
+        assert!(fprintd_in_sudo(&path));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

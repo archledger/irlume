@@ -960,6 +960,18 @@ fn stack_named<'a>(line: &'a str, phase: &str) -> Option<&'a str> {
         .and_then(|h| third_field(&h))
 }
 
+/// The control field of a known auth directive, with token brackets removed.
+/// This reads the field; it does not evaluate its control actions.
+pub(crate) fn auth_control(line: &str) -> Option<&str> {
+    typed_head(line, "auth").map(|h| h.control)
+}
+
+/// The target of an auth include/substack or Debian's all-phase `@include`.
+/// Keyword matching follows PAM; the target name keeps its original case.
+pub(crate) fn auth_stack_target(line: &str) -> Option<&str> {
+    at_include_target(line).or_else(|| stack_named(line, "auth"))
+}
+
 /// An `auth`-phase line whose password path is an `include` a `success=N` jump
 /// can't skip: Debian's `@include common-auth`/`login`, Arch's
 /// `auth include system-login`/`system-local-login`/`system-auth`, or a bare

@@ -68,7 +68,9 @@ pub(crate) use lock::lock_pam;
 // The PAM-grammar items shared outside this module: `fingerprint.rs` and the
 // TUI must read stack lines with the same comment and rule-field semantics
 // the wiring uses, or the two would disagree about what a file configures.
-pub(crate) use grammar::{directive, directive_has_auth_module, has_line_continuation};
+pub(crate) use grammar::{
+    auth_control, auth_stack_target, directive, directive_has_auth_module, has_line_continuation,
+};
 pub(crate) use overrides::Level as OverrideLevel;
 pub(crate) use report::{
     active_login_wired_by_mode, keyring_handoff_warnings, login_manager_fact, login_wired_by_mode,

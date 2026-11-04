@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Cameras marks truncated list rows with an ellipsis at the actual content
+  width, preserving status colours and the full Enter details
+  (ADR-0030 section 1.7).
+
 - Login & Apps offers Bitwarden setup in its action rows, help and keyboard
   focus only when the background observation reports that setup is needed
   (ADR-0030 section 1.4).

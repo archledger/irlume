@@ -73,8 +73,8 @@ pub(crate) use grammar::{
 };
 pub(crate) use overrides::Level as OverrideLevel;
 pub(crate) use report::{
-    active_login_wired_by_mode, keyring_handoff_warnings, login_manager_fact, login_wired_by_mode,
-    status_report, surface_facts, HandoffWarning,
+    active_login_wired_by_mode, face_login_wired_by_mode, keyring_handoff_warnings,
+    login_manager_fact, login_wired_by_mode, status_report, surface_facts, HandoffWarning,
 };
 pub(crate) use stanzas::BACKUP;
 pub(crate) use token::{

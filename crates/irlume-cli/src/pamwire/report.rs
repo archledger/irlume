@@ -30,6 +30,8 @@ pub(crate) struct SurfaceFact {
     /// Whether this service exists here at all: a real /etc file, or a vendor
     /// copy an /etc override would be materialized from.
     pub(crate) present: bool,
+    /// The contents were read, or the surface was observed absent.
+    readable: bool,
     pub(crate) wired: bool,
     /// How face fires here when wired: `face-first`, `on-demand`, `keyring`
     /// (the fingerprint keyring-unlock line, which is not a face factor) or
@@ -42,16 +44,40 @@ pub(super) fn surface_fact(
     vendor: Option<&'static str>,
     role: &'static str,
 ) -> SurfaceFact {
-    let path = service_present(&Svc { etc, vendor });
-    let content = path
-        .as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    surface_fact_from(etc, role, path.is_some(), &content)
+    surface_fact_from_sources(etc, role, etc, vendor)
+}
+
+/// Keep the reported service identity separate from borrowed filesystem paths.
+fn surface_fact_from_sources(
+    etc: &'static str,
+    role: &'static str,
+    source: &str,
+    vendor: Option<&str>,
+) -> SurfaceFact {
+    // service_present names the /etc write destination even for vendor-only
+    // services. Reporting must instead read the effective source. An existing
+    // but unreadable override must not fall through to the vendor's contents.
+    let content = read_surface_source(source).or_else(|| vendor.and_then(read_surface_source));
+    let present = content.is_some();
+    let readable = content.as_ref().is_none_or(Result::is_ok);
+    let content = content.and_then(Result::ok).unwrap_or_default();
+    let mut fact = surface_fact_from(etc, role, present, &content);
+    fact.readable = readable;
+    fact
+}
+
+fn read_surface_source(path: &str) -> Option<std::io::Result<String>> {
+    // lstat preserves a dangling override as an unreadable entry rather than
+    // treating it as absent and advertising the vendor's different policy.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(std::fs::read_to_string(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(Err(error)),
+    }
 }
 
 /// Testable core of [`surface_fact`]: the fact for the service at `etc`
-/// whose stack reads `content` (empty when absent or unreadable).
+/// whose stack was read as `content` (empty when observed absent).
 fn surface_fact_from(
     etc: &'static str,
     role: &'static str,
@@ -67,6 +93,7 @@ fn surface_fact_from(
         role,
         path: etc,
         present,
+        readable: true,
         wired,
         mode,
     }
@@ -89,6 +116,30 @@ fn any_login_wired(facts: &[SurfaceFact]) -> bool {
 /// module presence, as its rule for what is irlume's to maintain.
 pub(crate) fn login_wired_by_mode() -> bool {
     any_login_wired(&surface_facts())
+}
+
+/// Whether a login or lock surface has an observed face-authentication rule.
+/// Keyring delivery and password resealing do not authenticate a face.
+/// `None` means a surface could not be inspected and no other surface proved it.
+pub(crate) fn face_login_wired_by_mode() -> Option<bool> {
+    any_face_login_wired(&surface_facts())
+}
+
+fn any_face_login_wired(facts: &[SurfaceFact]) -> Option<bool> {
+    let is_login = |fact: &SurfaceFact| matches!(fact.role, ROLE_LOGIN | ROLE_LOGIN_FP | ROLE_LOCK);
+    if facts.iter().any(|fact| {
+        fact.readable
+            && fact.present
+            && fact.wired
+            && is_login(fact)
+            && matches!(fact.mode, Some("face-first" | "on-demand" | "verify"))
+    }) {
+        Some(true)
+    } else if facts.iter().any(|fact| is_login(fact) && !fact.readable) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Whether the active display manager's greeter authenticates with face or
@@ -441,6 +492,92 @@ fn enable_hint(nixos: bool) -> String {
 mod tests {
     use super::*;
 
+    struct PamReadFixture(std::path::PathBuf);
+
+    impl Drop for PamReadFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pam_read_fixture(name: &str) -> (PamReadFixture, String, String) {
+        let root = std::env::temp_dir().join(format!(
+            "irlume-pam-read-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let etc = root.join("override").to_str().unwrap().to_owned();
+        let vendor = root.join("vendor").to_str().unwrap().to_owned();
+        (PamReadFixture(root), etc, vendor)
+    }
+
+    #[test]
+    fn vendor_pam_read_uses_the_existing_stack_without_an_override() {
+        let (_fixture, etc, vendor) = pam_read_fixture("vendor-only");
+        for (contents, expected) in [
+            ("auth sufficient pam_irlume.so unseal\n", Some(true)),
+            ("auth required pam_unix.so\n", Some(false)),
+        ] {
+            std::fs::write(&vendor, contents).unwrap();
+            let fact =
+                surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+            assert!(fact.present && fact.readable);
+            assert_eq!(any_face_login_wired(&[fact]), expected);
+        }
+        assert!(
+            !std::path::Path::new(&etc).exists(),
+            "reporting never writes an override"
+        );
+    }
+
+    #[test]
+    fn vendor_pam_read_prefers_an_existing_override() {
+        let (_fixture, etc, vendor) = pam_read_fixture("override");
+        std::fs::write(&vendor, "auth sufficient pam_irlume.so unseal\n").unwrap();
+        std::fs::write(&etc, "auth required pam_unix.so\n").unwrap();
+        let fact = surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+        assert!(fact.present && fact.readable);
+        assert_eq!(any_face_login_wired(&[fact]), Some(false));
+    }
+
+    #[test]
+    fn vendor_pam_read_does_not_hide_an_unreadable_override() {
+        let (_fixture, etc, vendor) = pam_read_fixture("unreadable");
+        std::fs::write(&vendor, "auth sufficient pam_irlume.so unseal\n").unwrap();
+        std::fs::create_dir(&etc).unwrap();
+        let fact = surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+        assert!(fact.present && !fact.readable);
+        assert_eq!(any_face_login_wired(&[fact]), None);
+    }
+
+    #[test]
+    fn vendor_pam_read_does_not_hide_a_dangling_override() {
+        let (_fixture, etc, vendor) = pam_read_fixture("dangling");
+        std::fs::write(&vendor, "auth sufficient pam_irlume.so unseal\n").unwrap();
+        std::os::unix::fs::symlink("missing-target", &etc).unwrap();
+        let fact = surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+        assert!(!fact.readable);
+        assert_eq!(any_face_login_wired(&[fact]), None);
+    }
+
+    #[test]
+    fn vendor_pam_read_absent_sources_are_known_unwired() {
+        let (_fixture, etc, vendor) = pam_read_fixture("absent");
+        let fact = surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+        assert!(!fact.present && fact.readable);
+        assert_eq!(any_face_login_wired(&[fact]), Some(false));
+    }
+
+    #[test]
+    fn vendor_pam_read_preserves_an_unreadable_vendor_as_unknown() {
+        let (_fixture, etc, vendor) = pam_read_fixture("unreadable-vendor");
+        std::fs::create_dir(&vendor).unwrap();
+        let fact = surface_fact_from_sources("/etc/pam.d/test", ROLE_LOGIN, &etc, Some(&vendor));
+        assert!(fact.present && !fact.readable);
+        assert_eq!(any_face_login_wired(&[fact]), None);
+    }
+
     /// With nothing wired, `login status` names the command that wires a
     /// login surface, except on NixOS, where that command refuses and the
     /// hint names the module and docs/NIXOS.md.
@@ -632,6 +769,89 @@ mod tests {
                 "{stack}"
             );
         }
+    }
+
+    #[test]
+    fn coexistence_face_wiring_excludes_keyring_reseal_and_privileged_only_rules() {
+        for (role, stack, face, login) in [
+            (
+                ROLE_LOGIN,
+                "auth sufficient pam_irlume.so unseal",
+                true,
+                true,
+            ),
+            (
+                ROLE_LOGIN,
+                "auth sufficient pam_irlume.so unseal ondemand",
+                true,
+                true,
+            ),
+            (ROLE_LOCK, "auth sufficient pam_irlume.so", true, true),
+            (
+                ROLE_LOGIN_FP,
+                "auth optional pam_irlume.so keyring",
+                false,
+                true,
+            ),
+            (
+                ROLE_LOGIN,
+                "auth optional pam_irlume.so reseal",
+                false,
+                false,
+            ),
+            (ROLE_SUDO, "auth sufficient pam_irlume.so", false, false),
+            (ROLE_POLKIT, "auth sufficient pam_irlume.so", false, false),
+            (
+                ROLE_LOGIN,
+                "session optional pam_irlume.so unseal",
+                false,
+                false,
+            ),
+            (
+                ROLE_LOGIN,
+                "auth required pam_unix.so # pam_irlume.so unseal",
+                false,
+                false,
+            ),
+        ] {
+            let facts = [surface_fact_from("/etc/pam.d/test", role, true, stack)];
+            assert_eq!(any_face_login_wired(&facts), Some(face), "{role}: {stack}");
+            assert_eq!(any_login_wired(&facts), login, "{role}: {stack}");
+        }
+    }
+
+    #[test]
+    fn coexistence_face_wiring_requires_a_present_surface() {
+        let facts = [surface_fact_from(
+            "/etc/pam.d/test",
+            ROLE_LOGIN,
+            false,
+            "auth sufficient pam_irlume.so unseal",
+        )];
+        assert_eq!(any_face_login_wired(&facts), Some(false));
+    }
+
+    #[test]
+    fn coexistence_unreadable_surface_is_unknown_unless_another_proves_face_wiring() {
+        // A directory exists but cannot be read as a PAM stack, even as root.
+        let unreadable = surface_fact("/", None, ROLE_LOGIN);
+        assert!(unreadable.present && !unreadable.readable);
+        assert_eq!(any_face_login_wired(&[unreadable]), None);
+        let face = surface_fact_from(
+            "/etc/pam.d/test",
+            ROLE_LOCK,
+            true,
+            "auth sufficient pam_irlume.so",
+        );
+        assert_eq!(
+            any_face_login_wired(&[surface_fact("/", None, ROLE_LOGIN), face,]),
+            Some(true)
+        );
+        // An unreadable privileged-only service is not evidence about login.
+        assert_eq!(
+            any_face_login_wired(&[surface_fact("/", None, ROLE_SUDO)]),
+            Some(false)
+        );
     }
 
     #[test]

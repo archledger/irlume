@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Diagnostics checks face-authentication wiring and current enrollment before
+  reporting face and fingerprint coexistence. Keyring-only rules do not count
+  as face wiring, vendor-only stacks are read from their actual source, and
+  unknown observations do not become setup advice
+  (ADR-0030 section 6).
+
 - Diagnostics retains an observed fingerprint-reader claim error and its
   confirmed restart action when enrollment cannot be listed. Unknown enrollment
   stays unknown, and the restart warning names its effect on active sessions

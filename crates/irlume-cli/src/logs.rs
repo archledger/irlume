@@ -225,8 +225,18 @@ fn debug(action: Option<&str>) -> ExitCode {
                 eprintln!("[logs] could not write {DROPIN}: {e}");
                 return ExitCode::FAILURE;
             }
-            restart_daemon_and_wait();
-            println!("[logs] tracing ON: the daemon now logs per-stage pipeline lines (capture/detect/liveness cues/match scores; numbers only, never frames or embeddings).");
+            match restart_daemon_and_wait() {
+                Ok(DebugDaemonState::Active) => {
+                    println!("[logs] tracing ON: the daemon now logs per-stage pipeline lines (capture/detect/liveness cues/match scores; numbers only, never frames or embeddings).");
+                }
+                Ok(DebugDaemonState::Inactive) => {
+                    println!("[logs] tracing configuration enabled for the daemon's next start; it is not running");
+                }
+                Err(error) => {
+                    eprintln!("[logs] tracing configuration saved, but {error}; runtime tracing is unconfirmed. Retry: sudo irlume logs debug on");
+                    return ExitCode::FAILURE;
+                }
+            }
             println!("[logs] ⚠ while on, DENIED attempts log their score vs threshold: feedback a journal-reader could use to tune a spoof. Diagnose, then turn it off:");
             println!("[logs] watch live with:  irlume logs -f    ·   turn off with:  sudo irlume logs debug off");
             ExitCode::SUCCESS
@@ -238,17 +248,26 @@ fn debug(action: Option<&str>) -> ExitCode {
             }
             match std::fs::remove_file(DROPIN) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    println!("[logs] tracing already off");
-                    return ExitCode::SUCCESS;
-                }
+                // A previous attempt may have removed the file but failed to
+                // apply that change. An explicit retry must reconcile it too.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     eprintln!("[logs] could not remove {DROPIN}: {e}");
                     return ExitCode::FAILURE;
                 }
             }
             let _ = std::fs::remove_dir(DROPIN_DIR); // only if now empty
-            restart_daemon_and_wait();
+            match restart_daemon_and_wait() {
+                Ok(DebugDaemonState::Active) => {}
+                Ok(DebugDaemonState::Inactive) => {
+                    println!("[logs] tracing configuration disabled for the daemon's next start; it is not running");
+                    return ExitCode::SUCCESS;
+                }
+                Err(error) => {
+                    eprintln!("[logs] tracing drop-in is absent, but {error}; runtime tracing may still be active. Retry: sudo irlume logs debug off");
+                    return ExitCode::FAILURE;
+                }
+            }
             println!("[logs] tracing off");
             ExitCode::SUCCESS
         }
@@ -301,26 +320,73 @@ fn wait_for_serving() -> bool {
     )
 }
 
-/// Announce the restart, apply it, and hold the command until the daemon is
-/// serving again so scripted flows cannot race the model load (#562).
-fn restart_daemon_and_wait() {
-    println!("{}", restart_notice());
-    restart_daemon();
-    if wait_for_serving() {
-        println!("[logs] daemon serving again");
-    } else {
-        eprintln!(
-            "[logs] tracing set, but the daemon did not confirm serving within 45s; \
-             check: systemctl status irlumed"
-        );
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DebugDaemonState {
+    Active,
+    Inactive,
 }
 
-fn restart_daemon() {
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
-    let _ = Command::new("systemctl")
-        .args(["try-restart", "irlumed.service"])
-        .status();
+/// Announce and apply the change, then wait for an active daemon to serve.
+/// Do not probe an inactive service through its activation socket.
+fn restart_daemon_and_wait() -> Result<DebugDaemonState, String> {
+    restart_daemon_and_wait_with(restart_daemon, wait_for_serving)
+}
+
+fn restart_daemon_and_wait_with(
+    restart: impl FnOnce() -> Result<DebugDaemonState, String>,
+    serving: impl FnOnce() -> bool,
+) -> Result<DebugDaemonState, String> {
+    println!("{}", restart_notice());
+    let state = restart()?;
+    if state == DebugDaemonState::Inactive {
+        // Connecting to irlumed.socket could start the service we just found
+        // inactive. Save the configuration without triggering that activation.
+        return Ok(state);
+    }
+    if !serving() {
+        return Err(
+            "the daemon did not confirm serving within 45s; check: systemctl status irlumed".into(),
+        );
+    }
+    println!("[logs] daemon serving again");
+    Ok(DebugDaemonState::Active)
+}
+
+fn restart_daemon() -> Result<DebugDaemonState, String> {
+    for args in [
+        &["daemon-reload"][..],
+        &["try-restart", "irlumed.service"][..],
+    ] {
+        let status = Command::new("systemctl")
+            .args(args)
+            .status()
+            .map_err(|error| format!("could not run systemctl {}: {error}", args.join(" ")))?;
+        if !status.success() {
+            return Err(format!("systemctl {} failed ({status})", args.join(" ")));
+        }
+    }
+    let output = Command::new("systemctl")
+        .args([
+            "show",
+            "--property=ActiveState",
+            "--value",
+            "irlumed.service",
+        ])
+        .output()
+        .map_err(|error| format!("could not inspect irlumed.service: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl show irlumed.service failed ({})",
+            output.status
+        ));
+    }
+    let state = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "systemctl returned invalid service state".to_owned())?;
+    match state.trim() {
+        "active" | "activating" | "reloading" => Ok(DebugDaemonState::Active),
+        "inactive" => Ok(DebugDaemonState::Inactive),
+        _ => Err("irlumed.service is not active or inactive; runtime state is unconfirmed".into()),
+    }
 }
 
 #[cfg(test)]
@@ -547,6 +613,48 @@ mod tests {
         assert!(!gave_up);
     }
 
+    #[test]
+    fn restart_failure_never_checks_readiness() {
+        let result = restart_daemon_and_wait_with(
+            || Err("restart refused".into()),
+            || panic!("a failed restart must not be replaced by a successful Ping"),
+        );
+        assert_eq!(result.unwrap_err(), "restart refused");
+    }
+
+    #[test]
+    fn serving_timeout_is_an_application_failure() {
+        let result = restart_daemon_and_wait_with(|| Ok(DebugDaemonState::Active), || false);
+        assert!(result
+            .unwrap_err()
+            .contains("did not confirm serving within 45s"));
+    }
+
+    #[test]
+    fn successful_restart_is_checked_before_readiness() {
+        let restarted = std::cell::Cell::new(false);
+        let result = restart_daemon_and_wait_with(
+            || {
+                restarted.set(true);
+                Ok(DebugDaemonState::Active)
+            },
+            || {
+                assert!(restarted.get());
+                true
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn inactive_daemon_does_not_trigger_socket_activation() {
+        let result = restart_daemon_and_wait_with(
+            || Ok(DebugDaemonState::Inactive),
+            || panic!("an inactive service must not be pinged"),
+        );
+        assert_eq!(result.unwrap(), DebugDaemonState::Inactive);
+    }
+
     /// The acceptance IS the order: the notice prints before the restart
     /// fires, and both toggle paths go through the announcing wrapper. Pinned
     /// against the source (the daemon's startup-glue idiom) because the order
@@ -560,21 +668,22 @@ mod tests {
         let production = &src[..src.find("\nmod tests").expect("tests module exists")];
         let flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
         let region_start = flat
-            .find("fn restart_daemon_and_wait()")
+            .find("fn restart_daemon_and_wait_with(")
             .expect("wrapper exists");
         let region = &flat[region_start..];
         let notice_at = region
             .find("println!(\"{}\", restart_notice());")
             .expect("notice printed");
-        let restart_at = region.find("restart_daemon();").expect("restart called");
+        let restart_at = region.find("restart()?;").expect("restart called");
         assert!(
             notice_at < restart_at,
             "the notice must print before the restart fires"
         );
         assert_eq!(
-            flat.matches("restart_daemon_and_wait();").count(),
+            flat.matches("match restart_daemon_and_wait()").count(),
             2,
             "exactly the two toggle paths (on and off) use the announcing wrapper"
         );
+        assert!(flat.contains("restart_daemon_and_wait_with(restart_daemon, wait_for_serving)"));
     }
 }

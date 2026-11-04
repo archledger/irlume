@@ -215,6 +215,17 @@ sudo irlume logs debug off
 Unlike `irlume trace`, that switch installs a systemd drop-in, restarts the
 daemon, and stays enabled until explicitly turned off.
 
+Both toggle commands reapply the setting to a running daemon, including an
+`off` retry after the drop-in was already removed. They can interrupt an
+active request. A daemon that systemd reports as inactive is not pinged; the
+saved setting applies on its next start instead.
+
+If reloading, restarting, inspecting the unit state or confirming readiness
+fails, the command exits nonzero and names the same command to retry. The
+drop-in change is retained, but runtime tracing is not reported as confirmed.
+The 45-second readiness budget starts after the systemctl commands; it is
+not an end-to-end deadline for the toggle.
+
 A granted IR-path attempt looks like:
 
 ```

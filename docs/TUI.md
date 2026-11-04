@@ -57,6 +57,12 @@ If a command fails or is interrupted, some changes may already have been
 applied. Review its terminal output and the refreshed status before retrying.
 An unsuccessful daemon-start command does not automatically resume enrollment.
 
+Page shortcuts that write or run as administrator first show a confirmation,
+even for repeatable operations such as refreshing the PCR policy. Cancelling
+the daemon-start confirmation also cancels the queued enrollment; an unrelated
+later command cannot resume it. Read-only, unprivileged status commands remain
+direct.
+
 ## Keys that mean the same thing on every page
 
 The TUI keeps a small set of global keys that no page reuses with another

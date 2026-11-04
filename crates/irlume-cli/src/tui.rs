@@ -5247,6 +5247,7 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.confirm = None;
                     self.camera_confirmation = None;
+                    self.resume_enroll = None;
                 }
                 _ => {} // ignore stray keys
             }
@@ -5812,7 +5813,10 @@ impl App {
                     "sudo irlume logs: the daemon/PAM/keyring journal in one view",
                 );
                 self.log('·', "For bounded diagnostics use [T] Record Trace; review sensitive measurements before sharing.");
-                self.suspend = Some(Suspend::Logs);
+                self.confirm = Some((
+                    "Show authentication logs as administrator? Debug logs may contain sensitive measurements. Nothing is changed.".into(),
+                    "Show logs", ConfirmAct::Sus(Suspend::Logs),
+                ));
             }
             // Full `irlume doctor` readout: the complete authoritative dump,
             // including the info-only lines the Repair checklist omits, for a
@@ -5848,7 +5852,10 @@ impl App {
                     '→',
                     "creating a read-only support report (no camera capture)…",
                 );
-                self.suspend = Some(Suspend::SupportReport);
+                self.confirm = Some((
+                    "Create a support report in the current directory? No camera capture is performed. Inspect the report before sharing.".into(),
+                    "Create", ConfirmAct::Sus(Suspend::SupportReport),
+                ));
             }
             // IR liveness self-test: the daemon root-gates it (the raw
             // measurements are a spoof-tuning oracle), so like every other root
@@ -5856,7 +5863,10 @@ impl App {
             // error on the direct socket call.
             (SC_REPAIR, KeyCode::Char('l')) => {
                 self.log('→', "sudo irlume selftest liveness: fires the IR camera through the daemon and reports the liveness measurements");
-                self.suspend = Some(Suspend::SelfTestLiveness);
+                self.confirm = Some((
+                    "Run the IR liveness self-test as administrator? This opens the camera and reports sensitive liveness measurements.".into(),
+                    "Run test", ConfirmAct::Sus(Suspend::SelfTestLiveness),
+                ));
             }
             // Cameras: IR emitter auto-setup (root; writes the persisted UVC
             // control) suspends to sudo; the [p] probe below is read-only.
@@ -5881,7 +5891,10 @@ impl App {
             }
             (SC_CAMERAS, KeyCode::Char('s')) => {
                 self.log('→', "sudo irlume ir-setup: set up the 850nm emitter; this writes to the camera (you'll be asked for your password)");
-                self.suspend = Some(Suspend::IrSetup);
+                self.confirm = Some((
+                    "Set up the IR emitter? This writes camera controls and saves the setup. Administrator approval may be requested.".into(),
+                    "Set up", ConfirmAct::Sus(Suspend::IrSetup),
+                ));
             }
             // Capture-mode tuning: some Hello modules starve their own RGB
             // interface when both stream, others keep the faster concurrent
@@ -5939,7 +5952,7 @@ impl App {
             }
             // Refresh the pcrlock policy (Tier-2 only): re-predict the boot
             // measurements after a firmware/Secure Boot change so the seal keeps
-            // validating. Root op; idempotent, so no confirm.
+            // validating. It writes system policy, even when idempotent.
             (SC_KEYRING, KeyCode::Char('p'))
                 if self
                     .keyring_policy
@@ -5947,7 +5960,10 @@ impl App {
                     .is_some_and(|p| p.contains("Tier 2")) =>
             {
                 self.log('→', "sudo systemd-pcrlock make-policy: refreshes the boot-measurement policy your seal is bound to");
-                self.suspend = Some(Suspend::PcrlockMakePolicy);
+                self.confirm = Some((
+                    "Refresh the boot-measurement policy as administrator? This rewrites the systemd-pcrlock policy for the current boot state.".into(),
+                    "Refresh policy", ConfirmAct::Sus(Suspend::PcrlockMakePolicy),
+                ));
             }
             // The CLI owns seal-kind recovery (token seals must not be re-armed here).
             (SC_KEYRING, KeyCode::Char('b')) if self.keyring_armed == Some(true) => {
@@ -6000,7 +6016,10 @@ impl App {
                 if !self.fp_known || !self.source_usable(Source::FingerprintReader) {
                     self.log('·', "current fingerprint reader observation unavailable; refresh before enrollment");
                 } else if self.fp.available {
-                    self.suspend = Some(Suspend::FingerprintAdd);
+                    self.confirm = Some((
+                        format!("Enroll a fingerprint for {}? The reader will capture and save a fingerprint after its prompts.", self.user),
+                        "Enroll", ConfirmAct::Sus(Suspend::FingerprintAdd),
+                    ));
                 } else {
                     self.log('✗', "no fingerprint reader detected");
                 }
@@ -6018,11 +6037,17 @@ impl App {
             }
             (SC_FINGERPRINT, KeyCode::Char('e')) => {
                 self.log('→', "sudo irlume fingerprint enable: unlock with face OR fingerprint");
-                self.suspend = Some(Suspend::FingerprintEnable);
+                self.confirm = Some((
+                    format!("Enable fingerprint login for {}? This changes system login wiring to accept face or fingerprint, with password fallback.", self.user),
+                    "Enable", ConfirmAct::Sus(Suspend::FingerprintEnable),
+                ));
             }
             (SC_FINGERPRINT, KeyCode::Char('d')) => {
                 self.log('→', "sudo irlume fingerprint disable: remove fingerprint from login");
-                self.suspend = Some(Suspend::FingerprintDisable);
+                self.confirm = Some((
+                    format!("Disable fingerprint login for {}? This removes fingerprint login wiring; password fallback remains available.", self.user),
+                    "Disable", ConfirmAct::Sus(Suspend::FingerprintDisable),
+                ));
             }
             (SC_FINGERPRINT, KeyCode::Char('x')) => {
                 self.confirm = Some((
@@ -6040,7 +6065,10 @@ impl App {
                 self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
                 self.log('·', "leave the password empty and press Enter to use your face (login needs the IR/secure tier; an RGB-only camera unlocks the lock screen only)");
                 self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
-                self.suspend = Some(Suspend::LoginEnable);
+                self.confirm = Some((
+                    "Wire face authentication into login and the lock screen? This changes system PAM configuration for the current method, retaining password fallback.".into(),
+                    "Wire login", ConfirmAct::Sus(Suspend::LoginEnable),
+                ));
             }
             // Login wiring (PAM): show status outside the alt-screen.
             (SC_PAM, KeyCode::Char('s')) => self.suspend = Some(Suspend::LoginStatus),
@@ -6048,11 +6076,17 @@ impl App {
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
                 self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt (password still works)");
-                self.suspend = Some(Suspend::LoginEnableSudo);
+                self.confirm = Some((
+                    "Wire face authentication into sudo? This changes system PAM configuration; the password remains available.".into(),
+                    "Wire sudo", ConfirmAct::Sus(Suspend::LoginEnableSudo),
+                ));
             }
             (SC_PAM, KeyCode::Char('p')) => {
                 self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts (password still works)");
-                self.suspend = Some(Suspend::LoginEnablePolkit);
+                self.confirm = Some((
+                    "Wire face authentication into app approval prompts? This changes system polkit PAM configuration; the password remains available.".into(),
+                    "Wire prompts", ConfirmAct::Sus(Suspend::LoginEnablePolkit),
+                ));
             }
             // Un-wiring is destructive-ish (face login stops working until
             // re-enabled), so it gets the y/n gate.
@@ -6069,7 +6103,10 @@ impl App {
             (SC_PAM, KeyCode::Char('b')) => match crate::bitwarden::tui_state() {
                 Some(crate::bitwarden::TuiState::NeedsSetup) => {
                     self.log('→', "sudo irlume bitwarden setup --apply: installs Bitwarden's polkit action (host-side; the flatpak cannot)");
-                    self.suspend = Some(Suspend::BitwardenSetup);
+                    self.confirm = Some((
+                        "Install Bitwarden's system authentication action? This changes host polkit configuration and requires administrator approval.".into(),
+                        "Install", ConfirmAct::Sus(Suspend::BitwardenSetup),
+                    ));
                 }
                 Some(crate::bitwarden::TuiState::Ready) => {
                     self.log('·', "Bitwarden's polkit action is already installed; enable \"unlock with system authentication\" in its settings")
@@ -6083,7 +6120,10 @@ impl App {
             (SC_SETTINGS, KeyCode::Char('o')) => {
                 use irlume_common::config::FaceSensorPolicy;
                 match self.preference_state().face_sensor_policy.resolve() {
-                    Ok(FaceSensorPolicy::IrOnlyExperimental) => self.suspend = Some(Suspend::FaceSensorPolicy(false)),
+                    Ok(FaceSensorPolicy::IrOnlyExperimental) => self.confirm = Some((
+                        "Restore dual-camera face authentication? This changes the machine-wide sensor policy to use RGB and IR.".into(),
+                        "Restore dual", ConfirmAct::Sus(Suspend::FaceSensorPolicy(false)),
+                    )),
                     Ok(FaceSensorPolicy::Dual) => self.confirm = Some((
                         format!("Enable experimental IR-only? {}", crate::sensor_policy::WARNING),
                         "Enable", ConfirmAct::Sus(Suspend::FaceSensorPolicy(true)),
@@ -6106,13 +6146,15 @@ impl App {
                             ConfirmAct::Sus(Suspend::PrivilegedConsent(false)),
                         ));
                     }
-                    Some(false) => self.suspend = Some(Suspend::PrivilegedConsent(true)),
+                    Some(false) => self.confirm = Some((
+                        "Require confirmation at privileged face prompts? This disables hands-free face authentication for those prompts; the password remains available.".into(),
+                        "Require", ConfirmAct::Sus(Suspend::PrivilegedConsent(true)),
+                    )),
                     None => self.log('·', "Preferences are unavailable. Open Repair to check the daemon, then refresh; no setting was changed."),
                 }
             }
             // Biopolicy gate: enabling changes the security posture (restricts
-            // which services a face may satisfy), so it is confirmed; disabling
-            // just relaxes back to default and goes straight through.
+            // which services a face may satisfy). Both directions need confirmation.
             (SC_SETTINGS, KeyCode::Char('b')) => {
                 if self.preference_state().biopolicy_overridden || std::env::var_os("IRLUME_ENFORCE_BIOPOLICY").is_some() {
                     self.log('·', "An environment override controls biopolicy; remove it before changing the saved setting.");
@@ -6127,7 +6169,10 @@ impl App {
                 };
                 if on {
                     self.log('→', "sudo irlume biopolicy off: relax back to the default (all services may verify)");
-                    self.suspend = Some(Suspend::Biopolicy(false));
+                    self.confirm = Some((
+                        "Disable the biopolicy gate? This relaxes the operation-class restriction for face authentication and keyring release. Password fallback is unchanged.".into(),
+                        "Disable", ConfirmAct::Sus(Suspend::Biopolicy(false)),
+                    ));
                 } else {
                     self.confirm = Some((
                         "Enable the biopolicy gate? Only Login/Elevation may then release the \
@@ -6145,16 +6190,30 @@ impl App {
                 if !on {
                     self.log('·', "debug logging writes per-stage detail (incl. scores) to the journal; press [t] again to turn it off when done");
                 }
-                self.suspend = Some(Suspend::LogsDebug(!on));
+                self.confirm = Some((
+                    if on {
+                        "Turn off daemon debug logging? This changes the system logging configuration."
+                    } else {
+                        "Turn on daemon debug logging? Sensitive match and liveness measurements may be written to the system journal. Turn it off when finished."
+                    }.into(),
+                    if on { "Turn off" } else { "Turn on" },
+                    ConfirmAct::Sus(Suspend::LogsDebug(!on)),
+                ));
             }
             // Origin-aware updater, from the dashboard.
             (SC_WELCOME, KeyCode::Char('u')) => {
                 self.log('→', "irlume update: checks the release feed and updates via the channel this install came from");
-                self.suspend = Some(Suspend::Update);
+                self.confirm = Some((
+                    "Check for and install an Irlume update? This uses the network and may change installed packages. The CLI retains its own update checks.".into(),
+                    "Update", ConfirmAct::Sus(Suspend::Update),
+                ));
             }
             (SC_DONE, KeyCode::Char('u')) => {
                 self.log('→', "irlume update: checks the release feed and updates via the channel this install came from");
-                self.suspend = Some(Suspend::Update);
+                self.confirm = Some((
+                    "Check for and install an Irlume update? This uses the network and may change installed packages. The CLI retains its own update checks.".into(),
+                    "Update", ConfirmAct::Sus(Suspend::Update),
+                ));
             }
             _ => {}
         }
@@ -6171,14 +6230,17 @@ impl App {
         }
         self.log(
             '✗',
-            "irlumed isn't running; starting it now (enrollment continues automatically)",
+            "irlumed isn't running; confirm starting it to continue enrollment",
         );
         self.recompute_visible(); // daemon down ⇒ Repair earns its tab back
         self.screen = SC_REPAIR;
         self.repair_sel = 0; // the Daemon row is always first
         self.repair_reveal.set(true);
         self.resume_enroll = Some(resume);
-        self.suspend = Some(Suspend::RestartDaemon);
+        self.confirm = Some((
+            "Start Irlume and continue enrollment? This enables and restarts the daemon as administrator. Enrollment continues only if the command succeeds and the daemon answers.".into(),
+            "Start", ConfirmAct::Sus(Suspend::RestartDaemon),
+        ));
         false
     }
 
@@ -14083,6 +14145,9 @@ mod tests {
                 assert!(app.confirm.is_some(), "unwire asks first");
                 assert!(app.suspend.is_none());
             } else {
+                if key != 's' {
+                    confirm_suspended_action(&mut app);
+                }
                 assert!(
                     app.suspend.is_some(),
                     "{label} must schedule the existing CLI flow"
@@ -14314,6 +14379,225 @@ mod tests {
         drain_loads(&mut app);
     }
 
+    fn confirmation_app() -> App {
+        let mut app = test_app();
+        app.fp.available = true;
+        app.keyring_policy = Some("Tier 2".into());
+        app.preferences = Some(irlume_common::PreferencesState {
+            face_sensor_policy: irlume_common::config::FaceSensorPolicyObservation::Explicit(
+                irlume_common::config::FaceSensorPolicy::IrOnlyExperimental,
+            ),
+            privileged_face_consent: Some(false),
+            enforce_biopolicy: Some(true),
+            consent_overridden: false,
+            biopolicy_overridden: false,
+            forbid_external_cameras: Some(true),
+        });
+        app
+    }
+
+    fn assert_same_suspend(actual: &Suspend, expected: &Suspend) {
+        assert_eq!(
+            std::mem::discriminant(actual),
+            std::mem::discriminant(expected)
+        );
+        match (actual, expected) {
+            (Suspend::Biopolicy(a), Suspend::Biopolicy(b))
+            | (Suspend::PrivilegedConsent(a), Suspend::PrivilegedConsent(b))
+            | (Suspend::FaceSensorPolicy(a), Suspend::FaceSensorPolicy(b))
+            | (Suspend::LogsDebug(a), Suspend::LogsDebug(b)) => assert_eq!(a, b),
+            _ => {}
+        }
+    }
+
+    fn confirm_suspended_action(app: &mut App) {
+        assert!(app.suspend.is_none(), "the command must not be queued yet");
+        assert!(matches!(app.confirm, Some((_, _, ConfirmAct::Sus(_)))));
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.confirm.is_none());
+    }
+
+    macro_rules! confirms_shortcut {
+        ($name:ident, $screen:expr, $key:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let _guard = dead_socket();
+                let expected = $expected;
+                for cancel in [KeyCode::Esc, KeyCode::Char('n')] {
+                    let mut app = confirmation_app();
+                    app.screen = $screen;
+                    app.on_key(KeyCode::Char($key));
+                    assert!(app.suspend.is_none(), "first activation must only ask");
+                    let (question, verb, act) = app.confirm.as_ref().expect("confirmation");
+                    assert!(!question.is_empty() && !verb.is_empty());
+                    let ConfirmAct::Sus(action) = act else {
+                        panic!("the confirmation must retain the command");
+                    };
+                    assert_same_suspend(action, &expected);
+                    app.on_key(KeyCode::Enter);
+                    assert!(app.suspend.is_none() && app.confirm.is_some());
+                    app.on_key(cancel);
+                    assert!(app.suspend.is_none() && app.confirm.is_none());
+                    app.on_key(KeyCode::Char($key));
+                    assert!(app.suspend.is_none());
+                    app.on_key(KeyCode::Char('y'));
+                    assert_same_suspend(
+                        app.suspend.as_ref().expect("confirmed command"),
+                        &expected,
+                    );
+                    assert!(app.confirm.is_none());
+                    assert!(app.op.is_none() && app.enroll.is_none());
+                }
+            }
+        };
+    }
+
+    confirms_shortcut!(login_shortcut_confirms, SC_PAM, 'w', Suspend::LoginEnable);
+    confirms_shortcut!(
+        overview_login_shortcut_confirms,
+        SC_WELCOME,
+        'w',
+        Suspend::LoginEnable
+    );
+    confirms_shortcut!(
+        completion_login_shortcut_confirms,
+        SC_DONE,
+        'w',
+        Suspend::LoginEnable
+    );
+    confirms_shortcut!(
+        sudo_wiring_shortcut_confirms,
+        SC_PAM,
+        'u',
+        Suspend::LoginEnableSudo
+    );
+    confirms_shortcut!(
+        polkit_wiring_shortcut_confirms,
+        SC_PAM,
+        'p',
+        Suspend::LoginEnablePolkit
+    );
+    confirms_shortcut!(
+        emitter_setup_shortcut_confirms,
+        SC_CAMERAS,
+        's',
+        Suspend::IrSetup
+    );
+    confirms_shortcut!(
+        pcr_policy_shortcut_confirms,
+        SC_KEYRING,
+        'p',
+        Suspend::PcrlockMakePolicy
+    );
+    confirms_shortcut!(
+        fingerprint_add_shortcut_confirms,
+        SC_FINGERPRINT,
+        'a',
+        Suspend::FingerprintAdd
+    );
+    confirms_shortcut!(
+        fingerprint_enable_shortcut_confirms,
+        SC_FINGERPRINT,
+        'e',
+        Suspend::FingerprintEnable
+    );
+    confirms_shortcut!(
+        fingerprint_disable_shortcut_confirms,
+        SC_FINGERPRINT,
+        'd',
+        Suspend::FingerprintDisable
+    );
+    confirms_shortcut!(
+        biopolicy_disable_shortcut_confirms,
+        SC_SETTINGS,
+        'b',
+        Suspend::Biopolicy(false)
+    );
+    confirms_shortcut!(
+        dual_sensor_shortcut_confirms,
+        SC_SETTINGS,
+        'o',
+        Suspend::FaceSensorPolicy(false)
+    );
+    confirms_shortcut!(
+        consent_required_shortcut_confirms,
+        SC_SETTINGS,
+        'p',
+        Suspend::PrivilegedConsent(true)
+    );
+    confirms_shortcut!(
+        debug_logging_shortcut_confirms,
+        SC_REPAIR,
+        't',
+        Suspend::LogsDebug(!crate::logs::debug_active())
+    );
+    confirms_shortcut!(
+        overview_update_shortcut_confirms,
+        SC_WELCOME,
+        'u',
+        Suspend::Update
+    );
+    confirms_shortcut!(
+        completion_update_shortcut_confirms,
+        SC_DONE,
+        'u',
+        Suspend::Update
+    );
+    confirms_shortcut!(
+        privileged_logs_shortcut_confirms,
+        SC_REPAIR,
+        'w',
+        Suspend::Logs
+    );
+    confirms_shortcut!(
+        liveness_shortcut_confirms,
+        SC_REPAIR,
+        'l',
+        Suspend::SelfTestLiveness
+    );
+    confirms_shortcut!(
+        support_report_shortcut_confirms,
+        SC_REPAIR,
+        's',
+        Suspend::SupportReport
+    );
+
+    #[test]
+    fn daemon_start_confirmation_cancellation_clears_parked_enrollment() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('e'));
+        assert!(app.suspend.is_none());
+        assert!(matches!(
+            app.confirm,
+            Some((_, _, ConfirmAct::Sus(Suspend::RestartDaemon)))
+        ));
+        assert!(matches!(app.resume_enroll, Some(ResumeEnroll::New)));
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none() && app.suspend.is_none() && app.resume_enroll.is_none());
+        app.screen = SC_PROFILES;
+        app.on_key(KeyCode::Char('e'));
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(app.suspend, Some(Suspend::RestartDaemon)));
+        assert!(matches!(app.resume_enroll, Some(ResumeEnroll::New)));
+    }
+
+    #[test]
+    fn read_only_shortcuts_remain_direct() {
+        for (screen, key, expected) in [
+            (SC_PAM, 's', Suspend::LoginStatus),
+            (SC_REPAIR, 'd', Suspend::Doctor),
+            (SC_REPAIR, 'a', Suspend::Diag),
+            (SC_FINGERPRINT, 't', Suspend::FingerprintVerify),
+        ] {
+            let mut app = confirmation_app();
+            app.screen = screen;
+            app.on_key(KeyCode::Char(key));
+            assert!(app.confirm.is_none());
+            assert_same_suspend(app.suspend.as_ref().expect("read-only command"), &expected);
+        }
+    }
+
     #[test]
     fn parity_keys_route_to_the_right_actions() {
         // The new per-screen actions: keys must set the right suspend/confirm,
@@ -14337,9 +14621,11 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_PAM;
         app.on_key(KeyCode::Char('u'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::LoginEnableSudo)));
         app.suspend = None;
         app.on_key(KeyCode::Char('p'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::LoginEnablePolkit)));
         app.suspend = None;
         // Un-wire: confirm first, nothing suspended yet; [y] flips it over.
@@ -14373,10 +14659,12 @@ mod tests {
         // Repair debug toggle and Done updater.
         app.screen = SC_REPAIR;
         app.on_key(KeyCode::Char('t'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::LogsDebug(_))));
         app.suspend = None;
         app.screen = SC_DONE;
         app.on_key(KeyCode::Char('u'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::Update)));
         app.suspend = None;
 
@@ -14839,6 +15127,7 @@ mod tests {
         assert!(app.suspend.is_none(), "[v] must not open the logs view");
         app.screen = SC_REPAIR;
         app.on_key(KeyCode::Char('w'));
+        confirm_suspended_action(&mut app);
         assert!(
             matches!(app.suspend, Some(Suspend::Logs)),
             "the advertised logs key must actually reach the Repair action"
@@ -15883,6 +16172,7 @@ mod tests {
         assert_eq!(app.screen, SC_REPAIR, "a down daemon routes to Repair");
         assert_eq!(app.repair_sel, 0, "the Daemon row is selected");
         assert!(matches!(app.resume_enroll, Some(ResumeEnroll::New)));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::RestartDaemon)));
         assert!(
             app.input.is_none(),
@@ -16773,6 +17063,7 @@ mod tests {
         assert!(msg.contains("no fingerprint reader"), "got: {msg}");
         app.fp.available = true;
         app.on_key(KeyCode::Char('a'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::FingerprintAdd)));
     }
 
@@ -16781,6 +17072,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_PAM;
         app.on_key(KeyCode::Char('w'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::LoginEnable)));
         assert!(
             app.activity
@@ -16795,6 +17087,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_DONE;
         app.on_key(KeyCode::Char('w'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::LoginEnable)));
     }
 
@@ -17504,6 +17797,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_CAMERAS;
         app.on_key(KeyCode::Char('s'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::IrSetup)));
         app.suspend = None;
         // [t] routes capture tuning to sudo (#170: previously no TUI route),
@@ -17552,6 +17846,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_REPAIR;
         app.on_key(KeyCode::Char('l'));
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::SelfTestLiveness)));
         assert!(app.op.is_none() && app.error.is_none());
     }
@@ -17605,6 +17900,7 @@ mod tests {
 
         app.on_key(KeyCode::Char('s'));
 
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::SupportReport)));
         let source = include_str!("tui.rs");
         let branch = source
@@ -17784,6 +18080,7 @@ mod tests {
             matches!(app.resume_enroll, Some(ResumeEnroll::Named(ref n)) if n == "zed"),
             "the typed name must survive the daemon fix"
         );
+        confirm_suspended_action(&mut app);
         assert!(matches!(app.suspend, Some(Suspend::RestartDaemon)));
     }
 
@@ -23972,9 +24269,10 @@ mod tests {
         std::fs::write(dir.join("settings.conf"), "privileged_face_consent=0\n").unwrap();
         app.preferences = Some(irlume_common::PreferencesState::observe());
         app.on_key(KeyCode::Char('p'));
+        confirm_suspended_action(&mut app);
         assert!(
             app.confirm.is_none() && matches!(app.suspend, Some(Suspend::PrivilegedConsent(true))),
-            "restoring confirmation is direct"
+            "restoring confirmation uses the same explicit approval"
         );
         app.suspend = None;
         std::fs::remove_file(dir.join("settings.conf")).unwrap();
@@ -24481,6 +24779,7 @@ mod tests {
             } else {
                 app.on_key(KeyCode::Char('o'));
             }
+            confirm_suspended_action(&mut app);
             assert!(matches!(
                 app.suspend,
                 Some(Suspend::FaceSensorPolicy(false))

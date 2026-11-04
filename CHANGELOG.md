@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- TUI shortcuts ask for confirmation before writes or administrator commands,
+  including login wiring, fingerprint setup, policy changes and diagnostics.
+  Cancelling daemon startup also cancels its queued enrollment (ADR-0030 §1.1).
+
 - Fingerprint coverage and the `--fingerprint-only` guard read PAM type and
   control fields with the shared parser, including case-insensitive and
   bracketed forms. Sudo fingerprint warnings follow only authentication

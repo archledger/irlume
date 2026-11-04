@@ -341,6 +341,16 @@ page's actions. The whole page scrolls with the mouse wheel, and moving the
 selection brings the selected check into view. Pending system checks are
 labeled, and an unavailable automatic fix does not imply a pass.
 
+The coexistence wiring check distinguishes face-authentication rules from
+keyring delivery and password resealing. It reports both methods configured
+only with current camera and enrollment observations; login surfaces can
+still differ. Unknown enrollment is not treated as empty, and unreadable PAM
+wiring does not trigger rewiring advice. Automatic mode does
+not require adding face enrollment to a fingerprint-only machine.
+Wiring observations read an existing administrator override first, otherwise
+the vendor stack. An unreadable or dangling override remains unknown rather
+than borrowing the vendor's policy.
+
 **Fix Selected Issue** (`f`, or a click on the fix's action row) starts the
 appropriate existing workflow, and a fix that runs as root asks first. A daemon
 that is loading models or denying this account access is not offered a restart

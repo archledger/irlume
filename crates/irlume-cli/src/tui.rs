@@ -1040,6 +1040,8 @@ struct Probes {
     /// read from each stack's authentication mode as `login status` reads
     /// it: a greeter holding only irlume's reseal lines is not wired.
     login_wired: bool,
+    /// Face rules excluding keyring/reseal; None means wiring is unobserved.
+    face_login_wired: Option<bool>,
     /// irlume's module is in at least one login surface's stack, reseal
     /// lines alone included. Those lines reach the daemon at login too, so
     /// the SELinux row goes by this rather than by `login_wired`.
@@ -1201,6 +1203,7 @@ impl Probes {
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains("irlume_runtime_t"))
                 .unwrap_or(false),
             login_wired: crate::pamwire::login_wired_by_mode(),
+            face_login_wired: crate::pamwire::face_login_wired_by_mode(),
             login_module_present: crate::pamwire::login_wired(),
             fp_keyring_wired: crate::pamwire::fp_keyring_wired(),
             tpm_present: crate::tpm_device().is_some(),
@@ -3414,17 +3417,60 @@ impl App {
                     }
                 }
             }
-            // Coexistence is the intended state since 0.5.0: `both` (explicit)
-            // and `auto` (hardware-led) both mean "unlock with face OR
-            // fingerprint", so a reader wired alongside face is CORRECT, not a
-            // misconfiguration. Report it as healthy.
-            "both" | "auto" if fprintd_wired && enrolled && self.fp.available => {
-                v.push(mk(
-                    "Method wiring",
-                    Sev::Ok,
-                    "face + fingerprint both wired; unlock with either".into(),
-                    Fix::None,
-                ));
+            // Explicit coexistence needs both enrollments and face rules, not
+            // just a keyring landing marker. Auto does not require adding face
+            // enrollment to a fingerprint-only machine.
+            "both" | "auto"
+                if fprintd_wired && self.fp.available && (enrolled || self.fp.method == "both") =>
+            {
+                let face_camera = self.face_camera_presence();
+                let (sev, detail, fix) = if !self.source_usable(Source::FingerprintReader)
+                    || !self.source_usable(Source::Fingerprint)
+                    || !self.source_usable(Source::Profiles)
+                    || !self.profiles_loaded
+                    || self.enroll_error.is_some()
+                {
+                    (
+                        Sev::Unknown,
+                        "face or fingerprint enrollment is unavailable",
+                        Fix::None,
+                    )
+                } else if face_camera.is_none() {
+                    (
+                        Sev::Unknown,
+                        "face camera availability is unobserved",
+                        Fix::None,
+                    )
+                } else if face_camera == Some(false) {
+                    (
+                        Sev::Warn,
+                        "face camera is disconnected; fingerprint remains separate",
+                        Fix::None,
+                    )
+                } else if self.probes.face_login_wired.is_none() {
+                    (Sev::Unknown, "face login wiring is unavailable", Fix::None)
+                } else if self.probes.face_login_wired == Some(false) {
+                    (
+                        Sev::Warn,
+                        "face authentication is not wired for login or unlock",
+                        Fix::Root(RootFix::LoginEnable),
+                    )
+                } else if !enrolled {
+                    (
+                        Sev::Warn,
+                        "no face is enrolled for this account",
+                        Fix::Goto(GotoFix::Enroll),
+                    )
+                } else if self.fp.enrolled.is_empty() {
+                    (
+                        Sev::Warn,
+                        "no finger is enrolled for this account",
+                        Fix::Root(RootFix::FingerprintAdd),
+                    )
+                } else {
+                    (Sev::Ok, "face + fingerprint wiring and enrollment observed; login surfaces may differ", Fix::None)
+                };
+                v.push(mk("Method wiring", sev, detail.into(), fix));
             }
             // An EXPLICIT face-only method with a reader still wired: not harmful
             // (the fingerprint just works too), but it contradicts the chosen
@@ -12141,6 +12187,7 @@ mod tests {
     include!("tui/visual_tests.rs");
     include!("tui/live_tests.rs");
     include!("tui/reader_claim_tests.rs");
+    include!("tui/coexistence_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,

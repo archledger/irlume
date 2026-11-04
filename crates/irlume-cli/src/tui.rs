@@ -8679,7 +8679,7 @@ impl App {
                     let stale = matches!(role, CameraRole::Secondary(index)
                         if self.camera_groups.get(index - 1).is_some_and(|group| group.stale));
                     let no_usable_scans = self.no_usable_scans_for(role);
-                    ListItem::new(Line::from(vec![
+                    let line = Line::from(vec![
                         Span::styled(
                             if active { " ● " } else { " ○ " },
                             Style::new().fg(if active { th().ok } else { Color::Reset }),
@@ -8735,7 +8735,8 @@ impl App {
                         } else {
                             Span::styled("ready", Style::new().fg(th().ok))
                         },
-                    ]))
+                    ]);
+                    ListItem::new(clip_line(line, usize::from(area.width)))
                 })
                 .collect()
         };
@@ -12202,6 +12203,7 @@ mod tests {
     include!("tui/reader_claim_tests.rs");
     include!("tui/coexistence_tests.rs");
     include!("tui/bitwarden_action_tests.rs");
+    include!("tui/camera_layout_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,

@@ -96,8 +96,9 @@ selected camera's from 142, where its rows keep room for their status. Enter
 still opens the full details on the page itself, in place on Diagnostics and as
 a panel with the camera's actions below the list on Cameras: the readable copy
 on a short window, where a details column that does not fit ends in an
-ellipsis. Narrower terminals have only the Enter details. `r` on a page
-refreshes only what that page shows.
+ellipsis. Camera list rows also end in an ellipsis when the name, role and
+status do not fit; Enter retains the full details. Narrower terminals have
+only the Enter details. `r` on a page refreshes only what that page shows.
 
 ## Overview
 

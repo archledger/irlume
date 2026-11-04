@@ -215,6 +215,11 @@ sudo irlume logs debug off
 Unlike `irlume trace`, that switch installs a systemd drop-in, restarts the
 daemon, and stays enabled until explicitly turned off.
 
+`irlume logs debug status` reports whether the drop-in is present. If the
+caller cannot inspect it, the command reports `unknown` and exits nonzero;
+use `sudo irlume logs debug status` to inspect it with elevated permissions.
+An unreadable setting is not reported as off.
+
 Both toggle commands reapply the setting to a running daemon, including an
 `off` retry after the drop-in was already removed. They can interrupt an
 active request. A daemon that systemd reports as inactive is not pinged; the

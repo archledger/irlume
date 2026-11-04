@@ -203,7 +203,14 @@ fn failure_hint(argv: &[String]) -> Option<String> {
 fn debug(action: Option<&str>) -> ExitCode {
     match action {
         None | Some("status") => {
-            let on = Path::new(DROPIN).exists();
+            let on = match debug_state() {
+                Some(on) => on,
+                None => {
+                    println!("[logs] daemon diagnostic tracing: unknown");
+                    println!("[logs] cannot inspect the tracing drop-in; check with: sudo irlume logs debug status");
+                    return ExitCode::FAILURE;
+                }
+            };
             println!(
                 "[logs] daemon diagnostic tracing: {}",
                 if on { "ON (drop-in present)" } else { "off" }

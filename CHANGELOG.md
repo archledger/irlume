@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Debug-log status reports an unreadable setting as unknown, not off, and
+  names the elevated status check instead of offering to enable tracing
+  (ADR-0008, existing debug mode).
+
 - Debug-log toggles report application failures instead of success, retain
   the saved setting with retry guidance, and reapply an explicit disable even
   when its drop-in is already absent. A daemon reported inactive is not pinged

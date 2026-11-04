@@ -29,6 +29,8 @@ use irlume_common::{ProfileSummary, Request, Response};
 
 #[path = "cli_dispatch/logs_debug.rs"]
 mod logs_debug;
+#[path = "cli_dispatch/logs_status.rs"]
+mod logs_status;
 mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");

@@ -227,10 +227,12 @@ pub fn request(req: &Request) -> io::Result<Response> {
     request_with_timeout(req, DEFAULT_RW_TIMEOUT)
 }
 
-/// Send a request while allowing a guided operation to cancel its reply wait.
+/// Send a request while allowing a guided operation to cancel.
 ///
 /// Dropping the connection informs the daemon to cancel its pending approval
 /// or capture. The flag is checked at least once per 100 ms socket-read slice.
+/// It is also checked before connecting and writing the request. Cancellation
+/// after a write starts does not guarantee that the daemon has not acted.
 ///
 /// # Errors
 /// Returns transport/decoding errors, `ConnectionAborted` on cancellation, or
@@ -320,8 +322,11 @@ pub fn enrollment_session(
             "expected enrollment session",
         ));
     }
+    check_cancellation(Some(cancelled))?;
     let stream = connect_stream(Duration::from_millis(100))?;
-    (&stream).write_all(&serialize_request(req)?)?;
+    let line = serialize_request(req)?;
+    check_cancellation(Some(cancelled))?;
+    (&stream).write_all(&line)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(380);
     let reader = CancellableReply {
         stream: &stream,
@@ -469,6 +474,7 @@ fn request_with_timeouts_inner(
     cancelled: Option<&std::sync::atomic::AtomicBool>,
     observation_deadline: Option<std::time::Instant>,
 ) -> io::Result<Response> {
+    check_cancellation(cancelled)?;
     let stream =
         connect_with_timeout(&socket_path(), connect_timeout).map_err(map_connect_failure)?;
     stream.set_read_timeout(Some(rw_timeout))?;
@@ -485,6 +491,7 @@ fn request_with_timeouts_inner(
     // wiped after the writes: either one returns early, and the buffer holding
     // the serialized password would have been freed unwiped on exactly the
     // path the comment above says happens in the field.
+    check_cancellation(cancelled)?;
     if let Some(deadline) = observation_deadline {
         let mut pending = line.as_slice();
         while !pending.is_empty() {
@@ -550,14 +557,19 @@ struct CancellableReply<'a> {
     deadline: std::time::Instant,
 }
 
+fn check_cancellation(cancelled: Option<&std::sync::atomic::AtomicBool>) -> io::Result<()> {
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "request cancelled",
+        ));
+    }
+    Ok(())
+}
+
 impl CancellableReply<'_> {
     fn check(&self) -> io::Result<()> {
-        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "request cancelled",
-            ));
-        }
+        check_cancellation(Some(self.cancelled))?;
         if std::time::Instant::now() >= self.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -746,6 +758,58 @@ mod tests {
             matches!(result, Err(ref error) if error.kind() == io::ErrorKind::TimedOut),
             "trickled reply must expire, got {result:?}"
         );
+    }
+
+    #[test]
+    fn cancelled_enrollment_requests_do_not_connect() {
+        let _guard = testenv::lock();
+        let path = sock("cancelled-dispatch");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let requests = [
+            Request::Enroll {
+                user: "alice".into(),
+                profile: Some("main".into()),
+                scans: Some(1),
+                reset: false,
+            },
+            Request::AddScan {
+                user: "alice".into(),
+                profile: "main".into(),
+                scans: None,
+                report_enrollment: true,
+            },
+            Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: Some("main".into()),
+                scans: 1,
+                improve: false,
+            },
+        ];
+        let results: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                let result = if matches!(request, Request::EnrollmentSession { .. }) {
+                    enrollment_session(request, &cancelled, |_| {
+                        panic!("cancelled request emitted an event")
+                    })
+                } else {
+                    request_cancellable(request, Duration::from_secs(1), &cancelled)
+                };
+                (result, listener.accept())
+            })
+            .collect();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        for (result, connection) in results {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+            assert!(
+                matches!(connection, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                "an already-cancelled enrollment connected to the daemon"
+            );
+        }
     }
 
     #[test]

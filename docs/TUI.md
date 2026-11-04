@@ -346,6 +346,9 @@ appropriate existing workflow, and a fix that runs as root asks first. A daemon
 that is loading models or denying this account access is not offered a restart
 from the Cameras row. Access-denied inspection opens the read-only SELinux
 status action. Fingerprint-only wiring repair preserves the selected method.
+An observed fingerprint-reader claim error keeps its diagnosis and restart
+action even if the enrollment list is unavailable. The list remains unknown;
+restarting requires confirmation and interrupts active fingerprint sessions.
 Wallet connection and PCR resealing open Password Wallet's guided flows.
 Missing template keys offer Recovery Restore when a recovery backup is present;
 without a backup, the diagnosis explains the need to re-enroll. The CLI's

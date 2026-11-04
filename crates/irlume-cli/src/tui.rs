@@ -1030,7 +1030,7 @@ struct Probes {
     fp: FpInfo,
     pam_cache: PamCache,
     fp_coverage: Vec<(&'static str, &'static str, bool)>,
-    /// The reader is claimed by a stale fprintd session (prompts fail silently).
+    /// A reader listing reported a claim error; the owning session may be active.
     reader_stuck: bool,
     /// SELinux is enforcing this boot.
     selinux_enforcing: bool,
@@ -3306,9 +3306,18 @@ impl App {
                 ));
             }
         }
-        // Fingerprint reader health: a crashed/aborted enrollment leaves the
-        // device CLAIMED and pam_fprintd fails silently (no finger prompt).
+        // A positive claim error is independent of the enrollment list. The
+        // same error can prevent listing, so retain both observations.
         if self.fp.available && self.source_usable(Source::FingerprintReader) {
+            if self.probes.reader_stuck {
+                v.push(mk(
+                    "Fingerprint reader",
+                    Sev::Fail,
+                    "reader reported a claim error; another fingerprint session may be using it"
+                        .into(),
+                    Fix::Root(RootFix::RestartFprintd),
+                ));
+            }
             if !self.source_usable(Source::Fingerprint) {
                 v.push(mk(
                     "Fingerprint enrollment",
@@ -3316,14 +3325,7 @@ impl App {
                     "reader observed; enrollment list unavailable".into(),
                     Fix::None,
                 ));
-            } else if self.probes.reader_stuck {
-                v.push(mk(
-                    "Fingerprint reader",
-                    Sev::Fail,
-                    "reader is claimed by a stale session; finger prompts fail silently".into(),
-                    Fix::Root(RootFix::RestartFprintd),
-                ));
-            } else {
+            } else if !self.probes.reader_stuck {
                 v.push(mk(
                     "Fingerprint reader",
                     Sev::Ok,
@@ -3718,7 +3720,7 @@ impl App {
                         Suspend::RestartDaemon,
                     ),
                     RootFix::RestartFprintd => (
-                        "sudo sh -c 'systemctl restart fprintd || pkill fprintd' (releases a stale reader claim; stops the process if the unit will not restart)",
+                        "sudo sh -c 'systemctl restart fprintd || pkill fprintd' (interrupts fingerprint sessions; stops the process if the unit will not restart)",
                         Suspend::RestartFprintd,
                     ),
                     RootFix::LoginEnable => (
@@ -4933,10 +4935,10 @@ impl App {
                     "systemctl enable irlumed; systemctl restart irlumed",
                 ],
             ),
-            // A stale device claim (crashed/aborted enrollment) makes pam_fprintd
-            // fail silently; restarting fprintd releases it.
+            // Restarting may clear a claim error, but also interrupts active
+            // fingerprint sessions. The confirmation explains that effect.
             Suspend::RestartFprintd => self.sudo_step(
-                "restart fprintd (release a stale reader claim)",
+                "restart fprintd (interrupt fingerprint sessions)",
                 &[
                     "sh",
                     "-c",
@@ -12138,6 +12140,7 @@ mod tests {
     use super::*;
     include!("tui/visual_tests.rs");
     include!("tui/live_tests.rs");
+    include!("tui/reader_claim_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,

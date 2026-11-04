@@ -325,6 +325,14 @@ down or refuses this account, Diagnostics (`6`), whose Daemon check carries
 the fix. F6 reaches these actions while the row is shown, before the page's
 own actions.
 
+## Login & Apps
+
+On Login & Apps, Bitwarden setup appears in the page, help and F6 action walk
+only after a background observation finds an installation missing its system
+authentication action. An absent, already configured, Snap-managed or still
+unobserved installation does not offer that setup action. Activation checks
+the current host state again before asking for administrator confirmation.
+
 ## Diagnostics
 
 The page opens with the number of passed, warning, failed and unknown checks,

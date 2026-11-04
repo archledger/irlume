@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Login & Apps offers Bitwarden setup in its action rows, help and keyboard
+  focus only when the background observation reports that setup is needed
+  (ADR-0030 section 1.4).
+
 - Diagnostics checks face-authentication wiring and current enrollment before
   reporting face and fingerprint coexistence. Keyring-only rules do not count
   as face wiring, vendor-only stacks are read from their actual source, and

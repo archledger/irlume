@@ -9983,6 +9983,15 @@ impl App {
         self.draw_page_paragraph(f, area, lines, &targets, reveal);
     }
 
+    /// Shared by the body, help and F6; never probes the host while drawing.
+    fn bitwarden_setup_needed(&self) -> bool {
+        self.heavy_known
+            && matches!(
+                self.heavy.as_ref(),
+                Some(crate::bitwarden::TuiState::NeedsSetup)
+            )
+    }
+
     fn draw_pam(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
         let mut lines = vec![
@@ -10145,10 +10154,7 @@ impl App {
                 Style::new().dim(),
             )));
         }
-        if matches!(
-            self.heavy.clone(),
-            Some(crate::bitwarden::TuiState::NeedsSetup)
-        ) {
+        if self.bitwarden_setup_needed() {
             push_page_action(
                 &mut lines,
                 &mut page_actions,
@@ -10606,11 +10612,18 @@ impl App {
                 ("d", "Disable…"),
                 ("x", "Reset…"),
             ],
-            SC_PAM => &[
+            SC_PAM if self.bitwarden_setup_needed() => &[
                 ("w", "Connect Login…"),
                 ("u", "Configure Sudo…"),
                 ("p", "Configure App Prompts…"),
                 ("b", "Configure App Unlock…"),
+                ("x", "Disconnect…"),
+                ("s", "Show Status"),
+            ],
+            SC_PAM => &[
+                ("w", "Connect Login…"),
+                ("u", "Configure Sudo…"),
+                ("p", "Configure App Prompts…"),
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
@@ -12188,6 +12201,7 @@ mod tests {
     include!("tui/live_tests.rs");
     include!("tui/reader_claim_tests.rs");
     include!("tui/coexistence_tests.rs");
+    include!("tui/bitwarden_action_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,

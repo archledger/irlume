@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use irlume_common::{ProfileSummary, Request, Response};
 
+#[path = "cli_dispatch/logs_debug.rs"]
+mod logs_debug;
 mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");

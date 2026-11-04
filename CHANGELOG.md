@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Debug-log toggles report application failures instead of success, retain
+  the saved setting with retry guidance, and reapply an explicit disable even
+  when its drop-in is already absent. A daemon reported inactive is not pinged
+  through its activation socket (ADR-0008, existing debug mode).
+
 - Enrollment stops guidance and skips new capture requests when cancellation
   arrives during framing or the countdown, including the older-daemon fallback.
   Cancellable enrollment requests recheck cancellation before writing to the

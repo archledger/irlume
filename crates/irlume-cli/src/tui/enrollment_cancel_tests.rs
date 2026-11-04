@@ -114,13 +114,18 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
             let mut requests = Vec::new();
             let mut samples = 0;
             let mut session_requests = 0;
+            let mut finished_observed = false;
             loop {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if finished.load(Ordering::Relaxed) {
+                        // Observe completion before the final accept attempt:
+                        // a cancelled client can enqueue and return without
+                        // waiting for this server to consume its request.
+                        if finished_observed {
                             break;
                         }
+                        finished_observed = finished.load(Ordering::Relaxed);
                         assert!(Instant::now() < deadline, "enrollment worker stalled");
                         std::thread::sleep(Duration::from_millis(5));
                         continue;

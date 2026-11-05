@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Managed concurrent capture reports each role's timing at its callback
+  endpoint, including returned cancellation and deadline errors, instead of
+  shifting or losing events after the pair finishes (ADR-0008).
+
 - Native continuity evidence validation uses the producer's discard counts:
   RGB warm-up stays inside single-stream fills and IR pays a five-frame
   startup flush. Concurrent validation also includes RGB warm-up and IR's

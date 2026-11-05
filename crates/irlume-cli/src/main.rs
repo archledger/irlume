@@ -28,6 +28,9 @@ mod gkr_session;
 mod logintx;
 mod logs;
 mod machine;
+mod measurement_records;
+#[cfg(test)]
+mod measurement_report_tests;
 mod models;
 mod nixos;
 mod os_release;
@@ -1175,7 +1178,7 @@ fn measurement_drift_report(
 }
 
 fn camera_tune(args: &[String]) -> std::process::ExitCode {
-    use irlume_common::Request;
+    use irlume_common::{Request, Response};
     // Same rule as `enroll --scans`: this command fires the IR emitter for up to
     // a minute, so an unparseable count is a usage error rather than a silent
     // substitution of the default round count.
@@ -1209,21 +1212,26 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
         }
         Some(raw) => Some(raw.to_string()),
     };
-    if let Some(reference_path) = &verify_record_path {
-        if let Ok(text) = std::fs::read_to_string(reference_path) {
-            if let Ok(records) =
-                serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(&text)
-            {
-                if let Some((_, first)) = records.iter().find_map(|r| {
-                    r.rates.first().map(|(role, evidence)| {
-                        let _ = role;
-                        (r, evidence)
-                    })
-                }) {
-                    rounds = Some(first.rounds_completed.max(1) as usize);
-                }
-            }
+    if verify_record_path.is_some() && flag_present(args, "--emit-record") {
+        eprintln!("[camera-tune] --emit-record and --verify-record cannot be combined");
+        return std::process::ExitCode::from(2);
+    }
+    let reference_records = match verify_record_path
+        .as_deref()
+        .map(measurement_records::read_reference)
+        .transpose()
+    {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("[camera-tune] invalid reference: {error}");
+            return std::process::ExitCode::from(2);
         }
+    };
+    if let Some(first) = reference_records
+        .as_ref()
+        .and_then(|records| records.iter().find_map(|r| r.rates.first()))
+    {
+        rounds = Some(first.1.rounds_completed.max(1) as usize);
     }
     // ADR-0023 evidence emission: asks the daemon to write the completed
     // arms' measurement records as a JSON artifact. An unparseable or
@@ -1238,66 +1246,71 @@ fn camera_tune(args: &[String]) -> std::process::ExitCode {
             eprintln!("[camera-tune] --emit-record requires a file path");
             return std::process::ExitCode::from(2);
         }
-        Some(raw) => Some(raw.to_string()),
+        Some(raw) => match measurement_records::output_path(raw) {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("[camera-tune] invalid output: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        },
+    };
+    let mut fresh = if reference_records.is_some() {
+        match measurement_records::FreshArtifact::create() {
+            Ok(output) => Some(output),
+            Err(error) => {
+                eprintln!("[camera-tune] cannot prepare fresh evidence: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let output_path = match fresh.as_ref().map(|output| output.path()).transpose() {
+        Ok(path) => path.or(emit_record_path),
+        Err(error) => {
+            eprintln!("[camera-tune] cannot prepare fresh evidence: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     eprintln!(
         "[camera-tune] measuring this camera under load; it fires the IR emitter \
          for up to a minute…"
     );
-    let fresh_path = verify_record_path.as_ref().map(|_| {
-        std::env::temp_dir().join(format!("irlume-verify-record-{}.json", std::process::id()))
+    let response = daemon_request(&Request::TuneCaptureMode {
+        rounds,
+        emit_record_path: output_path,
     });
-    let result = report_ok_response(
-        "camera-tune",
-        daemon_request(&Request::TuneCaptureMode {
-            rounds,
-            emit_record_path: fresh_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .or(emit_record_path),
-        }),
-    );
+    let success = matches!(&response, Ok(Response::Ok(_)));
+    let mut result = report_ok_response("camera-tune", response);
     if let Some(path) = flag(args, "--emit-record") {
         eprintln!(
             "[camera-tune] {path} is MEASUREMENT EVIDENCE, not a camera profile; \
              attach it to the PR that contributes this camera's tuning"
         );
     }
-    if let (Some(reference_path), Some(fresh)) = (verify_record_path.as_ref(), fresh_path.as_ref())
-    {
-        let reference_text = match std::fs::read_to_string(reference_path) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("[camera-tune] cannot read {reference_path}: {error}");
-                return result;
-            }
-        };
-        let fresh_text = match std::fs::read_to_string(fresh) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!(
-                    "[camera-tune] no fresh artifact at {}: {error}",
-                    fresh.display()
-                );
-                return result;
-            }
-        };
-        let _ = std::fs::remove_file(fresh);
-        match (
-            serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(
-                &reference_text,
-            ),
-            serde_json::from_str::<Vec<irlume_camera::measurement::MeasurementRecord>>(&fresh_text),
-        ) {
-            (Ok(reference), Ok(fresh_records)) => {
-                eprintln!("[camera-tune] drift vs {reference_path}:");
-                for line in measurement_drift_report(&reference, &fresh_records) {
-                    eprintln!("[camera-tune]   {line}");
+    if success {
+        if let (Some(reference), Some(output)) = (reference_records.as_ref(), fresh.as_mut()) {
+            match output.read() {
+                Ok(records) => {
+                    eprintln!(
+                        "[camera-tune] drift vs {}:",
+                        verify_record_path.as_deref().unwrap_or_default()
+                    );
+                    for line in measurement_drift_report(reference, &records) {
+                        eprintln!("[camera-tune]   {line}");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[camera-tune] invalid fresh evidence after tuning: {error}");
+                    result = std::process::ExitCode::FAILURE;
                 }
             }
-            (Err(error), _) | (_, Err(error)) => {
-                eprintln!("[camera-tune] artifact parse failed: {error}");
-            }
+        }
+    }
+    if let Some(output) = fresh {
+        if let Err(error) = output.finish() {
+            eprintln!("[camera-tune] {error}");
+            result = std::process::ExitCode::FAILURE;
         }
     }
     result

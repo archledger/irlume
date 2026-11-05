@@ -31,6 +31,8 @@ use irlume_common::{ProfileSummary, Request, Response};
 mod logs_debug;
 #[path = "cli_dispatch/logs_status.rs"]
 mod logs_status;
+#[path = "cli_dispatch/measurement_records.rs"]
+mod measurement_records;
 mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_irlume");
@@ -351,20 +353,32 @@ fn measurement_report_compare(
     let seen = requests.clone();
     let output = std::sync::Arc::new(std::sync::Mutex::new(None));
     let emitted = output.clone();
+    let state = sb.path("state");
     serve(&sb.sock(), move |request| match request {
         Request::TuneCaptureMode {
             emit_record_path: Some(path),
             ..
         } => {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *emitted.lock().unwrap() = Some(PathBuf::from(path));
-            std::fs::write(path, &fresh).unwrap();
+            let path = measurement_records::disk_path(&state, Path::new(path));
+            *emitted.lock().unwrap() = Some(path.clone());
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.write_all(fresh.as_bytes()).unwrap();
             Response::Ok("synthetic measurement".into())
         }
         _ => Response::Error("unexpected synthetic request".into()),
     });
     let (code, _, error) = run(
-        &mut sb.cmd(&["camera-tune", "--verify-record", path.to_str().unwrap()]),
+        &mut measurement_records::command(
+            &sb,
+            &["camera-tune", "--verify-record", path.to_str().unwrap()],
+        ),
         "measurement report comparison",
     );
     assert_eq!(code, 0, "{error}");
@@ -430,19 +444,25 @@ fn measurement_report_marks_contradictory_success_on_either_side() {
 }
 
 #[test]
-fn measurement_report_marks_invalid_success_as_inconsistent() {
-    let good = measurement_report_record(true, Some(25_000));
-    let mut invalid = good.clone();
+fn measurement_report_rejects_unsupported_reference_before_tuning() {
+    let sb = Sandbox::new("unsupported-measurement-reference");
+    let mut invalid = measurement_report_record(true, Some(25_000));
     invalid.schema_version += 1;
     assert!(invalid.evaluate_acceptance().is_err());
-    let reference =
-        measurement_report_compare("measure-invalid-ref", invalid.clone(), good.clone());
-    assert!(
-        reference.contains("accepted inconsistent -> true"),
-        "{reference}"
+    let path = sb.path("work/reference.json");
+    std::fs::write(&path, serde_json::to_vec(&[invalid]).unwrap()).unwrap();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    serve(&sb.sock(), move |_| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Response::Error("must not tune".into())
+    });
+    let (code, _, error) = run(
+        &mut sb.cmd(&["camera-tune", "--verify-record", path.to_str().unwrap()]),
+        "unsupported reference",
     );
-    let fresh = measurement_report_compare("measure-invalid-fresh", good, invalid);
-    assert!(fresh.contains("accepted true -> inconsistent"), "{fresh}");
+    assert_eq!(code, 2, "{error}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]

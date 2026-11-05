@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAD reports leave ACER unavailable when no bona-fide baseline was measured,
+  rather than treating the missing error rate as zero. Reports with both
+  attack and bona-fide presentations keep the existing calculation.
+
 - `padcapture` stops prompted capture on input EOF and returns failure on an
   input read error, rather than treating either as permission to take another
   sample. Previously appended records are kept; `--no-prompt` remains explicit.

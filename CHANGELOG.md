@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Rate-probe escalation counts every dequeue attempt against its existing
+  fill budget, so corrupt buffers cannot extend single or paired probes
+  without bound. Rate floors and full-fill fallback are unchanged (ADR-0021).
+
 - Stream restoration confirms the displaced control value after an
   acknowledged write. Failed or mismatched readback keeps the recovery
   record claimable instead of marking restoration complete (#188).

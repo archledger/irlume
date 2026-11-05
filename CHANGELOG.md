@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAD Markdown reports include the bona-fide non-response rate and sample
+  count. Explicit Markdown export failures return a nonzero status instead
+  of reporting command success.
+
 - PAD reports leave ACER unavailable when no bona-fide baseline was measured,
   rather than treating the missing error rate as zero. Reports with both
   attack and bona-fide presentations keep the existing calculation.

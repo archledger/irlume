@@ -1857,6 +1857,99 @@ fn padreport_with_attacks_only_flags_the_missing_bonafide_baseline() {
 }
 
 #[test]
+fn padreport_markdown_keeps_bonafide_nonresponse_rate_and_denominator() {
+    for (tag, outcomes, expected) in [
+        (
+            "pad-nonresponse-all",
+            &["Uncertain", "Uncertain"][..],
+            "100.0% (n=2)",
+        ),
+        (
+            "pad-nonresponse-mixed",
+            &["Live", "Spoof", "Uncertain", "Uncertain"][..],
+            "50.0% (n=4)",
+        ),
+        ("pad-nonresponse-absent", &[][..], "n/a (n=0)"),
+    ] {
+        let sb = Sandbox::new(tag);
+        let input = sb.path("work/pad.jsonl");
+        let output = sb.path("work/pad.md");
+        let mut records = vec![serde_json::json!({
+            "species": "synthetic", "kind": "attack", "verdict": "Spoof"
+        })];
+        records.extend(outcomes.iter().map(|verdict| {
+            serde_json::json!({"species": "baseline", "kind": "bonafide", "verdict": verdict})
+        }));
+        let jsonl = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+        std::fs::write(&input, &jsonl).unwrap();
+        let (code, out, err) = run(sb
+            .cmd(&[
+                "padreport",
+                "--in",
+                input.to_str().unwrap(),
+                "--md",
+                output.to_str().unwrap(),
+            ])
+            .env("IRLUME_DEV", "1"));
+        assert_eq!(code, 0, "{out}\n{err}");
+        assert_eq!(std::fs::read_to_string(input).unwrap(), jsonl);
+        let markdown = std::fs::read_to_string(output).unwrap();
+        assert!(
+            markdown.contains(&format!("- **Bona-fide non-response:** {expected}")),
+            "{markdown}"
+        );
+    }
+}
+
+fn assert_padreport_export_fails(tag: &str, destination: impl FnOnce(&std::path::Path) -> PathBuf) {
+    let sb = Sandbox::new(tag);
+    let input = sb.path("work/pad.jsonl");
+    std::fs::write(&input, PAD_FIXTURE).unwrap();
+    let output = destination(&input);
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "padreport",
+            "--in",
+            input.to_str().unwrap(),
+            "--md",
+            output.to_str().unwrap(),
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.contains("padreport: cannot write"), "{err}");
+    assert!(!out.contains("wrote markdown report"), "{out}");
+    assert!(out.contains("WORST-CASE APCER:"), "{out}");
+    assert_eq!(std::fs::read_to_string(input).unwrap(), PAD_FIXTURE);
+}
+
+#[test]
+fn padreport_fails_when_markdown_destination_is_a_directory() {
+    assert_padreport_export_fails("pad-export-directory", |input| {
+        let directory = input.with_extension("directory");
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    });
+}
+
+#[test]
+fn padreport_fails_when_markdown_parent_is_missing() {
+    assert_padreport_export_fails("pad-export-parent", |input| {
+        let output = input.parent().unwrap().join("absent/report.md");
+        assert!(!output.parent().unwrap().exists());
+        output
+    });
+}
+
+#[test]
+fn padreport_fails_when_markdown_write_is_full() {
+    assert_padreport_export_fails("pad-export-full", |_| {
+        let output = PathBuf::from("/dev/full");
+        assert!(output.exists());
+        output
+    });
+}
+
+#[test]
 fn padreport_input_errors() {
     let sb = Sandbox::new("paderr");
     let (code, _, err) = run(sb

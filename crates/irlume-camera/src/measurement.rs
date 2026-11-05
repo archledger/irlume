@@ -158,7 +158,7 @@ pub struct RateEvidence {
     /// Largest inter-frame gap observed across rounds, when any round
     /// observed one.
     pub max_inter_frame_gap_us: Option<u64>,
-    /// Total continuity errors across rounds.
+    /// Total continuity errors across rounds, saturated at [`u32::MAX`].
     pub continuity_errors: u32,
     pub basis: PercentileBasis,
     /// Every round, in order, so the aggregate is auditable.
@@ -339,7 +339,9 @@ impl RateEvidence {
                 .iter()
                 .filter_map(|round| round.max_inter_frame_gap_us)
                 .max(),
-            continuity_errors: rounds.iter().map(|round| round.continuity_errors).sum(),
+            continuity_errors: rounds.iter().fold(0_u32, |total, round| {
+                total.saturating_add(round.continuity_errors)
+            }),
             basis: PercentileBasis::RoundLevelRate,
             rounds: rounds.to_vec(),
         })

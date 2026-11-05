@@ -349,8 +349,8 @@ impl RateEvidence {
 }
 
 impl MeasurementRecord {
-    /// Validates field bounds (schema version, string lengths, role
-    /// uniqueness, round counts).
+    /// Validates field bounds, nested rounds and reconstructed aggregates.
+    /// Stored acceptance is preserved because producers can add refusals.
     ///
     /// # Errors
     ///
@@ -371,6 +371,13 @@ impl MeasurementRecord {
         }
         if self.rates.len() > 2 {
             return Err(Error::InvalidRecord("at most two roles"));
+        }
+        for (_, evidence) in &self.rates {
+            let rebuilt = RateEvidence::from_rounds(&evidence.rounds, evidence.rounds_failed)
+                .map_err(|_| Error::InvalidRecord("invalid rate rounds"))?;
+            if &rebuilt != evidence {
+                return Err(Error::InvalidRecord("inconsistent rate evidence"));
+            }
         }
         Ok(())
     }

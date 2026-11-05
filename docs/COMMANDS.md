@@ -99,6 +99,27 @@ recorded policy succeeds and accepts it; otherwise it is `inconsistent`.
 This consistency check does not certify the artifact or qualify the camera.
 A missing maximum inter-frame gap prints `n/a`; an observed zero prints `0`.
 
+Verification reads and validates the reference once, before requesting tuning.
+Missing, malformed or internally inconsistent references return exit code 2
+without tuning. Fresh evidence is validated after tuning; missing or invalid
+output returns exit code 1. These failures do not roll back any qualification
+the daemon already saved. Verification never automatically retries a tune.
+
+Fresh output uses a new private directory under the shared state directory
+(normally `/var/lib/irlume`). The directory and its ancestors must be controlled
+by root or the invoking user, not writable by other accounts; the state directory
+itself must be owned by the caller. The daemon creates a mode-0600 file inside
+the directory. Ordinary completion removes only that file and the empty directory;
+unexpected contents or changed identities are retained with an error. Forced
+termination can leave the directory behind. A custom `IRLUME_STATE_DIR` must be
+visible at the same path in both namespaces; an absolute path alone does not
+prove that. Paths under `/tmp` and `/var/tmp` are refused because the packaged
+daemon has private temporary directories.
+
+`--emit-record` resolves relative paths from the invoking directory and requires
+an existing parent and absent final filename. It cannot be combined with
+`--verify-record`. Both reference and fresh JSON inputs are limited to 16 MiB.
+
 Diagnostic output files are private artifacts: the opened file must be a
 creator-owned regular file with mode 0600. Known unqualified network
 destinations, including NFS and SMB/CIFS, are refused before data is written.

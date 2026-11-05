@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `camera-tune --verify-record` validates and retains its reference before
+  tuning, rejects inconsistent fresh evidence, and uses a private output
+  directory shared with the daemon instead of its private temporary area.
+  Explicit exports resolve their parent directory and never overwrite a
+  target. Combined emit/verify options are rejected before tuning (ADR-0023).
+
 - Pair-measurement records refuse acceptance when either camera role has no
   recorded rounds, without inventing missing observations. Aggregated
   continuity-error counts saturate instead of overflowing (ADR-0023).

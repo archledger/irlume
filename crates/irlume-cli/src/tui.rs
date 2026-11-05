@@ -3484,7 +3484,7 @@ impl App {
                     "method is face-only but a fingerprint reader is also wired; both will unlock"
                         .into(),
                     Fix::Manual(
-                        "on the Fingerprint page, choose face OR fingerprint, or remove fingerprint from login".into(),
+                        "on the Fingerprint page, enable fingerprint login, or remove fingerprint from login".into(),
                     ),
                 ));
             }
@@ -4873,7 +4873,7 @@ impl App {
                 crate::fingerprint::run(Some("verify"), &for_user);
             }
             Suspend::FingerprintEnable => self.sudo_step(
-                "enable fingerprint (face OR finger)",
+                "enable fingerprint login",
                 &["irlume", "fingerprint", "enable", "--user", &target],
             ),
             Suspend::FingerprintDisable => self.sudo_step(
@@ -6084,9 +6084,9 @@ impl App {
                 }
             }
             (SC_FINGERPRINT, KeyCode::Char('e')) => {
-                self.log('→', "sudo irlume fingerprint enable: unlock with face OR fingerprint");
+                self.log('→', "sudo irlume fingerprint enable: enable fingerprint login");
                 self.confirm = Some((
-                    format!("Enable fingerprint login for {}? This changes system login wiring to accept face or fingerprint, with password fallback.", self.user),
+                    format!("Enable fingerprint login for {}? This changes system login wiring. Face availability depends on the supported hardware and selected method; password fallback remains.", self.user),
                     "Enable", ConfirmAct::Sus(Suspend::FingerprintEnable),
                 ));
             }
@@ -6182,7 +6182,7 @@ impl App {
             (SC_SETTINGS, KeyCode::Char('c')) => self.prepare_action(actions::Invocation { action: &actions::SENSOR_PREFLIGHT, values: Vec::new() }),
             // Settings.
             (SC_SETTINGS, KeyCode::Char('p')) => {
-                if self.preference_state().consent_overridden {
+                if self.consent_override_active() {
                     self.log('·', "An environment override controls privileged consent; remove it before changing the saved setting.");
                     return;
                 }
@@ -7865,7 +7865,7 @@ impl App {
         // cannot push them off the pane (the List draws nothing after the
         // selected row once it scrolls), and they stay while the listing
         // reloads after the test or cannot be read. Each wraps under its
-        // own start, so neither the cause nor the time is cut.
+        // own start; a bounded footer shows when more text was truncated.
         let inner = area.width.saturating_sub(2);
         let mut footer = Vec::new();
         // Without the added-camera store every profile would look as if
@@ -7884,7 +7884,8 @@ impl App {
             area
         } else {
             let footer = Paragraph::new(footer).wrap(Wrap { trim: false });
-            let height = u16::try_from(footer.line_count(inner))
+            let lines = footer.line_count(inner);
+            let height = u16::try_from(lines)
                 .unwrap_or(u16::MAX)
                 .min(area.height / 2);
             let [list, _, strip] = Layout::vertical([
@@ -7893,14 +7894,22 @@ impl App {
                 Constraint::Length(height),
             ])
             .areas(area);
-            f.render_widget(
-                footer,
-                Rect {
-                    x: strip.x.saturating_add(2),
-                    width: inner,
-                    ..strip
-                },
-            );
+            let text_area = Rect {
+                x: strip.x.saturating_add(2),
+                width: inner,
+                ..strip
+            };
+            f.render_widget(footer, text_area);
+            if lines > usize::from(text_area.height) && !text_area.is_empty() {
+                // Clear the whole row so no half of a wide glyph survives the marker.
+                let overflow = Rect {
+                    y: text_area.bottom().saturating_sub(1),
+                    height: 1,
+                    ..text_area
+                };
+                f.render_widget(Clear, overflow);
+                f.render_widget(Paragraph::new("…"), overflow);
+            }
             list
         };
         let rows = self.rows();
@@ -8328,6 +8337,10 @@ impl App {
             })
     }
 
+    fn consent_override_active(&self) -> bool {
+        crate::consent::overridden() || self.preference_state().consent_overridden
+    }
+
     fn draw_settings(&self, f: &mut Frame, area: Rect) {
         let mut page_actions = Vec::new();
         // The shared reader, which agrees with the daemon's truthy set (`yes` and
@@ -8394,17 +8407,12 @@ impl App {
                 "  Login and lock-screen start behavior is separate.",
             ));
             v.push(Line::raw(""));
-            if crate::consent::overridden() || self.preference_state().consent_overridden {
-                v.push(Line::raw(
-                    if self
-                        .preferences
-                        .is_some_and(|state| state.consent_overridden)
-                    {
-                        "  Daemon environment override controls this setting."
-                    } else {
-                        "  Local environment override; daemon policy may differ."
-                    },
-                ));
+            if self.consent_override_active() {
+                v.push(Line::raw(if state.consent_overridden {
+                    "  Daemon environment override controls this setting."
+                } else {
+                    "  Local environment override; daemon policy may differ."
+                }));
                 v.push(Line::raw(
                     "  Remove IRLUME_PRIVILEGED_FACE_CONSENT before changing this setting.",
                 ));
@@ -8956,7 +8964,7 @@ impl App {
                 f,
                 area,
                 vec![
-                    section("Fingerprint (companion factor)"),
+                    section("Fingerprint"),
                     Line::raw("  reader   unknown (waiting for background observation)"),
                     Line::raw("  enrolled unknown"),
                 ],
@@ -8988,7 +8996,7 @@ impl App {
             )
         };
         let mut lines = vec![
-            section("Fingerprint (companion factor)"),
+            section("Fingerprint"),
             state_row("reader", 14, reader),
             state_row("enrolled", 14, enrolled),
             state_row(
@@ -9000,7 +9008,7 @@ impl App {
         ];
         if self.fp.available {
             lines.push(Line::from(Span::styled(
-                "  Stock fprintd + pam_fprintd; unlocks alongside face, never instead.",
+                "  Uses stock fprintd + pam_fprintd. The active method determines whether face is enabled.",
                 Style::new().dim(),
             )));
             // Per-surface coverage (#155), the same table `fingerprint status`
@@ -9041,7 +9049,7 @@ impl App {
                 &mut lines,
                 &mut page_actions,
                 &[
-                    ("e", "face OR fingerprint (sudo)"),
+                    ("e", "enable fingerprint login (sudo)"),
                     ("d", "remove from login"),
                 ],
             );
@@ -10280,29 +10288,7 @@ impl App {
             Line::from(vec![Span::raw("  login connection  "), onoff_opt(wired)]),
             Line::raw(""),
             Line::from(Span::styled(
-                if self.daemon_ready_observed().is_none() {
-                    "  Current daemon readiness unavailable; F4 shows observation status."
-                } else if self.daemon_ready_observed() == Some(false) {
-                    "  Daemon is changing state; wait for Ready before checking setup."
-                } else if !self.daemon_up {
-                    "  Daemon not running; see Diagnostics before quitting."
-                } else if !self.source_usable(Source::Profiles) || self.enrolled_known().is_none() {
-                    "  Current enrollment observation unavailable; wait for Faces to refresh."
-                } else if self.profiles.is_empty() && self.caps.rgb {
-                    "  Not set up yet; enroll a face (Overview [e]) to begin."
-                } else if self.profiles.is_empty() {
-                    "  Face hardware availability is unconfirmed; password remains available."
-                } else if wired == Some(false) {
-                    "  One step left: your login screen isn't wired yet; press [w] (sudo; password stays the fallback)."
-                } else if wired.is_none() {
-                    "  Checking login connection; the row above fills in when the probe lands."
-                } else if self.face_camera_presence() != Some(true)
-                    || !self.source_usable(Source::Profiles)
-                {
-                    "  Current face setup is unconfirmed; inspect Cameras and Faces observations."
-                } else {
-                    "  All set. irlume keeps running as a daemon; this panel is safe to quit."
-                },
+                "  These are setup observations, not an authentication-readiness check. Closing this panel does not stop irlumed.",
                 Style::new().dim(),
             )),
         ];
@@ -10609,7 +10595,7 @@ impl App {
             SC_FINGERPRINT => &[
                 ("a", "Enroll Finger…"),
                 ("t", "Test Finger"),
-                ("e", "Enable Both…"),
+                ("e", "Enable Fingerprint…"),
                 ("d", "Disable…"),
                 ("x", "Reset…"),
             ],
@@ -10628,6 +10614,9 @@ impl App {
                 ("x", "Disconnect…"),
                 ("s", "Show Status"),
             ],
+            SC_SETTINGS if self.consent_override_active() => {
+                &[("o", "IR-only…"), ("c", "Readiness…"), ("b", "Biopolicy…")]
+            }
             SC_SETTINGS => &[
                 ("o", "IR-only…"),
                 ("c", "Readiness…"),
@@ -11822,10 +11811,7 @@ fn with_seal_note(user: &str, (ok, msg): (bool, String)) -> (bool, String) {
 
 fn map_sealed(resp: Response) -> (bool, String) {
     match resp {
-        Response::PasswordSealed => (
-            true,
-            "keyring armed; unlocking your session will open your wallet".into(),
-        ),
+        Response::PasswordSealed => (true, "keyring armed".into()),
         Response::Error(e) => (false, format!("arm failed: {e}")),
         _ => (false, unexpected_response()),
     }
@@ -12213,6 +12199,7 @@ fn legacy_enroll_worker(
 
 #[cfg(test)]
 mod tests {
+    include!("tui/observation_tests.rs");
     use super::*;
     include!("tui/visual_tests.rs");
     include!("tui/live_tests.rs");
@@ -14050,7 +14037,7 @@ mod tests {
                     ("[a] enroll", 'a'),
                     ("[t] test", 't'),
                     ("[x] wipe", 'x'),
-                    ("[e] face", 'e'),
+                    ("[e] enable fingerprint", 'e'),
                     ("[d] remove", 'd'),
                 ],
             ),
@@ -21718,9 +21705,10 @@ mod tests {
         let text = draw_text(&app);
         assert!(text.contains("Setup dashboard"));
         assert!(
-            text.contains("Current daemon readiness unavailable"),
-            "unobserved readiness must be explicit"
+            row_with(&text, "daemon            ").contains("unknown"),
+            "unobserved readiness must be explicit: {text}"
         );
+        assert!(text.contains("not an authentication-readiness check"));
         app.apply_live_snapshot(live_test_snapshot(), app.now());
         app.screen = SC_DONE;
         app.daemon_up = true;
@@ -21728,7 +21716,7 @@ mod tests {
             ir_pair: false,
             rgb: true,
         };
-        assert!(draw_text(&app).contains("enrollment observation unavailable"));
+        assert!(row_with(&draw_text(&app), "enrollment").contains("profile list not read"));
         app.profiles_loaded = true; // explicitly observed empty enrollment
         let now = app.now();
         app.freshness
@@ -21736,15 +21724,16 @@ mod tests {
             .record(true, now);
         let text = draw_text(&app);
         assert!(
-            text.contains("enroll a face (Overview [e])"),
-            "an empty enrollment with a camera points at [e]"
+            row_with(&text, "enrollment").contains("none"),
+            "an observed empty enrollment stays distinct from an unread list"
         );
         app.caps = irlume_camera::Caps {
             ir_pair: false,
             rgb: false,
         };
         let text = draw_text(&app);
-        assert!(text.contains("Face hardware availability is unconfirmed"));
+        assert!(text.contains("not an authentication-readiness check"));
+        assert!(!text.contains("All set."));
     }
 
     #[test]
@@ -25070,15 +25059,24 @@ mod tests {
         app.probes_landed = true;
         app.probes.login_wired = false;
         assert!(footer(&app).contains("Connect Login"));
-        assert!(draw_text(&app).contains("One step left"));
-        // Observed wired: the body says done and no chrome advertises [w],
+        let text = draw_text(&app);
+        assert!(
+            row_with(&text, "login connection").contains("○ no"),
+            "{text}"
+        );
+        assert!(text.contains("[w] wire login"), "{text}");
+        // Observed wired: no chrome advertises [w],
         // which on a wired box would re-run `sudo irlume login enable`.
         app.probes.login_wired = true;
         let f = footer(&app);
         assert!(!f.contains("Connect Login"), "{f}");
         assert!(!app.help_body().contains("Connect Login"));
         let text = draw_text(&app);
-        assert!(text.contains("All set"), "{text}");
+        assert!(
+            text.contains("not an authentication-readiness check"),
+            "{text}"
+        );
+        assert!(!text.contains("All set"), "{text}");
         assert!(
             row_with(&text, "login connection").contains("● yes"),
             "{text}"

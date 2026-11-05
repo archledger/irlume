@@ -380,13 +380,20 @@ fn live_freshness_done_cannot_claim_all_set_after_live_expiry() {
     app.profiles = vec![profile("Alice", &["a"])];
     app.probes_landed = true;
     app.probes.login_wired = true;
-    assert!(draw_text(&app).contains("All set"));
+    assert_eq!(app.daemon_ready_observed(), Some(true));
+    let current = draw_text(&app);
+    assert!(current.contains("not an authentication-readiness check"));
+    assert!(row_with(&current, "daemon            ").contains("● yes"));
     app.clock_override = Some(app.now() + Duration::from_secs(5));
     app.expire_observations(app.now());
     app.screen = SC_DONE;
     let text = draw_text(&app);
     assert!(!text.contains("All set"), "{text}");
-    assert!(text.contains("readiness unavailable"), "{text}");
+    assert_eq!(app.daemon_ready_observed(), None);
+    assert!(
+        row_with(&text, "daemon            ").contains("◐ unknown"),
+        "{text}"
+    );
 }
 
 #[test]

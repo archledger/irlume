@@ -100,6 +100,11 @@ ellipsis. Camera list rows also end in an ellipsis when the name, role and
 status do not fit; Enter retains the full details. Narrower terminals have
 only the Enter details. `r` on a page refreshes only what that page shows.
 
+Fingerprint shows the selected method without promising that face is also
+available. **Enable Fingerprint** keeps password fallback; the command chooses
+the supported method for the hardware. Setup Status summarizes observations,
+not authentication readiness. Closing that page does not stop irlumed.
+
 ## Overview
 
 Overview leads with your account's last face attempt, read from the
@@ -272,7 +277,9 @@ hands-free privileged face authentication, and the biopolicy gate. State is
 read from the daemon in the background, so a normal user can inspect root-only
 settings without running the entire TUI as root. A disconnected or older daemon
 is explicitly labeled; any available local observation is not a confirmed
-daemon state. Environment overrides are identified and block misleading toggles.
+daemon state. A local or currently observed daemon consent override hides
+the Preferences consent toggle from the page and action walk and blocks its
+keyboard shortcut. Stale daemon data does not establish an override.
 
 Click an action or use its key:
 
@@ -311,6 +318,9 @@ the row below. Forget on a GNOME keyring token, or on a seal whose kind the
 daemon does not report, runs the CLI's re-key flow first. With a GNOME keyring
 token armed on Fedora 43 or 44, the page and Diagnostics say to run
 `irlume keyring forget` before upgrading to Fedora 45.
+
+A successful arm confirms that the secret was sealed. It does not establish
+working session delivery; check Login & Apps for the required integration.
 
 Recovery shows whether the face templates are encrypted and whether a recovery
 passphrase is set. Its actions share one row too: set (`s`), restore (`t`) and
@@ -464,11 +474,12 @@ the result reads `did not complete:` with the daemon's own reason, or
 models; a test refused for too many attempts, or because face unlock is
 not the configured method, reads `refused:` with that reason, as on
 Overview. No result shows a score or a threshold. The Faces line stays
-at the foot of the page while the list reloads after the test, and wraps
-rather than losing its end. Once the Faces list has been read and holds
-no face, `i` says so and opens no camera; while the list is still
-loading, `i` runs the test, and the camera opens before the daemon finds
-nothing to compare with.
+at the foot of the page while the list reloads after the test, and wraps.
+When the available footer space is too small, an ellipsis marks overflow;
+Activity retains the result under its normal history limits. Once the Faces
+list has been read and holds no face, `i` says so and opens no camera; while
+the list is still loading, `i` runs the test, and the camera opens before
+the daemon finds nothing to compare with.
 Against a daemon older than the TUI, the result reads
 `recognition test needs a newer irlumed; restart it after the upgrade`.
 

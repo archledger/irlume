@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The TUI marks clipped recognition results, hides consent toggles controlled
+  by local or daemon overrides, and describes fingerprint enabling without
+  promising face availability. Setup observations and successful wallet
+  sealing no longer claim authentication or wallet-delivery readiness
+  (ADR-0030).
+
 - `suncal` rejects malformed or unsupported PGM headers without panicking
   and skips bursts whose frames have different dimensions, rather than
   analyzing them with the last frame's dimensions.

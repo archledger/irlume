@@ -122,7 +122,9 @@ Definitions follow ISO/IEC 30107-3. Implementation and unit tests live in
   merely *stall* is flagged, because an attacker can retry; treat a high attack
   non-response rate as unresolved, not as a defence.
 - **ACER** = (worst-case APCER + BPCER) / 2. Deprecated by newer ISO revisions but
-  still the legacy iBeta single headline; reported for continuity only.
+  still the legacy iBeta single headline; reported for continuity only. It is
+  unavailable unless both attack and bona-fide presentations were measured;
+  an unmeasured error rate is not treated as zero.
 - **95% confidence intervals**: every rate carries a **Clopper-Pearson exact
   binomial** interval. This is essential at self-test sample sizes: *0 of 20 attacks
   accepted means "APCER ≤ 16.8% with 95% confidence", not "0% APCER".* Read the

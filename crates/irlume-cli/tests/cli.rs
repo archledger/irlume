@@ -1728,6 +1728,7 @@ fn padreport_aggregates_a_fixture_into_iso_metrics() {
     assert!(md_text.contains("| print_matte | 3 | 33.3% |"), "{md_text}");
     assert!(md_text.contains("**Worst-case APCER:**"), "{md_text}");
     assert!(md_text.contains("**BPCER:** 25.0%"), "{md_text}");
+    assert!(md_text.contains("**ACER:** 29.2%"), "{md_text}");
     assert!(md_text.contains("not a lab-accredited"), "{md_text}");
     assert!(out.contains("wrote markdown report"), "{out}");
 }
@@ -1836,13 +1837,23 @@ fn padreport_with_attacks_only_flags_the_missing_bonafide_baseline() {
 "#,
     )
     .unwrap();
-    let (code, out, _) = run(sb
-        .cmd(&["padreport", "--in", jsonl.to_str().unwrap()])
+    let md = sb.path("work/attacks.md");
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "padreport",
+            "--in",
+            jsonl.to_str().unwrap(),
+            "--md",
+            md.to_str().unwrap(),
+        ])
         .env("IRLUME_DEV", "1"));
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{err}");
     assert!(out.contains("no bona-fide presentations captured"), "{out}");
     assert!(out.contains("n/a"), "BPCER with den=0 renders n/a: {out}");
     assert!(out.contains("WORST-CASE APCER: cutout"), "{out}");
+    assert!(out.contains("ACER: n/a"), "{out}");
+    let markdown = std::fs::read_to_string(md).unwrap();
+    assert!(!markdown.contains("**ACER:**"), "{markdown}");
 }
 
 #[test]

@@ -20,7 +20,8 @@
 //!    Uncertain attack did NOT succeed) but surface the rate on its own so a
 //!    species whose attacks merely stall (and could be retried) is visible.
 //!  * **ACER** = (APCER_worst + BPCER) / 2, deprecated by newer ISO revisions but
-//!    still the iBeta-style single headline; reported for continuity only.
+//!    still the iBeta-style single headline; reported for continuity only when
+//!    both attack and bona-fide presentations were measured.
 //!
 //! Every rate carries a **Clopper-Pearson exact 95% binomial confidence interval**.
 //! With the small sample sizes a home self-test can realistically capture, the
@@ -114,7 +115,8 @@ pub struct PadReport {
     pub bpcer: Rate,
     /// Bona-fide presentations that stalled at `Uncertain` (non-response).
     pub bonafide_nonresponse: Rate,
-    /// ACER = (worst-case APCER + BPCER) / 2. `None` when no attacks were tested.
+    /// ACER = (worst-case APCER + BPCER) / 2. `None` when either attack or
+    /// bona-fide presentations were not tested.
     pub acer: Option<f64>,
 }
 
@@ -184,10 +186,10 @@ pub fn analyze(trials: &[Trial]) -> PadReport {
         .count();
     let bpcer = Rate::new(bf_rejected, bf_n);
 
-    let acer = worst_apcer.as_ref().map(|(_, ap)| {
-        let bp = if bf_n == 0 { 0.0 } else { bpcer.p };
-        (ap + bp) / 2.0
-    });
+    let acer = worst_apcer
+        .as_ref()
+        .filter(|_| bf_n != 0)
+        .map(|(_, ap)| (ap + bpcer.p) / 2.0);
 
     PadReport {
         n_attacks: trials.iter().filter(|t| t.label == Label::Attack).count(),
@@ -445,5 +447,63 @@ mod tests {
         assert_eq!(r.bpcer.num, 1);
         assert_eq!(r.bpcer.den, 10);
         assert_eq!(r.bonafide_nonresponse.num, 1);
+    }
+
+    #[test]
+    fn acer_is_unavailable_without_bonafide_trials() {
+        for outcome in [Outcome::Accepted, Outcome::Rejected, Outcome::NonResponse] {
+            let r = analyze(&[attack("synthetic", outcome, &[])]);
+            assert_eq!((r.n_attacks, r.n_bonafide), (1, 0));
+            assert!(r.worst_apcer.is_some());
+            assert!(r.bpcer.p.is_nan());
+            assert_eq!(r.acer, None, "unmeasured BPCER for {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn acer_is_unavailable_without_attack_trials() {
+        assert_eq!(analyze(&[]).acer, None);
+        for outcome in [Outcome::Accepted, Outcome::Rejected, Outcome::NonResponse] {
+            let r = analyze(&[bonafide(outcome)]);
+            assert_eq!((r.n_attacks, r.n_bonafide), (0, 1));
+            assert_eq!(r.worst_apcer, None);
+            assert!(r.bpcer.p.is_finite());
+            assert_eq!(r.acer, None, "unmeasured APCER for {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn acer_uses_worst_species_and_keeps_nonresponse_denominators() {
+        let mut trials = vec![attack("A", Outcome::Rejected, &[]); 3];
+        trials.push(attack("A", Outcome::Accepted, &[]));
+        trials.extend(vec![attack("B", Outcome::Accepted, &[]); 2]);
+        trials.push(attack("B", Outcome::Rejected, &[]));
+        trials.push(attack("B", Outcome::NonResponse, &[]));
+        trials.push(bonafide(Outcome::Accepted));
+        trials.push(bonafide(Outcome::Rejected));
+        trials.extend(vec![bonafide(Outcome::NonResponse); 2]);
+        let r = analyze(&trials);
+        assert_eq!(r.worst_apcer, Some(("B".into(), 0.5)));
+        assert_eq!((r.bpcer.num, r.bpcer.den), (1, 4));
+        assert_eq!(
+            (r.bonafide_nonresponse.num, r.bonafide_nonresponse.den),
+            (2, 4)
+        );
+        assert!(approx(r.acer.unwrap(), 0.375, 1e-12));
+    }
+
+    #[test]
+    fn acer_preserves_measured_zero_including_nonresponses() {
+        for (attack_outcome, bonafide_outcome) in [
+            (Outcome::Rejected, Outcome::Accepted),
+            (Outcome::NonResponse, Outcome::NonResponse),
+        ] {
+            let r = analyze(&[
+                attack("synthetic", attack_outcome, &[]),
+                bonafide(bonafide_outcome),
+            ]);
+            assert_eq!((r.n_attacks, r.n_bonafide), (1, 1));
+            assert!(approx(r.acer.unwrap(), 0.0, 1e-12));
+        }
     }
 }

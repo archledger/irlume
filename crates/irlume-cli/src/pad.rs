@@ -534,7 +534,10 @@ pub(crate) fn padreport(args: &[String]) -> std::process::ExitCode {
         };
         match written {
             Ok(()) => println!("\n[padreport] wrote markdown report to {md_path}"),
-            Err(e) => eprintln!("padreport: cannot write {md_path}: {e}"),
+            Err(e) => {
+                eprintln!("padreport: cannot write {md_path}: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
         }
     }
     std::process::ExitCode::SUCCESS
@@ -696,6 +699,11 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
         pct(r.bpcer.lo).trim(),
         pct(r.bpcer.hi).trim(),
         r.bpcer.den
+    ));
+    o.push_str(&format!(
+        "- **Bona-fide non-response:** {} (n={})\n",
+        pct(r.bonafide_nonresponse.p).trim(),
+        r.bonafide_nonresponse.den
     ));
     if let Some(a) = r.acer {
         o.push_str(&format!("- **ACER:** {} (legacy)\n", pct(a).trim()));

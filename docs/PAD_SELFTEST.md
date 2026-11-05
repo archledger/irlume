@@ -206,7 +206,13 @@ irlume padreport --in $LOG --md pad-results.md
 
 `padreport --md` refuses an output that refers to the same file as `--in`,
 including symbolic and hard links. The input corpus is left unchanged. A
-distinct existing Markdown report can still be replaced.
+distinct existing Markdown report can still be replaced. An explicitly
+requested export that cannot be opened or written returns a nonzero exit
+status, even though the human-readable report has already been printed.
+
+Markdown includes the bona-fide non-response rate and its sample count,
+separately from BPCER and ACER. High non-response means users need to
+re-present; a low error rate alone does not describe that outcome.
 
 `padcapture` **appends**, so one log accumulates every species. During capture an
 accepted attack prints `‼ ACCEPTED (breach!)` immediately so you don't have to wait

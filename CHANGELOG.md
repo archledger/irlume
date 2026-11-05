@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- PAD report export refuses an output that aliases its input corpus, including
+  symbolic and hard links, instead of replacing the JSONL with Markdown.
+  Distinct existing reports can still be replaced (PAD self-test reporting).
+
 - Debug-log status reports an unreadable setting as unknown, not off, and
   names the elevated status check instead of offering to enable tracing
   (ADR-0008, existing debug mode).

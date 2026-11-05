@@ -202,6 +202,10 @@ irlume padcapture --species cutout        --kind attack --det $DET --out $LOG --
 irlume padreport --in $LOG --md pad-results.md
 ```
 
+`padreport --md` refuses an output that refers to the same file as `--in`,
+including symbolic and hard links. The input corpus is left unchanged. A
+distinct existing Markdown report can still be replaced.
+
 `padcapture` **appends**, so one log accumulates every species. During capture an
 accepted attack prints `‼ ACCEPTED (breach!)` immediately so you don't have to wait
 for the report to notice a hole.

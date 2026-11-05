@@ -20,7 +20,8 @@
 
 use irlume_core::pad as metrics;
 use irlume_liveness::{FaceBox, LivenessGate, Signals, Verdict};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt as _;
 
 /// Which gate path to exercise.
 #[derive(Clone, Copy, PartialEq)]
@@ -421,8 +422,13 @@ pub(crate) fn padreport(args: &[String]) -> std::process::ExitCode {
         eprintln!("usage: irlume padreport --in <pad.jsonl> [--md <report.md>]");
         return std::process::ExitCode::from(2);
     };
-    let text = match std::fs::read_to_string(input) {
-        Ok(t) => t,
+    // Keep the file we actually read alive until any report output is checked.
+    let (input_file, text) = match std::fs::File::open(input).and_then(|mut file| {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok((file, text))
+    }) {
+        Ok(input) => input,
         Err(e) => {
             eprintln!("padreport: cannot read {input}: {e}");
             return std::process::ExitCode::FAILURE;
@@ -503,12 +509,49 @@ pub(crate) fn padreport(args: &[String]) -> std::process::ExitCode {
 
     if let Some(md_path) = crate::flag(args, "--md") {
         let md = render_markdown(&report, input, &paths);
-        match std::fs::write(md_path, md) {
+        let written = match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(md_path)
+        {
+            Ok(mut output) => {
+                // Compare and write held files, not paths that can be replaced
+                // between the identity check and truncation.
+                if let Err(error) = ensure_distinct_report(&input_file, &output) {
+                    eprintln!("padreport: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+                replace_report_contents(&mut output, &md)
+            }
+            Err(error) => Err(error),
+        };
+        match written {
             Ok(()) => println!("\n[padreport] wrote markdown report to {md_path}"),
             Err(e) => eprintln!("padreport: cannot write {md_path}: {e}"),
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+fn ensure_distinct_report(input: &std::fs::File, output: &std::fs::File) -> std::io::Result<()> {
+    let input = input.metadata()?;
+    let output = output.metadata()?;
+    if (input.dev(), input.ino()) == (output.dev(), output.ino()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to overwrite input corpus with markdown report",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_report_contents(output: &mut std::fs::File, report: &str) -> std::io::Result<()> {
+    // O_TRUNC previously left streams alone; do not ftruncate pipes/devices.
+    if output.metadata()?.is_file() {
+        output.set_len(0)?;
+    }
+    output.write_all(report.as_bytes())
 }
 
 fn pct(x: f64) -> String {
@@ -660,6 +703,73 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
 mod tests {
     use super::*;
     use irlume_liveness::{IR_FACE_MIN_BRIGHTNESS, MIN_CENTER_EDGE_RATIO, MIN_FACE_SCORE};
+
+    fn report_test_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("irlume-report-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn report_identity_retains_the_input_after_its_path_is_replaced() {
+        let dir = report_test_dir();
+        let path = dir.join("input");
+        let retained = dir.join("retained");
+        std::fs::write(&path, b"original corpus").unwrap();
+        let input = std::fs::File::open(&path).unwrap();
+        std::fs::rename(&path, &retained).unwrap();
+        std::fs::write(&path, b"replacement corpus").unwrap();
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&retained)
+            .unwrap();
+        assert!(ensure_distinct_report(&input, &output).is_err());
+        assert_eq!(std::fs::read(&retained).unwrap(), b"original corpus");
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement corpus");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn report_write_keeps_the_checked_output_after_its_path_is_replaced() {
+        let dir = report_test_dir();
+        let input_path = dir.join("input");
+        let output_path = dir.join("output");
+        let retained = dir.join("retained");
+        std::fs::write(&input_path, b"corpus").unwrap();
+        std::fs::write(&output_path, b"old report with a long tail").unwrap();
+        let input = std::fs::File::open(&input_path).unwrap();
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&output_path)
+            .unwrap();
+        ensure_distinct_report(&input, &output).unwrap();
+        std::fs::rename(&output_path, &retained).unwrap();
+        std::os::unix::fs::symlink(&input_path, &output_path).unwrap();
+        replace_report_contents(&mut output, "report").unwrap();
+        assert_eq!(std::fs::read(&retained).unwrap(), b"report");
+        assert_eq!(std::fs::read(&input_path).unwrap(), b"corpus");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn report_identity_rejects_an_alias_even_after_it_is_retargeted() {
+        let dir = report_test_dir();
+        let path = dir.join("input");
+        let alias = dir.join("alias");
+        std::fs::write(&path, b"corpus").unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let input = std::fs::File::open(&path).unwrap();
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&alias)
+            .unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, b"unrelated").unwrap();
+        assert!(ensure_distinct_report(&input, &output).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"corpus");
+        assert_eq!(std::fs::read(&alias).unwrap(), b"unrelated");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Signals that pass every cue the attribution helper looks at.
     fn passing_signals() -> Signals {

@@ -1732,6 +1732,100 @@ fn padreport_aggregates_a_fixture_into_iso_metrics() {
     assert!(out.contains("wrote markdown report"), "{out}");
 }
 
+fn assert_padreport_preserves_corpus(
+    tag: &str,
+    destination: impl FnOnce(&std::path::Path) -> PathBuf,
+) {
+    let sb = Sandbox::new(tag);
+    let input = sb.path("work/pad.jsonl");
+    std::fs::write(&input, PAD_FIXTURE).unwrap();
+    let output = destination(&input);
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "padreport",
+            "--in",
+            input.to_str().unwrap(),
+            "--md",
+            output.to_str().unwrap(),
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(std::fs::read(&input).unwrap(), PAD_FIXTURE.as_bytes());
+    assert_eq!(code, 1, "stdout: {out}\nstderr: {err}");
+    assert!(err.contains("refusing to overwrite input corpus"), "{err}");
+    assert!(!out.contains("wrote markdown report"), "{out}");
+}
+
+#[test]
+fn padreport_preserves_input_when_markdown_uses_the_same_path() {
+    assert_padreport_preserves_corpus("pad-same-path", |input| input.to_owned());
+}
+
+#[test]
+fn padreport_preserves_input_when_markdown_is_a_symlink() {
+    assert_padreport_preserves_corpus("pad-symlink-output", |input| {
+        let alias = input.with_extension("md");
+        std::os::unix::fs::symlink(input, &alias).unwrap();
+        alias
+    });
+}
+
+#[test]
+fn padreport_preserves_input_when_markdown_is_a_hard_link() {
+    assert_padreport_preserves_corpus("pad-hardlink-output", |input| {
+        let alias = input.with_extension("md");
+        std::fs::hard_link(input, &alias).unwrap();
+        alias
+    });
+}
+
+#[test]
+fn padreport_replaces_a_distinct_existing_markdown_report() {
+    let sb = Sandbox::new("pad-replace-report");
+    let input = sb.path("work/pad.jsonl");
+    let output = sb.path("work/pad.md");
+    std::fs::write(&input, PAD_FIXTURE).unwrap();
+    let old_report = "stale report data\n".repeat(1000);
+    std::fs::write(&output, &old_report).unwrap();
+    let (code, out, err) = run(sb
+        .cmd(&[
+            "padreport",
+            "--in",
+            input.to_str().unwrap(),
+            "--md",
+            output.to_str().unwrap(),
+        ])
+        .env("IRLUME_DEV", "1"));
+    assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+    assert!(out.contains("wrote markdown report"), "{out}");
+    assert_eq!(std::fs::read(&input).unwrap(), PAD_FIXTURE.as_bytes());
+    let report = std::fs::read_to_string(output).unwrap();
+    assert!(report.starts_with("## IR liveness PAD self-test results"));
+    assert!(!report.contains("stale report data"));
+    assert!(report.len() < old_report.len());
+}
+
+#[test]
+fn padreport_keeps_null_and_pipe_outputs_working() {
+    let sb = Sandbox::new("pad-stream-report");
+    let input = sb.path("work/pad.jsonl");
+    std::fs::write(&input, PAD_FIXTURE).unwrap();
+    for output in ["/dev/null", "/dev/stdout"] {
+        let (code, out, err) = run(sb
+            .cmd(&["padreport", "--in", input.to_str().unwrap(), "--md", output])
+            .env("IRLUME_DEV", "1"));
+        assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+        assert!(out.contains("wrote markdown report"), "{out}\n{err}");
+        assert!(!err.contains("cannot write"), "{err}");
+        assert_eq!(std::fs::read(&input).unwrap(), PAD_FIXTURE.as_bytes());
+        if output == "/dev/stdout" {
+            assert!(
+                out.contains("## IR liveness PAD self-test results"),
+                "{out}"
+            );
+        }
+    }
+}
+
 #[test]
 fn padreport_with_attacks_only_flags_the_missing_bonafide_baseline() {
     let sb = Sandbox::new("padnobf");

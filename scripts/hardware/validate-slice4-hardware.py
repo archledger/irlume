@@ -199,19 +199,22 @@ def main(argv):
         stream_recovery = finite_number(
             stream.get("recovery_duration_seconds"), f"{role}: recovery duration"
         )
-        # The delivered-rate fill discards a bounded number of frames per
-        # stream on top of the warm-up discards: flush (role-aware,
-        # rate_gate::startup_flush: RGB 0, IR 10) + fill (1 seed +
-        # RATE_WINDOW_CAPACITY deltas = 31) per establishment, run twice
-        # (initial + post-recovery). The faster stream keeps discarding until
-        # its slower twin is ready, so the total is rate-ratio dependent;
-        # assert only the deterministic minimum, and let the
-        # delivered/discarded accounting check above catch inconsistency.
+        # Each cold establishment needs a seed plus 30 deltas, twice for
+        # initial startup and recovery. Single-stream fill retains RGB warm-up
+        # timing, so it is already part of those 31 observations. Concurrent
+        # dual-stream drain resets the window and adds both 7-frame warm-ups.
+        # IR has one session warm-up and a 5-frame startup flush per full fill.
+        # The concurrent test then jointly fills the already-started IR session:
+        # its fresh completion permits at least a flush + seed + 5-delta probe.
+        # Recovery invalidates that completion, requiring another full fill.
+        # Faster paired streams may discard more; enforce deterministic minima
+        # and exact accounting, not a maximum (rate_gate/rate_amortization).
+        concurrent_pair = mode == "concurrent" and expected_streams == 2
+        rgb_warmup = 14 if concurrent_pair else 0
+        ir_joint_probe = 5 + 1 + 5 if concurrent_pair else 0
         minimum_discarded = {
-            # warm-up (14 = 7 initial + 7 recovered; 1 = the IR session warm-up)
-            # + two fill establishments (2 * (flush + 31)).
-            "rgb": 14 + 2 * (0 + 31),
-            "ir": 1 + 2 * (10 + 31),
+            "rgb": rgb_warmup + 2 * 31,
+            "ir": 1 + 2 * (5 + 31) + ir_joint_probe,
         }[role]
         if discarded_observations < minimum_discarded:
             fail(

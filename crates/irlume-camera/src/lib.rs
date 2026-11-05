@@ -11817,6 +11817,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    include!("native_validator_accounting_tests.rs");
     include!("probe_bounds_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");

@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Native continuity evidence validation uses the producer's discard counts:
+  RGB warm-up stays inside single-stream fills and IR pays a five-frame
+  startup flush. Concurrent validation also includes RGB warm-up and IR's
+  extra joint fill after session startup (ADR-0021).
+
 - Camera census reports an unreadable privacy control as unknown (`null`),
   not as a released shutter. Confirmed absent controls remain `false`;
   capture and setup policy are unchanged (ADR-0031).

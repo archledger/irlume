@@ -289,7 +289,11 @@ bypass the daemon. Not needed for normal use.
 Each prints its own usage line when run without arguments. `padcapture` /
 `padreport` are the presentation-attack self-test pair documented in
 [PAD_SELFTEST.md](PAD_SELFTEST.md); `suncal` is the outdoor/sunlight
-calibration analyzer.
+calibration analyzer. It reads full-scale 8-bit binary P5 frames with positive,
+matching dimensions within each burst. Malformed, truncated or unsupported
+PGM files, or mixed frame dimensions, cause the whole burst to be skipped.
+Raster-leading whitespace is pixel data; bytes after the required raster are
+ignored.
 
 Two diagnostics are NOT dev-gated: `irlume selftest liveness` (goes through
 the daemon; the TUI ships it as Diagnostics -> Test Infrared Camera) and the

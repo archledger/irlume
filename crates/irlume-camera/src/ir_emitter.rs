@@ -2390,7 +2390,7 @@ impl UvcMode {
                 Ok(())
             }
             Ok(_) => {
-                if let Some(lease) = self
+                let written = if let Some(lease) = self
                     .handle
                     .as_ref()
                     .and_then(|handle| handle.lease.as_ref())
@@ -2420,7 +2420,18 @@ impl UvcMode {
                     }
                 } else {
                     set_cur(self.fd(), self.unit, self.selector, &self.restore)
-                }
+                };
+                // An acknowledged SET_CUR can be ignored or clamped. Only a
+                // matching readback allows the restoration record to resolve.
+                written.and_then(|()| {
+                    let restored =
+                        get_cur(self.fd(), self.unit, self.selector, self.restore.len())?;
+                    if restored == self.restore {
+                        Ok(())
+                    } else {
+                        Err(XuError::Unresponsive(libc::EIO))
+                    }
+                })
             }
             // An unreadable control authorises NOTHING: writing blind here
             // could put the restore value over bytes some other client set
@@ -5683,6 +5694,7 @@ pub fn describe_units(device: &str) -> std::io::Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    include!("restore_confirmation_tests.rs");
     fn legacy_configuration_record(
         id: &crate::uvc_descriptor::CameraIdentity,
     ) -> serde_json::Value {

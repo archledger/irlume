@@ -1114,6 +1114,20 @@ fn measurement_drift_report(
     let fps = |r: irlume_camera::measurement::RateRational| {
         r.deltas as f64 * 1_000_000.0 / r.span_us as f64
     };
+    let acceptance = |record: &irlume_camera::measurement::MeasurementRecord| {
+        // The producer may reject for reasons beyond the generic policy.
+        // Never turn a stored refusal into success when re-evaluating it.
+        if !record.acceptance.accepted {
+            "false"
+        } else if record.acceptance.failures.is_empty()
+            && matches!(record.evaluate_acceptance(), Ok(result) if result.accepted)
+        {
+            "true"
+        } else {
+            "inconsistent"
+        }
+    };
+    let gap = |value: Option<u64>| value.map_or_else(|| "n/a".into(), |us| us.to_string());
     let mut lines = Vec::new();
     for reference_record in reference {
         let arm = &reference_record.method;
@@ -1121,6 +1135,8 @@ fn measurement_drift_report(
             lines.push(format!("{arm}: no fresh {arm} arm ran; cannot compare"));
             continue;
         };
+        let reference_acceptance = acceptance(reference_record);
+        let fresh_acceptance = acceptance(fresh_record);
         for (role, reference_evidence) in &reference_record.rates {
             let Some((_, fresh_evidence)) = fresh_record.rates.iter().find(|(r, _)| r == role)
             else {
@@ -1138,12 +1154,12 @@ fn measurement_drift_report(
                 "{arm} {role:?}: p50 {:.1} -> {:.1} fps ({direction}); max gap {} -> {} us; rounds {} -> {}; accepted {} -> {}",
                 fps(reference_evidence.rate_p50),
                 fps(fresh_evidence.rate_p50),
-                reference_evidence.max_inter_frame_gap_us.unwrap_or(0),
-                fresh_evidence.max_inter_frame_gap_us.unwrap_or(0),
+                gap(reference_evidence.max_inter_frame_gap_us),
+                gap(fresh_evidence.max_inter_frame_gap_us),
                 reference_evidence.rounds_completed,
                 fresh_evidence.rounds_completed,
-                reference_record.acceptance.accepted,
-                fresh_record.acceptance.accepted,
+                reference_acceptance,
+                fresh_acceptance,
             ));
         }
     }

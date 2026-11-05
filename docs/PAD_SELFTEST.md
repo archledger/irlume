@@ -210,6 +210,11 @@ distinct existing Markdown report can still be replaced.
 accepted attack prints `‼ ACCEPTED (breach!)` immediately so you don't have to wait
 for the report to notice a hole.
 
+Prompted capture stops on `q` or input EOF without taking another sample. An
+input read error stops the command with a nonzero exit status; records already
+appended remain in the log. Use `--no-prompt` explicitly for unattended capture
+without per-presentation input.
+
 Each JSONL record carries the ground-truth label (`species`, `kind`), the gate
 `verdict`, the catching cue (`caught`), and the raw signals (`ir_brightness`,
 `ir_center_edge_ratio`, `ir_glint`, `cross_dist`, pose), so a marginal near-threshold attack

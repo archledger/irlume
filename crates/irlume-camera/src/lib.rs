@@ -2475,6 +2475,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 // invalidates, and re-establishes from scratch.
                 while self.rate_window.count()
                     < rate_amortization::CONTINUITY_PROBE_ESCALATED_DELTAS
+                    && attempts < MAX_RATE_FILL_ATTEMPTS
                     && !self.rate_window.meets_floor(
                         policy.floor_num(),
                         policy.floor_den(),
@@ -2482,6 +2483,7 @@ impl<S: ValidatedStream> TrackedStream<S> {
                     )
                 {
                     self.next_discarded()?;
+                    attempts += 1;
                 }
                 // Admission consumes at least `CONTINUITY_PROBE_DELTAS`
                 // sound deltas: error-marked dequeues contribute nothing and
@@ -3081,6 +3083,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
         // 15-delta window and both miss a 5-delta point sample; a genuinely
         // slow stream escalates to a miss here and takes the full path.
         while stream.rate_window.count() < rate_amortization::CONTINUITY_PROBE_ESCALATED_DELTAS
+            && attempts < MAX_RATE_FILL_ATTEMPTS
             && !stream.rate_window.meets_floor(
                 policy.floor_num(),
                 policy.floor_den(),
@@ -3094,6 +3097,7 @@ fn drain_until_both_ready<S: ValidatedStream>(
                 cancelled.store(true, Ordering::Release);
                 return Err(error);
             }
+            attempts += 1;
         }
         // Same delta-count floor as the single-stream admission: a window
         // below `CONTINUITY_PROBE_DELTAS` carries no continuity evidence (an
@@ -11813,6 +11817,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    include!("probe_bounds_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");
     }

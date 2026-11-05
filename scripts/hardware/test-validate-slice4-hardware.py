@@ -82,6 +82,27 @@ def valid_record():
     }
 
 
+def set_discard_count(stream, count):
+    stream["discarded_observations"] = count
+    stream["observations"] = stream["frames"] + count
+    stream["sequence_span_sum"] = (
+        stream["observations"] - stream["epoch_count"] + stream["cumulative_drops"]
+    )
+
+
+def sequential_record():
+    record = valid_record()
+    record["mode"] = "sequential"
+    record["duration_seconds"] = sum(s["duration_seconds"] for s in record["streams"])
+    record["recovery_duration_seconds"] = sum(
+        s["recovery_duration_seconds"] for s in record["streams"]
+    )
+    record["rgb_ir_skew_us"] = None
+    set_discard_count(record["streams"][0], 62)
+    set_discard_count(record["streams"][1], 73)
+    return record
+
+
 class ValidatorTests(unittest.TestCase):
     def run_raw(
         self,
@@ -123,7 +144,7 @@ class ValidatorTests(unittest.TestCase):
 
     def test_discarded_below_the_role_aware_minimum_is_rejected(self):
         # The deterministic minimum mirrors rate_gate::startup_flush (RGB 0,
-        # IR 10): warm-up + two fill establishments of flush+31 each. One
+        # IR 5): warm-up + two fill establishments of flush+31 each. One
         # below the RGB floor (14 + 2*31 = 76) must reject; the floor itself
         # is accepted by the untouched fixture above (136 > 76).
         def one_below_rgb_floor(record):
@@ -159,6 +180,71 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(constant=constant):
                 self.assertNotEqual(self.run_raw(raw + "\n").returncode, 0)
 
+    def test_sequential_discard_minima_are_accepted(self):
+        result = self.run_validator(sequential_record())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sequential_one_below_each_discard_minimum_is_rejected(self):
+        for index, count in [(0, 61), (1, 72)]:
+            with self.subTest(index=index):
+                record = sequential_record()
+                set_discard_count(record["streams"][index], count)
+                result = self.run_validator(record)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("below the minimum fill/warm-up", result.stderr)
+
+    def test_rgb_only_discard_minimum_is_accepted(self):
+        record = valid_record()
+        record["streams"] = record["streams"][:1]
+        record["rgb_ir_skew_us"] = None
+        set_discard_count(record["streams"][0], 62)
+        result = self.run_validator(record, expected_streams="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rgb_only_one_below_discard_minimum_is_rejected(self):
+        record = valid_record()
+        record["streams"] = record["streams"][:1]
+        record["rgb_ir_skew_us"] = None
+        set_discard_count(record["streams"][0], 61)
+        result = self.run_validator(record, expected_streams="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("below the minimum fill/warm-up", result.stderr)
+
+    def test_concurrent_discard_minima_are_accepted(self):
+        for ir_discarded in [84, 109]:
+            with self.subTest(ir_discarded=ir_discarded):
+                record = valid_record()
+                set_discard_count(record["streams"][0], 76)
+                set_discard_count(record["streams"][1], ir_discarded)
+                result = self.run_validator(record)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_concurrent_ir_one_below_discard_minimum_is_rejected(self):
+        record = valid_record()
+        set_discard_count(record["streams"][0], 76)
+        set_discard_count(record["streams"][1], 83)
+        result = self.run_validator(record)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("ir: discarded observations", result.stderr)
+
+    def test_concurrent_ir_missing_startup_observations_is_rejected(self):
+        for count in [73, 82, 83]:
+            with self.subTest(discarded=count):
+                record = valid_record()
+                set_discard_count(record["streams"][0], 76)
+                set_discard_count(record["streams"][1], count)
+                result = self.run_validator(record)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("ir: discarded observations", result.stderr)
+
+    def test_missing_full_establishment_is_rejected(self):
+        for index, count in [(0, 31), (1, 37)]:
+            with self.subTest(index=index):
+                record = sequential_record()
+                set_discard_count(record["streams"][index], count)
+                result = self.run_validator(record)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("below the minimum fill/warm-up", result.stderr)
     def test_identity_record_count_and_exact_keys_are_enforced(self):
         self.assertNotEqual(self.run_records([]).returncode, 0)
         record = valid_record()

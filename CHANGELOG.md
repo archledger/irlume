@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera census reports an unreadable privacy control as unknown (`null`),
+  not as a released shutter. Confirmed absent controls remain `false`;
+  capture and setup policy are unchanged (ADR-0031).
+
 - Rate-probe escalation counts every dequeue attempt against its existing
   fill budget, so corrupt buffers cannot extend single or paired probes
   without bound. Rate floors and full-fill fallback are unchanged (ADR-0021).

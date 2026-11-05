@@ -370,6 +370,29 @@ fn node_entries(scan: &crate::NodeScan, pairs: &[crate::CameraPair]) -> Vec<Cens
     out
 }
 
+/// Keep failed observations distinct from known released or absent controls.
+fn privacy_from_state(observed: std::io::Result<Option<bool>>) -> Option<bool> {
+    match observed {
+        Ok(Some(engaged)) => Some(engaged),
+        Ok(None) => Some(false), // The control is known to be absent.
+        Err(_) => None,
+    }
+}
+
+// Unlike the capture path's best-effort boolean, a census observation must
+// distinguish a failed read from a confirmed released/absent privacy control.
+fn privacy_observed(device: &str) -> Option<bool> {
+    let _permit = crate::lease::permit_for_endpoint(
+        device,
+        crate::lease::CameraOperationKind::Diagnostics,
+        std::time::Duration::from_secs(2),
+    )
+    .ok()?;
+    crate::hostfs::check_probe(device);
+    let dev = crate::hostfs::open_video(device).ok()?;
+    privacy_from_state(crate::privacy_state(&dev))
+}
+
 /// Gather one node's classification facts from the live device and sysfs.
 /// Hardware-only surface: the mapping from facts to a row is pure above.
 fn facts_for(
@@ -433,7 +456,7 @@ fn facts_for(
             "removable" => Some(true),
             _ => None,
         },
-        privacy: Some(crate::privacy_engaged(path)),
+        privacy: privacy_observed(path),
         paired: paired.contains(path),
         luma_ir_check,
     }
@@ -781,6 +804,7 @@ fn render_verdict(verdict: &CensusVerdict) -> String {
 
 #[cfg(test)]
 mod tests {
+    include!("census_privacy_tests.rs");
     use super::*;
 
     fn facts(node: &str, role: Role, fourccs: &[&[u8; 4]]) -> NodeFacts {

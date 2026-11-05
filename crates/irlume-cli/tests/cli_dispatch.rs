@@ -295,6 +295,173 @@ fn write_test_seal_without_pcr_snapshot(path: &Path) {
     std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
 }
 
+// ------------------------------------------------ measurement report comparison
+
+fn measurement_report_record(
+    meets_floor: bool,
+    gap: Option<u64>,
+) -> irlume_camera::measurement::MeasurementRecord {
+    use irlume_camera::measurement as m;
+    let round = m::RateRound {
+        deltas: 30,
+        timestamp_span_us: 1_000_000,
+        wall_clock_us: None,
+        max_inter_frame_gap_us: gap,
+        continuity_errors: 0,
+        meets_floor,
+    };
+    let mut record = m::MeasurementRecord {
+        schema_version: m::MEASUREMENT_SCHEMA_VERSION,
+        policy: m::AcceptancePolicy {
+            policy_version: 1,
+            min_completed_rounds: 1,
+            max_failed_rounds: 0,
+            max_inter_frame_gap_us: None,
+            require_all_rounds_meet_floor: true,
+        },
+        tool_revision: "synthetic".into(),
+        measured_at_unix: 1,
+        method: "sequential".into(),
+        stages: Vec::new(),
+        rates: vec![(
+            m::MeasuredRole::Ir,
+            m::RateEvidence::from_rounds(&[round], 0).unwrap(),
+        )],
+        arm_failed_rounds: 0,
+        acceptance: m::Acceptance {
+            accepted: false,
+            failures: Vec::new(),
+        },
+    };
+    record.acceptance = record.evaluate_acceptance().unwrap();
+    record
+}
+
+fn measurement_report_compare(
+    tag: &str,
+    reference: irlume_camera::measurement::MeasurementRecord,
+    fresh: irlume_camera::measurement::MeasurementRecord,
+) -> String {
+    let sb = Sandbox::new(tag);
+    let path = sb.path("work/reference.json");
+    let text = serde_json::to_string(&[reference]).unwrap();
+    std::fs::write(&path, &text).unwrap();
+    let fresh = serde_json::to_string(&[fresh]).unwrap();
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = requests.clone();
+    let output = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let emitted = output.clone();
+    serve(&sb.sock(), move |request| match request {
+        Request::TuneCaptureMode {
+            emit_record_path: Some(path),
+            ..
+        } => {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *emitted.lock().unwrap() = Some(PathBuf::from(path));
+            std::fs::write(path, &fresh).unwrap();
+            Response::Ok("synthetic measurement".into())
+        }
+        _ => Response::Error("unexpected synthetic request".into()),
+    });
+    let (code, _, error) = run(
+        &mut sb.cmd(&["camera-tune", "--verify-record", path.to_str().unwrap()]),
+        "measurement report comparison",
+    );
+    assert_eq!(code, 0, "{error}");
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+    assert!(!output.lock().unwrap().as_ref().unwrap().exists());
+    error
+}
+
+#[test]
+fn measurement_report_preserves_consistent_and_additional_refusals() {
+    use irlume_camera::measurement as m;
+    for accepted in [true, false] {
+        let record = measurement_report_record(accepted, Some(0));
+        let output = measurement_report_compare("measure-valid", record.clone(), record);
+        assert!(
+            output.contains(&format!("accepted {accepted} -> {accepted}")),
+            "{output}"
+        );
+        assert!(output.contains("max gap 0 -> 0 us"), "{output}");
+    }
+    let mut extra_refusal = measurement_report_record(true, Some(25_000));
+    assert!(extra_refusal.evaluate_acceptance().unwrap().accepted);
+    extra_refusal.acceptance = m::Acceptance {
+        accepted: false,
+        failures: vec![m::AcceptanceFailure::TooFewCompletedRounds {
+            role: m::MeasuredRole::Rgb,
+            completed: 0,
+            required: 1,
+        }],
+    };
+    let output = measurement_report_compare("measure-extra", extra_refusal.clone(), extra_refusal);
+    assert!(output.contains("accepted false -> false"), "{output}");
+}
+
+#[test]
+fn measurement_report_marks_contradictory_success_on_either_side() {
+    use irlume_camera::measurement as m;
+    for policy_fails in [false, true] {
+        let mut bad = measurement_report_record(!policy_fails, Some(25_000));
+        bad.acceptance.accepted = true;
+        if policy_fails {
+            // Contradict the recorded criteria while removing saved failures.
+            bad.acceptance.failures.clear();
+        } else {
+            // Contradict a saved failure despite otherwise passing criteria.
+            bad.acceptance
+                .failures
+                .push(m::AcceptanceFailure::TooManyFailedRounds {
+                    failed: 1,
+                    tolerated: 0,
+                });
+        }
+        let good = measurement_report_record(false, Some(25_000));
+        let reference = measurement_report_compare("measure-bad-ref", bad.clone(), good.clone());
+        assert!(
+            reference.contains("accepted inconsistent -> false"),
+            "{reference}"
+        );
+        let fresh = measurement_report_compare("measure-bad-fresh", good, bad);
+        assert!(fresh.contains("accepted false -> inconsistent"), "{fresh}");
+    }
+}
+
+#[test]
+fn measurement_report_marks_invalid_success_as_inconsistent() {
+    let good = measurement_report_record(true, Some(25_000));
+    let mut invalid = good.clone();
+    invalid.schema_version += 1;
+    assert!(invalid.evaluate_acceptance().is_err());
+    let reference =
+        measurement_report_compare("measure-invalid-ref", invalid.clone(), good.clone());
+    assert!(
+        reference.contains("accepted inconsistent -> true"),
+        "{reference}"
+    );
+    let fresh = measurement_report_compare("measure-invalid-fresh", good, invalid);
+    assert!(fresh.contains("accepted true -> inconsistent"), "{fresh}");
+}
+
+#[test]
+fn measurement_report_distinguishes_missing_gaps_from_zero() {
+    for (reference, fresh, expected) in [
+        (None, Some(25_000), "max gap n/a -> 25000 us"),
+        (Some(25_000), None, "max gap 25000 -> n/a us"),
+        (None, None, "max gap n/a -> n/a us"),
+        (Some(0), Some(25_000), "max gap 0 -> 25000 us"),
+    ] {
+        let output = measurement_report_compare(
+            "measure-gap",
+            measurement_report_record(true, reference),
+            measurement_report_record(true, fresh),
+        );
+        assert!(output.contains(expected), "{output}");
+    }
+}
+
 // ---------------------------------------------------------------- status arms
 
 // status renders one arm per daemon answer; cli.rs pins the all-green dashboard,

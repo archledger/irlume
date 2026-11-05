@@ -840,6 +840,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `camera-tune --verify-record` marks a claimed success as `inconsistent`
+  when stored failures or the record's policy evaluation contradict it, or
+  evaluation fails. Stored refusals remain `false`, including additional
+  producer checks. Missing frame-gap measurements print `n/a`, not zero
+  (ADR-0023).
+
 - PAD Markdown reports include the bona-fide non-response rate and sample
   count. Explicit Markdown export failures return a nonzero status instead
   of reporting command success.

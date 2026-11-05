@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Stream restoration confirms the displaced control value after an
+  acknowledged write. Failed or mismatched readback keeps the recovery
+  record claimable instead of marking restoration complete (#188).
+
 - `camera-tune --verify-record` validates and retains its reference before
   tuning, rejects inconsistent fresh evidence, and uses a private output
   directory shared with the daemon instead of its private temporary area.

@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `suncal` rejects malformed or unsupported PGM headers without panicking
+  and skips bursts whose frames have different dimensions, rather than
+  analyzing them with the last frame's dimensions.
+
 - `camera-tune --verify-record` marks a claimed success as `inconsistent`
   when stored failures or the record's policy evaluation contradict it, or
   evaluation fails. Stored refusals remain `false`, including additional

@@ -22,7 +22,7 @@ use std::process::ExitCode;
 fn read_pgm(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
     let raw = std::fs::read(path).ok()?;
     // Parse the three whitespace-separated header tokens after the "P5" magic.
-    if &raw[0..2] != b"P5" {
+    if !raw.starts_with(b"P5") || !raw.get(2).is_some_and(u8::is_ascii_whitespace) {
         return None;
     }
     let mut pos = 2usize;
@@ -36,14 +36,21 @@ fn read_pgm(path: &std::path::Path) -> Option<(u32, u32, Vec<u8>)> {
             pos += 1;
         }
         *v = std::str::from_utf8(&raw[start..pos]).ok()?.parse().ok()?;
+        if !raw.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            return None;
+        }
     }
-    pos += 1; // single whitespace after maxval, before the pixel block
-    let (w, h) = (vals[0], vals[1]);
-    let px = &raw[pos..];
-    if px.len() < (w * h) as usize {
+    let [w, h, maxval] = vals;
+    if w == 0 || h == 0 || maxval != 255 {
         return None;
     }
-    Some((w, h, px[..(w * h) as usize].to_vec()))
+    // Consume exactly the header separator: binary whitespace is pixel data.
+    pos += 1;
+    let pixels = usize::try_from(w)
+        .ok()?
+        .checked_mul(usize::try_from(h).ok()?)?;
+    let px = raw.get(pos..)?.get(..pixels)?;
+    Some((w, h, px.to_vec()))
 }
 
 /// Load every `frameNN.pgm` in a burst dir, ascending. Returns (w, h, frames).
@@ -59,17 +66,16 @@ fn load_burst(dir: &std::path::Path) -> Option<(u32, u32, Vec<Vec<u8>>)> {
         .collect();
     entries.sort();
     let mut frames = Vec::new();
-    let (mut w, mut h) = (0u32, 0u32);
+    let mut dimensions = None;
     for p in entries {
         let (fw, fh, data) = read_pgm(&p)?;
-        (w, h) = (fw, fh);
+        if *dimensions.get_or_insert((fw, fh)) != (fw, fh) {
+            return None;
+        }
         frames.push(data);
     }
-    if frames.is_empty() {
-        None
-    } else {
-        Some((w, h, frames))
-    }
+    let (w, h) = dimensions?;
+    Some((w, h, frames))
 }
 
 /// Detect the top IR face and return (brightness, center/edge ratio) for one grey
@@ -273,5 +279,76 @@ mod tests {
         let d = tmp("burst-empty");
         assert!(load_burst(&d).is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_pgm_rejects_malformed_headers_without_panicking() {
+        let d = tmp("pgm-invalid-header");
+        let cases: &[(&str, &[u8])] = &[
+            ("empty", b""),
+            ("one byte", b"P"),
+            ("magic only", b"P5"),
+            ("missing magic separator", b"P51 1 255\nx"),
+            ("missing dimension separator", b"P5\n1x1\n255\nx"),
+            ("missing raster separator", b"P5\n1 1\n255"),
+            ("invalid raster separator", b"P5\n1 1\n255Xx"),
+            ("zero width", b"P5\n0 1\n255\n"),
+            ("zero height", b"P5\n1 0\n255\n"),
+            ("zero maxval", b"P5\n1 1\n0\nx"),
+            ("scaled pixels", b"P5\n1 1\n1\nx"),
+            ("wide pixels", b"P5\n1 1\n256\nxx"),
+            ("sixteen-bit pixels", b"P5\n1 1\n65535\nxx"),
+            ("oversized dimension", b"P5\n4294967296 1\n255\nx"),
+            ("pixel count overflow", b"P5\n65536 65536\n255\n"),
+            ("short raster", b"P5\n2 2\n255\nx"),
+        ];
+        let path = d.join("frame.pgm");
+        let mut failures = Vec::new();
+        for &(name, bytes) in cases {
+            std::fs::write(&path, bytes).unwrap();
+            match std::panic::catch_unwind(|| read_pgm(&path)) {
+                Ok(None) => {}
+                Ok(Some(_)) => failures.push(format!("{name}: accepted")),
+                Err(_) => failures.push(format!("{name}: panicked")),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(failures.is_empty(), "{}", failures.join(", "));
+    }
+
+    #[test]
+    fn read_pgm_preserves_binary_whitespace_and_hash_pixels() {
+        let d = tmp("pgm-binary-boundary");
+        let path = d.join("frame.pgm");
+        for pixel in [b' ', b'\t', b'\n', b'\r', b'#', 0, 255] {
+            let mut bytes = b"P5\n1 1\n255\n".to_vec();
+            bytes.extend([pixel, 77, 88]);
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(read_pgm(&path), Some((1, 1, vec![pixel])));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_burst_rejects_mixed_dimensions_in_either_order() {
+        let d = tmp("burst-mixed-dimensions");
+        let mut accepted = Vec::new();
+        for (first, second) in [
+            ((2, 2), (4, 1)),
+            ((4, 1), (2, 2)),
+            ((2, 2), (3, 2)),
+            ((3, 2), (2, 2)),
+        ] {
+            std::fs::write(d.join("frame00.pgm"), pgm_bytes(first.0, first.1, 1)).unwrap();
+            std::fs::write(d.join("frame01.pgm"), pgm_bytes(second.0, second.1, 2)).unwrap();
+            if load_burst(&d).is_some() {
+                accepted.push((first, second));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(
+            accepted.is_empty(),
+            "accepted mixed dimensions: {accepted:?}"
+        );
     }
 }

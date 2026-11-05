@@ -286,6 +286,12 @@ fn presentation_record(
     serde_json::Value::Object(rec)
 }
 
+fn read_presentation_confirmation(input: &mut impl std::io::BufRead) -> std::io::Result<bool> {
+    let mut line = String::new();
+    let read = input.read_line(&mut line)?;
+    Ok(read != 0 && !line.trim().eq_ignore_ascii_case("q"))
+}
+
 /// `irlume padcapture --species NAME --kind attack|bonafide --det <yunet.onnx>
 ///   --out pad.jsonl [--path full|ir-only] [--n 10] [--rgb ..] [--ir ..] [--no-prompt]`
 pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
@@ -354,9 +360,9 @@ pub(crate) fn padcapture(args: &[String]) -> std::process::ExitCode {
                     idx + 1
                 );
                 std::io::stdout().flush().ok();
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line).ok();
-                if line.trim().eq_ignore_ascii_case("q") {
+                if !read_presentation_confirmation(&mut std::io::stdin().lock()).map_err(|e| {
+                    irlume_common::Error::Io(format!("cannot read presentation confirmation: {e}"))
+                })? {
                     break;
                 }
             }
@@ -703,6 +709,82 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
 mod tests {
     use super::*;
     use irlume_liveness::{IR_FACE_MIN_BRIGHTNESS, MIN_CENTER_EDGE_RATIO, MIN_FACE_SCORE};
+
+    #[test]
+    fn prompt_eof_stops_before_the_next_presentation() {
+        let mut input = std::io::Cursor::new(b"");
+        assert!(!read_presentation_confirmation(&mut input).unwrap());
+
+        let mut input = std::io::Cursor::new(b"\n");
+        assert!(read_presentation_confirmation(&mut input).unwrap());
+        assert!(!read_presentation_confirmation(&mut input).unwrap());
+    }
+
+    #[test]
+    fn prompt_preserves_quit_and_other_line_confirmations() {
+        for (line, expected) in [
+            ("\n", true),
+            (" \r\n", true),
+            ("ready\n", true),
+            ("ready", true),
+            ("q\n", false),
+            (" Q \r\n", false),
+            ("q", false),
+        ] {
+            let mut input = std::io::Cursor::new(line);
+            assert_eq!(
+                read_presentation_confirmation(&mut input).unwrap(),
+                expected,
+                "{line:?}"
+            );
+        }
+    }
+
+    struct PromptReadFailure;
+
+    impl Read for PromptReadFailure {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic prompt read failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn prompt_read_errors_are_not_confirmations_even_after_partial_input() {
+        for prefix in ["", "ready"] {
+            let mut input =
+                std::io::BufReader::new(std::io::Cursor::new(prefix).chain(PromptReadFailure));
+            let error = read_presentation_confirmation(&mut input).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "synthetic prompt read failure");
+        }
+    }
+
+    #[test]
+    fn prompt_read_error_after_a_complete_line_stops_the_next_presentation() {
+        let mut input =
+            std::io::BufReader::new(std::io::Cursor::new("\n").chain(PromptReadFailure));
+        assert!(read_presentation_confirmation(&mut input).unwrap());
+        assert_eq!(
+            read_presentation_confirmation(&mut input)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn prompt_invalid_utf8_is_not_a_confirmation() {
+        let mut input = std::io::Cursor::new(b"\xff\n");
+        assert_eq!(
+            read_presentation_confirmation(&mut input)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     fn report_test_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("irlume-report-{}", rand::random::<u64>()));

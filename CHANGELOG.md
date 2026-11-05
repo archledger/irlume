@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `padcapture` stops prompted capture on input EOF and returns failure on an
+  input read error, rather than treating either as permission to take another
+  sample. Previously appended records are kept; `--no-prompt` remains explicit.
+
 - PAD report export refuses an output that aliases its input corpus, including
   symbolic and hard links, instead of replacing the JSONL with Markdown.
   Distinct existing reports can still be replaced (PAD self-test reporting).

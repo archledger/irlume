@@ -10804,8 +10804,8 @@ pub fn tune_measurement_policy(requested_rounds: usize) -> measurement::Acceptan
 /// Builds an ADR-0023 measurement record for one completed contention arm
 /// from its recorded production window facts, with the acceptance policy
 /// evaluated against the record's own copy. Roles with no completed rounds
-/// are omitted (there is nothing to aggregate); the arm-level failed-round
-/// count is carried per role.
+/// are omitted, but fail the pair's acceptance check. The arm-level failed
+/// round count is recorded separately.
 ///
 /// # Errors
 ///
@@ -10848,7 +10848,22 @@ pub fn pair_sample_measurement_record(
         },
     };
     record.validate().map_err(wire)?;
-    let acceptance = record.evaluate_acceptance().map_err(wire)?;
+    let mut acceptance = record.evaluate_acceptance().map_err(wire)?;
+    for role in [
+        measurement::MeasuredRole::Rgb,
+        measurement::MeasuredRole::Ir,
+    ] {
+        if !record.rates.iter().any(|(observed, _)| *observed == role) {
+            acceptance.accepted = false;
+            acceptance
+                .failures
+                .push(measurement::AcceptanceFailure::TooFewCompletedRounds {
+                    role,
+                    completed: 0,
+                    required: record.policy.min_completed_rounds,
+                });
+        }
+    }
     Ok(measurement::MeasurementRecord {
         acceptance,
         ..record

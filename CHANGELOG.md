@@ -840,6 +840,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Pair-measurement records refuse acceptance when either camera role has no
+  recorded rounds, without inventing missing observations. Aggregated
+  continuity-error counts saturate instead of overflowing (ADR-0023).
+
 - The TUI marks clipped recognition results, hides consent toggles controlled
   by local or daemon overrides, and describes fingerprint enabling without
   promising face availability. Setup observations and successful wallet

@@ -14168,6 +14168,7 @@ mod engine_tests {
     #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
     mod identity_characterization_tests;
     mod managed_pad_tests;
+    mod managed_timing_tests;
     mod pair_identity_tests;
     mod request_preparation_tests;
     mod secondary_camera_tests;

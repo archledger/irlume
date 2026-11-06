@@ -215,6 +215,23 @@ pub(super) fn with_managed_pair<'d, R, I, T>(
     (result, true, Some(release))
 }
 
+/// Report a capture at its own endpoint, before its caller waits for the peer
+/// or drains the pair. Keep milliseconds for existing assessment metadata.
+pub(super) fn capture_with_timing<T>(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    stage: irlume_common::diagnostics::TraceStage,
+    capture: impl FnOnce() -> T,
+) -> (T, u128) {
+    let started = Instant::now();
+    let result = capture();
+    let elapsed = started.elapsed();
+    diagnostics.emit_trace(irlume_common::diagnostics::TraceEventKind::StageTiming {
+        stage,
+        elapsed_us: u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+    });
+    (result, elapsed.as_millis())
+}
+
 impl Engine {
     /// Only the ordinary Live + eligible RGB preparation can produce Pending.
     /// The callback includes capture, contract checks, and completed tail drains.
@@ -437,25 +454,37 @@ impl Engine {
             rgb,
             ir,
             |session| {
-                let started = Instant::now();
-                let frame = session.denoised();
-                if let Err(error) = &frame {
-                    if fault_revokes_rate_evidence(error) {
-                        session.invalidate_rate_evidence();
-                    }
-                }
-                rgb_ms = started.elapsed().as_millis();
+                let (frame, elapsed_ms) = capture_with_timing(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::RgbCapture,
+                    || {
+                        let frame = session.denoised();
+                        if let Err(error) = &frame {
+                            if fault_revokes_rate_evidence(error) {
+                                session.invalidate_rate_evidence();
+                            }
+                        }
+                        frame
+                    },
+                );
+                rgb_ms = elapsed_ms;
                 frame
             },
             |session| {
-                let started = Instant::now();
-                let frame = session.capture_with_stats();
-                if let Err(error) = &frame {
-                    if fault_revokes_rate_evidence(error) {
-                        session.invalidate_rate_evidence();
-                    }
-                }
-                ir_ms = started.elapsed().as_millis();
+                let (frame, elapsed_ms) = capture_with_timing(
+                    diagnostics,
+                    irlume_common::diagnostics::TraceStage::IrCapture,
+                    || {
+                        let frame = session.capture_with_stats();
+                        if let Err(error) = &frame {
+                            if fault_revokes_rate_evidence(error) {
+                                session.invalidate_rate_evidence();
+                            }
+                        }
+                        frame
+                    },
+                );
+                ir_ms = elapsed_ms;
                 frame
             },
         );
@@ -476,16 +505,6 @@ impl Engine {
         {
             return Err(irlume_common::Error::DeadlineExpired.into());
         }
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::RgbCapture,
-            rgb_ms,
-        );
-        emit_trace_stage_ms(
-            diagnostics,
-            irlume_common::diagnostics::TraceStage::IrCapture,
-            ir_ms,
-        );
         let capture_error = |error| {
             transport_error(
                 mode,

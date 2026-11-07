@@ -134,9 +134,11 @@ def srcinfo(pkgbuild: str, install: str) -> str:
     with tempfile.TemporaryDirectory() as recipe:
         Path(recipe, "PKGBUILD").write_text(pkgbuild)
         Path(recipe, "irlume.install").write_text(install)
+        # Only this task-owned temporary directory is relabelled. Keep the
+        # mount read-only while allowing the container to read it under SELinux.
         result = subprocess.run(
             [
-                engine, "run", "--rm", "--network=none", "-v", f"{recipe}:/recipe:ro", ARCH_IMAGE,
+                engine, "run", "--rm", "--network=none", "-v", f"{recipe}:/recipe:ro,Z", ARCH_IMAGE,
                 "bash", "-euc",
                 "useradd -m builder && cp -r /recipe /home/builder/recipe"
                 " && chown -R builder /home/builder/recipe"

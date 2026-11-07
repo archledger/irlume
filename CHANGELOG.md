@@ -840,6 +840,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera capability enumeration accepts repeated discrete frame intervals,
+  including equivalent fractions, without failing camera operations (#1294).
+  The canonical interval list remains unique; malformed responses and the
+  raw enumeration limit are still checked.
+
 - Managed concurrent capture reports each role's timing at its callback
   endpoint, including returned cancellation and deadline errors, instead of
   shifting or losing events after the pair finishes (ADR-0008).

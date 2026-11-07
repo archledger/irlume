@@ -56,6 +56,16 @@ usage: run-tests-guarded.sh --min N -- <command> [args...]
 EOF
 }
 
+# Discard only complete leading CSI controls when parsing, not arbitrary text
+# prefixes or escape sequences within a result. Crossterm's mouse cleanup can
+# share a line with libtest. The raw stream and captured log remain unchanged.
+without_terminal_prefixes() {
+  awk '
+    BEGIN { prefix = "^" sprintf("%c", 27) "\\[[0-?]*[ -/]*[@-~]" }
+    { while (match($0, prefix)) $0 = substr($0, RLENGTH + 1); print }
+  '
+}
+
 # Sum the `passed` counts across every test binary in a run.
 #
 # A single invocation can produce several summary lines: one per test target,
@@ -63,7 +73,7 @@ EOF
 # "test result: FAILED." and is deliberately excluded, though in practice a
 # non-zero exit status is reported before the count is ever consulted.
 count_passed() {
-  grep -E "$SUMMARY_RE" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' \
+  without_terminal_prefixes | grep -E "$SUMMARY_RE" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' \
     | awk '{s+=$1} END {print s+0}'
 }
 
@@ -73,7 +83,7 @@ count_passed() {
 # Emit each passing test twice, as its full path and as its final component, so
 # a workflow can name either form.
 passed_names() {
-  sed -n 's/^test \([^ ]*\) \.\.\. ok$/\1/p' "$1" \
+  without_terminal_prefixes < "$1" | sed -n 's/^test \([^ ]*\) \.\.\. ok$/\1/p' \
     | awk '{print; sub(/.*::/, ""); print}'
 }
 
@@ -219,6 +229,35 @@ test result: ok. 1 passed; 0 failed; 1 ignored'
       printf "WARNING:esys:Esys_Load() Received TPM Error\n" >&2
       printf "ok\n"
       printf "\ntest result: ok. 1 passed; 0 failed\n"'
+
+  # Crossterm may disable mouse reporting on stdout without a newline before
+  # libtest writes the next result. Keep these real terminal-prefix shapes.
+  expect "terminal prefixes do not hide required passing names" 0 \
+    "$0" --require alpha,beta -- printf '%b' '\033[?1006l\033[?1015ltest m::tests::alpha ... ok\n\033[?1003l\033[?1002l\033[?1000h\033[?1006htest m::tests::beta ... ok\n\ntest result: ok. 2 passed; 0 failed\n'
+  expect "a terminal-prefixed summary still counts" 0 \
+    "$0" --min 2 -- printf '%b' '\033[?1006ltest result: ok. 2 passed; 0 failed\n'
+  expect "terminal prefixes cannot substitute a different required name" 1 \
+    "$0" --require alpha -- printf '%b' '\033[?1006ltest m::tests::alpha_extra ... ok\ntest result: ok. 1 passed; 0 failed\n'
+  expect "terminal prefixes do not turn ignored tests into passes" 1 \
+    "$0" --require alpha -- printf '%b' '\033[?1006ltest m::tests::alpha ... ignored\ntest result: ok. 1 passed; 0 failed\n'
+  expect "text before a terminal-prefixed result is not accepted" 1 \
+    "$0" --require alpha -- printf '%b' 'stdout: \033[?1006ltest m::tests::alpha ... ok\ntest result: ok. 1 passed; 0 failed\n'
+  expect "terminal prefixes do not remove a text prefix" 1 \
+    "$0" --min 2 -- printf '%b' '\033[?1006lstdout: test result: ok. 2 passed; 0 failed\n'
+  expect "an incomplete terminal prefix is not accepted" 1 \
+    "$0" --require alpha -- printf '%b' '\033[?1006test m::tests::alpha ... ok\ntest result: ok. 1 passed; 0 failed\n'
+  expect "terminal-prefixed output preserves command failure" 101 \
+    "$0" --require alpha -- sh -c 'printf "\033[?1006ltest m::tests::alpha ... ok\ntest result: ok. 1 passed; 0 failed\n"; exit 101'
+
+  local terminal_output
+  terminal_output="$("$0" --require alpha -- printf '%b' '\033[?1006ltest m::tests::alpha ... ok\ntest result: ok. 1 passed; 0 failed\n')"
+  n=$((n + 1))
+  if [[ "$terminal_output" == $'\033[?1006ltest '* ]]; then
+    printf '  ok   terminal controls remain in the raw output\n'
+  else
+    printf '  FAIL terminal controls remain in the raw output\n'
+    failures=$((failures + 1))
+  fi
 
   expect "require implies its own minimum count" 1 \
     "$0" --require alpha,beta,gamma -- printf '%s' 'test m::tests::alpha ... ok

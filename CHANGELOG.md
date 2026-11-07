@@ -867,6 +867,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Test-runner guards recognize leading terminal-control sequences before
+  libtest results, avoiding false missing-test failures in TUI checks while
+  retaining exact test-name and pass-count requirements.
+
 - Boot-time PAM reconciliation waits for the daemon's start job without making
   the daemon wait for the target that contains reconciliation. Disabled-daemon
   choices, readiness checks and password fallback remain unchanged.

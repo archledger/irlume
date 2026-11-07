@@ -447,7 +447,13 @@ fn enumerate_via<S: RecordSource>(
             values.push(value);
             for index in 1..MAX_DISCRETE_INTERVALS {
                 match read_record(source, query, index)? {
-                    Some(RawKind::Discrete(value)) => values.push(value),
+                    Some(RawKind::Discrete(value)) => {
+                        // Drivers can repeat equivalent capabilities (#1294).
+                        // Keep the domain unique, but bound raw records by index.
+                        if !values.contains(&value) {
+                            values.push(value);
+                        }
+                    }
                     Some(RawKind::Continuous { .. } | RawKind::Stepwise { .. }) => {
                         return Err(FrameIntervalError::MixedType);
                     }
@@ -815,6 +821,171 @@ mod tests {
             FrameIntervalDomain::discrete(vec![interval(1, 30), interval(2, 60)]),
             Err(FrameIntervalError::DuplicateDiscrete(interval(1, 30)))
         );
+    }
+
+    #[test]
+    fn enumeration_deduplicates_reported_mjpg_intervals() {
+        // #1294: the driver repeats 1/30 for the same MJPG geometry.
+        let query = FrameIntervalQuery::new(*b"MJPG", 2560, 1440).unwrap();
+        let records = (0..2).map(|index| {
+            Ok(RawRecord {
+                pixel_format: query.pixel_format(),
+                width: 2560,
+                height: 1440,
+                ..discrete(index, interval(1, 30))
+            })
+        });
+        let mut source = FixtureSource::new(records.chain([Err(errno(libc::EINVAL))]));
+        let domain = enumerate_via(query, &mut source).unwrap();
+        assert_eq!(domain.discrete_values().unwrap(), &[interval(1, 30)]);
+        assert!(
+            source.answers.is_empty(),
+            "enumerate through the terminal EINVAL"
+        );
+    }
+
+    #[test]
+    fn enumeration_deduplicates_equivalent_intervals_without_losing_later_values() {
+        let values = [(1, 30), (1, 15), (2, 60), (1, 60), (2, 30), (1, 30)];
+        let records = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, (n, d))| Ok(discrete(index as u32, interval(n, d))));
+        let mut source = FixtureSource::new(records.chain([Err(errno(libc::EINVAL))]));
+        let domain = enumerate_via(query(), &mut source).unwrap();
+        assert_eq!(
+            domain.discrete_values().unwrap(),
+            &[interval(1, 60), interval(1, 30), interval(1, 15)]
+        );
+        assert!(!domain.contains(interval(1, 20)));
+        assert!(source.answers.is_empty());
+    }
+
+    #[test]
+    fn enumeration_accepts_maximum_number_of_duplicate_records() {
+        let records = (0..MAX_DISCRETE_INTERVALS).map(|index| Ok(discrete(index, interval(1, 30))));
+        let mut source = FixtureSource::new(records.chain([Err(errno(libc::EINVAL))]));
+        let domain = enumerate_via(query(), &mut source).unwrap();
+        assert_eq!(domain.discrete_values().unwrap(), &[interval(1, 30)]);
+        assert!(source.answers.is_empty());
+    }
+
+    #[test]
+    fn duplicate_records_cannot_extend_the_raw_enumeration_budget() {
+        let records =
+            (0..=MAX_DISCRETE_INTERVALS).map(|index| Ok(discrete(index, interval(1, 30))));
+        let mut source = FixtureSource::new(records.chain([Err(errno(libc::EIO))]));
+        assert_eq!(
+            enumerate_via(query(), &mut source),
+            Err(FrameIntervalError::TooMany)
+        );
+        assert_eq!(
+            source.answers.len(),
+            1,
+            "no query beyond the raw-record limit"
+        );
+    }
+
+    #[test]
+    fn duplicate_records_still_require_valid_query_echoes() {
+        for malformed in [
+            RawRecord {
+                index: 2,
+                ..discrete(1, interval(1, 30))
+            },
+            RawRecord {
+                pixel_format: u32::from_le_bytes(*b"MJPG"),
+                ..discrete(1, interval(1, 30))
+            },
+            RawRecord {
+                width: 800,
+                ..discrete(1, interval(1, 30))
+            },
+            RawRecord {
+                height: 600,
+                ..discrete(1, interval(1, 30))
+            },
+            RawRecord {
+                reserved: [0, 1],
+                ..discrete(1, interval(1, 30))
+            },
+        ] {
+            let mut source = FixtureSource::new([
+                Ok(discrete(0, interval(1, 30))),
+                Ok(malformed),
+                Err(errno(libc::EINVAL)),
+            ]);
+            assert!(matches!(
+                enumerate_via(query(), &mut source),
+                Err(FrameIntervalError::MalformedResponse { index: 1, .. })
+            ));
+            assert_eq!(
+                source.answers.len(),
+                1,
+                "malformed duplicate ends enumeration"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_records_do_not_hide_late_io_errors() {
+        for code in [libc::EIO, libc::ENODEV, libc::EACCES] {
+            let mut source = FixtureSource::new([
+                Ok(discrete(0, interval(1, 30))),
+                Ok(discrete(1, interval(1, 30))),
+                Err(errno(code)),
+            ]);
+            assert!(matches!(
+                enumerate_via(query(), &mut source),
+                Err(FrameIntervalError::Io { index: 2, errno: Some(actual), .. }) if actual == code
+            ));
+            assert!(source.answers.is_empty());
+        }
+    }
+
+    #[test]
+    fn duplicate_records_do_not_hide_late_type_or_rational_errors() {
+        for (next, expected) in [
+            (
+                Ok(RawRecord {
+                    kind: RawKind::Continuous {
+                        min: interval(1, 60),
+                        max: interval(1, 30),
+                    },
+                    ..discrete(2, interval(1, 30))
+                }),
+                FrameIntervalError::MixedType,
+            ),
+            (
+                Ok(RawRecord {
+                    kind: RawKind::Unknown(4),
+                    ..discrete(2, interval(1, 30))
+                }),
+                FrameIntervalError::UnknownRawType(4),
+            ),
+            (
+                Err(std::io::Error::other(FrameIntervalError::ZeroNumerator)),
+                FrameIntervalError::MalformedResponse {
+                    index: 2,
+                    reason: "zero numerator in driver response",
+                },
+            ),
+            (
+                Err(std::io::Error::other(FrameIntervalError::ZeroDenominator)),
+                FrameIntervalError::MalformedResponse {
+                    index: 2,
+                    reason: "zero denominator in driver response",
+                },
+            ),
+        ] {
+            let mut source = FixtureSource::new([
+                Ok(discrete(0, interval(1, 30))),
+                Ok(discrete(1, interval(1, 30))),
+                next,
+            ]);
+            assert_eq!(enumerate_via(query(), &mut source), Err(expected));
+            assert!(source.answers.is_empty());
+        }
     }
 
     #[test]
@@ -1193,6 +1364,41 @@ mod tests {
                 "release"
             ]
         );
+    }
+
+    #[test]
+    fn duplicate_enumeration_keeps_postcheck_and_resource_release() {
+        for stale in [false, true] {
+            let mut hooks = Hooks::new(libc::EINVAL);
+            hooks.source = Some(FixtureSource::new([
+                Ok(discrete(0, interval(1, 30))),
+                Ok(discrete(1, interval(1, 30))),
+                Err(errno(libc::EINVAL)),
+            ]));
+            let refusal = FrameIntervalError::Device {
+                device: "/dev/video-test".into(),
+                message: "stale endpoint".into(),
+            };
+            if stale {
+                hooks.coverage = [Ok(()), Err(refusal.clone())].into();
+            }
+            let result = entrypoint_via("/dev/video-test", *b"YUYV", 640, 480, &mut hooks);
+            if stale {
+                assert_eq!(result, Err(refusal));
+            } else {
+                assert_eq!(
+                    result.unwrap().discrete_values().unwrap(),
+                    &[interval(1, 30)]
+                );
+            }
+            assert_eq!(
+                &*hooks.log.borrow(),
+                &[
+                    "verify", "permit", "coverage", "open", "record", "record", "record",
+                    "coverage", "close", "release"
+                ]
+            );
+        }
     }
 
     #[test]

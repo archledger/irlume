@@ -14,8 +14,12 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("arch_git_pkgbuild", ROOT / "scripts" / "arch-git-pkgbuild.py")
@@ -35,6 +39,25 @@ def function(text: str, name: str) -> str:
 
 
 class ArchGitRecipe(unittest.TestCase):
+    def test_srcinfo_mount_is_private_labelled_read_only_and_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(GENERATOR.shutil, "which", side_effect=lambda name:
+                              "/tools/podman" if name == "podman" else None), \
+                    patch.object(GENERATOR.tempfile, "TemporaryDirectory",
+                                 return_value=nullcontext(temporary)), \
+                    patch.object(GENERATOR.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=0, stdout="generated metadata", stderr="")) as run:
+                self.assertEqual(GENERATOR.srcinfo("recipe", "hooks"), "generated metadata")
+            run.assert_called_once_with(
+                ["/tools/podman", "run", "--rm", "--network=none", "-v",
+                 f"{temporary}:/recipe:ro,Z", GENERATOR.ARCH_IMAGE, "bash", "-euc",
+                 "useradd -m builder && cp -r /recipe /home/builder/recipe"
+                 " && chown -R builder /home/builder/recipe"
+                 " && su builder -c 'cd /home/builder/recipe && makepkg --printsrcinfo'"],
+                check=False, capture_output=True, text=True)
+            self.assertEqual(Path(temporary, "PKGBUILD").read_text(), "recipe")
+            self.assertEqual(Path(temporary, "irlume.install").read_text(), "hooks")
+
     def test_names_provides_and_conflicts(self) -> None:
         self.assertIn("pkgbase=irlume-git\n", NIGHTLY)
         self.assertIn("pkgname=(irlume-git irlume-kcm-git)\n", NIGHTLY)

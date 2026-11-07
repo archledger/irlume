@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-camera"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "irlume-common",
  "libc",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-common"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "libc",
  "serde",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "irlume-vision"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "edgefirst-tflite",
  "irlume-common",

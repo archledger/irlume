@@ -6,7 +6,7 @@
 Never invoke this on an installed host. The guard runs before any mutation.
 No enrollment, biometric template, recovery envelope or physical device is used.
 
-Source contract for the 0.14.0 -> 0.15.0 release pair:
+Source contract for the 0.15.0 -> 0.16.0 release pair:
 * crates/irlume-daemon/src/retry_throttle.rs: Record v2, FaceBudget, Store::path.
 * crates/irlume-daemon/src/retry_throttle/recovery.rs: Attempts v1, status/reset.
 * crates/irlume-cli/src/retry.rs and main.rs::read_password: CLI and stdin.

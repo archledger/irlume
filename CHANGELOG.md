@@ -413,6 +413,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Upgrade-validation tools require the 0.15.0 -> 0.16.0 -> 0.15.0 -> 0.16.0
+  package sequence. Rollback guidance distinguishes preserved files from
+  usable migrated TPM envelopes and requires separate sealed-state recovery
+  acceptance; see `docs/UPGRADE-VALIDATION.md`.
+
 - Use published `edgefirst-tflite` and `edgefirst-tflite-sys` 0.11.1 in place
   of the temporary ZIP-9 Git pin (#1103). Both lockfiles retain the reviewed
   registry checksums and the ZIP >= 9.0.5 guard. The explicit runtime path,

@@ -2,7 +2,7 @@
 %global ort_ver 1.28.1
 
 Name:           irlume
-Version:        0.15.0
+Version:        0.16.0
 Release:        1%{?dist}
 Summary:        Face authentication for Linux
 

@@ -22,20 +22,49 @@ SPEC.loader.exec_module(upgrade)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_release_pair_is_015_to_016(self):
+        self.assertEqual((upgrade.OLD_VERSION, upgrade.CANDIDATE_VERSION),
+                         ("0.15.0", "0.16.0"))
+
+    def test_other_release_pairs_refused_before_output_or_transactions(self):
+        for versions in (("0.14.0", "0.15.0"), ("0.15.0", "0.15.0"),
+                         ("0.14.0", "0.16.0"), ("0.16.0", "0.16.0")):
+            with self.subTest(versions=versions), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                old, candidate = root / "old.deb", root / "candidate.deb"
+                old.write_bytes(b"old synthetic package")
+                candidate.write_bytes(b"candidate synthetic package")
+                output = root / "result.json"
+                with patch.object(upgrade, "INPUT_ROOT", root), \
+                        patch.object(upgrade, "admit_guest", return_value="kvm"), \
+                        patch.object(upgrade, "read_command", side_effect=[
+                            "irlume", versions[0], "irlume", versions[1]]), \
+                        patch.object(upgrade, "Runner") as runner, \
+                        patch.object(upgrade, "execute") as execute, \
+                        patch.object(upgrade.sys, "stdout", io.StringIO()), \
+                        patch.object(upgrade.sys, "stderr", io.StringIO()):
+                    self.assertEqual(upgrade.main([
+                        "--old", str(old), "--candidate", str(candidate),
+                        "--output", str(output)]), 2)
+                runner.assert_not_called()
+                execute.assert_not_called()
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_name(output.name + ".log").exists())
+
     def test_ppa_versions_require_the_explicit_lane_and_exact_upstream(self):
-        version = "0.15.0-0ppa1~resolute1"
+        version = "0.16.0-0ppa1~resolute1"
         with patch.object(upgrade, "read_command", side_effect=["irlume", version]):
             with self.assertRaisesRegex(upgrade.Failure, "package-metadata"):
-                upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.15.0")
+                upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.16.0")
         with patch.object(upgrade, "read_command", side_effect=["irlume", version]):
             self.assertEqual(upgrade.package_metadata(
-                Path("/candidate.deb"), "deb", "0.15.0", deb_lane="ppa"), version)
-        for bad in ("0.14.0-0ppa1~resolute1", "0.15.0-1", "0.15.0-0ppa1~noble1",
-                    "1:0.15.0-0ppa1~resolute1", "0.15.0-0ppa1~resolute1\nextra"):
+                Path("/candidate.deb"), "deb", "0.16.0", deb_lane="ppa"), version)
+        for bad in ("0.15.0-0ppa1~resolute1", "0.16.0-1", "0.16.0-0ppa1~noble1",
+                    "1:0.16.0-0ppa1~resolute1", "0.16.0-0ppa1~resolute1\nextra"):
             with self.subTest(version=bad), \
                     patch.object(upgrade, "read_command", side_effect=["irlume", bad]):
                 with self.assertRaisesRegex(upgrade.Failure, "package-metadata"):
-                    upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.15.0", deb_lane="ppa")
+                    upgrade.package_metadata(Path("/candidate.deb"), "deb", "0.16.0", deb_lane="ppa")
 
     def test_each_debian_lane_requires_its_shipped_pam_module_mode(self):
         common = {
@@ -82,7 +111,7 @@ class HarnessTests(unittest.TestCase):
             with patch.object(upgrade, "INPUT_ROOT", root), \
                     patch.object(upgrade, "admit_guest", return_value="kvm"), \
                     patch.object(upgrade, "read_command", side_effect=[
-                        "irlume", "0.14.0-0ppa1~resolute1", "irlume", "0.15.0-0ppa1~resolute1"]), \
+                        "irlume", "0.15.0-0ppa1~resolute1", "irlume", "0.16.0-0ppa1~resolute1"]), \
                     patch.object(upgrade, "Runner"), \
                     patch.object(upgrade, "execute") as execute, \
                     patch.object(upgrade.sys, "stdout", io.StringIO()):
@@ -92,13 +121,13 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(execute.call_args.kwargs["deb_lane"], "ppa")
             self.assertEqual(json.loads(output.read_text())["deb_lane"], "ppa")
 
-    def test_release_policy_packages_match_the_014_to_015_main_packages(self):
-        metadata = ["irlume-selinux\t(none)\t0.14.0\t1.fc44\tnoarch",
-                    "irlume-selinux\t(none)\t0.15.0\t1.fc44\tnoarch"]
+    def test_release_policy_packages_match_the_015_to_016_main_packages(self):
+        metadata = ["irlume-selinux\t(none)\t0.15.0\t1.fc44\tnoarch",
+                    "irlume-selinux\t(none)\t0.16.0\t1.fc44\tnoarch"]
         with patch.object(upgrade, "package_path", side_effect=[Path("/old.rpm"), Path("/new.rpm")]), \
                 patch.object(upgrade, "read_command", side_effect=metadata):
             self.assertEqual(upgrade.rpm_companions(
-                "/old.rpm", "/new.rpm", ("0.14.0-1.fc44", "0.15.0-1.fc44")),
+                "/old.rpm", "/new.rpm", ("0.15.0-1.fc44", "0.16.0-1.fc44")),
                 (Path("/old.rpm"), Path("/new.rpm")))
 
     def test_rpm_metadata_checks_upstream_name_epoch_and_architecture(self):
@@ -411,7 +440,7 @@ class HarnessTests(unittest.TestCase):
                 processes.append(process)
             with patch.object(upgrade, "INPUT_ROOT", root), \
                  patch.object(upgrade, "admit_guest", return_value="kvm"), \
-                 patch.object(upgrade, "read_command", side_effect=["irlume", "0.14.0", "irlume", "0.15.0"]), \
+                 patch.object(upgrade, "read_command", side_effect=["irlume", "0.15.0", "irlume", "0.16.0"]), \
                  patch.object(upgrade.subprocess, "Popen", side_effect=processes) as command, \
                  patch.object(upgrade.sys, "stdout", io.StringIO()):
                 self.assertEqual(upgrade.main(["--old", str(old), "--candidate", str(candidate),

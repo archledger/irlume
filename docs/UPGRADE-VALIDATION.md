@@ -8,8 +8,8 @@ four real package transactions in one disposable systemd guest:
 3. Restore the complete old package (`old-rollback`).
 4. Upgrade to the candidate again (`candidate-reupgrade`).
 
-The current harness requires upstream versions **0.14.0 → 0.15.0 → 0.14.0 →
-0.15.0**. It checks package metadata and installed CLI versions; renaming an
+The current harness requires upstream versions **0.15.0 → 0.16.0 → 0.15.0 →
+0.16.0**. It checks package metadata and installed CLI versions; renaming an
 artifact does not change its version. For a later release pair, review and
 update the harness's version and state-format assertions before running it.
 This document describes a procedure, not a completed qualification result.
@@ -242,6 +242,26 @@ AppArmor/SELinux assertions, and a working independent administrator login.
 For a running case, also verify the live executable matches the installed
 candidate. Never use the active-daemon harness or its Ping check to validate an
 inactive case: the check itself could activate the socket and invalidate it.
+
+## Sealed-state migration and downgrade
+
+The four-stage harness seeds retry records and synthetic preservation files,
+not enrolled templates or sealed keyring/recovery envelopes. Its passing
+receipt does not establish that an older daemon can use migrated sealed state.
+
+Some eligible envelopes rewritten under the candidate's DA-exempt TPM parent
+cannot be opened by v0.15.0 after downgrade. Restoring the old package while
+retaining those bytes does not restore their cryptographic usability. Keep an
+independent working password/admin path; do not promise transparent rollback.
+
+Before accepting the release, separately qualify old-to-candidate migration,
+candidate use, the expected old-reader refusal after downgrade and intact
+password fallback in a disposable software-TPM fixture using synthetic state.
+Also qualify the supported template recovery/re-enrollment path, the separate
+keyring verified-login reseal/arming path, and interrupted migration behavior.
+Do not use owner enrollment or recovery material for that test. The storage
+and recovery contracts are described in [SECURITY_AT_REST.md](SECURITY_AT_REST.md)
+and [SETUP.md](SETUP.md); the package harness is not a replacement for them.
 
 ## Qualification limits
 

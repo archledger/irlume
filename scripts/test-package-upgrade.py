@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""Strict 0.14.0 -> 0.15.0 -> 0.14.0 -> 0.15.0 disposable QEMU test.
+"""Strict 0.15.0 -> 0.16.0 -> 0.15.0 -> 0.16.0 disposable QEMU test.
 
 Run inside a fresh root-owned guest only. Prepare dependencies/package inputs
 separately; this script does not alter service security settings. The marker is
@@ -39,8 +39,8 @@ SYNTHETIC_ROOT = STATE_ROOT / "upgrade-validation"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C", "LC_ALL": "C",
        "DEBIAN_FRONTEND": "noninteractive", "SYSTEMD_PAGER": "cat"}
 RPM_QUERY = "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\\n"
-OLD_VERSION = "0.14.0"
-CANDIDATE_VERSION = "0.15.0"
+OLD_VERSION = "0.15.0"
+CANDIDATE_VERSION = "0.16.0"
 
 
 class Failure(Exception):

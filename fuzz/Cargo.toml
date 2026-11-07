@@ -37,13 +37,6 @@ irlume-camera = { path = "../crates/irlume-camera" }
 
 [patch.crates-io]
 tss-esapi = { git = "https://github.com/archledger/rust-tss-esapi", branch = "irlume-patches" }
-# Same tflite zip-9 pin as the root Cargo.toml (full rationale there and in
-# docs/research/tflite-zip9-pin.md): exact rev, never a floating branch, so
-# fuzz/Cargo.lock resolves the identical upstream sources as the root
-# workspace. The graph guard in crates/irlume-vision/src/lib.rs asserts
-# both lockfiles stay on this rev with zip >= 9.0.5.
-edgefirst-tflite = { git = "https://github.com/EdgeFirstAI/tflite-rs", rev = "43c7a741818866bd7e4dc209f504430540c8711f" }
-edgefirst-tflite-sys = { git = "https://github.com/EdgeFirstAI/tflite-rs", rev = "43c7a741818866bd7e4dc209f504430540c8711f" }
 
 [[bin]]
 name = "ipc_request"

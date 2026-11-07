@@ -398,8 +398,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite"
-version = "0.10.3"
-source = "git+https://github.com/EdgeFirstAI/tflite-rs?rev=43c7a741818866bd7e4dc209f504430540c8711f#43c7a741818866bd7e4dc209f504430540c8711f"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78b51ae77d80311356e835829fe72d324f7033d8b7f06f8d82d6c7c06ca434e2"
 dependencies = [
  "edgefirst-tflite-sys",
  "flatbuffers",
@@ -411,8 +412,9 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-tflite-sys"
-version = "0.10.3"
-source = "git+https://github.com/EdgeFirstAI/tflite-rs?rev=43c7a741818866bd7e4dc209f504430540c8711f#43c7a741818866bd7e4dc209f504430540c8711f"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e992e8d4f4b0f7ae18b6aacef45b412fed1a451943b1a30f1c0215bbfdbf1e5"
 dependencies = [
  "flate2",
  "libloading 0.9.0",

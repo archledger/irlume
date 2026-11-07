@@ -3961,26 +3961,28 @@ mod model_tests {
 
 #[cfg(test)]
 mod tflite_dependency_graph_tests {
-    //! Guards the resolved dependency graph behind the tflite zip-9 pin
-    //! (#1103). The `[patch.crates-io]` entries in `Cargo.toml` and
-    //! `fuzz/Cargo.toml` pin `edgefirst-tflite`/`-sys` to an upstream
-    //! revision whose build-only zip dependency is 9.x; the three zip
-    //! advisory exceptions in `deny.toml` were dropped together with that
-    //! pin. A reverted patch section, or a lockfile refresh that quietly
-    //! falls back to the crates.io 0.10.3 pair, restores zip 8 and the
-    //! advisories with it. Reading the committed lockfiles here turns that
-    //! into a same-day test failure instead of a red advisory gate later.
+    //! Guards the reviewed registry release that replaces the temporary
+    //! tflite zip-9 Git pin (#1103). Both lockfiles must retain the reviewed
+    //! version, registry source and package checksums, without restoring an
+    //! older ZIP dependency. See docs/research/tflite-0.11.1-audit.md.
 
     use toml::Value;
 
     const ROOT_LOCK: &str = include_str!("../../../Cargo.lock");
     const FUZZ_LOCK: &str = include_str!("../../../fuzz/Cargo.lock");
 
-    /// The EdgeFirstAI/tflite-rs commit both tflite crates are pinned to.
-    /// It is merged upstream main that moves edgefirst-tflite-sys's
-    /// build-only zip dependency to 9; review
-    /// docs/research/tflite-zip9-pin.md before changing it.
-    const PINNED_TFLITE_REV: &str = "43c7a741818866bd7e4dc209f504430540c8711f";
+    const TFLITE_VERSION: &str = "0.11.1";
+    const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    const TFLITE_PACKAGES: [(&str, &str); 2] = [
+        (
+            "edgefirst-tflite",
+            "78b51ae77d80311356e835829fe72d324f7033d8b7f06f8d82d6c7c06ca434e2",
+        ),
+        (
+            "edgefirst-tflite-sys",
+            "3e992e8d4f4b0f7ae18b6aacef45b412fed1a451943b1a30f1c0215bbfdbf1e5",
+        ),
+    ];
 
     /// Every zip advisory tracked on this path is closed at or before this
     /// version: RUSTSEC-2026-0367/0368/0369 and RUSTSEC-2026-0429 are
@@ -4043,17 +4045,14 @@ mod tflite_dependency_graph_tests {
             assert!(
                 version_tuple(version) >= ZIP_FLOOR,
                 "{label}: zip {version} is below the advisory floor \
-                 {ZIP_FLOOR:?}; the tflite patch is stale or was reverted \
-                 (see docs/research/tflite-zip9-pin.md)"
+                 {ZIP_FLOOR:?}; review the resolved dependency graph \
+                 (see docs/research/tflite-0.11.1-audit.md)"
             );
         }
     }
 
     fn assert_tflite_pinned(lock: &str, label: &str) {
-        let expected_source = format!(
-            "git+https://github.com/EdgeFirstAI/tflite-rs?rev={PINNED_TFLITE_REV}#{PINNED_TFLITE_REV}"
-        );
-        for name in ["edgefirst-tflite", "edgefirst-tflite-sys"] {
+        for (name, checksum) in TFLITE_PACKAGES {
             let matches: Vec<_> = packages(lock)
                 .into_iter()
                 .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
@@ -4063,13 +4062,96 @@ mod tflite_dependency_graph_tests {
                 1,
                 "{label}: expected exactly one {name} entry"
             );
-            let source = source_of(&matches[0]).unwrap_or_default().to_owned();
+            let entry = &matches[0];
             assert_eq!(
-                source, expected_source,
-                "{label}: {name} does not resolve to the pinned upstream \
-                 revision; a crates.io or drifted-rev resolution reintroduces \
-                 the zip 8 build dependency (see docs/research/tflite-zip9-pin.md)"
+                version_of(entry),
+                TFLITE_VERSION,
+                "{label}: {name} is not the reviewed release"
             );
+            assert_eq!(
+                source_of(entry),
+                Some(CRATES_IO_SOURCE),
+                "{label}: {name} does not resolve from the reviewed registry"
+            );
+            assert_eq!(
+                entry.get("checksum").and_then(Value::as_str),
+                Some(checksum),
+                "{label}: {name} does not match the reviewed package checksum"
+            );
+        }
+    }
+
+    fn reviewed_lock_fixture() -> Value {
+        let text = TFLITE_PACKAGES
+            .iter()
+            .map(|(name, checksum)| {
+                format!(
+                    "[[package]]\nname = {name:?}\nversion = {TFLITE_VERSION:?}\n\
+                     source = {CRATES_IO_SOURCE:?}\nchecksum = {checksum:?}\n"
+                )
+            })
+            .collect::<String>();
+        Value::Table(text.parse().expect("valid registry lock fixture"))
+    }
+
+    fn assert_rejected_fixture(lock: &Value, label: &str) {
+        let text = toml::to_string(lock).expect("fixture serializes");
+        assert!(
+            std::panic::catch_unwind(|| assert_tflite_pinned(&text, label)).is_err(),
+            "accepted invalid registry identity: {label}"
+        );
+    }
+
+    #[test]
+    fn reviewed_release_guard_rejects_identity_drift() {
+        let valid = reviewed_lock_fixture();
+        assert_tflite_pinned(&toml::to_string(&valid).unwrap(), "valid fixture");
+        for index in 0..TFLITE_PACKAGES.len() {
+            for (field, wrong) in [
+                ("version", "0.10.3"),
+                (
+                    "source",
+                    "git+https://github.com/EdgeFirstAI/tflite-rs#unreviewed",
+                ),
+                (
+                    "checksum",
+                    "0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            ] {
+                let mut invalid = valid.clone();
+                invalid["package"][index][field] = Value::String(wrong.into());
+                assert_rejected_fixture(&invalid, field);
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_release_guard_requires_identity_fields_and_unique_packages() {
+        let valid = reviewed_lock_fixture();
+        for index in 0..TFLITE_PACKAGES.len() {
+            for field in ["source", "version", "checksum"] {
+                let mut invalid = valid.clone();
+                invalid["package"][index]
+                    .as_table_mut()
+                    .unwrap()
+                    .remove(field);
+                assert_rejected_fixture(&invalid, field);
+            }
+            let mut missing = valid.clone();
+            missing["package"].as_array_mut().unwrap().remove(index);
+            assert_rejected_fixture(&missing, "missing package");
+            let mut duplicate = valid.clone();
+            let entry = duplicate["package"][index].clone();
+            duplicate["package"].as_array_mut().unwrap().push(entry);
+            assert_rejected_fixture(&duplicate, "duplicate package");
+        }
+    }
+
+    #[test]
+    fn zip_guard_rejects_versions_below_the_advisory_floor() {
+        for version in ["8.6.0", "9.0.4"] {
+            let lock = format!("[[package]]\nname = \"zip\"\nversion = {version:?}\n");
+            assert!(std::panic::catch_unwind(|| assert_zip_above_floor(&lock, "fixture")).is_err());
         }
     }
 
@@ -4084,12 +4166,12 @@ mod tflite_dependency_graph_tests {
     }
 
     #[test]
-    fn root_lock_resolves_both_tflite_crates_from_the_pinned_rev() {
+    fn root_lock_resolves_both_tflite_crates_from_the_reviewed_release() {
         assert_tflite_pinned(ROOT_LOCK, "Cargo.lock");
     }
 
     #[test]
-    fn fuzz_lock_resolves_both_tflite_crates_from_the_pinned_rev() {
+    fn fuzz_lock_resolves_both_tflite_crates_from_the_reviewed_release() {
         assert_tflite_pinned(FUZZ_LOCK, "fuzz/Cargo.lock");
     }
 }

@@ -61,15 +61,14 @@ ignore = [
 multiple-versions = "warn"
 
 [sources]
-# The workspace intentionally has exactly three git sources, each pinned by
+# The workspace intentionally has exactly two git sources, each pinned by
 # commit: the tss-esapi fork, the pamsm fork (archledger/pam_sm_rust,
-# ADR-0012) and the EdgeFirstAI/tflite-rs zip-9 pin (see the [patch]
-# comments in Cargo.toml). Any other git or non-crates.io source appearing
+# ADR-0012; see the [patch] comments in Cargo.toml).
+# Any other git or non-crates.io source appearing
 # in the tree should fail CI until it is reviewed and listed here.
 unknown-git = "deny"
 unknown-registry = "deny"
 allow-git = [
     "https://github.com/archledger/rust-tss-esapi",
     "https://github.com/archledger/pam_sm_rust",
-    "https://github.com/EdgeFirstAI/tflite-rs",
 ]

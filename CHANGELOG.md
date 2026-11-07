@@ -413,6 +413,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Use published `edgefirst-tflite` and `edgefirst-tflite-sys` 0.11.1 in place
+  of the temporary ZIP-9 Git pin (#1103). Both lockfiles retain the reviewed
+  registry checksums and the ZIP >= 9.0.5 guard. The explicit runtime path,
+  CPU/XNNPACK backend, model pins and buffer-lifetime checks are unchanged;
+  no custom delegate is enabled. See `docs/research/tflite-0.11.1-audit.md`.
+
 - GPU inference is withdrawn (ADR-0038, #1053): the recognizer runs on the CPU, or
   on the NPU once a certification passes. ADR-0033 is withdrawn except its CPU
   execution-provider rule, and ADR-0022 returns to no GPU.

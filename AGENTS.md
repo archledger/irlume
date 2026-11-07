@@ -242,14 +242,16 @@ cargo build --release --locked
    verified password reset or an admin reset clears it, never a mode switch,
    cooldown or reboot (THREAT_MODEL.md "Intent, throttling, and privilege
    elevation").
-10. **Pinned forks.** `pamsm` and `tss-esapi` are pinned by commit (`rev`) in
+10. **Pinned dependencies.** `pamsm` and `tss-esapi` are pinned by commit (`rev`) in
     the root `Cargo.toml` `[patch.crates-io]`, never by branch or tag (ADR-0012);
-    so are `edgefirst-tflite`/`-sys`, pinned to the upstream zip-9 revision
-    (#1103, [docs/research/tflite-zip9-pin.md](docs/research/tflite-zip9-pin.md)).
-    `fuzz/Cargo.toml` repeats the tss-esapi patch by branch and both tflite
-    pins by rev, frozen by `fuzz/Cargo.lock`. A tss-esapi or tflite bump
-    updates both lockfiles, a pamsm bump only `Cargo.lock`; each updates
-    `nix/package.nix` `outputHashes`.
+    `fuzz/Cargo.toml` repeats the tss-esapi patch by branch, frozen by
+    `fuzz/Cargo.lock`. `edgefirst-tflite` is pinned to registry `=0.11.1`;
+    both lockfiles pin the reviewed wrapper/sys versions and checksums
+    (#1103, [docs/research/tflite-0.11.1-audit.md](docs/research/tflite-0.11.1-audit.md)).
+    Keep the graph guards and ZIP >= 9.0.5 floor when updating this pair.
+    A tss-esapi or tflite bump updates both lockfiles, a pamsm bump only
+    `Cargo.lock`; fork revision changes also update `nix/package.nix`
+    `outputHashes`. Registry packages need no Git output hash.
 
 ## Security and privacy
 

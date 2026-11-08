@@ -27,7 +27,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::elliptic_curve::Generate;
 use rand::CryptoRng;
-use rsa::{BoxedUint, Oaep, RsaPublicKey};
+use rsa::{BoxedUint, Oaep, PublicKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -337,7 +337,7 @@ fn rsa_encrypt_seed<R: CryptoRng + ?Sized>(
     } else {
         exponent
     };
-    let key = RsaPublicKey::new(
+    let key = PublicKey::new(
         BoxedUint::from_be_slice_vartime(modulus),
         BoxedUint::from(u64::from(exponent)),
     )

@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 use der::flagset::FlagSet;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 
 use super::*;
 
@@ -96,7 +96,7 @@ pub(crate) enum Key {
     P256(p256::ecdsa::SigningKey),
     P384(p384::ecdsa::SigningKey),
     P521(p521::ecdsa::SigningKey),
-    Rsa(RsaPrivateKey),
+    Rsa(PrivateKey),
 }
 
 impl Key {
@@ -116,11 +116,11 @@ impl Key {
 
     /// One of three RSA-2048 keys, generated once per test run.
     pub(crate) fn rsa(i: usize) -> Self {
-        static KEYS: OnceLock<Vec<RsaPrivateKey>> = OnceLock::new();
+        static KEYS: OnceLock<Vec<PrivateKey>> = OnceLock::new();
         let keys = KEYS.get_or_init(|| {
             let mut rng = rand::rng();
             (0..3)
-                .map(|_| RsaPrivateKey::new(&mut rng, 2048).unwrap())
+                .map(|_| PrivateKey::new(&mut rng, 2048).unwrap())
                 .collect()
         });
         Self::Rsa(keys[i].clone())

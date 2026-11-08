@@ -413,6 +413,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Update `rsa` to 0.10.0-rc.22 for endorsement-certificate verification and
+  MakeCredential, retaining the certificate verifier's 2048-4096-bit bounds.
+  Direct MakeCredential calls now reject RSA keys below 1024 bits. The
+  RUSTSEC-2023-0071 exception remains until a patched range is available
+  (ADR-0036, #1112).
+
 - Upgrade-validation tools require the 0.15.0 -> 0.16.0 -> 0.15.0 -> 0.16.0
   package sequence. Rollback guidance distinguishes preserved files from
   usable migrated TPM envelopes and requires separate sealed-state recovery

@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 
 use der::asn1::{Ia5StringRef, ObjectIdentifier, PrintableStringRef, UintRef, Utf8StringRef};
 use der::{Decode, Encode, Header, Reader, Sequence, SliceReader, Tag, Tagged};
-use rsa::{BoxedUint, Pkcs1v15Sign, Pss, RsaPublicKey};
+use rsa::{BoxedUint, Pkcs1v15Sign, Pss, PublicKey};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use x509_cert::certificate::Version;
@@ -1143,7 +1143,7 @@ fn pss_scheme(alg: &AlgorithmIdentifierOwned) -> Option<Scheme> {
 
 /// An issuer's key, ready to verify.
 enum IssuerKey {
-    Rsa(RsaPublicKey),
+    Rsa(PublicKey),
     P256(p256::ecdsa::VerifyingKey),
     P384(p384::ecdsa::VerifyingKey),
     P521(p521::ecdsa::VerifyingKey),
@@ -1216,10 +1216,10 @@ fn usable_key(key: &EkPublicKey) -> Result<IssuerKey, String> {
             if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
                 return Err(format!("RSA-{bits}"));
             }
-            RsaPublicKey::new_with_max_size(
+            PublicKey::new_with_size_limits(
                 BoxedUint::from_be_slice_vartime(modulus),
                 BoxedUint::from(u64::from(*exponent)),
-                MAX_RSA_BITS,
+                MIN_RSA_BITS..=MAX_RSA_BITS,
             )
             .map(IssuerKey::Rsa)
             .map_err(|_| format!("RSA-{bits} with an unusable modulus or exponent"))

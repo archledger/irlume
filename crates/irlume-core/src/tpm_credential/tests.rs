@@ -11,7 +11,7 @@ use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::elliptic_curve::Generate;
 use rand::{Rng, TryCryptoRng, TryRng};
 use rsa::traits::PublicKeyParts;
-use rsa::RsaPrivateKey;
+use rsa::PrivateKey;
 
 use super::*;
 
@@ -348,7 +348,7 @@ fn full_credentials_match_two_that_swtpm_activated() {
 // --- round trips through a software ActivateCredential -----------------------
 
 enum PrivateEk {
-    Rsa(RsaPrivateKey),
+    Rsa(PrivateKey),
     P256(p256::SecretKey),
     P384(p384::SecretKey),
     P521(p521::SecretKey),
@@ -475,7 +475,7 @@ fn activate(
 #[test]
 fn a_credential_round_trips_for_every_ek_shape_irlume_supports() {
     let mut rng = rand::rng();
-    let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let rsa = PrivateKey::new(&mut rng, 2048).unwrap();
     let shapes = [
         // L-1, H-1; H-6 and H-7 use the same code with SHA-384 and AES-256.
         (

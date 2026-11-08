@@ -1163,6 +1163,27 @@ fn rsa_encryption_parameters_other_than_null_make_the_key_unreadable() {
 }
 
 #[test]
+fn rsa_certificate_key_size_bounds_are_preserved() {
+    for (bits, accepted) in [
+        (1024usize, false),
+        (2047, false),
+        (2048, true),
+        (4096, true),
+        (4097, false),
+        (8192, false),
+    ] {
+        let mut modulus = vec![0u8; bits.div_ceil(8)];
+        modulus[0] = 1 << ((bits - 1) % 8);
+        *modulus.last_mut().unwrap() |= 1;
+        let key = EkPublicKey::Rsa {
+            modulus,
+            exponent: 65537,
+        };
+        assert_eq!(usable_key(&key).is_ok(), accepted, "RSA-{bits}");
+    }
+}
+
+#[test]
 fn an_ek_key_outside_the_accepted_sizes_or_off_its_curve_is_unknown() {
     let (root, issuing) = ecdsa_chain();
     let anchors = anchors(&[&root], &[&issuing]);

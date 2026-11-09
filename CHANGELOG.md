@@ -413,6 +413,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- First-time enrollment on an ordinary camera pair collects its scans in one
+  pass, avoiding a second RGB PAD warm-up when no existing profile can require
+  merge confirmation. The full five-score vote, saved scan count, first-scan
+  and remaining-scan attempt limits, and publication checks are retained.
+
 - Update `rsa` to 0.10.0-rc.22 for endorsement-certificate verification and
   MakeCredential, retaining the certificate verifier's 2048-4096-bit bounds.
   Direct MakeCredential calls now reject RSA keys below 1024 bits. The

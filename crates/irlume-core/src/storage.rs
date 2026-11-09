@@ -1086,6 +1086,27 @@ fn load_snapshot_with(
         return Ok(None);
     }
     let data = fs::read(&path).map_err(|e| irlume_common::Error::Io(e.to_string()))?;
+    parse_snapshot_with(user, data, load_key)
+}
+
+/// Parse already-read bytes while a diagnostic holds the account lock.
+#[cfg(any(test, feature = "ir-only-evaluation"))]
+pub(crate) fn snapshot_locked(
+    user: &str,
+    data: Vec<u8>,
+    _state: &template_key::UserStateLock,
+    load_key: impl FnOnce(&str, &mut Account<'_>) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+) -> irlume_common::Result<Option<PrimarySnapshot>> {
+    parse_snapshot_with(user, data, load_key)
+}
+
+fn parse_snapshot_with(
+    user: &str,
+    data: Vec<u8>,
+    load_key: impl FnOnce(&str, &mut Account<'_>) -> irlume_common::Result<Zeroizing<Vec<u8>>>,
+) -> irlume_common::Result<Option<PrimarySnapshot>> {
+    // Error and account-mismatch returns must erase a plaintext source buffer.
+    let mut data = Zeroizing::new(data);
     // Validate the encrypted format before resolving a key: on TPM hosts,
     // key resolution can open a TPM context and attempt an unseal.
     let is_enc = match serde_json::from_slice::<serde_json::Value>(&data) {
@@ -1118,7 +1139,7 @@ fn load_snapshot_with(
     Ok(Some(PrimarySnapshot {
         enrollment,
         key,
-        bytes: data,
+        bytes: std::mem::take(&mut *data),
     }))
 }
 

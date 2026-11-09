@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 default = []
+# Read-only account snapshots for the non-granting developer evaluator.
+ir-only-evaluation = []
 # The cross-crate test seams (template_key::test_support): a dependent crate's
 # test binary enables this from dev-dependencies to pin what `tpm_available()`
 # answers. Resolver 2 keeps it out of release builds, so no production binary

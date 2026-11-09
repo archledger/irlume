@@ -1,6 +1,9 @@
 [Unit]
 Description=Re-apply irlume face-auth PAM wiring after a distro update
 Documentation=https://github.com/archledger/irlume
+# Order existing start jobs without pulling in a disabled daemon. The CLI
+# separately waits for daemon readiness and refuses repair when it is unknown.
+After=irlumed.service
 # Runs from TWO triggers: the irlume-reconcile.path unit (a greeter PAM file
 # changed) AND at boot (WantedBy below), so a strip that landed while the path
 # watcher was inactive (an offline dnf/apt upgrade, or before paths.target on a

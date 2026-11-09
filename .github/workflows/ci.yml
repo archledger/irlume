@@ -718,6 +718,9 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
           python3 scripts/ci/test-auto-label.py
 
+      - name: systemd boot-order contract (no host service changes)
+        run: python3 scripts/test-systemd-boot-order.py
+
       - name: systemd-analyze verify (unit syntax)
         run: |
           set -euo pipefail

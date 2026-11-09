@@ -27,6 +27,7 @@ pages, so it must never move.
 | `run-tests-guarded.sh` | Runs a test command and fails if it selected no tests. `cargo test <name>` exits 0 when the filter matches nothing, which reads as a pass. |
 | `fetch-ort.sh` | Fetches the ONNX Runtime tarball CI loads through `ORT_DYLIB_PATH`, checks its pinned sha256, and only then unpacks it. Every CI job that needs the runtime calls it; `test-fetch-ort.sh` covers it without the network on every PR. |
 | `check-packaging-parity.sh` | Every systemd unit and AppArmor rule must ship in every lane, every lane must agree on the version, and CI, the lanes and the developer guide must check the same ONNX Runtime sha256. |
+| `test-systemd-boot-order.py` | Pins the packaged daemon/reconciliation startup order without changing services, preserving boot activation and disabled-daemon behavior. |
 | `check-action-pins.sh` | Enforces SHA-pinning on every GitHub Action, with one documented exception for the SLSA provenance generator. |
 | `check-agents-md.py` | Fails when an `AGENTS.md` cites a path git no longer lists, has a broken relative link or an unclosed code fence, or lists a gate command the `check` job in `ci.yml` no longer runs. Needs PyYAML (`python3-yaml`); `test-check-agents-md.py` covers it. |
 | `gkr-token-waiter-check.sh` | Drives the release `irlume-gkr-unlock` against a real `gnome-keyring-daemon --login` in a throwaway home and private bus: the token must arrive only once gnome-keyring is initialized, with no unlock prompt, and never to an impostor. A missing tool fails it. |

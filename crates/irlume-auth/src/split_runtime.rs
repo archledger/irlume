@@ -258,6 +258,7 @@ impl Engine {
                 use_ir: true,
                 diagnostics,
                 observer,
+                probe_first: false,
             },
             operation,
             observed,

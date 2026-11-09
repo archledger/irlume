@@ -1169,12 +1169,52 @@ enum EnrollmentCapture<'a> {
     Split(&'a mut SplitScanLoop<'a>),
 }
 
+#[derive(Clone, Copy)]
+struct EnrollmentScanTarget {
+    count: usize,
+    /// Preserve the old one-scan probe's attempt cap inside a single pass.
+    probe_first: bool,
+}
+
+struct EnrollmentAttemptBudget {
+    remaining: usize,
+    probe_remaining: Option<usize>,
+    after_probe: usize,
+}
+
+impl EnrollmentAttemptBudget {
+    fn new(target: EnrollmentScanTarget) -> Self {
+        Self {
+            remaining: target.count * 10,
+            probe_remaining: target.probe_first.then_some(10),
+            after_probe: target.count.saturating_sub(1) * 10,
+        }
+    }
+
+    fn take_attempt(&mut self) -> bool {
+        if self.remaining == 0 || self.probe_remaining == Some(0) {
+            return false;
+        }
+        self.remaining -= 1;
+        if let Some(remaining) = self.probe_remaining.as_mut() {
+            *remaining -= 1;
+        }
+        true
+    }
+
+    fn admitted(&mut self) {
+        if self.probe_remaining.take().is_some() {
+            self.remaining = self.after_probe;
+        }
+    }
+}
+
 impl EnrollmentCapture<'_> {
-    /// One capture loop of `count` scans on the admitted route.
+    /// One bounded capture loop on the admitted route.
     fn scans(
         &mut self,
         engine: &mut Engine,
-        count: usize,
+        target: EnrollmentScanTarget,
         pitch_neutral: Option<f32>,
         observed: &mut CaptureShape,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
@@ -1182,14 +1222,14 @@ impl EnrollmentCapture<'_> {
     ) -> irlume_common::Result<Vec<CapturedScan>> {
         match self {
             Self::Ordinary { force_rgb_only } => engine.capture_scans_observed(
-                count,
+                target,
                 pitch_neutral,
                 observed,
                 *force_rgb_only,
                 diagnostics,
                 observer,
             ),
-            Self::Split(scans) => scans(engine, count, pitch_neutral, observed, observer),
+            Self::Split(scans) => scans(engine, target.count, pitch_neutral, observed, observer),
         }
     }
 }
@@ -1213,6 +1253,7 @@ struct EnrollmentCapturePolicy<'a> {
     use_ir: bool,
     diagnostics: &'a dyn irlume_common::diagnostics::DiagnosticSink,
     observer: &'a dyn EnrollmentObserver,
+    probe_first: bool,
 }
 
 /// What one add-scan capture stored, with everything the daemon's reply
@@ -8697,13 +8738,14 @@ impl Engine {
     /// frontal gate on this user's camera (None on first enroll).
     fn capture_scans_observed(
         &mut self,
-        want: usize,
+        target: EnrollmentScanTarget,
         pitch_neutral: Option<f32>,
         observed: &mut CaptureShape,
         force_rgb_only: bool,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
         observer: &dyn EnrollmentObserver,
     ) -> irlume_common::Result<Vec<CapturedScan>> {
+        let want = target.count;
         observer.check()?;
         // Fresh ViT PAD vote ring per enrollment, mirroring the
         // per-authentication reset: the 5-median vote must describe ONE
@@ -8782,6 +8824,7 @@ impl Engine {
                     use_ir,
                     diagnostics,
                     observer,
+                    probe_first: target.probe_first,
                 },
                 &operation,
                 observed,
@@ -8820,6 +8863,7 @@ impl Engine {
                 use_ir,
                 diagnostics,
                 observer,
+                probe_first: target.probe_first,
             },
             &operation,
             observed,
@@ -8865,7 +8909,11 @@ impl Engine {
         // Budget (was ×4) absorbs the added frontality gate (a frame grabbed the
         // instant the user drifts off-angle is rejected, not saved) with enough
         // retries that a brief drift near the capture moment doesn't abort enroll.
-        for _ in 0..(want * 10) {
+        let mut attempts = EnrollmentAttemptBudget::new(EnrollmentScanTarget {
+            count: want,
+            probe_first: policy.probe_first,
+        });
+        while attempts.take_attempt() {
             if out.len() >= want {
                 break;
             }
@@ -8934,6 +8982,7 @@ impl Engine {
             // the countdown. Same bounds (and neutral) the enrollment guide uses.
             if let Some(scan) = self.enrollment_scan(a, policy.use_ir, pitch_neutral)? {
                 out.push(scan);
+                attempts.admitted();
                 // Progress resets the inactivity clock: a capture that keeps
                 // admitting scans is not stalling, however slow the pair.
                 last_progress = std::time::Instant::now();
@@ -9413,6 +9462,8 @@ impl Engine {
             }
         }
         let mut capture = self.admit_enrollment_route(route)?;
+        let single_pass =
+            enr.profiles.is_empty() && matches!(&capture, EnrollmentCapture::Ordinary { .. });
         let mut completed = 0;
         let (enr, outcome) = self.capture_enrollment_observed(
             enr,
@@ -9428,12 +9479,22 @@ impl Engine {
                         completed + count
                     },
                 };
-                let scans =
-                    capture.scans(engine, count, pitch, observed, diagnostics, &progress)?;
+                let scans = capture.scans(
+                    engine,
+                    EnrollmentScanTarget {
+                        count,
+                        probe_first: single_pass,
+                    },
+                    pitch,
+                    observed,
+                    diagnostics,
+                    &progress,
+                )?;
                 completed += scans.len();
                 Ok(scans)
             },
             observer,
+            single_pass,
         )?;
         observer.check()?;
         if self.should_stop() {
@@ -9472,7 +9533,7 @@ impl Engine {
             &mut CaptureShape,
         ) -> irlume_common::Result<Vec<CapturedScan>>,
     ) -> irlume_common::Result<(irlume_core::storage::Enrollment, EnrollOutcome)> {
-        self.capture_enrollment_observed(enr, profile_name, want, capture, &())
+        self.capture_enrollment_observed(enr, profile_name, want, capture, &(), true)
     }
 
     fn capture_enrollment_observed(
@@ -9487,6 +9548,7 @@ impl Engine {
             &mut CaptureShape,
         ) -> irlume_common::Result<Vec<CapturedScan>>,
         observer: &dyn EnrollmentObserver,
+        single_pass: bool,
     ) -> irlume_common::Result<(irlume_core::storage::Enrollment, EnrollOutcome)> {
         use irlume_core::storage::{FaceProfile, FaceScan, MAX_PROFILES, MAX_SCANS_PER_PROFILE};
         // Probe scan first: it decides whether this face merges into an existing
@@ -9501,8 +9563,13 @@ impl Engine {
         // the first observed and the message cannot claim "on every attempt"
         // about a subset of them.
         let mut observed = CaptureShape::default();
-        let probe_scans = capture(self, 1, enr.pitch_neutral(), &mut observed)?;
-        let solo_probe = if probe_scans.is_empty() {
+        // With no existing profiles there can be no merge prompt. Collect the
+        // whole ordinary enrollment without throwing away a completed PAD vote.
+        // Split and secondary-camera callers keep their existing capture plan.
+        let single_pass = single_pass && enr.profiles.is_empty();
+        let initial_count = if single_pass { want } else { 1 };
+        let mut captured = capture(self, initial_count, enr.pitch_neutral(), &mut observed)?;
+        let solo_probe = if captured.is_empty() {
             self.solo_rgb_starvation_probe(observed)
         } else {
             None
@@ -9516,7 +9583,7 @@ impl Engine {
                 );
             }
         }
-        let probe = probe_scans.into_iter().next().ok_or_else(|| {
+        let probe = captured.first().ok_or_else(|| {
             let advice = capture_advice(observed, solo_probe);
             irlume_common::Error::Protocol(format!("no live scan captured; {advice}"))
         })?;
@@ -9556,8 +9623,7 @@ impl Engine {
             }
         };
         observer.check()?;
-        let mut captured = vec![probe];
-        if goal > 1 {
+        if !single_pass && goal > 1 {
             captured.extend(capture(self, goal - 1, enr.pitch_neutral(), &mut observed)?);
         }
         if captured.len() < goal {
@@ -10006,7 +10072,10 @@ impl Engine {
         let want = count.clamp(1, room);
         let mut observed = CaptureShape::default();
         let captured = self.capture_scans_observed(
-            want,
+            EnrollmentScanTarget {
+                count: want,
+                probe_first: false,
+            },
             enr.pitch_neutral(),
             &mut observed,
             force_rgb_only,
@@ -10325,12 +10394,22 @@ impl Engine {
                         completed + count
                     },
                 };
-                let scans =
-                    capture.scans(engine, count, pitch, observed, diagnostics, &progress)?;
+                let scans = capture.scans(
+                    engine,
+                    EnrollmentScanTarget {
+                        count,
+                        probe_first: false,
+                    },
+                    pitch,
+                    observed,
+                    diagnostics,
+                    &progress,
+                )?;
                 completed += scans.len();
                 Ok(scans)
             },
             observer,
+            false,
         )?;
         let captured = scratch
             .profiles
@@ -16734,6 +16813,7 @@ mod engine_tests {
                         .collect())
                 },
                 &observer,
+                true,
             )
             .unwrap();
         assert_eq!(captures, 10);
@@ -16793,6 +16873,7 @@ mod engine_tests {
                     .collect())
             },
             &Decline,
+            true,
         );
         assert!(
             matches!(result,Err(irlume_common::Error::Preempted(ref e)) if e=="declined late match")
@@ -16840,10 +16921,104 @@ mod engine_tests {
                     .collect())
             },
             &observer,
+            true,
         );
         assert!(result.is_err(), "declining must discard the candidate");
         assert_eq!(captures, 1, "no further captures after merge decline");
         assert_eq!(observer.0.get(), 1);
+    }
+
+    #[test]
+    fn empty_enrollment_collects_ten_scans_with_one_pad_warmup() {
+        let _guard = env_guard();
+        let mut s = shared();
+        let mut assessments = 0;
+        let mut first_admissions = Vec::new();
+        let (candidate, outcome) = s
+            .engine
+            .capture_enrollment(
+                Enrollment::new("single-pass-test"),
+                Some("First".into()),
+                10,
+                |engine, count, pitch, _| {
+                    // Stand in only for camera/model output. Use the real vote
+                    // and enrollment admission for every synthetic assessment.
+                    engine.vit_scores.clear();
+                    let mut scans = Vec::new();
+                    for attempt in 1..=count * 10 {
+                        assessments += 1;
+                        let deny = engine.vit_pad_votes_deny(0.20);
+                        let (_, assessment) = pad_matching_fixture(0.20, deny);
+                        if let Some(scan) = engine
+                            .enrollment_scan(assessment, false, pitch)
+                            .unwrap_or_else(|_| panic!("unexpected admission error"))
+                        {
+                            if scans.is_empty() {
+                                first_admissions.push(attempt);
+                            }
+                            scans.push(scan);
+                        }
+                        if scans.len() == count {
+                            return Ok(scans);
+                        }
+                    }
+                    panic!("synthetic presentation did not complete");
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, EnrollOutcome::New { scans: 10, .. }));
+        assert_eq!(candidate.profiles.len(), 1);
+        assert_eq!(candidate.profiles[0].scans.len(), 10);
+        assert_eq!(
+            assessments, 14,
+            "do not restart PAD for an empty enrollment"
+        );
+        assert_eq!(first_admissions, [5], "the full initial vote is mandatory");
+        s.engine.vit_scores.clear();
+    }
+
+    #[test]
+    fn single_pass_preserves_probe_and_remainder_attempt_limits() {
+        let target = EnrollmentScanTarget {
+            count: 10,
+            probe_first: true,
+        };
+        let mut no_admission = EnrollmentAttemptBudget::new(target);
+        for _ in 0..10 {
+            assert!(no_admission.take_attempt());
+        }
+        assert!(!no_admission.take_attempt());
+
+        for first_admission in 1..=10 {
+            let mut budget = EnrollmentAttemptBudget::new(target);
+            for _ in 0..first_admission {
+                assert!(budget.take_attempt());
+            }
+            budget.admitted();
+            for attempt in 0..90 {
+                assert!(budget.take_attempt());
+                if attempt % 10 == 0 {
+                    // Later admissions cannot replenish the attempt budget.
+                    budget.admitted();
+                }
+            }
+            assert!(!budget.take_attempt());
+        }
+    }
+
+    #[test]
+    fn ordinary_capture_keeps_its_per_scan_attempt_budget() {
+        for count in [0, 1, 5, 10, 30] {
+            let mut budget = EnrollmentAttemptBudget::new(EnrollmentScanTarget {
+                count,
+                probe_first: false,
+            });
+            for _ in 0..count * 10 {
+                assert!(budget.take_attempt());
+                budget.admitted();
+            }
+            assert!(!budget.take_attempt());
+        }
     }
 
     #[test]
@@ -16870,26 +17045,19 @@ mod engine_tests {
             ambient_share: None,
         };
         for preempt in [false, true] {
-            let mut calls = 0;
             let result = s.engine.capture_enrollment(
                 Enrollment::new(&old.user),
                 None,
                 3,
                 |_, count, pitch, _| {
-                    calls += 1;
                     assert_eq!(pitch, None, "replacement must not inherit old pitch");
-                    if calls == 1 {
-                        assert_eq!(count, 1);
-                        Ok(vec![scan()])
+                    assert_eq!(count, 3);
+                    if preempt {
+                        Err(irlume_common::Error::Preempted(
+                            "injected cancellation".into(),
+                        ))
                     } else {
-                        assert_eq!(count, 2);
-                        if preempt {
-                            Err(irlume_common::Error::Preempted(
-                                "injected cancellation".into(),
-                            ))
-                        } else {
-                            Ok(vec![scan()])
-                        }
+                        Ok(vec![scan(), scan()])
                     }
                 },
             );

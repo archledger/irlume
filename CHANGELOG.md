@@ -857,6 +857,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Boot-time PAM reconciliation waits for the daemon's start job without making
+  the daemon wait for the target that contains reconciliation. Disabled-daemon
+  choices, readiness checks and password fallback remain unchanged.
+
 - Camera capability enumeration accepts repeated discrete frame intervals,
   including equivalent fractions, without failing camera operations (#1294).
   The canonical interval list remains unique; malformed responses and the

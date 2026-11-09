@@ -1,7 +1,8 @@
 [Unit]
 Description=irlume face authentication daemon
 Documentation=https://github.com/archledger/irlume
-After=multi-user.target
+# Start within multi-user.target, not after it: boot-time PAM reconciliation
+# needs this service before that target can finish starting.
 
 [Service]
 # Inherit the listening socket from irlumed.socket rather than binding our own,

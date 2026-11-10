@@ -36,11 +36,20 @@ use zeroize::Zeroizing;
 
 const SALT_LEN: usize = 16;
 // OWASP-recommended Argon2id baseline: 19 MiB, 2 passes, 1 lane. Plenty for a
-// rarely-used recovery path; tunable per-envelope via the stored cost fields.
+// rarely-used recovery path. Version 1 writes this tuple, and an envelope is
+// read only with it.
 const M_COST: u32 = 19_456;
 const T_COST: u32 = 2;
 const P_COST: u32 = 1;
 const CURRENT_VERSION: u32 = 1;
+/// Bounds the standalone recovery JSON, including whitespace and extra fields.
+pub(crate) const MAX_RECOVERY_FILE_BYTES: u64 = 4096;
+// Shared with the keyring token wrap (64 bytes), not only template keys (32).
+const MAX_WRAPPED_SECRET_BYTES: usize = 256;
+const GCM_OVERHEAD: usize = 12 + 16;
+const MAX_WRAPPED_BYTES: usize = MAX_WRAPPED_SECRET_BYTES + GCM_OVERHEAD;
+const MAX_WRAPPED_BASE64: usize = MAX_WRAPPED_BYTES.div_ceil(3) * 4;
+const SALT_BASE64_LEN: usize = SALT_LEN.div_ceil(3) * 4;
 
 /// Fewest characters a new recovery passphrase may have. The passphrase is
 /// the only secret on the recovery envelope, so it is a recovery key rather
@@ -117,6 +126,7 @@ fn derive_key(
     t: u32,
     p: u32,
 ) -> Result<Zeroizing<Vec<u8>>> {
+    require_supported_costs(m, t, p)?;
     let params = Params::new(m, t, p, Some(crypto::KEY_LEN))
         .map_err(|e| Error::Policy(format!("argon2 params: {e}")))?;
     let a2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -127,14 +137,27 @@ fn derive_key(
     Ok(out)
 }
 
+fn require_supported_costs(m: u32, t: u32, p: u32) -> Result<()> {
+    if (m, t, p) != (M_COST, T_COST, P_COST) {
+        return Err(Error::Policy("unsupported recovery KDF parameters".into()));
+    }
+    Ok(())
+}
+
 /// Wrap `template_key` under a fresh Argon2id-derived key from `passphrase`.
-/// Refuses only an empty passphrase: the keyring's login-password wrap shares
-/// this function, so the recovery floor is [`check_new_passphrase`], which
+/// The keyring's login-password wrap shares this function, so the recovery
+/// passphrase floor is [`check_new_passphrase`], which
 /// [`crate::template_key::setup_recovery`] applies.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+///
+/// # Errors
+/// Returns an error for an empty passphrase, a payload over 256 bytes, or a
+/// key-derivation or encryption failure.
 pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> {
     if passphrase.is_empty() {
         return Err(Error::Policy("empty recovery passphrase".into()));
+    }
+    if template_key.len() > MAX_WRAPPED_SECRET_BYTES {
+        return Err(Error::Policy("recovery payload is too large".into()));
     }
     let mut salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
@@ -155,8 +178,19 @@ pub fn wrap(passphrase: &[u8], template_key: &[u8]) -> Result<RecoveryEnvelope> 
 /// Recover the template key from a recovery envelope and passphrase. Returns a
 /// generic error on a wrong passphrase (AES-GCM tag mismatch), indistinguishable
 /// from tampering, by design.
-#[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+///
+/// # Errors
+/// Returns an error for an unsupported format or KDF tuple, invalid payload
+/// lengths/encoding, or failed key derivation or authentication.
 pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec<u8>>> {
+    unwrap_with(passphrase, env, derive_key)
+}
+
+fn unwrap_with(
+    passphrase: &[u8],
+    env: &RecoveryEnvelope,
+    derive: impl FnOnce(&[u8], &[u8], u32, u32, u32) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
     if env.version != CURRENT_VERSION {
         return Err(Error::Protocol(format!(
             "unsupported recovery envelope version: {}",
@@ -164,10 +198,14 @@ pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec
         )));
     }
     if env.kdf != "argon2id" {
-        return Err(Error::Policy(format!(
-            "unsupported recovery KDF: {}",
-            env.kdf
-        )));
+        return Err(Error::Policy("unsupported recovery KDF".into()));
+    }
+    require_supported_costs(env.m_cost, env.t_cost, env.p_cost)?;
+    // Check encoded lengths before decoding: base64's decoder allocates from
+    // the input length. Check decoded lengths too (284 and 285 bytes both
+    // encode to 380 characters). None of these failures reaches Argon2.
+    if env.salt.len() != SALT_BASE64_LEN || env.wrapped.len() > MAX_WRAPPED_BASE64 {
+        return Err(Error::Protocol("invalid recovery payload length".into()));
     }
     let salt = STANDARD
         .decode(&env.salt)
@@ -175,9 +213,16 @@ pub fn unwrap(passphrase: &[u8], env: &RecoveryEnvelope) -> Result<Zeroizing<Vec
     let wrapped = STANDARD
         .decode(&env.wrapped)
         .map_err(|e| Error::Protocol(format!("bad recovery blob: {e}")))?;
-    let dk = derive_key(passphrase, &salt, env.m_cost, env.t_cost, env.p_cost)?;
+    if salt.len() != SALT_LEN || !(GCM_OVERHEAD..=MAX_WRAPPED_BYTES).contains(&wrapped.len()) {
+        return Err(Error::Protocol("invalid recovery payload length".into()));
+    }
+    let dk = derive(passphrase, &salt, env.m_cost, env.t_cost, env.p_cost)?;
     crypto::decrypt(&dk, &wrapped).map_err(|_| Error::Policy("wrong recovery passphrase".into()))
 }
+
+#[cfg(test)]
+#[path = "recovery_limits_tests.rs"]
+mod limits_tests;
 
 #[cfg(test)]
 mod tests {

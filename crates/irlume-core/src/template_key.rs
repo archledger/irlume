@@ -1226,7 +1226,8 @@ fn require_key_is_the_accounts(
 /// and re-seal it against the *current* TPM PCRs (healing a PCR move / TPM
 /// clear / disk move). Errors on a wrong passphrase or a missing envelope,
 /// and, with nothing sealed, when the recovery file, the key it overwrites
-/// or the enrollment the restored key opens records another uid.
+/// or the enrollment the restored key opens records another uid, or when
+/// the restored key does not read a stored enrollment or added-camera store.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn restore_from_recovery(user: &str, passphrase: &[u8]) -> Result<()> {
     let _state = UserStateLock::acquire(user)?;
@@ -1262,15 +1263,25 @@ pub(crate) fn restore_with(
     account.require(Record::TemplateKey, existing)?;
     let uid = account.uid_to_record(Record::TemplateKey, env.uid.or(existing))?;
     let key = crate::recovery::unwrap(passphrase, &env)?;
-    // The enrollment the restored key opens counts too: when neither the
-    // recovery file nor the key records a uid, the enrollment may, and one
-    // recorded for another uid means the key protects that account's
-    // templates, so it is not sealed for this one.
+    if key.len() != crypto::KEY_LEN {
+        return Err(Error::Policy(
+            "recovered template key has invalid length".into(),
+        ));
+    }
+    // Every stored enrollment, the added-camera store included, must read
+    // and authenticate under the recovered key before anything is sealed.
+    // The enrollment's uid counts too: when neither the recovery file nor
+    // the key records a uid, the enrollment may, and one recorded for
+    // another uid means the key protects that account's templates, so it is
+    // not sealed for this one.
+    let enrollment = crate::storage::inspect_recovery_enrollment(user, &key)?;
+    let enrollment_uid = match enrollment {
+        crate::storage::RecoveryEnrollment::Absent
+        | crate::storage::RecoveryEnrollment::Unbound => None,
+        crate::storage::RecoveryEnrollment::Bound(uid) => Some(uid),
+    };
     account
-        .require(
-            Record::Enrollment,
-            crate::storage::stored_enrollment_uid(user, Some(&key)),
-        )
+        .require(Record::Enrollment, enrollment_uid)
         .map_err(|e| match e {
             Error::Policy(message) => Error::Policy(format!(
                 "the template key of '{user}' was not restored: {message}"
@@ -1347,15 +1358,24 @@ fn read_recovery_file(path: &Path) -> std::io::Result<Vec<u8>> {
     if !std::fs::metadata(path)?.is_file() {
         return Err(not_regular());
     }
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(not_regular());
     }
+    let limit = crate::recovery::MAX_RECOVERY_FILE_BYTES;
+    let too_large = || IoError::new(ErrorKind::FileTooLarge, "recovery file is too large");
+    if metadata.len() > limit {
+        return Err(too_large());
+    }
     let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    (&file).take(limit + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(too_large());
+    }
     Ok(data)
 }
 
@@ -1391,6 +1411,10 @@ fn set_0600(path: &Path) {
 }
 #[cfg(not(unix))]
 fn set_0600(_path: &Path) {}
+
+#[cfg(test)]
+#[path = "template_key_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2765,10 +2789,16 @@ mod tests {
     #[ignore = "requires a TPM: real /dev/tpmrm0, or swtpm via IRLUME_TCTI (CI does this)"]
     fn tpm_key_and_recovery_lifecycle() {
         let _g = ENV_LOCK.lock().unwrap();
+        // The enrollment's directory too: a restore reads the stored
+        // enrollment before it reseals.
+        let state = crate::test_tmp_dir("state-rt");
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", crate::test_tmp_dir("tk-rt"));
         std::env::set_var("IRLUME_RECOVERY_DIR", crate::test_tmp_dir("rec-tpm"));
+        std::env::set_var("IRLUME_STATE_DIR", &state);
         let _ = std::fs::remove_dir_all(crate::test_tmp_dir("tk-rt"));
         let _ = std::fs::remove_dir_all(crate::test_tmp_dir("rec-tpm"));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
 
         let k1 = ensure_key("rt").unwrap();
         assert!(has_key("rt"));
@@ -2805,6 +2835,7 @@ mod tests {
         forget_recovery("rt").unwrap();
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
+        std::env::remove_var("IRLUME_STATE_DIR");
     }
 
     /// A wrong recovery passphrase must fail the restore WITHOUT materialising a
@@ -2928,10 +2959,16 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let tk = crate::test_tmp_dir("tk-tamper");
         let rec = crate::test_tmp_dir("rec-tamper");
+        // The enrollment's directory too: a restore reads the stored
+        // enrollment before it reseals.
+        let state = crate::test_tmp_dir("state-tamper");
         std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &tk);
         std::env::set_var("IRLUME_RECOVERY_DIR", &rec);
+        std::env::set_var("IRLUME_STATE_DIR", &state);
         let _ = std::fs::remove_dir_all(tk);
         let _ = std::fs::remove_dir_all(rec);
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
 
         let original = ensure_key("rt").unwrap();
         setup_recovery("rt", b"my recovery passphrase").unwrap();
@@ -2955,6 +2992,7 @@ mod tests {
         forget_recovery("rt").unwrap();
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::env::remove_var("IRLUME_RECOVERY_DIR");
+        std::env::remove_var("IRLUME_STATE_DIR");
     }
 
     /// On signed-UKI hardware, a template key an earlier release sealed under

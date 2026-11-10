@@ -640,6 +640,21 @@ pub fn serialize_enrollment(e: &Enrollment, key: Option<&[u8]>) -> irlume_common
 /// encrypted (v2/v3, needs `key`), plaintext multi-profile, and the legacy
 /// single-profile layout (migrated). Pure; tested without a TPM.
 fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Result<Enrollment> {
+    deserialize_enrollment_or(
+        data,
+        key,
+        "template key does not match enrollment; preserve state and try recovery restore",
+    )
+}
+
+/// [`deserialize_enrollment`], with the refusal for a key the envelope does
+/// not name supplied by the caller: the restore check has no restore to
+/// suggest.
+fn deserialize_enrollment_or(
+    data: &[u8],
+    key: Option<&[u8]>,
+    key_mismatch: &str,
+) -> irlume_common::Result<Enrollment> {
     let v: serde_json::Value =
         serde_json::from_slice(data).map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
     if is_encrypted_enrollment(&v)? {
@@ -655,10 +670,7 @@ fn deserialize_enrollment(data: &[u8], key: Option<&[u8]>) -> irlume_common::Res
             .as_deref()
             .is_some_and(|expected| expected != irlume_common::sha256_hex(key))
         {
-            return Err(irlume_common::Error::Policy(
-                "template key does not match enrollment; preserve state and try recovery restore"
-                    .into(),
-            ));
+            return Err(irlume_common::Error::Policy(key_mismatch.into()));
         }
         let blob = STANDARD
             .decode(env.enc.as_bytes())
@@ -762,6 +774,156 @@ fn stored_enrollment_is_another_accounts(
 pub(crate) fn stored_enrollment_uid(user: &str, key: Option<&[u8]>) -> Option<u32> {
     let data = fs::read(profile_path(user)).ok()?;
     deserialize_enrollment(&data, key).ok()?.uid
+}
+
+/// What the recovery restore check found for the primary enrollment, once
+/// every stored enrollment has been read and authenticated under the
+/// candidate key. A store that does not read is an error; `Absent` means no
+/// file is there.
+pub(crate) enum RecoveryEnrollment {
+    Absent,
+    Unbound,
+    Bound(u32),
+}
+
+/// Read bound for the primary enrollment in the recovery restore check. It
+/// is a bound on this one read, not a format limit: nothing caps the primary
+/// when it is saved or loaded. [`MAX_PROFILES`] profiles holding
+/// [`MAX_SCANS_PER_PROFILE`] scans in each of four recognizer spaces, with a
+/// calibration per space, measure about 13.8 MB encrypted and about 22.1 MB
+/// as plaintext (`a_full_primary_fits_the_restore_read_bound`).
+pub(crate) const RECOVERY_PRIMARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Text of a restore-check refusal: the recovered key is not the one a store
+/// names.
+const RECOVERY_KEY_MISMATCH: &str = "the recovery file holds a different template key";
+
+/// Inspect without loading a TPM key, migrating files, or changing any state.
+/// The recovery restore uses this reader: every stored enrollment must read
+/// and authenticate under `key` and belong to the account. Each store is read
+/// once, the primary up to [`RECOVERY_PRIMARY_MAX_BYTES`] and the added-camera
+/// store up to [`crate::multi_camera::MAX_STORE_BYTES`], the limit its own
+/// loader has. A refusal names the store and its path.
+pub(crate) fn inspect_recovery_enrollment(
+    user: &str,
+    key: &[u8],
+) -> irlume_common::Result<RecoveryEnrollment> {
+    let path = profile_path(user);
+    let primary = inspect_recovery_primary(user, key, &path)
+        .map_err(|error| in_recovery_store("stored enrollment", &path, error))?;
+    let path = crate::multi_camera::secondary_store_path(user);
+    inspect_recovery_secondary(user, key, &path)
+        .map_err(|error| in_recovery_store("added-camera store", &path, error))?;
+    Ok(primary)
+}
+
+/// `error` with the store and its path in front of the message; the error
+/// keeps its kind.
+fn in_recovery_store(
+    store: &str,
+    path: &Path,
+    error: irlume_common::Error,
+) -> irlume_common::Error {
+    use irlume_common::Error;
+    let named = |message: String| format!("{store} {}: {message}", path.display());
+    match error {
+        Error::Io(message) => Error::Io(named(message)),
+        Error::Protocol(message) => Error::Protocol(named(message)),
+        Error::Policy(message) => Error::Policy(named(message)),
+        other => other,
+    }
+}
+
+fn inspect_recovery_primary(
+    user: &str,
+    key: &[u8],
+    path: &Path,
+) -> irlume_common::Result<RecoveryEnrollment> {
+    let Some(data) = read_recovery_store(path, RECOVERY_PRIMARY_MAX_BYTES)? else {
+        return Ok(RecoveryEnrollment::Absent);
+    };
+    let enrollment = deserialize_enrollment_or(&data, Some(key), RECOVERY_KEY_MISMATCH)?;
+    if enrollment.user != user {
+        return Err(irlume_common::Error::Policy(
+            "belongs to another account".into(),
+        ));
+    }
+    Ok(match enrollment.uid {
+        Some(uid) => RecoveryEnrollment::Bound(uid),
+        None => RecoveryEnrollment::Unbound,
+    })
+}
+
+fn read_recovery_store(path: &Path, max: u64) -> irlume_common::Result<Option<Zeroizing<Vec<u8>>>> {
+    match crate::envelope::read_bounded(path, max) {
+        Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // `open` found no file. The store counts as absent only when
+            // `symlink_metadata` agrees; one that appears in between is an
+            // error. A missing parent directory, or a dangling link among
+            // the parent components, reads as absent.
+            match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(irlume_common::Error::Io(
+                    "changed while it was being read".into(),
+                )),
+            }
+        }
+        Err(error) => Err(irlume_common::Error::Io(error.to_string())),
+    }
+}
+
+fn inspect_recovery_secondary(user: &str, key: &[u8], path: &Path) -> irlume_common::Result<()> {
+    let Some(data) = read_recovery_store(path, crate::multi_camera::MAX_STORE_BYTES as u64)? else {
+        return Ok(());
+    };
+    // The ordinary loader of this store reads a pathname itself. Inspect the
+    // bytes read above instead, so the store is read once, under the bound.
+    // Reuse the loader's public store type, versions, and structural
+    // validator.
+    #[derive(Deserialize)]
+    struct Version {
+        format_version: u64,
+    }
+    #[derive(Deserialize)]
+    struct Encrypted {
+        key_id: String,
+        enc: String,
+    }
+    let protocol = |e: serde_json::Error| irlume_common::Error::Protocol(e.to_string());
+    let version: Version = serde_json::from_slice(&data).map_err(protocol)?;
+    let plain = match version.format_version {
+        crate::multi_camera::SECONDARY_ENC_ENVELOPE_VERSION => {
+            let encrypted: Encrypted = serde_json::from_slice(&data).map_err(protocol)?;
+            if encrypted.key_id != irlume_common::sha256_hex(key) {
+                return Err(irlume_common::Error::Policy(RECOVERY_KEY_MISMATCH.into()));
+            }
+            let blob = STANDARD
+                .decode(encrypted.enc)
+                .map_err(|e| irlume_common::Error::Protocol(format!("bad enc blob: {e}")))?;
+            Some(crypto::decrypt(key, &blob)?)
+        }
+        version if version == u64::from(crate::multi_camera::SECONDARY_STORE_VERSION) => None,
+        _ => {
+            return Err(irlume_common::Error::Protocol(
+                "unsupported format version".into(),
+            ))
+        }
+    };
+    let bytes = plain
+        .as_deref()
+        .map_or(data.as_slice(), |bytes| bytes.as_slice());
+    let store: crate::multi_camera::SecondaryStore =
+        serde_json::from_slice(bytes).map_err(protocol)?;
+    store
+        .validate()
+        .map_err(|e| irlume_common::Error::Protocol(e.to_string()))?;
+    if store.owner != user {
+        return Err(irlume_common::Error::Policy(
+            "belongs to another account".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Publish `bytes` as the enrollment at `path`; [`publication_result`] turns

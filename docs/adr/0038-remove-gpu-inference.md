@@ -6,7 +6,9 @@ Accepted 2026-10-30, on the maintainer's decision. Implementation follows in
 separate pull requests.
 
 Amended 2026-10-31 by [ADR-0039](0039-remove-npu-inference.md): NPU inference is
-removed too, so sections 1, 3, 6 and 7 no longer describe the current state.
+removed too, so sections 1, 3, 5, 6 and 7, the second, fourth and fifth
+consequences, the first, second, third and sixth acceptance tests and the
+amendment of 2026-10-30 no longer describe the current state.
 
 Withdraws ADR-0033, except its section 7 as narrowed below. Amends ADR-0022
 sections 3 and 15, which return to "no GPU". Closes #1053, #1162, #1163 and
@@ -47,6 +49,9 @@ The recognizer runs on the CPU, which stays authoritative, or on the NPU under
 ADR-0022 once a certification passes. GPU placement, identity, certification,
 loading admission, launch checks, evidence lanes and ranking are removed.
 
+Amended 2026-10-31 by ADR-0039: NPU inference is removed too. The recognizer and
+every other model run on the CPU (ADR-0039 section 1).
+
 ### 2. What stays from ADR-0033
 
 Every CPU session keeps its exact CPU execution provider and its cutoff of
@@ -71,6 +76,11 @@ selection provenance. Authentication never fails because of it. The `gpu` key in
 `settings.conf` and `IRLUME_GPU` are no longer read, so a line left behind does
 nothing.
 
+Amended 2026-10-31 by ADR-0039: `recognizer_device`, `npu` and `npu_library`, and
+`IRLUME_RECOGNIZER_DEVICE`, `IRLUME_NPU` and `IRLUME_NPU_LIBRARY`, are no longer
+read either, so a line left behind, `recognizer_device=gpu` included, does nothing
+(ADR-0039 section 3). The selection provenance is removed (ADR-0039 section 5).
+
 ### 4. Machine API
 
 The selection word `gpu`, the fields `accelerator`, `gpu_platform`,
@@ -89,6 +99,10 @@ OpenCL registrations, compute-runtime libraries, the `irlumed-gpu` local include
 and the GPU launch environment. Rules the NPU path also uses stay, including
 Level Zero and oneTBB.
 
+Amended 2026-10-31 by ADR-0039: the NPU rules leave both AppArmor profiles, the
+systemd unit and the Nix module too, Level Zero and oneTBB included. A rule stays
+only if something else on the CPU path needs it (ADR-0039 section 6).
+
 ### 6. Before NPU admission opens
 
 NPU discovery calls `Core::available_devices()` only to check that `NPU` is listed
@@ -100,12 +114,18 @@ Production is unaffected while NPU admission is closed, since the refusal comes
 first. Discovery queries only the NPU before admission opens, with a hardware run
 on the decision laptop.
 
+Amended 2026-10-31 by ADR-0039: NPU loading admission is removed, and no NPU
+discovery remains (ADR-0039 section 1 and Consequences).
+
 ### 7. Revisiting
 
 Section 15 of ADR-0022 sets the test again: evidence that CPU-only users face
 unacceptable latency. A full login on CPU has not been timed end to end, only single
 inferences (108.7 to 258.5 ms on the fleet's CPUs). If that timing shows a failed
 target, the NPU is the first answer.
+
+Amended 2026-10-31 by ADR-0039: the revisit rule of ADR-0039 section 8 replaces
+this one, and a return needs a new ADR.
 
 ## Consequences
 
@@ -114,15 +134,27 @@ target, the NPU is the first answer.
   GPU tables and identity were separate from the NPU's.
 - Only the CPU runs authentication today, as before: the NPU's `CERTIFIED` table is
   empty too.
+  (Amended 2026-10-31 by ADR-0039 section 1: the `CERTIFIED` table is removed.)
 - The contained-job runner built for the GPU campaign is not merged (#1231, closed).
   Its branch `test/1164-job-runtime-evidence` stays as the record.
 - The research records in `docs/research/` stay as historical evidence, with a
   short supersession banner. `2026-10-22-certification-extent.md` gets none, because
   its extent rule still applies to NPU certification.
+  (Amended 2026-10-31 by ADR-0039: the certification corpus extent rule falls with
+  ADR-0022, and `2026-10-22-certification-extent.md` stays on file as history with
+  a short supersession note, like the other research records.)
 - CI test floors do not change. The workspace run stays above its floor of 2,720,
   and the NPU lane keeps its floor of nine by requiring three other named tests.
+  (Amended 2026-10-31 by ADR-0039: the CI lane for the optional NPU feature goes.
+  The workspace test floor does not change.)
 
 ## Acceptance tests
+
+Amended 2026-10-31 by ADR-0039: the first, second, third and sixth tests below check
+what ADR-0039 removes. `recognizer_device`, `npu` and their variables are no longer
+read (ADR-0039 section 3), NPU placement is removed (section 1), the `recognizer`
+object and its selection provenance are removed (section 5), and the CI lane for
+the optional NPU feature goes (Consequences).
 
 - `recognizer_device=gpu` and `IRLUME_RECOGNIZER_DEVICE=gpu` give a warning, `auto`
   and provenance `invalid_value`. The daemon starts, and no GPU code runs.
@@ -148,3 +180,7 @@ stays as the record, and no longer binds.
 
 If the NPU is certified later, its measurement path is decided then and sized to what
 it needs. The corpus extent rule in ADR-0022 still applies to that certification.
+
+Amended 2026-10-31 by ADR-0039: NPU certification is removed, a return needs a new
+ADR, and the corpus extent rule falls with ADR-0022 (ADR-0039 sections 1 and 8 and
+Consequences).

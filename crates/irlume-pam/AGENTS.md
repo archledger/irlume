@@ -73,8 +73,10 @@ login or locks a person out. It is critical-tier
   modules from before that amendment. `IRLUME_LOGIND_DIR` is a fixture
   override read through `secure_env`; setuid callers use the fixed system
   paths. The pamwrap harness keeps `IRLUME_GETENT` as a tripwire pointing
-  at hostile scripts: nothing in the module may run an account probe on the
-  PAM path again, and a re-introduced one fails the inert-line test on time.
+  at hostile scripts: the `keyring` auth line may never run an account probe
+  again, and a re-introduced one that reads the fixture overrides fails the
+  inert-line test on time. `kr`'s cold-login check on a face line
+  (`user_has_live_session`, after a released password) is separate.
 - It runs in setuid stacks with the caller's environment: read socket and
   helper paths only through `irlume_common::client::secure_env` (`socket_path`,
   `secure_helper_path`). Anything else that environment can change, such as
@@ -97,11 +99,11 @@ login or locks a person out. It is critical-tier
   attempt starts at the prompt instead, and the daemon re-checks that key before
   honoring `IntentAttestation::PolicyWaived` (ADR-0018).
 - Every copy the module makes of a secret (`PAM_AUTHTOK`, released secrets)
-  must be zeroized: hold it in `SecretBytes`, in pamsm's `PamSecretBytes` for
-  the PAM-data stashes, or in `Zeroizing` (the `set_authtok` `CString` from
-  `secret_cstring`, which also wipes the copy a rejected one leaves). Never
-  log one. A GNOME keyring token never rides
-  `PAM_AUTHTOK` (`session_state`).
+  must be zeroized: hold it in `SecretBytes` (the `session_state` PAM-data
+  slot stores them that way) or in `Zeroizing` (the `set_authtok` `CString`
+  from `secret_cstring`, which also wipes the copy a rejected one leaves).
+  Never log one. A GNOME keyring token never rides `PAM_AUTHTOK`
+  (`session_state`).
 - Service kinds are classified, from a named source, in
   `crates/irlume-common/src/pam_service.rs`
   ([its AGENTS.md](../irlume-common/AGENTS.md)). `src/lib.rs` also matches
@@ -112,11 +114,15 @@ login or locks a person out. It is critical-tier
   `kr`, `facefirst`, `ondemand`, `defer_wallet`, `begin`) are written by
   `crates/irlume-cli/src/pamwire.rs` and
   `crates/irlume-cli/src/pamwire/stanzas.rs` (every argument but `wait`), on
-  NixOS by `nix/module.nix` (`unseal ondemand`, with its own controls), and on
-  test boxes by `scripts/deploy-keyring-unlock.sh` (`wait`, `unseal`,
-  `reseal`). A change to an argument's meaning or to the allowed controls
-  updates all three and runs `nix flake check --no-build --show-trace` beside
-  the CLI wiring tests. Face lines are `sufficient`,
+  NixOS by `nix/module.nix` (`unseal ondemand`, plus `kr` on `login`-profile
+  lines, with its own controls), and on test boxes by
+  `scripts/deploy-keyring-unlock.sh` (`wait`, `unseal`, `defer_wallet`,
+  `reseal`, `begin`). A change to an argument's meaning or to the allowed
+  controls updates all three and runs
+  `nix flake check --no-build --show-trace` beside the CLI wiring tests. An
+  argument that already-wired greeter stacks must gain also goes in pamwire's
+  `login_recipe_stale`, so `irlume login reconcile` re-applies the recipe
+  there. Face lines are `sufficient`,
   `[success=1 default=ignore]` or, on polkit consent prompts and the Omarchy
   lock (`omarchy-lock-password`), `POLKIT_VERIFY_STANZA` (`sufficient` plus
   `abort=die`); keyring and `reseal` lines are `optional`; never `required` or
@@ -145,8 +151,9 @@ login or locks a person out. It is critical-tier
     COSMIC tests fail, so a filtered run that leaves them out tests no PAM
     stack. `IRLUME_REQUIRE_PAM_TOOLS=1`, set in the CI PAM lanes, makes each of
     those tests fail instead; set it, as above, before you report a pass.
-    `nix develop` has neither tool; the COSMIC tests also compile a C driver
-    (`cc`, libpam headers).
+    `nix develop` has neither tool. The COSMIC tests compile a C driver, and
+    the `tests/pamwrap.rs` tests that use a `tests/pamwrap/*.c` fixture
+    compile it (`cc`, libpam headers).
 - The fake daemon must send the real wire text
   ([daemon AGENTS.md](../irlume-daemon/AGENTS.md)).
 - Shared-greeter tests run the real daemon with this module; they compile a C

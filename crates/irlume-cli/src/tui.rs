@@ -5993,7 +5993,7 @@ impl App {
             }
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
-                    "Login password to seal (••):".into(),
+                    keyring_arm_prompt(crate::nixos::host_is_nixos()),
                     String::new(),
                     Pending::KeyringPw(None),
                 ));
@@ -11783,6 +11783,22 @@ fn map_confirm(resp: Response) -> (bool, String) {
     }
 }
 
+/// The first prompt of a keyring arm. Off NixOS irlumed picks what is sealed,
+/// and one kind, a GNOME keyring token, has no disarm in this release, so the
+/// prompt says so before a password is typed, as `irlume keyring arm` and the
+/// `irlume setup` question do. On NixOS only the login password is sealed.
+fn keyring_arm_prompt(nixos: bool) -> String {
+    const PASSWORD: &str = "Login password to seal (••):";
+    if nixos {
+        PASSWORD.into()
+    } else {
+        format!(
+            "A GNOME keyring token arm cannot be undone in this release: token disarm is \
+             unavailable.\n\n{PASSWORD}"
+        )
+    }
+}
+
 /// Arm the TPM-sealed login password (a slow op worth keeping off the UI thread).
 /// A keyring arm's result, with the sealed-storage guidance after a
 /// successful one, as `keyring arm` prints it ([`crate::seal_storage_advice`]).
@@ -17060,6 +17076,30 @@ mod tests {
         assert!(matches!(&app.suspend,
             Some(Suspend::MoreAction(invocation))
                 if invocation.args("bob") == ["keyring", "forget", "--user", "bob"]));
+    }
+
+    /// The arm prompt names the one-way token arm before a password is typed,
+    /// and the modal shows it above the masked field.
+    #[test]
+    fn the_arm_prompt_names_the_one_way_token_arm_before_the_password() {
+        let prompt = keyring_arm_prompt(false);
+        assert!(
+            prompt.starts_with("A GNOME keyring token arm cannot be undone in this release"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("Login password to seal (••):"), "{prompt}");
+        assert_eq!(keyring_arm_prompt(true), "Login password to seal (••):");
+
+        let mut app = test_app();
+        app.input = Some((prompt, "hunter2".into(), Pending::KeyringPw(None)));
+        let text = draw_text(&app);
+        for word in ["GNOME", "undone", "disarm", "Login password to seal"] {
+            assert!(
+                text.contains(word),
+                "the prompt modal lacks '{word}':\n{text}"
+            );
+        }
+        assert!(text.contains("•••••••") && !text.contains("hunter2"));
     }
 
     #[test]

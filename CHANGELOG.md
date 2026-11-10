@@ -426,6 +426,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The TUI's keyring arm prompt says before a password is typed that a GNOME
+  keyring token arm cannot be undone in this release, as `irlume keyring arm`
+  and the `irlume setup` question do.
+
 - GNOME keyring token disarm is unavailable in this release.
   `irlume keyring forget` refuses a token with no prompt and no disarm
   request, and the envelope and keyring unlock stay armed; `--force` is

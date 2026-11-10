@@ -320,6 +320,10 @@ does not report. With a GNOME keyring
 token armed on Fedora 43 or 44, the page and Diagnostics carry the upgrade
 notice: retain the sealed token and postpone that upgrade.
 
+The arm prompt says, before a password is typed, that a GNOME keyring token
+arm cannot be undone in this release. On NixOS, where only the login password
+is sealed, it asks for the password alone.
+
 A successful arm confirms that the secret was sealed. It does not establish
 working session delivery; check Login & Apps for the required integration.
 

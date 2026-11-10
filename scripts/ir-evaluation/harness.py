@@ -9,6 +9,7 @@ import signal
 import subprocess
 import time
 
+import request_contract
 from host import strict_json
 
 CATEGORIES = frozenset(
@@ -137,7 +138,9 @@ def ioctl_event(line, live):
     }
 
 
-def checked_report(record):
+def checked_report(record, *, request_mode=False):
+    if request_mode:
+        return request_contract.checked_report(record)
     required = {
         "schema",
         "operation",
@@ -223,6 +226,7 @@ def run_traced(
     timeout=45,
     tracer="/usr/bin/strace",
     trace_ioctl=False,
+    request_mode=False,
 ):
     """One fixed diagnostic invocation; no raw stderr is retained.
 
@@ -429,7 +433,7 @@ def run_traced(
     output_valid = False
     if not flags["output_overflow"]:
         try:
-            report = checked_report(strict_json(output))
+            report = checked_report(strict_json(output), request_mode=request_mode)
             output_valid = True
         except (ValueError, TypeError):
             pass
@@ -479,7 +483,15 @@ def release_checks(events, ir_device, metadata_device, *, preflight=False):
     return not live and (preflight or saw_image)
 
 
-def trial_checks(result, mode, ir_device="/dev/video2", metadata_device="/dev/video3"):
+def trial_checks(
+    result,
+    mode,
+    ir_device="/dev/video2",
+    metadata_device="/dev/video3",
+    *,
+    request_mode=False,
+    expected_window_ms=None,
+):
     if (
         result["returncode"] != 0
         or not result["output_valid"]
@@ -505,6 +517,24 @@ def trial_checks(result, mode, ir_device="/dev/video2", metadata_device="/dev/vi
         preflight=mode == "preflight",
     ):
         return False
+    if request_mode:
+        try:
+            report = request_contract.checked_report(result["report"])
+        except (ValueError, TypeError, KeyError):
+            return False
+        if report["window_ms"] != expected_window_ms:
+            return False
+        if report["phase"] != ("preflight" if mode == "preflight" else "evaluation"):
+            return False
+        kind = report["result"]["kind"]
+        if mode == "preflight":
+            return kind == "ready"
+        if mode == "cancel":
+            return result["cancellation_sent"] and report["result"] == {
+                "kind": "refused",
+                "cause": "cancelled",
+            }
+        return kind in {"would_grant", "refused"}
     if mode == "preflight":
         return result["report"]["category"] == "ready"
     if mode == "cancel":

@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import host
 
@@ -34,6 +35,57 @@ def config():
 
 
 class ConfigTests(unittest.TestCase):
+    def test_request_swap_refuses_disk_swap_and_zram_writeback(self):
+        header = "Filename\tType\tSize\tUsed\tPriority\n"
+        with patch("host.Path.read_text", return_value=header):
+            self.assertEqual(host.memory_only_swap(), ())
+        with patch(
+            "host.Path.read_text",
+            side_effect=[header + "/dev/zram0 partition 10 0 100\n", "none\n"],
+        ):
+            self.assertEqual(host.memory_only_swap(), ("zram0",))
+        for values in (
+            [header + "/dev/dm-0 partition 10 0 100\n"],
+            [header + "/dev/zram0 partition 10 0 100\n", "/dev/nvme0n1\n"],
+        ):
+            with (
+                patch("host.Path.read_text", side_effect=values),
+                self.assertRaises(ValueError),
+            ):
+                host.memory_only_swap()
+
+    def test_request_configuration_has_expected_window_not_override(self):
+        data = config()
+        data.update(
+            schema=2,
+            request_service="kde",
+            expected_window_ms=15000,
+            watchdog_seconds=45,
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+        )
+        del data["budget_ms"]
+        data["cameras"]["metadata"] = None
+        self.assertEqual(host.validate_config(data), data)
+        with self.assertRaises(ValueError):
+            host.validate_config(dict(data, budget_ms=5000))
+
+    def test_account_preservation_detects_creation_removal_and_change(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("host.trusted_path", side_effect=Path),
+        ):
+            root = Path(tmp)
+            before = host.account_state("fixture", root)
+            file = root / "fixture.json"
+            file.write_text("synthetic primary")
+            created = host.account_state("fixture", root)
+            self.assertNotEqual(before, created)
+            file.write_text("changed primary")
+            self.assertNotEqual(created, host.account_state("fixture", root))
+            file.unlink()
+            self.assertEqual(before, host.account_state("fixture", root))
+
     def test_explicit_non_default_camera_numbers_are_preserved(self):
         self.assertEqual(
             host.validate_config(config())["cameras"]["ir"], "/dev/video10"

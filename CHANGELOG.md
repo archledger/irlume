@@ -418,6 +418,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- TPM sealing runs `TPM2_Create` in an HMAC session salted to the parent
+  key, with AES-128-CFB parameter encryption. A secret over 256 bytes, the
+  TSS buffer size, is rejected before any TPM command. Policies and
+  envelope fields are unchanged.
+
 - First-time enrollment on an ordinary camera pair collects its scans in one
   pass, avoiding a second RGB PAD warm-up when no existing profile can require
   merge confirmation. The full five-score vote, saved scan count, first-scan

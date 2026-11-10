@@ -9,9 +9,9 @@ This is the runbook for them.
 
 `scripts/ci/irlume-ci-capture.py` is the root-installed, source-bound capture
 the hardware suite's strobe stage uses where an administrator installed it.
-archhost has it again since its October 2026 reinstall; its scheduled runs
-of 2026-11-05 to 2026-11-08 failed on a stale approval (run 42432854124 is
-the last). It executes only the ELF
+archhost has it again since its October 2026 reinstall; its four scheduled
+runs of 2026-11-05 to 2026-11-08 failed on a stale approval (42432854124 is
+the last of them). The helper executes only the ELF
 recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
 
 ```json
@@ -127,7 +127,7 @@ The coverage step sets `IRLUME_REQUIRE_PAM_TOOLS=1`, so `pamtester` (AUR on
 Arch) and `pam_wrapper` must be installed on the runner; a missing tool fails
 the PAM lane instead of skipping it.
 
-## 5. archhost runs NixOS: declarative environment, restart after switch
+## 5. archhost on NixOS: declarative environment, restart after switch
 
 archhost was reinstalled with Arch Linux in October 2026 and its runner is
 the `actions.runner.archledger-irlume.archhost.service` unit of section 2,

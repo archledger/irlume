@@ -18,10 +18,12 @@ carries that release's version label.
    the release runner, minihost. It carries every capability label the
    trusted hardware jobs select on and its IR capture needs no per-tree
    approval, so a release does not wait for a second runner. archhost
-   carries the same labels; it can take those jobs when it is online and its
-   capture approval names the candidate tree
-   ([RUNNER-MAINTENANCE.md](RUNNER-MAINTENANCE.md), section 1). Record which
-   runner ran each hardware job. Fork PR jobs stay hosted.
+   carries the labels those jobs select on; it can take them when it is
+   online and its capture approval names the candidate tree
+   ([RUNNER-MAINTENANCE.md](RUNNER-MAINTENANCE.md), section 1). A green run
+   there under an approval for another tree captured no IR frames and does
+   not close check 2. Record in the handoff which runner ran each hardware
+   job. Fork PR jobs stay hosted.
 4. Build the actual Debian, Arch, Fedora and Nix outputs for the channels being
    released. Inspect package contents, ownership, runtime dependencies and version
    metadata. The recipe parity script checks declarations; it does not replace

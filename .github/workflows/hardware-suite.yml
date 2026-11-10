@@ -1,6 +1,6 @@
 # Nightly hardware-in-the-loop suite on the self-hosted runners carrying the
-# `ir-camera` label (minihost, with the NexiGo N930W; or archhost, NixOS since
-# 2026-09-29, with the Logitech BRIO), with a real TPM at /dev/tpmrm0 via the
+# `ir-camera` label (minihost, with the NexiGo N930W; or archhost, while it is
+# online, with the Logitech BRIO), with a real TPM at /dev/tpmrm0 via the
 # tss group
 # and an IR camera via the video group. Software fakes have proven blind spots:
 # the Tier-1 signed-PCR bug passed swtpm-based CI completely and only failed

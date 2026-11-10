@@ -882,7 +882,8 @@ fn prove(
 mod tests {
     use super::super::super::grammar::{with_stack_reader, StackReader};
     use super::super::super::stanzas::{
-        GREETER_UNSEAL_COSMIC_JUMP, KEYRING_UNSEAL, PERMIT_LANDING, RESEAL_AUTH, RESEAL_SESSION,
+        GREETER_UNSEAL_COSMIC_JUMP, KEYRING_UNSEAL, PERMIT_LANDING, RESEAL_AUTH, RESEAL_BEGIN,
+        RESEAL_SESSION,
     };
     use super::super::super::tests::{FEDORA_PASSWORD_AUTH, FEDORA_POSTLOGIN, UPSTREAM_FEDORA};
     use super::super::super::transform::{unwire_lines, wire_greeter_impl};
@@ -1277,7 +1278,7 @@ mod tests {
     fn a_jump_that_does_not_cross_irlumes_lines_is_left_as_it_is() {
         let top = "auth       [success=1 default=ignore]   pam_succeed_if.so user ingroup kiosk";
         let (before, _) = issue_files(ISSUE_JUMP);
-        let before = format!("{top}\n{before}");
+        let before = before.replacen(RESEAL_BEGIN, &format!("{RESEAL_BEGIN}\n{top}"), 1);
         let after = face(&unwire_lines(&before).0);
         let adjusted = raise(&before, &after).expect("adjustable");
         assert_eq!(adjusted.changed.len(), 1);
@@ -2172,7 +2173,8 @@ mod tests {
              auth optional pam_b.so\n"
         );
         let fingerprint = "auth [success=4 default=ignore] pam_fprintd.so";
-        let before = format!("{fingerprint}\n{}", face(&vendor));
+        let before =
+            face(&vendor).replacen(RESEAL_BEGIN, &format!("{RESEAL_BEGIN}\n{fingerprint}"), 1);
         let stripped = unwire_lines(&before).0;
         // Where the success of `line` lands in `text`, read independently.
         let lands_on = |line: &str, text: &str| {

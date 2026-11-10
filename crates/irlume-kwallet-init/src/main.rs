@@ -17,8 +17,10 @@
 //! three plus a listening socket. Keeping that in a short-lived helper leaves
 //! the module's own blast radius unchanged.
 //!
-//! Invoked as `irlume-kwallet-init <username>` with the key on **stdin**, never
-//! in argv, which is world-readable through `/proc`.
+//! Invoked as `irlume-kwallet-init <username> [--strict-runtime]` with the key
+//! on **stdin**, never in argv, which is world-readable through `/proc`.
+//! The optional argument is a capability handshake: older helpers reject it,
+//! so callers can rely on exit 4 meaning only an absent runtime directory.
 //!
 //! It is launched from the PAM process rather than from `irlumed` on purpose:
 //! that places `ksecretd` in the session's cgroup, where `pam_kwallet5` puts it.
@@ -28,7 +30,7 @@
 use irlume_common::kwallet_wire::{
     KEY_LEN, LOGIN_ENV, SALT_ABSENT_EXIT, SALT_LEN, SESSION_NOT_READY_EXIT, SOCKET_NAME,
 };
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::io::{Read, Write};
 use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt;
@@ -47,31 +49,47 @@ const CANDIDATES: &[&str] = &[
     "/usr/bin/kwalletd5",
 ];
 
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    Wallet(OsString),
+    ReadSalt(OsString),
+}
+
+fn parse_args(mut args: impl Iterator<Item = OsString>) -> Option<Invocation> {
+    let user = args.next()?;
+    if user == "--read-salt" {
+        let user = args.next()?;
+        return args.next().is_none().then_some(Invocation::ReadSalt(user));
+    }
+    // This is an opt-in capability marker, not a different runtime policy.
+    // Keep the same strict classification for existing callers too.
+    if let Some(option) = args.next() {
+        if option != "--strict-runtime" || args.next().is_some() {
+            return None;
+        }
+    }
+    Some(Invocation::Wallet(user))
+}
+
 fn main() -> std::process::ExitCode {
-    let mut args = std::env::args_os().skip(1);
-    let Some(user) = args.next() else {
-        eprintln!("usage: irlume-kwallet-init <username>  (key on stdin)");
+    let invocation = parse_args(std::env::args_os().skip(1));
+    let Some(invocation) = invocation else {
+        eprintln!("usage: irlume-kwallet-init <username> [--strict-runtime]  (key on stdin)");
         return std::process::ExitCode::from(2);
     };
-    if user == "--read-salt" {
-        let Some(user) = args.next() else {
-            return std::process::ExitCode::from(2);
-        };
-        if args.next().is_some() {
-            return std::process::ExitCode::from(2);
+    let user = match invocation {
+        Invocation::Wallet(user) => user,
+        Invocation::ReadSalt(user) => {
+            return match read_salt_mode(&user.to_string_lossy()) {
+                Ok(salt) => match write_salt(salt.expose()) {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(_) => std::process::ExitCode::FAILURE,
+                },
+                Err(SaltReadError::Absent) => std::process::ExitCode::from(SALT_ABSENT_EXIT as u8),
+                Err(SaltReadError::Failed) => std::process::ExitCode::FAILURE,
+            };
         }
-        return match read_salt_mode(&user.to_string_lossy()) {
-            Ok(salt) => match write_salt(salt.expose()) {
-                Ok(()) => std::process::ExitCode::SUCCESS,
-                Err(_) => std::process::ExitCode::FAILURE,
-            },
-            Err(SaltReadError::Absent) => std::process::ExitCode::from(SALT_ABSENT_EXIT as u8),
-            Err(SaltReadError::Failed) => std::process::ExitCode::FAILURE,
-        };
-    }
-    if args.next().is_some() {
-        return std::process::ExitCode::from(2);
-    }
+    };
     let user = user.to_string_lossy().into_owned();
 
     match run(&user) {
@@ -114,10 +132,28 @@ impl From<String> for RunError {
 /// when logind has not created it yet (a cold-boot first login, during auth).
 fn require_runtime_dir(uid: libc::uid_t) -> Result<PathBuf, RunError> {
     let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
-    if !runtime_dir.is_dir() {
-        return Err(RunError::NotReady(runtime_dir));
+    let observed = std::fs::symlink_metadata(&runtime_dir).map(|metadata| metadata.is_dir());
+    runtime_dir_status(runtime_dir, observed)
+}
+
+fn runtime_dir_status(
+    runtime_dir: PathBuf,
+    observed: std::io::Result<bool>,
+) -> Result<PathBuf, RunError> {
+    match observed {
+        Ok(true) => Ok(runtime_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(RunError::NotReady(runtime_dir))
+        }
+        Ok(false) => Err(RunError::Failed(format!(
+            "{} is not a runtime directory",
+            runtime_dir.display()
+        ))),
+        Err(error) => Err(RunError::Failed(format!(
+            "cannot inspect {}: {error}",
+            runtime_dir.display()
+        ))),
     }
-    Ok(runtime_dir)
 }
 
 fn write_salt(salt: &[u8]) -> std::io::Result<()> {
@@ -137,11 +173,12 @@ fn run(user: &str) -> Result<PathBuf, RunError> {
     let mut key = read_wallet_key_from_stdin()?;
 
     let pw = lookup_user(user)?;
-    let runtime_dir = require_runtime_dir(pw.uid)?;
-    let sock_path = runtime_dir.join(SOCKET_NAME);
     // Resolved while still privileged: after the drop below, a user-writable
     // PATH or a swapped file could change which program this becomes.
     let exe = wallet_daemon()?;
+    // A missing backend is not a retryable cold-session condition.
+    let runtime_dir = require_runtime_dir(pw.uid)?;
+    let sock_path = runtime_dir.join(SOCKET_NAME);
 
     // EVERYTHING below runs as the target user. Nothing after this point needs
     // privilege, and doing pathname work as root inside /run/user/<uid>, which
@@ -159,7 +196,7 @@ fn run(user: &str) -> Result<PathBuf, RunError> {
     let (status_read, status_write) = make_status_pipe()?;
 
     // Resolved HERE, in the parent, so the child between fork() and execve()
-    // does nothing but open/dup2/close/fcntl/execve on buffers that already
+    // does nothing but open/dup2/close/close_range/fcntl/execve on buffers that already
     // exist (#363).
     // It used to call getpwuid, format! and CString::new down there. This
     // process is single-threaded at the fork, which is why that never
@@ -181,7 +218,8 @@ fn run(user: &str) -> Result<PathBuf, RunError> {
         )));
     }
     if pid == 0 {
-        #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
+        // SAFETY: only async-signal-safe calls and allocation-free key wiping
+        // occur in this child. The failure path exits without destructors.
         unsafe {
             libc::close(status_read);
             libc::close(write_fd);
@@ -191,9 +229,9 @@ fn run(user: &str) -> Result<PathBuf, RunError> {
             // branch. Slice zeroization is allocation-free and does not run a
             // Vec destructor in the post-fork child.
             wipe_fork_child_key(&mut key);
-            child_exec(&exe, read_fd, listener, &plan);
-            // Only reached when execve failed. The byte distinguishes that from
-            // the EOF a successful exec produces.
+            child_exec(&exe, read_fd, listener, status_write, &plan);
+            // Reached on pre-exec or execve failure. The byte distinguishes
+            // that from the EOF a successful exec produces.
             let failed = [1u8];
             libc::write(status_write, failed.as_ptr() as *const libc::c_void, 1);
             libc::_exit(127);
@@ -254,10 +292,14 @@ fn read_wallet_key(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
         .read_exact(&mut key)
         .map_err(|e| format!("expected {KEY_LEN} bytes of wallet key on stdin: {e}"))?;
     let mut extra = Zeroizing::new([0u8; 1]);
-    if let Ok(1) = input.read(&mut *extra) {
-        return Err(format!("more than {KEY_LEN} bytes on stdin; refusing"));
+    loop {
+        match input.read(&mut *extra) {
+            Ok(0) => return Ok(key),
+            Ok(_) => return Err(format!("more than {KEY_LEN} bytes on stdin; refusing")),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("checking wallet key end of input: {error}")),
+        }
     }
-    Ok(key)
 }
 
 fn wipe_fork_child_key(key: &mut [u8]) {
@@ -772,9 +814,9 @@ impl LaunchPlan {
     }
 }
 
-/// The post-fork child: only `open`, `dup2`, `close`, `fcntl` and `execve`,
-/// every one of them on the POSIX async-signal-safe list, all operating on
-/// buffers [`LaunchPlan`] already built.
+/// The post-fork child uses only allocation-free operations, POSIX
+/// async-signal-safe calls and the Linux close_range syscall. All buffers are
+/// built by [`LaunchPlan`] before fork.
 ///
 /// # Safety
 ///
@@ -784,37 +826,107 @@ unsafe fn child_exec(
     exe: &CString,
     read_fd: libc::c_int,
     listen_fd: libc::c_int,
+    status_fd: libc::c_int,
     plan: &LaunchPlan,
 ) {
     // No privilege drop here: the parent already dropped, before it touched the
     // user-owned runtime directory at all.
+    if !isolate_child_fds(read_fd, listen_fd, status_fd) {
+        return;
+    }
     // Detach the standard streams before exec. The wallet daemon outlives this
     // helper by design, and if it kept our stdout the caller would block: a
     // pipe or a `$(...)` capture waits for EVERY writer to close, not just the
     // process it started. Found by hanging exactly that way in the end-to-end
     // test. ksecretd logs to the journal regardless.
-    let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
-    if devnull >= 0 {
-        libc::dup2(devnull, libc::STDIN_FILENO);
-        libc::dup2(devnull, libc::STDOUT_FILENO);
-        libc::dup2(devnull, libc::STDERR_FILENO);
-        if devnull > libc::STDERR_FILENO {
-            libc::close(devnull);
+    // SAFETY: the path is static and NUL-terminated; open owns its returned fd.
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    if devnull < 0 {
+        return;
+    }
+    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        // SAFETY: both descriptors are valid scalar arguments to dup2.
+        if unsafe { libc::dup2(devnull, target) } < 0 {
+            return;
+        }
+    }
+    if devnull > libc::STDERR_FILENO {
+        // SAFETY: this temporary fd is owned by the child and no longer needed.
+        if unsafe { libc::close(devnull) } < 0 {
+            return;
         }
     }
 
     // Both fds are passed by number, so they must not carry CLOEXEC.
-    clear_cloexec(read_fd);
-    clear_cloexec(listen_fd);
+    if !set_cloexec(read_fd, false) || !set_cloexec(listen_fd, false) {
+        return;
+    }
 
-    libc::execve(exe.as_ptr(), plan.argv.as_ptr(), plan.envp.as_ptr());
+    // SAFETY: the parent constructed these NUL-terminated buffers and pointer
+    // arrays; they remain alive in this child until exec or _exit.
+    unsafe { libc::execve(exe.as_ptr(), plan.argv.as_ptr(), plan.envp.as_ptr()) };
 }
 
-unsafe fn clear_cloexec(fd: libc::c_int) {
-    let flags = libc::fcntl(fd, libc::F_GETFD);
-    if flags >= 0 {
-        libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+/// Close everything except stdio and the three handoff descriptors with
+/// close_range (Linux 5.9+), which covers the whole descriptor table whatever
+/// the resource limit; /proc enumeration and an RLIMIT bound do not. An
+/// unavailable or blocked syscall refuses the launch, without a partial
+/// fallback. See <https://man7.org/linux/man-pages/man2/close_range.2.html>.
+fn isolate_child_fds(read_fd: libc::c_int, listen_fd: libc::c_int, status_fd: libc::c_int) -> bool {
+    let (mut first, mut middle, mut last) = (read_fd, listen_fd, status_fd);
+    // A fixed sorting network cannot allocate, consult NSS or unwind.
+    if first > middle {
+        std::mem::swap(&mut first, &mut middle);
     }
+    if middle > last {
+        std::mem::swap(&mut middle, &mut last);
+    }
+    if first > middle {
+        std::mem::swap(&mut first, &mut middle);
+    }
+    if first <= libc::STDERR_FILENO || first == middle || middle == last {
+        return false;
+    }
+    for fd in [first, middle, last] {
+        // SAFETY: F_GETFD inspects only this process's descriptor table.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return false;
+        }
+    }
+    // EOF on this pipe must still mean exec, not descriptor isolation.
+    if !set_cloexec(status_fd, true) {
+        return false;
+    }
+    let mut start = 3u32;
+    for kept in [first, middle, last] {
+        let kept = kept as u32; // All three are positive c_int values above 2.
+        if start < kept && !close_fd_range(start, kept - 1) {
+            return false;
+        }
+        start = kept + 1; // c_int::MAX + 1 fits in u32.
+    }
+    close_fd_range(start, u32::MAX)
+}
+
+fn close_fd_range(first: u32, last: u32) -> bool {
+    // SAFETY: direct Linux syscall with integer arguments, no userspace memory
+    // or libc allocation/locking. The child has its own post-fork fd table.
+    unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) == 0 }
+}
+
+fn set_cloexec(fd: libc::c_int, enabled: bool) -> bool {
+    // SAFETY: F_GETFD inspects only this process's descriptor table.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return false;
+    }
+    let flags = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: F_SETFD updates flags for this process's descriptor only.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, flags) == 0 }
 }
 
 fn name_of(uid: libc::uid_t) -> String {
@@ -868,6 +980,276 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
 
     #[test]
+    fn strict_runtime_capability_and_legacy_arguments() {
+        let parse = |args: &[&str]| super::parse_args(args.iter().map(std::ffi::OsString::from));
+        let wallet = Some(super::Invocation::Wallet("alice".into()));
+        assert_eq!(parse(&["alice"]), wallet);
+        assert_eq!(parse(&["alice", "--strict-runtime"]), wallet);
+        assert_eq!(
+            parse(&["--read-salt", "alice"]),
+            Some(super::Invocation::ReadSalt("alice".into()))
+        );
+        for invalid in [
+            vec![],
+            vec!["--read-salt"],
+            vec!["alice", "--unknown"],
+            vec!["--strict-runtime", "alice"],
+            vec!["alice", "--strict-runtime", "--strict-runtime"],
+            vec!["--read-salt", "alice", "--strict-runtime"],
+            vec!["alice", "--read-salt"],
+            vec!["alice", "bob"],
+        ] {
+            assert_eq!(parse(&invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn child_exec_keeps_only_wallet_descriptors() {
+        check_child_exec(ChildFault::None);
+    }
+
+    #[test]
+    fn child_exec_refuses_incomplete_isolation() {
+        for fault in [
+            ChildFault::CloseKey,
+            ChildFault::CloseListener,
+            ChildFault::DenyCloseRange,
+            ChildFault::DenyFcntl,
+            ChildFault::DenySetFd,
+            ChildFault::DenyOpen,
+            ChildFault::DenyDup,
+        ] {
+            check_child_exec(fault);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ChildFault {
+        None,
+        CloseKey,
+        CloseListener,
+        DenyCloseRange,
+        DenyFcntl,
+        DenySetFd,
+        DenyOpen,
+        DenyDup,
+    }
+
+    fn check_child_exec(fault: ChildFault) {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("irlume-wallet-fds-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let exe_path = root.join("wallet-fds");
+        let compiler = std::process::Command::new("cc")
+            .args(["-Wall", "-Wextra", "-Werror", "-o"])
+            .arg(&exe_path)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/wallet-fds.c"
+            ))
+            .status()
+            .unwrap();
+        assert!(compiler.success());
+        let exe = CString::new(exe_path.as_os_str().as_bytes()).unwrap();
+        let canary = std::fs::File::open("/dev/null").unwrap();
+        assert!(super::set_cloexec(canary.as_raw_fd(), false));
+        let (read_fd, write_fd) = super::make_pipe().unwrap();
+        // SAFETY: each descriptor was newly created and is owned exactly once.
+        let (read_fd, write_fd) = unsafe {
+            (
+                OwnedFd::from_raw_fd(read_fd),
+                OwnedFd::from_raw_fd(write_fd),
+            )
+        };
+        let socket = root.join("wallet.socket");
+        let listener = super::bind_listener(&socket).unwrap();
+        // SAFETY: bind_listener transfers this newly created descriptor.
+        let listener = unsafe { OwnedFd::from_raw_fd(listener) };
+        let (status_read, status_write) = super::make_status_pipe().unwrap();
+        // SAFETY: each descriptor was newly created and is owned exactly once.
+        let (status_read, status_write) = unsafe {
+            (
+                OwnedFd::from_raw_fd(status_read),
+                OwnedFd::from_raw_fd(status_write),
+            )
+        };
+        // SAFETY: F_DUPFD duplicates a live fd without CLOEXEC, at a deliberately
+        // high number that also checks the unbounded final close range.
+        let high = unsafe { libc::fcntl(canary.as_raw_fd(), libc::F_DUPFD, 64) };
+        assert!(high >= 64);
+        // SAFETY: high is a fresh descriptor owned by this scope.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        let plan =
+            LaunchPlan::build(&exe, read_fd.as_raw_fd(), listener.as_raw_fd(), &socket).unwrap();
+        // BPF loads seccomp_data.nr (offset 0) and rejects one chosen syscall.
+        // Built before fork; neither allocation nor assertion occurs afterward.
+        #[cfg(any(
+            target_arch = "aarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "loongarch64"
+        ))]
+        let dup_syscall = libc::SYS_dup3;
+        #[cfg(not(any(
+            target_arch = "aarch64",
+            target_arch = "riscv32",
+            target_arch = "riscv64",
+            target_arch = "loongarch64"
+        )))]
+        let dup_syscall = libc::SYS_dup2;
+        let denied_syscall = match fault {
+            ChildFault::DenyFcntl | ChildFault::DenySetFd => libc::SYS_fcntl,
+            ChildFault::DenyOpen => libc::SYS_openat,
+            ChildFault::DenyDup => dup_syscall,
+            _ => libc::SYS_close_range,
+        };
+        let mut filter = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 3,
+                k: denied_syscall as u32,
+            },
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                // Low word of seccomp_data.args[1]: fcntl's command argument.
+                k: if cfg!(target_endian = "little") {
+                    24
+                } else {
+                    28
+                },
+            },
+            libc::sock_filter {
+                // JEQ F_SETFD allows F_GETFD to succeed. JGE 0 matches every
+                // command for the other faults, rejecting the whole syscall.
+                code: if fault == ChildFault::DenySetFd {
+                    0x15
+                } else {
+                    0x35
+                },
+                jt: 0,
+                jf: 1,
+                k: if fault == ChildFault::DenySetFd {
+                    libc::F_SETFD as u32
+                } else {
+                    0
+                },
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let filter_program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // The canary descriptor sits above the new soft limit; the sweep
+        // covers the whole table and must close it.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            // SAFETY: getrlimit writes one initialized rlimit through this pointer.
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = 64;
+        // The child uses only prebuilt buffers and async-signal-safe calls.
+        // SAFETY: no Rust allocation or unwinding occurs on the child branch.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // SAFETY: the child owns these copies and exits without destructors.
+            unsafe {
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    libc::_exit(121);
+                }
+                libc::close(status_read.as_raw_fd());
+                libc::close(write_fd.as_raw_fd());
+                match fault {
+                    ChildFault::None => {}
+                    ChildFault::CloseKey => {
+                        libc::close(read_fd.as_raw_fd());
+                    }
+                    ChildFault::CloseListener => {
+                        libc::close(listener.as_raw_fd());
+                    }
+                    ChildFault::DenyCloseRange
+                    | ChildFault::DenyFcntl
+                    | ChildFault::DenySetFd
+                    | ChildFault::DenyOpen
+                    | ChildFault::DenyDup => {
+                        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                            || libc::prctl(
+                                libc::PR_SET_SECCOMP,
+                                libc::SECCOMP_MODE_FILTER,
+                                &filter_program,
+                            ) != 0
+                        {
+                            libc::_exit(120);
+                        }
+                    }
+                }
+                super::child_exec(
+                    &exe,
+                    read_fd.as_raw_fd(),
+                    listener.as_raw_fd(),
+                    status_write.as_raw_fd(),
+                    &plan,
+                );
+                let failed = [1u8];
+                libc::write(status_write.as_raw_fd(), failed.as_ptr().cast(), 1);
+                libc::_exit(127);
+            }
+        }
+        drop(status_write);
+        drop(listener);
+        super::write_all(write_fd.as_raw_fd(), &[0x5a; KEY_LEN]).unwrap();
+        drop(write_fd);
+        drop(read_fd);
+        let exec_result = super::await_exec(status_read.into_raw_fd());
+        let mut status = 0;
+        // SAFETY: waitpid writes to a valid status and waits for our exact child.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status));
+        let expected = if fault == ChildFault::None { 0 } else { 127 };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            expected,
+            "synthetic exec target: {fault:?}"
+        );
+        assert_eq!(exec_result.is_ok(), fault == ChildFault::None, "{fault:?}");
+        // The parent's canary remains open: only the child's copy may close.
+        // SAFETY: high remains a live parent-owned descriptor.
+        assert!(unsafe { libc::fcntl(high.as_raw_fd(), libc::F_GETFD) } >= 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "fresh-exec child invoked by wallet_stdin_does_not_buffer_key_bytes"]
     fn wallet_stdin_child() {
         let error = super::read_wallet_key_from_stdin().expect_err("oversized input must fail");
@@ -903,6 +1285,96 @@ mod tests {
             require_runtime_dir(libc::uid_t::MAX),
             Err(RunError::NotReady(_))
         ));
+    }
+
+    #[test]
+    fn only_runtime_directory_absence_is_retryable() {
+        use std::io::ErrorKind;
+        let path = std::path::PathBuf::from("/synthetic/runtime");
+        assert!(super::runtime_dir_status(path.clone(), Ok(true)).is_ok());
+        assert!(matches!(
+            super::runtime_dir_status(path.clone(), Err(ErrorKind::NotFound.into())),
+            Err(RunError::NotReady(_))
+        ));
+        for observed in [
+            Ok(false),
+            Err(ErrorKind::PermissionDenied.into()),
+            Err(ErrorKind::NotADirectory.into()),
+            Err(ErrorKind::Other.into()),
+        ] {
+            assert!(matches!(
+                super::runtime_dir_status(path.clone(), observed),
+                Err(RunError::Failed(_))
+            ));
+        }
+    }
+
+    fn check_wallet_key_probe(probe: Vec<std::io::Result<usize>>, success: bool) {
+        use std::collections::VecDeque;
+        use std::io::Read;
+
+        struct ProbeReader {
+            key: std::io::Cursor<[u8; KEY_LEN]>,
+            probe: VecDeque<std::io::Result<usize>>,
+            requests: Vec<usize>,
+        }
+
+        impl Read for ProbeReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.requests.push(buf.len());
+                if self.key.position() < KEY_LEN as u64 {
+                    return self.key.read(buf);
+                }
+                assert_eq!(buf.len(), 1, "the trailing probe must stay bounded");
+                let result = self.probe.pop_front().expect("unexpected extra read");
+                if matches!(result, Ok(1)) {
+                    buf[0] = 0x6b;
+                }
+                result
+            }
+        }
+
+        let mut input = ProbeReader {
+            key: std::io::Cursor::new([0x5a; KEY_LEN]),
+            probe: probe.into(),
+            requests: Vec::new(),
+        };
+        let result = read_wallet_key(&mut input);
+        assert_eq!(result.is_ok(), success, "probe result must be conclusive");
+        assert!(input.probe.is_empty(), "Interrupted must retry the probe");
+        assert_eq!(input.requests[0], KEY_LEN);
+        assert!(input.requests[1..].iter().all(|size| *size == 1));
+        if let Ok(key) = result {
+            assert_eq!(&**key, &[0x5a; KEY_LEN]);
+        }
+    }
+
+    #[test]
+    fn wallet_key_probe_rejects_non_eof_errors() {
+        use std::io::ErrorKind;
+        check_wallet_key_probe(vec![Ok(0)], true);
+        check_wallet_key_probe(vec![Ok(1)], false);
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::Other,
+            ErrorKind::UnexpectedEof,
+        ] {
+            check_wallet_key_probe(vec![Err(kind.into())], false);
+        }
+    }
+
+    #[test]
+    fn wallet_key_probe_retries_interrupted() {
+        use std::io::ErrorKind;
+        check_wallet_key_probe(vec![Err(ErrorKind::Interrupted.into()), Ok(0)], true);
+        check_wallet_key_probe(vec![Err(ErrorKind::Interrupted.into()), Ok(1)], false);
+        check_wallet_key_probe(
+            vec![
+                Err(ErrorKind::Interrupted.into()),
+                Err(ErrorKind::WouldBlock.into()),
+            ],
+            false,
+        );
     }
 
     #[test]

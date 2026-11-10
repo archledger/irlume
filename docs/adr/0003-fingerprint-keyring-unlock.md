@@ -419,3 +419,78 @@ pam_wrapper:
 
 Daemon-side warm withholding keeps its own tests in `irlume-daemon`
 (`a_warm_unlock_releases_no_keyring_secret` and the unseal gates).
+
+## Amendment 2026-11-08: defer a cold-login face wallet key
+
+This changes delivery after an existing successful face match; it changes
+no daemon authorization, PAD requirement, credential kind or wire message.
+
+### 1. Opt in only on login stacks with a session consumer
+
+After a cold boot, `pam_systemd` creates `/run/user/<uid>` during session
+opening, not during authentication. A face match can therefore unseal a KDE
+wallet key while `irlume-kwallet-init` cannot yet start the wallet. Treating
+that condition as a failed delivery forces an unnecessary password login.
+
+The `defer_wallet` PAM argument allows that key to wait in the current PAM
+transaction until its `reseal` session hook runs. The login wiring adds this
+argument together with that hook. Separate lock stacks and NixOS's
+password-only wiring do not opt in. Existing hand-written stacks without the
+argument retain their password fallback; a hand-written opt-in must include
+the session consumer after the runtime directory is established.
+
+Only the helper's explicit session-not-ready exit permits deferral. The
+helper returns it only for a missing runtime directory, after finding a
+wallet backend. An unreadable path, a non-directory or symlink, a missing
+backend, a malformed key, timeout or other helper failure remains a failed
+delivery. No directory is created during authentication.
+
+### 2. Hold the key only in transaction-local zeroizing memory
+
+A successful stash is an explicit delivery outcome, like the existing GNOME
+token stash. It never sets `PAM_AUTHTOK`, so `kr` does not send a KDE key into
+the password stack. The stash binds the key to the exact PAM user and
+service. Failed registration cannot grant authentication.
+
+The session hook destructively takes the key before checking that binding or
+invoking a helper. It does not ask the daemon for another secret. The
+running-wallet interlock still prevents a second wallet daemon. A failed or
+not-ready session delivery is final for that transaction; repeated session
+opening cannot retry it. A new primary authentication attempt, session
+closure and transaction destruction discard any pending key. Optional
+`keyring` and `reseal` auth markers do not discard it.
+
+### 3. Acceptance tests and remaining qualification
+
+The real-PAM fixtures must show that a cold face login succeeds before a
+session-only readiness marker is created, then delivers the same key once
+after that marker, with no second credential request and no wallet key in
+`PAM_AUTHTOK`. Both sufficient and numeric-jump greeter controls are covered.
+Negative cases cover legacy no-opt-in fallback, malformed keys, helper
+failure, changed user/service, repeated authentication and the existing
+running-wallet interlock. Password, fingerprint and GNOME-token tests remain
+required. Physical cold-boot login and desktop wallet use require a separate
+attended qualification; a passing fixture is not that qualification.
+
+### 4. Establish the authentication attempt before any factor
+
+Managed greeter and fingerprint recipes start their auth chain with
+`pam_irlume.so begin reseal service=SERVICE`. The service is the top-level
+PAM service owning the file. A marker reached inside another service's include
+does not reset that outer transaction. The new module handles the arguments
+before reading the user or token: it discards the prior attempt's state and
+returns `PAM_IGNORE`, without prompting or requesting a credential. The
+`reseal` carrier keeps the entry non-authenticating on older modules too;
+an older module still needs replacement to provide the reset guarantee.
+
+This entry precedes any provider that can return a sufficient success,
+including providers in inline includes. Credential-granting rules remain
+below their existing policy gates. The post-auth `reseal` line also removes
+any previously cached password before examining the current token, without
+discarding a face-released key from the same attempt.
+
+All stashed secrets share one user/service-bound transaction state. Session
+opening marks it consumed before resealing, making a credential request or
+delivering to a helper. That transition needs no fallible PAM-data replacement.
+Failure to create the state before any side effect can be retried by a later
+session call; it never permits a second release after consumption.

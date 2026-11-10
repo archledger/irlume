@@ -23,14 +23,16 @@
 # script starts is stopped at exit; nothing is selected by process name.
 #
 # The login keyring starts as `irlume keyring arm` leaves it: it holds a
-# canary and is keyed to a random token (the stale case keeps it keyed to the
-# test password). Every case that delivers checks that the Secret Service
-# client got the canary with no prompt, that the collection is unlocked and
-# still keyed to the token, that the helper activated no bus name, and that
-# no helper process is left. The helper runs with --foreground, except in the
-# first case, which runs the real PAM-mode fork: the parent must return within
-# about a second while its detached waiter delivers later. That waiter logs to
-# the journal, so a run leaves a few `irlume-gkr-unlock` lines there.
+# canary and is keyed to a random token (the stale and login-password cases
+# keep it keyed to the test password). Every case that delivers checks that
+# the Secret Service client got the canary with no prompt, that the collection
+# is unlocked and still keyed to what it was, that the helper activated no bus
+# name, and that no helper process is left. The login-password case sends the
+# password with --password, as the session line does for a keyring keyed to
+# it. The helper runs with --foreground, except in the first case, which runs
+# the real PAM-mode fork: the parent must return within about a second while
+# its detached waiter delivers later. That waiter logs to the journal, so a
+# run leaves a few `irlume-gkr-unlock` lines there.
 #
 # A missing tool is a failure, not a skip: gnome-keyring-daemon, dbus-daemon,
 # dbus-monitor, secret-tool, systemd-socket-activate, python3 with jeepney, a
@@ -45,8 +47,8 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
 HELPER="${IRLUME_GKR_UNLOCK:-$TARGET_DIR/release/irlume-gkr-unlock}"
 
 CASES=(typed-pam-early fingerprint-order face secret-tool-client worst-client
-       stale no-initializer socket-unit socket-activated fake-owner prebound
-       no-login-keyring sigterm baseline)
+       stale login-password no-initializer socket-unit socket-activated
+       fake-owner prebound no-login-keyring sigterm baseline)
 
 if [[ "${1:-}" == --list ]]; then
     printf '%s\n' "${CASES[@]}"
@@ -522,9 +524,14 @@ seed() {  # seed token|password: a login keyring with a canary, keyed to $1
 }
 
 HP=""
-helper_fg() {  # helper_fg TIMEOUT: --foreground, in the background of this shell
-    printf '%s' "$CHECK_TOKEN" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
-        "$HELPER" --foreground --timeout-secs "$1" "$(id -un)" \
+helper_fg() {  # helper_fg TIMEOUT [--password]: --foreground, in the background of this shell
+    local secret="$CHECK_TOKEN" mode=()
+    if [[ "${2:-}" == --password ]]; then
+        secret="$CHECK_PASSWORD"
+        mode=(--password)
+    fi
+    printf '%s' "$secret" | env IRLUME_GKR_RUNTIME_DIR="$XDG_RUNTIME_DIR" IRLUME_GKR_HOME="$HOME" \
+        "$HELPER" "${mode[@]}" --foreground --timeout-secs "$1" "$(id -un)" \
         >"$DIR/helper.out" 2>"$DIR/helper.err" &
     HP=$!
     PIDS+=("$HP")
@@ -630,7 +637,7 @@ case_fingerprint-order() {
     got="$(client)"
     helper_done 20
     expect_exit 0 delivered
-    expect_log "token delivered"
+    expect_log "credential delivered"
     [[ "$got" == found ]] && ok "the client got the canary" || bad "the client got nothing"
     [[ "$(prompts)" == 0 ]] && ok "no unlock prompt" || bad "$(prompts) unlock prompt(s)"
     check_delivered
@@ -718,7 +725,7 @@ case_stale() {
     got="$(client)"
     helper_done 20
     expect_exit 4 stale
-    expect_log "not keyed to irlume's token"
+    expect_log "not keyed to the supplied credential"
     [[ "$got" == found ]] && ok "the password unlocked it at initialization" || bad "the client got nothing"
     local r
     r="$(gk ctl change @password @password)"
@@ -731,6 +738,34 @@ case_stale() {
     r="$(gk ctl change @password @password)"
     [[ "$r" == OK ]] && ok "nothing was recorded: still keyed to the password after it" \
         || bad "the keyring changed key after the prompt: CHANGE(password,password) $r"
+    r="$(gk ctl change @token @token)"
+    [[ "$r" == DENIED ]] && ok "the token opens nothing" || bad "CHANGE(token,token): $r"
+    check_clean
+}
+
+case_login-password() {
+    # A keyring keyed to the login password, after a face login:
+    # pam_gnome_keyring had no password to pass, and irlume's session line
+    # sends the sealed one with --password. Its spaces make it a value that
+    # token mode refuses, and the last one must arrive untrimmed.
+    PASSWORD="test pass 4417 "
+    begin_case login-password 5 || return 1
+    seed password || return 1
+    start_login empty || return 1
+    helper_fg 30 --password
+    sleep 1.2
+    local got
+    got="$(client)"
+    helper_done 20
+    expect_exit 0 delivered
+    expect_log "credential delivered"
+    [[ "$got" == found ]] && ok "the client got the canary" || bad "the client got nothing"
+    [[ "$(prompts)" == 0 ]] && ok "no unlock prompt" || bad "$(prompts) unlock prompt(s)"
+    local r
+    r="$(gk locked)"
+    [[ "$r" == unlocked ]] && ok "login collection unlocked" || bad "login collection: $r"
+    r="$(gk ctl change @password @password)"
+    [[ "$r" == OK ]] && ok "still keyed to the password" || bad "CHANGE(password,password): $r"
     r="$(gk ctl change @token @token)"
     [[ "$r" == DENIED ]] && ok "the token opens nothing" || bad "CHANGE(token,token): $r"
     check_clean
@@ -770,7 +805,7 @@ case_socket-unit() {
     helper_done 5
     expect_exit 0 delivered
     local ms
-    ms="$(sed -nE 's/.*token delivered ([0-9]+) ms.*/\1/p' "$DIR/helper.err")"
+    ms="$(sed -nE 's/.*credential delivered ([0-9]+) ms.*/\1/p' "$DIR/helper.err")"
     [[ -n "$ms" ]] && ((ms < 1000)) && ok "delivered at once (${ms} ms)" || bad "delivery took '${ms}' ms"
     [[ "$(prompts)" == 0 ]] && ok "no unlock prompt" || bad "$(prompts) unlock prompt(s)"
     check_delivered

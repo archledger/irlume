@@ -97,6 +97,34 @@ pub(super) fn keyring_handoff(content: &str, service: &str) -> Option<KeyringHan
     })
 }
 
+/// Put the inert attempt boundary before any factor can short-circuit auth.
+fn finish_login_stack(mut lines: Vec<String>) -> String {
+    let first_auth = lines
+        .iter()
+        .position(|line| is_auth_directive(line) || is_at_include(line))
+        .expect("a wired login has an authentication anchor");
+    lines.insert(first_auth, RESEAL_BEGIN.to_string());
+    format!("{}\n", lines.join("\n"))
+}
+
+/// Bind generated entry markers to the PAM service that owns the file.
+/// An include retains its caller's PAM_SERVICE, so nested markers stay inert.
+pub(super) fn scope_attempt_markers(content: &str, service: &str) -> String {
+    content
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_end_matches('\n') == RESEAL_BEGIN {
+                format!(
+                    "{RESEAL_BEGIN} service={service}{}",
+                    if line.ends_with('\n') { "\n" } else { "" }
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
+}
+
 /// Insert irlume's greeter block: `unseal` before the password substack, a
 /// `pam_permit` landing + `reseal` after it, and a `session reseal` after the
 /// session substack. Idempotent; falls back to the first `auth` line if there's
@@ -156,7 +184,7 @@ pub(super) fn wire_greeter_impl(
         if !out.iter().any(|l| l == RESEAL_SESSION) {
             out.push(RESEAL_SESSION.to_string());
         }
-        return (format!("{}\n", out.join("\n")), true);
+        return (finish_login_stack(out), true);
     }
     let auth_at = find_auth_anchor(&lines);
     let sess_at = lines.iter().position(|l| is_passwd_substack(l, "session"));
@@ -194,7 +222,7 @@ pub(super) fn wire_greeter_impl(
     if sess_at.is_none() {
         out.push(RESEAL_SESSION.to_string()); // harmless optional session line
     }
-    (format!("{}\n", out.join("\n")), true)
+    (finish_login_stack(out), true)
 }
 
 /// Wire the KDE lock (`kde`) with the consent-driven on-demand face block: face
@@ -236,7 +264,7 @@ pub(super) fn wire_lock(content: &str) -> (String, bool) {
     let mut out = Vec::with_capacity(lines.len() + 2);
     for (i, l) in lines.iter().enumerate() {
         if i == auth_at {
-            out.push(GREETER_UNSEAL_COSMIC_JUMP.to_string());
+            out.push(LOCK_UNSEAL_ONDEMAND_JUMP.to_string());
             out.push((*l).to_string());
             out.push(PERMIT_LANDING.to_string());
         } else {
@@ -321,7 +349,7 @@ pub(super) fn wire_fp_keyring(content: &str, service: &str) -> (String, bool) {
     {
         out.push(RESEAL_SESSION.to_string());
     }
-    (format!("{}\n", out.join("\n")), true)
+    (finish_login_stack(out), true)
 }
 
 /// Wire a single-stanza verify service (`sudo`, `polkit-1`): the stanza goes

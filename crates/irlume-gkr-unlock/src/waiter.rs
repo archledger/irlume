@@ -329,12 +329,11 @@ impl Event {
                 after_ms,
                 daemon_pid,
             } => format!(
-                "token delivered {after_ms} ms after the session line (gnome-keyring pid {daemon_pid})"
+                "credential delivered {after_ms} ms after the session line (gnome-keyring pid {daemon_pid})"
             ),
             Event::Stale { daemon_pid } => format!(
-                "the login keyring is not keyed to irlume's token (gnome-keyring pid {daemon_pid}); \
-                 nothing was sent that gnome-keyring would remember. Run `irlume keyring arm` as \
-                 the user to put them back in step, or `irlume keyring forget`"
+                "the login keyring is not keyed to the supplied credential (gnome-keyring pid {daemon_pid}); \
+                 nothing was sent that gnome-keyring would remember. Check the keyring setup"
             ),
             Event::GaveUp { bound_secs } => format!(
                 "gnome-keyring was not initialized within {bound_secs} s (not a GNOME session?); \

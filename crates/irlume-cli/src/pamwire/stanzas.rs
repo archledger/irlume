@@ -28,7 +28,7 @@ pub(super) fn ondemand_hint(service: &str) -> &'static str {
 /// it the module runs the ACTIVE probe (`pam_get_authtok`), and a greeter that
 /// blocks that probe until the user types means face never fires at all.
 pub(super) const GREETER_UNSEAL_FACEFIRST_JUMP: &str =
-    "auth       [success=1 default=ignore]   pam_irlume.so unseal facefirst";
+    "auth       [success=1 default=ignore]   pam_irlume.so unseal facefirst defer_wallet";
 
 /// The greeter/locker face line for any INCLUDE layout: Debian/Ubuntu
 /// `@include common-auth` and Arch `auth include system-login` alike (a
@@ -41,13 +41,18 @@ pub(super) const GREETER_UNSEAL_FACEFIRST_JUMP: &str =
 /// `mode` is `facefirst` (GDM scan-immediately) or `ondemand` (explicit input). `kr`
 /// adds the keyring-continue arg: true for greeters (cold login unlocks the
 /// keyring), false for a separate warm lock service (keyring already open).
+/// Greeters also opt in to wallet deferral: their recipe adds a reseal session
+/// consumer. Lock-only recipes do not add that consumer and must not opt in.
 pub(super) fn include_greeter_line(mode: &str, kr: bool) -> String {
-    let kr_arg = if kr { " kr" } else { "" };
+    let kr_arg = if kr { " kr defer_wallet" } else { "" };
     format!("auth       sufficient   pam_irlume.so unseal {mode}{kr_arg}")
 }
 
 /// Jump-style variant for a non-`@include` (e.g. Fedora) COSMIC stack.
 pub(super) const GREETER_UNSEAL_COSMIC_JUMP: &str =
+    "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand defer_wallet";
+
+pub(super) const LOCK_UNSEAL_ONDEMAND_JUMP: &str =
     "auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand";
 
 // Tagged so unwire strips OUR landing but never a foreign pam_permit.so the
@@ -56,6 +61,12 @@ pub(super) const PERMIT_LANDING: &str =
     "auth       optional                     pam_permit.so   # irlume-landing";
 
 pub(super) const RESEAL_AUTH: &str = "auth       optional                     pam_irlume.so reseal";
+
+/// The compatibility carrier keeps this inert in older PAM modules too.
+/// The writer adds the owning service: the line acts only in a transaction
+/// that service opened, and is inert where another service includes the file.
+pub(super) const RESEAL_BEGIN: &str =
+    "auth       optional                     pam_irlume.so begin reseal";
 
 /// Post-auth landing marker for the FINGERPRINT path. The line itself
 /// requests nothing: PAM keeps `optional` lines running after a failed

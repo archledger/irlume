@@ -810,6 +810,7 @@ fn maintain_override(svc: &Svc, recipe: overrides::Recipe) -> Result<Option<Stri
         }
         overrides::Maintenance::Nothing | overrides::Maintenance::Blocked(_) => return Ok(None),
     };
+    let content = scope_attempt_markers(&content, service_name(svc.etc));
     // The maintenance owner infers the reseal-only recipe from the reduced
     // stack. Let that recipe propagate vendor policy updates while remote
     // seats remain enabled, but never publish a result that restores their
@@ -1142,7 +1143,10 @@ fn reconcile_wiring(
     // A greeter `remote_seats` governs can need its face lines stripped or
     // put back while the module stays in its stack.
     let remote_seat = remote_seat_change();
-    if !active_login_regressed()
+    let login_regressed = active_login_regressed();
+    let recipe_stale = login_recipe_stale();
+    if !login_regressed
+        && !recipe_stale
         && remote_seat.is_none()
         && !lockscreen_regressed(with_lock)
         && !wired_surface_regressed(with_sudo, with_polkit)
@@ -1172,6 +1176,10 @@ fn reconcile_wiring(
         );
     } else if let Some(RemoteSeat::Unwire) = &remote_seat {
         eprintln!("[login] LightDM's reseal lines lost their anchor; removing them");
+    } else if recipe_stale && !login_regressed {
+        eprintln!(
+            "[login] a login stack holds an earlier irlume recipe; re-applying irlume wiring"
+        );
     } else {
         eprintln!("[login] greeter PAM configuration changed; re-applying irlume wiring");
     }
@@ -1323,6 +1331,47 @@ fn polkit_stanza_stale(etc: &Path) -> bool {
     })
 }
 
+/// A pre-deferral or pre-attempt-reset login must be refreshed even when its
+/// vendor files did not change. Reuse the normal writer's gate/jump checks rather
+/// than appending arguments to a possibly administrator-edited PAM rule.
+/// The answer comes from the file alone, as [`polkit_stanza_stale`]'s does: a
+/// stack the writer declines to change stays stale, and each reconcile run
+/// examines it again and says so.
+fn login_recipe_stale() -> bool {
+    GREETERS.iter().chain(FP_GREETERS.iter()).any(|svc| {
+        let Some(path) = service_present(svc) else {
+            return false;
+        };
+        let Ok(content) = token::read_stack_file(&path) else {
+            return false;
+        };
+        let old_face = content.lines().filter_map(irlume_rule).any(|rule| {
+            rule.phase == "auth"
+                && rule.args.contains(&"unseal")
+                && !rule.args.contains(&"defer_wallet")
+                && rule
+                    .args
+                    .iter()
+                    .all(|arg| matches!(*arg, "unseal" | "ondemand" | "facefirst" | "kr"))
+        });
+        let has_begin = content
+            .lines()
+            .find(|line| is_auth_directive(line) || is_at_include(line))
+            .and_then(irlume_rule)
+            .is_some_and(|rule| {
+                rule.args.contains(&"begin")
+                    && rule.args.contains(&"reseal")
+                    && rule
+                        .args
+                        .contains(&format!("service={}", service_name(svc.etc)).as_str())
+            });
+        (old_face || !has_begin)
+            && with_stack_reader(stack_reader(&path.to_string_lossy()), || {
+                session_reaches_reseal(&content, &grammar::read_stack)
+            })
+    })
+}
+
 fn wired_surface_regressed(with_sudo: bool, with_polkit: bool) -> bool {
     let fp: Vec<&Path> = FP_GREETERS.iter().map(|s| Path::new(s.etc)).collect();
     surfaces_regressed(
@@ -1392,6 +1441,7 @@ pub(crate) fn reconcile_needed() -> bool {
     let face_lane_present = Path::new(OMARCHY_FACE_LANE).exists();
     let stock_wired = lock_wired();
     active_login_regressed()
+        || login_recipe_stale()
         || remote_seat_change().is_some()
         || lockscreen_regressed(with_lock)
         || wired_surface_regressed(with_sudo, with_polkit)
@@ -3457,7 +3507,15 @@ fn wire_service_with(
     // The stack a first auth `include` names is read where libpam finds it
     // for this file.
     let reader = stack_reader(s.etc);
-    let wire = &|c: &str| with_stack_reader(reader.clone(), || wire(c));
+    let wire = &|c: &str| {
+        with_stack_reader(reader.clone(), || {
+            let (content, changed) = wire(c);
+            (
+                scope_attempt_markers(&content, service_name(s.etc)),
+                changed,
+            )
+        })
+    };
     let apply = opts.apply;
     let out = |change: PlannedChange, message: String| {
         Ok(WireOutcome {
@@ -4737,10 +4795,8 @@ mod tests {
             .iter()
             .position(|l| l.contains("pam_permit.so"))
             .unwrap();
-        let reseal_auth = lines
-            .iter()
-            .position(|l| l.contains("auth") && l.contains("reseal"))
-            .unwrap();
+        let reseal_auth = lines.iter().position(|l| *l == RESEAL_AUTH).unwrap();
+        assert!(lines.iter().position(|line| *line == RESEAL_BEGIN).unwrap() < unseal);
         // unseal BEFORE substack; permit + reseal AFTER it.
         assert!(unseal < substack && substack < permit && permit < reseal_auth);
         // session reseal present after the session substack.
@@ -4840,6 +4896,60 @@ mod tests {
         assert!(dm_profile("/etc/pam.d/plasmalogin", None).ondemand);
         // an untested/unknown greeter defaults to the safe facefirst.
         assert!(!dm_profile("/etc/pam.d/xdm", None).ondemand);
+    }
+
+    #[test]
+    fn attempt_boundary_precedes_every_supported_include_spelling() {
+        for keyword in ["@include", "@INCLUDE", "-@include", "[@include]"] {
+            let source = format!("{keyword} common-auth\nsession optional pam_permit.so\n");
+            let reader: StackReader = std::rc::Rc::new(|name| {
+                (name == "common-auth").then(|| "auth required pam_unix.so\n".to_owned())
+            });
+            let (wired, changed) =
+                with_stack_reader(reader, || wire_greeter_impl(&source, false, true, false));
+            assert!(changed, "{keyword}");
+            assert_eq!(wired.lines().next(), Some(RESEAL_BEGIN), "{wired}");
+        }
+    }
+
+    #[test]
+    fn login_recipes_reset_before_any_authentication_factor() {
+        let stock = "auth sufficient pam_example.so\nauth include system-login\nsession include system-login\n";
+        for face in [false, true] {
+            let (wired, changed) = wire_greeter_impl(stock, face, false, true);
+            assert!(changed);
+            assert!(wired
+                .lines()
+                .find(|line| is_auth_directive(line))
+                .unwrap()
+                .contains("begin reseal"));
+        }
+        let (wired, changed) = wire_fp_keyring(
+            "auth sufficient pam_fprintd.so\nsession optional pam_permit.so\n",
+            "gdm-fingerprint",
+        );
+        assert!(changed);
+        assert!(wired.lines().next().unwrap().contains("begin reseal"));
+    }
+
+    #[test]
+    fn only_greeters_with_session_delivery_defer_wallet_keys() {
+        for stock in [
+            "auth include system-login\naccount include system-login\nsession include system-login\n",
+            "auth substack password-auth\naccount required pam_permit.so\nsession substack password-auth\n",
+        ] {
+            for ondemand in [false, true] {
+                let (greeter, changed) = wire_greeter_impl(stock, true, false, ondemand);
+                assert!(changed);
+                let face = greeter.lines().find(|line| line.contains("unseal")).unwrap();
+                assert!(face.split_whitespace().any(|arg| arg == "defer_wallet"));
+                assert!(greeter.lines().any(|line| line == RESEAL_SESSION));
+            }
+            let (lock, changed) = wire_lock(stock);
+            assert!(changed);
+            assert!(!lock.contains("defer_wallet"));
+            assert!(!lock.contains(RESEAL_SESSION));
+        }
     }
 
     #[test]
@@ -5761,7 +5871,10 @@ mod tests {
         );
         let face = wire_service(&svc, true, true, &with_face).unwrap();
         assert!(!face.unmet, "{face}");
-        assert_eq!(std::fs::read_to_string(&etc).unwrap(), wired);
+        assert_eq!(
+            std::fs::read_to_string(&etc).unwrap(),
+            scope_attempt_markers(&wired, service_name(svc.etc))
+        );
     }
 
     #[test]
@@ -7951,6 +8064,7 @@ auth       optional      pam_gnome_keyring.so\n";
             // The face jump skips the first line the include puts in its
             // place, the password step, onto the landing after the include.
             let wired = face.0.lines().collect::<Vec<_>>();
+            let at = at + 1; // The attempt marker precedes all original auth rules.
             assert_eq!(wired[at], GREETER_UNSEAL_COSMIC_JUMP, "{}", face.0);
             assert_eq!(wired[at + 1], include, "{}", face.0);
             assert_eq!(wired[at + 2], PERMIT_LANDING, "{}", face.0);
@@ -7958,6 +8072,7 @@ auth       optional      pam_gnome_keyring.so\n";
             assert_eq!(wired[at + 4], RESEAL_AUTH, "{}", face.0);
             assert!(!face.0.contains("sufficient   pam_irlume"), "{}", face.0);
             let locked = lock.0.lines().collect::<Vec<_>>();
+            let at = at - 1; // Lock-only stacks have no attempt-reset marker.
             assert!(
                 locked[at].contains("[success=1 default=ignore]"),
                 "{}",

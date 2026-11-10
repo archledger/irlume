@@ -24,14 +24,15 @@
 
 use super::grammar::{
     self, carriage_return_line, content_has_module, directive, has_line_continuation,
-    has_read_carriage_return, head, irlume_rule, is_at_include, is_auth_substack_anchor,
-    is_include_auth_layout, is_passwd_substack, unreadable_line, UnreadLine,
+    has_read_carriage_return, head, irlume_rule, is_at_include, is_auth_directive,
+    is_auth_substack_anchor, is_include_auth_layout, is_passwd_substack, unreadable_line,
+    UnreadLine,
 };
 use super::stanzas::{inert_line, BACKUP, CREATED_PREFIX, INERT_TAG, KEYRING_TAG};
 use super::transform::{
     holds_irlume_line, is_irlume_line, jump_could_count_irlume_lines, recipe_has_no_anchor,
-    removal_preserves_continuations, unwire_lines, wire_greeter_impl, wire_lock,
-    wire_polkit_service, wire_verify_service, without_irlume_lines,
+    removal_preserves_continuations, scope_attempt_markers, unwire_lines, wire_greeter_impl,
+    wire_lock, wire_polkit_service, wire_verify_service, without_irlume_lines,
 };
 use super::PlannedChange;
 
@@ -213,10 +214,11 @@ pub(super) fn body_digest(body: &str) -> String {
 
 /// A fresh override: both header lines, then the wired body.
 pub(super) fn render(vendor_path: &str, vendor: &str, wired: &str) -> String {
+    let wired = scope_attempt_markers(wired, super::service_name(vendor_path));
     format!(
         "{}\n{}\n{wired}",
         created_line(vendor_path),
-        tracking_line(&sha256(vendor), &body_digest(wired))
+        tracking_line(&sha256(vendor), &body_digest(&wired))
     )
 }
 
@@ -1534,6 +1536,48 @@ fn arrange(
     edited: bool,
     wire: &dyn Fn(&str) -> (String, bool),
 ) -> Result<String, Misplaced> {
+    let begin = wired
+        .lines()
+        .find(|line| is_irlume_line(line) && kind(line) == "auth begin");
+    let Some(begin) = begin else {
+        return arrange_without_begin(body, bare, wired, vendor, edited, wire);
+    };
+    let without_begin = |text: &str| {
+        format!(
+            "{}\n",
+            text.lines()
+                .filter(|line| !(is_irlume_line(line) && kind(line) == "auth begin"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let body = without_begin(body);
+    let next = without_begin(&wired);
+    let wire_without_begin = |text: &str| {
+        let (text, ok) = wire(text);
+        (without_begin(&text), ok)
+    };
+    let arranged = arrange_without_begin(&body, bare, next, vendor, edited, &wire_without_begin)?;
+    let mut lines: Vec<&str> = arranged.lines().collect();
+    let first = lines
+        .iter()
+        .position(|line| is_auth_directive(line) || is_at_include(line))
+        .ok_or(Misplaced::NoPasswordAnchor)?;
+    // The entry marker never grants and must run before every factor. All
+    // other irlume lines retain the ordinary crossing and substitution rules;
+    // the caller still checks jumps against the complete result below.
+    lines.insert(first, begin);
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn arrange_without_begin(
+    body: &str,
+    bare: &str,
+    wired: String,
+    vendor: Option<&str>,
+    edited: bool,
+    wire: &dyn Fn(&str) -> (String, bool),
+) -> Result<String, Misplaced> {
     let own = own_lines(bare, vendor, edited);
     if !has_irlume_line(body) {
         if !edited {
@@ -1936,6 +1980,18 @@ fn take_anyway(etc: &str, vendor_path: &str, scope_flag: &str) -> String {
 /// The current file is not an override (it changed after the caller looked),
 /// or `force` would replace a different `<etc>.pre-irlume`.
 pub(super) fn decide(i: &Input<'_>) -> Result<Decision, String> {
+    let scoped_wire = |text: &str| {
+        let (text, changed) = (i.wire)(text);
+        (
+            scope_attempt_markers(&text, super::service_name(i.etc)),
+            changed,
+        )
+    };
+    let scoped = Input {
+        wire: &scoped_wire,
+        ..*i
+    };
+    let i = &scoped;
     use Class::*;
     let etc = i.etc;
     let Some(current) = i.current else {
@@ -3161,11 +3217,13 @@ session     include       password-auth
         "auth       [success=2 default=ignore]   pam_fprintd.so max-tries=1 timeout=15   # local";
 
     fn greeter(content: &str) -> (String, bool) {
-        wire_greeter_impl(content, true, true, true)
+        let (wired, changed) = wire_greeter_impl(content, true, true, true);
+        (scope_attempt_markers(&wired, "plasmalogin"), changed)
     }
 
     fn keyring_only(content: &str) -> (String, bool) {
-        wire_greeter_impl(content, false, true, false)
+        let (wired, changed) = wire_greeter_impl(content, false, true, false);
+        (scope_attempt_markers(&wired, "plasmalogin"), changed)
     }
 
     /// The landing on `text`, as [`landing_of`] builds it.
@@ -5053,10 +5111,15 @@ session     include       password-auth
                 d.message
             );
         }
-        let continued_own = generation(VENDOR).replacen(
-            "pam_irlume.so unseal ondemand\n",
-            "pam_irlume.so unseal ondemand \\\n                                        debug\n",
+        let original = generation(VENDOR);
+        let continued_own = original.replacen(
+            "pam_irlume.so unseal ondemand defer_wallet\n",
+            "pam_irlume.so unseal ondemand defer_wallet \\\n                                        debug\n",
             1,
+        );
+        assert_ne!(
+            continued_own, original,
+            "the fixture must contain a continuation"
         );
         let facefirst: WireFn<'_> = &|c: &str| wire_greeter_impl(c, true, true, false);
         for vendor in [Some(VENDOR), None] {

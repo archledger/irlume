@@ -427,10 +427,23 @@ All notable changes to irlume are documented here. This project adheres to
   8 MiB is refused, and only the Argon2id costs every irlume release has
   written are accepted, so existing recovery files stay valid.
 
+- `irlume-kwallet-init` closes every inherited descriptor except stdio and
+  its three handoff descriptors before it starts the wallet daemon, using
+  `close_range` (Linux 5.9 or later). Where that call is unavailable or
+  blocked, the helper refuses the launch; there is no partial fallback. A
+  new optional `--strict-runtime` argument lets a caller rely on exit 4
+  meaning only an absent runtime directory; older helpers reject it.
+
 - TPM sealing runs `TPM2_Create` in an HMAC session salted to the parent
   key, with AES-128-CFB parameter encryption. A secret over 256 bytes, the
   TSS buffer size, is rejected before any TPM command. Policies and
   envelope fields are unchanged.
+
+- A GNOME keyring token held between authentication and session opening is
+  bound to the PAM user and service that stored it, like a deferred KDE
+  wallet key. A PAM handle delivers at most once per authentication
+  attempt: a second session open neither asks irlumed again nor starts
+  another helper.
 
 - First-time enrollment on an ordinary camera pair collects its scans in one
   pass, avoiding a second RGB PAD warm-up when no existing profile can require
@@ -880,6 +893,28 @@ All notable changes to irlume are documented here. This project adheres to
   authentication stay refused until the later steps.
 
 ### Fixed
+
+- Cold-boot face login can defer a KDE wallet key until the session creates
+  its runtime directory. The login stacks irlume wires carry `defer_wallet`
+  on the face line and open their auth chain with
+  `pam_irlume.so begin reseal service=NAME`. A separate lock-screen service,
+  the NixOS module's rules and a hand-written stack without the argument do
+  not defer: there, a key the helper cannot deliver falls back to the
+  password. `irlume login reconcile` brings a wired login stack to this
+  recipe. With irlume's reconcile units enabled, as the packages enable
+  them at install, it runs at boot, from its timer three minutes after boot
+  and every 30 minutes, when a watched PAM file changes, and on a package
+  upgrade. A stack the writer declines to change keeps its lines and is
+  examined again on each run. A deferred key stays in zeroizing,
+  user/service-bound PAM memory and is delivered once, without another
+  credential request (ADR-0003, amendment 2026-11-08).
+
+- A sealed login password that holds a space or a non-ASCII byte reaches
+  gnome-keyring at session opening. `pam_irlume` hands it to
+  `irlume-gkr-unlock --password`, which accepts 1 to 4096 non-NUL bytes
+  without trimming. In both modes the helper's journal lines read
+  `credential delivered` and `not keyed to the supplied credential`; these
+  replace `token delivered` and `not keyed to irlume's token`.
 
 - Test-runner guards recognize leading terminal-control sequences before
   libtest results, avoiding false missing-test failures in TUI checks while

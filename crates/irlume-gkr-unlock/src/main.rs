@@ -27,9 +27,13 @@
 //! gnome-keyring is initialized ([`waiter`]), and the parent returns to PAM
 //! within about a second.
 //!
-//! Invoked as `irlume-gkr-unlock [--foreground] [--timeout-secs N] <username>`
-//! with the token on **stdin**, never in argv, which is world-readable through
-//! `/proc`.
+//! Invoked as `irlume-gkr-unlock [--password] [--foreground] [--timeout-secs N]
+//! <username>` with the credential on **stdin**, never in argv, which is
+//! world-readable through `/proc`. Without `--password`, input must be a
+//! nonempty ASCII-graphic token of at most 256 bytes. `--password` explicitly
+//! accepts 1 to 4096 non-NUL password bytes, without trimming or conversion.
+//! Both modes use the same identity checks and delivery protocol. Older
+//! helpers reject `--password` as a usage error before reading any credential.
 //!
 //! - Without `--foreground` (the PAM session line): exit status 0 means the
 //!   token was delivered, or handed to the waiter, which logs its outcome to
@@ -50,6 +54,9 @@ mod bus;
 mod detach;
 mod waiter;
 
+#[cfg(test)]
+mod credential_tests;
+
 use irlume_common::gkr_wire::{self, Op};
 use std::ffi::{CString, OsString};
 use std::io::Read;
@@ -66,6 +73,10 @@ use zeroize::Zeroizing;
 /// stream lengths from a confused caller.
 const MAX_TOKEN_LEN: usize = 256;
 
+/// Match the non-NUL byte contract of irlume-password-verify and the daemon's
+/// password retry verifier. The wire protocol length-prefixes bytes, not text.
+const MAX_PASSWORD_LEN: usize = 4096;
+
 /// Deadline for each control-socket connect, read and write. The daemon
 /// imposes none, and a delivery that finds gnome-keyring already initialized
 /// runs inside the PAM session phase, where an unbounded wait is a hung login.
@@ -73,7 +84,37 @@ const MAX_TOKEN_LEN: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 const USAGE: &str =
-    "usage: irlume-gkr-unlock [--foreground] [--timeout-secs N] <username>  (token on stdin)";
+    "usage: irlume-gkr-unlock [--password] [--foreground] [--timeout-secs N] <username>  (credential on stdin)";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Token,
+    Password,
+}
+
+impl InputMode {
+    fn max_len(self) -> usize {
+        match self {
+            Self::Token => MAX_TOKEN_LEN,
+            Self::Password => MAX_PASSWORD_LEN,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Password => "password",
+        }
+    }
+
+    /// What to do when the login keyring this credential opens is absent.
+    fn missing_keyring_remedy(self) -> &'static str {
+        match self {
+            Self::Token => "Create the keyring first.",
+            Self::Password => "Run `irlume keyring forget` to disarm, or create the keyring first.",
+        }
+    }
+}
 
 /// How the helper runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +128,7 @@ enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
     mode: Mode,
+    input_mode: InputMode,
     timeout_secs: Option<u64>,
     user: String,
 }
@@ -112,11 +154,13 @@ fn main() -> std::process::ExitCode {
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
     let mut mode = Mode::Pam;
+    let mut input_mode = InputMode::Token;
     let mut timeout_secs = None;
     let mut user = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--password") => input_mode = InputMode::Password,
             Some("--foreground") => mode = Mode::Foreground,
             Some("--timeout-secs") => {
                 let value = args.next().ok_or("--timeout-secs needs a value")?;
@@ -139,6 +183,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> 
     }
     Ok(Args {
         mode,
+        input_mode,
         timeout_secs,
         user: user.ok_or("no username")?,
     })
@@ -158,7 +203,7 @@ fn waiter_bound(timeout_secs: Option<u64>, privileged: bool) -> Result<Duration,
 
 fn run(args: &Args, started: Instant) -> Result<u8, String> {
     let bound = waiter_bound(args.timeout_secs, privileged())?;
-    let target = prepare(&args.user)?;
+    let target = prepare(&args.user, args.input_mode)?;
     let plan = waiter::Plan {
         started,
         bound,
@@ -195,12 +240,12 @@ struct Target {
     runtime_dir: PathBuf,
 }
 
-/// Read the token, find the user's keyring and runtime directory, become the
-/// user for good, and harden the process that now holds the token.
-fn prepare(user: &str) -> Result<Target, String> {
-    // Read the token first, before any privilege change, so a malformed
+/// Read the credential, find the user's keyring and runtime directory, become
+/// the user for good, and harden the process that now holds the credential.
+fn prepare(user: &str, input_mode: InputMode) -> Result<Target, String> {
+    // Read the credential first, before any privilege change, so a malformed
     // invocation fails without side effects.
-    let token = read_token_from_stdin()?;
+    let token = read_credential_from_stdin(input_mode)?;
 
     let pw = lookup_user(user)?;
     // Refuse when there is no login keyring to unlock.
@@ -216,9 +261,10 @@ fn prepare(user: &str) -> Result<Target, String> {
     if !keyring.exists() {
         return Err(format!(
             "{} does not exist; refusing to UNLOCK, which would CREATE a login keyring \
-             keyed to the sealed token instead of unlocking one. Run `irlume keyring \
-             forget` to disarm, or create the keyring first.",
-            keyring.display()
+             keyed to the sealed {} instead of unlocking one. {}",
+            keyring.display(),
+            input_mode.name(),
+            input_mode.missing_keyring_remedy()
         ));
     }
     let runtime_dir = runtime_dir_for(&pw)?;
@@ -468,26 +514,29 @@ fn cgroup_names_user_manager(cgroup: &str, uid: u32) -> bool {
     })
 }
 
-/// Read and check the token on stdin.
+/// Read and check the credential on stdin.
 ///
 /// `Stdin` would keep a second copy in its process-wide buffer, which nothing
 /// wipes. An unbuffered `File` on a clone of the descriptor reads straight
-/// into the buffer [`read_token`] wipes, and closes the clone when done.
-fn read_token_from_stdin() -> Result<Zeroizing<Vec<u8>>, String> {
+/// into the buffer [`read_credential`] wipes, and closes the clone when done.
+fn read_credential_from_stdin(input_mode: InputMode) -> Result<Zeroizing<Vec<u8>>, String> {
     let input = std::io::stdin()
         .as_fd()
         .try_clone_to_owned()
-        .map_err(|e| format!("reading the token from stdin: {e}"))?;
-    read_token(std::fs::File::from(input))
+        .map_err(|e| format!("reading the {} from stdin: {e}", input_mode.name()))?;
+    read_credential(std::fs::File::from(input), input_mode)
 }
 
-/// Read one token of at most [`MAX_TOKEN_LEN`] printable bytes from `input`,
-/// into a buffer that is wiped when it is dropped, on every return path.
-fn read_token(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
+/// Read one bounded credential into a buffer wiped on every return path.
+/// Passwords are byte strings, as in PAM: NUL is forbidden, but whitespace and
+/// non-UTF8 bytes are preserved. Tokens keep their stricter ASCII-only policy.
+fn read_credential(mut input: impl Read, mode: InputMode) -> Result<Zeroizing<Vec<u8>>, String> {
+    let max_len = mode.max_len();
+    let name = mode.name();
     // One allocation with room for a byte past the limit, which is how an
     // oversized token shows. It never grows, so no reallocation frees a
     // partial copy before the wipe.
-    let mut token = Zeroizing::new(vec![0u8; MAX_TOKEN_LEN + 1]);
+    let mut token = Zeroizing::new(vec![0u8; max_len + 1]);
     // Best effort, as in irlume-kwallet-init: keep the pages out of swap and
     // core dumps before any token byte lands in them.
     irlume_common::memlock::lock_slice(&token);
@@ -497,25 +546,36 @@ fn read_token(mut input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
             Ok(0) => break,
             Ok(n) => len += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(format!("reading the token from stdin: {e}")),
+            Err(e) => return Err(format!("reading the {name} from stdin: {e}")),
         }
     }
     // Shrinks the length, not the allocation, so the wipe still covers every
     // byte read.
     token.truncate(len);
     if token.is_empty() {
-        return Err("empty token on stdin".into());
+        return Err(format!("empty {name} on stdin"));
     }
-    if token.len() > MAX_TOKEN_LEN {
-        return Err(format!("token longer than {MAX_TOKEN_LEN} bytes; refusing"));
+    if token.len() > max_len {
+        return Err(format!("{name} longer than {max_len} bytes; refusing"));
     }
     // The keyring credential is a string; a token with a NUL or control bytes
     // is not one this program ever produced, so refuse it rather than let a
     // truncated comparison "succeed" somewhere downstream.
-    if token.iter().any(|b| !b.is_ascii_graphic()) {
-        return Err("token contains non-printable bytes; refusing".into());
+    match mode {
+        InputMode::Token if token.iter().any(|b| !b.is_ascii_graphic()) => {
+            return Err("token contains non-printable bytes; refusing".into());
+        }
+        InputMode::Password if token.contains(&0) => {
+            return Err("password contains NUL; refusing".into());
+        }
+        InputMode::Token | InputMode::Password => {}
     }
     Ok(token)
+}
+
+#[cfg(test)]
+fn read_token(input: impl Read) -> Result<Zeroizing<Vec<u8>>, String> {
+    read_credential(input, InputMode::Token)
 }
 
 /// Connect to the control socket without ever blocking past [`IO_TIMEOUT`].
@@ -856,6 +916,7 @@ mod tests {
     /// clears only its first byte on drop still counts as unwiped.
     const TOKEN: &[u8] = b"tok-irlume-wipe-check-5c1e";
     const MARKER: &[u8] = b"irlume-wipe-check-5c1e";
+    const PASSWORD: &[u8] = b" synthetic irlume-wipe-check-5c1e \xc3\xa9\xff\n";
     /// Stdin bytes for the refused case: more than the limit plus the one
     /// byte read past it, so some must stay in the pipe.
     const OVERSIZED_LEN: usize = 300;
@@ -943,6 +1004,79 @@ mod tests {
     }
 
     #[test]
+    fn the_stdin_password_is_read_unbuffered_and_wiped() {
+        use std::io::Write as _;
+        let oversized = Zeroizing::new(
+            MARKER
+                .iter()
+                .copied()
+                .cycle()
+                .take(MAX_PASSWORD_LEN + 100)
+                .collect::<Vec<_>>(),
+        );
+        for (child, input) in [
+            ("tests::password_stdin_child", PASSWORD),
+            (
+                "tests::oversized_password_stdin_child",
+                oversized.as_slice(),
+            ),
+        ] {
+            let mut proc = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", child])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            proc.stdin.take().unwrap().write_all(input).unwrap();
+            let out = proc.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{child} failed:\n{stdout}");
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "{child} did not run:\n{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by the_stdin_password_is_read_unbuffered_and_wiped"]
+    fn password_stdin_child() {
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let why = refusal(prepare(NO_SUCH_USER, InputMode::Password));
+            assert!(why.contains("no such user"), "{why}");
+        });
+        assert_eq!(unwiped, 0, "password was freed without a wipe");
+        assert_eq!(stdin_bytes_left(), 0);
+    }
+
+    #[test]
+    #[ignore = "fresh-exec child invoked by the_stdin_password_is_read_unbuffered_and_wiped"]
+    fn oversized_password_stdin_child() {
+        let unwiped = freed_blocks::count_unwiped(MARKER, || {
+            let why = refusal(prepare(NO_SUCH_USER, InputMode::Password));
+            assert!(why.contains("longer than 4096 bytes"), "{why}");
+        });
+        assert_eq!(unwiped, 0, "refused password was freed without a wipe");
+        assert_eq!(stdin_bytes_left(), 99);
+    }
+
+    #[test]
+    fn delivery_logs_do_not_assume_the_input_was_a_token() {
+        for event in [
+            waiter::Event::Delivered {
+                after_ms: 1,
+                daemon_pid: 2,
+            },
+            waiter::Event::Stale { daemon_pid: 2 },
+        ] {
+            assert!(
+                !event.text().contains("token"),
+                "password mode shares these events"
+            );
+        }
+    }
+
+    #[test]
     fn read_token_keeps_the_checks_and_returns_a_wiping_buffer() {
         let token: Zeroizing<Vec<u8>> = read_token(TOKEN).expect("a printable token");
         assert_eq!(token.as_slice(), TOKEN);
@@ -963,6 +1097,62 @@ mod tests {
         for bad in [&b"tok\0en"[..], b"tok en", b"token\n"] {
             let why = read_token(bad).expect_err("non-printable byte");
             assert!(why.contains("non-printable"), "{why}");
+        }
+    }
+
+    #[test]
+    fn password_mode_preserves_bytes_and_rejects_empty_nul_and_oversize() {
+        for valid in [PASSWORD, &b" "[..], &b"\t\r\n"[..], &b"\xff\xfe"[..]] {
+            let got = read_credential(valid, InputMode::Password).unwrap();
+            assert!(got.as_slice() == valid, "password bytes changed");
+        }
+        let limit = vec![b' '; MAX_PASSWORD_LEN];
+        assert_eq!(
+            read_credential(&limit[..], InputMode::Password)
+                .unwrap()
+                .len(),
+            MAX_PASSWORD_LEN
+        );
+        for invalid in [
+            &b""[..],
+            &b"synthetic\0password"[..],
+            &vec![b'a'; MAX_PASSWORD_LEN + 1][..],
+        ] {
+            assert!(read_credential(invalid, InputMode::Password).is_err());
+        }
+        let over = vec![b'a'; MAX_PASSWORD_LEN + 100];
+        let mut reader = std::io::Cursor::new(over);
+        assert!(read_credential(&mut reader, InputMode::Password).is_err());
+        assert_eq!(reader.position(), (MAX_PASSWORD_LEN + 1) as u64);
+    }
+
+    #[test]
+    fn default_token_mode_rejects_every_non_graphic_byte() {
+        for byte in 0u8..=u8::MAX {
+            let result = read_credential(&[byte][..], InputMode::Token);
+            assert_eq!(result.is_ok(), byte.is_ascii_graphic(), "byte {byte}");
+        }
+    }
+
+    #[test]
+    fn password_buffers_are_wiped_on_acceptance_and_refusal() {
+        let too_long = Zeroizing::new(
+            MARKER
+                .iter()
+                .copied()
+                .cycle()
+                .take(MAX_PASSWORD_LEN + 1)
+                .collect::<Vec<_>>(),
+        );
+        for input in [
+            PASSWORD,
+            &b"irlume-wipe-check-5c1e\0"[..],
+            too_long.as_slice(),
+        ] {
+            let unwiped = freed_blocks::count_unwiped(MARKER, || {
+                drop(read_credential(input, InputMode::Password));
+            });
+            assert_eq!(unwiped, 0, "password buffer was freed without a wipe");
         }
     }
 
@@ -1036,7 +1226,7 @@ mod tests {
     #[ignore = "fresh-exec child invoked by the_stdin_token_is_read_unbuffered_and_wiped"]
     fn token_stdin_child() {
         let unwiped = freed_blocks::count_unwiped(MARKER, || {
-            let why = refusal(prepare(NO_SUCH_USER));
+            let why = refusal(prepare(NO_SUCH_USER, InputMode::Token));
             assert!(why.contains("no such user"), "{why}");
         });
         assert_eq!(unwiped, 0, "the token was freed without a wipe");
@@ -1047,7 +1237,7 @@ mod tests {
     #[ignore = "fresh-exec child invoked by the_stdin_token_is_read_unbuffered_and_wiped"]
     fn oversized_token_stdin_child() {
         let unwiped = freed_blocks::count_unwiped(MARKER, || {
-            let why = refusal(prepare(NO_SUCH_USER));
+            let why = refusal(prepare(NO_SUCH_USER, InputMode::Token));
             assert!(why.contains("longer than 256 bytes"), "{why}");
         });
         assert_eq!(unwiped, 0, "the refused token was freed without a wipe");
@@ -1076,12 +1266,36 @@ mod tests {
     }
 
     #[test]
+    fn password_input_requires_an_explicit_supported_flag() {
+        for args in [
+            vec!["--password", "alice"],
+            vec!["--foreground", "--password", "--timeout-secs", "3", "alice"],
+            vec!["alice", "--password"],
+        ] {
+            let parsed = parse_args(args.iter().map(OsString::from));
+            assert!(
+                parsed.is_ok(),
+                "explicit password mode must be accepted: {parsed:?}"
+            );
+            assert_eq!(parsed.unwrap().input_mode, InputMode::Password);
+        }
+        for args in [
+            vec!["--password"],
+            vec!["--password=alice"],
+            vec!["--token", "alice"],
+        ] {
+            assert!(parse_args(args.iter().map(OsString::from)).is_err());
+        }
+    }
+
+    #[test]
     fn arguments_are_flags_then_one_user() {
         let parse = |args: &[&str]| parse_args(args.iter().map(OsString::from));
         assert_eq!(
             parse(&["alice"]),
             Ok(Args {
                 mode: Mode::Pam,
+                input_mode: InputMode::Token,
                 timeout_secs: None,
                 user: "alice".into()
             })
@@ -1090,6 +1304,7 @@ mod tests {
             parse(&["--foreground", "--timeout-secs", "3", "alice"]),
             Ok(Args {
                 mode: Mode::Foreground,
+                input_mode: InputMode::Token,
                 timeout_secs: Some(3),
                 user: "alice".into()
             })

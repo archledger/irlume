@@ -25,7 +25,9 @@ login or locks a person out. It is critical-tier
   is a release whose secret reached its consumer (`code_for`, `Released`,
   `only_a_real_delivery_continues_the_stack`) or the identity-only fallback
   below, which delivers nothing; a lock screen running as the user unlocks
-  that way.
+  that way. `defer_wallet` also accepts a face-released KDE key in zeroizing,
+  user/service-bound PAM data when only the runtime directory is missing.
+  It requires a matching `reseal` session consumer and never sets AUTHTOK.
 - Keep every implemented entry point inside `firewall`, which maps a panic to
   `PAM_IGNORE`; without it the pinned pamsm dispatcher returns the panic as
   `PAM_ABORT`, a third abort path.
@@ -57,8 +59,16 @@ login or locks a person out. It is critical-tier
   amendment). That session query is exempt from the warm rule: the session
   being opened needs its secret although logind already lists the account as
   live. The reply is routed by kind (a login password and a GNOME token to
-  the keyring control socket, a wallet key to `irlume-kwallet-init`), and an
-  emptied-stash sentinel makes each handle deliver at most once. irlumed
+  the keyring control socket, a wallet key to `irlume-kwallet-init`), and a
+  transaction-local consumed state makes a handle deliver at most once per
+  authentication attempt.
+  Deferred credentials and reseal passwords are bound to the PAM user and
+  service and cleared before a new primary authentication attempt. Managed
+  login stacks also begin with `begin reseal service=SERVICE`, which resets state before a
+  password or fingerprint provider can short-circuit the remaining auth rules.
+  Only the named top-level PAM service resets, so nested markers preserve
+  outer credentials. The `reseal` carrier keeps this line non-authenticating
+  on older modules. irlumed
   still withholds auth-phase releases on a warm or unreadable account for
   modules from before that amendment. `IRLUME_LOGIND_DIR` is a fixture
   override read through `secure_env`; setuid callers use the fixed system
@@ -91,7 +101,7 @@ login or locks a person out. It is critical-tier
   the PAM-data stashes, or in `Zeroizing` (the `set_authtok` `CString` from
   `secret_cstring`, which also wipes the copy a rejected one leaves). Never
   log one. A GNOME keyring token never rides
-  `PAM_AUTHTOK` (`GKR_TOKEN_STASH_KEY`).
+  `PAM_AUTHTOK` (`session_state`).
 - Service kinds are classified, from a named source, in
   `crates/irlume-common/src/pam_service.rs`
   ([its AGENTS.md](../irlume-common/AGENTS.md)). `src/lib.rs` also matches
@@ -99,7 +109,7 @@ login or locks a person out. It is critical-tier
   `cosmic-greeter` (the COSMIC choice prompt). A remote service the module
   must stand down for goes in that deny-list.
 - Stacks using the module arguments (`unseal`, `wait`, `reseal`, `keyring`,
-  `kr`, `facefirst`, `ondemand`) are written by
+  `kr`, `facefirst`, `ondemand`, `defer_wallet`, `begin`) are written by
   `crates/irlume-cli/src/pamwire.rs` and
   `crates/irlume-cli/src/pamwire/stanzas.rs` (every argument but `wait`), on
   NixOS by `nix/module.nix` (`unseal ondemand`, with its own controls), and on

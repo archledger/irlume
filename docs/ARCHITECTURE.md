@@ -284,13 +284,21 @@ irlume's headline feature is Windows-Hello-style keyring unlock: log in with you
 face and your GNOME-keyring / KWallet is already open. When you submit an empty
 password field, `pam_irlume.so` (in `unseal` mode) asks the daemon to
 `UnsealPassword`. The daemon runs the same pipeline and, **only on a live
-match**, TPM-unseals the sealed secret and hands it back; `pam_irlume` sets it
-as `PAM_AUTHTOK`, so a downstream `pam_gnome_keyring` / `pam_kwallet` opens the
-wallet with the same credential a typed password would have supplied. Anything
+match**, TPM-unseals the sealed secret and hands it back. A login password is
+set as `PAM_AUTHTOK`, so the downstream keyring module can open the wallet.
+A KDE wallet key instead goes to `irlume-kwallet-init`, never to `PAM_AUTHTOK`.
+With `defer_wallet`, a missing runtime directory defers that key in zeroizing
+PAM memory until the matching `reseal` session hook runs after `pam_systemd`.
+The key is bound to this user and service, consumed once, and never re-requested.
+Without that argument, the helper's not-ready result keeps the password
+fallback. A GNOME token also uses a session-phase stash, as described in
+[ADR-0003](adr/0003-fingerprint-keyring-unlock.md). Anything
 short of a live match returns `PAM_IGNORE` and the stack falls through to the
 password. (The fingerprint companion reaches the same keyring unlock through a
 distinct `UnsealKeyring` request, gated on a root peer in a login context; see
 `THREAT_MODEL.md`.)
+
+The login-password path is:
 
 ```mermaid
 flowchart LR

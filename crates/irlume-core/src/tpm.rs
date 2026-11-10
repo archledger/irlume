@@ -2101,6 +2101,7 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
 /// any boot state can unseal; use only for testing).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
+    let sensitive = SensitiveData::try_from(secret).map_err(tpm_err)?;
     let pcrs = pcrs.to_vec();
     let mut ctx = open_context()?;
 
@@ -2110,12 +2111,12 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
         let pcr_values = read_pcr_values(ctx, &pcrs)?;
         let tmpl = sealed_template(literal_auth_policy(&pcr_values)?)?;
 
-        let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
-        let created = ctx
-            .execute_with_nullauth_session(|ctx| {
+        let created = with_session(ctx, Some(*srk), SessionType::Hmac, |ctx, session| {
+            ctx.execute_with_session(Some(session), |ctx| {
                 ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
             })
-            .map_err(tpm_err)?;
+            .map_err(tpm_err)
+        })?;
 
         Ok(SealedEnvelope {
             // This layer seals bytes and does not know what they mean; the
@@ -2388,6 +2389,7 @@ fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u
 /// to build the envelopes earlier releases wrote.
 #[cfg(test)]
 pub(crate) fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
+    let sensitive = SensitiveData::try_from(secret).map_err(tpm_err)?;
     let pubkey_pem = crate::pcrsig::load_pubkey_pem()?;
     let pcrs = crate::pcrsig::signed_pcrs(crate::pcrsig::DEFAULT_BANK)
         .ok_or_else(|| Error::Policy("signed-PCR file has no usable signatures".into()))?;
@@ -2407,12 +2409,12 @@ pub(crate) fn seal_authorized(secret: &[u8]) -> Result<SealedEnvelope> {
 
     with_srk(&mut ctx, |ctx, srk| {
         let tmpl = sealed_template(auth_policy.clone())?;
-        let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
-        let created = ctx
-            .execute_with_nullauth_session(|ctx| {
+        let created = with_session(ctx, Some(*srk), SessionType::Hmac, |ctx, session| {
+            ctx.execute_with_session(Some(session), |ctx| {
                 ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
             })
-            .map_err(tpm_err)?;
+            .map_err(tpm_err)
+        })?;
 
         Ok(SealedEnvelope {
             // This layer seals bytes and does not know what they mean; the
@@ -3087,6 +3089,7 @@ fn pcrlock_auth_policy(ctx: &mut Context, nv: NvIndexHandle) -> Result<Digest> {
 
 /// Seal `secret` bound to the systemd-pcrlock NV index at `nv_index`.
 fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
+    let sensitive = SensitiveData::try_from(secret).map_err(tpm_err)?;
     let plock = read_pcrlock_json()?;
     let mut pcrs: Vec<u32> = plock.pcr_values.iter().map(|e| e.pcr).collect();
     pcrs.sort_unstable();
@@ -3098,12 +3101,12 @@ fn seal_pcrlock(secret: &[u8], nv_index: u32) -> Result<SealedEnvelope> {
 
     with_seal_parent(&mut ctx, |ctx, srk, parent| {
         let tmpl = sealed_template(auth_policy.clone())?;
-        let sensitive = SensitiveData::try_from(secret.to_vec()).map_err(tpm_err)?;
-        let created = ctx
-            .execute_with_nullauth_session(|ctx| {
+        let created = with_session(ctx, Some(*srk), SessionType::Hmac, |ctx, session| {
+            ctx.execute_with_session(Some(session), |ctx| {
                 ctx.create(*srk, tmpl, None, Some(sensitive), None, None)
             })
-            .map_err(tpm_err)?;
+            .map_err(tpm_err)
+        })?;
 
         Ok(SealedEnvelope {
             // This layer seals bytes and does not know what they mean; the
@@ -3370,6 +3373,10 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
         .map(|(expected, _)| expected.pcr)
         .collect())
 }
+
+#[cfg(test)]
+#[path = "tpm_sealing_tests.rs"]
+mod sealing_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

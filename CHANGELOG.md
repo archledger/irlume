@@ -7,34 +7,36 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Removed
 
-- NPU inference, which no tagged release carried (ADR-0039, #1244). The runtime,
-  certification table, loading admission, provider and device selection and the
-  `npu` feature are gone, with the `openvino` crates. Every model runs on the CPU,
-  as every release has. `recognizer_device`, `npu`, `npu_library` and their
-  `IRLUME_` variables are no longer read, so a line left behind does nothing. A
-  scan's `embed_producer` from a nightly build still loads and is dropped on the
-  next write. The `recognizer` status object and the `recognizer-device`,
-  `recognizer-selection`, `npu-platform`, `npu-runtime` and `npu-qualification`
-  doctor ids leave contract 1, and those ids are never reused. The AppArmor
-  profiles, unit and Nix module lose their NPU cache, device and library rules.
-  Earlier entries in this section that describe NPU placement, selection or
-  reporting describe work that never shipped.
-- GPU inference, which no tagged release carried (ADR-0038, #1053). A nightly
-  build's `recognizer_device=gpu` now takes the invalid-value path to `auto`
-  with a journal warning, and its `gpu` key and `IRLUME_GPU` are no longer read.
-  The `gpu` selection word, the `accelerator`, `gpu_platform`,
-  `gpu_runtime_available` and `gpu_qualified` status fields and the `gpu-platform`,
-  `gpu-runtime` and `gpu-qualification` doctor ids leave contract 1, and those ids
-  are never reused. The AppArmor profiles lose their render-node, OpenCL and
-  compute-runtime rules, and the units lose the GPU launch environment. The
-  recognizer ranking API goes with them.
-- The `irlume-vision` features `cuda`, `openvino`, `coreml` and `tensorrt`, which
-  custom builds of 0.15.0 could enable, and the `IRLUME_TEST_ALLOW_UNCERTIFIED_EP`
-  escape behind them (ADR-0038 section 2).
-- The private measurement tooling built for the GPU campaign, which no shipped
-  program used (ADR-0038, amendment 2026-10-30): the `irlume_hw_evidence` build,
-  measurement profiles and fixtures, `native-metadata`, its fuzz targets and the
-  contained-job scripts. The `elf` dependency goes with it.
+- NPU inference, which no tagged release carried (ADR-0039, #1244). The
+  runtime, certification table, loading admission, provider and device
+  selection and the `npu` feature are gone, with the `openvino` crates. Every
+  model runs on the CPU, as every release's default build has.
+  `recognizer_device`, `npu`, `npu_library` and their `IRLUME_` variables are
+  no longer read, so a line left behind does nothing. A scan's
+  `embed_producer` from a nightly build still loads and is dropped on the next
+  write. The `recognizer` status object and the `recognizer-device`,
+  `recognizer-selection`, `npu-platform`, `npu-runtime` and
+  `npu-qualification` doctor ids leave contract 1, and those ids are never
+  reused. The AppArmor profiles, unit and Nix module lose their NPU cache,
+  device and library rules.
+
+- GPU inference by device selection, which no tagged release carried
+  (ADR-0038, #1053). A nightly build's `gpu` key, `IRLUME_GPU` and
+  `recognizer_device=gpu` are no longer read, so a line left behind does
+  nothing. The `gpu` selection word, the `accelerator`, `gpu_platform`,
+  `gpu_runtime_available` and `gpu_qualified` status fields and the
+  `gpu-platform`, `gpu-runtime` and `gpu-qualification` doctor ids leave
+  contract 1, and those ids are never reused. The AppArmor profiles lose their
+  render-node, OpenCL and compute-runtime rules, and the units lose the GPU
+  launch environment. The recognizer ranking API goes with them.
+
+- The `irlume-vision` features `cuda`, `openvino`, `coreml` and `tensorrt`,
+  which custom builds of 0.15.0 could enable (ADR-0038 section 2).
+
+- The private measurement tooling built for the GPU campaign, which no tagged
+  release carried (ADR-0038, amendment 2026-10-30): the `irlume_hw_evidence`
+  build, measurement profiles and fixtures, `native-metadata`, its fuzz
+  targets and the contained-job scripts. The `elf` dependency goes with it.
 
 ### Added
 
@@ -73,9 +75,9 @@ All notable changes to irlume are documented here. This project adheres to
   the camera's D1 value, the camera reading it back, each burst's D1 proof
   and the restore, on the node under test only. It writes nothing to the
   camera itself. For it, `IRLUME_LOG_EMITTER_WRITES=1` now names the camera
-  node on every line, prints each extension-unit read with the bytes the
-  camera returned, or why it returned none, and says after each write
-  whether the camera accepted it; `IRLUME_DEBUG_IR_FRAMES` prints each
+  node on each extension-unit read and write line, prints each read with the
+  bytes the camera returned, or why it returned none, and says after each
+  write whether the camera accepted it; `IRLUME_DEBUG_IR_FRAMES` prints each
   frame's raw sequence number and, per burst, an `[ir_d1]` line with the D1
   proof's numbers and verdict. The debug journal is unchanged.
 
@@ -97,8 +99,8 @@ All notable changes to irlume are documented here. This project adheres to
   seat user cannot open still counts as IR capability in the camera-nodes
   check, since the daemon opens it as root. Nothing changes for
   cameras with illumination records, and the experimental split opt-in
-  itself is unchanged. (#887's T480 emitter-table entry and qualification
-  are unaffected.)
+  itself is unchanged. (The T480's built-in emitter entry is unaffected, and
+  its broader qualification stays open in #887.)
 
 - The nightly channel's Ubuntu lane, `ppa:archledger/irlume-nightly`
   (ADR-0037 section 3; docs/PLATFORMS.md "Nightly channel"):
@@ -106,8 +108,9 @@ All notable changes to irlume are documented here. This project adheres to
   maintainer's machine (`packaging/ppa/nightly/`), builds `main` when it
   moved, with the release's container script and image, signs it through
   gpg-agent's extra socket, uploads it and follows it on Launchpad. A
-  failed or rejected upload retries with the next PPA revision while `main`
-  is unchanged, and a new commit supersedes a pending one.
+  failed or rejected upload retries with the next PPA revision, up to
+  `-0ppa5`, while `main` is unchanged, and a new commit supersedes a pending
+  one.
 
 - A nightly channel builds `main` for trying a fix before the next release
   (ADR-0037; docs/PLATFORMS.md "Nightly channel"): on Fedora the Copr
@@ -139,10 +142,10 @@ All notable changes to irlume are documented here. This project adheres to
   the TPM is not genuine, and a check that could not run. Nothing is fetched,
   written or kept, and no EK public key, serial or fingerprint is shown;
   certificate text is shown as visible ASCII. A client waits up to 60
-  seconds, and irlumed sends no TPM command later than 45 seconds after the
-  request reached it. The TUI's doctor readout runs the same check, and its
-  Diagnostics page gains Full Diagnostics as Administrator, the TUI's route to
-  `sudo irlume doctor`, since the TPM checks need root.
+  seconds, and irlumed starts no TPM command that does work later than 45
+  seconds after the request reached it. The TUI's doctor readout runs the same
+  check, and its Diagnostics page gains Full Diagnostics as Administrator, the
+  TUI's route to `sudo irlume doctor`, since the TPM checks need root.
 
 - `irlume uninstall` reports the storage keys irlumed's record keeps that
   are still persisted after its evictions (ADR-0034, Phase 3 amendment,
@@ -235,14 +238,14 @@ All notable changes to irlume are documented here. This project adheres to
   A start that already derived an RSA-2048 key does not, so no start pays
   for two. A key today's derivation does not give is never evicted and is
   not derived for again; the journal names the manual command, to run once
-  no envelope is under it and nothing else uses it. A derivation or eviction that fails, as with
-  an owner authorization set since, is recorded with the boot and tried
-  again only at the first start in a later boot. A template key that comes
-  back under the retired key moves onto the DA-exempt key at the next
-  start, as before.
+  no envelope is under it and nothing else uses it. A derivation or
+  eviction that fails, as with an owner authorization set since, is
+  recorded with the boot and tried again only at the first start in a
+  later boot. A template key that comes back under the retired key moves
+  onto the DA-exempt key at the next start, as before.
 
 - irlumed keeps an account of the original storage key's use for its
-  coming retirement (ADR-0034, Phase 3 amendment, condition 1; #1073).
+  retirement (ADR-0034, Phase 3 amendment, condition 1; #1073).
   After its template key moves, irlumed's start counts the envelopes still
   under that key, and an envelope it cannot read counts as one. While none
   is found, the record keeps the boot of the start that first found none.
@@ -252,7 +255,6 @@ All notable changes to irlume are documented here. This project adheres to
   its entry, so a start in that boot marks nothing, whatever other moves
   in the boot did. A record write that fails, or is not durable, stops the
   move. This happens only once irlumed has recorded the DA-exempt key.
-  Nothing is retired yet.
 
 - irlumed records the TPM name of irlume's original storage key once
   today's derivation of the original template gives that key (ADR-0034
@@ -296,17 +298,17 @@ All notable changes to irlume are documented here. This project adheres to
   (ADR-0025). Every move, also one to a stronger policy, unseals its new
   envelope and compares the secret before it replaces the old one, a move
   whose directory sync fails counts as made since the new envelope is
-  visible, and no move takes an envelope off the DA-exempt key. irlumed
-  persists the key before the template keys move, so they move in the same
-  start. A moved envelope needs this release, as one sealed under the new
-  key does.
+  visible, and no move takes an envelope from a DA-exempt key to the
+  original key. irlumed persists the DA-exempt key before the template keys
+  move, so they move in the same start. A moved envelope needs this
+  release, as one sealed under the new key does.
 
 - New seals go under irlume's DA-exempt storage key once irlumed has
   persisted it, and each envelope records that key's handle and TPM name
   (ADR-0034 §3.3). A load uses only the key the envelope records, so a TPM in
   dictionary-attack lockout no longer blocks face login or the release of a
-  keyring secret sealed this way; envelopes sealed before stay on the original
-  key and still load through it. A seal checks the recorded key's name and
+  keyring secret sealed this way; older envelopes move to the DA-exempt key as
+  the entry on moved envelopes says. A seal checks the recorded key's name and
   the DA-exempt template's shape at its handle and otherwise uses the original
   key; it never derives the new key. A downgrade to a release before this one
   cannot open an envelope sealed under the new key: a keyring secret reseals
@@ -319,18 +321,18 @@ All notable changes to irlume are documented here. This project adheres to
   start persisted is found by its TPM name, so a power loss before the
   record never leaves two. A refused persist is recorded with the boot: the
   same boot derives nothing again unless the refusal was for lack of room
-  and the TPM now reports room, and `irlume doctor`'s `tpm-lockout` warns
-  with the reason (no room, no free handle, an owner authorization, or a
-  refused `IRLUME_SRK_HANDLE`) (#1083).
+  and the TPM now reports room, or was for an `IRLUME_SRK_HANDLE` that has
+  since been corrected. `irlume doctor`'s `tpm-lockout` warns with the
+  reason (no room, no free handle, an owner authorization, or a refused
+  `IRLUME_SRK_HANDLE`) (#1083).
 
 - `irlume doctor` reports, as `tpm-lockout`, the TPM's dictionary-attack
   lockout state: whether a lockout authorization is set, whether the TPM is in
   lockout, and its failure counter, maximum and recovery interval, read by
   irlumed without changing anything. The counter is shared by everything that
   uses the TPM, so a lockout another user caused (wrong disk unlock PINs, a
-  Windows Hello PIN) also blocks irlume's storage key until ADR-0034 §3 moves it
-  to a DA-exempt one: in lockout the check warns that face login with an
-  encrypted enrollment and the release of sealed keyring secrets use the
+  Windows Hello PIN) also blocks irlume's original storage key: in lockout
+  the check warns that what an envelope still on that key protects uses the
   password until it ends, and says how an administrator clears it. With no
   lockout authorization set it notes that any process with TPM access can
   reset the lockout. THREAT_MODEL.md,
@@ -350,9 +352,10 @@ All notable changes to irlume are documented here. This project adheres to
   three held no data, when shim measured its validation as disabled
   (`MokSBState`), or when no authority that verifies an image was measured
   (shim's SBAT level is policy). It otherwise names the authorities
-  (Microsoft's certificates by hash, also one `db` holds as a bare RSA key). When a 2011 Microsoft CA signed the boot
-  loader it notes that one signed by the 2023 replacement, as distributions
-  ship after the 2011 CAs' expiry, changes PCR 7 (#1080).
+  (Microsoft's certificates by hash, also one `db` holds as a bare RSA
+  key). When a 2011 Microsoft CA signed the boot loader it notes that one
+  signed by the 2023 replacement, as distributions ship after the 2011 CAs'
+  expiry, changes PCR 7 (#1080).
 
 - `irlume doctor` warns, as `shim-validation`, when shim's Secure Boot
   validation is disabled (`mokutil --disable-validation`). shim then loads
@@ -398,10 +401,9 @@ All notable changes to irlume are documented here. This project adheres to
   of the session broke the footroom or flat-chroma bounds, and the burst's
   own frames show the emitter alternating. Such a camera reports no
   per-frame illumination, so that burst's alternation also marks its lit
-  frames for pairing. On a T480 its face-authentication mode must be
-  selected first, for now with `IRLUME_IR_EMITTER=8:6:1,1,2,0,0,0,0,0,0`.
-  Any other burst still refuses as IR exposure unmeasurable. Not yet qualified on a T480 (ADR-0031 §4, amendments
-  2026-10-13 and 2026-10-14; #887).
+  frames for pairing. Any other burst still refuses as IR exposure
+  unmeasurable. Broader qualification on the T480 stays open (ADR-0031 §4,
+  amendments 2026-10-13, 2026-10-14 and 2026-10-20; #887).
 
 - Experimental split camera pairs as a machine-owner opt-in:
   `sudo irlume split experimental on --yes` saves
@@ -423,6 +425,106 @@ All notable changes to irlume are documented here. This project adheres to
   that host's RGB-only standing tier as final. Supported activation still
   needs the acceptance matrix in #1030 (ADR-0032 amendment 2026-10-13).
   Thanks to @maurerr for the report in #1061.
+
+- `irlume enroll --split-camera-choice JSON` asks irlumed to enroll, with or
+  without `--reset`, on an authorized split pair for this operation only,
+  and `enroll --add-camera --split-camera-choice JSON` to add that pair as a
+  camera group. The choice carries the side guards and opaque authorization
+  proof built from `irlume split list` and goes unchanged in one
+  `EnrollSplitOn` or `AddSplitCameraGroupOn` request. Malformed, repeated
+  or combined choices fail before sending; the client reports an older
+  daemon's `bad request` as unsupported and does not fall back to an
+  ordinary request, and it prints any other refusal as is. Split
+  enrollment runs only under the experimental owner opt-in (ADR-0032,
+  guarded split operation-choice amendment; #1030).
+
+- The liveness self-test (`irlume selftest liveness`, the TUI's infrared camera
+  test) runs on a selected split camera pair, both sides in one diagnostic
+  operation, instead of refusing it; it grants and releases nothing, and an
+  unplugged pair or IR forced off refuses before any camera opens (ADR-0032,
+  split liveness self-test amendment; #995).
+
+- Split-camera enrollment, camera-group addition and authentication run end to
+  end behind the camera trust predicate, which only the experimental owner
+  opt-in opens (`split_camera_pairs=experimental`). One split lease covers
+  both original sides and capture runs RGB then IR; a pinned or automatic
+  split routes once per request with no ordinary, legacy or standing
+  fallback; split evidence never grants through the RGB-primary or fusion
+  arms; IR-only requests refuse a split choice before any lease; and a split
+  denial releases no credential and keeps its retry charge (ADR-0032,
+  retained split runtime amendment; #995).
+
+- Guarded split enrollment and add-camera operation requests retain both
+  displayed camera guards and an opaque machine-publication proof through
+  approval and camera-free preparation. Whole-pair publication revalidation
+  preserves ordinary device claims and saved selection. Split enrollment and
+  add-camera run only under the experimental owner opt-in (ADR-0032, guarded
+  split operation-choice amendment; #995).
+
+- LightDM runs against a private, read-only PAM view when irlume's LightDM
+  units are installed. A preparation unit ordered before every LightDM start
+  reads the prospective configuration with `lightdm --show-config` and, while
+  XDMCP or VNC is enabled, publishes include copies in which `pam_fprintd`
+  and irlume's own credential rules become inert, jump-preserving slots. The
+  shared host stacks are never rewritten, other services and desktop sessions
+  keep fingerprint, and a failed preparation or view check prevents an
+  unprotected LightDM start (#859).
+
+- The LightDM preparation hook ships in every packaging lane (Fedora, Arch,
+  Debian/nfpm, PPA, NixOS and the source installer) through a
+  `lightdm.service.d` drop-in (on NixOS, the irlume module's settings for
+  the `display-manager` service), and a path unit watching the PAM directories
+  with `PathModified` (which replacement by rename cannot escape) refreshes
+  the view of a running LightDM, so a `sed -i` configuration change can no
+  longer leave face lines served until the reconcile timer fires (#859).
+
+- Split-camera diagnostics capture RGB then IR under one retained two-device
+  operation and return an operation-bound complete-pair receipt. Assessment
+  carries split sequential posture at every skew. Native opens validate the
+  selected descriptor before configuration; owned cleanup can restore a
+  surviving camera after peer loss. Split enrollment and authentication need
+  the experimental opt-in (ADR-0032, sequential capture amendment; #995).
+
+- Ordinary enrollment and add-camera requests accept an operation-scoped camera
+  choice through `--camera-choice JSON`. The daemon validates the displayed
+  connection guard and roles before camera work, retains the exact pair through
+  probe and capture, and restores the standing selection afterward. Non-reset
+  additions require the existing primary binding
+  (ADR-0029, guarded ordinary operation-choice amendment; #995).
+
+- Automatic face authentication selects an eligible enrolled whole pair before
+  capture, pins secondary selection to the same loaded store, and acquires the
+  exact selected camera incarnation. IR authentication and readiness resolve
+  the chosen pair. Daemon admission uses its tier and the clipped original
+  window, retaining admitted retry charges; request cleanup clears authority
+  while retaining an automatic standing choice (ADR-0032, automatic account
+  routing amendment; #995).
+
+- Camera-backed request entries share a validated configuration-gate snapshot
+  through daemon enrollment probes and nested Engine calls. Invalid selection
+  refuses before environment precedence; of these entries, only account-routed
+  authentication under the experimental opt-in follows a selected split pair.
+  An ordinary override needs a unique Current ordinary pair and both external
+  policy gates. Scope mutation or retained-pair inventory drift refuses before
+  nested capture, and cleanup restores standing devices (ADR-0032, request
+  configuration-gate amendment; #995).
+
+- Split-pair account foundations retain complete class-aware primary and
+  secondary bindings, scoped approval and grant-boundary checks, and typed
+  primary-first camera ranking. Ordinary stored forms and partial-primary
+  behavior stay compatible; split strings refuse legacy struct readers.
+  Split enrollment and authentication need the experimental opt-in
+  (ADR-0032, 2026-10-04 account-binding amendment; #995).
+
+- Split-pair authorization storage and management (ADR-0032 Step 3): immutable
+  generation files under `/etc/irlume/split-pairs/`, the coherent publication
+  protocol behind the `split_generation` / `split_digest` / `split_pair` keys
+  of `cameras.conf`, and root-only `irlume split add|remove|select|status`
+  commands with a share-safe `irlume split list`. Capture-side split support
+  (paired leases, incarnation revalidation and the unconditional sequential
+  admission posture) lands internally too. Split enrollment and
+  authentication stay refused unless the machine owner opts in with
+  `sudo irlume split experimental on --yes` and restarts irlumed.
 
 ### Changed
 
@@ -470,12 +572,13 @@ All notable changes to irlume are documented here. This project adheres to
   `close_range` (Linux 5.9 or later). Where that call is unavailable or
   blocked, the helper refuses the launch; there is no partial fallback. A
   new optional `--strict-runtime` argument lets a caller rely on exit 4
-  meaning only an absent runtime directory; older helpers reject it.
+  meaning only an absent runtime directory; helpers from 0.12.0 through 0.15.0
+  reject it, and earlier ones ignore it and have no exit 4.
 
 - TPM sealing runs `TPM2_Create` in an HMAC session salted to the parent
   key, with AES-128-CFB parameter encryption. A secret over 256 bytes, the
-  TSS buffer size, is rejected before any TPM command. Policies and
-  envelope fields are unchanged.
+  TSS buffer size, is rejected before any TPM command. This change adds no
+  policy and no envelope field.
 
 - A GNOME keyring token held between authentication and session opening is
   bound to the PAM user and service that stored it, like a deferred KDE
@@ -488,11 +591,13 @@ All notable changes to irlume are documented here. This project adheres to
   merge confirmation. The full five-score vote, saved scan count, first-scan
   and remaining-scan attempt limits, and publication checks are retained.
 
-- Update `rsa` to 0.10.0-rc.22 for endorsement-certificate verification and
-  MakeCredential, retaining the certificate verifier's 2048-4096-bit bounds.
-  Direct MakeCredential calls now reject RSA keys below 1024 bits. The
-  RUSTSEC-2023-0071 exception remains until a patched range is available
-  (ADR-0036, #1112).
+- `rsa` returns to the dependency graph, at 0.10.0-rc.22, for
+  endorsement-certificate verification and MakeCredential (ADR-0036); 0.14.0
+  had removed it. The certificate verifier accepts RSA keys of 2048 to 4096
+  bits, and direct MakeCredential calls reject RSA keys below 1024 bits.
+  `deny.toml` carries an exception for RUSTSEC-2023-0071, which has no
+  patched release. The advisory concerns RSA private-key operations, and
+  irlume holds no RSA private key and makes no private-key operation (#1112).
 
 - Upgrade-validation tools require the 0.15.0 -> 0.16.0 -> 0.15.0 -> 0.16.0
   package sequence. Rollback guidance distinguishes preserved files from
@@ -500,29 +605,19 @@ All notable changes to irlume are documented here. This project adheres to
   acceptance; see `docs/UPGRADE-VALIDATION.md`.
 
 - Use published `edgefirst-tflite` and `edgefirst-tflite-sys` 0.11.1 in place
-  of the temporary ZIP-9 Git pin (#1103). Both lockfiles retain the reviewed
-  registry checksums and the ZIP >= 9.0.5 guard. The explicit runtime path,
-  CPU/XNNPACK backend, model pins and buffer-lifetime checks are unchanged;
-  no custom delegate is enabled. See `docs/research/tflite-0.11.1-audit.md`.
+  of 0.10.2, which moves the sys crate's `zip` dependency from 8.6.0 to 9.2.2
+  (#1103). Graph tests in `irlume-vision` require both lockfiles to keep each
+  crate's reviewed registry version, source and checksum, and every `zip` at
+  or above 9.0.5. The explicit runtime path, CPU/XNNPACK backend, model pins
+  and buffer-lifetime checks are unchanged; no custom delegate is enabled. See
+  `docs/research/tflite-0.11.1-audit.md`.
 
-- GPU inference is withdrawn (ADR-0038, #1053): the recognizer runs on the CPU, or
-  on the NPU once a certification passes. ADR-0033 is withdrawn except its CPU
-  execution-provider rule, and ADR-0022 returns to no GPU.
-- Update ctutils to 0.4.4 in the application and fuzz lockfiles.
-
-- Version the decision fingerprint to bind bounded threshold coverage and
-  composed RGB/IR decisions, including arm priority, exact boundaries and
-  calibration provenance (ADR-0022, amendment 2026-10-23, #1164). Invalid
-  coverage keeps the recognizer on CPU. This changes no authentication
-  threshold, loading admission or certification entry.
-
-- Keep experimental IR-only recognition probes on the CPU reference even
-  when a recognizer is placed on an accelerator (ADR-0022, amendment
-  2026-10-22 "experimental IR-only probes stay on CPU", #1164). That route
-  does not have certified accelerator decision coverage. Its unused probe
-  admission is removed, and the source guard covers multiline embedding
-  calls across the authentication modules. Thresholds and grant rules stay
-  unchanged; accelerator loading and certification remain closed.
+- Update ctutils to 0.4.8 in the application and fuzz lockfiles.
+  `crypto-bigint`, which enters the dependency graph in this release with
+  the EK certificate verifier (ADR-0036), resolves to 0.7.10, newer than
+  the 0.7.6 release that fixes
+  [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
+  The minimum supported Rust version is unchanged.
 
 - Correct the Tufts evidence behind the dark recognition threshold
   (ADR-0016, amendment 2026-10-22, #1164): the shipped lambda-0.5
@@ -531,48 +626,17 @@ All notable changes to irlume are documented here. This project adheres to
   separate centroid arms and the full scaled production decision. No
   threshold, calibration parameter or authentication behavior changes.
 
-- ADR-0022 fixes what a certification runs over (amendment 2026-10-22,
-  #1164). LFW runs every ordered within-identity and cross-identity pair
-  (484,514 and 174,614,542) on the original images as packaged on Hugging
-  Face, the copy behind 0.55, and on the deep-funneled Kaggle copy that the
-  published all-pairs upper bound cites. FairFace runs every ordered
-  within-group pair (17,556,198) of its 0.25 validation copy, the
-  threshold's own. CBSR, Tufts and the supplementary Oulu-CASIA run every
-  ordered pair from their Kaggle mirrors, the maintainer's chosen copies,
-  with the owners' terms quoted. Recorded data is the 73 sessions of a fixed
-  private manifest: the maintainer's genuine and attack sessions, one other
-  consenting household member's genuine session and a no-face control. Six
-  recordings that earlier decisions rest on are not in it and are re-recorded
-  before any entry. Decision arms cover single identities, households of two
-  and three and the two splits behind 0.635, in two orders fixed by each
-  copy. Fusion runs recorded pairs as recorded and every combination of
-  corpus RGB and IR comparisons at every point of a brightness grid spanning
-  the production weights, counted by searches over sorted scores. Enrolled
-  users' arms run every one-profile shape of up to 30 scans against named
-  zero-effort populations, the household member's frames included; the
-  attack sessions also run against household enrollments of two and three
-  profiles and at every threshold value; and an enrollment shape keeps its
-  probes on CPU unless both an impostor arm and an attack arm reach it.
-  Every production threshold value is generated from the code. Arms that
-  consume recorded data or a CBSR, Tufts or Oulu-CASIA score span their
-  whole extent under ids from a fixed list and leave the measuring machine
-  only as counts, drift, outcome, summed flip totals, a within-drift flag
-  and the digest of a local list that opens with a per-run random value,
-  once a validator run there as root has passed the record; that list and
-  the run's console output stay with the maintainer, and such an arm with a
-  difference above a drift of 1e-5 is refused. Items 6 and 7 run separately,
-  through the production compile. The irlume-core comments now give LFW's
-  identity-grouped impostor rate (2e-5 at 0.55), label the 2.0e-3 all-pairs
-  figure an upper bound, replace the SFHQ figure that could not be
-  reproduced (9.8e-5 at 0.50) with the committed re-run (4.71e-4 at 0.50,
-  1.43e-4 at 0.55), no longer say 0.55 holds 1e-4 in every FairFace group,
-  cite the 2026-08-05 record's anchor runs for the live floor instead of
-  restating it, and no longer call the CBSR OR-arm deployment-shaped.
-  docs/VERIFY.md names the copy behind each LFW figure and drops the `--lfw`
-  flag that `irbench` refuses with `--impostor-only`, and
-  benchmarks/README.md names the Tufts copy
+- The irlume-core threshold comments now give LFW's identity-grouped impostor
+  rate (2e-5 at 0.55), label the 2.0e-3 all-pairs figure an upper bound,
+  replace the SFHQ figure that could not be reproduced (9.8e-5 at 0.50) with
+  the committed re-run (4.71e-4 at 0.50, 1.43e-4 at 0.55), no longer say 0.55
+  holds 1e-4 in every FairFace group, cite the 2026-08-05 record's anchor runs
+  for the live floor instead of restating it, and no longer call the CBSR
+  OR-arm deployment-shaped (#1164). docs/VERIFY.md names the copy behind each
+  LFW figure and drops the `--lfw` flag that `irbench` refuses with
+  `--impostor-only`, and benchmarks/README.md names the Tufts copy
   (docs/research/2026-10-22-certification-extent.md). No threshold or code
-  path changes; `CERTIFIED` stays empty.
+  path changes.
 
 - On the grouped sequential route each sample's RGB face detection and ViT
   RGB PAD score now run while the IR session captures, instead of after both
@@ -664,24 +728,24 @@ All notable changes to irlume are documented here. This project adheres to
   grant withdrawn at the completion boundary, or a refusal of the retry
   accounting, which a credential release journals at notice level. An
   identification that fails before a decision journals
-  `irlumed: Identify failed: <error>`, with no account or score, at most
-  once a minute per peer. Every
-  other request that runs on the camera worker (enrollment, scans,
-  profiles, camera groups, split pairs, `ir-setup`, self-tests,
-  diagnostics, recovery, keyring sealing) ends with one notice line,
-  `irlumed: <Request> for '<user>' failed: <error>`, also after a line its
-  handler wrote; it names the account only when the request's privilege
+  `irlumed: Identify failed: <error>` (`IdentifyFor` for the TUI's
+  account-scoped request), with no account or score, at most once a minute
+  per request and peer. Every other request that runs on the camera worker
+  (enrollment, scans, profiles, camera groups, split pairs, `ir-setup`,
+  self-tests, diagnostics, recovery, keyring sealing) ends with one notice
+  line, `irlumed: <Request> for '<user>' failed: <error>`, also after a line
+  its handler wrote; it names the account only when the request's privilege
   checked it, and comes at most once a minute per request, peer and
-  account, with repeats in the debug log. The face requests and `UnsealKeyring` keep
-  their own lines, refusals answered before a request reaches the worker
-  are not journaled. Every line's prose loses its numbers unless tracing is
-  on, as a deny reason does (a failure can quote a match score), drops
-  invisible Unicode formatting and is put on one line. A support probe that
-  caught its capture failure is a failed request too, and a grant the last
-  admission check withholds says it was not delivered.
+  account, with repeats in the debug log. The face requests and
+  `UnsealKeyring` keep their own lines, and refusals answered before a
+  request reaches the worker are not journaled. Every line's prose loses its
+  numbers unless tracing is on, as a deny reason does (a failure can quote a
+  match score), drops invisible Unicode formatting and is put on one line. A
+  support probe that caught its capture failure is a failed request too, and
+  a grant the last admission check withholds says it was not delivered.
 
-- `irlume doctor`'s `pcr7-binding` check reads the firmware event log more
-  strictly (#1081). It now judges these cases:
+- `irlume doctor`'s `pcr7-binding` check reads the firmware event log
+  strictly (#1081). The check came after 0.15.0. It judges these cases:
   - A separator that records a measurement error (its digest is that of
     the value 1, whatever its event data) is a `warn`; one that is neither
     that nor a 4-byte 0 or all ones is malformed.
@@ -696,27 +760,19 @@ All notable changes to irlume are documented here. This project adheres to
   - SecureBoot must be one byte, 0 or 1; one measured with no data, as
     EDK2 measures an absent variable, reads as off.
 
-- `deny.toml` suppresses RUSTSEC-2026-0367, 0368 and 0369, three
-  extraction flaws in `zip` 8.6.0 (#1103). `zip` is only a build
-  dependency of `edgefirst-tflite-sys` 0.10.3, whose build script extracts
-  an archive only for its `vendored` feature, which irlume does not enable,
-  so the vulnerable code is never reached. No release of that crate builds
-  with the fixed zip 9 yet. A release's VEX document states the three as
-  `not_affected` (`vulnerable_code_not_in_execute_path`); the entries go
-  once the pinned crate moves to zip 9.
-
-- Once irlumed has persisted irlume's DA-exempt storage key, nothing but
-  irlumed's start derives the original storage key (ADR-0034, Phase 3
-  amendment). An unseal under the original key that finds it away from its
-  handle, freed or taken by another stack's key, now fails instead of
+- Once irlumed has persisted irlume's DA-exempt storage key, only irlumed's
+  start derives the original storage key to unseal through it (ADR-0034,
+  Phase 3 amendment). An unseal under the original key that finds it away
+  from its handle, freed or taken by another stack's key, now fails instead of
   deriving it, so irlume falls back to the password. Before, it derived the
   key on every call while another key held the handle (seconds on slow
   TPMs), and with the handle free it persisted the key there again, which
-  would undo a retirement of that key (#1073). irlumed's start still moves a template key there onto the
-  DA-exempt key, through a transient derivation that persists nothing. A
-  keyring secret is sealed again under the DA-exempt key at the next
-  password login, with no derivation. With no persisted irlume key at all,
-  an unseal derives and persists the original key as before.
+  would undo a retirement of that key (#1073). irlumed's start still moves
+  a template key there onto the DA-exempt key, through a transient
+  derivation that persists nothing. A keyring secret is sealed again under
+  the DA-exempt key at the next password login, with no derivation. With no
+  persisted irlume key at all, an unseal derives and persists the original
+  key as before.
 
 - `irlume uninstall` also evicts irlume's DA-exempt storage key (ADR-0034
   §3), which it finds by scanning the owner persistent handles, and names
@@ -724,24 +780,23 @@ All notable changes to irlume are documented here. This project adheres to
   only when its modulus equals a fresh derivation of the template, and the
   template now carries an irlume label in `unique` (ADR-0034, amendment
   2026-10-15), so another stack's storage key built from the TCG template,
-  such as systemd's RSA key at 0x81000001, never matches it. Nothing seals
-  under the new key yet.
+  such as systemd's RSA key at 0x81000001, never matches it.
 
 - When irlume's storage key carries the ROCA fingerprint, `irlume doctor`'s
-  `tpm-firmware` check now derives the key irlume's template gives and
+  `tpm-firmware` check derives the key irlume's template gives and
   compares the two. It names the eviction command when they match, and when
   the TPM now derives a key without the fingerprint, as it does after a
   firmware update fixed its key generation. A key with irlume's template that
   irlume did not derive, on firmware that still generates affected keys, may
   have been placed at the handle by another tool and gets a warning to find
-  what uses it first (#1073).
+  what uses it first (#1073). The check came after 0.15.0.
 
 - `irlume doctor`'s `secure-boot-certificates` check recognizes Microsoft's
   Secure Boot certificates by their SHA-256 hashes, as published in
-  microsoft/secureboot_objects, instead of by subject name, which any
-  certificate can carry. A `db` certificate that firmware holds as a bare
-  RSA-2048 key now counts too, as Microsoft's key guidance allows for every
-  one of them (#1073).
+  microsoft/secureboot_objects, not by subject name, which any certificate
+  can carry. A `db` certificate that firmware holds as a bare RSA-2048 key
+  counts too, as Microsoft's key guidance allows for every one of them
+  (#1073). The check came after 0.15.0.
 
 - An enrollment capture (`irlume enroll`, a guided enrollment from its
   framing guide on, more scans, an added camera, a split pair) is refused
@@ -777,8 +832,9 @@ All notable changes to irlume are documented here. This project adheres to
   override report the ordinary camera path's limitation. Dual-sensor
   authentication with a proven ordinary override uses that reason for a
   split-bound primary too.
-  Automatic and saved-pin split authentication retain the activation refusal;
-  admitted IR-only split choices retain their unsupported-path refusal.
+  Without the experimental opt-in, automatic and saved-pin split
+  authentication retain the activation refusal. Admitted IR-only split
+  choices retain their unsupported-path refusal.
   The ordinary reason names the explicit split-enrollment entry point without
   presenting it as a remedy for every operation (ADR-0032 refusal-context
   amendment 2026-10-08; #1030).
@@ -786,149 +842,14 @@ All notable changes to irlume are documented here. This project adheres to
 - An attested YUYV IR camera freezes its raw format from the open device
   once negotiation is final, including the Y'CbCr encoding the v4l crate
   drops, after reading the device's whole format list and re-checking its
-  USB descriptor. A capture then refuses as format drift if any of it
-  changes at a buffer claim, the first frame or a recovery. YUYV IR still
-  has no exposure ceiling (ADR-0031 §4, fd-bound format evidence
-  amendment; #887).
+  USB descriptor. A capture then refuses as stream state drift if any of it
+  changes at a buffer claim, the first frame or a recovery (ADR-0031 §4,
+  fd-bound format evidence amendment; #887).
 
 - Refresh both Cargo lockfiles to current compatible transitive releases,
-  including `libc` 0.2.190 and `spki` 0.8.1. `aes` stays at 0.9.2 and `uuid`
-  at 1.26.0 because their newer releases declare Rust 1.89 while the
-  workspace MSRV remains 1.88, and the pinned `edgefirst-tflite` 0.10.2 /
-  `edgefirst-tflite-sys` pair stays synchronized pending a reviewed 0.10.3
-  bump.
-
-### Added
-
-- Recognizer device selection: `recognizer_device` in `settings.conf`
-  (`IRLUME_RECOGNIZER_DEVICE` overrides) names the recognizer's intended
-  device, `auto` (the default), `cpu` or `npu`. A selection never lowers a
-  gate: `cpu` skips NPU discovery with the reason reported, `npu` attempts
-  placement under the unchanged kill switch, admission and certification, and
-  `auto` keeps today's switch-gated behavior. A malformed value or unreadable
-  settings is a journal warning resolving to `auto`, the selection joins the
-  one startup settings snapshot, and `doctor` (`recognizer-selection`) and
-  `status --json` (`recognizer.selection`) report it (#1053).
-
-- Both daemon AppArmor profiles grant scoped NPU cache, discovery, firmware,
-  device and library access, and share an optional local rule include for
-  administrator-selected provider prefixes. Native loading and certification
-  remain closed; enforcing NPU qualification is still pending (ADR-0022;
-  part of #1046).
-
-- NPU provider selection and reporting groundwork: an administrator can select
-  an absolute C API file with `npu_library` or `IRLUME_NPU_LIBRARY`; automatic
-  selection checks standard system and `/usr/local` roots, preferring
-  `libopenvino_c.so.2621` before the retained `.2620` soname. Exact identities
-  stay path-based, while a separate v2 execution key supports qualification
-  matching across equivalent layouts. Doctor and status JSON distinguish runtime
-  discovery from current model placement, with fixed fallback categories for
-  non-root peers. Native loading remains closed, no loading profile is admitted,
-  and no setting bypasses that refusal. `CERTIFIED` stays empty and CPU remains
-  authoritative (ADR-0022 provider-selection amendment 2026-10-09).
-
-- `irlume doctor` reports where the daemon's recognizer computes
-  authentication probes (`recognizer-device`: NPU, or CPU with the reason)
-  and the NPU platform it read (`npu-platform`), and `irlume status --json`
-  gains an optional `recognizer` object. The default-off `npu` feature has
-  placement support behind loading admission and per-model certification;
-  both gates remain closed, so it runs on CPU everywhere. New face scans
-  record the CPU reference that embedded them, an optional field older
-  releases ignore (ADR-0022).
-
-- `irlume enroll --split-camera-choice JSON` asks irlumed to enroll, with or
-  without `--reset`, on an authorized split pair for this operation only,
-  and `enroll --add-camera --split-camera-choice JSON` to add that pair as a
-  camera group. The choice carries the side guards and opaque authorization
-  proof built from `irlume split list` and goes unchanged in one
-  `EnrollSplitOn` or `AddSplitCameraGroupOn` request. Malformed, repeated
-  or combined choices fail before sending; the client reports an older
-  daemon's `bad request` as unsupported and does not fall back to an
-  ordinary request, and it prints any other refusal as is. Split
-  enrollment stays disabled until activation (ADR-0032, guarded split
-  operation-choice amendment; #1030).
-
-- The liveness self-test (`irlume selftest liveness`, the TUI's infrared camera
-  test) runs on a selected split camera pair, both sides in one diagnostic
-  operation, instead of refusing it; it grants and releases nothing, and an
-  unplugged pair or IR forced off refuses before any camera opens (ADR-0032,
-  split liveness self-test amendment; #995).
-
-- Split-camera enrollment, camera-group addition and authentication run end to
-  end behind the camera trust predicate, which stays closed in every shipped
-  build. One split lease covers both original sides and capture runs RGB then
-  IR; a pinned or automatic split routes once per request with no ordinary,
-  legacy or standing fallback; split evidence never grants through the
-  RGB-primary or fusion arms; IR-only requests refuse a split choice before any
-  lease; and a split denial releases no credential and keeps its retry charge
-  (ADR-0032, retained split runtime amendment; #995).
-
-- Guarded split enrollment and add-camera operation requests retain both displayed
-  camera guards and an opaque machine-publication proof through approval and
-  camera-free preparation. Whole-pair publication revalidation preserves ordinary
-  device claims and saved selection. Split trust operations remain disabled
-  (ADR-0032, guarded split operation-choice amendment; #995).
-- LightDM runs against a private, read-only PAM view when irlume's LightDM
-  units are installed. A preparation unit ordered before every LightDM start
-  reads the prospective configuration with `lightdm --show-config` and, while
-  XDMCP or VNC is enabled, publishes include copies in which `pam_fprintd`
-  and irlume's own credential rules become inert, jump-preserving slots. The
-  shared host stacks are never rewritten, other services and desktop sessions
-  keep fingerprint, and a failed preparation or view check prevents an
-  unprotected LightDM start (#859).
-
-- The LightDM preparation hook ships in every packaging lane (Fedora, Arch,
-  Debian/nfpm, PPA, NixOS and the source installer) through a
-  `lightdm.service.d` drop-in, and a path unit watching the PAM directories
-  with `PathModified` (which replacement by rename cannot escape) refreshes
-  the view of a running LightDM, so a `sed -i` configuration change can no
-  longer leave face lines served until the reconcile timer fires (#859).
-
-- Split-camera diagnostics capture RGB then IR under one retained two-device
-  operation and return an operation-bound complete-pair receipt. Assessment
-  carries split sequential posture at every skew. Native opens validate the
-  selected descriptor before configuration; owned cleanup can restore a
-  surviving camera after peer loss. Split enrollment and authentication remain
-  disabled (ADR-0032, sequential capture amendment; #995).
-
-- Ordinary enrollment and add-camera requests accept an operation-scoped camera
-  choice through `--camera-choice JSON`. The daemon validates the displayed
-  connection guard and roles before camera work, retains the exact pair through
-  probe and capture, and restores the standing selection afterward. Non-reset
-  additions require the existing primary binding; split enrollment stays disabled
-  (ADR-0029, guarded ordinary operation-choice amendment; #995).
-
-- Automatic face authentication selects an eligible enrolled whole pair before
-  capture, pins secondary selection to the same loaded store, and acquires the
-  exact selected camera incarnation. IR authentication and readiness resolve
-  the chosen pair. Daemon admission uses its tier and the clipped original
-  window, retaining admitted retry charges; request cleanup clears authority
-  while retaining an automatic standing choice (ADR-0032, automatic account
-  routing amendment; #995).
-
-- Camera-backed request entries share a validated configuration-gate snapshot
-  through daemon enrollment probes and nested Engine calls. Invalid selection
-  refuses before environment precedence; selected split capture stays closed.
-  An ordinary override needs a unique Current ordinary pair and both external
-  policy gates. Scope mutation or retained-pair inventory drift refuses before
-  nested capture, and cleanup restores standing devices (ADR-0032, request
-  configuration-gate amendment; #995).
-
-- Split-pair account foundations retain complete class-aware primary and
-  secondary bindings, scoped approval and grant-boundary checks, and typed
-  primary-first camera ranking. Ordinary stored forms and partial-primary
-  behavior stay compatible; split strings refuse legacy struct readers.
-  Split enrollment and authentication remain disabled pending request-path
-  integration and acceptance (ADR-0032, 2026-10-04 amendment; #995).
-
-- Split-pair authorization storage and management (ADR-0032 Step 3): immutable
-  generation files under `/etc/irlume/split-pairs/`, the coherent publication
-  protocol behind the `split_generation` / `split_digest` / `split_pair` keys
-  of `cameras.conf`, and root-only `irlume split add|remove|select|status`
-  commands with a share-safe `irlume split list`. Capture-side split support
-  (paired leases, incarnation revalidation and the unconditional sequential
-  admission posture) lands internally too. Split enrollment and
-  authentication stay refused until the later steps.
+  including `libc` 0.2.191 and `spki` 0.8.1. `aes` goes to 0.9.2 and no
+  further, because its newer releases declare Rust 1.89 while the workspace
+  MSRV remains 1.88; `uuid` goes to 1.26.0.
 
 ### Fixed
 
@@ -1065,12 +986,12 @@ All notable changes to irlume are documented here. This project adheres to
   reporting face and fingerprint coexistence. Keyring-only rules do not count
   as face wiring, vendor-only stacks are read from their actual source, and
   unknown observations do not become setup advice
-  (ADR-0030 section 6).
+  (ADR-0030 section 1.6).
 
 - Diagnostics retains an observed fingerprint-reader claim error and its
   confirmed restart action when enrollment cannot be listed. Unknown enrollment
   stays unknown, and the restart warning names its effect on active sessions
-  (ADR-0030 section 6).
+  (ADR-0030 section 1.6).
 
 - TUI shortcuts ask for confirmation before writes or administrator commands,
   including login wiring, fingerprint setup, policy changes and diagnostics.
@@ -1106,18 +1027,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 - LightDM managed-start evidence checks the directories traversed through
   symbolic links before treating configuration as readable by both root and
-  unprivileged clients. Supported public symlinks remain valid.
+  unprivileged clients. Supported public symlinks remain valid. LightDM
+  managed-start evidence came after 0.15.0.
 
 - LightDM preparation allows cold reads on slow storage. Its former
   three-second service limit and half-second observation limits could stop
   the greeter from starting even before face login was configured. The
   private-view units now allow 90 seconds and each observation 60 seconds;
-  a failed or masked preparation still blocks an unprotected start.
+  a failed or masked preparation still blocks an unprotected start. LightDM
+  preparation came after 0.15.0.
 
 - Removing the universal Debian package reloads systemd after the LightDM
   drop-in is gone, so later LightDM starts do not depend on the removed
   irlume executable. Removal stops the private-view refresh units without
-  stopping the running greeter; upgrades leave those units alone.
+  stopping the running greeter; upgrades leave those units alone. The
+  LightDM drop-in came after 0.15.0.
 
 - `irlume login enable` wires GDM and SDDM on a stock Fedora again. The check for jumps in
   included stacks (#934) also refused irlume's session line right after `session include
@@ -1127,15 +1051,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 - `irlume uninstall` and `irlume update` now read a deb822 `.sources` stanza
   the way apt does: one disabled by `Enabled: no` (in any zero spelling apt
-  reads) is not a source apt lists, so a release `.deb` cleanup no longer
-  offers to remove that PPA and update no longer calls it a stray to clean
-  up. A URI needs its scheme, repeated fields count once (the last), a
+  reads) is not a source apt lists, so a release `.deb` cleanup leaves that
+  PPA alone and update does not call it a stray to clean up. A URI needs its
+  scheme, repeated fields count once (the last), a
   whitespace-only line continues its stanza, and a file apt would refuse
   contributes nothing; comments, disabled entries and unrelated sources keep
   their bytes. The parts directory is walked with apt's own file-name rules
   (`GetListOfFilesInDir`): hidden, spaced or otherwise run-parts-invalid
   names (a `.irlume.list` rename, an `irlume copy.sources` backup) are files
-  apt never reads, so they no longer count as an active PPA lane either. And
+  apt never reads, so they do not count as an active PPA lane either. And
   when a `.sources` file mixes the PPA with a repository that is not
   irlume's, `irlume uninstall` refuses the automatic removal and `irlume
   update` recommends an edit instead of it: on software-properties with
@@ -1147,11 +1071,13 @@ All notable changes to irlume are documented here. This project adheres to
   value by hand.
 
 - Keep the PPA lane when its index answers with a transient HTTP 429/500/503:
-  the install script now demotes an Ubuntu series to the release `.deb` only
-  on a reported 404, or, defensively, when curl reports an HTTP error with no
-  code. `irlume update`'s own probe answers the same way: an outage is not
-  proof the PPA serves a series nothing, so it no longer prints the
-  "nothing for your series" removal advice while the PPA is merely unreachable.
+  the install script demotes an Ubuntu series to the release `.deb` only when
+  the index is missing (a reported 404) or lists no irlume, or, defensively,
+  when curl reports an HTTP error with no code. `irlume update`'s own probe
+  treats an outage the same way, as no proof the PPA serves a series nothing:
+  on such an outage it no longer calls the release `.deb` that series' update
+  channel, and it does not advise removing the PPA. The install script's
+  PPA probe came after 0.15.0.
 
 - `scripts/install.sh` adds the PPA only on an Ubuntu release it serves. It added it on every
   release and fell back to the `.deb`, so on 22.04 every later `apt update` failed with
@@ -1166,14 +1092,6 @@ All notable changes to irlume are documented here. This project adheres to
   every open failed with EPERM: the daemon reported no camera, and nothing could be sealed.
   The unit now sets `DeviceAllow=char-* rw`, which also refuses block devices everywhere.
   Measured with a software TPM and the `vivid` test driver, not with a real camera.
-
-- The NPU execution identity loads the compiler loader, the compiler and
-  the IR and ONNX frontends before it reads the mapped libraries, so the
-  libraries those four need are hashed too (ADR-0022 §4, #1238). A compile
-  no longer refuses its own dependencies when the process had not mapped
-  them already (`libzstd` in the #1046 run). A library only a compile maps
-  is still refused, the legacy identity is unchanged, and a compile-time
-  library that does not load leaves the identity unreadable.
 
 - PPA packages preserve AppArmor parser diagnostics and warn when profile
   loading fails, while keeping installation non-fatal and service ordering
@@ -1190,7 +1108,7 @@ All notable changes to irlume are documented here. This project adheres to
   Fresh installs and upgrades from before 0.7.0 still arm the timer.
 
 - Secure the single systemd activation listener against exec inheritance and
-  refuse startup if securing it fails (#1213). AppArmor policy is unchanged.
+  refuse startup if securing it fails (#1213).
 
 - Enrollment, scan addition, profile removal and recovery management address
   polkit by the well-known name allowed by the shipped AppArmor profiles
@@ -1225,7 +1143,7 @@ All notable changes to irlume are documented here. This project adheres to
 - CI virtual-camera setup checks that `videodev` loads before requiring a
   module package. It tries the running kernel's core modules before the
   older extra-module layout, so Azure 7.0's unavailable `-extra` package
-  no longer blocks an already usable driver (#1154). Module loading,
+  no longer blocks an already usable driver (#1157). Module loading,
   pinned loopback build, frame readiness and camera test gates stay required.
 
 - Diagnostic trace collection expires under producer contention and socket
@@ -1252,12 +1170,13 @@ All notable changes to irlume are documented here. This project adheres to
   storage key now states the downgrade consequence and the restore paths:
   a release from before the DA-exempt storage key cannot open the moved
   envelope, and `irlume recovery restore` or a re-enrollment reseals it
-  (ADR-0034 section 5). Previously the notice read as a benign
+  (ADR-0034 §3.3 and Consequences). Previously the notice read as a benign
   improvement, so an operator running a newer irlumed once - a diagnostic
   run or a test install - did not learn the one-way door had closed until
-  the older daemon refused every load with TPM_RC_INTEGRITY (#1148). A
-  StrongerPolicy move stays on the same storage key and keeps the plain
-  notice: an older release can still open that envelope.
+  the older daemon refused every load with TPM_RC_INTEGRITY (#1148). The
+  DA-exempt storage key came after 0.15.0. A StrongerPolicy move stays on
+  the same storage key and keeps the plain notice: an older release can
+  still open that envelope.
 
 - A split camera pair no longer refuses every batch with "split frame does
   not match its retained capture contract" when the RGB median is slow
@@ -1265,7 +1184,7 @@ All notable changes to irlume are documented here. This project adheres to
   capture thread while the camera kept streaming; once that outlasted the
   queue's spare buffers, the driver dropped frames before the next
   sample's burst, and that sample's own continuity check refused it. Seen
-  on a Lenovo T480. The median now runs while the capture thread keeps
+  on a ThinkPad T480. The median now runs while the capture thread keeps
   consuming the stream, on every path that denoises from a held session
   (split, sequential, RGB-only and concurrent captures, and the
   `camera-tune` concurrent probe). The refusal also names the frame's role
@@ -1294,7 +1213,7 @@ All notable changes to irlume are documented here. This project adheres to
   not be read. A lock screen that fell back to the password with no camera
   now says why. It is a policy refusal, not a decision about a face, so it
   is journaled on every tier at notice level, at most once a minute per
-  account.
+  request, peer and account.
 
 - The first split-pair authentication after the IR camera is replugged no
   longer ends at once with `operation-failed` when the camera's metadata
@@ -1378,8 +1297,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 - The AppArmor profile for a source install's `/usr/local/bin/irlumed`
   (`packaging/apparmor/usr.local.bin.irlumed`, loaded by hand) now has the
-  two rules the packaged profile gained in #640: the `rwk` lock on the
-  template-key flocks, without which an enforcing profile fails every
+  two rules the packaged profile gained in #530 and #535: the `rwk` lock on
+  the template-key flocks, without which an enforcing profile fails every
   enrollment read with "lock state transaction ... Permission denied", and
   `/dev/media[0-9]* r`, without which camera classification falls back to
   opening video nodes. The packaging parity check now requires both rules
@@ -1409,16 +1328,12 @@ All notable changes to irlume are documented here. This project adheres to
   device that also has an authorized interface with no driver keeps the
   fault warning for it (#1063).
 
-- NPU startup reads the opt-in and provider from one settings snapshot, so
-  an atomic settings replacement cannot combine decisions from different
-  versions. Non-NPU builds release verified recognizer bytes before auxiliary
-  sessions load on startup and post-panic rebuilds (ADR-0022; #1051).
-
 - A wrapper format drift, an interval drift or a failed format or interval
   read seen at a stream's first dequeue ends warm-up on that dequeue with
   the boundary's own error, as the raw ADR-0031 §4 evidence already did,
   instead of spending the eight-try budget and reporting the drift as an
   unavailable camera (#1035).
+
 - A held concurrent pair no longer recovers a broken stream in place before
   the mandatory sequential fallback. A held-side capture fault fails over at
   once with that side's original error (message, typed payload and class
@@ -1435,17 +1350,6 @@ All notable changes to irlume are documented here. This project adheres to
   error-marked dequeues can no longer pass the floor check on an empty
   window. A held pair re-pays the full 30-delta fill at least once every
   24 hours of daemon uptime, as the bound promises (ADR-0021, #1034).
-
-- An RGB or IR burst captured after an in-place stream recovery no longer
-  fails as an invalid aggregate. Its first frame keeps the recovery marker
-  and is accepted only after a discarded frame of the new stream, so the
-  burst stays non-continuous: the concurrent pair check and IR recognition
-  still refuse it, and a held pair with a recovered side still falls back
-  (ADR-0007).
-
-- A recovered stream drops its rate-probe admission and re-establishes its
-  30-delta delivered-rate window before its next frame (ADR-0021, decision
-  item 3).
 
 - `irlume camera diagnostics --json` measures the selected split camera pair,
   both sides in one diagnostic operation, instead of the RGB camera the daemon
@@ -1494,17 +1398,10 @@ All notable changes to irlume are documented here. This project adheres to
   password delivered to the keyring's control socket and a wallet key to
   `irlume-kwallet-init`. The session query reports a password only when the
   daemon accepted one for resealing or a wallet already runs, so a cached
-  typo no longer suppresses the release. The module-side warm guard of #863
-  and #977 is subsumed: a module that makes no auth-phase release request
-  needs no guard on one, and the daemon keeps withholding for modules from
-  before this change (ADR-0003, 2026-10-06 amendment; #859).
-
-- The GDM and LightDM autologin readers keep a value's trailing whitespace,
-  as GLib's key file parser does, and read the enable and server switches
-  exactly as each daemon does (GDM: case-insensitive `true` or `1` on the
-  raw value; LightDM: trailing whitespace stripped, then an exact lowercase
-  `true`). A trailing space no longer names an account, and `yes` or `True`
-  no longer turns a login manager's switch on (#859).
+  typo no longer suppresses the release. For a module from before this
+  change, irlumed still withholds an auth-phase release while the account has
+  a live local desktop or its state cannot be read, as in 0.15.0 (#863, #864)
+  (ADR-0003, 2026-10-06 amendment; #859).
 
 - The SDDM and Plasma Login autologin readers order each `conf.d` layer the
   way the login manager reads it, Qt's `QDir::LocaleAware` collation, so
@@ -1516,8 +1413,8 @@ All notable changes to irlume are documented here. This project adheres to
 - Paired startup consumes bounded native Parked returns before admission while
   keeping ERROR buffers unviewed and unrequeued. A handled startup park revokes
   both streams' cached admission and requires fresh clean full paired windows;
-  other capture and authority failures retain their refusals. Split activation
-  remains closed (ADR-0021, parked-buffer amendment; #995).
+  other capture and authority failures retain their refusals (ADR-0021,
+  parked-buffer amendment; #995).
 
 - Authentication rechecks retained account stores after preparation admission
   and lease contention, before opening cameras. IR readiness refuses pending
@@ -1578,8 +1475,9 @@ All notable changes to irlume are documented here. This project adheres to
   without counting changes beside intact targets. Explicit `-c`/`--config`
   invocations keep irlume's authentication lines out of the greeter. Bounded
   reads pin and type-check files before opening them for data, and unrelated
-  non-UTF-8 process names no longer invalidate the process check. The existing
-  timestamp-based restart rule is unchanged (#859).
+  non-UTF-8 process names do not invalidate the process check. A LightDM
+  launch without a managed-start receipt, such as one started without
+  irlume's drop-in, keeps the timestamp-based restart rule (#859).
 
 - GNOME keyring token arming requires a provably reached `reseal` session
   rule, following PAM includes, substacks and numeric jumps. Unreadable or
@@ -1590,15 +1488,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Login-manager checks follow manager-specific hash and quote rules and
   refuse malformed GDM/LightDM files or unsupported Plasma Login syntax.
-  Token arming refuses when Qt drop-in ordering or the Plasma parser version
-  can change the autologin result. Ordinary higher-priority settings override
+  Token arming refuses when the autologin result depends on the read order of
+  a drop-in directory that holds a name outside the modeled Qt collation, or
+  on the Plasma parser version. Ordinary higher-priority settings override
   supported alternatives; unreadable or potentially immutable files still
   refuse (#859).
-
-- PAM's optional fingerprint-keyring auth line withholds requests on warm
-  or unknown desktop state even while an older daemon runs during an upgrade.
-  Bounded account and session checks preserve password fallback and GNOME's
-  session-phase token delivery (ADR-0003, 2026-10-01 amendment; #859).
 
 - TPM policy upgrades rank pcrlock envelopes against the current prediction
   for their NV index. A policy re-provisioned over OS-only PCRs can move to
@@ -1611,10 +1505,12 @@ All notable changes to irlume are documented here. This project adheres to
   borrow a later request's account binding; a new request can retry after
   account resolution recovers (#859).
 
-- LightDM's restart gate checks `/etc` when `/etc/lightdm` is missing, so
-  removing the configuration directory does not restore irlume's authentication
-  lines while the running daemon may still serve remote login screens.
-  Unrelated `/etc` changes stay excluded while `/etc/lightdm` exists (#859).
+- For a LightDM launch without a managed-start receipt, such as one started
+  without irlume's drop-in, the timestamp-based restart rule checks `/etc`
+  when `/etc/lightdm` is missing, so removing the configuration directory
+  does not restore irlume's authentication lines while the running daemon
+  may still serve remote login screens. Unrelated `/etc` changes stay
+  excluded while `/etc/lightdm` exists (#859).
 
 - Privileged PAM prompts skip the face invitation when the daemon reports
   the RGB-only convenience tier, leaving the first input to the password
@@ -1699,21 +1595,23 @@ All notable changes to irlume are documented here. This project adheres to
   such a jump can land outside its own file; a substack's internal jumps
   are atomic and stay allowed), a required gate inside or behind the
   skipped stack (the password verifier pam_unix and the terminator
-  pam_deny are not gates, though pam_deny must sit after the verifier,
-  not before it or alone), a module that is neither password, keyring
+  pam_deny are not gates, though a required or requisite
+  pam_deny must sit after a sufficient verifier, not before it or
+  alone), a module that is neither password, keyring
   nor denial inside the skipped stack (a face grant would silently skip
   its policy), a required or requisite pam_unix or pam_deny above the
   anchor, directly or inside a preceding delegation, where the
   empty-Enter arm could never complete, and for an include anchor any
   required, requisite or bracketed control after it, direct or inside a
-  delegation after it (the sufficient form returns at the face line), an extended
-  control or unresolvable delegation (including one into a service
+  delegation after it (the sufficient form returns at the face line), an
+  extended control or unresolvable delegation (including one into a service
   whose text was overridden, since the inspected rules no longer
   describe the file libpam runs), or, for substack anchors, a password
   stack with no required rule at all. Controls are compared case-insensitively
   with surrounding whitespace trimmed, as libpam reads them. Found in live
   NixOS 26.05 acceptance: the lock screen worked, the greeter fell back to
   the password after a 0.93-score match (#955).
+
 - PAM wiring accepts vertical tabs, form feeds and carriage returns inside
   closed bracketed controls that Linux-PAM parses. A line such as
   `auth [success=1<VT>default=ignore] pam_unix.so` keeps its bytes and is
@@ -1726,23 +1624,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Security
 
-- Pin `edgefirst-tflite`/`edgefirst-tflite-sys` 0.10.3 to the merged
-  upstream zip-9 revision `43c7a741`
-  ([EdgeFirstAI/tflite-rs](https://github.com/EdgeFirstAI/tflite-rs), PR
-  #20) via `[patch.crates-io]` in both the application and fuzz
-  workspaces, moving the sys crate's build-only zip dependency from 8.6.0
-  to 9.2.2 and dropping the three zip advisory exceptions
-  (RUSTSEC-2026-0367/0368/0369, #1103). No exception replaces them: zip
-  8.6.0, which carried RUSTSEC-2026-0429 as well, is out of both graphs.
-  A lockfile graph guard in `irlume-vision` keeps every zip at or above
-  the 9.0.5 advisory floor and both tflite crates on the reviewed
-  revision. Resolved versions, the upstream delta review and the
-  restore-when-upstream-releases plan are in
-  `docs/research/tflite-zip9-pin.md`.
-
-- Update `crypto-bigint` to 0.7.6 and its `ctutils` dependency to 0.4.5 in
-  both lockfiles for [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
-  The application interfaces and minimum supported Rust version are unchanged.
+- Move the build-only `zip` dependency of `edgefirst-tflite-sys` from 8.6.0
+  to 9.2.2 in both the application and fuzz lockfiles, through the
+  published `edgefirst-tflite`/`edgefirst-tflite-sys` 0.11.1 (#1103).
+  `zip` 8.6.0, which RUSTSEC-2026-0367/0368/0369 and RUSTSEC-2026-0429
+  cover, is out of both graphs, and `deny.toml` carries no exception for
+  them. A lockfile graph guard in `irlume-vision` keeps every zip at or
+  above the 9.0.5 advisory floor and both tflite crates on their reviewed
+  registry version, source and checksum. The upstream review is in
+  `docs/research/tflite-0.11.1-audit.md`; the earlier zip-9 qualification
+  is in `docs/research/tflite-zip9-pin.md`.
 
 ## [0.15.0] - 2026-09-29
 

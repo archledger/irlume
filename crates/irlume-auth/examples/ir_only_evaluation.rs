@@ -3,9 +3,9 @@
 
 //! Root-only, non-granting, one-presentation IR developer diagnostic.
 use irlume_auth::ir_only_evaluation::{valid_budget, Category, Report};
+mod support;
 use std::{
     io::Read,
-    os::fd::AsRawFd,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,6 +13,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use support::{disable_process_dumps, quiet_dependencies, root};
 
 const HELP: &str = "Non-granting IR-only developer evaluation. Never authenticates or releases credentials.\nUsage: ir_only_evaluation (--evaluate|--preflight) USER DETECTOR RECOGNIZER FLIR --budget-ms 100..30000 [--adapter PATH] [--cancel-on-stdin]\nModel paths must be absolute. Reads the configured camera pair without discovery.\n--preflight loads models/enrollment but never opens cameras. --evaluate needs an attended start cue.\nWith --cancel-on-stdin, any byte, EOF or read error requests cooperative cancellation.\nThe budget covers capture/inference, not model loading or template-key unseal.\n";
 
@@ -84,41 +85,6 @@ fn parse(args: &[String]) -> Option<Options> {
         adapter,
         cancel_on_stdin,
     })
-}
-
-fn root() -> bool {
-    // SAFETY: getuid/geteuid take no pointers and have no failure convention.
-    unsafe { libc::getuid() == 0 && libc::geteuid() == 0 }
-}
-
-fn disable_process_dumps() -> bool {
-    let limits = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: limits points to the initialized platform rlimit ABI type.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limits) } != 0 {
-        return false;
-    }
-    // SAFETY: PR_SET_DUMPABLE takes a boolean scalar and no pointer arguments.
-    unsafe {
-        libc::prctl(
-            libc::PR_SET_DUMPABLE,
-            0 as libc::c_ulong,
-            0 as libc::c_ulong,
-            0 as libc::c_ulong,
-            0 as libc::c_ulong,
-        ) == 0
-    }
-}
-
-fn quiet_dependencies() -> bool {
-    let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
-        return false;
-    };
-    // SAFETY: null owns a valid descriptor and STDERR_FILENO is the process's
-    // standard error slot. Called before spawning the stdin/model worker threads.
-    unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) >= 0 }
 }
 
 fn run(options: &Options) -> Report {

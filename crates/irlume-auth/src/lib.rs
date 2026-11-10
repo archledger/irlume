@@ -25,6 +25,10 @@ pub mod test_support;
 #[cfg(feature = "ir-only-evaluation")]
 pub mod ir_only_evaluation;
 
+/// Non-granting measurements of a whole IR verification request.
+#[cfg(feature = "ir-only-evaluation")]
+pub mod ir_request_evaluation;
+
 use irlume_liveness::{LivenessGate, Signals, Verdict};
 use irlume_vision::{align, Adapter, Detection, Embedder, Landmarks5, EMBED_DIM};
 
@@ -93,6 +97,10 @@ pub use request_preparation::is_split_external_refusal;
 
 /// Loaded models + camera device selection. Build once, reuse per request.
 pub struct Engine {
+    #[cfg(feature = "ir-only-evaluation")]
+    request_evaluation: Option<ir_request_evaluation::SharedContext>,
+    #[cfg(all(test, feature = "ir-only-evaluation"))]
+    ir_request_assessor: Option<Box<ir_request_evaluation::TestAssessor>>,
     camera_selection: Option<request_preparation::PreparedSelection>,
     det: Detector,
     emb: Embedder,
@@ -4256,6 +4264,10 @@ impl Engine {
             // `with_devices`, so `IRLUME_FORCE_NO_IR=1` still outranks it.
             ir_available: selected_ir_available(irlume_camera::DEFAULT_IR_DEVICE),
             secondary_attempt: None,
+            #[cfg(feature = "ir-only-evaluation")]
+            request_evaluation: None,
+            #[cfg(all(test, feature = "ir-only-evaluation"))]
+            ir_request_assessor: None,
             primary_attempt: None,
             stop_requested: None,
             request_cancelled: None,
@@ -7154,6 +7166,8 @@ impl Engine {
         admission: PreparationAdmission<'_>,
         deliver: DecisionDelivery<'_>,
     ) -> irlume_common::Result<Outcome> {
+        #[cfg(feature = "ir-only-evaluation")]
+        self.validate_evaluation_request(policy)?;
         if policy == irlume_common::config::FaceSensorPolicy::IrOnlyExperimental {
             // The IR-only allowance is independent of the chosen dual tier.
             let request_window = request_window.clipped_to(self.authentication_window_from(
@@ -14742,6 +14756,32 @@ mod engine_tests {
             state.engine.last_attempt_situation_label(),
             Some("timed out")
         );
+    }
+
+    #[cfg(feature = "ir-only-evaluation")]
+    #[test]
+    fn request_evaluation_scope_rejects_nesting_and_clears_after_unwind() {
+        use crate::ir_request_evaluation::{Context, Scope};
+        use std::sync::Arc;
+        let _guard = env_guard();
+        let mut state = shared();
+        assert!(state.engine.request_evaluation.is_none());
+        {
+            let scope =
+                Scope::enter(&mut state.engine, Arc::new(Mutex::new(Context::default()))).unwrap();
+            assert!(scope.engine.request_evaluation.is_some());
+            assert!(Scope::enter(scope.engine, Arc::new(Mutex::new(Context::default()))).is_none());
+        }
+        assert!(state.engine.request_evaluation.is_none());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope =
+                Scope::enter(&mut state.engine, Arc::new(Mutex::new(Context::default()))).unwrap();
+            panic!("synthetic diagnostic unwind");
+        }));
+        assert!(panic.is_err());
+        assert!(state.engine.request_evaluation.is_none());
+        drop(Scope::enter(&mut state.engine, Arc::new(Mutex::new(Context::default()))).unwrap());
+        assert!(state.engine.request_evaluation.is_none());
     }
 
     #[test]

@@ -2292,6 +2292,47 @@ fn target_issue(error: &irlume_camera::IrTargetError) -> irlume_common::IrTarget
 }
 
 impl Engine {
+    fn ir_request_boundary(&self, scope: &IrOnlyScope) -> Option<Outcome> {
+        #[cfg(feature = "ir-only-evaluation")]
+        if self.request_evaluation.is_some() {
+            self.observe_evaluation_scope(scope.report().0);
+            let checked = (|| {
+                use irlume_core::{multi_camera::commit::GrantDecision, read_only::ReadError};
+                let view = self.evaluation_view()?;
+                let primary = view.primary_bytes()?;
+                let current = match scope {
+                    IrOnlyScope::Primary { digest, .. } => primary
+                        .as_ref()
+                        .is_some_and(|bytes| irlume_common::sha256_hex(bytes) == *digest),
+                    IrOnlyScope::Secondary(context) => {
+                        let secondary = view.load_secondary(&mut *self.request_key())?;
+                        matches!(
+                            context.boundary_check(
+                                primary.as_ref().map(|v| v.as_slice()),
+                                secondary.as_ref()
+                            ),
+                            GrantDecision::Grant
+                        )
+                    }
+                };
+                view.finish()?;
+                if current {
+                    Ok(())
+                } else {
+                    Err(ReadError::Changed)
+                }
+            })();
+            return checked.err().map(|error| {
+                self.evaluation_read_error(error);
+                Outcome::deny(
+                    OutcomeKind::SetupUnavailable,
+                    "read-only account state changed",
+                )
+            });
+        }
+        scope.boundary_refusal(&mut *self.request_key())
+    }
+
     /// Require an explicitly configured adapter for experimental IR assessment.
     /// An absent optional default adapter still selects the existing raw space.
     pub fn with_ir_adapter_required(mut self, required: bool) -> Self {
@@ -2324,6 +2365,34 @@ impl Engine {
         target: &irlume_camera::IrCaptureTarget,
         keys: &mut dyn irlume_core::template_key::TemplateKeySource,
     ) -> Result<IrOnlyResolution, IrOnlyRefusal> {
+        #[cfg(feature = "ir-only-evaluation")]
+        if self.request_evaluation.is_some() {
+            let read = (|| {
+                let view = self.evaluation_view()?;
+                let resolved = resolve_ir_only_scope_read_only_at(
+                    &IrOnlyStores {
+                        user,
+                        primary_path: &irlume_core::multi_camera::primary_enrollment_path(user),
+                        secondary_path: &irlume_core::multi_camera::secondary_store_path(user),
+                    },
+                    primary,
+                    (target.rgb_identity(), target.identity()),
+                    &|enrollment| self.compatible_ir_templates(enrollment),
+                    keys,
+                );
+                view.finish()?;
+                Ok::<_, irlume_core::read_only::ReadError>(resolved)
+            })();
+            return match read {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    self.evaluation_read_error(error);
+                    Err(IrOnlyRefusal::unscoped(
+                        irlume_common::IrOnlyReadiness::EnrollmentUnavailable,
+                    ))
+                }
+            };
+        }
         resolve_ir_only_scope_at(
             &IrOnlyStores {
                 user,
@@ -2354,9 +2423,16 @@ impl Engine {
         });
         let (sender, receiver) = std::sync::mpsc::channel();
         let user = user.to_string();
+        #[cfg(feature = "ir-only-evaluation")]
+        let evaluation = self.request_evaluation.clone();
         std::thread::Builder::new()
             .name("irlume-enrollment-load".into())
             .spawn(move || {
+                #[cfg(feature = "ir-only-evaluation")]
+                if let Some(context) = evaluation {
+                    let _ = sender.send(crate::ir_request_evaluation::load(&context, &user));
+                    return;
+                }
                 // The snapshot keeps the key and the bytes: the caller
                 // adopts the key into its request source and pins the
                 // scope by the bytes (ADR-0028 §4-5).
@@ -2762,7 +2838,7 @@ impl Engine {
                 return Ok(refusal_outcome(lease_error_failure(error)));
             }
         };
-        if let Some(refusal) = scope.boundary_refusal(&mut *self.request_key()) {
+        if let Some(refusal) = self.ir_request_boundary(&scope) {
             return Ok(refusal);
         }
         self.check_request_active()?;
@@ -2811,18 +2887,34 @@ impl Engine {
         let control = self.capture_control();
         let deadline = self.authentication_deadline;
         let adapter = self.has_ir_adapter();
-        let run = assess_stages(
-            &mut TargetStages {
-                inference: IrInference {
-                    engine: self,
-                    enrollment,
+        #[cfg(all(test, feature = "ir-only-evaluation"))]
+        let scripted = self
+            .ir_request_assessor
+            .as_mut()
+            .map(|assess| assess(&control, deadline));
+        let mut capture = || {
+            assess_stages(
+                &mut TargetStages {
+                    inference: IrInference {
+                        engine: self,
+                        enrollment,
+                    },
+                    target,
+                    operation,
                 },
-                target,
-                operation,
-            },
-            &control,
-            deadline,
-        );
+                &control,
+                deadline,
+            )
+        };
+        #[cfg(all(test, feature = "ir-only-evaluation"))]
+        let run = match scripted {
+            Some(run) => run,
+            None => capture(),
+        };
+        #[cfg(not(all(test, feature = "ir-only-evaluation")))]
+        let run = capture();
+        #[cfg(feature = "ir-only-evaluation")]
+        self.observe_ir_request(&run, enrollment.profiles.len(), adapter);
         self.last_attempt_facts = AttemptFacts::from_ir_signals(run.observations.as_ref());
         use irlume_common::diagnostics::{TraceEventKind, TraceStage};
         for (stage, millis) in [
@@ -2847,9 +2939,7 @@ impl Engine {
                     // The grant boundary (ADR-0028 §4): the stores the
                     // attempt was pinned to must still be in that state at
                     // the moment of the decision.
-                    scope
-                        .boundary_refusal(&mut *self.request_key())
-                        .unwrap_or(outcome)
+                    self.ir_request_boundary(scope).unwrap_or(outcome)
                 } else {
                     outcome
                 }

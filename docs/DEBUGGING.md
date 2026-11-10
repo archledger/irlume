@@ -67,9 +67,13 @@ state; run them only when those changes are intended.
 
 On an account armed with a GNOME keyring token, the login's session line
 hands the token to `irlume-gkr-unlock`, which waits (at most 120 s) until
-gnome-keyring is initialized and then delivers it. It writes one or two lines
-under the identifier `irlume-gkr-unlock` (facility authpriv), with numbers and
-pids only, never the token, its length or a password:
+gnome-keyring is initialized and then delivers it. An account armed with the
+login password goes through the same helper on a gnome-keyring session, with
+the password and `--password` in place of the token; a hand-off that fails is
+journaled as `GNOME keyring token hand-off failed` for either. The helper
+writes one or two lines under the identifier `irlume-gkr-unlock` (facility
+authpriv), with numbers and pids only, never the token, its length or a
+password:
 
 ```sh
 journalctl -b -t irlume-gkr-unlock
@@ -78,8 +82,8 @@ journalctl -b -t irlume-gkr-unlock
 | Line | Level | Meaning |
 |---|---|---|
 | `waiting up to 120 s for gnome-keyring to initialize (uid U)` | info | gnome-keyring was not ready at the session line (Fedora 43 and 44, where `pam_gnome_keyring` starts it with `--login`); the waiter watches for it |
-| `token delivered N ms after the session line (gnome-keyring pid P)` | info | the login keyring is unlocked. About 2000 ms is normal on Fedora 44 GNOME; where gnome-keyring runs from a socket unit, it is as soon as something in the login starts it, usually well under a second |
-| `the login keyring is not keyed to irlume's token …` | warning | gnome-keyring refused the token, so the sealed token and the keyring are out of step. Nothing was sent that gnome-keyring would remember, and the password still opens the keyring if it is keyed to it. Run `irlume keyring arm` as the user, or `irlume keyring forget` |
+| `credential delivered N ms after the session line (gnome-keyring pid P)` | info | the login keyring is unlocked. About 2000 ms is normal on Fedora 44 GNOME; where gnome-keyring runs from a socket unit, it is as soon as something in the login starts it, usually well under a second |
+| `the login keyring is not keyed to the supplied credential …` | warning | gnome-keyring refused the token or password it was given, so irlume's sealed copy and the keyring are out of step. Nothing was sent that gnome-keyring would remember, and the password still opens the keyring if it is keyed to it. Run `irlume keyring arm` as the user, or `irlume keyring forget` |
 | `gnome-keyring was not initialized within 120 s (not a GNOME session?)` | notice | nothing claimed `org.gnome.keyring` in time: a `--login` gnome-keyring that nothing initialized, as in a Plasma session, or a socket-unit gnome-keyring that nothing started (the waiter never starts one itself); the keyring stays locked |
 | `no gnome-keyring in this session …` | notice | after 15 s there was neither a gnome-keyring nor its control socket, as on Fedora 45, where oo7 replaces it: a token arm does not carry over, so run `irlume keyring forget` |
 | `the org.gnome.keyring owner (pid A) does not match this user's control socket (listener pid B); not sent` | warning | the process that claimed gnome-keyring's bus name is not the one listening on the control socket, so the token was not sent; the waiter goes on waiting, and logs this once |

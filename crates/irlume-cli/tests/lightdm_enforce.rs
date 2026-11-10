@@ -406,11 +406,19 @@ fn assert_reseal_only(stack: &str) {
         .lines()
         .filter(|line| line.contains("pam_irlume.so"))
         .collect();
-    assert_eq!(rules.len(), 2, "{stack}");
-    assert!(rules[0]
+    assert_eq!(rules.len(), 3, "{stack}");
+    assert!(rules[0].split_whitespace().eq([
+        "auth",
+        "optional",
+        "pam_irlume.so",
+        "begin",
+        "reseal",
+        "service=lightdm"
+    ]));
+    assert!(rules[1]
         .split_whitespace()
         .eq(["auth", "optional", "pam_irlume.so", "reseal"]));
-    assert!(rules[1]
+    assert!(rules[2]
         .split_whitespace()
         .eq(["session", "optional", "pam_irlume.so", "reseal"]));
 }

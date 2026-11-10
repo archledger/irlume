@@ -58,10 +58,18 @@ fi
 [[ $EUID -eq 0 ]] || { echo "must run as root"; exit 1; }
 
 echo "=== 1/5 install rebuilt binaries ==="
+for binary in irlumed irlume libpam_irlume.so irlume-kwallet-init irlume-gkr-unlock; do
+    [[ -f "$REPO/target/release/$binary" ]] || {
+        echo "missing rebuilt $binary; build the workspace before deploying"
+        exit 1
+    }
+done
 install -m755 "$REPO/target/release/irlumed"  /usr/local/bin/irlumed
 install -m755 "$REPO/target/release/irlume"   /usr/local/bin/irlume
 install -m644 "$REPO/target/release/libpam_irlume.so" /usr/lib64/security/pam_irlume.so
-echo "    installed irlumed, irlume, pam_irlume.so"
+install -Dm755 "$REPO/target/release/irlume-kwallet-init" /usr/libexec/irlume/irlume-kwallet-init
+install -Dm755 "$REPO/target/release/irlume-gkr-unlock" /usr/libexec/irlume/irlume-gkr-unlock
+echo "    installed irlumed, irlume, pam_irlume.so and both keyring helpers"
 
 echo "=== 2/5 load SELinux policy (greeter → daemon socket) ==="
 if ! semodule -l | grep -q '^irlume$'; then
@@ -83,14 +91,19 @@ echo "    socket label: $(ls -Z /run/irlume.sock 2>/dev/null | awk '{print $1}')
 
 echo "=== 4/5 wire plasmalogin greeter (face → KWallet unlock) ==="
 if [[ -f "$PAM_GREETER" ]] && grep -q "pam_irlume.so unseal" "$PAM_GREETER"; then
-    echo "    already wired; skipping"
+    echo "    already wired; leaving existing PAM text unchanged"
+    echo "    refresh managed recipes separately with: sudo irlume login reconcile"
 else
     staged=$(mktemp)
     {
         echo "$MARKER"
-        awk '
+        awk -v service="$(basename "$PAM_GREETER")" '
+            /^-?auth[[:space:]]/ && !bdone {
+                print "auth        optional      pam_irlume.so begin reseal service=" service
+                bdone=1
+            }
             /^auth[[:space:]]+substack[[:space:]]+password-auth/ && !adone {
-                print "auth     [success=1 default=ignore]   pam_irlume.so unseal"
+                print "auth     [success=1 default=ignore]   pam_irlume.so unseal defer_wallet"
                 print                                              # the substack password-auth line
                 # Landing target for the success=1 jump. A numeric jump does NOT
                 # itself authenticate; without an explicit success here the face

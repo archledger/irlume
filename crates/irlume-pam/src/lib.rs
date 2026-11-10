@@ -31,6 +31,10 @@
 //! and `ondemand` restricts the module to explicitly requested attempts (see
 //! the per-argument docs in `parse_module_args` and the wiring recipes in
 //! irlume-cli's `pamwire`).
+//! `defer_wallet` is for login stacks with a `session ... reseal` consumer:
+//! it stashes a face-released KDE key only when the helper reports that the
+//! runtime directory does not exist yet. Other delivery failures still fall
+//! back to the password, and legacy stacks without it keep their behavior.
 //!
 //! Per NIST SP 800-63B-4, face is one factor and a non-biometric fallback MUST
 //! always exist: on any decline/timeout we return `PAM_IGNORE` so the stack
@@ -42,6 +46,8 @@ use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::ffi::{CStr, CString};
 use std::time::{Duration, Instant};
+
+mod session_state;
 
 /// How long `wait` keeps retrying before giving up to the password fallback.
 const WAIT_BUDGET: Duration = Duration::from_secs(20);
@@ -174,17 +180,6 @@ fn confirm_cosmic_face(pamh: &Pam) -> IntentConfirmation {
         pamh.clear_authtok()
     })
 }
-
-/// PAM-data key under which the `reseal` AUTH line stashes the typed password for
-/// the `reseal` SESSION line to pick up. Namespaced to this module.
-const RESEAL_STASH_KEY: &str = "pam_irlume_reseal_authtok";
-
-/// PAM-data key for a released GNOME keyring token, carried from the auth
-/// phase to `open_session`, which hands it to the unlock helper and leaves
-/// the key set but empty, so a handle delivers once. A token never
-/// rides `PAM_AUTHTOK`: on a Debian-style `kr` stack `pam_unix` would consume
-/// it as the Unix password and fail the login it was meant to decorate.
-const GKR_TOKEN_STASH_KEY: &str = "pam_irlume_gkr_token";
 
 struct IrlumePam;
 
@@ -535,6 +530,28 @@ fn session_is_local(
 impl PamServiceModule for IrlumePam {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         firewall(move || {
+            // `reseal` keeps this entry marker inert on older modules too.
+            // It must precede every factor, including an inline provider that
+            // can end authentication before the post-auth bookkeeping lines.
+            if args.iter().any(|arg| arg == "reseal") && args.iter().any(|arg| arg == "begin") {
+                let mut scopes = args.iter().filter_map(|arg| arg.strip_prefix("service="));
+                let scope = scopes.next();
+                if scopes.next().is_none()
+                    && pamh.get_service().ok().flatten().is_some_and(|service| {
+                        scope.is_some_and(|name| service.to_bytes() == name.as_bytes())
+                    })
+                {
+                    let _ = session_state::reset(&pamh);
+                }
+                return PamError::IGNORE;
+            }
+            // Each authentication attempt starts with empty attempt state.
+            // The optional bookkeeping lines belong to the current attempt.
+            if !args.iter().any(|arg| arg == "reseal" || arg == "keyring")
+                && session_state::reset(&pamh).is_err()
+            {
+                return PamError::IGNORE;
+            }
             let user = match pamh.get_user(None) {
                 Ok(Some(u)) => u.to_string_lossy().into_owned(),
                 _ => return PamError::IGNORE,
@@ -552,6 +569,8 @@ impl PamServiceModule for IrlumePam {
                 return PamError::IGNORE;
             }
             let unseal = args.iter().any(|a| a == "unseal");
+            // Only login stacks with a matching reseal session hook opt in.
+            let defer_wallet = args.iter().any(|a| a == "defer_wallet");
             let wait = args.iter().any(|a| a == "wait");
             let reseal = args.iter().any(|a| a == "reseal");
             let keyring = args.iter().any(|a| a == "keyring");
@@ -603,7 +622,7 @@ impl PamServiceModule for IrlumePam {
             // checks the token against the login hash where it can read one. Always
             // IGNORE.
             if reseal {
-                stash_authtok(&pamh);
+                stash_authtok(&pamh, &user);
                 return PamError::IGNORE;
             }
 
@@ -725,7 +744,7 @@ impl PamServiceModule for IrlumePam {
             let deadline = Instant::now() + WAIT_BUDGET;
             loop {
                 let (attempt, delivered) = if unseal {
-                    match try_unseal(&pamh, &user) {
+                    match try_unseal(&pamh, &user, defer_wallet) {
                         UnsealAttempt::Delivered(delivered) => (code_for(delivered), delivered),
                         // Shared login/lock services may need identity only when
                         // release was refused BEFORE any face attempt. A denial,
@@ -796,7 +815,7 @@ impl PamServiceModule for IrlumePam {
     /// replaceable; hand it to the daemon, which re-binds the TPM-sealed
     /// password to today's PCRs iff it is armed and has gone stale. Then
     /// release and deliver the keyring secret this login still needs: a GNOME
-    /// keyring token stashed by the auth phase, or a session query serving
+    /// token or opted-in KDE key stashed by the auth phase, or a session query serving
     /// every kind. Best-effort and always IGNORE: a session must never fail
     /// because of this, and other modes (unseal/verify/wait) wire no session
     /// line so they fall straight through.
@@ -805,12 +824,16 @@ impl PamServiceModule for IrlumePam {
             if args.iter().any(|a| a == "reseal") {
                 if let Ok(Some(u)) = pamh.get_user(None) {
                     let user = u.to_string_lossy().into_owned();
+                    let secrets = match session_state::take(&pamh, &user) {
+                        Ok(Some(secrets)) => secrets,
+                        Ok(None) | Err(_) => return PamError::IGNORE,
+                    };
                     // Reseal first: on a typed-password login after PCR drift
                     // it repairs the token envelope from its password wrap, so
                     // the delivery below can then unseal what a moment ago
                     // could not be unsealed. Its reply is also the password
                     // evidence for the release query below.
-                    let accepted_password = try_reseal_session(&pamh, &user);
+                    let accepted_password = try_reseal_session(&user, secrets.password);
                     // Evidence, not presence: a token merely cached in
                     // PAM_AUTHTOK says nothing (it may be a typo the stack
                     // recovered from by granting on another factor), so only a
@@ -821,15 +844,20 @@ impl PamServiceModule for IrlumePam {
                     // query's `have_password` stays the conservative skip it
                     // always was there.
                     let have_password = accepted_password || kwallet_login_set(&pamh);
-                    deliver_keyring_secret(&pamh, &user, have_password);
+                    deliver_keyring_secret(&pamh, &user, have_password, secrets.released);
+                } else {
+                    session_state::close(&pamh);
                 }
             }
             PamError::IGNORE
         })
     }
 
-    fn close_session(_pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
-        firewall(|| PamError::IGNORE)
+    fn close_session(pamh: Pam, _flags: PamFlags, _args: Vec<String>) -> PamError {
+        firewall(|| {
+            session_state::close(&pamh);
+            PamError::IGNORE
+        })
     }
 }
 
@@ -838,13 +866,14 @@ impl PamServiceModule for IrlumePam {
 /// daemon, no TPM. If auth ultimately fails the session never opens and PAM
 /// drops this data without it ever being acted on. We stash only a non-empty
 /// token (a blank submit on the face path has nothing to heal with).
-fn stash_authtok(pamh: &Pam) {
+fn stash_authtok(pamh: &Pam, user: &str) {
+    if session_state::clear_password(pamh).is_err() {
+        return;
+    }
     if let Ok(Some(tok)) = pamh.get_cached_authtok() {
         let bytes = tok.to_bytes();
         if !bytes.is_empty() {
-            // The stash itself is zeroizing on the PAM side now; the copy
-            // taken in the session phase is wrapped in SecretBytes as well.
-            let _ = pamh.send_secret(RESEAL_STASH_KEY, pamsm::PamSecretBytes::new(bytes.to_vec()));
+            session_state::store_password(pamh, user, bytes);
         }
     }
 }
@@ -857,17 +886,8 @@ fn stash_authtok(pamh: &Pam) {
 /// password evidence the release query below reports: a refusal (a password
 /// that failed the login-hash check), a missing stash, an unreadable wallet
 /// salt or a transport failure all return `false`.
-fn try_reseal_session(pamh: &Pam, user: &str) -> bool {
-    // SAFETY: the key was registered by `stash_authtok` in this same PAM
-    // transaction and is not replaced while the borrow is live; the borrow
-    // ends inside the first match arm, before `SecretBytes` copies it.
-    let pw = match unsafe { pamh.get_secret(RESEAL_STASH_KEY) } {
-        Ok(stash) if !stash.is_empty() => SecretBytes::new(stash.expose().to_vec()),
-        // No stash (e.g. a pure face login that submitted a blank field, or auth
-        // took a path that never set a token); nothing to heal, and nothing to
-        // verify: this login carries no password evidence.
-        _ => return false,
-    };
+fn try_reseal_session(user: &str, password: Option<SecretBytes>) -> bool {
+    let Some(pw) = password else { return false };
     let wallet_salt = match irlume_common::client::read_wallet_salt(user) {
         Ok(salt) => salt,
         Err(_) => return false,
@@ -886,8 +906,8 @@ fn try_reseal_session(pamh: &Pam, user: &str) -> bool {
 /// SESSION-phase release and delivery of the keyring secret this login still
 /// needs (ADR-0003, 2026-10-06 amendment). Two sources, in order:
 ///
-/// 1. A GNOME keyring token the AUTH phase stashed (the face `unseal` line's
-///    release) delivers without a new request.
+/// 1. A KDE wallet key or GNOME token the AUTH phase stashed (the face
+///    `unseal` line's release) delivers without a new request.
 /// 2. Otherwise one `UnsealKeyring` query serves the fingerprint lane and the
 ///    stash-less logins alike: after the session-phase move, a fingerprint
 ///    login releases its secret here (the auth-phase `keyring` line requests
@@ -904,30 +924,26 @@ fn try_reseal_session(pamh: &Pam, user: &str) -> bool {
 /// and a KDE wallet key starts the wallet daemon, which at this phase finds
 /// `/run/user/<uid>` in place.
 ///
-/// Each handle delivers at most once: the stash is emptied first on both
-/// paths, and a run with no stash registers the empty sentinel, so a second
-/// `open_session` on this handle neither asks the daemon again nor starts a
-/// second helper. Best-effort like everything else in the session phase:
+/// A handle delivers at most once per authentication attempt: `open_session`
+/// consumes its transaction state before calling here, whether a credential
+/// was stashed or a query is needed. No fallible PAM data replacement follows
+/// that transition. A second session open neither asks the daemon again nor
+/// starts a second helper.
+/// Best-effort like everything else in the session phase:
 /// nothing reaches the prompt and the session opens either way, but a failed
 /// hand-off to the GNOME helper writes one journal warning
 /// ([`hand_token_to_keyring_daemon`]).
-fn deliver_keyring_secret(pamh: &Pam, user: &str, have_password: bool) {
-    // SAFETY: the key was registered by this module in the same PAM
-    // transaction and is not replaced while the borrow is live; the borrow
-    // ends inside the match arms, before `SecretBytes` copies it.
-    let stashed = match unsafe { pamh.get_secret(GKR_TOKEN_STASH_KEY) } {
-        Ok(stash) if !stash.is_empty() => Some(SecretBytes::new(stash.expose().to_vec())),
-        // Emptied below by an earlier `open_session` on this handle: the
-        // token was handed on already.
-        Ok(_) => return,
-        Err(_) => None,
-    };
-    // Empty the stash before anything else can fail. The replacement also
-    // wipes the stashed copy, and doubles as the once-guard for stash-less
-    // runs: the next `open_session` reads the empty sentinel and returns.
-    let _ = pamh.send_secret(GKR_TOKEN_STASH_KEY, pamsm::PamSecretBytes::new(Vec::new()));
+fn deliver_keyring_secret(
+    pamh: &Pam,
+    user: &str,
+    have_password: bool,
+    stashed: Option<(SecretBytes, irlume_common::KeyringSecretKind)>,
+) {
+    if stashed.is_some() && is_remote_session(pamh) {
+        return;
+    }
     let (secret, kind) = match stashed {
-        Some(token) => (token, irlume_common::KeyringSecretKind::GnomeKeyringToken),
+        Some(secret) => secret,
         None => {
             let service = pamh
                 .get_service()
@@ -954,11 +970,14 @@ fn deliver_keyring_secret(pamh: &Pam, user: &str, have_password: bool) {
     match kind {
         // The control socket takes the keyring's own secret: the token of a
         // token-keyed keyring, or the login password of a password-keyed one.
-        K::GnomeKeyringToken | K::LoginPassword => {
-            let _ = hand_token_to_keyring_daemon(pamh, user, &secret);
+        K::GnomeKeyringToken => {
+            let _ = hand_token_to_keyring_daemon(pamh, user, &secret, false);
+        }
+        K::LoginPassword => {
+            let _ = hand_token_to_keyring_daemon(pamh, user, &secret, true);
         }
         K::KdeWalletKey => {
-            let _ = hand_key_to_wallet_daemon(pamh, user, secret.expose());
+            let _ = hand_key_to_wallet_daemon(pamh, user, secret.expose(), false);
         }
     }
 }
@@ -1009,6 +1028,7 @@ fn hand_token_to_keyring_daemon(
     pamh: &Pam,
     user: &str,
     secret: &irlume_common::SecretBytes,
+    password: bool,
 ) -> bool {
     use std::io::Write;
     use std::os::unix::process::ExitStatusExt as _;
@@ -1019,7 +1039,11 @@ fn hand_token_to_keyring_daemon(
         log_hand_off_failure(pamh, HandOffFailure::Missing);
         return false;
     }
-    let mut child = match Command::new(&helper)
+    let mut command = Command::new(&helper);
+    if password {
+        command.arg("--password");
+    }
+    let mut child = match command
         .arg(user)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1355,7 +1379,7 @@ enum UnsealAttempt {
 
 /// Release and deliver a secret by kind, preserving pre-auth refusal separately
 /// from failed authentication or delivery. Never log the secret.
-fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
+fn try_unseal(pamh: &Pam, user: &str, defer_wallet: bool) -> UnsealAttempt {
     // Pass the PAM service name so the daemon can apply opt-in biopolicy
     // operation-class gating (e.g. refuse credential release to a remote service).
     let service = pamh
@@ -1368,7 +1392,7 @@ fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
         service,
     }) {
         Ok(Response::PasswordUnsealed { secret, kind }) => {
-            UnsealAttempt::Delivered(release_secret(pamh, user, &secret, kind))
+            UnsealAttempt::Delivered(release_secret(pamh, user, &secret, kind, defer_wallet))
         }
         Ok(Response::UnsealUnavailable { .. }) => UnsealAttempt::Unavailable,
         _ => UnsealAttempt::Failed,
@@ -1387,9 +1411,10 @@ fn try_unseal(pamh: &Pam, user: &str) -> UnsealAttempt {
 /// someone states which of the two it is.
 fn code_for(delivered: Released) -> PamError {
     match delivered {
-        Released::AuthtokSet | Released::WalletStarted | Released::TokenStashed => {
-            PamError::SUCCESS
-        }
+        Released::AuthtokSet
+        | Released::WalletStarted
+        | Released::WalletStashed
+        | Released::TokenStashed => PamError::SUCCESS,
         Released::Failed => PamError::IGNORE,
     }
 }
@@ -1403,6 +1428,8 @@ enum Released {
     AuthtokSet,
     /// The KDE wallet daemon was started with the wallet key.
     WalletStarted,
+    /// A KDE wallet key was stashed for this login's reseal session hook.
+    WalletStashed,
     /// A GNOME keyring token was stashed for `open_session` to deliver.
     TokenStashed,
     Failed,
@@ -1422,6 +1449,7 @@ fn release_secret(
     user: &str,
     secret: &irlume_common::SecretBytes,
     kind: irlume_common::KeyringSecretKind,
+    defer_wallet: bool,
 ) -> Released {
     use irlume_common::KeyringSecretKind as K;
     match kind {
@@ -1440,25 +1468,22 @@ fn release_secret(
                 Released::Failed
             }
         }
-        K::KdeWalletKey => match hand_key_to_wallet_daemon(pamh, user, secret.expose()) {
-            WalletHandoff::Started => Released::WalletStarted,
-            // Never deferred here: the face `unseal` path's result decides
-            // the login, and a stack without a `reseal` session line (the
-            // NixOS module) would leave the wallet locked after a face grant
-            // anyway. A session that is not ready yet falls to the password
-            // like any other failure. The fingerprint lane no longer releases
-            // in the auth phase at all (ADR-0003, 2026-10-06 amendment), so
-            // nothing here stashes either.
-            WalletHandoff::NotReady | WalletHandoff::Failed => Released::Failed,
-        },
+        K::KdeWalletKey => {
+            if secret.len() != irlume_common::kwallet_wire::KEY_LEN {
+                return Released::Failed;
+            }
+            match hand_key_to_wallet_daemon(pamh, user, secret.expose(), defer_wallet) {
+                WalletHandoff::Started => Released::WalletStarted,
+                WalletHandoff::NotReady
+                    if defer_wallet && session_state::store_released(pamh, user, secret, kind) =>
+                {
+                    Released::WalletStashed
+                }
+                WalletHandoff::NotReady | WalletHandoff::Failed => Released::Failed,
+            }
+        }
         K::GnomeKeyringToken => {
-            if pamh
-                .send_secret(
-                    GKR_TOKEN_STASH_KEY,
-                    pamsm::PamSecretBytes::new(secret.expose().to_vec()),
-                )
-                .is_ok()
-            {
+            if session_state::store_released(pamh, user, secret, kind) {
                 Released::TokenStashed
             } else {
                 Released::Failed
@@ -1521,7 +1546,12 @@ fn kwallet_login_set(pamh: &Pam) -> bool {
 /// environment to our daemon with no change on its side. When that variable
 /// is already set in the PAM environment, this stands down, as `pam_kwallet5`
 /// does on the same variable (see [`kwallet_login_set`]).
-fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> WalletHandoff {
+fn hand_key_to_wallet_daemon(
+    pamh: &Pam,
+    user: &str,
+    key: &[u8],
+    strict_runtime: bool,
+) -> WalletHandoff {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -1543,8 +1573,12 @@ fn hand_key_to_wallet_daemon(pamh: &Pam, user: &str, key: &[u8]) -> WalletHandof
     if !std::path::Path::new(&helper).is_file() {
         return WalletHandoff::Failed;
     }
-    let mut child = match Command::new(&helper)
-        .arg(user)
+    let mut command = Command::new(&helper);
+    command.arg(user);
+    if strict_runtime {
+        command.arg("--strict-runtime");
+    }
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1898,6 +1932,7 @@ mod tests {
         for delivered in [
             Released::AuthtokSet,
             Released::WalletStarted,
+            Released::WalletStashed,
             Released::TokenStashed,
         ] {
             assert_eq!(

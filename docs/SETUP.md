@@ -300,10 +300,11 @@ name (`irlume logs` shows only the lines that mention irlume):
 journalctl -b -t irlume-gkr-unlock
 ```
 
-`token delivered N ms after the session line` is the normal line. After a
-typed-password login gnome-keyring also logs `failed to unlock login keyring on
-startup`: it tries the typed password first, which no longer opens a keyring
-keyed to the token. That line is expected, and the token's success clears it.
+`credential delivered N ms after the session line` is the normal line. With a
+token armed, gnome-keyring also logs `failed to unlock login keyring on
+startup` after a typed-password login: it tries the typed password first, which
+does not open a keyring keyed to the token. That line is expected, and the
+token's success clears it.
 [DEBUGGING.md](DEBUGGING.md) lists every line the waiter writes.
 
 Where the login screen starts gnome-keyring (`pam_gnome_keyring.so auto_start`

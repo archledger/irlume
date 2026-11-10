@@ -2743,7 +2743,11 @@ fn pamwrap_keyring_upgrade_cold_password_reaches_auth_consumer() {
         ),
         "one release, from the session phase"
     );
-    assert_eq!(gkr_record(&h, "gkr-argv"), ["tester"], "the user is argv");
+    assert_eq!(
+        gkr_record(&h, "gkr-argv"),
+        ["--password tester"],
+        "the password input contract is explicit"
+    );
     const LEGACY_PASSWORD_SHA256: &str =
         "3b202204fe5ae24522b84a80aebfd967c8f0354fffa6bd14075a6bf2729e84ee";
     assert_eq!(
@@ -3233,8 +3237,9 @@ fn pamwrap_keyring_upgrade_still_delivers_gnome_token_in_session() {
     ));
 }
 
-/// The typed-password path delivers once per handle too: the second
-/// `open_session` neither asks the daemon again nor starts a second helper.
+/// The typed-password path delivers once per authentication attempt too: the
+/// second `open_session` neither asks the daemon again nor starts a second
+/// helper.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_gnome_token_without_a_stash_is_asked_for_once() {
@@ -3608,7 +3613,16 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
          echo {sock}\n\
          exit 0\n\
          ;;\n\
-         notready)\n\
+          session)\n\
+          if [ ! -f '{ready}' ]; then\n\
+          echo \"notready $user $bytes\" >> '{log}'\n\
+          exit 4\n\
+          fi\n\
+          echo \"deliver $user $bytes\" >> '{log}'\n\
+          echo {sock}\n\
+          exit 0\n\
+          ;;\n\
+          notready)\n\
          echo \"notready $user $bytes\" >> '{log}'\n\
          exit 4\n\
          ;;\n\
@@ -3622,6 +3636,7 @@ fn write_kde_fake_helper(root: &Path, log: &Path, counter: &Path, mode: &str) ->
         log = log.display(),
         sock = FAKE_KWALLET_SOCK,
         expected = "42".repeat(irlume_common::kwallet_wire::KEY_LEN),
+        ready = root.join("session-ready").display(),
     );
     std::fs::write(&path, body).unwrap();
     use std::os::unix::fs::PermissionsExt as _;
@@ -3976,11 +3991,637 @@ fn pamwrap_kde_wallet_session_stands_down_for_a_running_wallet() {
     );
 }
 
-/// The face `unseal` path never defers a `NotReady` wallet key: its result
-/// decides the login, so a not-ready helper on this path is a plain failure.
-/// The `reseal` session line below then asks the daemon once for the
-/// fingerprint lane's release; this mock refuses that request (as an
-/// unarmed account's daemon would), the refusal delivers nothing, and the
+fn compile_pam_fixture(h: &Harness, name: &str) -> PathBuf {
+    let output = h.root.join(format!("{name}.so"));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/pamwrap")
+        .join(format!("{name}.c"));
+    let result = Command::new("cc")
+        .args(["-Wall", "-Wextra", "-Werror", "-shared", "-fPIC"])
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .args(["-lpam", "-ldl"])
+        .output()
+        .expect("compile the PAM fixture");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    output
+}
+
+fn wallet_token_guard(h: &Harness) -> PathBuf {
+    compile_pam_fixture(h, "wallet_guard")
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_no_face_attempt_begin_discards_previous_password() {
+    let Some(h) = Harness::try_new("no-face-reauth") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |_| {
+        Response::Error("no credential needed".into())
+    });
+    h.write_service(
+        "irlume-no-face-reauth",
+        &[
+            h.auth_line("optional", "begin reseal service=irlume-no-face-reauth"),
+            format!(
+                "auth [success=done default=ignore] {}",
+                compile_pam_fixture(&h, "attempt_token").display()
+            ),
+            h.auth_line("optional", "reseal"),
+            "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-no-face-reauth",
+        &["authenticate", "authenticate", "open_session"],
+        "",
+        None,
+    );
+    assert!(
+        ok,
+        "the second factor may short-circuit the post-auth marker: {out}"
+    );
+    assert!(
+        matches!(
+            reqs.lock().unwrap().as_slice(),
+            [Request::UnsealKeyring { .. }]
+        ),
+        "a password from the earlier attempt must never be resealed"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_nested_attempt_marker_preserves_outer_credentials() {
+    let Some(h) = Harness::try_new("nested-begin") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |req| match req {
+        Request::ResealPassword { .. } => Response::PasswordResealed {
+            armed: true,
+            changed: false,
+        },
+        _ => Response::Error("no keyring delivery needed".into()),
+    });
+    h.write_service(
+        "inner-fingerprint",
+        &[
+            h.auth_line("optional", "begin reseal service=inner-fingerprint"),
+            "auth required pam_permit.so".into(),
+        ],
+    );
+    h.write_service(
+        "outer-login",
+        &[
+            h.auth_line("optional", "begin reseal service=outer-login"),
+            format!("auth required {}", h.set_items.display()),
+            h.auth_line("optional", "reseal"),
+            "auth include inner-fingerprint".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "outer-login",
+        &["authenticate", "open_session"],
+        "",
+        Some("synthetic-nested-password"),
+    );
+    assert!(
+        ok,
+        "nested marker must not erase this attempt's state: {out}"
+    );
+    assert!(
+        matches!(reqs.lock().unwrap().first(), Some(Request::ResealPassword { password, .. }) if password.expose()==b"synthetic-nested-password")
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_gnome_stash_is_bound_to_pam_identity() {
+    for change in ["user=someone-else", "service=another-login"] {
+        let Some(mut h) = Harness::try_new(change) else {
+            return;
+        };
+        let reqs = serve(&h.socket, |req| match req {
+            Request::UnsealPassword { .. } => gnome_token(),
+            _ => Response::Error("unexpected request".into()),
+        });
+        h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "exit3"));
+        h.write_service(
+            "irlume-bound-gnome",
+            &[
+                h.auth_line("sufficient", "unseal"),
+                "auth required pam_deny.so".into(),
+                format!(
+                    "session required {} {change}",
+                    wallet_token_guard(&h).display()
+                ),
+                format!("session optional {} reseal", h.module.display()),
+                "session required pam_permit.so".into(),
+            ],
+        );
+        let (ok, out) = h.run(
+            "irlume-bound-gnome",
+            &["authenticate", "open_session"],
+            "\n",
+            None,
+        );
+        assert!(
+            ok,
+            "keyring delivery cannot fail the surrounding session: {out}"
+        );
+        assert!(
+            gkr_record(&h, "gkr-argv").is_empty(),
+            "a changed identity cannot receive the old token"
+        );
+        assert!(matches!(
+            reqs.lock().unwrap().as_slice(),
+            [Request::UnsealPassword { .. }]
+        ));
+    }
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_gnome_stash_is_cleared_before_reauthentication() {
+    let Some(mut h) = Harness::try_new("gnome-reauth") else {
+        return;
+    };
+    let first = std::cell::Cell::new(true);
+    let reqs = serve(&h.socket, move |req| match req {
+        Request::UnsealPassword { .. } if first.replace(false) => gnome_token(),
+        _ => Response::Error("no token on this attempt".into()),
+    });
+    h.set_gkr_unlock(write_gkr_fake_helper(&h.root, "exit3"));
+    h.write_service(
+        "irlume-gnome-reauth",
+        &[
+            h.auth_line("sufficient", "unseal"),
+            "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-gnome-reauth",
+        &["authenticate", "authenticate", "open_session"],
+        "\n\n",
+        None,
+    );
+    assert!(ok, "the fallback carries the second login: {out}");
+    assert!(
+        gkr_record(&h, "gkr-argv").is_empty(),
+        "the previous attempt's token must be discarded"
+    );
+    assert_eq!(reqs.lock().unwrap().len(), 3);
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_failed_session_state_registration_makes_no_release() {
+    let Some(h) = Harness::try_new("session-data-failure") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |_| gnome_token());
+    gkr_service(&h, false);
+    let preload = format!(
+        "{}:{}",
+        compile_pam_fixture(&h, "data_failure").display(),
+        h.wrapper.display()
+    );
+    let (ok, out) = h.run_with_env(
+        "irlume-gkr",
+        &["open_session", "open_session"],
+        "",
+        None,
+        &[("LD_PRELOAD", &preload), ("IRLUME_TEST_FAIL_PAM_DATA", "1")],
+    );
+    assert!(ok, "optional delivery must not break the session: {out}");
+    assert!(
+        reqs.lock().unwrap().is_empty(),
+        "failed one-shot registration must not release credentials"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_deferred_wallet_survives_session_data_failure_without_requery() {
+    let Some(mut h) = Harness::try_new("wallet-session-data-failure") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |req| match req {
+        Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        _ => Response::Error("unexpected second request".into()),
+    });
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+    h.write_service(
+        "irlume-failing-session-data",
+        &[
+            h.auth_line("sufficient", "unseal defer_wallet"),
+            "auth required pam_deny.so".into(),
+            format!(
+                "session required {} fail-data",
+                wallet_token_guard(&h).display()
+            ),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let preload = format!(
+        "{}:{}",
+        compile_pam_fixture(&h, "data_failure").display(),
+        h.wrapper.display()
+    );
+    let (ok, out) = h.run_with_env(
+        "irlume-failing-session-data",
+        &["authenticate", "open_session", "open_session"],
+        "\n",
+        None,
+        &[("LD_PRELOAD", &preload)],
+    );
+    assert!(
+        ok,
+        "existing transaction state needs no fallible replacement: {out}"
+    );
+    assert_eq!(
+        reqs.lock().unwrap().len(),
+        1,
+        "consumption cannot be lost when PAM data replacement fails"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\ndeliver tester 56\n"
+    );
+}
+
+/// A genuine face match on a cold login must not need a password just because
+/// logind has not created the user's runtime directory during authentication.
+/// The same key is delivered once when the session becomes ready, without a
+/// second credential request. Exercise both generated greeter controls.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_kde_wallet_face_cold_login_delivers_in_session() {
+    for (name, control, landing) in [
+        ("include", "sufficient", false),
+        ("substack", "[success=1 default=ignore]", true),
+    ] {
+        let Some(mut h) = Harness::try_new(&format!("face-cold-{name}")) else {
+            return;
+        };
+        let reqs = serve(&h.socket, |req| match req {
+            Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(vec![
+                    0x42;
+                    irlume_common::kwallet_wire::KEY_LEN
+                ]),
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+            },
+            _ => Response::Error("unexpected second request".into()),
+        });
+        let log = h.root.join("deliveries.log");
+        let counter = h.root.join("deliveries.count");
+        h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "session"));
+        let ready = h.root.join("make-session-ready.sh");
+        std::fs::write(
+            &ready,
+            format!(
+                "#!/bin/sh\nunset LD_PRELOAD PAM_WRAPPER\n: > '{}'\n",
+                h.root.join("session-ready").display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&ready, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut lines = vec![
+            h.auth_line(control, "unseal ondemand kr defer_wallet"),
+            "auth required pam_deny.so".into(),
+        ];
+        if landing {
+            lines.push("auth optional pam_permit.so".into());
+        }
+        lines.extend([
+            "account required pam_permit.so".into(),
+            format!("session required {}", wallet_token_guard(&h).display()),
+            format!("session required pam_exec.so quiet {}", ready.display()),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ]);
+        h.write_service("irlume-face-cold", &lines);
+        let (ok, out) = h.run("irlume-face-cold", &["authenticate"], "\n", None);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "notready tester 56\n",
+            "authentication must not retry delivery before the session: {out}"
+        );
+        assert!(ok, "a deferred key must allow the face grant: {out}");
+        assert!(!h.root.join("session-ready").exists());
+        std::fs::remove_file(&log).unwrap();
+        reqs.lock().unwrap().clear();
+        let (ok, out) = h.run(
+            "irlume-face-cold",
+            &[
+                "authenticate",
+                "acct_mgmt",
+                "open_session",
+                "close_session",
+                "open_session",
+            ],
+            "\n",
+            None,
+        );
+        let deliveries = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            deliveries.starts_with("notready tester 56\n"),
+            "the regression must reach the not-ready helper: {out}"
+        );
+        assert!(
+            ok,
+            "cold face login must bypass the password fallback: {out}"
+        );
+        assert_eq!(
+            deliveries, "notready tester 56\ndeliver tester 56\n",
+            "the session must deliver the same key exactly once"
+        );
+        assert!(
+            matches!(
+                reqs.lock().unwrap().as_slice(),
+                [Request::UnsealPassword { .. }]
+            ),
+            "a deferred face key must not require a second unseal"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester + cc (CI installs them)"]
+fn pamwrap_kde_wallet_deferred_key_is_bound_to_pam_identity() {
+    for change in ["user=someone-else", "service=another-login"] {
+        let Some(mut h) = Harness::try_new(change) else {
+            return;
+        };
+        let reqs = serve(&h.socket, |req| match req {
+            Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+            },
+            _ => Response::Error("unexpected second request".into()),
+        });
+        let log = h.root.join("deliveries.log");
+        let counter = h.root.join("deliveries.count");
+        h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+        h.write_service(
+            "irlume-bound-wallet",
+            &[
+                h.auth_line("sufficient", "unseal defer_wallet"),
+                "auth required pam_deny.so".into(),
+                format!(
+                    "session required {} {change}",
+                    wallet_token_guard(&h).display()
+                ),
+                format!("session optional {} reseal", h.module.display()),
+                "session required pam_permit.so".into(),
+            ],
+        );
+        let (ok, out) = h.run(
+            "irlume-bound-wallet",
+            &["authenticate", "open_session"],
+            "\n",
+            None,
+        );
+        assert!(
+            ok,
+            "a rejected wallet delivery must not fail the session: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "notready tester 56\n"
+        );
+        assert!(matches!(
+            reqs.lock().unwrap().as_slice(),
+            [Request::UnsealPassword { .. }]
+        ));
+    }
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_kde_wallet_deferred_key_is_cleared_on_reauthentication() {
+    let Some(mut h) = Harness::try_new("face-reauth") else {
+        return;
+    };
+    let first = std::cell::Cell::new(true);
+    let reqs = serve(&h.socket, move |req| match req {
+        Request::UnsealPassword { .. } if first.replace(false) => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        _ => Response::Error("no release on second attempt".into()),
+    });
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+    h.write_service(
+        "irlume-reauth",
+        &[
+            h.auth_line("sufficient", "unseal defer_wallet"),
+            "auth required pam_permit.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-reauth",
+        &["authenticate", "authenticate", "open_session"],
+        "\n\n",
+        None,
+    );
+    assert!(
+        ok,
+        "the password stand-in must still carry the second attempt: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\n"
+    );
+    assert_eq!(
+        reqs.lock().unwrap().len(),
+        3,
+        "two auth requests and the session query, not stale delivery"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_kde_wallet_deferred_key_stands_down_for_vendor_wallet() {
+    let Some(mut h) = Harness::try_new("face-vendor-wallet") else {
+        return;
+    };
+    let reqs = serve(&h.socket, |req| match req {
+        Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        _ => Response::Error("unexpected second request".into()),
+    });
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+    h.write_service(
+        "irlume-face-vendor",
+        &[
+            h.auth_line("sufficient", "unseal defer_wallet"),
+            "auth required pam_deny.so".into(),
+            kwallet_env_line(&h, FAKE_KWALLET_SOCK),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-face-vendor",
+        &["authenticate", "open_session", "open_session"],
+        "\n",
+        None,
+    );
+    assert!(ok, "the vendor wallet must keep its session: {out}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\n"
+    );
+    assert!(matches!(
+        reqs.lock().unwrap().as_slice(),
+        [Request::UnsealPassword { .. }]
+    ));
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_kde_wallet_deferred_key_is_not_delivered_after_account_denial() {
+    let Some(mut h) = Harness::try_new("face-account-deny") else {
+        return;
+    };
+    serve(&h.socket, |req| match req {
+        Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let log = h.root.join("deliveries.log");
+    let counter = h.root.join("deliveries.count");
+    h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "cold"));
+    h.write_service(
+        "irlume-face-account-deny",
+        &[
+            h.auth_line("sufficient", "unseal defer_wallet"),
+            "auth required pam_deny.so".into(),
+            "account required pam_deny.so".into(),
+            format!("session optional {} reseal", h.module.display()),
+            "session required pam_permit.so".into(),
+        ],
+    );
+    let (ok, out) = h.run(
+        "irlume-face-account-deny",
+        &["authenticate", "acct_mgmt", "open_session"],
+        "\n",
+        None,
+    );
+    assert!(!ok, "a face grant must not override account denial: {out}");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "notready tester 56\n"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_legacy_wallet_helper_cannot_authorize_strict_deferral() {
+    let Some(mut h) = Harness::try_new("legacy-wallet-contract") else {
+        return;
+    };
+    serve(&h.socket, |req| match req {
+        Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+            secret: irlume_common::SecretBytes::new(vec![0x42; 56]),
+            kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+        },
+        _ => Response::Error("unexpected request".into()),
+    });
+    let helper = h.root.join("legacy-helper");
+    let args = h.root.join("helper-args");
+    std::fs::write(&helper, format!("#!/bin/sh\nprintf '%s\\n' \"$#\" \"$2\" > '{}'\n[ \"$#\" -eq 1 ] || exit 2\ncat >/dev/null\nexit 4\n", args.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    h.set_kwallet_init(helper);
+    h.write_service(
+        "irlume-legacy-helper",
+        &[
+            h.auth_line("sufficient", "unseal defer_wallet"),
+            "auth required pam_deny.so".into(),
+        ],
+    );
+    let (ok, out) = h.run("irlume-legacy-helper", &["authenticate"], "\n", None);
+    assert!(
+        !ok,
+        "a helper without the strict contract must fall back: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(args).unwrap(),
+        "2\n--strict-runtime\n"
+    );
+}
+
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them)"]
+fn pamwrap_kde_wallet_defer_option_does_not_accept_delivery_failure() {
+    for length in [55, 56, 57] {
+        let Some(mut h) = Harness::try_new(&format!("face-failure-{length}")) else {
+            return;
+        };
+        serve(&h.socket, move |req| match req {
+            Request::UnsealPassword { .. } => Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(vec![0x42; length]),
+                kind: irlume_common::KeyringSecretKind::KdeWalletKey,
+            },
+            _ => Response::Error("unexpected request".into()),
+        });
+        let log = h.root.join("deliveries.log");
+        let counter = h.root.join("deliveries.count");
+        h.set_kwallet_init(write_kde_fake_helper(&h.root, &log, &counter, "fail"));
+        h.write_service(
+            "irlume-defer-failure",
+            &[
+                h.auth_line("sufficient", "unseal defer_wallet"),
+                "auth required pam_deny.so".into(),
+            ],
+        );
+        let (ok, out) = h.run("irlume-defer-failure", &["authenticate"], "\n", None);
+        assert!(
+            !ok,
+            "malformed keys and helper failures cannot grant: {out}"
+        );
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(logged, if length == 56 { "fail tester 56\n" } else { "" });
+    }
+}
+
+/// Without `defer_wallet`, the face `unseal` path never defers a `NotReady`
+/// wallet key: its result decides the login, so a not-ready helper on this path
+/// is a plain failure. The `reseal` session line below then asks the daemon
+/// once for the fingerprint lane's release; this mock refuses that request (as
+/// an unarmed account's daemon would), the refusal delivers nothing, and the
 /// helper log keeps exactly the face line's single not-ready attempt.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]

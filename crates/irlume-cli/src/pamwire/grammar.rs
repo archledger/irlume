@@ -1489,7 +1489,7 @@ pub(super) fn with_stack_reader<T>(reader: StackReader, f: impl FnOnce() -> T) -
 }
 
 /// The stack `name` names, read with the reader [`with_stack_reader`] set.
-fn read_stack(name: &str) -> Option<String> {
+pub(super) fn read_stack(name: &str) -> Option<String> {
     let reader = STACK_READER.with(|r| r.borrow().clone())?;
     reader(name)
 }

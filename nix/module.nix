@@ -139,6 +139,8 @@ let
   # re-drives the keyring handoff from the daemon so the session starts
   # with the wallet unlocked. On cold login the module IGNOREs and `kr` is
   # inert. Lock screens never carry it: the wallet is already open.
+  # No defer_wallet: these rules do not add the reseal session consumer.
+  # NixOS intentionally supports only login-password envelopes.
   pamArgsLogin = pamArgs ++ [ "kr" ];
 
   # Turn one opted-in service into its NixOS PAM auth rules.

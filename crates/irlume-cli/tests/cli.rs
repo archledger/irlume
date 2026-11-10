@@ -3547,11 +3547,236 @@ fn irlume_lines(text: &str) -> Vec<String> {
     lines
 }
 
+/// A sandbox whose `plasmalogin` stack holds the login recipe of an earlier
+/// release, under the marker that has `login reconcile` examine it.
+struct LegacyLogin {
+    sb: Sandbox,
+    etc: PathBuf,
+    vendor: PathBuf,
+}
+
+impl LegacyLogin {
+    const BASE: &'static str = "auth required pam_nologin.so\nauth include system-auth\naccount include system-auth\nsession include system-auth\n";
+
+    /// `managed`: the stack is irlume's override of the vendor file. `face`:
+    /// it holds the face line, where the fingerprint method holds the reseal
+    /// lines alone. `admin`: lines an administrator put above the rest.
+    fn new(tag: &str, managed: bool, face: bool, admin: &str) -> Self {
+        let old = "auth required pam_nologin.so\nauth sufficient pam_irlume.so unseal ondemand kr\nauth include system-auth\nauth optional pam_irlume.so reseal\naccount include system-auth\nsession include system-auth\nsession optional pam_irlume.so reseal\n";
+        let old = if face {
+            old.to_owned()
+        } else {
+            old.replace("auth sufficient pam_irlume.so unseal ondemand kr\n", "")
+        };
+        Self::with_stack(tag, managed, face, &format!("{admin}{old}"))
+    }
+
+    /// As [`Self::new`], with the whole stack given.
+    fn with_stack(tag: &str, managed: bool, face: bool, old: &str) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut sb = Sandbox::new(tag);
+        sb.hide_system_units();
+        sb.fake_tool("semodule", "exit 0");
+        sb.fake_tool("systemctl", "exit 0");
+        sb.fake_tool("restorecon", "exit 0");
+        sb.fake_tool("fprintd-list", "exit 0");
+        sb.fake_tool("fprintd-verify", "exit 0");
+        sb.fake_tool(
+            "busctl",
+            if face {
+                "exit 1"
+            } else {
+                "printf '/net/reactivated/Fprint/Device/0\\n'"
+            },
+        );
+        let etc = sb.path("pam-etc");
+        let vendor = sb.path("pam-vendor");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(&vendor).unwrap();
+        if !face {
+            std::fs::write(sb.path("cfg/method"), "fingerprint\n").unwrap();
+        }
+        std::fs::write(vendor.join("system-auth"), "auth required pam_unix.so\naccount required pam_permit.so\nsession optional pam_permit.so\n").unwrap();
+        std::fs::write(vendor.join("plasmalogin"), Self::BASE).unwrap();
+        let current = if managed {
+            let digest: String = Sha256::digest(Self::BASE.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("# irlume: created from /usr/lib/pam.d/plasmalogin; delete this file to restore the vendor copy\n# irlume: override v1 vendor-sha256={digest} body-sha256={digest}\n{old}")
+        } else {
+            old.to_owned()
+        };
+        std::fs::write(etc.join("plasmalogin"), current).unwrap();
+        std::fs::write(
+            sb.path("state/login.wired"),
+            "with_sudo=false\nwith_polkit=false\nwith_lock=false\nface_lock_intent=false\n",
+        )
+        .unwrap();
+        serve(&sock(&sb), |req| match req {
+            Request::Health => Response::Health {
+                tier: "secure".into(),
+                rgb_dev: Some("/dev/video91".into()),
+                ir_dev: Some("/dev/video92".into()),
+                mesh: true,
+                adapter: false,
+                rgb_pad: Some(irlume_common::PadModelStatus::Loaded),
+                ir_pad: Some(irlume_common::PadModelStatus::Loaded),
+                version: env!("CARGO_PKG_VERSION").into(),
+                apparmor: None,
+                split_trust: None,
+            },
+            _ => Response::Error("unexpected request".into()),
+        });
+        Self { sb, etc, vendor }
+    }
+
+    /// `irlume login reconcile` as root: exit code, stdout, stderr.
+    fn reconcile(&self) -> (i32, String, String) {
+        run(support::isolated_root_command(
+            &self.sb.root,
+            BIN,
+            &["login", "reconcile"],
+            &[
+                "semodule",
+                "systemctl",
+                "restorecon",
+                "fprintd-list",
+                "fprintd-verify",
+                "busctl",
+            ],
+            &self.sb.hidden,
+            &[(&self.etc, "/etc/pam.d"), (&self.vendor, "/usr/lib/pam.d")],
+        )
+        .env("IRLUME_OS_RELEASE", self.sb.path("no-os-release"))
+        .env("IRLUME_PAM_LOCK", self.sb.pam_lock()))
+    }
+
+    fn stack(&self) -> String {
+        std::fs::read_to_string(self.etc.join("plasmalogin")).unwrap()
+    }
+}
+
+/// What `login reconcile` prints when it acts on a login stack for its
+/// recipe alone, and the part every re-apply line shares.
+const EARLIER_RECIPE: &str = "a login stack holds an earlier irlume recipe";
+const REAPPLYING: &str = "re-applying irlume wiring";
+
+#[test]
+fn login_reconcile_upgrades_legacy_wallet_arguments_without_moving_gates() {
+    for (managed, face, edited) in [
+        (false, true, false),
+        (true, true, false),
+        (false, false, false),
+        (true, false, false),
+        (true, true, true),
+        (true, false, true),
+    ] {
+        let admin = if edited {
+            "auth required pam_local_policy.so\n"
+        } else {
+            ""
+        };
+        let login = LegacyLogin::new(
+            &format!("wallet-upgrade-{managed}-{face}-{edited}"),
+            managed,
+            face,
+            admin,
+        );
+        let (code, out, err) = login.reconcile();
+        assert_eq!(code, 0, "{out}\n{err}");
+        assert!(err.contains(EARLIER_RECIPE), "{out}\n{err}");
+        let after = login.stack();
+        assert_eq!(
+            after.contains("defer_wallet"),
+            face,
+            "legacy recipe was not upgraded: {after}\n{err}"
+        );
+        // The attempt boundary is the first authentication line and names
+        // the service that owns the file.
+        let first_auth = after
+            .lines()
+            .find(|line| line.starts_with("auth"))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_auth,
+            [
+                "auth",
+                "optional",
+                "pam_irlume.so",
+                "begin",
+                "reseal",
+                "service=plasmalogin"
+            ],
+            "managed={managed}, face={face}\n{after}\n{out}\n{err}"
+        );
+        let gate = after.find("auth required pam_nologin.so").unwrap();
+        if face {
+            let face_at = after.find("pam_irlume.so unseal").unwrap();
+            assert!(
+                gate < face_at,
+                "the required gate must stay before face authentication"
+            );
+            if edited {
+                assert!(after.find("auth required pam_local_policy.so").unwrap() < face_at);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(login.vendor.join("plasmalogin")).unwrap(),
+            LegacyLogin::BASE
+        );
+        let (code, out, err) = login.reconcile();
+        assert_eq!(code, 0, "{out}\n{err}");
+        assert!(
+            !err.contains(REAPPLYING),
+            "the upgraded stack must read as current: {out}\n{err}"
+        );
+        assert_eq!(
+            login.stack(),
+            after,
+            "second reconciliation must not rewrite"
+        );
+    }
+}
+
+/// A login stack the writer declines to change keeps its earlier recipe:
+/// reconcile leaves the file byte for byte, succeeds, and examines the stack
+/// again on its next run. Here an administrator's override holds the face
+/// line above a line of its own and has no auth reseal line, so the recipe's
+/// lines have no place to take without moving past that line.
+#[test]
+fn login_reconcile_keeps_a_login_stack_the_writer_declines() {
+    let login = LegacyLogin::with_stack(
+        "wallet-upgrade-declined",
+        true,
+        true,
+        "auth sufficient pam_irlume.so unseal ondemand kr\nauth required pam_local_policy.so\nauth required pam_nologin.so\nauth include system-auth\naccount include system-auth\nsession include system-auth\nsession optional pam_irlume.so reseal\n",
+    );
+    let before = login.stack();
+    for run in 0..2 {
+        let (code, out, err) = login.reconcile();
+        assert_eq!(code, 0, "run {run}: {out}\n{err}");
+        assert!(err.contains(EARLIER_RECIPE), "run {run}: {out}\n{err}");
+        assert!(
+            out.contains(
+                "/etc/pam.d/plasmalogin: kept as it is, because updating irlume's lines would \
+                 move one of them past line 4, which irlume did not write"
+            ),
+            "run {run}: {out}\n{err}"
+        );
+        assert_eq!(login.stack(), before, "run {run}: {out}\n{err}");
+    }
+}
+
 /// `login reconcile` as root keeps irlume's own overrides in step with their
 /// vendor files, and touches nothing else: a file an administrator edited
 /// stays byte for byte, one written by an older release that still matches
 /// its vendor copy only gains the tracking line, and one nobody edited is
-/// rebuilt when its vendor file changes. The intact check passes, so this
+/// rebuilt when its vendor file changes. These fixtures use the current
+/// wallet argument and entry marker; legacy-recipe migration has its own regression above.
+/// The intact check passes, so this
 /// needs no daemon and runs no re-apply.
 #[test]
 fn login_reconcile_rewrites_only_the_override_whose_vendor_copy_changed() {
@@ -3589,9 +3814,10 @@ session     include       password-auth\n\
 -session     optional      pam_kwallet5.so auto_start\n\
 -session     optional      pam_oo7.so auto_start\n";
     let plasma = format!(
-        "{}auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
+        "{}auth       optional                     pam_irlume.so begin reseal service=plasmalogin\n\
+auth     [success=done ignore=ignore default=bad] pam_selinux_permit.so\n\
 auth       [success=2 default=ignore]   pam_fprintd.so max-tries=1 timeout=15   # local\n\
-auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand defer_wallet\n\
 auth        substack      password-auth\n\
 auth       optional                     pam_permit.so   # irlume-landing\n\
 auth       optional                     pam_irlume.so keyring\n\
@@ -3620,7 +3846,8 @@ session    include      system-auth\n",
     let sddm_vendor = "#%PAM-1.0\nauth     substack       common-auth\naccount  include        common-account\nsession  include        common-session\n";
     let sddm = format!(
         "{}#%PAM-1.0\n\
-auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand\n\
+auth       optional                     pam_irlume.so begin reseal service=sddm\n\
+auth       [success=1 default=ignore]   pam_irlume.so unseal ondemand defer_wallet\n\
 auth     substack       common-auth\n\
 auth       optional                     pam_permit.so   # irlume-landing\n\
 auth       optional                     pam_irlume.so keyring\n\

@@ -49,6 +49,7 @@ fn fedora_with_oo7() -> String {
 
 /// The override an older irlume wrote: the first header line only.
 fn legacy_override(vendor_path: &str, wired: &str) -> String {
+    let wired = scope_attempt_markers(wired, service_name(vendor_path));
     format!("{CREATED_PREFIX}{vendor_path}; delete this file to restore the vendor copy\n{wired}")
 }
 
@@ -1094,7 +1095,10 @@ fn an_unedited_override_left_by_a_removed_package_can_gain_face() {
     let after = read_file(svc.etc);
     assert!(after.contains("pam_irlume.so unseal"), "{after}");
     let (fresh, _) = face_and_keyring(&unwire_lines(UPSTREAM_FEDORA).0);
-    assert!(after.ends_with(&fresh), "wired as a rebuild would: {after}");
+    assert!(
+        after.ends_with(&scope_attempt_markers(&fresh, service_name(svc.etc))),
+        "wired as a rebuild would: {after}"
+    );
 }
 
 /// An administrator's verbatim copy of the vendor's password include above
@@ -3161,7 +3165,10 @@ fn the_stack_a_first_auth_include_names_is_read_where_libpam_finds_it() {
         assert_eq!(on.change, PlannedChange::Wire, "{dir_of_stack}: {on}");
         let wired = with_stack_reader(stack_reader(svc.etc), || face_and_keyring(vendor));
         assert!(wired.1);
-        assert_eq!(read_file(svc.etc), wired.0);
+        assert_eq!(
+            read_file(svc.etc),
+            scope_attempt_markers(&wired.0, service_name(svc.etc))
+        );
         // A stack whose password line fails nothing is no anchor.
         std::fs::write(&etc, vendor).unwrap();
         std::fs::remove_file(format!("{}{BACKUP}", svc.etc)).unwrap();
@@ -3531,7 +3538,10 @@ fn the_issue_file_takes_face_login_with_adjust_jumps_only() {
     let after = read_file(svc.etc);
     // The header lines are comments the recipe passes over.
     let (wired, _) = face_and_keyring(&unwire_lines(&before).0);
-    assert_eq!(after, wired.replacen(ISSUE_JUMP, &raised, 1));
+    assert_eq!(
+        after,
+        scope_attempt_markers(&wired, service_name(svc.etc)).replacen(ISSUE_JUMP, &raised, 1)
+    );
     assert_eq!(
         lands_after(&after, "pam_fprintd.so", 2),
         PERMIT_LANDING,
@@ -4426,7 +4436,17 @@ fn a_jump_in_an_included_stack_holds_an_override_write_that_moves_it() {
     let rewire = wire_service(&svc, true, true, &face_and_keyring).unwrap();
     assert_eq!(change_id(&rewire), "keep-edited-override", "{rewire}");
     assert!(rewire.unmet, "{rewire}");
-    assert!(rewire.message.contains("the include on line 5"), "{rewire}");
+    let include_line = edited
+        .lines()
+        .position(|line| line == include_of("leap-auth"))
+        .unwrap()
+        + 1;
+    assert!(
+        rewire
+            .message
+            .contains(&format!("the include on line {include_line}")),
+        "{rewire}"
+    );
     assert_eq!(read_file(svc.etc), edited);
     let flagged = wire_service_with(&svc, true, &adjusting(true), &face_and_keyring).unwrap();
     assert_eq!(change_id(&flagged), "keep-edited-override", "{flagged}");
@@ -4453,7 +4473,11 @@ fn a_jump_in_an_included_stack_holds_an_override_write_that_moves_it() {
         let after = read_file(svc.etc);
         assert!(after.contains(&include_of("leap-auth")), "{after}");
         assert!(after.contains(INERT_TAG), "{off}\n{after}");
-        assert!(off.message.contains("the include on line 5"), "{off}");
+        assert!(
+            off.message
+                .contains(&format!("the include on line {include_line}")),
+            "{off}"
+        );
         std::fs::write(svc.etc, &edited).unwrap();
     }
 

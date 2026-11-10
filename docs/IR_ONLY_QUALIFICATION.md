@@ -16,6 +16,12 @@ permission. No authentication, PAM grant or credential release belongs in this
 phase. Its absence of RGB scene/cross-spectrum evidence is part of the policy
 being evaluated, not evidence that those checks are unnecessary.
 
+For request-level measurements, the
+[verification-request evaluator](IR_REQUEST_EVALUATION.md) reuses production
+engine preparation, internal retries and final binding checks. Its `would_grant`
+result is still a measurement. Pending repair-dependent state is refused without
+recovery, and daemon/PAM authorization remains outside its measured scope.
+
 The older [PAD self-test](PAD_SELFTEST.md) measures a component; `padcapture`,
 `padreport`, or recorded-frame PAD replay cannot substitute for this full-path
 study. Do not use their raw-signal logging for this protocol. No claim of Windows

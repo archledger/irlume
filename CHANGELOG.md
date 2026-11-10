@@ -38,6 +38,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- A developer-only [IR verification-request evaluator](docs/IR_REQUEST_EVALUATION.md)
+  reuses the production engine's retries, PAD, identity and final binding checks.
+  It reports non-granting measurements, refuses protected state requiring repair,
+  and keeps the experimental policy and thresholds unchanged.
+
 - The ThinkPad T480 Bison IR camera (`5986:1141`) has a built-in emitter
   control (unit 8, selector 6, D1 on interface 1), validated by maurerr's
   capture-path write, read-back, optical proof and restore run (#887,

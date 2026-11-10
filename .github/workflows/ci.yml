@@ -123,6 +123,12 @@ jobs:
       - name: Hosted APT mirror contracts (fixtures, no network)
         run: python3 -B scripts/ci/test-prefer-ubuntu-archive.py
 
+      # The fuzz job names its targets by hand. A target missing from that
+      # loop is never built in CI and its seeds are never replayed, so the
+      # loop, fuzz/Cargo.toml, fuzz/fuzz_targets and fuzz/seeds must agree.
+      - name: Fuzz target list contract (files only)
+        run: python3 -B scripts/ci/test-fuzz-targets-contract.py
+
       # Selection and immutable-output regressions stay offline. The runner
       # already has PyYAML and jsonschema from the dependency step above.
       - name: Nightly source snapshot contracts (fixtures, no network)
@@ -880,7 +886,7 @@ jobs:
 
       # The generated corpus accumulates across runs via the cache below, so
       # each 45-second round explores from everything earlier rounds found
-      # instead of restarting from the 5 seed files.
+      # instead of restarting from the checked-in seeds.
       # Restore on every run (PRs seed from the latest main corpus via
       # restore-keys), but SAVE only from main. Keyed on run_id, saving on
       # every PR would append a fresh entry each run and refill the 10 GB cache
@@ -899,13 +905,13 @@ jobs:
       # committed), then fuzz for a bounded time. Replaying the seeds is a
       # regression gate: an input that once crashed a parser fails CI forever.
       # A crash exits non-zero and fails the job; the input is uploaded below.
-      - name: Fuzz the IPC, envelope, PCR-signature, UVC-illumination, event-log and EK-certificate parsers
+      - name: Fuzz every target in fuzz/Cargo.toml
         working-directory: fuzz
         run: |
           # cargo-fuzz has no --locked flag. Refuse a stale detached lockfile
           # before its build can silently update shared path dependencies.
           cargo fetch --locked
-          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate; do
+          for t in ipc_request pcr_signature sealed_envelope uvc_illumination event_log ek_certificate split_key_text split_generation; do
             echo "::group::fuzz $t"
             mkdir -p "corpus/$t"
             cp -n "seeds/$t"/* "corpus/$t"/ 2>/dev/null || true

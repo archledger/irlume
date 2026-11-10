@@ -14,11 +14,16 @@ carries that release's version label.
    to pass on that candidate. A targeted regression or an older green run does
    not close a full-suite failure. Audit failed, cancelled and skipped jobs;
    resolve actual failures without lowering floors or removing tests.
-3. Check the permanent runner-health monitor, GitHub runner status and the handoff
-   for both self-hosted runners: minihost, and archhost (re-qualified on
-   NixOS 2026-09-29 with the same capability labels). Trusted hardware jobs
-   select runners by capability labels, so either can accept them. Fork PR
-   jobs stay hosted.
+3. Check GitHub runner status, the open `ci-alert` issues and the handoff for
+   the release runner, minihost. It carries every capability label the
+   trusted hardware jobs select on and its IR capture needs no per-tree
+   approval, so a release does not wait for a second runner. archhost
+   carries the labels those jobs select on; it can take them when it is
+   online and its capture approval names the candidate tree
+   ([RUNNER-MAINTENANCE.md](RUNNER-MAINTENANCE.md), section 1). A green run
+   there under an approval for another tree captured no IR frames and does
+   not close check 2. Record in the handoff which runner ran each hardware
+   job. Fork PR jobs stay hosted.
 4. Build the actual Debian, Arch, Fedora and Nix outputs for the channels being
    released. Inspect package contents, ownership, runtime dependencies and version
    metadata. The recipe parity script checks declarations; it does not replace

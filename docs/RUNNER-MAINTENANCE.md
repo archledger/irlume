@@ -1,7 +1,7 @@
 # Trusted runner maintenance
 
-The self-hosted runners (minihost; archhost, on NixOS since 2026-09-29) have
-operational requirements that have each silently
+The self-hosted runners (minihost, the release runner; archhost, an optional
+second runner) have operational requirements that have each silently
 red-shifted the nightly hardware suite for days. Each is quick once known.
 This is the runbook for them.
 
@@ -9,8 +9,9 @@ This is the runbook for them.
 
 `scripts/ci/irlume-ci-capture.py` is the root-installed, source-bound capture
 the hardware suite's strobe stage uses where an administrator installed it.
-archhost used it until its runner was removed on 2026-09-28; no current
-runner has it. It executes only the ELF
+archhost has it again since its October 2026 reinstall; its four scheduled
+runs of 2026-11-05 to 2026-11-08 failed on a stale approval (42432854124 is
+the last of them). The helper executes only the ELF
 recorded in `/usr/local/lib/irlume-ci/capture.json`, which binds three facts:
 
 ```json
@@ -101,8 +102,10 @@ OOM killer. The runner service carries `OOMScoreAdjust=500` (drop-in
 `60-oom-score.conf`), so under memory pressure the kernel kills the CI build
 before the host's other services. If that signature appears in a
 hardware-checks or hardware-suite log, free memory on minihost, then rerun
-the failed job; archhost (30 GiB) can also take the lane: briefly stopping
-the minihost runner service moves the next job there.
+the failed job. While archhost (30 GiB) is online it can also take the lane:
+briefly stopping the minihost runner service moves the next job there. With
+archhost offline no other runner carries the labels, so freeing memory is
+the only fix.
 
 ## 4. Toolchain and PAM tools for the coverage lane
 
@@ -124,7 +127,12 @@ The coverage step sets `IRLUME_REQUIRE_PAM_TOOLS=1`, so `pamtester` (AUR on
 Arch) and `pam_wrapper` must be installed on the runner; a missing tool fails
 the PAM lane instead of skipping it.
 
-## 5. archhost runs NixOS: declarative environment, restart after switch
+## 5. archhost on NixOS: declarative environment, restart after switch
+
+archhost was reinstalled with Arch Linux in October 2026 and its runner is
+the `actions.runner.archledger-irlume.archhost.service` unit of section 2,
+so this section describes no current runner. It stays as the record for a
+NixOS runner.
 
 archhost re-joined the fleet on NixOS (2026-09-29, qualified green on the
 full suite, run 36537023186). Its whole runner environment is declared in

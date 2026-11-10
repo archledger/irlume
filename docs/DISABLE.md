@@ -213,9 +213,10 @@ While any account's GNOME login keyring is keyed to an irlume token
 (`irlume keyring status` says so), the disable refuses and changes nothing.
 The session line it removes is what hands that token to the keyring, and
 without it the keyring stays locked at every login, a typed password
-included, under a secret nobody has seen. Have each such user run
-`irlume keyring forget` in their own session first, which re-keys the
-keyring back to their password, or add `--force` to disable anyway. A
+included, under a secret nobody has seen. Token disarm is unavailable, so
+there is no supported removal path for such a token; `--force` bypasses
+this wiring guard only, removing the session line without migrating the
+keyring, which then stays locked. A
 `login enable` that would unwire such a login screen, because the
 configuration no longer wants face or fingerprint there, refuses the same
 way, and so does the reconcile unit. A machine-API `login apply` of either
@@ -568,11 +569,27 @@ or configuration refusal can occur after the barrier was recorded but before
 any store was removed. Follow the manual procedure below; do not bypass the
 refusal with a package manager while PAM still references the module.
 
+The teardown reads the keyring stores again once irlumed has stopped. If that
+read finds a GNOME keyring token, or cannot complete, it refuses with the data
+in place, PAM un-wired and irlumed stopped; a token is then not delivered at
+login. A reboot brings irlumed back, since the units keep their enabled state
+until the teardown's last step. So does `sudo systemd-tmpfiles --create
+irlume.conf` (it recreates `/run/lock/irlume`, which the teardown removed)
+followed by `sudo systemctl start irlumed.socket`; a source install has
+neither `irlume.conf` nor a socket unit, and there
+`sudo systemctl start irlumed` alone does it. Then wire login again with
+`sudo irlume login enable --apply` and the options used before. The reconcile
+units the teardown stopped start again at the next boot. The retention record
+stays as it is, and the manual procedure below applies before another
+uninstall attempt.
+
 `--keep-data` preserves enrollment, template-key/recovery state and application
 configuration (normally `/etc/irlume`); it does not skip keyring disarm or preserve
 service units/drop-ins. Program files, packaged models and contributor camera
-profiles are removed with the application. GNOME token holders must first
-disarm from their own sessions as the refusal directs. A successful retained-data
+profiles are removed with the application. GNOME token holders cannot uninstall
+yet: token disarm is unavailable, so the refusal directs them to retain the
+envelopes and their working delivery path until a supported keyring migration
+exists, and not to delete the token files manually. A successful retained-data
 removal may exit 0, but its **WARNING names the retained record and the resulting
 refusal of later uninstall attempts**, even with `--yes` or `--keep-data`.
 An intentional envelope-directory override can retain the SRK and record too.
@@ -648,8 +665,11 @@ teardown only through this procedure:
    configuration/store references, or perform an explicitly authorized cleanup
    that accounts for those stores. Do not mark the record clean while a surviving
    earlier store would be outside the next teardown's verified discovery. Do not
-   improvise envelope moves or remove a token envelope instead of disarming its
-   owner's keyring. After `--keep-data`, retained state still needs its SRK.
+   improvise envelope moves or delete a token envelope: token disarm is
+   unavailable, and that envelope holds the only copy of the secret its owner's
+   keyring opens with. irlume has no command that removes a token envelope,
+   including one recorded for an account whose name was reused. After
+   `--keep-data`, retained state still needs its SRK.
 3. Coordinate a maintenance window: stop additional uninstall attempts and
    independent deployments/store writers. Ensure the previous uninstall and
    any package transaction have finished. Preserve needed running-daemon store

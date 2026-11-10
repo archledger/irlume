@@ -789,8 +789,8 @@ struct App {
     keyring_load: Option<mpsc::Receiver<(u64, Result<Response, String>)>>,
     keyring_generation: u64,
     /// What kind of secret is armed (`KeyringInfo`); `None` from an older
-    /// daemon. Routes the disarm key: a token disarm needs the CLI's re-key
-    /// flow, and a bare `ForgetPassword` on it would strand the keyring.
+    /// daemon. Shown in the sealed line; it also selects the upgrade notice
+    /// and the re-arm hint.
     keyring_kind: Option<irlume_common::KeyringSecretKind>,
     /// What the daemon answered for this account's attempt record
     /// (`LastAttempts`, ADR-0030 §5), led with on Overview. `None` until an
@@ -5993,7 +5993,7 @@ impl App {
             }
             (SC_KEYRING, KeyCode::Char('a')) => {
                 self.input = Some((
-                    "Login password to seal (••):".into(),
+                    keyring_arm_prompt(crate::nixos::host_is_nixos()),
                     String::new(),
                     Pending::KeyringPw(None),
                 ));
@@ -6018,19 +6018,9 @@ impl App {
                 self.prepare_action(actions::Invocation { action: &actions::WALLET_RESEAL, values: Vec::new() });
             }
             (SC_KEYRING, KeyCode::Char('f')) => {
-                // The CLI performs the password rekey before deleting token seals and
-                // refuses unknown formats; never offer its force option implicitly.
-                if !matches!(self.keyring_kind, Some(irlume_common::KeyringSecretKind::LoginPassword | irlume_common::KeyringSecretKind::KdeWalletKey)) {
-                    self.prepare_action(actions::Invocation { action: &actions::WALLET_FORGET, values: Vec::new() });
-                    return;
-                }
-                self.confirm = Some((
-                    "Erase the TPM-sealed keyring secret?".into(),
-                    "Erase",
-                    ConfirmAct::Daemon(Request::ForgetPassword {
-                        user: self.user.clone(),
-                    }),
-                ));
+                // The CLI refuses a GNOME keyring token and an unreported kind;
+                // irlumed decides every other request on the envelope it holds.
+                self.prepare_action(actions::Invocation { action: &actions::WALLET_FORGET, values: Vec::new() });
             }
             // Recovery: masked in-TUI entry.
             (SC_RECOVERY, KeyCode::Char('s')) => {
@@ -9255,10 +9245,10 @@ impl App {
                 Some(K::KdeWalletKey) => ("KDE wallet key", " (a typed password still opens it)"),
                 Some(K::GnomeKeyringToken) => (
                     "GNOME keyring token",
-                    // NOT "[f] re-keys back": [f] refuses for this kind and
-                    // sends the user to the CLI, which is where the re-key
-                    // and its password prompt live.
-                    " (your password alone no longer opens it; `irlume keyring forget` re-keys back)",
+                    // `[f]` runs the CLI's `keyring forget`, which refuses
+                    // this kind.
+                    " (after a completed arm your password alone does not open it; token disarm \
+                     is currently unavailable)",
                 ),
                 None => ("unreported by this daemon", ""),
             };
@@ -11790,6 +11780,22 @@ fn map_confirm(resp: Response) -> (bool, String) {
         ),
         Response::Error(e) => (false, e),
         _ => (false, unexpected_response()),
+    }
+}
+
+/// The first prompt of a keyring arm. Off NixOS irlumed picks what is sealed,
+/// and one kind, a GNOME keyring token, has no disarm in this release, so the
+/// prompt says so before a password is typed, as `irlume keyring arm` and the
+/// `irlume setup` question do. On NixOS only the login password is sealed.
+fn keyring_arm_prompt(nixos: bool) -> String {
+    const PASSWORD: &str = "Login password to seal (••):";
+    if nixos {
+        PASSWORD.into()
+    } else {
+        format!(
+            "A GNOME keyring token arm cannot be undone in this release: token disarm is \
+             unavailable.\n\n{PASSWORD}"
+        )
     }
 }
 
@@ -17057,6 +17063,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_password_forget_confirmation_still_runs_the_safe_cli() {
+        let mut app = test_app();
+        app.screen = SC_KEYRING;
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
+        app.on_key(KeyCode::Char('f'));
+        // The armed kind changes while the confirmation is open.
+        app.keyring_kind = Some(irlume_common::KeyringSecretKind::GnomeKeyringToken);
+        app.on_key(KeyCode::Char('y'));
+        assert!(app.confirm.is_none());
+        assert!(app.op.is_none(), "must not send the cached raw delete");
+        assert!(matches!(&app.suspend,
+            Some(Suspend::MoreAction(invocation))
+                if invocation.args("bob") == ["keyring", "forget", "--user", "bob"]));
+    }
+
+    /// The arm prompt names the one-way token arm before a password is typed,
+    /// and the modal shows it above the masked field.
+    #[test]
+    fn the_arm_prompt_names_the_one_way_token_arm_before_the_password() {
+        let prompt = keyring_arm_prompt(false);
+        assert!(
+            prompt.starts_with("A GNOME keyring token arm cannot be undone in this release"),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("Login password to seal (••):"), "{prompt}");
+        assert_eq!(keyring_arm_prompt(true), "Login password to seal (••):");
+
+        let mut app = test_app();
+        app.input = Some((prompt, "hunter2".into(), Pending::KeyringPw(None)));
+        let text = draw_text(&app);
+        for word in ["GNOME", "undone", "disarm", "Login password to seal"] {
+            assert!(
+                text.contains(word),
+                "the prompt modal lacks '{word}':\n{text}"
+            );
+        }
+        assert!(text.contains("•••••••") && !text.contains("hunter2"));
+    }
+
+    #[test]
     fn keyring_and_recovery_keys_open_masked_prompts_and_confirms() {
         let mut app = test_app();
         app.screen = SC_KEYRING;
@@ -17082,6 +17128,8 @@ mod tests {
         for kind in [
             None,
             Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+            Some(irlume_common::KeyringSecretKind::LoginPassword),
+            Some(irlume_common::KeyringSecretKind::KdeWalletKey),
         ] {
             app.keyring_kind = kind;
             app.on_key(KeyCode::Char('f'));
@@ -17095,16 +17143,9 @@ mod tests {
             app.on_key(KeyCode::Esc);
         }
 
-        // A confirmed password arm is safe to erase from here.
-        app.keyring_kind = Some(irlume_common::KeyringSecretKind::LoginPassword);
-        app.on_key(KeyCode::Char('f'));
-        match &app.confirm {
-            Some((q, _, ConfirmAct::Daemon(Request::ForgetPassword { user }))) => {
-                assert!(q.contains("Erase the TPM-sealed"), "got: {q}");
-                assert_eq!(user, "testuser");
-            }
-            _ => panic!("expected the keyring-forget confirm"),
-        }
+        // The kind shown can differ from the envelope by the time of the
+        // confirmation, so every kind goes through the CLI, where irlumed
+        // decides on the envelope it holds.
         app.confirm = None;
         app.screen = SC_RECOVERY;
         app.on_key(KeyCode::Char('s'));

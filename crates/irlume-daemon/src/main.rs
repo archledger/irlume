@@ -2074,8 +2074,8 @@ fn refuse_nul_password(request: &str, user: &str) -> Response {
 ///
 /// The token's password wrap is under the password it was armed with, or the
 /// one last typed at a login screen that carries the `reseal` line; a
-/// password change alone does not move it. Until such a login, `forget` opens
-/// the wrap only with the old password, so the remedy starts with that login,
+/// password change alone does not move it. Until such a login, the wrap opens
+/// only with the old password, so the remedy starts with that login,
 /// which also leaves nothing to re-arm after a password change or PCR drift.
 fn refuse_unverified_token_rearm(
     user: &str,
@@ -2087,9 +2087,9 @@ fn refuse_unverified_token_rearm(
              re-arm over the GNOME keyring token already armed; nothing was changed. The \
              token's password copy follows the password last typed at a login screen that \
              carries irlume's re-seal, so after a password change with no such login since \
-             (or with no such screen, as on NixOS) it still needs the previous password. To \
-             arm again, run `irlume keyring forget` with that password, then \
-             `irlume keyring arm`."
+             (or with no such screen, as on NixOS) it still needs the previous password. \
+             Recover through a password login with irlume's re-seal configured. GNOME token \
+             disarm is currently unavailable; keep the envelope."
         ),
         Ok(_) => return None,
         Err(e) => format!(
@@ -2120,8 +2120,8 @@ fn keep_unreadable_envelope(user: &str) -> String {
 /// proceed. Nothing is written.
 ///
 /// The login keyring was re-keyed to the token when it was armed, and the
-/// envelope holds its only copy, so only `forget`, which re-keys the keyring
-/// back to the password first, may take it away. An envelope that cannot be
+/// envelope holds its only recoverable copy, so no disarm may take it away
+/// while outstanding holders cannot be excluded. An envelope that cannot be
 /// read may be a token; it is left for an irlume that can read it. A token
 /// re-arm keeps the token, and login-password and KDE wallet-key envelopes are
 /// derived from the password, so replacing those loses nothing.
@@ -2152,10 +2152,8 @@ fn refuse_irreversible_seal(
             };
             format!(
                 "'{user}' has a GNOME keyring token armed, which the login keyring was re-keyed \
-                 to. This arm would replace it with a {}, {why}, so nothing was changed. To arm \
-                 again, run `irlume keyring forget` first, as '{user}' with gnome-keyring \
-                 running: it re-keys the keyring back to the password. Then run \
-                 `irlume keyring arm`.",
+                 to. This arm would replace it with a {}, {why}, so nothing was changed. \
+                 GNOME token disarm is currently unavailable; keep the envelope for recovery.",
                 kind.describe()
             )
         }
@@ -4803,7 +4801,7 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
             camera: NoCapture,
         },
-        ForgetPassword { user } => RequestPosture {
+        ForgetPassword { user } | DisarmKeyring { user } => RequestPosture {
             privilege: RootOrTarget {
                 verb: "forget password for",
             },
@@ -7492,6 +7490,7 @@ fn diagnostic_operation_class(req: &Request) -> irlume_common::diagnostics::Oper
         | KeyringMetadata { .. }
         | KeyringInfo { .. }
         | ForgetPassword { .. }
+        | DisarmKeyring { .. }
         | ResealPassword { .. }
         | RecoverySetup { .. }
         | RecoveryRestore { .. }
@@ -8685,6 +8684,7 @@ fn request_label(req: &Request) -> &'static str {
         Request::TpmEndorsement => "TpmEndorsement",
         Request::KeyringInfo { .. } => "KeyringInfo",
         Request::ForgetPassword { .. } => "ForgetPassword",
+        Request::DisarmKeyring { .. } => "DisarmKeyring",
         Request::ReleaseTokenForDisarm { .. } => "ReleaseTokenForDisarm",
         Request::ResealPassword { .. } => "ResealPassword",
         Request::RecoverySetup { .. } => "RecoverySetup",
@@ -10144,8 +10144,9 @@ fn dispatch_after_authorization(
             // the existing token and the caller re-keys the login keyring to
             // it, and an unchecked password says nothing about how that token
             // was armed (the login re-seal moves its password wrap too), so
-            // the re-arm is refused for every peer, root included. `forget`,
-            // then a fresh arm, mints a new token. An envelope that cannot be
+            // the re-arm is refused for every peer, root included. Token
+            // disarm is unavailable, so the way back is a password login that
+            // runs irlume's re-seal. An envelope that cannot be
             // read may be such a token. A login-password or KDE wallet-key
             // envelope returns nothing and needs no password to forget, so
             // refusing its re-arm would protect nothing; it proceeds, as does
@@ -10182,8 +10183,8 @@ fn dispatch_after_authorization(
             };
             // Checked or not, an arm never writes over an envelope it cannot
             // read, and never replaces an armed token with another kind: the
-            // login keyring was re-keyed to that token, and `forget` re-keys
-            // it back to the password before the envelope goes.
+            // login keyring was re-keyed to that token, and the envelope
+            // holds its only recoverable copy.
             if let Some(refusal) =
                 refuse_irreversible_seal(&user, &armed_kind, core_kind, forced_kind.is_some())
             {
@@ -10210,19 +10211,17 @@ fn dispatch_after_authorization(
                     .is_some_and(irlume_core::kwallet::oo7_keeps_keyrings)
                 {
                     // An arm without a forced kind is refused too while a
-                    // token is armed, so the advice starts with `forget`.
+                    // token is armed; it cannot bypass the retention policy.
                     let next = if already_token {
-                        format!(
-                            "Run `irlume keyring forget` first, as '{user}' with gnome-keyring \
-                             running, then arm without forcing a kind"
-                        )
+                        "GNOME token disarm is currently unavailable; keep its envelope. \
+                         Do not replace it with a different kind"
+                            .to_string()
                     } else {
                         "Arm without forcing a kind".to_string()
                     };
                     let refusal = format!(
                         "oo7 keeps '{user}'s login keyring and opens it with the login \
-                         password, which a token cannot replace; nothing was changed. {next} \
-                         to seal the login password."
+                         password, which a token cannot replace; nothing was changed. {next}."
                     );
                     jout_notice!("irlumed: SealPassword: refused for '{user}': {refusal}");
                     return Response::Error(refusal);
@@ -10431,10 +10430,15 @@ fn dispatch_after_authorization(
                 irlume_core::account::resolve,
             )
         }
-        Request::ForgetPassword { user } => match irlume_core::keyring::forget_password(&user) {
-            Ok(()) => Response::PasswordForgotten,
-            Err(e) => Response::Error(e.to_string()),
-        },
+        // These read/check/delete operations remain on the single mutation
+        // worker, serialized with SealPassword and ResealPassword. Never move
+        // their envelope check to a connection-thread status preflight.
+        Request::ForgetPassword { user } | Request::DisarmKeyring { user } => {
+            match irlume_core::keyring::forget_non_token(&user) {
+                Ok(()) => Response::PasswordForgotten,
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Request::ReleaseTokenForDisarm { user, password } => {
             // Same authz as arming (posture table); the password check inside
             // (the token's own AES-GCM wrap) is what actually gates the
@@ -11723,13 +11727,13 @@ fn finish_unseal_password(
 /// `reseal` line. `irlume keyring arm` re-binds a login password or KDE
 /// wallet key, but over a GNOME keyring token it refuses wherever irlumed
 /// cannot read the login hash or would pick another kind (a KDE wallet beside
-/// the login keyring). A token instead gets `forget` then `arm`: forget
-/// unwraps the token with the password, not the TPM, so drift does not stop
-/// it, and that route works where no `reseal` line is wired (NixOS).
+/// the login keyring). Keep token envelopes for password-based recovery;
+/// token disarm is unavailable while outstanding holders cannot be excluded.
 fn pcr_drift_hint(armed: Option<irlume_core::envelope::SecretKind>) -> &'static str {
     if armed == Some(irlume_core::envelope::SecretKind::GnomeKeyringToken) {
         " -- log in once by typing the password to re-bind the sealed secret to the \
-         current PCRs, or run `irlume keyring forget` and then `irlume keyring arm`"
+         current PCRs where irlume's re-seal is configured; token disarm is currently \
+         unavailable, so keep the envelope"
     } else {
         " -- log in once by typing the password, or re-run `irlume keyring arm`, to \
          re-bind the sealed secret to the current PCRs"
@@ -12380,9 +12384,10 @@ mod tests {
         use irlume_core::envelope::SecretKind as K;
         let token = pcr_drift_hint(Some(K::GnomeKeyringToken));
         assert!(token.contains("typing the password"), "{token}");
-        // Never a bare re-arm over the token: forget first, then arm.
+        // Never suggest the disabled deletion path or a blind re-arm.
         assert!(
-            token.contains("`irlume keyring forget` and then `irlume keyring arm`")
+            token.contains("token disarm is currently unavailable")
+                && !token.contains("keyring forget")
                 && !token.contains("re-run `irlume keyring arm`"),
             "{token}"
         );
@@ -14212,6 +14217,7 @@ mod tests {
         KeyringMetadata => Request::KeyringMetadata { user: u() },
         KeyringInfo => Request::KeyringInfo { user: u() },
         ForgetPassword => Request::ForgetPassword { user: u() },
+        DisarmKeyring => Request::DisarmKeyring { user: u() },
         ReleaseTokenForDisarm => Request::ReleaseTokenForDisarm {
             user: u(),
             password: secret(),
@@ -14321,7 +14327,7 @@ mod tests {
     #[test]
     fn each_request_labels_itself_by_its_variant_name() {
         let samples = named_samples(SAMPLE_USER);
-        assert_eq!(samples.len(), 63, "one sample per Request variant");
+        assert_eq!(samples.len(), 64, "one sample per Request variant");
         for (name, req) in samples {
             assert_eq!(request_label(&req), name);
         }
@@ -17595,6 +17601,7 @@ mod tests {
         // as Status would let it race captures and other writers.
         for req in [
             Request::ForgetPassword { user: u() },
+            Request::DisarmKeyring { user: u() },
             Request::DeleteProfile {
                 user: u(),
                 profile: "p".into(),
@@ -20301,6 +20308,19 @@ mod tests {
         let path = irlume_core::keyring::envelope_path(user);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"not a sealed envelope").unwrap();
+    }
+
+    /// The reply to a disarm of a GNOME keyring token envelope, whole.
+    fn token_kept(response: &Response, label: &str) {
+        match response {
+            Response::Error(msg) => assert_eq!(
+                msg,
+                "policy: GNOME token disarm is unavailable: outstanding token holders cannot be \
+                 excluded; the token envelope was retained and keyring unlock is still armed",
+                "{label}"
+            ),
+            other => panic!("{label}: a token envelope must be kept, got {other:?}"),
+        }
     }
 
     #[test]
@@ -24362,6 +24382,171 @@ mod tests {
         }
     }
 
+    /// A disarm under either request name keeps a GNOME keyring token
+    /// envelope byte for byte and says so. Both names run on the mutation
+    /// worker and are classed alike.
+    #[test]
+    fn a_disarm_keeps_a_token_envelope_under_either_request_name() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("token-disarm-kept");
+        let user = "carol";
+        let before = plant_token_envelope(user, b"fixture password");
+        for (label, request) in [
+            (
+                "ForgetPassword",
+                Request::ForgetPassword { user: user.into() },
+            ),
+            (
+                "DisarmKeyring",
+                Request::DisarmKeyring { user: user.into() },
+            ),
+        ] {
+            assert_eq!(
+                arbiter::classify(&request),
+                arbiter::Class::Plain,
+                "{label}"
+            );
+            assert_eq!(
+                diagnostic_operation_class(&request),
+                irlume_common::diagnostics::OperationClass::Status,
+                "{label}"
+            );
+            token_kept(&dispatch(request, &peer(0), &mut e), label);
+            assert_eq!(envelope_bytes(user), Some(before.clone()), "{label}");
+        }
+    }
+
+    /// What an `irlume` CLI from before `DisarmKeyring` sends for a token:
+    /// the release hands the token out, the forget after it is refused, and
+    /// the envelope is the same afterwards and releases the same token.
+    #[test]
+    fn a_release_then_a_forget_leaves_the_token_envelope_armed() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("token-release-forget");
+        let user = "carol";
+        let root = peer(0);
+        let before = plant_token_envelope(user, b"fixture password");
+        let released = |response: Response, label: &str| match response {
+            Response::PasswordUnsealed { kind, secret, .. } => {
+                assert_eq!(
+                    kind,
+                    irlume_common::KeyringSecretKind::GnomeKeyringToken,
+                    "{label}"
+                );
+                assert_eq!(secret.expose(), &[b'a'; 64][..], "{label}");
+            }
+            other => panic!("{label}: expected the token, got {other:?}"),
+        };
+        released(
+            dispatch(release_request(user, b"fixture password"), &root, &mut e),
+            "the release",
+        );
+        token_kept(
+            &dispatch(Request::ForgetPassword { user: user.into() }, &root, &mut e),
+            "the forget after the release",
+        );
+        assert_eq!(envelope_bytes(user), Some(before.clone()));
+        assert_eq!(
+            irlume_core::keyring::read_sealed_kind(user).unwrap(),
+            Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)
+        );
+        released(
+            dispatch(release_request(user, b"fixture password"), &root, &mut e),
+            "a release after the refused forget",
+        );
+        assert_eq!(envelope_bytes(user), Some(before));
+    }
+
+    /// A disarm is for root or the account it names. The account's own
+    /// process gets the answers root gets: a token envelope kept, a login
+    /// password erased.
+    #[test]
+    fn an_account_disarms_its_own_keyring_and_no_other() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("disarm-owner-peer");
+        let (me, owner) = own_account();
+        let disarm = || Request::DisarmKeyring { user: me.clone() };
+        let before = plant_token_envelope(&me, b"fixture password");
+        match dispatch(disarm(), &peer(NOBODY), &mut e) {
+            Response::Error(msg) => {
+                assert_eq!(msg, format!("not authorized to forget password for '{me}'"));
+            }
+            other => panic!("another account's disarm must be refused, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes(&me), Some(before.clone()));
+        assert!(pregate(&disarm(), &owner).is_none());
+        token_kept(&dispatch(disarm(), &owner, &mut e), "the account itself");
+        assert_eq!(envelope_bytes(&me), Some(before));
+        plant_passwordless_envelope(&me, "LoginPassword");
+        match dispatch(disarm(), &owner, &mut e) {
+            Response::PasswordForgotten => {}
+            other => panic!("the account's own disarm must erase a password, got {other:?}"),
+        }
+        assert_eq!(envelope_bytes(&me), None);
+    }
+
+    #[test]
+    fn legacy_forget_refuses_a_new_token_after_stale_password_observation() {
+        let _g = env_lock();
+        let mut e = engine();
+        let _sb = sandbox("stale-forget-token");
+        let path = irlume_core::keyring::envelope_path("carol");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for kind in ["LoginPassword", "KdeWalletKey"] {
+            let envelope = serde_json::json!({
+                "version": irlume_core::envelope::CURRENT_VERSION,
+                "policy": {"kind": "PcrLiteral"}, "secret": kind,
+                "pcrs": [7], "public": "", "private": ""
+            });
+            std::fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+            assert!(matches!(
+                dispatch(
+                    Request::ForgetPassword {
+                        user: "carol".into()
+                    },
+                    &peer(0),
+                    &mut e
+                ),
+                Response::PasswordForgotten
+            ));
+            assert!(!path.exists());
+        }
+        // The kind is the one on disk when the request runs: a token now.
+        let envelope = serde_json::json!({
+            "version": irlume_core::envelope::CURRENT_VERSION,
+            "policy": {"kind": "PcrLiteral"}, "secret": "GnomeKeyringToken",
+            "pcrs": [7], "public": "", "private": ""
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        token_kept(
+            &dispatch(
+                Request::ForgetPassword {
+                    user: "carol".into(),
+                },
+                &peer(0),
+                &mut e,
+            ),
+            "a token where a password was",
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, b"unreadable envelope format").unwrap();
+        assert!(matches!(
+            dispatch(
+                Request::ForgetPassword {
+                    user: "carol".into()
+                },
+                &peer(0),
+                &mut e
+            ),
+            Response::Error(_)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"unreadable envelope format");
+    }
+
     #[test]
     fn has_sealed_password_and_forget_roundtrip_through_dispatch() {
         let _g = env_lock();
@@ -24389,7 +24574,18 @@ mod tests {
             Response::HasPassword(armed) => assert!(!armed),
             other => panic!("expected HasPassword(false), got {other:?}"),
         }
-        plant_fake_envelope("carol");
+        let path = irlume_core::keyring::envelope_path("carol");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": irlume_core::envelope::CURRENT_VERSION,
+                "policy": {"kind": "PcrLiteral"}, "secret": "LoginPassword",
+                "pcrs": [7], "public": "", "private": ""
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         match dispatch(
             Request::HasSealedPassword {
                 user: "carol".into(),
@@ -24912,7 +25108,7 @@ mod tests {
                 refused(
                     dispatch(seal_request(&me, password), peer, &mut e),
                     &label,
-                    "run `irlume keyring forget` with that password, then",
+                    "GNOME token disarm is currently unavailable",
                 );
                 assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]), "{label}");
             }
@@ -24973,7 +25169,7 @@ mod tests {
 
     /// A password that passes the login-hash check still never replaces an
     /// armed GNOME keyring token with another kind, since the login keyring
-    /// was re-keyed to that token and `forget` must re-key it back first, and
+    /// was re-keyed to that token and token disarm is unavailable, and
     /// never arms over an envelope that cannot be read, for root and the
     /// owner alike. Both refusals come before the TPM and write nothing. An
     /// arm of any kind over a login-password or KDE wallet-key envelope, and
@@ -24981,7 +25177,7 @@ mod tests {
     #[test]
     fn a_checked_seal_never_replaces_a_token_or_an_unreadable_envelope() {
         use irlume_common::KeyringSecretKind::{KdeWalletKey, LoginPassword};
-        const FORGET_FIRST: &str = "run `irlume keyring forget` first";
+        const DISARM_UNAVAILABLE: &str = "GNOME token disarm is currently unavailable";
         const UNREADABLE: &str = "cannot be read";
         let _g = env_lock();
         let mut e = engine();
@@ -25027,7 +25223,7 @@ mod tests {
                 ),
             ] {
                 let label = format!("{who}, token, {which}");
-                refused(dispatch(request, peer, &mut e), &label, FORGET_FIRST);
+                refused(dispatch(request, peer, &mut e), &label, DISARM_UNAVAILABLE);
                 assert_eq!(envelope_bytes(&me).as_deref(), Some(&token[..]), "{label}");
             }
         }
@@ -25036,7 +25232,7 @@ mod tests {
         for (who, peer) in &peers {
             let label = format!("{who}, token, KDE wallet beside the login keyring");
             let request = login_seal_request(&me, None, kde_salt());
-            refused(dispatch(request, peer, &mut e), &label, FORGET_FIRST);
+            refused(dispatch(request, peer, &mut e), &label, DISARM_UNAVAILABLE);
             assert_eq!(envelope_bytes(&me).as_deref(), Some(&token[..]), "{label}");
             let request = login_seal_request(&me, None, None);
             reached_the_seal(
@@ -25102,8 +25298,8 @@ mod tests {
     /// password that detection picks once oo7 keeps the keyring: the
     /// envelope holds the only copy of the credential the login keyring is
     /// keyed to. The checked login password is refused, the refusal names oo7
-    /// as the reason for the login password and gnome-keyring in its remedy
-    /// (the re-key back goes through it), and nothing reaches the TPM. The
+    /// as the reason for the login password, says that token disarm is
+    /// unavailable and to keep the envelope, and nothing reaches the TPM. The
     /// other kinds over a token are covered by
     /// `a_checked_seal_never_replaces_a_token_or_an_unreadable_envelope`.
     #[test]
@@ -25122,8 +25318,8 @@ mod tests {
                     "GNOME keyring token",
                     "where oo7 keeps the login keyring",
                     "nothing was changed",
-                    "irlume keyring forget",
-                    "gnome-keyring running",
+                    "GNOME token disarm is currently unavailable",
+                    "keep the envelope",
                 ] {
                     assert!(msg.contains(part), "{part}: {msg}");
                 }
@@ -25137,7 +25333,7 @@ mod tests {
     /// anything is minted: oo7 opens the login keyring with the login
     /// password, and the token re-key speaks only gnome-keyring's socket.
     /// With a token already armed, an arm without a forced kind is refused
-    /// too, so the advice starts with `forget`.
+    /// too, so the advice is to keep the envelope.
     #[test]
     fn a_forced_token_arm_on_an_oo7_home_is_refused() {
         let _g = env_lock();
@@ -25167,8 +25363,11 @@ mod tests {
         match dispatch(forced(), &peer(0), &mut e) {
             Response::Error(msg) => {
                 assert!(msg.contains("oo7"), "{msg}");
-                assert!(msg.contains("irlume keyring forget"), "{msg}");
-                assert!(msg.contains("gnome-keyring running"), "{msg}");
+                assert!(
+                    msg.contains("GNOME token disarm is currently unavailable"),
+                    "{msg}"
+                );
+                assert!(msg.contains("keep its envelope"), "{msg}");
             }
             other => panic!("a forced token on an oo7 home must be refused, got {other:?}"),
         }
@@ -26781,8 +26980,8 @@ mod tests {
         for password in [&b"another-password"[..], b"wrap-password"] {
             let response = dispatch(seal_request(&me, password), &owner, &mut e);
             assert!(
-                matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
-                "no hash: must be refused with the remedy, got {response:?}"
+                matches!(&response, Response::Error(msg) if msg.contains("GNOME token disarm is currently unavailable")),
+                "no hash: must be refused, naming the limit, got {response:?}"
             );
             assert_eq!(envelope_bytes(&me).as_deref(), Some(&before[..]));
         }
@@ -26830,8 +27029,8 @@ mod tests {
         ] {
             let response = dispatch(request, &root, &mut e);
             assert!(
-                matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
-                "{label}: must be refused with the remedy, got {response:?}"
+                matches!(&response, Response::Error(msg) if msg.contains("GNOME token disarm is currently unavailable")),
+                "{label}: must be refused, naming the limit, got {response:?}"
             );
             assert_eq!(
                 envelope_bytes("carol").as_deref(),
@@ -26888,13 +27087,14 @@ mod tests {
 
     /// With no login hash to check against, the re-seal after login still
     /// heals a token: after a password change it re-wraps the token under
-    /// the new password, so `forget` takes that password, and after PCR
+    /// the new password, so a release takes that password, and after PCR
     /// drift it re-seals the same token from the wrap. Before that login the
     /// wrap is still under the old password, so the arm refusal's remedy
-    /// starts with the login; after it, forget then arm mints a new token.
+    /// starts with the login; after it, a disarm keeps the envelope and an
+    /// arm is refused again, leaving the envelope unchanged.
     #[test]
     #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
-    fn tpm_unverified_reseal_rewraps_the_token_for_a_later_forget() {
+    fn tpm_unverified_reseal_rewraps_the_token_under_the_new_password() {
         if std::env::var("IRLUME_TCTI").is_err() {
             return;
         }
@@ -26919,7 +27119,7 @@ mod tests {
         match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
             Response::Error(msg) => assert!(
                 msg.contains("it still needs the previous password")
-                    && msg.contains("run `irlume keyring forget` with that password"),
+                    && msg.contains("GNOME token disarm is currently unavailable"),
                 "{msg}"
             ),
             other => panic!("an unchecked re-arm must be refused, got {other:?}"),
@@ -26969,32 +27169,37 @@ mod tests {
             Err(err) => panic!("the healed seal must unseal the same token: {err}"),
         }
 
-        // The rest of the remedy: forget with that password, then arm again.
+        // The healed seal still releases under the new password; a disarm
+        // keeps the envelope. An arm after it is refused like the first one:
+        // irlumed still has no login hash to check the password against.
         released(
             dispatch(release_request("carol", b"new-password"), &root, &mut e),
-            "forget",
+            "the new password after the healed seal",
         );
-        match dispatch(
-            Request::ForgetPassword {
-                user: "carol".into(),
-            },
-            &root,
-            &mut e,
-        ) {
-            Response::PasswordForgotten => {}
-            other => panic!("expected PasswordForgotten, got {other:?}"),
-        }
+        token_kept(
+            &dispatch(
+                Request::DisarmKeyring {
+                    user: "carol".into(),
+                },
+                &root,
+                &mut e,
+            ),
+            "a disarm after the release",
+        );
+        let healed = envelope_bytes("carol").expect("armed");
         match dispatch(seal_request("carol", b"new-password"), &root, &mut e) {
-            Response::TokenSealed {
-                token: fresh,
-                minted: true,
-            } => assert_ne!(fresh.expose(), token.as_bytes(), "a new token"),
-            other => panic!("an arm after forget must mint a token, got {other:?}"),
+            Response::Error(msg) => assert!(
+                msg.contains("does not re-arm over the GNOME keyring token already armed")
+                    && msg.contains("GNOME token disarm is currently unavailable"),
+                "{msg}"
+            ),
+            other => panic!("an unchecked re-arm must be refused, got {other:?}"),
         }
+        assert_eq!(envelope_bytes("carol").as_deref(), Some(&healed[..]));
     }
 
     /// After a password change, a re-seal whose password matches the login
-    /// hash re-wraps the token under it, so a disarm then takes the new
+    /// hash re-wraps the token under it, so a release then takes the new
     /// password and not the old one; and the owner's arm with that checked
     /// password re-arms the same token over a stale wrap.
     #[test]
@@ -27051,7 +27256,8 @@ mod tests {
     /// as it was: a KDE wallet beside the login keyring (the login password
     /// is then picked), a home where irlumed sees no login keyring, or a
     /// kind the client forces. The token kind still re-arms the same token,
-    /// and after `forget` the other kind seals.
+    /// before a disarm and after it, and a refused disarm never permits the
+    /// other kind to replace it.
     #[test]
     #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
     fn tpm_a_checked_arm_never_replaces_a_token_with_another_kind() {
@@ -27075,7 +27281,7 @@ mod tests {
             );
             match response {
                 Response::Error(msg) => assert!(
-                    msg.contains("run `irlume keyring forget` first"),
+                    msg.contains("GNOME token disarm is currently unavailable"),
                     "{label}: {msg}"
                 ),
                 other => panic!("{label}: must be refused, got {other:?}"),
@@ -27111,25 +27317,32 @@ mod tests {
             } => assert_eq!(again.expose(), token.as_bytes()),
             other => panic!("the token kind must re-arm the same token, got {other:?}"),
         }
-        // The remedy: `forget` (the CLI re-keys the keyring back first), then
-        // the arm.
-        match dispatch(
-            Request::ForgetPassword {
-                user: "carol".into(),
-            },
-            &root,
-            &mut e,
-        ) {
-            Response::PasswordForgotten => {}
-            other => panic!("expected PasswordForgotten, got {other:?}"),
-        }
+        // A disarm keeps the token, so another kind is still refused after it
+        // and the token kind re-arms the same token.
+        token_kept(
+            &dispatch(
+                Request::DisarmKeyring {
+                    user: "carol".into(),
+                },
+                &root,
+                &mut e,
+            ),
+            "a disarm",
+        );
         match dispatch(login_seal_request("carol", None, kde_salt()), &root, &mut e) {
-            Response::PasswordSealed => {}
-            other => panic!("an arm after forget must seal, got {other:?}"),
+            Response::Error(_) => {}
+            other => panic!("an arm after a refused disarm must keep the token, got {other:?}"),
+        }
+        match dispatch(login_seal_request("carol", None, None), &root, &mut e) {
+            Response::TokenSealed {
+                token: again,
+                minted: false,
+            } => assert_eq!(again.expose(), token.as_bytes()),
+            other => panic!("a checked arm after a disarm must reuse the token, got {other:?}"),
         }
         assert_eq!(
             irlume_core::keyring::read_sealed_kind("carol").unwrap(),
-            Some(irlume_core::envelope::SecretKind::LoginPassword)
+            Some(irlume_core::envelope::SecretKind::GnomeKeyringToken)
         );
     }
 
@@ -27283,8 +27496,8 @@ mod tests {
     /// With a TPM that unseals, a GNOME keyring token armed before the home
     /// moved to oo7 is kept: a re-arm with the checked login password, which
     /// detection now answers with the login password, is refused and the
-    /// envelope stays byte-identical, so `irlume keyring forget` can still
-    /// re-key the keyring back.
+    /// envelope stays byte-identical, so its password wrap still recovers the
+    /// token.
     #[test]
     #[ignore = "needs swtpm via IRLUME_TCTI (CI does this); never runs against a real TPM"]
     fn tpm_an_arm_on_an_oo7_home_keeps_an_armed_token() {
@@ -27301,7 +27514,7 @@ mod tests {
         migrate_to_oo7("carol", &sb);
         let response = dispatch(seal_request("carol", SHADOW_PASSWORD), &peer(0), &mut e);
         assert!(
-            matches!(&response, Response::Error(msg) if msg.contains("irlume keyring forget")),
+            matches!(&response, Response::Error(msg) if msg.contains("GNOME token disarm is currently unavailable")),
             "the token must be kept, got {response:?}"
         );
         assert_eq!(envelope_bytes("carol").as_deref(), Some(&before[..]));

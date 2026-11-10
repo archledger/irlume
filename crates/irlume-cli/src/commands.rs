@@ -2417,8 +2417,8 @@ pub fn reseal(args: &[String]) -> ExitCode {
     if armed == Some(irlume_common::KeyringSecretKind::GnomeKeyringToken) {
         println!(
             "[reseal] '{user}' is armed with a GNOME keyring token; it re-binds itself on \
-             your next password login. To rebuild it from scratch, run `irlume keyring \
-             forget` then `irlume keyring arm`."
+             your next password login. GNOME token disarm is currently unavailable, so \
+             `irlume keyring forget` cannot remove it; keep its envelope."
         );
         return ExitCode::SUCCESS;
     }
@@ -2582,7 +2582,8 @@ pub fn setup(args: &[String]) -> ExitCode {
     let arm = match crate::nixos::seal_kind(&user) {
         Ok(seal) => {
             let yes = yes_no(
-                "  Arm keyring unlock now (you'll enter your login password)?",
+                "  Arm keyring unlock now (you'll enter your login password; a GNOME keyring \
+                 token arm cannot be undone in this release)?",
                 /* default_yes: */ true,
             );
             yes.then_some(seal)
@@ -2653,9 +2654,8 @@ pub fn setup(args: &[String]) -> ExitCode {
                         Err(e) => eprintln!("  arm failed: {e}"),
                     }
                 }
-                // The daemon's refusals say what to do next (a re-arm over a
-                // token it cannot check the password for names `keyring
-                // forget`), so show the text, not the reply's debug form.
+                // The daemon's refusals say what to do next, so show the
+                // text, not the reply's debug form.
                 Ok(Response::Error(e)) | Err(e) => eprintln!("  arm failed: {e}"),
                 Ok(other) => eprintln!("  arm failed: unexpected response: {other:?}"),
             }
@@ -2806,7 +2806,7 @@ ENROLLMENT & AUTH
   identify              1:N \"who is this?\" (all users as root; else scoped to you)
 KEYRING / TPM
   keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
-                        (forget takes --force to erase without re-keying back)
+                        (GNOME token disarm is unavailable; --force does not erase tokens)
   reseal                re-bind the sealed secret to current PCRs (after a
                         firmware/kernel update); safe, re-enters the password
   recovery <status|setup|restore|forget>   recovery passphrase + encryption

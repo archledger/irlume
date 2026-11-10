@@ -563,9 +563,10 @@ pub(crate) fn request_kind(req: &Request) -> Option<(LiveOperationKind, bool)> {
         | SetRequireEyesOpen { .. } => (K::ProfileUpdate, true),
         FaceSensorStatus { user: Some(_) } => (K::SensorReadiness, false),
         KeyringInfo { .. } => (K::WalletRead, false),
-        SealPassword { .. } | ResealPassword { .. } | ForgetPassword { .. } => {
-            (K::WalletUpdate, true)
-        }
+        SealPassword { .. }
+        | ResealPassword { .. }
+        | ForgetPassword { .. }
+        | DisarmKeyring { .. } => (K::WalletUpdate, true),
         RecoverySetup { .. } | RecoveryRestore { .. } | RecoveryForget { .. } => {
             (K::RecoveryUpdate, true)
         }

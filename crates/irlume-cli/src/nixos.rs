@@ -133,8 +133,13 @@ fn armed_kind(
 /// Why the login password is the one kind sealed on NixOS.
 const WRITTEN_FOR: &str = "the kind the NixOS module's PAM rules were written for";
 
-/// The remedy for an existing arm the NixOS paths refuse.
-const FORGET: &str = "`irlume keyring forget` removes the existing arm";
+/// The remedy named to an account that has a KDE wallet key armed.
+const FORGET_WALLET_KEY: &str = "; `irlume keyring forget` removes the wallet key";
+
+/// What an account that has a GNOME keyring token armed is told.
+const KEEP_TOKEN: &str =
+    "; GNOME token disarm is unavailable and `irlume keyring forget` refuses a token, so keep \
+     its envelope";
 
 /// The kind irlumed picks for an account whose home is `home` (`None`: not
 /// found), given whether the account-scoped helper found a KDE wallet salt.
@@ -164,15 +169,15 @@ fn nixos_seal_kind(
     has_kde_salt: bool,
 ) -> Result<SealKind, String> {
     let kind = armed.unwrap_or_else(|| expected_kind(home, has_kde_salt));
-    let what = match kind {
+    let (what, remedy) = match kind {
         KeyringSecretKind::LoginPassword => return Ok(SealKind::LoginPassword),
-        KeyringSecretKind::KdeWalletKey => "a KDE wallet key",
-        KeyringSecretKind::GnomeKeyringToken => "a GNOME keyring token",
+        KeyringSecretKind::KdeWalletKey => ("a KDE wallet key", FORGET_WALLET_KEY),
+        KeyringSecretKind::GnomeKeyringToken => ("a GNOME keyring token", KEEP_TOKEN),
     };
-    // Only an existing arm has anything for `forget` to remove.
+    // Only an existing arm has a remedy to name.
     let (has, remedy) = match armed {
-        Some(_) => ("has", format!("; {FORGET}")),
-        None => ("would get", String::new()),
+        Some(_) => ("has", remedy),
+        None => ("would get", ""),
     };
     Err(format!(
         "refusing: this account {has} {what}, and on NixOS irlume seals only the login \
@@ -280,7 +285,7 @@ mod tests {
         std::fs::write(gnome.join(".local/share/keyrings/login.keyring"), b"").unwrap();
         // One reading: what is armed, the home, whether a KDE wallet salt
         // exists, and the decision (a refusal by a fragment of its text).
-        // `forget` is named only when there is an arm for it to remove.
+        // `forget` is named only for an existing arm.
         fn check(armed: Option<K>, home: Option<&Path>, salt: bool, want: Result<SealKind, &str>) {
             let got = nixos_seal_kind(armed, home, salt);
             match (want, &got) {
@@ -359,8 +364,8 @@ mod tests {
         ] {
             assert!(unknown.contains(needle), "{needle:?} not in {unknown}");
         }
-        // `forget` refuses an arm it cannot identify, and with `--force`
-        // deletes the file irlumed says to keep, so it is not offered here.
+        // `forget` refuses an arm it cannot identify, with or without
+        // `--force`, so it is not offered here.
         assert!(!unknown.contains("irlume keyring forget"), "{unknown}");
         for reply in [
             Ok(Response::Error("bad request".into())),

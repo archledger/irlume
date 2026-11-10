@@ -290,7 +290,7 @@ reused for a different meaning. The registry as of this contract:
 | `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
 | `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
 | `keyring-secrets` | the login keyring's lock state and provider |
-| `keyring-os-upgrade` | whether the armed keyring secret survives the next upgrade of this release. `warn`, with the step in `detail`, when the account has a GNOME keyring token armed on a release whose upgrade does not carry it over (Fedora 43 or 44, before Fedora 45: run `irlume keyring forget` first); `pass` for any other kind, or nothing armed, on such a release; `unknown` when the daemon does not answer its metadata query or does not report the kind, or when the release cannot be determined (no readable os-release, or an `ID` or `VERSION_ID` that is missing, empty or unbalanced in its quoting); `info` on every other release |
+| `keyring-os-upgrade` | whether the armed keyring secret survives the next upgrade of this release. `warn`, with the step in `detail`, when the account has a GNOME keyring token armed on a release whose upgrade does not carry it over (Fedora 43 or 44, before Fedora 45: the detail says to retain the sealed token and postpone the migration, since GNOME token disarm is unavailable); `pass` for any other kind, or nothing armed, on such a release; `unknown` when the daemon does not answer its metadata query or does not report the kind, or when the release cannot be determined (no readable os-release, or an `ID` or `VERSION_ID` that is missing, empty or unbalanced in its quoting); `info` on every other release |
 | `camera-groups` | enrolled secondary-camera groups (ADR-0024): present and healthy, stale, or the secondary store unreadable. Conditionally present: emitted only when groups exist or the store cannot be read |
 | `pam-faillock` | the `pam_faillock` tally for the target account (the OS-level lockout counter, distinct from irlume's own retry throttle): quiet when clean, `warn` with the count and the `faillock --reset` remedy at/above the threshold. Conditionally present: root-only and requires the `faillock` binary |
 
@@ -930,8 +930,8 @@ Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
 the configuration no longer wants, or a `rollback --apply` that would restore
 a stack without it, while an account's GNOME keyring is keyed to an irlume
 token and a login stack carries the session line that delivers it; refused
-before anything is recorded or written, and not retryable until that account
-runs `irlume keyring forget`),
+before anything is recorded or written, and not retryable while that token
+must be retained: token disarm is unavailable),
 `not-authorized` (apply and `rollback --apply` need root, checked before
 anything is written rather than left to a write failing partway),
 `unconfirmed-transaction`, `unsupported-record`, `unmanaged-path` (a record

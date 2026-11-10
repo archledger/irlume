@@ -299,9 +299,9 @@ controls remain in their dedicated sections.
 F2 includes sensor status, readiness, privileged confirmation status, face retry
 status, password-verified retry reset, and a separately labeled administrator
 retry reset. Password Wallet's Reseal uses the same seal-type handling as the CLI.
-Forget uses the safe password-rekey flow for token or unknown seals; it refuses
-an unsuccessful inspection. Force-forget remains a separate, explicitly warned
-action. No command needs to be typed for these workflows.
+Forget removes a sealed login password or KDE wallet key; it refuses a GNOME
+token, which is retained while token disarm is unavailable, and refuses an
+unsuccessful inspection. No command needs to be typed for these workflows.
 
 ## Password Wallet and Recovery
 
@@ -314,10 +314,15 @@ and Diagnostics shows it as the PCR policy. The page's actions share one row,
 in the order F6 walks them: arm or re-arm (`a`), reseal (`b`, once armed),
 forget (`f`), refresh the pcrlock policy (`p`, Tier 2 seals only) and check the
 current PCRs (`d`, once armed). A window too narrow for all of them continues
-the row below. Forget on a GNOME keyring token, or on a seal whose kind the
-daemon does not report, runs the CLI's re-key flow first. With a GNOME keyring
-token armed on Fedora 43 or 44, the page and Diagnostics say to run
-`irlume keyring forget` before upgrading to Fedora 45.
+the row below. Forget on a GNOME keyring token is refused (token disarm is
+unavailable, and the envelope is retained); so is a seal whose kind the daemon
+does not report. With a GNOME keyring
+token armed on Fedora 43 or 44, the page and Diagnostics carry the upgrade
+notice: retain the sealed token and postpone that upgrade.
+
+The arm prompt says, before a password is typed, that a GNOME keyring token
+arm cannot be undone in this release. On NixOS, where only the login password
+is sealed, it asks for the password alone.
 
 A successful arm confirms that the secret was sealed. It does not establish
 working session delivery; check Login & Apps for the required integration.
@@ -573,7 +578,6 @@ scan lists. Rename and Delete confirmations name their exact target.
 | `retry status/reset`, administrator `retry reset` | F2: status, password-verified reset or administrator reset |
 | `auth test` | F2: Test authentication for this account; JSON `granted` is the verdict |
 | `keyring arm/status/forget`, `reseal` | Password Wallet |
-| `keyring forget --force` | F2: Forget wallet secret without rekeying; review the consequence carefully |
 | `recovery status/setup/restore/forget` | Recovery; F2 also works with the camera disconnected |
 | `fingerprint status/add/verify/reset/enable/disable` | Fingerprint |
 | `fingerprint enable --fingerprint-only` | F2: Enable fingerprint-only login |

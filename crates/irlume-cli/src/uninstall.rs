@@ -106,12 +106,9 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // A GNOME keyring token arm (#250) means the user's login keyring is keyed
     // to a secret that exists ONLY in the sealed envelope. Deleting it here
-    // would make that keyring permanently unreachable, and the re-key back to
-    // the password cannot happen from this root process (the keyring control
-    // socket authenticates the session's uid). Refuse until each such user has
-    // disarmed from their own session; this is a data-loss guard, so there is
-    // deliberately no flag to bypass it (`irlume keyring forget --force` per
-    // user is the explicit, per-user override).
+    // would make that keyring permanently unreachable. Token disarm is
+    // unavailable (ADR-0003, amendment 2026-11-10); refuse while a token is
+    // retained. No force flag bypasses this guard.
     // Enumerate ENVELOPES, not enrolled users: `keyring arm` needs no
     // enrollment, so a user can hold a sealed token and never appear in
     // `storage::list_users()`. And an envelope this cannot READ is not an
@@ -151,9 +148,9 @@ pub fn run(args: &[String]) -> ExitCode {
             token_users.join(", ")
         );
         eprintln!(
-            "[uninstall] Have each of these users run `irlume keyring forget` in their \
-             own session first (it re-keys the keyring back to their password), then \
-             re-run the uninstall."
+            "[uninstall] GNOME token disarm is unavailable. Retain the envelopes and \
+             working delivery path; a supported keyring migration is required before \
+             uninstalling. Do not delete the token files manually."
         );
         return ExitCode::FAILURE;
     }
@@ -917,17 +914,14 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
         }
         let stores = selected_keyrings::hold(&dirs, 0)?;
         let other_overrides = snapshot.disk.values[2..].iter().any(Option::is_some);
-        let sweep = sealed_token_holders_with(
+        token_free(sealed_token_holders_with(
             irlume_core::keyring::list_sealed_kinds(),
             &homes,
             &extra_roots,
             &dirs,
             0,
-        )?;
-        if !sweep.holders.is_empty() {
-            return Err(format!("GNOME token holders: {}", sweep.holders.join(", ")));
-        }
-        Ok((dirs, stores, other_overrides))
+        ))?;
+        Ok::<_, String>((dirs, stores, other_overrides))
     })();
     let (keyring_dirs, selected_stores, unit_other_overrides) = match selected {
         Ok(selected) => selected,
@@ -1103,6 +1097,41 @@ fn perform_held_teardown(keep_data: bool, retained: &mut retention::Retention) -
             data_wipe_requested: !keep_data,
             data_wiped: false,
             data_left: vec!["daemon did not stop; data left in place".into()],
+            srk_eviction: SrkOutcome::Kept,
+            da_exempt_srk: DaExemptSrkOutcome::Kept,
+            tpm_target: None,
+            kept_keys: KeptKeys::NotChecked,
+            retention: RetentionState::Unverified,
+        };
+    }
+
+    // irlumed and the units that start it are stopped, so irlumed seals
+    // nothing from here on. Read the stores again before any envelope,
+    // enrollment or state tree is removed: an envelope sealed up to the stop
+    // is seen here, and a GNOME keyring token among them keeps every envelope
+    // and tree in place.
+    if let Err(e) = token_free(sealed_token_holders_with(
+        irlume_core::keyring::list_sealed_kinds(),
+        &homes,
+        &extra_roots,
+        &keyring_dirs,
+        0,
+    )) {
+        return TeardownReport {
+            pam_unwired,
+            service_stopped,
+            users_cleared: 0,
+            data_wipe_requested: !keep_data,
+            data_wiped: false,
+            data_left: vec![format!(
+                "store check refused after the daemon stopped; data left in place: {}; PAM is \
+                 un-wired and irlumed is stopped: to bring irlume's login path back, token \
+                 delivery included, run `sudo systemd-tmpfiles --create irlume.conf` and \
+                 `sudo systemctl start irlumed.socket` (a source install: \
+                 `sudo systemctl start irlumed` alone), or reboot; then run \
+                 `sudo irlume login enable --apply` with the options used before",
+                terminal_safe(&e)
+            )],
             srk_eviction: SrkOutcome::Kept,
             da_exempt_srk: DaExemptSrkOutcome::Kept,
             tpm_target: None,
@@ -2483,6 +2512,20 @@ fn skipped_tree_keyring(tree: &Path, root_uid: u32) -> Result<Option<HeldStore>,
     };
     let owner = dir.metadata().map_err(fail)?.uid();
     Ok((owner == root_uid).then_some(HeldStore { shown, dir }))
+}
+
+/// `Ok` when a completed sweep found no GNOME keyring token. A token keeps
+/// every envelope and tree in place: token disarm is unavailable (ADR-0003,
+/// amendment 2026-11-10), so removing its envelope would leave that login
+/// keyring keyed to a secret nothing holds. A sweep that could not complete
+/// is passed through, because a store it could not read may hold one.
+fn token_free(sweep: Result<TokenSweep, String>) -> Result<(), String> {
+    let sweep = sweep?;
+    if sweep.holders.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("GNOME token holders: {}", sweep.holders.join(", ")))
+    }
 }
 
 /// [`sealed_token_holders`] with the default-root enumeration, the
@@ -4432,6 +4475,71 @@ mod tests {
         );
         assert_eq!(env("IRLUME_STATE_DIR"), None, "the value it has");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn token_free_refuses_a_token_and_passes_a_sweep_error_through() {
+        let dir = std::env::temp_dir().join(format!("irlume-token-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sweep =
+            || sealed_token_holders_with(Ok(Vec::new()), &[], &[], std::slice::from_ref(&dir), 0);
+        std::fs::write(dir.join("alice.json"), PASSWORD_ENVELOPE).unwrap();
+        assert_eq!(token_free(sweep()), Ok(()));
+        std::fs::write(dir.join("carol.json"), TOKEN_ENVELOPE).unwrap();
+        assert_eq!(
+            token_free(sweep()),
+            Err("GNOME token holders: carol".to_string())
+        );
+        std::fs::write(dir.join("dave.json"), b"not an envelope").unwrap();
+        let err = token_free(sweep()).unwrap_err();
+        assert!(err.contains(dir.to_str().unwrap()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The teardown runs systemctl and the PAM tools, so no test drives it.
+    /// This pins the order in its source: the stores are read again once
+    /// irlumed has stopped, ahead of the removal calls listed below, and a
+    /// refusal returns before the first of them.
+    #[test]
+    fn teardown_rereads_the_stores_after_the_stop_and_before_any_data_removal() {
+        let source = include_str!("uninstall.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = code
+            .split_once("fn perform_held_teardown(")
+            .expect("the teardown function")
+            .1;
+        // rustfmt puts a top-level item's closing brace alone in column 0.
+        let body = body.split_once("\n}\n").expect("the function's end").0;
+        let stopped = body.find("if !stop {").expect("the stop check");
+        let reread = body[stopped..]
+            .find("token_free(sealed_token_holders_with(")
+            .map(|at| stopped + at)
+            .expect("a store re-read after the stop check");
+        assert!(
+            body[..reread].trim_end().ends_with("if let Err(e) ="),
+            "the re-read's refusal is handled where it is made"
+        );
+        let mut first_removal = body.len();
+        for removal in [
+            "selected_keyrings::disarm(",
+            "keyring::forget_password(",
+            "storage::delete(",
+            "disarm_home_trees(",
+            "wipe_data_trees(",
+            "wipe_home_trees(",
+            "selected_keyrings::empty(",
+        ] {
+            let first = body
+                .find(removal)
+                .unwrap_or_else(|| panic!("{removal} is not in the teardown"));
+            assert!(reread < first, "{removal} precedes the store re-read");
+            first_removal = first_removal.min(first);
+        }
+        assert!(
+            body[reread..first_removal].contains("return TeardownReport {"),
+            "a refused re-read returns before the first removal"
+        );
     }
 
     #[test]

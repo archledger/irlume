@@ -38,6 +38,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `DisarmKeyring` daemon request, used by `irlume keyring forget`: irlumed
+  reads the envelope's kind when the request runs and decides from that,
+  whatever kind the client read earlier. It erases a sealed login password
+  or KDE wallet key and keeps a GNOME keyring token; `ForgetPassword` runs
+  the same code. A daemon without this request answers `bad request`, and
+  the CLI stops there and asks for an irlumed restart; it never sends
+  `ForgetPassword` in its place (ADR-0003, amendment 2026-11-10).
+
 - A developer-only [IR verification-request evaluator](docs/IR_REQUEST_EVALUATION.md)
   reuses the production engine's retries, PAD, identity and final binding checks.
   It reports non-granting measurements, refuses protected state requiring repair,
@@ -417,6 +425,36 @@ All notable changes to irlume are documented here. This project adheres to
   Thanks to @maurerr for the report in #1061.
 
 ### Changed
+
+- The TUI's keyring arm prompt says before a password is typed that a GNOME
+  keyring token arm cannot be undone in this release, as `irlume keyring arm`
+  and the `irlume setup` question do.
+
+- GNOME keyring token disarm is unavailable in this release.
+  `irlume keyring forget` refuses a token with no prompt and no disarm
+  request, and the envelope and keyring unlock stay armed; `--force` is
+  accepted and changes nothing. It refuses the same way when irlumed does
+  not report the envelope's kind or cannot read the envelope. Forgetting a
+  sealed login password or KDE wallet key erases the envelope. The TUI's
+  F2 row "Forget wallet secret without rekeying" is removed; Password
+  Wallet's Forget runs `irlume keyring forget`. `irlume uninstall` refuses
+  while an account has a token envelope, and reads the stores again after
+  irlumed has stopped and before any envelope, enrollment or state tree is
+  removed; a refusal at that point leaves PAM un-wired, irlumed stopped and
+  the data in place. No supported path removes a token envelope, including
+  one recorded for another uid after an account name is reused. A
+  typed-password login on a screen wired with irlume's re-seal repairs a
+  password change or a firmware or Secure Boot change, one at a time; after
+  both, the token is not delivered until the earlier boot state or the
+  earlier password is back and such a login is made. An older `irlume` CLI
+  running `keyring forget` against this irlumed re-keys the keyring to the
+  password and is then refused: the envelope stays armed. Where irlumed can
+  check the login password, a later `irlume keyring arm` re-keys the keyring
+  to the same token; where it cannot, that arm is refused and the keyring
+  stays on the password. On Fedora 43 and 44, `irlume keyring arm`, `irlume
+  keyring status` and the `keyring-os-upgrade` doctor check say to retain
+  the token and postpone the Fedora 45 keyring migration (ADR-0003,
+  amendment 2026-11-10; [docs/SETUP.md](docs/SETUP.md) "Keyring unlock").
 
 - `irlume recovery restore` requires the recovered key to open the stored
   enrollment and the added-camera store before it reseals. A store that
@@ -908,6 +946,15 @@ All notable changes to irlume are documented here. This project adheres to
   examined again on each run. A deferred key stays in zeroizing,
   user/service-bound PAM memory and is delivered once, without another
   credential request (ADR-0003, amendment 2026-11-08).
+
+- A GNOME keyring token arm that fails after sealing keeps its envelope and
+  says so. The envelope counts as a token for `irlume keyring forget`,
+  `irlume uninstall` and the login wiring guards, whether or not the
+  keyring was re-keyed. A later `irlume keyring arm`, run in the account's
+  own graphical session, completes the re-key where irlumed can check the
+  login password; where it cannot, that arm is refused. Every keyring
+  forget in the TUI runs `irlume keyring forget`, so irlumed decides from
+  the envelope stored at that moment.
 
 - A sealed login password that holds a space or a non-ASCII byte reaches
   gnome-keyring at session opening. `pam_irlume` hands it to

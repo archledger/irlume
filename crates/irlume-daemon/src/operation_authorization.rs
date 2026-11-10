@@ -109,6 +109,7 @@ fn approval_operation(req: &Request) -> Option<(&'static str, &'static str)> {
         | Request::KeyringMetadata { .. }
         | Request::KeyringInfo { .. }
         | Request::ForgetPassword { .. }
+        | Request::DisarmKeyring { .. }
         | Request::ReleaseTokenForDisarm { .. }
         | Request::ResealPassword { .. }
         | Request::RecoveryRestore { .. }

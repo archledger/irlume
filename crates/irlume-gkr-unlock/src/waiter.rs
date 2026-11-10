@@ -340,7 +340,8 @@ impl Event {
                  nothing was sent"
             ),
             Event::NoGnomeKeyring => "no gnome-keyring in this session; nothing was sent. On \
-                 Fedora 45 (oo7) a token arm does not carry over: run `irlume keyring forget`"
+                 Fedora 45 (oo7) a token arm does not carry over; keep the sealed token, \
+                 since token disarm is unavailable"
                 .to_string(),
             Event::IdentityMismatch {
                 owner_pid,

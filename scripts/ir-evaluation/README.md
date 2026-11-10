@@ -7,6 +7,12 @@ implemented by this tool. A successful harness result means the recorded attempt
 passed instrumentation and preservation checks, not that a sensor or policy is
 qualified.
 
+The separate [verification-request evaluator](../../docs/IR_REQUEST_EVALUATION.md)
+uses the production request loop and host configuration schema 2. Its
+`would_grant` report remains non-authoritative. The instructions below describe
+the retained schema-1 one-shot workflow unless stated otherwise. Both workflows
+now install `request_contract.py` alongside the three original Python modules.
+
 ## Diagnostic report records
 
 New diagnostic builds emit report schema 4. `identity_acceptance` is
@@ -105,12 +111,12 @@ cargo build --release --locked -p irlume-auth \
 python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'
 ```
 
-Review the three Python modules and exact executable/model/runtime hashes before
+Review the four Python modules and exact executable/model/runtime hashes before
 root execution. This tool is **not a sandbox for an untrusted executable or model**.
 It pins the selected files; the OS, Python, tracer and transitive shared libraries
 remain trusted dependencies whose versions belong in the campaign record.
 
-Copy the three modules (`runner.py`, `host.py`, `harness.py`) and reviewed diagnostic
+Copy the four modules (`runner.py`, `host.py`, `harness.py`, `request_contract.py`) and reviewed diagnostic
 to an administrator-owned directory such as `/opt/irlume-ir-evaluation`, using
 root ownership and modes 0644 for modules / 0500 for the executable. Every component
 and symlink hop in tool, asset, configuration and output paths must be root-owned

@@ -761,25 +761,33 @@ pub fn load_secondary_with_source(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SecondaryStoreError::Io(error.to_string())),
     };
+    parse_secondary_with_source(path, &bytes, keys).map(Some)
+}
+
+pub(crate) fn parse_secondary_with_source(
+    path: &Path,
+    bytes: &[u8],
+    keys: &mut dyn crate::template_key::TemplateKeySource,
+) -> Result<SecondaryStore, SecondaryStoreError> {
     if bytes.len() > MAX_STORE_BYTES {
         return Err(SecondaryStoreError::Invalid(format!(
             "store larger than {MAX_STORE_BYTES} bytes"
         )));
     }
-    let version: serde_json::Value = serde_json::from_slice(&bytes)
+    let version: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| SecondaryStoreError::Corrupt(error.to_string()))?;
     let declared = version
         .get("format_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| SecondaryStoreError::Corrupt("no format_version".into()))?;
     if declared != SECONDARY_ENC_ENVELOPE_VERSION {
-        return parse_store_bytes(&bytes, None).map(Some);
+        return parse_store_bytes(bytes, None);
     }
     let user = store_user(path)?;
     let key = keys.template_key(&user).map_err(|error| {
         SecondaryStoreError::Invalid(format!("the account template key is unavailable: {error}"))
     })?;
-    parse_store_bytes(&bytes, key).map(Some)
+    parse_store_bytes(bytes, key)
 }
 
 /// [`load_secondary`] with an explicit borrowed key: `Some` decrypts an

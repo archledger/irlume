@@ -10,10 +10,13 @@ import errno
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
 from pathlib import Path
+
+import request_contract
 
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 ASSETS = {"binary", "detector", "recognizer", "flir", "ort"}
@@ -32,27 +35,47 @@ def strict_json(text):
 
 
 def validate_config(data):
-    if not isinstance(data, dict) or set(data) != {
+    if (
+        not isinstance(data, dict)
+        or type(data.get("schema")) is not int
+        or data["schema"] not in (1, 2)
+    ):
+        raise ValueError("invalid_config")
+    request_mode = data["schema"] == 2
+    window_key = "expected_window_ms" if request_mode else "budget_ms"
+    keys = {
         "schema",
         "subject_uid",
-        "budget_ms",
+        window_key,
         "watchdog_seconds",
         "assets",
         "cameras",
         "protected_files",
         "service",
-    }:
-        raise ValueError("invalid_config")
-    if type(data["schema"]) is not int or data["schema"] != 1:
+    }
+    if request_mode:
+        keys.update({"request_service", "source_commit", "source_tree"})
+    if set(data) != keys:
         raise ValueError("invalid_config")
     for key, low, high in [
         ("subject_uid", 1, 2**32 - 2),
-        ("budget_ms", 100, 30000),
+        (window_key, 1 if request_mode else 100, 60000 if request_mode else 30000),
         ("watchdog_seconds", 1, 120),
     ]:
         if type(data[key]) is not int or not low <= data[key] <= high:
             raise ValueError("invalid_config")
-    if data["watchdog_seconds"] * 1000 <= data["budget_ms"]:
+    if data["watchdog_seconds"] * 1000 <= data[window_key]:
+        raise ValueError("invalid_config")
+    if request_mode and (
+        not isinstance(data["request_service"], str)
+        or re.fullmatch("[a-z0-9][a-z0-9-]{0,63}", data["request_service"]) is None
+    ):
+        raise ValueError("invalid_config")
+    if request_mode and any(
+        not isinstance(data[key], str)
+        or re.fullmatch("[a-f0-9]{40}", data[key]) is None
+        for key in ("source_commit", "source_tree")
+    ):
         raise ValueError("invalid_config")
     assets = data["assets"]
     if (
@@ -73,13 +96,15 @@ def validate_config(data):
     cameras = data["cameras"]
     if not isinstance(cameras, dict) or set(cameras) != {"rgb", "ir", "metadata"}:
         raise ValueError("invalid_config")
-    if (
-        any(
-            not isinstance(node, str) or re.fullmatch("/dev/video[0-9]+", node) is None
-            for node in cameras.values()
-        )
-        or len(set(cameras.values())) != 3
-    ):
+    selected_nodes = [
+        node
+        for role, node in cameras.items()
+        if not (request_mode and role == "metadata" and node is None)
+    ]
+    if any(
+        not isinstance(node, str) or re.fullmatch("/dev/video[0-9]+", node) is None
+        for node in selected_nodes
+    ) or len(set(selected_nodes)) != len(selected_nodes):
         raise ValueError("invalid_config")
     paths = data["protected_files"]
     if (
@@ -165,7 +190,9 @@ def qualified_topology(nodes, cameras):
     )
 
 
-def topology(cameras):
+def topology(cameras, *, request_mode=False):
+    if request_mode:
+        return request_topology(cameras)
     nodes = {}
     for role, device in cameras.items():
         info = Path(device).lstat()
@@ -186,6 +213,79 @@ def topology(cameras):
     if not qualified_topology(nodes, cameras):
         raise ValueError("unsupported_topology")
     return nodes
+
+
+def request_topology(cameras):
+    def node_record(device):
+        info = Path(device).lstat()
+        if not stat.S_ISCHR(info.st_mode) or os.major(info.st_rdev) != 81:
+            raise ValueError("unsupported_topology")
+        node = Path("/sys/class/video4linux") / Path(device).name
+        number = f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
+        if (node / "dev").read_text().strip() != number:
+            raise ValueError("unsupported_topology")
+        return {
+            "index": int((node / "index").read_text()),
+            "name": (node / "name").read_text().strip(),
+            "interface": str((node / "device").resolve(strict=True)),
+            "device": number,
+        }
+
+    nodes = {
+        role: node_record(device)
+        for role, device in cameras.items()
+        if device is not None
+    }
+    members = {
+        path.name: node_record(str(Path("/dev") / path.name))
+        for path in (Path(nodes["ir"]["interface"]) / "video4linux").iterdir()
+    }
+    if not request_contract.qualified_topology(nodes, cameras, members):
+        raise ValueError("unsupported_topology")
+    return {"nodes": nodes, "members": members}
+
+
+def memory_only_swap():
+    """No disk swap or zram writeback may retain biometric process memory."""
+    lines = Path("/proc/swaps").read_text().splitlines()
+    if not lines or not lines[0].startswith("Filename"):
+        raise ValueError("swap_unverified")
+    devices = []
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) != 5 or re.fullmatch(r"/dev/zram[0-9]+", fields[0]) is None:
+            raise ValueError("persistent_swap")
+        name = Path(fields[0]).name
+        if (Path("/sys/block") / name / "backing_dev").read_text().strip() != "none":
+            raise ValueError("persistent_swap")
+        devices.append(name)
+    return tuple(sorted(devices))
+
+
+def account_state(user, root=Path("/var/lib/irlume")):
+    """Hash only this account's files in memory; never export this dictionary."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,255}", user) is None:
+        raise ValueError("invalid_account")
+    lock = hashlib.sha256(user.encode()).hexdigest()
+    paths = [
+        f"{user}.json",
+        f"cameras/{user}.json",
+        f"cameras/{user}.json.intent",
+        f"template-keys/{user}.json",
+        f"template-keys/{user}.replacing",
+        f"template-keys/.locks/{lock}.lock",
+        f"recovery/{user}.json",
+    ]
+    state = {}
+    for name in paths:
+        path = root / name
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            state[name] = None
+        else:
+            state[name] = file_identity(path)
+    return state
 
 
 def command_output(command):
@@ -240,6 +340,13 @@ def security_state(process, lsm_list=Path("/sys/kernel/security/lsm")):
 
 
 def snapshot(config):
+    request_mode = config["schema"] == 2
+    swap = memory_only_swap() if request_mode else None
+    account = (
+        account_state(pwd.getpwuid(config["subject_uid"]).pw_name)
+        if request_mode
+        else None
+    )
     assets = {
         key: file_identity(asset["path"]) for key, asset in config["assets"].items()
     }
@@ -248,7 +355,7 @@ def snapshot(config):
     ):
         raise ValueError("asset_hash_mismatch")
     protected = {path: file_identity(path) for path in config["protected_files"]}
-    nodes = topology(config["cameras"])
+    nodes = topology(config["cameras"], request_mode=request_mode)
     idle()
     service = command_output(
         [
@@ -281,6 +388,8 @@ def snapshot(config):
         "security": security,
         "lsm": lsm,
         "selinux": selinux,
+        "memory_only_swap": swap,
+        "account_state": account,
     }
 
 

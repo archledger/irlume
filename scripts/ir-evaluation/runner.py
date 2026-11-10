@@ -3,6 +3,7 @@
 """One attended, non-granting IR experiment. See README.md before root execution."""
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,16 @@ import harness
 import host
 
 MODES = ["preflight", "genuine", "impostor", "attack", "empty", "cancel"]
+
+
+def protect_process():
+    """Disable both core limits and piped-handler dumps before private reads."""
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    libc = ctypes.CDLL(None)
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    libc.prctl.restype = ctypes.c_int
+    # Linux UAPI: PR_SET_DUMPABLE=4, PR_GET_DUMPABLE=3. No pointer arguments.
+    return libc.prctl(4, 0, 0, 0, 0) == 0 and libc.prctl(3, 0, 0, 0, 0) == 0
 
 
 def attend(mode):
@@ -44,27 +55,33 @@ def diagnostic_command(config, binary, operation):
         "--" + operation,
         pwd.getpwuid(config["subject_uid"]).pw_name,
         *[assets[key]["path"] for key in ["detector", "recognizer", "flir"]],
-        "--budget-ms",
-        str(config["budget_ms"]),
-        "--cancel-on-stdin",
     ]
+    command += (
+        ["--service", config["request_service"]]
+        if config["schema"] == 2
+        else ["--budget-ms", str(config["budget_ms"])]
+    )
+    command += ["--cancel-on-stdin"]
     if "adapter" in assets:
         command += ["--adapter", assets["adapter"]["path"]]
     return command
 
 
 def execute(config, directory, label, mode, campaign, binary, *, trace_ioctl=False):
+    request_mode = config["schema"] == 2
+    window_key = "expected_window_ms" if request_mode else "budget_ms"
+    checks = {"request_mode": request_mode, "expected_window_ms": config[window_key]}
     ledger = host.Ledger(directory)
     attempt = ledger.reserve(
         label, mode, campaign, config["assets"]["binary"]["sha256"]
     )
     result = {
-        "schema": 1,
+        "schema": 2 if request_mode else 1,
         "status": "stopped",
         "stop_required": True,
         "mode": mode,
         "campaign": campaign,
-        "budget_ms": config["budget_ms"],
+        window_key: config[window_key],
         "watchdog_seconds": config["watchdog_seconds"],
         "asset_sha256": {k: v["sha256"] for k, v in config["assets"].items()},
         "preflight": None,
@@ -72,6 +89,13 @@ def execute(config, directory, label, mode, campaign, binary, *, trace_ioctl=Fal
         "preservation_verified": False,
         "failure": None,
     }
+    if request_mode:
+        result.update(
+            operation="ir_request_evaluation",
+            source_commit=config["source_commit"],
+            source_tree=config["source_tree"],
+            request_service=config["request_service"],
+        )
     before = None
     env = dict(
         host.ENV,
@@ -86,6 +110,7 @@ def execute(config, directory, label, mode, campaign, binary, *, trace_ioctl=Fal
             env=env,
             timeout=config["watchdog_seconds"],
             trace_ioctl=trace_ioctl,
+            request_mode=request_mode,
         )
         result["preflight"] = preflight
         preflight["installed_unchanged"] = host.snapshot(config) == before
@@ -94,6 +119,7 @@ def execute(config, directory, label, mode, campaign, binary, *, trace_ioctl=Fal
             "preflight",
             config["cameras"]["ir"],
             config["cameras"]["metadata"],
+            **checks,
         ):
             result["failure"] = "preflight_failed"
         elif mode == "preflight":
@@ -108,16 +134,22 @@ def execute(config, directory, label, mode, campaign, binary, *, trace_ioctl=Fal
                 env=env,
                 timeout=config["watchdog_seconds"],
                 trace_ioctl=trace_ioctl,
+                request_mode=request_mode,
                 cancel_on_ir_open=config["cameras"]["ir"] if mode == "cancel" else None,
             )
             result["evaluation"] = trial
             trial["installed_unchanged"] = host.snapshot(config) == before
             safe = harness.trial_checks(
-                trial, mode, config["cameras"]["ir"], config["cameras"]["metadata"]
+                trial,
+                mode,
+                config["cameras"]["ir"],
+                config["cameras"]["metadata"],
+                **checks,
             )
-            candidate = (
-                trial["report"] is not None
-                and trial["report"]["category"] == "candidate_match"
+            candidate = trial["report"] is not None and (
+                trial["report"]["result"]["kind"] == "would_grant"
+                if request_mode
+                else trial["report"]["category"] == "candidate_match"
             )
             if safe and not (mode in {"attack", "impostor", "empty"} and candidate):
                 result.update(status="complete", stop_required=False)
@@ -170,7 +202,6 @@ def main():
         print("root_required", file=sys.stderr)
         return 2
     os.umask(0o077)
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
     # Handle normal terminal/service interruption through cleanup and the ledger.
     def interrupted(signum, frame):
@@ -178,7 +209,9 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        for name in ["runner.py", "host.py", "harness.py"]:
+        if not protect_process():
+            raise ValueError("process_privacy_unavailable")
+        for name in ["runner.py", "host.py", "harness.py", "request_contract.py"]:
             host.trusted_path(Path(__file__).resolve().parent / name)
         config_path = host.trusted_path(args.config)
         output = host.trusted_path(args.output)

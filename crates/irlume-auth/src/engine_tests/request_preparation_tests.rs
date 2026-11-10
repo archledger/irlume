@@ -7,6 +7,9 @@ use irlume_common::split_schema::{AuthorizationRecord, SideFields};
 use irlume_core::storage;
 use std::{cell::Cell, ffi::OsString, path::PathBuf};
 
+#[cfg(feature = "ir-only-evaluation")]
+mod ir_request_evaluation_tests;
+
 struct Fixture {
     dir: PathBuf,
     rgb: String,

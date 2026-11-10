@@ -47,7 +47,8 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   step in `ci.yml` (later steps add swtpm, ffmpeg and more).
 - The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
   directories at system paths, and the daemon's activation-startup,
-  shared-greeter runtime-directory and software-TPM eyes-open tests exec `/usr/bin/bwrap` (Ubuntu 24.04:
+  shared-greeter runtime-directory and software-TPM eyes-open tests, and the
+  optional auth request-evaluator fixture exec `/usr/bin/bwrap` (Ubuntu 24.04:
   `bash scripts/ci-bubblewrap.sh --check`). The selection-provenance CLI test
   also needs bubblewrap, a C compiler, pax-utils `lddtree` and Python
   `jsonschema`; it starts an empty-root sandbox before running the CLI.

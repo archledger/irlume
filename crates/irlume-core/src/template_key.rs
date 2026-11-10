@@ -58,6 +58,12 @@ fn recovery_dir() -> PathBuf {
 pub(crate) struct UserStateLock(std::fs::File);
 
 impl UserStateLock {
+    /// Existing-state diagnostic acquisition: never creates, repairs or waits.
+    #[cfg(any(test, feature = "ir-only-evaluation"))]
+    pub(crate) fn try_acquire_read_only(user: &str) -> Result<Self> {
+        Self::acquire_with_options(user, false, true)
+    }
+
     pub(crate) fn acquire_read_only(user: &str) -> Result<Self> {
         Self::acquire_with_creation(user, false)
     }
@@ -82,6 +88,10 @@ impl UserStateLock {
     }
 
     fn acquire_with_creation(user: &str, create: bool) -> Result<Self> {
+        Self::acquire_with_options(user, create, false)
+    }
+
+    fn acquire_with_options(user: &str, create: bool, nonblocking: bool) -> Result<Self> {
         let dir = key_dir().join(".locks");
         if create {
             let dir_existed = dir.try_exists().unwrap_or(false);
@@ -106,9 +116,9 @@ impl UserStateLock {
             .create(create)
             .truncate(false);
         #[cfg(unix)]
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        options.mode(0o600).custom_flags(
+            libc::O_CLOEXEC | libc::O_NOFOLLOW | if nonblocking { libc::O_NONBLOCK } else { 0 },
+        );
         let file = options
             .open(&path)
             .map_err(|error| Error::Io(format!("open state lock {}: {error}", path.display())))?;
@@ -124,9 +134,11 @@ impl UserStateLock {
             )));
         }
         #[cfg(unix)]
+        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        #[cfg(unix)]
         // SAFETY: `file` owns this live descriptor and the returned guard keeps
         // it open for the whole state transaction.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
             return Err(Error::Io(format!(
                 "lock state transaction {}: {}",
                 path.display(),
@@ -2026,6 +2038,68 @@ mod tests {
         drop(UserStateLock::acquire_read_only("alice").unwrap());
         std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_try_lock_refuses_contention_without_waiting_or_creating_state() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-try-lock"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        assert!(UserStateLock::try_acquire_read_only("alice").is_err());
+        assert!(!dir.exists());
+        let held = UserStateLock::acquire("alice").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(UserStateLock::try_acquire_read_only("alice").is_err())
+                .unwrap();
+        });
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release before asserting so even a blocking regression drains its thread.
+        drop(held);
+        waiter.join().unwrap();
+        assert!(refused.unwrap());
+        drop(UserStateLock::try_acquire_read_only("alice").unwrap());
+        std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_try_lock_refuses_fifo_without_waiting_for_a_writer() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(crate::test_tmp_dir("readonly-lock-fifo"));
+        std::fs::create_dir_all(dir.join(".locks")).unwrap();
+        let previous = std::env::var_os("IRLUME_TEMPLATE_KEY_DIR");
+        std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", &dir);
+        let fifo = dir
+            .join(".locks")
+            .join(format!("{}.lock", irlume_common::sha256_hex(b"u")));
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: cpath is a live NUL-terminated private test path.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(UserStateLock::try_acquire_read_only("u").is_err())
+                .unwrap()
+        });
+        let refused = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Drain a blocking regression before asserting, without leaving a worker behind.
+        let _drain = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        waiter.join().unwrap();
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_TEMPLATE_KEY_DIR", value),
+            None => std::env::remove_var("IRLUME_TEMPLATE_KEY_DIR"),
+        };
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(refused.is_ok_and(|value| value));
     }
 
     #[test]

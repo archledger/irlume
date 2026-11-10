@@ -5,6 +5,8 @@
 import contextlib
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +15,7 @@ from unittest.mock import patch
 
 import runner
 from test_host import config
+from test_request_contract import report as request_report
 
 
 def result(category="candidate_match"):
@@ -58,7 +61,68 @@ def result(category="candidate_match"):
 
 
 class RunnerTests(unittest.TestCase):
-    def execute(self, mode="genuine", outcomes=None, snapshots=None, ready=True):
+    def test_dump_protection_failure_precedes_all_state_reads_and_launch(self):
+        args = [
+            "runner.py",
+            "--config",
+            "/private/config",
+            "--output",
+            "/private/output",
+            "--attempt",
+            "a01",
+            "--mode",
+            "preflight",
+            "--campaign",
+            "development",
+        ]
+        with (
+            patch("sys.argv", args),
+            patch("runner.os.getuid", return_value=0),
+            patch("runner.os.geteuid", return_value=0),
+            patch("runner.os.umask"),
+            patch("runner.resource.setrlimit"),
+            patch("runner.signal.signal"),
+            patch("runner.protect_process", return_value=False, create=True),
+            patch(
+                "runner.host.trusted_path",
+                side_effect=RuntimeError("unexpected state access"),
+            ) as reads,
+            patch("runner.host.snapshot") as snapshot,
+            patch("runner.harness.run_traced") as launch,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(runner.main(), 2)
+            reads.assert_not_called()
+            snapshot.assert_not_called()
+            launch.assert_not_called()
+
+    def test_dump_protection_is_verified_in_a_disposable_process(self):
+        code = """import ctypes, resource, runner
+assert runner.protect_process()
+libc = ctypes.CDLL(None)
+libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+libc.prctl.restype = ctypes.c_int
+assert libc.prctl(3, 0, 0, 0, 0) == 0
+assert resource.getrlimit(resource.RLIMIT_CORE) == (0, 0)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(runner.__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def execute(
+        self,
+        mode="genuine",
+        outcomes=None,
+        snapshots=None,
+        ready=True,
+        config_data=None,
+    ):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         folder = Path(self.tmp.name)
@@ -76,7 +140,9 @@ class RunnerTests(unittest.TestCase):
             ),
             patch("runner.attend", return_value=ready),
         ):
-            runner.execute(config(), folder, "a01", mode, "pilot", "/fixed/binary")
+            runner.execute(
+                config_data or config(), folder, "a01", mode, "pilot", "/fixed/binary"
+            )
         return json.loads((folder / "a01/final.json").read_text())
 
     def test_attack_candidate_stops_and_preserves_categorical_evidence(self):
@@ -130,6 +196,67 @@ class RunnerTests(unittest.TestCase):
         ):
             self.assertFalse(runner.attend("genuine"))
         self.assertNotIn("START", output.getvalue())
+
+    def test_request_mode_binds_namespace_phase_window_and_process_exit(self):
+        cfg = config()
+        del cfg["budget_ms"]
+        cfg.update(
+            schema=2,
+            request_service="kde",
+            expected_window_ms=15000,
+            watchdog_seconds=45,
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+        )
+        preflight = result()
+        preflight["video_events"] = []
+        preflight["report"] = request_report()
+        preflight["report"].update(phase="preflight", result={"kind": "ready"})
+        preflight["report"]["counts"] = dict.fromkeys(preflight["report"]["counts"], 0)
+        preflight["report"]["timings_ms"] = dict.fromkeys(
+            preflight["report"]["timings_ms"], None
+        )
+        trial = result()
+        trial["report"] = request_report()
+        got = self.execute(outcomes=[preflight, trial], config_data=cfg)
+        self.assertEqual(got["status"], "complete")
+        self.assertEqual(got["schema"], 2)
+        self.assertNotIn("budget_ms", got)
+        got = self.execute(
+            mode="impostor", outcomes=[preflight, trial], config_data=cfg
+        )
+        self.assertTrue(got["stop_required"])
+        import copy
+
+        for mutation in ("exit", "phase", "window", "incomplete", "namespace"):
+            bad = copy.deepcopy(trial)
+            if mutation == "exit":
+                bad["returncode"] = 1
+            if mutation == "phase":
+                bad["report"]["phase"] = "preflight"
+            if mutation == "window":
+                bad["report"]["window_ms"] = 5000
+            if mutation == "incomplete":
+                bad["report"]["result"] = {
+                    "kind": "incomplete",
+                    "cause": "missing_evidence",
+                }
+            if mutation == "namespace":
+                bad = result()
+            with self.subTest(mutation=mutation):
+                got = self.execute(outcomes=[preflight, bad], config_data=cfg)
+                self.assertTrue(got["stop_required"])
+
+    def test_request_command_never_overrides_production_window(self):
+        cfg = config()
+        del cfg["budget_ms"]
+        cfg.update(schema=2, request_service="kde", expected_window_ms=15000)
+        with patch(
+            "runner.pwd.getpwuid", return_value=SimpleNamespace(pw_name="fixture")
+        ):
+            command = runner.diagnostic_command(cfg, "/fixed/binary", "evaluate")
+        self.assertNotIn("--budget-ms", command)
+        self.assertEqual(command[command.index("--service") + 1], "kde")
 
 
 if __name__ == "__main__":

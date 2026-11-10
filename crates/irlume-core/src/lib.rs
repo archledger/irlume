@@ -32,6 +32,8 @@ pub mod multi_camera;
 pub mod pad;
 pub mod pcrsig;
 pub mod policy;
+#[cfg(any(test, feature = "ir-only-evaluation"))]
+pub mod read_only;
 pub mod recovery;
 pub(crate) mod replacement;
 pub mod storage;

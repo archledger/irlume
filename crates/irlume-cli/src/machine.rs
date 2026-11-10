@@ -176,7 +176,7 @@ fn error_message(code: &str) -> Option<&'static str> {
         "usage-error" => "Usage error. Run the command with --help.",
         "protocol-error" => "The daemon sent an unexpected response; it may be older than this CLI. Run irlume doctor.",
         "daemon-unavailable" => "irlumed is not running; start it with: sudo systemctl enable --now irlumed.",
-        "keyring-token-armed" => "A login keyring is keyed to an irlume token that this change would stop delivering. Run irlume keyring forget in that account's session first.",
+        "keyring-token-armed" => "A login keyring is keyed to an irlume token that this change would stop delivering. Token disarm is unavailable; retain its envelope and working delivery path.",
         _ => return None,
     })
 }

@@ -178,6 +178,7 @@ pub fn classify(req: &Request) -> Class {
         | TpmEndorsement
         | KeyringInfo { .. }
         | ForgetPassword { .. }
+        | DisarmKeyring { .. }
         | ReleaseTokenForDisarm { .. }
         | RecoverySetup { .. }
         | RecoveryRestore { .. }

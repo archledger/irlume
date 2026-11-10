@@ -908,10 +908,10 @@ pub enum Request {
     /// would replace an armed token with another kind, detected or requested,
     /// and a requested `GnomeKeyringToken` where oo7 keeps the account's
     /// keyrings (oo7 opens them with the login password). Each refusal
-    /// applies to any peer, root included, and changes nothing. Over a token,
-    /// `irlume keyring forget` and a fresh arm are the way back; an envelope
-    /// it cannot read is left for an irlume that can read it. PRIVILEGED:
-    /// root or `user`.
+    /// applies to any peer, root included, and changes nothing. Token disarm
+    /// is unavailable, so over a token the way back is a password login that
+    /// runs irlume's re-seal; an envelope it cannot read is left for an
+    /// irlume that can read it. PRIVILEGED: root or `user`.
     SealPassword {
         user: String,
         password: SecretBytes,
@@ -1032,18 +1032,25 @@ pub enum Request {
     /// daemon from before this request answers with a parse error.
     /// Unprivileged: root or `user`.
     KeyringInfo { user: String },
-    /// Erase `user`'s sealed password (disarms keyring unlock). PRIVILEGED:
-    /// root or `user`.
+    /// Erase `user`'s sealed password or KDE wallet key. irlumed reads the
+    /// envelope's kind on the serialized mutation worker when the request
+    /// runs; a GNOME keyring token envelope is refused and kept (ADR-0003,
+    /// amendment 2026-11-10). PRIVILEGED: root or `user`.
     ForgetPassword { user: String },
-    /// Release `user`'s sealed GNOME keyring token to the caller so `keyring
-    /// forget` can re-key the login keyring BACK to the password before the
-    /// envelope is erased. Without that re-key, deleting a token envelope
-    /// strands the keyring on a secret that no longer exists anywhere.
-    /// `password` must open the token's password wrap, made under the login
-    /// password the token was armed or last re-sealed with; the daemon checks
-    /// it before releasing (the caller proves they could have obtained the
-    /// keyring contents anyway). Refused for envelopes of any other kind.
-    /// PRIVILEGED: root or `user`.
+    /// [`Request::ForgetPassword`] under the name clients send. Only a daemon
+    /// that reads the kind when the request runs knows this name; an older
+    /// daemon answers `Error("bad request")`, and a client treats that as
+    /// final: it never sends `ForgetPassword` in its place. PRIVILEGED: root
+    /// or `user`.
+    DisarmKeyring { user: String },
+    /// Release `user`'s sealed GNOME keyring token to the caller. `password`
+    /// must open the token's password wrap, made under the login password the
+    /// token was armed or last re-sealed with; the daemon checks it before
+    /// releasing (the caller proves they could have obtained the keyring
+    /// contents anyway). Refused for envelopes of any other kind. The
+    /// envelope stays armed afterwards. No current client sends this; an
+    /// `irlume` CLI from before `DisarmKeyring` does, in `keyring forget`
+    /// (ADR-0003, amendment 2026-11-10). PRIVILEGED: root or `user`.
     ReleaseTokenForDisarm { user: String, password: SecretBytes },
     /// Re-seal `user`'s login password against the *current* PCR policy, but
     /// ONLY if a sealed password is already armed (never auto-arms a fresh user)
@@ -2066,13 +2073,8 @@ pub enum Response {
     TokenSealed {
         token: SecretBytes,
         /// Whether the token was freshly minted (first arm) or reused from an
-        /// existing envelope (re-arm). Governs the caller's failure handling:
-        /// a minted envelope may be rolled back with `ForgetPassword` once
-        /// the caller has shown the keyring never took the token (a re-key
-        /// whose answer was lost may have landed); a reused one may hold the
-        /// LIVE keyring credential and must never be deleted on error.
-        /// Defaults to `false`, the never-delete reading, so an older caller
-        /// cannot inherit the destructive branch.
+        /// existing envelope (re-arm). Informational only: a caller whose
+        /// arm fails keeps the envelope either way.
         #[serde(default)]
         minted: bool,
     },
@@ -2112,9 +2114,10 @@ pub enum Response {
         #[serde(default)]
         drifted: Option<bool>,
         /// What kind of secret is armed. `None` from a daemon predating #250's
-        /// GNOME half, or when nothing is armed. `keyring forget` routes on
-        /// this: a token disarm must re-key the keyring back to the password
-        /// first, a password disarm just deletes the envelope.
+        /// GNOME half, or when nothing is armed. For status surfaces, and
+        /// `keyring forget` reads it to refuse a token before it prompts or
+        /// sends a disarm. irlumed reads the kind again when a disarm runs,
+        /// so no disarm depends on this reply.
         #[serde(default)]
         kind: Option<KeyringSecretKind>,
     },
@@ -3129,6 +3132,34 @@ mod tests {
             report,
             tpm_endorsement::EndorsementReport::stopped("the endorsement hierarchy is disabled")
         );
+    }
+
+    #[test]
+    fn disarm_keyring_is_additive_and_never_decodes_as_legacy_forget() {
+        #[derive(serde::Deserialize)]
+        #[expect(dead_code, reason = "models the old decoder")]
+        enum OldRequest {
+            ForgetPassword {
+                user: String,
+            },
+            ReleaseTokenForDisarm {
+                user: String,
+                password: super::SecretBytes,
+            },
+        }
+        let request = super::Request::DisarmKeyring {
+            user: "alice".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(wire, r#"{"DisarmKeyring":{"user":"alice"}}"#);
+        assert!(
+            serde_json::from_str::<OldRequest>(&wire).is_err(),
+            "a decoder without the request must not read it as another one"
+        );
+        match serde_json::from_str::<super::Request>(&wire).unwrap() {
+            super::Request::DisarmKeyring { user } => assert_eq!(user, "alice"),
+            other => panic!("wrong request: {other:?}"),
+        }
     }
 
     #[test]

@@ -2045,7 +2045,7 @@ fn split_json_flags_preserve_serials_and_older_daemon_never_triggers_fallback() 
 }
 
 #[test]
-fn wallet_forget_refuses_failed_or_unexpected_inspection_unless_force_is_explicit() {
+fn wallet_forget_refuses_failed_or_unexpected_inspection_even_with_force() {
     for (tag, response) in [
         ("error", Response::Error("fixture kind query failed".into())),
         ("unexpected", Response::Pong),
@@ -2064,10 +2064,12 @@ fn wallet_forget_refuses_failed_or_unexpected_inspection_unless_force_is_explici
         );
         let (code, out, err) =
             run(&mut sb.cmd(&["keyring", "forget", "--force", "--user", "tester"]));
-        assert_eq!(code, 0, "{out} {err}");
-        assert!(
-            matches!(log.lock().unwrap().last(), Some(Request::ForgetPassword { user }) if user == "tester")
-        );
+        assert_ne!(code, 0, "{out} {err}");
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| matches!(request, Request::KeyringInfo { .. })));
     }
 }
 
@@ -2098,17 +2100,115 @@ fn biopolicy_write_refuses_unknown_content_and_preserves_other_preferences() {
 }
 
 #[test]
+fn wallet_forget_refuses_a_token_before_asking_or_sending_anything() {
+    let sb = Sandbox::new("forget-token");
+    let runtime = sb.path("run");
+    std::fs::create_dir_all(runtime.join("keyring")).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(
+        irlume_common::gkr_wire::control_socket_path(&runtime),
+    )
+    .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let log = serve(&sock(&sb), |request| match request {
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: true,
+            policy: None,
+            pcrs: Vec::new(),
+            drifted: None,
+            kind: Some(irlume_common::KeyringSecretKind::GnomeKeyringToken),
+        },
+        // Answered and logged, so the assertions below see any request
+        // beyond the kind query.
+        _ => Response::Error("fixture: only KeyringInfo is expected".into()),
+    });
+    for (sent, args) in [
+        (1, &["keyring", "forget", "--user", "tester"][..]),
+        (2, &["keyring", "forget", "--force", "--user", "tester"][..]),
+    ] {
+        // Stdin is closed: a password prompt would end "empty password".
+        let (code, out, err) = run(sb.cmd(args).env("XDG_RUNTIME_DIR", &runtime));
+        assert_eq!(code, 1, "{args:?}: {out} {err}");
+        assert!(
+            err.contains("token envelope is kept") && err.contains("stays armed"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains("empty password"), "{args:?}: {err}");
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), sent, "{args:?}: {log:?}");
+        assert!(
+            log.iter()
+                .all(|request| matches!(request, Request::KeyringInfo { .. })),
+            "{args:?}: {log:?}"
+        );
+    }
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "nothing connects to the gnome-keyring control socket"
+    );
+}
+
+#[test]
+fn wallet_forget_requires_new_daemon_and_never_retries_legacy_delete() {
+    for kind in [
+        irlume_common::KeyringSecretKind::LoginPassword,
+        irlume_common::KeyringSecretKind::KdeWalletKey,
+    ] {
+        let sb = Sandbox::new("forget-old-daemon");
+        let log = serve(&sock(&sb), move |request| match request {
+            Request::KeyringInfo { .. } => Response::KeyringInfo {
+                armed: true,
+                policy: None,
+                pcrs: Vec::new(),
+                drifted: None,
+                kind: Some(kind),
+            },
+            Request::DisarmKeyring { .. } => Response::Error("bad request".into()),
+            Request::ForgetPassword { .. } => Response::PasswordForgotten,
+            _ => panic!("unexpected request"),
+        });
+        let (code, _, err) = run(&mut sb.cmd(&["keyring", "forget", "--user", "tester"]));
+        assert_ne!(code, 0);
+        assert!(err.contains("newer irlumed"), "{err}");
+        assert!(matches!(
+            log.lock().unwrap().as_slice(),
+            [Request::KeyringInfo { .. }, Request::DisarmKeyring { .. }]
+        ));
+    }
+}
+
+#[test]
+fn wallet_forget_stale_non_token_snapshot_cannot_bypass_daemon_refusal() {
+    let sb = Sandbox::new("forget-stale-kind");
+    let log = serve(&sock(&sb), |request| match request {
+        Request::KeyringInfo { .. } => Response::KeyringInfo {
+            armed: true,
+            policy: None,
+            pcrs: Vec::new(),
+            drifted: None,
+            kind: Some(irlume_common::KeyringSecretKind::LoginPassword),
+        },
+        Request::DisarmKeyring { .. } => Response::Error("token now armed; kept".into()),
+        Request::ForgetPassword { .. } => panic!("must not bypass current-envelope guard"),
+        _ => panic!("unexpected request"),
+    });
+    let (code, _, err) = run(&mut sb.cmd(&["keyring", "forget", "--user", "tester"]));
+    assert_ne!(code, 0);
+    assert!(err.contains("token now armed; kept"), "{err}");
+    assert_eq!(log.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn keyring_success_paths_with_a_live_daemon() {
     let sb = Sandbox::new("keyringok");
     sb.fake_tester_home_without_keyring();
     let log = serve(&sock(&sb), |req| match req {
         Request::SealPassword { .. } => Response::PasswordSealed,
         Request::HasSealedPassword { .. } => Response::HasPassword(true),
-        Request::ForgetPassword { .. } => Response::PasswordForgotten,
+        Request::DisarmKeyring { .. } => Response::PasswordForgotten,
         // `forget` asks what is armed before erasing it, and refuses when it
         // cannot tell: erasing a GNOME keyring token leaves the login keyring
         // encrypted under a secret nothing can reproduce. This user has a
-        // password armed, which is safe to erase directly.
+        // password armed, which irlumed erases on `DisarmKeyring`.
         Request::KeyringInfo { .. } => Response::KeyringInfo {
             armed: true,
             policy: None,
@@ -2188,11 +2288,11 @@ fn serve_keyring_control(runtime_dir: &std::path::Path) {
 /// On Fedora 45 the login screen unlocks the login keyring through oo7, which
 /// migrates it with the login password, so a keyring keyed to an irlume token
 /// does not carry over. On Fedora 43 and 44 a token arm is told, by
-/// `keyring arm`, `keyring status` and both doctor reports, to re-key back
-/// with `keyring forget` before upgrading. Other answers and other releases
+/// `keyring arm`, `keyring status` and both doctor reports, to retain the token
+/// and postpone migration while token disarm is unavailable. Other answers and releases
 /// stay quiet, each with the check state that says why.
 #[test]
-fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
+fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
     use irlume_common::KeyringSecretKind as K;
     const FEDORA_44: &str = "NAME=\"Fedora Linux\"\nVERSION=\"44 (Workstation Edition)\"\n\
                        ID=fedora\nVERSION_ID=44\nVARIANT_ID=workstation\n";
@@ -2200,7 +2300,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_forget_before_upgrading_to_45() {
     const FEDORA_45: &str = "NAME=\"Fedora Linux\"\nID=fedora\nVERSION_ID=45\n";
     const DEBIAN: &str = "ID=debian\nVERSION_ID=\"13\"\n";
     const NOTICE: &str = "Before upgrading to Fedora 45";
-    const FORGET: &str = "irlume keyring forget";
+    const FORGET: &str = "GNOME token disarm is currently unavailable";
     const STATUS: &[&str] = &["keyring", "status", "--user", "tester"];
     // The fake daemon reports `armed` and `kind`, and answers a seal with a
     // fresh token. Failing package probes keep doctor's install-origin step
@@ -2869,8 +2969,8 @@ fn keyring_arm_keeps_an_armed_token_where_oo7_provides_secrets() {
     for part in [
         "GNOME keyring token armed",
         "nothing was changed",
-        "irlume keyring forget",
-        "gnome-keyring running",
+        "GNOME token disarm is currently unavailable",
+        "retain the envelope and do not replace it",
     ] {
         assert!(err.contains(part), "{part}: {err}");
     }
@@ -3047,8 +3147,7 @@ fn reseal_on_nixos_keeps_to_the_login_password() {
     };
 
     // A wallet key or token names `forget` and docs/NIXOS.md. An unreadable
-    // envelope gets irlumed's own advice instead: keep the file, which
-    // `forget --force` would delete.
+    // envelope gets irlumed's own advice instead: keep the file as it is.
     for (tag, kind, refusal, forget) in [
         (
             "gt",
@@ -4255,7 +4354,8 @@ session    optional                     pam_irlume.so reseal\n";
     assert_eq!(code, 1, "{out}\n{err}");
     assert!(
         err.contains("login keyring of alice is keyed to an irlume-held token")
-            && err.contains("irlume keyring forget")
+            && err.contains("token disarm is unavailable")
+            && err.contains("does not migrate the keyrings or authorize token deletion")
             && err.contains("--force"),
         "{out}\n{err}"
     );
@@ -4914,7 +5014,7 @@ fn fake_login_gnome_keyring_child() {
 /// keyring is GNOME's, would re-key the keyring to a token that is never
 /// delivered at login. `keyring arm` refuses it before `SealPassword`, so
 /// nothing is minted or replaced. Where irlumed would seal no token, the arm
-/// goes ahead, and a token sealed anyway is rolled back without a re-key.
+/// goes ahead, and a token sealed anyway is retained without a re-key.
 #[test]
 fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initialized() {
     let mut sb = Sandbox::new("gkr-uninitialized");
@@ -5010,16 +5110,13 @@ fn a_token_arm_is_refused_before_sealing_where_gnome_keyring_was_never_initializ
 
     // No login keyring in the home: irlumed seals a login password, so the
     // arm is not stopped here. The fixture daemon answers with a token all
-    // the same, and the arm then rolls it back without sending a re-key.
+    // the same, and the arm then retains it without sending a re-key.
     let (code, text, requests) = arm("false");
     assert_ne!(code, 0, "{text}");
     assert!(text.contains("not a GNOME session"), "{text}");
-    assert!(text.contains("rolled back"), "{text}");
+    assert!(text.contains("kept"), "{text}");
     assert!(
-        matches!(
-            requests.as_slice(),
-            [Request::SealPassword { .. }, Request::ForgetPassword { .. }]
-        ),
+        matches!(requests.as_slice(), [Request::SealPassword { .. }]),
         "{requests:?}"
     );
 

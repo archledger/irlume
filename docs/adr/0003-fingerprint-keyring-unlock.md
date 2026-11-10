@@ -494,3 +494,180 @@ opening marks it consumed before resealing, making a credential request or
 delivering to a helper. That transition needs no fallible PAM-data replacement.
 Failure to create the state before any side effect can be retried by a later
 session call; it never permits a second release after consumption.
+
+## Amendment 2026-11-10: a GNOME keyring token arm is one-way
+
+This amendment records the disarm side of a GNOME keyring token arm. It
+changes no authentication decision, PAD requirement, release gate or
+credential kind. The 2026-10-03 ordering, a durable envelope before the
+keyring is re-keyed, stays the recovery boundary for arming.
+
+### 1. A token envelope is kept while its holders cannot be excluded
+
+Arming re-keys the login keyring to a random token; the envelope under
+`/var/lib/irlume/keyring` is irlumed's copy of that token. A holder, in this
+amendment, is a client that has received the token from irlumed and can
+present it to gnome-keyring, to unlock the keyring or to re-key it, at any
+later time. The uninstall and login guards use the word differently: their
+"token holders" (`sealed_token_holders`) are the accounts that have a token
+envelope.
+
+A login delivers the token in the root-only `UnsealPassword` and
+`UnsealKeyring` replies to the PAM transaction, which hands it to
+`irlume-gkr-unlock`; that helper presents the token to gnome-keyring to
+unlock the keyring and sets no other credential. Outside a login the token
+leaves irlumed in two replies, each to root or the account's owner:
+
+- `TokenSealed`, answering a `SealPassword` that armed or re-armed a token (a
+  re-arm returns the token already armed);
+- `PasswordUnsealed { kind: GnomeKeyringToken }`, answering
+  `ReleaseTokenForDisarm`.
+
+irlumed cannot establish that no holder remains:
+
+- it keeps no record of the tokens it returned, and a record held in memory
+  would not survive a restart;
+- an older client takes part in no newer exchange;
+- a correct password and an unchanged envelope show what the requester knows,
+  not what a holder does later;
+- a count or a deadline must never expire into permission to remove.
+
+While a holder remains, the keyring can be keyed to the token at any later
+time, and without the envelope nothing can reproduce that secret. No irlume
+request, command or flag therefore removes a token envelope. An envelope
+irlumed cannot read may be a token and is kept under the same rule.
+Login-password and KDE wallet-key envelopes are outside it:
+`irlume keyring forget` erases them.
+
+### 2. `DisarmKeyring { user }`
+
+`irlume keyring forget` sends `DisarmKeyring { user }`. The request carries
+no kind, password or flag. irlumed reads the envelope's kind when the request
+runs, on the single mutation worker and serialized with `SealPassword` and
+`ResealPassword`, so the answer follows the envelope of that moment, whatever
+an earlier `KeyringInfo` reply said.
+
+| Table | `DisarmKeyring` |
+|---|---|
+| `posture` | `RootOrTarget` (verb "forget password for"), enrollment `Reads`, camera `NoCapture` |
+| `classify` | `Plain` |
+| `approval_operation` | `None` |
+| `request_kind` | `WalletUpdate`, mutating |
+| `diagnostic_operation_class` | `Status` |
+
+It shares its dispatch arm and its function (`forget_non_token`) with
+`ForgetPassword`. The reply is `PasswordForgotten` after a login-password or
+KDE wallet-key envelope is erased, and when no envelope exists. For a token
+envelope, or one irlumed cannot read, the reply is an error and the envelope
+is kept.
+
+Mixed versions: only a daemon that reads the kind when the request runs
+knows the name. An older daemon answers `Error("bad request")`; the client
+treats that as final, reports that irlumed needs a restart after the upgrade,
+and never sends `ForgetPassword` in its place. `ForgetPassword` stays for
+older clients and runs the same code.
+
+### 3. `ReleaseTokenForDisarm` remains for older clients
+
+No current client sends `ReleaseTokenForDisarm`. The request stays on the
+wire as it is, for an older CLI whose `keyring forget` sends it.
+
+| Table | `ReleaseTokenForDisarm` |
+|---|---|
+| `posture` | `RootOrTarget` (verb "release the keyring token for"), enrollment `Reads`, camera `NoCapture` |
+| `classify` | `Plain` |
+| `approval_operation` | `None` |
+| `request_kind` | `WalletAuthentication`, not mutating |
+| `diagnostic_operation_class` | `Authentication` |
+
+It answers `PasswordUnsealed { kind: GnomeKeyringToken }` once the supplied
+password opens the token's password wrap, and the envelope stays armed.
+
+An older CLI then re-keys the keyring back to the password and sends
+`ForgetPassword`, which is refused under section 2. The end state is a
+keyring keyed to the password, a token envelope still armed, and a CLI that
+reports the forget as failed. A face or fingerprint login then leaves the
+keyring locked, since the delivered token does not open it. A later
+`irlume keyring arm` re-keys the keyring to the same token where irlumed
+can check the password against the login hash. Where it cannot (the
+shipped AppArmor profile, LDAP, SSSD), irlumed refuses a re-arm over an
+armed token, and this end state stays.
+
+### 4. What a disarm would need
+
+Token disarm stays unavailable until a separate decision record defines it.
+That record has to provide:
+
+- the release and the re-key back as one account-bound transaction under
+  irlumed's control, with the envelope removed only on confirmed success;
+- a transaction that fails closed across a daemon restart: an interrupted
+  one keeps the envelope;
+- the retirement of `ReleaseTokenForDisarm`;
+- a rule for envelopes armed earlier, whose holders are unknown.
+
+### Consequences
+
+- `irlume keyring forget` refuses a GNOME keyring token with no prompt and no
+  disarm request, with or without `--force`. It refuses the same way when
+  irlumed does not report the envelope's kind or cannot read the envelope.
+  The read-only `KeyringInfo` reply gives the CLI the kind; irlumed decides
+  again when `DisarmKeyring` runs.
+- `irlume uninstall` refuses while an account has a token envelope. It reads
+  the stores again after irlumed has stopped and before any envelope,
+  enrollment or state tree is removed; a refusal at that point leaves PAM
+  un-wired, irlumed stopped, and the data and the installation in place.
+- `irlume login disable`, and any other run that would remove the session
+  line that delivers a token, refuses while an account has a token envelope.
+  `--force` passes that wiring guard only: it removes the delivery line and
+  keeps the envelope, and the keyring then stays locked.
+- A token arm on Fedora 43 or 44 has no supported path to Fedora 45, where
+  the login screen unlocks the login keyring through oo7.
+- A login with a typed password, on a stack wired with the re-seal, repairs
+  one change at a time. After a password change the seal opens and the wrap
+  moves to the new password; after a firmware or Secure Boot change the
+  typed password opens the wrap and the seal is bound again. When both have
+  changed since the last such login, neither half opens: the envelope is
+  left as it is and the token cannot be delivered. The two exits are the
+  earlier boot state and the earlier password, each followed by such a
+  login.
+- A token envelope recorded for another uid, as after an account name is
+  reused, is not released, not re-sealed, not returned for a re-arm and not
+  removed.
+- A re-key that fails after the seal leaves a token envelope, which counts
+  as a token for every guard above. A later `irlume keyring arm`, run in the
+  account's own graphical session, completes the re-key where irlumed can
+  check the password against the login hash. Where it cannot, that arm is
+  refused: the envelope stays, the keyring stays keyed to the password, and
+  a face or fingerprint login leaves the keyring locked.
+- An arm of another kind over a token is refused and changes nothing.
+
+### Acceptance tests
+
+- `irlume-common`:
+  `disarm_keyring_is_additive_and_never_decodes_as_legacy_forget` pins the
+  wire form.
+- `irlume-core`:
+  `a_token_envelope_stays_armed_after_a_release_and_a_refused_forget`,
+  `non_token_forget_refuses_tokens_and_unknown_formats`,
+  `a_sealed_secret_recorded_for_another_uid_is_not_released` and
+  `rearming_reuses_the_existing_token_rather_than_minting`; on a software
+  TPM, `a_token_envelope_heals_from_whichever_half_survives` covers the
+  one-change repairs and the refusal of the combined case.
+- `irlume-daemon`:
+  `a_disarm_keeps_a_token_envelope_under_either_request_name`,
+  `a_release_then_a_forget_leaves_the_token_envelope_armed`,
+  `an_account_disarms_its_own_keyring_and_no_other`,
+  `legacy_forget_refuses_a_new_token_after_stale_password_observation`,
+  `a_checked_seal_never_replaces_a_token_or_an_unreadable_envelope` and
+  `an_arm_on_an_oo7_home_keeps_an_armed_token`; on a software TPM,
+  `tpm_unverified_reseal_rewraps_the_token_under_the_new_password`,
+  `tpm_owner_reseal_leaves_the_token_envelope_unchanged` and
+  `tpm_a_checked_new_password_rewraps_the_token`.
+- `irlume-cli`:
+  `wallet_forget_refuses_a_token_before_asking_or_sending_anything`,
+  `wallet_forget_stale_non_token_snapshot_cannot_bypass_daemon_refusal`,
+  `a_minted_token_is_kept_when_the_rekey_answer_is_lost`,
+  `a_token_arm_in_a_session_without_an_initialized_gnome_keyring_sends_nothing`,
+  `token_free_refuses_a_token_and_passes_a_sweep_error_through` and
+  `teardown_rereads_the_stores_after_the_stop_and_before_any_data_removal`,
+  which reads `uninstall.rs` as text and pins the order of the calls.

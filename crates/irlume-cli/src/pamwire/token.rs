@@ -8,7 +8,7 @@
 //! login screen's PAM stack, which hands the token to gnome-keyring once the
 //! session is open. Without that line every login leaves the keyring locked,
 //! a typed password included, under a secret the user has never seen, and
-//! only `irlume keyring forget` from inside a session gets it back.
+//! its envelope must be retained until a supported token migration exists.
 //!
 //! So an arm that would mint a token refuses where no login would deliver it
 //! ([`token_delivery_refusal`]), and a disable that removes the line refuses
@@ -266,9 +266,9 @@ pub(super) fn stranded_lines(users: &[String]) -> [String; 2] {
              stay locked at every login, a typed password included.",
             users.join(", ")
         ),
-        "[login] Have each of these users run `irlume keyring forget` in their own session \
-         first (it re-keys the keyring back to their password), or re-run with --force to go \
-         ahead anyway."
+        "[login] GNOME token disarm is unavailable. Retain the envelopes and working \
+         delivery path. --force bypasses this wiring guard only; it does not migrate \
+         the keyrings or authorize token deletion."
             .to_string(),
     ]
 }
@@ -758,8 +758,11 @@ mod tests {
         let [what, how] = stranded_lines(&["alice".to_string(), "bob".to_string()]);
         assert!(what.contains("keyring of alice, bob"), "{what}");
         assert!(
-            how.contains("irlume keyring forget") && how.contains("--force"),
+            how.contains("token disarm is unavailable")
+                && how.contains("--force bypasses this wiring guard only")
+                && how.contains("does not migrate the keyrings or authorize token deletion"),
             "{how}"
         );
+        assert!(!how.contains("keyring forget"), "{how}");
     }
 }

@@ -157,14 +157,17 @@ in sync after a password change:
 With a GNOME keyring token arm, the login keyring is keyed to a random token,
 not to your password, so steps 2 and 3 are not needed: the first login where you
 type the new password at a login screen wired with irlume's re-seal moves
-irlume's copy to it. Until then, `irlume keyring forget` asks for the previous
-password. Where irlumed cannot read your login hash (LDAP or SSSD accounts, and
-the AppArmor profile that the Debian, Ubuntu, Mint and Arch packages install),
-`irlume keyring arm` does not re-arm over the token. To arm again there anyway,
-log in once by typing your new password at such a screen, then run
-`irlume keyring forget` with it, then `irlume keyring arm`. If a firmware
-update also landed before that login, the login cannot update irlume's copy;
-use the previous password with `irlume keyring forget` instead.
+irlume's copy to it. Make that login before a firmware or Secure Boot change:
+once both have changed, irlume cannot deliver the token until the earlier boot
+state or the earlier password is back and you type the password at such a login
+screen ([docs/SETUP.md](SETUP.md), "Keyring unlock"). Where irlumed cannot read
+your login hash (LDAP or SSSD accounts, and the AppArmor profile that the
+Debian, Ubuntu, Mint and Arch packages install), `irlume keyring arm` does not
+re-arm over the token, and with token disarm unavailable there is currently no
+way to replace it: keep the token, which keeps working once its arm completed,
+and whose password copy follows that next password login. A token arm whose
+keyring re-key did not complete cannot be finished there: the keyring stays
+keyed to your password, and a face or fingerprint login leaves it locked.
 
 Rule of thumb: with a login-password or KDE wallet-key arm
 (`irlume keyring status` shows which), whenever the wallet password changes,

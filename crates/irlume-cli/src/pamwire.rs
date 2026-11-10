@@ -2066,8 +2066,8 @@ pub(crate) fn tokens_a_run_strands(enable: bool) -> Result<Vec<String>, String> 
         }
         // A login screen remote users reach loses its lines whatever a
         // token needs: leaving a face line there is the worse failure,
-        // and the envelope still lets `irlume keyring forget` re-key the
-        // keyring back (`greeter_want`, `remote_seats`).
+        // and the token's envelope stays for recovery. Token disarm is not
+        // available (`greeter_want`, `remote_seats`).
         let probed = (want && !blocked)
             .then(|| wire_service(svc, true, false, wire).ok())
             .flatten();
@@ -2943,8 +2943,8 @@ fn act_holding_lock(
             println!(
                 "  {}: irlume's reseal lines cannot be placed here, so every irlume line \
                  comes out; a GNOME keyring token armed for an account is no longer \
-                 delivered at this login screen (`irlume keyring forget` re-keys the \
-                 keyring back to the password)",
+                 delivered at this login screen. Retain its envelope; token disarm \
+                 is unavailable",
                 s.etc
             );
         }

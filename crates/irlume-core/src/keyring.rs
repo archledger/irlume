@@ -208,7 +208,8 @@ pub fn rearm_gnome_token(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8
             let Some(wrap) = env.password_wrap.as_ref() else {
                 return Err(Error::Policy(format!(
                     "keyring token for '{user}': TPM unseal failed ({unseal_err}) and the \
-                     envelope has no password wrap; `irlume keyring forget --force` and re-arm"
+                     envelope has no password wrap; keep it for recovery. GNOME token disarm \
+                     is currently unavailable"
                 )));
             };
             crate::recovery::unwrap(password, wrap).map_err(|_| {
@@ -783,13 +784,14 @@ fn reseal_token(
 }
 
 /// Release `user`'s sealed GNOME keyring token to a caller who proves they
-/// know the login password, for `keyring forget`'s re-key-back step.
+/// know the login password. Serves `ReleaseTokenForDisarm`, which an `irlume`
+/// CLI from before `DisarmKeyring` sends; the envelope stays armed afterwards.
 ///
 /// The proof is the envelope's own password wrap: only the right password
 /// opens it (AES-GCM authenticates), so no shadow lookup is needed, and it
-/// works with the TPM seal broken, which is exactly when a disarm matters
-/// most. Fails closed: a wrong password, a stale wrap (password changed with
-/// no login since), and a non-token envelope are all refusals, each named.
+/// works with the TPM seal broken. Fails closed: a wrong password, a stale
+/// wrap (password changed with no login since), and a non-token envelope
+/// are all refusals, each named.
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let path = envelope_path(user);
@@ -797,6 +799,14 @@ pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroiz
         return Err(Error::Policy(format!("no sealed secret for '{user}'")));
     }
     let env = SealedEnvelope::load(&path)?;
+    release_token_from_envelope(user, password, &env)
+}
+
+fn release_token_from_envelope(
+    user: &str,
+    password: &[u8],
+    env: &SealedEnvelope,
+) -> Result<Zeroizing<Vec<u8>>> {
     // A token sealed for another uid is not released, whatever password
     // opens its wrap.
     Account::new(user).require(record_for(env.secret), env.uid)?;
@@ -818,6 +828,36 @@ pub fn release_token_with_password(user: &str, password: &[u8]) -> Result<Zeroiz
                 .into(),
         )
     })
+}
+
+/// The refusal for a GNOME keyring token envelope: irlume keeps it (ADR-0003,
+/// amendment 2026-11-10).
+fn token_disarm_unavailable() -> Error {
+    Error::Policy(
+        "GNOME token disarm is unavailable: outstanding token holders cannot be excluded; \
+         the token envelope was retained and keyring unlock is still armed"
+            .into(),
+    )
+}
+
+/// Erase `user`'s sealed login password or KDE wallet key. The kind is the
+/// one read here, from the envelope as it is when this runs; a GNOME keyring
+/// token envelope is kept. The caller must serialize the read and the removal
+/// against arm and reseal, as the daemon mutation worker does. A missing
+/// envelope is already disarmed.
+///
+/// # Errors
+/// Refuses a token or an unreadable envelope, or reports a failed removal.
+pub fn forget_non_token(user: &str) -> Result<()> {
+    let path = envelope_path(user);
+    if !path.try_exists().map_err(|e| Error::Io(e.to_string()))? {
+        return Ok(());
+    }
+    let env = SealedEnvelope::load(&path)?;
+    if env.secret == SecretKind::GnomeKeyringToken {
+        return Err(token_disarm_unavailable());
+    }
+    forget_password(user)
 }
 
 /// Whether `user` has a sealed password armed.
@@ -979,6 +1019,61 @@ mod tests {
         }
     }
 
+    /// A token envelope stays armed through a release and a forget: the
+    /// forget is refused, the file is byte for byte the same, and the same
+    /// password releases the same token afterwards.
+    #[test]
+    fn a_token_envelope_stays_armed_after_a_release_and_a_refused_forget() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-disarm-kept");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "disarm-owner";
+        let _account = crate::account::remember(user, 4302);
+        let before = plant_envelope(user, SecretKind::GnomeKeyringToken, Some(4302));
+        let token = release_token_with_password(user, b"old password").unwrap();
+        assert_eq!(&*token, b"old token");
+        let refusal = forget_non_token(user).unwrap_err().to_string();
+        assert!(
+            refusal.contains("token disarm is unavailable") && refusal.contains("still armed"),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read(envelope_path(user)).unwrap(), before);
+        assert_eq!(
+            &*release_token_with_password(user, b"old password").unwrap(),
+            &*token
+        );
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_token_forget_refuses_tokens_and_unknown_formats() {
+        let _g = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _tpm = crate::testenv::NoTpm::set();
+        let dir = crate::test_tmp_dir("kr-forget-kinds");
+        std::env::set_var("IRLUME_KEYRING_DIR", &dir);
+        let user = "forget-owner";
+        for kind in [SecretKind::LoginPassword, SecretKind::KdeWalletKey] {
+            plant_envelope(user, kind, None);
+            forget_non_token(user).unwrap();
+            assert!(!envelope_path(user).exists());
+        }
+        let token = plant_envelope(user, SecretKind::GnomeKeyringToken, None);
+        let refusal = forget_non_token(user).unwrap_err().to_string();
+        assert!(refusal.contains("token disarm is unavailable"), "{refusal}");
+        assert_eq!(std::fs::read(envelope_path(user)).unwrap(), token);
+        std::fs::write(envelope_path(user), b"unknown format").unwrap();
+        assert!(forget_non_token(user).is_err());
+        assert!(envelope_path(user).exists());
+        std::env::remove_var("IRLUME_KEYRING_DIR");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A keyring envelope records the uid it was armed for. One recorded for
     /// another uid is not released (face or fingerprint path), not returned
     /// for a re-arm or a disarm, even with the password that opens its wrap,
@@ -1011,7 +1106,12 @@ mod tests {
 
         let before = plant_envelope(user, SecretKind::GnomeKeyringToken, Some(4301));
         let error = unseal_error(user);
-        assert!(error.contains("keyring forget --force"), "{error}");
+        assert!(
+            error.contains("token disarm is currently unavailable")
+                && error.contains("`irlume keyring forget --force` does not erase it")
+                && error.contains("the envelope is kept as it is"),
+            "{error}"
+        );
         let error = release_token_with_password(user, b"old password")
             .unwrap_err()
             .to_string();

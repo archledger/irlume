@@ -13,29 +13,20 @@
 //! `--login` daemon of this uid while `org.gnome.keyring` has no owner is one
 //! that nothing has initialized.
 //!
-//! `irlume keyring forget` initializes such a daemon the way a GNOME session
-//! does when it refuses the change back ([`initialize_for_forget`]). A token
-//! arm refuses there instead ([`token_arm_refusal`]): a token is only
+//! A token arm refuses there ([`token_arm_refusal`]): a token is only
 //! delivered once a GNOME session initializes gnome-keyring, so a token armed
 //! from this session would never unlock the keyring. It refuses, too, where
 //! no login would deliver the token at all
 //! ([`crate::pamwire::token_delivery_refusal`]).
 //!
 //! D-Bus goes through `busctl --user --auto-start=no`, as in
-//! [`crate::secrets`], and no secret goes near it. Only
-//! [`initialize_for_forget`] starts a service.
+//! [`crate::secrets`], and no secret goes near it. Nothing here starts a
+//! service.
 
 use std::path::{Path, PathBuf};
 
 /// The name gnome-keyring claims once it is initialized.
 const KEYRING_BUS: &str = "org.gnome.keyring";
-/// The Secret Service name, which gnome-keyring claims next.
-const SECRETS_BUS: &str = "org.freedesktop.secrets";
-/// How long `busctl` waits for the reply to `StartServiceByName`. The bus
-/// itself may wait longer (dbus-daemon's session.conf allows 120 s, and
-/// dbus-broker leaves it to the systemd job), so this is the bound `forget`
-/// relies on. Activation normally answers within a second.
-const START_TIMEOUT_SECS: u32 = 30;
 
 /// Why a token arm stops in a session whose gnome-keyring the login screen
 /// started and nothing initialized. Callers add what happened to the arm.
@@ -94,10 +85,6 @@ pub(crate) trait Session {
     /// Whether `name` has an owner on the user bus; `None` when the bus
     /// could not be asked.
     fn has_owner(&self, name: &str) -> Option<bool>;
-    /// The pid of `name`'s owner, or `None`.
-    fn owner_pid(&self, name: &str) -> Option<u32>;
-    /// `StartServiceByName(name)`, the one call here that starts anything.
-    fn start_service(&self, name: &str) -> Result<(), String>;
 }
 
 /// The real session: the control socket under `runtime_dir`, `/proc` and
@@ -134,36 +121,6 @@ impl Session for Live {
             crate::secrets::busctl_output_within(3, &bus_driver_call("NameHasOwner", name))?;
         parse_bool_reply(&reply)
     }
-
-    fn owner_pid(&self, name: &str) -> Option<u32> {
-        let reply = crate::secrets::busctl_output_within(
-            3,
-            &bus_driver_call("GetConnectionUnixProcessID", name),
-        )?;
-        parse_u32_reply(&reply)
-    }
-
-    fn start_service(&self, name: &str) -> Result<(), String> {
-        let reply = crate::secrets::busctl_output_within(
-            START_TIMEOUT_SECS,
-            &[
-                "call",
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "StartServiceByName",
-                "su",
-                name,
-                "0",
-            ],
-        )
-        .ok_or_else(|| format!("the user bus did not start {name}"))?;
-        // 1: started; 2: it already had an owner.
-        match parse_u32_reply(&reply) {
-            Some(1 | 2) => Ok(()),
-            _ => Err(format!("unexpected reply to starting {name}")),
-        }
-    }
 }
 
 /// `busctl` arguments for a one-string-argument call to the bus driver.
@@ -188,14 +145,6 @@ fn parse_bool_reply(reply: &str) -> Option<bool> {
     }
 }
 
-/// A `busctl call` reply of one `u32`, such as `u 1234`.
-fn parse_u32_reply(reply: &str) -> Option<u32> {
-    match reply.split_whitespace().collect::<Vec<_>>()[..] {
-        ["u", n] => n.parse().ok(),
-        _ => None,
-    }
-}
-
 /// Whether `cmdline` is `gnome-keyring-daemon` started with `--login`, the
 /// way `pam_gnome_keyring` starts it. A daemon from the socket unit or from
 /// D-Bus activation has no `--login`. The flag stays in argv after
@@ -209,14 +158,14 @@ fn is_login_daemon(cmdline: &[u8]) -> bool {
     name == b"gnome-keyring-daemon" && argv.any(|a| a == b"--login")
 }
 
-/// The state of this session's gnome-keyring that decides both checks.
+/// The state of this session's gnome-keyring that a token arm acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LoginDaemon {
     /// A `--login` daemon running as `me` while `org.gnome.keyring` has no
     /// owner: the login screen started it and nothing initialized it.
-    Uninitialized { pid: libc::pid_t },
+    Uninitialized,
     /// Anything else: no daemon, another uid's, a socket-unit or initialized
-    /// one, or a state that could not be read. Neither check acts on it.
+    /// one, or a state that could not be read. A token arm does not act on it.
     Other,
 }
 
@@ -236,62 +185,8 @@ fn login_daemon(session: &impl Session, me: libc::uid_t) -> LoginDaemon {
         return LoginDaemon::Other;
     }
     match session.has_owner(KEYRING_BUS) {
-        Some(false) => LoginDaemon::Uninitialized { pid: peer.pid },
+        Some(false) => LoginDaemon::Uninitialized,
         _ => LoginDaemon::Other,
-    }
-}
-
-/// What [`initialize_for_forget`] did.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Initialized {
-    /// The daemon behind the control socket is initialized now; retry.
-    Now,
-    /// Not a login-started gnome-keyring waiting for initialization, so the
-    /// refusal has another cause. Nothing was started.
-    NotNeeded,
-    /// gnome-keyring waits for initialization, but another process owns the
-    /// Secret Service name, such as KDE's in a Plasma session. Initializing
-    /// gnome-keyring there would put it in line for that name, so nothing
-    /// was started.
-    OtherProvider,
-    /// gnome-keyring waits for initialization and it did not happen: the bus
-    /// could not be read, the start failed, or the daemon behind the control
-    /// socket did not claim `org.gnome.keyring`.
-    Failed(String),
-}
-
-/// For `keyring forget` after gnome-keyring refused the change back: when
-/// the refusal comes from a `--login` daemon that nothing initialized, and no
-/// other Secret Service provider runs, ask the bus to start
-/// `org.gnome.keyring` once, as a GNOME session's first keyring client does.
-/// The activated `gnome-keyring-daemon --start` finds the running daemon and
-/// initializes it, and the daemon then claims `org.gnome.keyring`, which is
-/// checked before a retry.
-pub(crate) fn initialize_for_forget(session: &impl Session, me: libc::uid_t) -> Initialized {
-    let LoginDaemon::Uninitialized { pid } = login_daemon(session, me) else {
-        return Initialized::NotNeeded;
-    };
-    let pid = u32::try_from(pid).ok();
-    match session.has_owner(SECRETS_BUS) {
-        Some(false) => {}
-        Some(true) if pid.is_some() && session.owner_pid(SECRETS_BUS) == pid => {}
-        Some(true) => return Initialized::OtherProvider,
-        None => {
-            return Initialized::Failed(format!(
-                "could not read who owns {SECRETS_BUS} on the user bus"
-            ))
-        }
-    }
-    if let Err(e) = session.start_service(KEYRING_BUS) {
-        return Initialized::Failed(e);
-    }
-    match session.owner_pid(KEYRING_BUS) {
-        owner if owner.is_some() && owner == pid => Initialized::Now,
-        Some(owner) => Initialized::Failed(format!(
-            "{KEYRING_BUS} is owned by pid {owner}, not by the gnome-keyring behind the \
-             control socket"
-        )),
-        None => Initialized::Failed(format!("{KEYRING_BUS} still has no owner")),
     }
 }
 
@@ -360,7 +255,7 @@ pub(crate) fn session_refusal() -> Option<String> {
 
 fn uninitialized_refusal(session: &impl Session, me: libc::uid_t) -> Option<String> {
     match login_daemon(session, me) {
-        LoginDaemon::Uninitialized { .. } => Some(NOT_A_GNOME_SESSION.to_string()),
+        LoginDaemon::Uninitialized => Some(NOT_A_GNOME_SESSION.to_string()),
         LoginDaemon::Other => None,
     }
 }
@@ -372,7 +267,6 @@ mod tests {
 
     const ME: libc::uid_t = 4242;
     const DAEMON: libc::pid_t = 3100;
-    const KSECRETD: u32 = 3300;
     /// argv of the daemon `pam_gnome_keyring auto_start` starts.
     const PAM_STARTED: &[u8] = b"/usr/bin/gnome-keyring-daemon\0--daemonize\0--login\0";
     /// argv of the daemon the socket unit starts, as on Debian or Arch.
@@ -384,12 +278,8 @@ mod tests {
     struct Fake {
         peer: Option<Peer>,
         cmdline: Option<&'static [u8]>,
-        /// Owner pid per name; a name that is absent has no owner. `None`:
-        /// the bus cannot be asked.
-        owners: RefCell<Option<Vec<(&'static str, u32)>>>,
-        /// What a start of `org.gnome.keyring` does: `Some(pid)` makes that
-        /// pid its owner, `None` fails.
-        start_owner: Option<u32>,
+        /// Names with an owner; `None`: the bus cannot be asked.
+        owners: RefCell<Option<Vec<&'static str>>>,
         calls: RefCell<Vec<String>>,
     }
 
@@ -402,25 +292,17 @@ mod tests {
                 }),
                 cmdline: Some(PAM_STARTED),
                 owners: RefCell::new(Some(Vec::new())),
-                start_owner: Some(DAEMON as u32),
                 calls: RefCell::new(Vec::new()),
             }
         }
 
-        fn owned(self, name: &'static str, pid: u32) -> Self {
-            self.owners.borrow_mut().as_mut().unwrap().push((name, pid));
+        fn owned(self, name: &'static str) -> Self {
+            self.owners.borrow_mut().as_mut().unwrap().push(name);
             self
         }
 
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
-        }
-
-        fn started(&self) -> usize {
-            self.calls()
-                .iter()
-                .filter(|c| c.starts_with("start"))
-                .count()
         }
     }
 
@@ -435,26 +317,7 @@ mod tests {
         fn has_owner(&self, name: &str) -> Option<bool> {
             self.calls.borrow_mut().push(format!("has_owner {name}"));
             let owners = self.owners.borrow();
-            Some(owners.as_ref()?.iter().any(|(n, _)| *n == name))
-        }
-        fn owner_pid(&self, name: &str) -> Option<u32> {
-            self.calls.borrow_mut().push(format!("owner_pid {name}"));
-            let owners = self.owners.borrow();
-            owners
-                .as_ref()?
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, p)| *p)
-        }
-        fn start_service(&self, name: &str) -> Result<(), String> {
-            self.calls.borrow_mut().push(format!("start {name}"));
-            let owner = self.start_owner.ok_or("activation failed")?;
-            self.owners
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .push((KEYRING_BUS, owner));
-            Ok(())
+            Some(owners.as_ref()?.contains(&name))
         }
     }
 
@@ -483,11 +346,8 @@ mod tests {
     #[test]
     fn a_login_daemon_is_uninitialized_while_its_bus_name_has_no_owner() {
         let fake = Fake::login_daemon();
-        assert_eq!(
-            login_daemon(&fake, ME),
-            LoginDaemon::Uninitialized { pid: DAEMON }
-        );
-        let fake = Fake::login_daemon().owned(KEYRING_BUS, DAEMON as u32);
+        assert_eq!(login_daemon(&fake, ME), LoginDaemon::Uninitialized);
+        let fake = Fake::login_daemon().owned(KEYRING_BUS);
         assert_eq!(login_daemon(&fake, ME), LoginDaemon::Other);
         // A bus that cannot be asked proves nothing.
         let fake = Fake::login_daemon();
@@ -523,63 +383,9 @@ mod tests {
             ("argv unreadable", gone),
         ] {
             assert_eq!(login_daemon(&fake, ME), LoginDaemon::Other, "{case}");
-            assert_eq!(
-                initialize_for_forget(&fake, ME),
-                Initialized::NotNeeded,
-                "{case}"
-            );
             assert_eq!(uninitialized_refusal(&fake, ME), None, "{case}");
             assert!(fake.calls().is_empty(), "{case}: {:?}", fake.calls());
         }
-    }
-
-    #[test]
-    fn forget_starts_gnome_keyring_once_and_checks_who_claimed_it() {
-        let fake = Fake::login_daemon();
-        assert_eq!(initialize_for_forget(&fake, ME), Initialized::Now);
-        assert_eq!(
-            fake.calls(),
-            [
-                "has_owner org.gnome.keyring",
-                "has_owner org.freedesktop.secrets",
-                "start org.gnome.keyring",
-                "owner_pid org.gnome.keyring",
-            ]
-        );
-        // The daemon already holding the Secret Service name is no reason to
-        // stop.
-        let fake = Fake::login_daemon().owned(SECRETS_BUS, DAEMON as u32);
-        assert_eq!(initialize_for_forget(&fake, ME), Initialized::Now);
-        assert_eq!(fake.started(), 1);
-    }
-
-    #[test]
-    fn forget_never_starts_gnome_keyring_beside_another_secret_service() {
-        let fake = Fake::login_daemon().owned(SECRETS_BUS, KSECRETD);
-        assert_eq!(initialize_for_forget(&fake, ME), Initialized::OtherProvider);
-        assert_eq!(fake.started(), 0, "{:?}", fake.calls());
-    }
-
-    #[test]
-    fn forget_reports_a_start_that_did_not_initialize_the_control_socket_daemon() {
-        let failed = Fake {
-            start_owner: None,
-            ..Fake::login_daemon()
-        };
-        assert!(matches!(
-            initialize_for_forget(&failed, ME),
-            Initialized::Failed(_)
-        ));
-        // Another process claimed the name: the daemon behind the control
-        // socket is still waiting, so a retry would be refused again.
-        let elsewhere = Fake {
-            start_owner: Some(DAEMON as u32 + 7),
-            ..Fake::login_daemon()
-        };
-        let Initialized::Failed(why) = initialize_for_forget(&elsewhere, ME) else {
-            panic!("a foreign owner is not an initialized daemon");
-        };
-        assert!(why.contains("not by the gnome-keyring behind"), "{why}");
     }
 
     #[test]
@@ -591,11 +397,15 @@ mod tests {
         assert!(refusal.contains("not a GNOME session"), "{refusal}");
         assert!(refusal.contains("started by the login screen"), "{refusal}");
         assert!(refusal.ends_with("from a GNOME session"), "{refusal}");
-        assert_eq!(uninitialized.started(), 0, "an arm never starts anything");
+        assert_eq!(
+            uninitialized.calls(),
+            ["has_owner org.gnome.keyring"],
+            "an arm asks the bus one question"
+        );
 
         // Initialized (a GNOME session), and no token to arm (a KDE wallet or
         // no GNOME keyring): no refusal, and the second asks nothing.
-        let initialized = Fake::login_daemon().owned(KEYRING_BUS, DAEMON as u32);
+        let initialized = Fake::login_daemon().owned(KEYRING_BUS);
         assert_eq!(
             token_arm_refusal_in(true, delivered, Some(&initialized), ME),
             None
@@ -612,7 +422,7 @@ mod tests {
     #[test]
     fn a_token_no_login_delivers_is_refused_before_the_session_is_asked() {
         let undelivered = || Some("no session line".to_string());
-        let initialized = Fake::login_daemon().owned(KEYRING_BUS, DAEMON as u32);
+        let initialized = Fake::login_daemon().owned(KEYRING_BUS);
         assert_eq!(
             token_arm_refusal_in(true, undelivered, Some(&initialized), ME).as_deref(),
             Some("no session line")
@@ -661,7 +471,6 @@ mod tests {
     fn busctl_replies_parse_strictly() {
         assert_eq!(parse_bool_reply("b true\n"), Some(true));
         assert_eq!(parse_bool_reply("b false"), Some(false));
-        assert_eq!(parse_u32_reply("u 1234\n"), Some(1234));
         for bad in [
             "",
             "b",
@@ -673,15 +482,14 @@ mod tests {
             "u 1 2",
         ] {
             assert_eq!(parse_bool_reply(bad), None, "{bad}");
-            assert_eq!(parse_u32_reply(bad), None, "{bad}");
         }
     }
 
-    /// The live session asks `busctl --user --auto-start=no` exactly these
-    /// questions, with the start given the longer timeout. Run in a child
-    /// process so the fixture PATH cannot race other tests.
+    /// The live session asks `busctl --user --auto-start=no` exactly this
+    /// question. Run in a child process so the fixture PATH cannot race
+    /// other tests.
     #[test]
-    fn live_bus_calls_never_auto_start_and_start_only_org_gnome_keyring() {
+    fn live_bus_calls_never_auto_start_and_only_ask_for_a_name_owner() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "irlume-gkr-session-bus-{}-{}",
@@ -697,10 +505,6 @@ printf '%s\n' "$*" >> "$IRLUME_TEST_BUSCTL_LOG"
 case "$*" in
   "--user --timeout=3 --auto-start=no call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus NameHasOwner s org.gnome.keyring")
     printf 'b false\n' ;;
-  "--user --timeout=3 --auto-start=no call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.secrets")
-    printf 'u 77\n' ;;
-  "--user --timeout=30 --auto-start=no call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus StartServiceByName su org.gnome.keyring 0")
-    printf 'u 1\n' ;;
   *) exit 64 ;;
 esac
 "#,
@@ -726,7 +530,7 @@ esac
             "{stdout} {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(calls.lines().count(), 4, "{calls}");
+        assert_eq!(calls.lines().count(), 2, "{calls}");
     }
 
     #[test]
@@ -739,10 +543,8 @@ esac
         };
         assert_eq!(live.control_peer(), None);
         assert_eq!(live.has_owner(KEYRING_BUS), Some(false));
-        assert_eq!(live.owner_pid(SECRETS_BUS), Some(77));
-        assert_eq!(live.start_service(KEYRING_BUS), Ok(()));
         // Anything else the fixture refuses, and a refusal is no answer.
-        assert_eq!(live.has_owner(SECRETS_BUS), None);
+        assert_eq!(live.has_owner("org.freedesktop.secrets"), None);
         println!("IRLUME_BUS_CHILD_OK");
     }
 }

@@ -225,8 +225,9 @@ an account that has or would get either kind:
 
 An account with neither wallet, or with both, gets the login password, and an
 account whose login password is already armed keeps it when it re-arms or
-reseals. `irlume keyring forget` removes a wallet key or token armed earlier; a
-token is re-keyed back to your password first. As on every distribution, irlume
+reseals. `irlume keyring forget` removes a wallet key armed earlier; a GNOME
+token armed earlier is retained instead, because token disarm is unavailable. As
+on every distribution, irlume
 does not arm over a sealed secret irlumed cannot read; on NixOS `keyring arm`,
 `reseal` and the setup step say so before asking for the password. Without an
 arm, irlume leaves the wallet to the rest of the PAM stack.

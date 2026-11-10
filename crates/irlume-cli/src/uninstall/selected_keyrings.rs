@@ -37,9 +37,11 @@ pub(super) fn hold(paths: &[PathBuf], owner: u32) -> Result<Vec<HeldStore>, Stri
     Ok(stores)
 }
 
-/// Disarm every envelope, including accounts without enrollment. Failure keeps
-/// the entry and is reported to the wipe/SRK gates. Even with --keep-data the
-/// historical uninstall contract disarms seals; it keeps enrollment data.
+/// Disarm every non-token envelope, including accounts without enrollment. A
+/// GNOME keyring token stops its store's disarm with a refusal and is left in
+/// place. Failure keeps the entry and is reported to the wipe/SRK gates. Even
+/// with --keep-data the historical uninstall contract disarms seals; it keeps
+/// enrollment data.
 pub(super) fn disarm(stores: &[HeldStore], owner: u32) -> (usize, Vec<String>) {
     disarm_with(stores, owner, |path| std::fs::remove_file(path))
 }
@@ -98,7 +100,9 @@ fn disarm_store(
             .map_err(|_| "unreadable envelope left in place".to_string())?;
         if envelope.secret == irlume_core::envelope::SecretKind::GnomeKeyringToken {
             return Err(
-                "GNOME token appeared since preflight; disarm it in its session first".into(),
+                "GNOME token appeared since preflight; token disarm is unavailable, so the \
+                 envelope is left in place"
+                    .into(),
             );
         }
         let now = std::fs::symlink_metadata(&file).map_err(fail)?;
@@ -323,7 +327,12 @@ mod tests {
             assert_eq!(count, 0);
             assert!(left.iter().any(|s| s.contains(dir.to_str().unwrap())));
             if data.contains("GnomeKeyringToken") {
-                assert!(left[0].contains("GNOME token appeared"));
+                assert!(
+                    left[0].contains("GNOME token appeared")
+                        && left[0].contains("token disarm is unavailable")
+                        && !left[0].contains("disarm it in its session"),
+                    "{left:?}"
+                );
             }
             assert_eq!(
                 std::fs::read_to_string(dir.join("alice.json")).unwrap(),

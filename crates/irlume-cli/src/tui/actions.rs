@@ -112,7 +112,7 @@ pub(super) const SELINUX_STATUS: Action = Action {
     fields: &[],
 };
 pub(super) const SENSOR_PREFLIGHT: Action = Action { label: "Check IR-only readiness", description: "Checks this account's IR-only prerequisites without opening the camera or attempting authentication.", args: &["auth", "sensor", "preflight"], root: false, per_user: true, fields: &[] };
-pub(super) const WALLET_FORGET: Action = Action { label: "Forget wallet secret safely", description: "For a token-based wallet, asks for your password privately and rekeys the wallet before forgetting its sealed secret.", args: &["keyring", "forget"], root: false, per_user: true, fields: &[] };
+pub(super) const WALLET_FORGET: Action = Action { label: "Forget wallet secret safely", description: "Removes a sealed login password or KDE wallet key. GNOME token disarm is unavailable; its envelope is retained.", args: &["keyring", "forget"], root: false, per_user: true, fields: &[] };
 pub(super) const WALLET_RESEAL: Action = Action { label: "Reseal wallet secret", description: "Uses the existing seal type to choose the safe recovery path after boot measurements change; may ask for your password privately.", args: &["reseal"], root: false, per_user: true, fields: &[] };
 
 pub(super) static ACTIONS: &[Action] = &[
@@ -153,7 +153,6 @@ pub(super) static ACTIONS: &[Action] = &[
     Action { label: "Forget recovery setup", description: "Deletes this account's recovery wrap. Stored face profiles are retained. This removes the recovery route.", args: &["recovery", "forget"], root: false, per_user: true, fields: &[] },
     Action { label: "Rename a profile or scan", description: "Renames the selected account's profile, or the named scan within it. No camera required.", args: &["profiles", "rename"], root: false, per_user: true, fields: &[PROFILE, Field { label: "Scan name (blank renames the whole profile)", flag: Some("--scan"), optional: true }, Field { label: "New name", flag: Some("--name"), optional: false }] },
     Action { label: "Delete a profile or scan", description: "Permanently deletes the specified profile or scan for this account. A blank scan field means the WHOLE profile and all its scans.", args: &["profiles", "delete"], root: false, per_user: true, fields: &[PROFILE, Field { label: "Scan name (blank deletes the WHOLE profile)", flag: Some("--scan"), optional: true }] },
-    Action { label: "Forget wallet secret without rekeying", description: "Force-forgets the sealed wallet secret. For a token-based keyring this skips rekeying and may leave the wallet inaccessible. Use ordinary Forget Wallet when possible.", args: &["keyring", "forget", "--force"], root: false, per_user: true, fields: &[] },
 
     SENSOR_PREFLIGHT,
     WALLET_FORGET,

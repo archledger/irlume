@@ -175,9 +175,9 @@ fn arm_kind_from(
             "'{user}' has a GNOME keyring token armed, and oo7 provides this session's \
              Secret Service, so this arm would replace the token with the login password; \
              nothing was changed. The token is the only copy of what the login keyring is \
-             keyed to. Run `irlume keyring forget` first, as '{user}' with gnome-keyring \
-             running: it re-keys the keyring back to the password. Then run `irlume keyring \
-             arm`."
+             keyed to. GNOME token disarm is currently unavailable: retain the envelope \
+             and do not replace it. A supported migration path is required before \
+             arming a different credential kind."
         )),
         // Nothing armed, or a login password or KDE wallet key.
         Some(false) => Ok(Some(irlume_common::KeyringSecretKind::LoginPassword)),
@@ -396,8 +396,8 @@ mod tests {
         for part in [
             "'alice' has a GNOME keyring token armed",
             "nothing was changed",
-            "irlume keyring forget",
-            "gnome-keyring running",
+            "GNOME token disarm is currently unavailable",
+            "retain the envelope",
         ] {
             assert!(refusal.contains(part), "{part}: {refusal}");
         }

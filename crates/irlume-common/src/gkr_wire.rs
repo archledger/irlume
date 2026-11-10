@@ -7,7 +7,7 @@
 //! socket, not D-Bus, is how the daemon's own PAM module unlocks the login
 //! keyring at login and re-keys it on a password change. irlume uses the same
 //! channel for the same two operations on a token-armed user ([`Op::Unlock`]
-//! from the session helper, [`Op::Change`] from `keyring arm`/`forget`), because
+//! from the session helper, [`Op::Change`] from `keyring arm`), because
 //! the alternative, `busctl` with the secret in argv, publishes the secret in
 //! `/proc/<pid>/cmdline`.
 //!

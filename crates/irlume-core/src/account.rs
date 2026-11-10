@@ -317,9 +317,10 @@ impl Record {
         match self {
             Record::Enrollment | Record::TemplateKey => "run `irlume enroll` to enroll again",
             Record::SealedSecret => "run `irlume keyring arm` to arm keyring unlock again",
-            // A re-arm reuses an armed token, so this one has to go first.
+            // Token disarm is unavailable, so nothing in irlume removes it.
             Record::KeyringToken => {
-                "remove it with `irlume keyring forget --force`, then run `irlume keyring arm`"
+                "GNOME token disarm is currently unavailable: `irlume keyring forget \
+                 --force` does not erase it, and the envelope is kept as it is"
             }
             Record::Recovery => {
                 "run `irlume enroll` to enroll again, then `irlume recovery setup` to set a new \

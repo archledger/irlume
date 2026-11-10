@@ -271,15 +271,25 @@ and the TUI, run in your own session and not under `sudo`, also ask which
 program provides the Secret Service.
 
 GNOME token arming rekeys the login keyring: your password alone no longer
-opens it directly. Use `irlume keyring forget` to rekey it back before
-removing the integration; deleting the token envelope can strand that keyring.
+opens it directly. Token disarm is currently unavailable, so `irlume keyring
+forget` cannot rekey it back; keep the token envelope and the integration that
+delivers the token, since deleting the token envelope can strand that keyring.
 The envelope also keeps the token wrapped under a password, which recovers the
 token after a firmware or Secure Boot change. That is the password you armed
-with, or the one you last typed at a login screen wired with irlume's re-seal,
-and it is the one `forget` asks for. So a token arm needs no re-arm after a
-password change or a firmware update: the next login where you type your
-password at such a screen moves the wrap to it and re-binds the seal. Until
-then, `forget` takes the previous password.
+with, or the one you last typed at a login screen wired with irlume's re-seal.
+So a token arm needs no re-arm after a password change or a firmware update:
+the next login where you type your password at such a screen moves the wrap to
+it and re-binds the seal.
+
+That login repairs one change at a time. After a password change it opens the
+seal and moves the wrap to the new password; after a firmware or Secure Boot
+change the typed password opens the wrap and the seal is bound again. If both
+have changed since the last such login, neither half opens: irlume leaves the
+envelope as it is and cannot deliver the token, so the login keyring stays
+locked. There are two ways out: boot in the earlier firmware and Secure Boot
+state, where that is still possible, or set the login password back to the
+earlier one. Then type the password at such a login screen. After either
+change, log in that way before making the other.
 
 At each login, irlume's session line hands the token to `irlume-gkr-unlock`,
 which gives it to gnome-keyring over gnome-keyring's control socket once
@@ -327,40 +337,40 @@ for nothing, so irlume releases no token there. `irlume setup` arms before its
 wiring step, so on a GNOME machine not wired yet it reports this; run
 `sudo irlume login enable --apply`, then `irlume keyring arm`.
 
-`irlume keyring forget` works in such a session too. When gnome-keyring refuses
-the change back, and the process behind its control socket is a
-`gnome-keyring-daemon --login` that has not claimed `org.gnome.keyring`, forget
-has the session bus start `org.gnome.keyring` once, as a GNOME session's first
-keyring client does, and tries again. It starts nothing while another Secret
-Service provider, such as KDE's, owns `org.freedesktop.secrets`; the token
-then stays sealed, and forget asks you to run it from a GNOME session.
+For a login password or a KDE wallet key, `irlume keyring forget` works in
+such a session too. On a GNOME keyring token it is refused, with or without
+`--force`, and nothing is changed: token disarm is currently unavailable, and
+the envelope is kept.
 
 `irlume keyring arm` picks the kind again each time, but it does not replace
 an armed token with a login-password or KDE wallet-key arm, which it picks
 where oo7 keeps the keyring, when a KDE wallet sits beside the GNOME keyring or
-when irlumed cannot see the keyring. Run `irlume keyring forget` first, as
-yourself with gnome-keyring running, so it can rekey the keyring back. Nor does
+when irlumed cannot see the keyring. Token disarm is currently unavailable, so
+`irlume keyring forget` cannot remove the token first: it is kept. Nor does
 it arm over a sealed secret irlumed cannot read, such as one a newer irlume
 wrote: the file under `/var/lib/irlume/keyring` stays as it is, and that newer
 version can still read it. Both refusals apply to every caller and change
 nothing.
 
 Where irlumed cannot check passwords, `irlume keyring arm` does not re-arm over
-a token that is already armed, whoever runs it, and changes nothing. To arm
-again there anyway, log in once by typing your current password at such a
-screen, then run `irlume keyring forget` with that password, then
-`irlume keyring arm`. If the password and the firmware both changed before
-that login, the login cannot update the seal; run `irlume keyring forget`
-with the previous password instead.
+a token that is already armed, whoever runs it, and changes nothing. Token
+disarm is currently unavailable, so `irlume keyring forget` cannot remove the
+token to re-arm over it: the existing token is kept. Its password copy still
+follows the password you last typed at a login screen wired with irlume's
+re-seal, so such a login remains the way to move that wrap after a password or
+firmware change, one change at a time as described above. A token arm whose
+keyring re-key did not complete cannot be finished there either: the keyring
+stays keyed to your password, and a face or fingerprint login leaves it locked.
 
-With a token armed on Fedora 43 or 44, run `irlume keyring forget` before
+With a token armed on Fedora 43 or 44, retain the sealed token and postpone
 upgrading to Fedora 45: on Fedora 45 the login screen unlocks the login keyring
 through oo7, which migrates it with the login password, so a token-keyed
-keyring does not carry over. `forget` re-keys through gnome-keyring, and where
-gnome-keyring no longer runs it keeps the token and says so. After the first
-login on Fedora 45, `irlume keyring arm` seals the login password, which oo7
-accepts. `irlume doctor`, `irlume keyring status` and `irlume keyring arm`
-give this step on Fedora 43 and 44.
+keyring does not carry over. GNOME token disarm is currently unavailable;
+neither `irlume keyring forget` nor `--force` removes the token, and the
+envelope must not be deleted or replaced with a login-password arm; a supported
+migration path is required before proceeding. `irlume doctor`,
+`irlume keyring status` and `irlume keyring arm`
+give this guidance on Fedora 43 and 44.
 
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after
@@ -868,8 +878,9 @@ sudo irlume login disable --apply
 Removes every PAM change (greeter, lock, and `sudo`) and restores the originals.
 Your password login is never touched. While an account's GNOME keyring is keyed
 to an irlume token, the disable refuses: the session line it removes is what
-delivers the token. Run `irlume keyring forget` in that account's session first
-([DISABLE.md](DISABLE.md)). To remove just face-`sudo` while keeping
+delivers the token. Token disarm is unavailable, so `irlume keyring forget`
+cannot remove the token first; `--force` bypasses that guard only, and the
+keyring would stay locked ([DISABLE.md](DISABLE.md)). To remove just face-`sudo` while keeping
 the greeter, re-run `login enable --apply` *without* `--with-sudo`. For every
 off-switch in one place (per-surface tiers, standing face down without touching
 PAM, canceling a running scan, full uninstall), read [DISABLE.md](DISABLE.md).

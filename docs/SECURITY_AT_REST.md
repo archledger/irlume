@@ -242,7 +242,7 @@ only while the name resolves to the uid its load used.
 | Record | Recorded uid differs from the current one | Current uid cannot be resolved |
 |---|---|---|
 | Enrollment and template key | The account reads as not enrolled; the key is not unsealed. `irlume enroll` enrolls again: it writes a new enrollment under a new key, and once that enrollment is saved it removes the recovery envelope of the replaced key and the added-camera store beside the replaced enrollment (an enrollment that fails to save puts the replaced key back and removes neither) | Error; face falls back to the password |
-| Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again; a GNOME keyring token has to be removed first with `irlume keyring forget --force` | Not released |
+| Keyring envelope | Not released (face or fingerprint path), not re-sealed, and not returned for a re-arm or a disarm. `irlume keyring arm` arms again over a login password or KDE wallet key; a GNOME keyring token is kept, because token disarm is unavailable (`irlume keyring forget --force` does not erase it) | Not released |
 | Recovery envelope | `irlume recovery restore` refuses it; `irlume recovery setup` after enrolling again writes a new one | Refused |
 
 A name that no account has any more counts as a different uid. irlumed logs

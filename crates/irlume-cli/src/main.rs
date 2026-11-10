@@ -1481,8 +1481,8 @@ fn control_client_uid() -> libc::uid_t {
 /// One CHANGE against the caller's own gnome-keyring control socket.
 /// gnome-keyring serves only its own uid, so this works only for the invoking
 /// user's own keyring, in their own session. Against a gnome-keyring of
-/// another uid it sends nothing and fails as unchanged, so arming another
-/// user's token rolls back rather than half-arming.
+/// another uid it sends nothing and fails as unchanged, so an arm of another
+/// user's token ends unverified and keeps its envelope.
 fn rekey_login_keyring(current: &[u8], new: &[u8]) -> Result<(), RekeyError> {
     use irlume_common::gkr_wire::{self, ControlResult, Op};
     let rt = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
@@ -1550,98 +1550,23 @@ fn verify_keyring_credential(secret: &[u8]) -> Result<(), RekeyError> {
     rekey_login_keyring(secret, secret)
 }
 
-/// How `keyring forget` put the login keyring back on the password.
-#[derive(Debug, PartialEq, Eq)]
-enum RekeyedBack {
-    /// The keyring was keyed to the token and is now keyed to the password.
-    Rekeyed,
-    /// The change back was refused or unanswered, but the keyring opens with
-    /// the password: the token is not its credential.
-    AlreadyPassword,
-}
-
-/// Re-key the login keyring from `token` back to `password`, and prove the
-/// password is its credential. When the change back is refused or goes
-/// unanswered, the keyring may never have taken the token (an arm whose
-/// re-key did not land keeps the token, see [`finish_token_arm`]); a password
-/// that opens the keyring then still clears the way to erase the envelope.
-fn rekey_back(token: &[u8], password: &[u8]) -> Result<RekeyedBack, RekeyError> {
-    match rekey_login_keyring(token, password) {
-        Ok(()) => verify_keyring_credential(password).map(|()| RekeyedBack::Rekeyed),
-        Err(refused) => verify_keyring_credential(password)
-            .map(|()| RekeyedBack::AlreadyPassword)
-            .map_err(|_| refused),
-    }
-}
-
-/// [`rekey_back`] for `keyring forget`, which may run before anything in the
-/// session has initialized a gnome-keyring the login screen started with
-/// `--login` (Fedora 43 and 44 start it that way). Such a daemon answers
-/// DENIED to every CHANGE. When the change back is DENIED, `initialize` checks
-/// for exactly that daemon and, unless another Secret Service provider runs
-/// the session, has the user bus start `org.gnome.keyring` once, as a GNOME
-/// session's first keyring client does; the change back is then tried once
-/// more. Denied CHANGEs before initialization change and record nothing.
-fn rekey_back_initializing(
-    token: &[u8],
-    password: &[u8],
-    initialize: impl FnOnce() -> gkr_session::Initialized,
-) -> Result<RekeyedBack, RekeyError> {
-    use gkr_session::Initialized;
-    let first = rekey_back(token, password);
-    let Err(RekeyError::Denied(refused)) = first else {
-        return first;
-    };
-    match initialize() {
-        Initialized::Now => {
-            println!(
-                "[keyring] gnome-keyring here was started by the login screen and not \
-                 initialized yet; started it through the session bus, as a GNOME session \
-                 does, and trying again."
-            );
-            rekey_back(token, password)
-        }
-        Initialized::NotNeeded => Err(RekeyError::Denied(refused)),
-        // Here the DENIED says nothing about the secret: this daemon refuses
-        // every request until something initializes it.
-        Initialized::OtherProvider => Err(RekeyError::Denied(
-            "keyring re-key: refused, because gnome-keyring here was started by the login \
-             screen and nothing has initialized it, and another Secret Service provider runs \
-             this session, so irlume leaves gnome-keyring alone. Run `irlume keyring forget` \
-             from a GNOME session"
-                .to_string(),
-        )),
-        Initialized::Failed(why) => Err(RekeyError::Denied(format!(
-            "keyring re-key: refused, because gnome-keyring here was started by the login \
-             screen and nothing has initialized it, and irlume could not initialize it \
-             through the session bus: {why}"
-        ))),
-    }
-}
-
 /// Second half of a GNOME token arm, shared by `keyring arm`, the setup wizard
 /// and the TUI: re-key the login keyring from `password` to `token` and verify
 /// the token is now the live credential. On a RE-arm the keyring is usually
 /// keyed to the token already, so a denied re-key followed by a passing
 /// verification is success, not failure.
 ///
-/// `minted` is the daemon's word on whether this token is fresh. irlumed mints
-/// one only for an account with a login keyring, and of the CHANGEs sent here
-/// only the re-key from `password` can key that keyring to a new secret. So a
-/// fresh token's envelope is rolled back with `ForgetPassword` when the
-/// keyring provably never took the token: gnome-keyring refused the re-key or
-/// never received it, or the keyring still opens with `password`. Any other
-/// failure keeps the envelope, because a re-key whose answer was lost may have
-/// landed, and the envelope then holds the only copy of the keyring's
-/// credential. A reused token may BE the live keyring credential and is never
-/// deleted here. Returns a human-readable error; success needs no message
-/// beyond the caller's own.
+/// A failed arm keeps the envelope, whether the daemon minted the token for
+/// this request (`minted`) or reused an earlier one: a token the daemon has
+/// returned to a caller may already be a keyring's credential. Returns a
+/// human-readable error.
 ///
 /// A session whose gnome-keyring the login screen started and nothing
 /// initialized gets no re-key at all (see [`gkr_session`]): that daemon
 /// refuses every CHANGE, and a token armed there is never delivered at login.
-/// Every arm path refuses such a session before sealing; this check covers a
-/// session that changed since.
+/// An arm made inside a session is refused there before sealing; this check
+/// also covers an arm made with no session to inspect and a session that
+/// changed since.
 pub(crate) fn finish_token_arm(
     user: &str,
     password: &[u8],
@@ -1657,72 +1582,38 @@ fn finish_token_arm_in(
     user: &str,
     password: &[u8],
     token: &[u8],
-    minted: bool,
+    _minted: bool,
     session_refusal: impl FnOnce() -> Option<String>,
 ) -> Result<(), String> {
     if let Some(why) = session_refusal() {
-        // Nothing was sent to gnome-keyring, so the keyring never took the
-        // token and a fresh one has nothing to protect.
-        if !minted {
-            return Err(format!(
-                "not armed: {why}. The envelope was left in place, since it holds the token \
-                 armed earlier; nothing was sent to gnome-keyring."
-            ));
-        }
-        return Err(format!("not armed: {why}. {}.", erase_unused_token(user)));
+        return Err(format!(
+            "not armed: {why}. The sealed token was kept; the envelope was left in place \
+             because another client may use it. Nothing was sent to gnome-keyring by this \
+             attempt. Retry as '{user}' inside their own graphical session; where irlumed \
+             cannot check the login password it refuses that retry. GNOME token disarm is \
+             currently unavailable; keep the envelope for recovery."
+        ));
     }
     let rekey = rekey_login_keyring(password, token);
     // The keyring may already be keyed to this exact token (idempotent
     // re-arm, or a re-key whose answer was lost); verification decides.
     let checked = verify_keyring_credential(token);
-    let rekey_confirmed = rekey.is_ok();
-    let rekey_unchanged = matches!(rekey, Err(RekeyError::Denied(_) | RekeyError::Unchanged(_)));
     let e = match (rekey, checked) {
         (_, Ok(())) => return Ok(()),
         // Report the re-key's own error; after a confirmed re-key, the
         // verification's.
         (Err(e), Err(_)) | (Ok(()), Err(e)) => e,
     };
-    if !minted {
-        return Err(format!(
-            "keyring re-key failed: {e}. The envelope was left in place (it holds the \
-             keyring's live token); retry as '{user}' inside their own graphical session."
-        ));
-    }
-    // A CHANGE from the password to itself succeeds only while the keyring
-    // still opens with it. After a confirmed re-key it cannot, so skip it.
-    let token_unused =
-        rekey_unchanged || (!rekey_confirmed && verify_keyring_credential(password).is_ok());
-    if !token_unused {
-        return Err(format!(
-            "keyring re-key not verified: {e}. The sealed token was kept, since the login \
-             keyring may be keyed to it now and the envelope holds its only copy. Run \
-             `irlume keyring arm` again as '{user}' inside their own graphical session to \
-             finish the re-key with this token. Where irlumed refuses that re-arm, \
-             `irlume keyring forget` re-keys the keyring back to the password first."
-        ));
-    }
-    let cleanup = erase_unused_token(user);
     Err(format!(
-        "keyring re-key failed: {e}. {cleanup}. Run the arm as '{user}' inside \
-         their own graphical session."
+        "keyring re-key not verified: {e}. The sealed token was kept; the envelope was \
+         left in place because this or another client's keyring may use it. If the login \
+         keyring's password differs from the login password, set it to the login password \
+         first (Seahorse, the \"Login\" keyring, \"Change Password\"). Then run \
+         `irlume keyring arm` again as '{user}' inside their own graphical session to \
+         finish the re-key with this token; where irlumed cannot check the login \
+         password it refuses that arm, and the re-key cannot be finished there. \
+         GNOME token disarm is currently unavailable; keep the envelope for recovery."
     ))
-}
-
-/// Roll back a freshly minted token the login keyring never took, and say
-/// how that went.
-fn erase_unused_token(user: &str) -> String {
-    match daemon_request(&irlume_common::Request::ForgetPassword {
-        user: user.to_string(),
-    }) {
-        Ok(irlume_common::Response::PasswordForgotten) => {
-            "rolled back: the sealed token was erased; nothing changed".to_string()
-        }
-        other => format!(
-            "WARNING: could not erase the unused token envelope ({other:?}); run \
-             `irlume keyring forget` to clean up. The keyring itself is unchanged"
-        ),
-    }
 }
 
 /// Read a typed secret without echo, mirroring the arm prompt's terminal/pipe
@@ -1756,6 +1647,24 @@ fn read_password(prompt: &str) -> Result<zeroize::Zeroizing<String>, String> {
         let keep = line.trim_end_matches(['\n', '\r']).len();
         line.truncate(keep);
         Ok(line)
+    }
+}
+
+/// Ask irlumed to disarm `user`'s keyring unlock. `DisarmKeyring` is the only
+/// request sent: an irlumed that does not know it answers `bad request`, which
+/// is reported without sending `ForgetPassword` in its place.
+fn request_keyring_disarm(user: &str) -> Result<irlume_common::Response, String> {
+    let response = daemon_request(&irlume_common::Request::DisarmKeyring {
+        user: user.to_string(),
+    })?;
+    match response {
+        irlume_common::Response::Error(error) if error.contains("bad request") => Err(
+            "keyring disarm needs a newer irlumed; restart it after the upgrade \
+             (nothing was erased)"
+                .into(),
+        ),
+        irlume_common::Response::Error(error) => Err(error),
+        response => Ok(response),
     }
 }
 
@@ -1832,7 +1741,8 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                     "Depending on the wallet you run, what gets sealed is the password \
                      itself, the key your KDE wallet is already opened with, or a fresh \
                      random token this re-keys your GNOME keyring to. Nothing is stored in \
-                     plaintext either way."
+                     plaintext either way. A GNOME keyring token arm cannot be undone in \
+                     this release: token disarm is unavailable."
                 }
                 crate::nixos::SealKind::LoginPassword => {
                     "On NixOS what gets sealed is the password itself; it is not stored in \
@@ -1928,10 +1838,9 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 }
                 // GNOME token arm (#250): the daemon minted and sealed a token;
                 // the login keyring must now be re-keyed to it, which only this
-                // process can do (the control socket is in this session). A
-                // failure rolls a fresh token's envelope back only where the
-                // keyring provably never took the token, and otherwise keeps
-                // it (`finish_token_arm`).
+                // process can do (the control socket is in this session).
+                // A failure keeps the envelope, minted or reused
+                // (`finish_token_arm`).
                 Ok(irlume_common::Response::TokenSealed { token, minted }) => {
                     match finish_token_arm(&user, pw.as_bytes(), token.expose(), minted) {
                         Ok(()) => {
@@ -1942,7 +1851,8 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                             );
                             println!(
                                 "[keyring] Your password alone no longer opens the keyring \
-                                 directly; `irlume keyring forget` re-keys it back."
+                                 directly. Keep the token envelope: GNOME token disarm is \
+                                 currently unavailable."
                             );
                             print_token_upgrade_notice(&user);
                             print_seal_storage_note(&user);
@@ -1990,13 +1900,15 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                         ),
                         Some(K::GnomeKeyringToken) => {
                             println!(
-                                "[keyring] '{user}': ARMED \u{2705} (GNOME keyring token). Your \
-                                 login keyring is keyed to a random secret irlume releases on \
-                                 every login."
+                                "[keyring] '{user}': ARMED \u{2705} (GNOME keyring token). \
+                                 irlume holds a random secret for your login keyring and \
+                                 releases it on every login."
                             );
                             println!(
-                                "[keyring] Your password alone no longer opens that keyring; \
-                                 `irlume keyring forget` re-keys it back."
+                                "[keyring] After a completed arm, your password alone does not \
+                                 open that keyring; after an arm that ended with its re-key not \
+                                 verified, the keyring may still be on your password. Token \
+                                 disarm is currently unavailable, so keep its envelope."
                             );
                             print_token_upgrade_notice(&user);
                         }
@@ -2036,19 +1948,18 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
             }
         }
         Some("forget") => {
-            // A token disarm must re-key the login keyring BACK to the
-            // password before the envelope goes away: deleting a token
-            // envelope first would strand the keyring on a secret that no
-            // longer exists anywhere. `--force` skips the re-key for the case
-            // where the keyring is already gone (deleted profile, reinstalled
-            // distro) and the stale envelope is all that is left.
-            let force = args.iter().any(|a| a == "--force");
+            // irlumed decides a disarm on the envelope it holds at that
+            // moment (`DisarmKeyring`) and keeps a GNOME keyring token. A
+            // token is refused here on the read-only `KeyringInfo` reply,
+            // with no prompt and no disarm request; `--force` changes
+            // nothing.
+            //
             // Three outcomes, not two. "Armed with something we could not
             // identify" must not collapse into "not a token": a daemon from
             // before #250 answers `kind: None`, an unreadable envelope answers
             // an error, and deleting a token envelope on either reading leaves
             // the login keyring encrypted under a secret nothing can
-            // reproduce. Unknown therefore refuses and names `--force`.
+            // reproduce. Unknown therefore always refuses.
             let (token_armed, unknown) =
                 match daemon_request(&irlume_common::Request::KeyringInfo { user: user.clone() }) {
                     Ok(irlume_common::Response::KeyringInfo { armed: false, .. }) => (false, false),
@@ -2073,7 +1984,7 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                         (false, true)
                     }
                 };
-            if unknown && !force {
+            if unknown {
                 eprintln!(
                     "[keyring] cannot tell what '{user}' has armed, so refusing to erase it: \
                      if it is a GNOME keyring token, deleting it leaves the login keyring \
@@ -2081,83 +1992,22 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                 );
                 eprintln!(
                     "[keyring] Update irlumed (an older one does not report the kind), or \
-                     pass --force if you are certain the keyring no longer matters."
+                     retry after repairing the envelope; --force does not bypass this refusal."
                 );
                 return std::process::ExitCode::FAILURE;
             }
-            if token_armed && !force {
-                println!(
-                    "[keyring] '{user}' is armed with a keyring token; re-keying the login \
-                     keyring back to your password first."
-                );
-                let pw = match read_password("Login password: ") {
-                    Ok(p) if !p.is_empty() => p,
-                    Ok(_) => {
-                        eprintln!("[keyring] empty password; aborted (nothing changed).");
-                        return std::process::ExitCode::from(2);
-                    }
-                    Err(e) => {
-                        eprintln!("[keyring] {e}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                };
-                let token = match daemon_request(&irlume_common::Request::ReleaseTokenForDisarm {
-                    user: user.clone(),
-                    password: irlume_common::SecretBytes::new(pw.as_bytes().to_vec()),
-                }) {
-                    Ok(irlume_common::Response::PasswordUnsealed { secret, .. }) => secret,
-                    Ok(irlume_common::Response::Error(e)) => {
-                        eprintln!("[keyring] {e}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                    other => {
-                        eprintln!("[keyring] unexpected response: {other:?}");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                };
-                let initialize = || {
-                    gkr_session::Live::from_env().map_or(
-                        gkr_session::Initialized::NotNeeded,
-                        |session| {
-                            gkr_session::initialize_for_forget(&session, control_client_uid())
-                        },
-                    )
-                };
-                match rekey_back_initializing(token.expose(), pw.as_bytes(), initialize) {
-                    Ok(RekeyedBack::Rekeyed) => {
-                        println!("[keyring] login keyring re-keyed back to your password.");
-                    }
-                    Ok(RekeyedBack::AlreadyPassword) => {
-                        println!(
-                            "[keyring] the login keyring already opens with your password; \
-                             the token it never took is erased."
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[keyring] could not re-key the keyring back ({e}); the sealed \
-                             token is UNTOUCHED so nothing is lost. Fix the session (run as \
-                             '{user}' with gnome-keyring running) and retry, or `--force` to \
-                             delete the envelope anyway."
-                        );
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-            } else if token_armed && force {
+            if token_armed {
                 eprintln!(
-                    "[keyring] WARNING: --force on a token arm deletes the only copy of the \
-                     keyring token. If the login keyring still exists and is keyed to it, \
-                     its contents become unreachable."
+                    "[keyring] '{user}' has a GNOME keyring token armed. GNOME token disarm \
+                     is currently unavailable, with or without --force: the token envelope \
+                     is kept and keyring unlock stays armed. Nothing was changed."
                 );
+                return std::process::ExitCode::FAILURE;
             }
-            match daemon_request(&irlume_common::Request::ForgetPassword { user: user.clone() }) {
+            match request_keyring_disarm(&user) {
                 Ok(irlume_common::Response::PasswordForgotten) => {
                     println!("[keyring] '{user}': sealed secret erased; keyring unlock disarmed.");
                     std::process::ExitCode::SUCCESS
-                }
-                Ok(irlume_common::Response::Error(e)) => {
-                    eprintln!("[keyring] forget failed: {e}");
-                    std::process::ExitCode::FAILURE
                 }
                 Ok(other) => {
                     eprintln!("[keyring] unexpected response: {other:?}");
@@ -2175,10 +2025,9 @@ pub(crate) fn keyring(sub: Option<&str>, args: &[String]) -> std::process::ExitC
                  \x20 arm      seal a secret so a login opens your wallet; what is\n\
                  \x20          sealed depends on the wallet you run\n\
                  \x20 status   whether a secret is armed, and which kind\n\
-                 \x20 forget   erase it. A GNOME keyring token is re-keyed back to\n\
-                 \x20          your password first, which needs that password;\n\
-                 \x20          --force skips the re-key and leaves such a keyring\n\
-                 \x20          unreachable"
+                 \x20 forget   erase a sealed login password or KDE wallet key; a GNOME\n\
+                 \x20          keyring token stays armed (token disarm is currently\n\
+                 \x20          unavailable), with or without --force"
             );
             std::process::ExitCode::from(2)
         }
@@ -9484,10 +9333,6 @@ mod tests {
         /// answering, as gnome-keyring does for a client whose uid is not
         /// its own (`control_input` in gkd-control-server.c).
         ForeignUid,
-        /// Read the request and answer DENIED without applying it, as a
-        /// daemon `pam_gnome_keyring` started with `--login` does until
-        /// something initializes it (`gkd-control-server.c`, `gkd-login.c`).
-        Uninitialized,
     }
 
     thread_local! {
@@ -9500,7 +9345,8 @@ mod tests {
     /// The outcome of one `finish_token_arm` against the two fakes.
     struct ArmRun {
         result: Result<(), String>,
-        /// The accounts named by each `ForgetPassword` irlumed received.
+        /// Each `ForgetPassword` and `DisarmKeyring` irlumed received, as
+        /// `Request account`.
         forgets: Vec<String>,
         /// The login keyring's credential afterwards.
         keyring: zeroize::Zeroizing<Vec<u8>>,
@@ -9508,42 +9354,6 @@ mod tests {
         /// least the credentials byte (a `DropUnread` one reads nothing, so
         /// it never counts).
         requests: usize,
-    }
-
-    /// `keyring forget` erases the token when the keyring opens with the
-    /// password, whether it re-keys back or never took the token, and keeps
-    /// it otherwise.
-    #[test]
-    fn forget_rekeys_back_or_finds_the_password_already_current() {
-        let back = |keyring: &[u8], script: &[Control]| {
-            let outcome = std::cell::Cell::new(None);
-            let run = against(keyring, script, || {
-                outcome.set(Some(rekey_back(ARM_TOKEN, ARM_PASSWORD)));
-                Ok(())
-            });
-            (outcome.take().unwrap(), run)
-        };
-        // Keyed to the token: re-keyed back and verified.
-        let (outcome, run) = back(ARM_TOKEN, &[Control::Answer, Control::Answer]);
-        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
-        assert_eq!(*run.keyring, ARM_PASSWORD);
-        // The arm's re-key never landed: the change back is refused, but the
-        // password opens the keyring.
-        for first in [Control::Answer, Control::ApplyThenDrop] {
-            let (outcome, run) = back(ARM_PASSWORD, &[first, Control::Answer]);
-            assert!(
-                matches!(outcome, Ok(RekeyedBack::AlreadyPassword)),
-                "{first:?}: {outcome:?}"
-            );
-            assert_eq!(*run.keyring, ARM_PASSWORD);
-        }
-        // Keyed to something else: the token is kept.
-        let (outcome, run) = back(b"another-secret", &[Control::Answer, Control::Answer]);
-        assert!(outcome.is_err(), "{outcome:?}");
-        assert_eq!(*run.keyring, b"another-secret");
-        // No gnome-keyring: nothing can be checked, so the token is kept.
-        let (outcome, _) = back(ARM_PASSWORD, &[]);
-        assert!(outcome.is_err(), "{outcome:?}");
     }
 
     const ARM_PASSWORD: &[u8] = b"login-password";
@@ -9583,16 +9393,14 @@ mod tests {
             zeroize::Zeroizing::new(packet[12 + current_len..12 + current_len + new_len].to_vec());
         let code: u32 = {
             let mut keyring = secret.lock().unwrap();
-            if matches!(fate, Control::Uninitialized) {
-                1 // DENIED, whatever the secret
-            } else if *keyring == current {
+            if *keyring == current {
                 *keyring = new;
                 0 // OK
             } else {
                 1 // DENIED
             }
         };
-        if matches!(fate, Control::Answer | Control::Uninitialized) {
+        if matches!(fate, Control::Answer) {
             let mut reply = 8u32.to_be_bytes().to_vec();
             reply.extend_from_slice(&code.to_be_bytes());
             stream.write_all(&reply).unwrap();
@@ -9668,9 +9476,10 @@ mod tests {
             })
         });
 
-        // irlumed: records every ForgetPassword. Other requests, such as a
-        // detached TUI worker from another test reading IRLUME_SOCKET, get an
-        // error and are not counted.
+        // irlumed: records every ForgetPassword and DisarmKeyring, and answers
+        // the second as an irlumed that does not know it. Other requests, such
+        // as a detached TUI worker from another test reading IRLUME_SOCKET, get
+        // an error and are not counted.
         let forgets = Arc::new(Mutex::new(Vec::new()));
         let daemon_sock = dir.join("irlumed.sock");
         let listener = std::os::unix::net::UnixListener::bind(&daemon_sock).unwrap();
@@ -9695,8 +9504,14 @@ mod tests {
                             let reply = match serde_json::from_str::<irlume_common::Request>(&line)
                             {
                                 Ok(irlume_common::Request::ForgetPassword { user }) => {
-                                    forgets.lock().unwrap().push(user);
+                                    let seen = format!("ForgetPassword {user}");
+                                    forgets.lock().unwrap().push(seen);
                                     irlume_common::Response::PasswordForgotten
+                                }
+                                Ok(irlume_common::Request::DisarmKeyring { user }) => {
+                                    let seen = format!("DisarmKeyring {user}");
+                                    forgets.lock().unwrap().push(seen);
+                                    irlume_common::Response::Error("bad request".into())
                                 }
                                 _ => irlume_common::Response::Error("not in this test".into()),
                             };
@@ -9753,8 +9568,10 @@ mod tests {
         );
         assert!(err.contains("kept"), "{err}");
         assert!(!err.contains("rolled back"), "{err}");
-        // A host whose irlumed refuses the re-arm still has a way out.
-        assert!(err.contains("`irlume keyring forget`"), "{err}");
+        assert!(
+            err.contains("token disarm is currently unavailable"),
+            "{err}"
+        );
     }
 
     /// Every answer is lost while gnome-keyring keeps running: the re-key,
@@ -9783,10 +9600,10 @@ mod tests {
         assert!(err.contains("kept"), "{err}");
     }
 
-    /// Rollback still happens where the keyring provably never took the
-    /// token, so a failed first arm does not leave a token envelope behind.
+    /// A failed arm keeps the envelope even when this session's keyring
+    /// never took the token.
     #[test]
-    fn a_minted_token_is_rolled_back_when_the_keyring_never_took_it() {
+    fn a_minted_token_is_retained_when_this_keyring_never_took_it() {
         for (case, keyring, script) in [
             ("no gnome-keyring in the session", ARM_PASSWORD, &[][..]),
             (
@@ -9808,17 +9625,17 @@ mod tests {
             let run = arm_against(keyring, script, true);
             assert_eq!(*run.keyring, keyring, "{case}: the keyring is unchanged");
             let err = run.result.expect_err(case);
-            assert_eq!(run.forgets, ["testuser"], "{case}: {err}");
-            assert!(err.contains("rolled back"), "{case}: {err}");
+            assert!(run.forgets.is_empty(), "{case}: {err}");
+            assert!(err.contains("kept"), "{case}: {err}");
         }
     }
 
     /// gnome-keyring serves only its own uid: from any other it reads the
     /// credentials byte and closes without applying or answering, as when
     /// root runs the arm with the user's `XDG_RUNTIME_DIR`. Nothing is sent
-    /// to it, and the token it never took is rolled back.
+    /// to it, and the envelope is kept.
     #[test]
-    fn a_minted_token_is_rolled_back_when_gnome_keyring_runs_as_another_uid() {
+    fn a_minted_token_is_kept_when_gnome_keyring_runs_as_another_uid() {
         // SAFETY: takes no arguments, reads only this process's own
         // credentials, and is specified as always succeeding.
         let keyring_uid = unsafe { libc::geteuid() };
@@ -9827,9 +9644,9 @@ mod tests {
         POSE_AS_UID.with(|uid| uid.set(None));
         assert_eq!(*run.keyring, ARM_PASSWORD, "the keyring is unchanged");
         let err = run.result.expect_err("another uid's keyring is not armed");
-        assert_eq!(run.forgets, ["testuser"], "{err}");
+        assert!(run.forgets.is_empty(), "{err}");
         assert_eq!(run.requests, 0, "nothing is sent to it: {err}");
-        assert!(err.contains("rolled back"), "{err}");
+        assert!(err.contains("kept"), "{err}");
         assert!(err.contains(&format!("runs as uid {keyring_uid}")), "{err}");
     }
 
@@ -9851,121 +9668,9 @@ mod tests {
         assert!(run.forgets.is_empty());
     }
 
-    /// Run `rekey_back_initializing` against a fake gnome-keyring, with
-    /// `initialize` standing in for the session bus. Returns the outcome,
-    /// the run and how often `initialize` was asked.
-    fn forget_against(
-        keyring: &[u8],
-        script: &[Control],
-        initialize: gkr_session::Initialized,
-    ) -> (Result<RekeyedBack, RekeyError>, ArmRun, usize) {
-        let outcome = std::cell::Cell::new(None);
-        let asked = std::cell::Cell::new(0);
-        let initialize = std::cell::Cell::new(Some(initialize));
-        let run = against(keyring, script, || {
-            outcome.set(Some(rekey_back_initializing(
-                ARM_TOKEN,
-                ARM_PASSWORD,
-                || {
-                    asked.set(asked.get() + 1);
-                    initialize.take().unwrap()
-                },
-            )));
-            Ok(())
-        });
-        (outcome.take().unwrap(), run, asked.get())
-    }
-
-    /// Right after login on Fedora 43 or 44, gnome-keyring is a `--login`
-    /// daemon nothing has initialized, which refuses every CHANGE. `forget`
-    /// has the bus start it once and the change back then goes through,
-    /// whether the keyring was keyed to the token or never took it.
-    #[test]
-    fn forget_initializes_a_login_started_gnome_keyring_once_and_retries() {
-        use gkr_session::Initialized;
-        let waiting = [
-            Control::Uninitialized,
-            Control::Uninitialized,
-            Control::Answer,
-            Control::Answer,
-        ];
-        let (outcome, run, asked) = forget_against(ARM_TOKEN, &waiting, Initialized::Now);
-        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
-        assert_eq!(*run.keyring, ARM_PASSWORD);
-        assert_eq!((asked, run.requests), (1, 4));
-
-        let (outcome, run, asked) = forget_against(ARM_PASSWORD, &waiting, Initialized::Now);
-        assert!(
-            matches!(outcome, Ok(RekeyedBack::AlreadyPassword)),
-            "{outcome:?}"
-        );
-        assert_eq!(*run.keyring, ARM_PASSWORD);
-        assert_eq!(asked, 1);
-
-        // Initialized, and keyed to something else after all: one start
-        // only, and the token is kept.
-        let (outcome, run, asked) = forget_against(b"another-secret", &waiting, Initialized::Now);
-        assert!(matches!(outcome, Err(RekeyError::Denied(_))), "{outcome:?}");
-        assert_eq!(*run.keyring, b"another-secret");
-        assert_eq!((asked, run.requests), (1, 4));
-    }
-
-    /// Without that daemon to initialize, or beside another Secret Service
-    /// provider, `forget` sends nothing more and keeps the token; only a
-    /// DENIED change back asks at all.
-    #[test]
-    fn forget_retries_only_after_an_initialization_and_only_on_denied() {
-        use gkr_session::Initialized;
-        let refused = [Control::Uninitialized, Control::Uninitialized];
-        for (case, initialize, says) in [
-            (
-                "not a login-started daemon",
-                Initialized::NotNeeded,
-                "denied",
-            ),
-            (
-                "another provider",
-                Initialized::OtherProvider,
-                "another Secret Service provider runs this session",
-            ),
-            (
-                "the start did not help",
-                Initialized::Failed("fixture failure".into()),
-                "fixture failure",
-            ),
-        ] {
-            let (outcome, run, asked) = forget_against(ARM_TOKEN, &refused, initialize);
-            let Err(RekeyError::Denied(e)) = &outcome else {
-                panic!("{case}: {outcome:?}");
-            };
-            assert!(e.contains(says), "{case}: {e}");
-            // A daemon waiting for initialization refuses whatever the
-            // secret, so only the plain refusal may blame the secret.
-            assert_eq!(
-                e.contains("wrong secret"),
-                matches!(case, "not a login-started daemon"),
-                "{case}: {e}"
-            );
-            assert_eq!(*run.keyring, ARM_TOKEN, "{case}: the token is kept");
-            assert_eq!((asked, run.requests), (1, 2), "{case}");
-        }
-        // No gnome-keyring at all, and a change back that goes through: no
-        // bus is asked.
-        let (outcome, _, asked) = forget_against(ARM_TOKEN, &[], Initialized::Now);
-        assert!(
-            matches!(outcome, Err(RekeyError::Unchanged(_))),
-            "{outcome:?}"
-        );
-        assert_eq!(asked, 0);
-        let (outcome, _, asked) =
-            forget_against(ARM_TOKEN, &[Control::Answer; 2], Initialized::Now);
-        assert!(matches!(outcome, Ok(RekeyedBack::Rekeyed)), "{outcome:?}");
-        assert_eq!(asked, 0);
-    }
-
     /// A token arm from a session whose gnome-keyring the login screen
     /// started and nothing initialized sends gnome-keyring nothing. A fresh
-    /// token is rolled back and an earlier one kept.
+    /// token and an earlier one are both kept.
     #[test]
     fn a_token_arm_in_a_session_without_an_initialized_gnome_keyring_sends_nothing() {
         let refusal = || Some(gkr_session::NOT_A_GNOME_SESSION.to_string());
@@ -9974,8 +9679,8 @@ mod tests {
         });
         let err = run.result.expect_err("not armed");
         assert!(err.contains("not a GNOME session"), "{err}");
-        assert!(err.contains("rolled back"), "{err}");
-        assert_eq!(run.forgets, ["testuser"], "{err}");
+        assert!(err.contains("kept"), "{err}");
+        assert!(run.forgets.is_empty(), "{err}");
         assert_eq!(run.requests, 0, "nothing is sent: {err}");
         assert_eq!(*run.keyring, ARM_PASSWORD, "{err}");
 
@@ -9986,5 +9691,35 @@ mod tests {
         assert!(err.contains("left in place"), "{err}");
         assert!(run.forgets.is_empty(), "{err}");
         assert_eq!(run.requests, 0, "{err}");
+    }
+
+    #[test]
+    fn failed_first_client_keeps_token_reused_successfully_by_second_client() {
+        let run = against(ARM_PASSWORD, &[Control::Answer; 2], || {
+            // A second arm completes with the same token, then the first arm
+            // fails: the envelope stays, whatever `minted` says.
+            finish_token_arm_in("testuser", ARM_PASSWORD, ARM_TOKEN, false, || None)?;
+            finish_token_arm_in("testuser", ARM_PASSWORD, ARM_TOKEN, true, || {
+                Some("first client's session is unavailable".into())
+            })
+        });
+        assert!(run.result.is_err());
+        assert_eq!(*run.keyring, ARM_TOKEN);
+        assert!(
+            run.forgets.is_empty(),
+            "the token a completed arm uses stays sealed"
+        );
+    }
+
+    #[test]
+    fn disarm_request_does_not_fall_back_to_legacy_delete() {
+        let run = against(ARM_PASSWORD, &[], || {
+            // The fake daemon rejects the new request. It would accept and
+            // record a legacy ForgetPassword, which must never be sent.
+            request_keyring_disarm("testuser").map(|_| ())
+        });
+        let error = run.result.unwrap_err();
+        assert!(error.contains("newer irlumed"), "{error}");
+        assert_eq!(run.forgets, ["DisarmKeyring testuser"]);
     }
 }

@@ -27,8 +27,12 @@ do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
    (ADR-0021). When a new ADR makes it, name the amended ADR in the new one's
    Status (ADR-0027) and add a dated "Amended by ADR-NNNN" note at the changed
    text of the old one (ADR-0020).
+   A new ADR that withdraws one says `Withdraws ADR-NNNN` in its Status
+   (ADR-0038, ADR-0039), and the withdrawn ADR's Status opens with a dated
+   `Withdrawn YYYY-MM-DD by ADR-NNNN` line saying its text is kept as the
+   record (ADR-0022, ADR-0033).
 5. Plain punctuation, no em dashes (CONTRIBUTING.md "Writing style").
 
 Before camera or TUI work, read ADR-0007, 0023, 0024, 0027, 0028, 0029 and
-0030; before camera work, also ADR-0020, 0021 and 0032 (split-pair
-authorization, admission posture and activation gates).
+0030; before camera work, also ADR-0020, 0021, 0031 (YUYV-luma IR endpoints)
+and 0032 (split-pair authorization, admission posture and activation gates).

@@ -231,18 +231,14 @@ the NV index itself, the same way `systemd-pcrlock make-policy` does.
 
 ## Isolated CLI checks
 
-The selection-provenance integration test runs the compiled CLI against a
-mock Health server in an empty-root namespace. Its ordinary `cargo test`
-entry starts that namespace automatically. It needs bubblewrap, a C
-compiler, Python `jsonschema` and the Python `lddtree` from pax-utils.
-Ubuntu CI installs `pax-utils`, `python3-pyelftools` and `python3-jsonschema`.
-Missing tools or failed namespace setup fail the test; there is no host
-execution fallback.
-
 Run the generic machine API checks with
 `bash scripts/test-machine-api-isolated.sh target/release/irlume` after
-building the release binary. The latter keeps the fixture/schema checks
-outside the namespace and isolates every invocation of the compiled CLI.
+building the release binary. It keeps the fixture/schema checks outside an
+empty-root namespace and isolates every invocation of the compiled CLI in it,
+which needs bubblewrap, a C compiler and the Python `lddtree` from pax-utils;
+its `--strict` schema check also needs Python `jsonschema` and exits 2
+without it (Ubuntu CI installs `pax-utils`, `python3-pyelftools` and
+`python3-jsonschema`). There is no host execution fallback.
 Read-only commands such as doctor and camera census can open devices, so a
 dead daemon socket alone is not an isolation boundary.
 
@@ -352,8 +348,8 @@ points = list(csv.DictReader(open(f"out/frame{n}.landmarks.csv")))
 ```
 
 The MediaPipe canonical face-landmark map names each index (nose tip, eye
-rings, cheek centers); irlume's own eye rings are `EAR_LEFT` / `EAR_RIGHT`
-in `crates/irlume-vision/src/lib.rs`.
+rings, cheek centers); irlume's own eye rings are `RESCUE_LEFT_EYE_RING` /
+`RESCUE_RIGHT_EYE_RING` in `rescue_detect` (`crates/irlume-auth/src/lib.rs`).
 
 ## What the dev shell can't do: real-hardware testing
 

@@ -1,13 +1,18 @@
 # AGENTS.md: irlume-cli
 
 The root [AGENTS.md](../../AGENTS.md) applies; this adds rules for the `irlume`
-CLI, TUI and machine API. `src/tui.rs` is about 25k lines, tests from about
-line 11930: search for the names below.
+CLI, TUI and machine API. `src/tui.rs` is about 26k lines, tests from about
+line 12190: search for the names below.
 
 ## CLI
 
 - `src/main.rs` parses argv by hand (`flag`, `flag_present` accept `--x v` and
   `--x=v`); commands are documented in [docs/COMMANDS.md](../../docs/COMMANDS.md).
+- Internal entry points, not in docs/COMMANDS.md, change their arguments only
+  with their callers: `--internal-token-delivery-lock-v1` (checked first in
+  `main`, run by irlumed's `token_delivery`; `tests/token_lock.rs`) and the
+  `login lightdm-*` hooks, run between them by `packaging/systemd/`,
+  `packaging/lightdm/` and `nix/module.nix`.
 - `DEV_CMDS` need `IRLUME_DEV` set (any value) and are never an auth path.
   The capture ones open the camera directly; `eval`, `irbench`, `normprobe`,
   `padreport`, `suncal` and `selftest align` read saved files or synthetic
@@ -25,6 +30,15 @@ line 11930: search for the names below.
   `src/fingerprint.rs` makes the `irlume fingerprint` PAM edits. The login
   plan, apply, verify and rollback commands are in `src/machine.rs`; their
   records and rollback digest checks are in `src/logintx.rs`.
+  `src/pamwire/lightdm_view.rs` builds LightDM's private PAM view and never
+  rewrites shared host stacks. Each LightDM service file in the view opens
+  with a deliberate `session [success=ignore default=die]` line on a retained
+  copy of `pam_irlume_view.so` (crate `irlume-pam-view`), outside the
+  `pam_irlume.so` controls.
+  `irlume login reconcile` rewires only when one of its checks fires, so a
+  change to a line irlume writes also teaches a stale check, such as
+  `login_recipe_stale` (greeters) or `polkit_stanza_stale` (polkit), the old
+  shape; otherwise upgraded installs keep the old wiring.
 
 ## Machine API (`--json`)
 
@@ -138,7 +152,9 @@ where older pages break them.
   sandbox environment overrides. Tests built on
   `support::isolated_root_command` need `/usr/bin/bwrap`: `isolated_root_cmd`
   for fixed-path root probes, and tests that bind fixture directories at fixed
-  paths such as `/etc/pam.d` (its `binds`). The selection-provenance test also
-  needs bubblewrap, a C compiler, pax-utils `lddtree` and Python `jsonschema`;
-  its host entry starts the empty-root runner before executing the CLI.
+  paths such as `/etc/pam.d` (its `binds`). `isolated_mount_root_command` is
+  the same with `CAP_SYS_ADMIN` inside the namespace, for the LightDM view
+  tests. `tests/lightdm_enforce.rs` also compiles a PAM probe and modules
+  from `tests/support/lightdm_pam_probe.c` with `$CC` (else `cc`) and
+  `-lpam`, so it needs a C compiler and the libpam headers.
   Other tests run on a host without bubblewrap.

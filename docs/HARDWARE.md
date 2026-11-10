@@ -51,7 +51,7 @@ answers "broken, an unusable class, or configuration" in one round trip.
 - **RGB:** `/dev/video0`: MJPG 1280x720@30 (RGB primary)
 - **IR:** `/dev/video2`: GREY 640x360, strobe ~2.4fps burst / ~15fps delivered lit frames
 - **Capture mode:** sequential: measured (capture_mode.3443:c803+3443:c803=sequential persisted)
-- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs). steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
+- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output via burst_dump PGM evidence, restoration); the 3443:930d sibling is a separate row. steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
 - **Anti-spoofing:** ViT RGB + FLIR IR qualified; SecureDark stage 2+3 measured on this host
 - **Evidence (irlume 0.11.1-1 (Arch)):**
   - slice4: sequential PASS as unprivileged runner (2026-08-24, sha a9c410e0: 0 drops)
@@ -89,6 +89,7 @@ Read from source at generation time. These are the modules whose emitter payload
 
 - `3277:0059` MS-XU unit 14, selector 0x06 (face authentication) (Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.)
 - `3443:c803` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W; MS-XU is unit 4.)
+- `3443:930d` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W "60fps" variant; IR on streaming interface 3; MS-XU unit 4.)
 - `5986:1141` MS-XU unit 8, selector 0x06 (face authentication) (Bison Integrated IR Camera in the ThinkPad T480; MS-XU is unit 8.)
 
 <!-- generated: schema 1; inputs: docs/hardware/fleet-evidence.json + ir_emitter.rs known_control; regenerate with scripts/generate-hardware-matrix.py -->

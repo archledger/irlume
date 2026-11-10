@@ -54,7 +54,7 @@
       "capture_mode_source": "measured (capture_mode.3443:c803+3443:c803=sequential persisted)",
       "emitter": {
         "control": "MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination",
-        "status": "validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs)",
+        "status": "validated (write, read-back, optical output via burst_dump PGM evidence, restoration); the 3443:930d sibling is a separate row",
         "notes": "steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)"
       },
       "pad": "ViT RGB + FLIR IR qualified; SecureDark stage 2+3 measured on this host",

@@ -480,14 +480,23 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
             payload: HELLO_FACE_AUTH.to_vec(),
         }),
         // NexiGo HelloCam N930W; MS-XU is unit 4.
-        //
-        // The product name is ambiguous, and a USB identity still does not
-        // establish payload compatibility. A prior survey classified 3443:930d
-        // as RGB-only, while #449 reports that ID with an IR stream and Windows
-        // Hello. Only c803 is the hardware this payload was validated against,
-        // so do not add 930d without its descriptor and on-device write,
-        // read-back, optical-output, and restoration evidence.
         (0x3443, 0xc803) => Some(EmitterControl {
+            unit: 4,
+            selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+            payload: HELLO_FACE_AUTH.to_vec(),
+        }),
+        // NexiGo HelloCam N930W "60fps" variant; IR on streaming interface 3; MS-XU unit 4.
+        //
+        // #449 reported this identity with an IR stream while an earlier
+        // survey had called it RGB-only; both are settled by the hardware now.
+        // Its descriptor advertises MSXU_CONTROL_FACE_AUTHENTICATION on the IR
+        // chain (VC interface 2, unit 4, bmControls bit 5 -> selector 0x06),
+        // GET_LEN reports 9 and GET_MAX 0x03 (D0|D1 supported, D2 not). The
+        // interface-3 D1 payload below drove the illuminator: GET_CUR read back
+        // 01 03 02 .. while lit and 01 03 01 .. after restoration, and captured
+        // IR frames alternate dark/lit (means 0.9 and 222.7) in D1 while
+        // staying flat in D0.
+        (0x3443, 0x930d) => Some(EmitterControl {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
             payload: HELLO_FACE_AUTH.to_vec(),
@@ -10791,7 +10800,7 @@ mod tests {
 
     #[test]
     fn known_control_table_is_keyed_on_usb_identity_not_a_name() {
-        // The two modules with the validated interface-3 payload.
+        // The modules with the validated interface-3 payload.
         let asus = known_control(0x3277, 0x0059).expect("ASUS entry");
         assert_eq!(asus.unit, 14);
         assert_eq!(
@@ -10806,12 +10815,17 @@ mod tests {
             crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
         );
 
-        // The same model name and a different, unvalidated USB identity. #449
-        // reports 3443:930d with an IR stream, contradicting the earlier
-        // RGB-only survey, but provides no descriptor or write contract. It
-        // must remain fail-closed until that exact hardware validates the
-        // control coordinates, payload, optical effect, and restoration.
-        assert_eq!(known_control(0x3443, 0x930d), None);
+        // The same model name, and a second validated identity: #449's report
+        // is confirmed on that hardware, which reaches the same MS-XU unit 4 /
+        // selector 0x06 / interface-3 D1 payload, and ends back in D0.
+        assert_eq!(
+            known_control(0x3443, 0x930d),
+            Some(EmitterControl {
+                unit: 4,
+                selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
+                payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
+            })
+        );
 
         // A different camera gets nothing, however it names itself. The old
         // table matched `card.contains("ASUS")`, so any camera with that word

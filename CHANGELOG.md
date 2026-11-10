@@ -418,6 +418,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume recovery restore` requires the recovered key to open the stored
+  enrollment and the added-camera store before it reseals. A store that
+  does not read or authenticate under that key, or that names another
+  account, refuses the restore, and the refusal names the store and its
+  path. With neither store present, the check passes. A recovery file over
+  4096 bytes, a stored enrollment over 64 MiB or an added-camera store over
+  8 MiB is refused, and only the Argon2id costs every irlume release has
+  written are accepted, so existing recovery files stay valid.
+
 - TPM sealing runs `TPM2_Create` in an HMAC session salted to the parent
   key, with AES-128-CFB parameter encryption. A secret over 256 bytes, the
   TSS buffer size, is rejected before any TPM command. Policies and

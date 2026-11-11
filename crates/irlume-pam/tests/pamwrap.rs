@@ -1871,8 +1871,9 @@ fn pamwrap_polkit_shake_aborts_only_the_polkit_stack() {
     // instrument, so the module's ABORT-vs-IGNORE is observable on each; under
     // plain `sufficient` an ABORT is `default=ignore`d and the scoping guard could
     // not be tested. In production only the polkit stanza carries abort=die and
-    // sudo keeps plain `sufficient`, but pam_irlume never returns ABORT for sudo
-    // (the is_polkit_consent guard), so sudo's real control cannot change the outcome.
+    // sudo keeps plain `sufficient`, but pam_irlume never returns the decline
+    // ABORT for sudo (the is_polkit_consent guard), so sudo's real control
+    // cannot change this test's outcome.
     const POLKIT_CONTROL: &str = "[success=done new_authtok_reqd=done abort=die default=ignore]";
     let permit_after = |service: &str, control: &str| {
         h.write_service(

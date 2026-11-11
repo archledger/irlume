@@ -1585,9 +1585,10 @@ All notable changes to irlume are documented here. This project adheres to
   password prompt and render no landing, and a password chain reached
   through an `include` takes the `sufficient` form instead, because libpam
   expands an include inline and a jump would skip only its first expanded
-  rule. Greeter face lines carry the `kr` keyring-continue arg, so a face
-  grant still hands the keyring over when the skipped stack contains the
-  keyring module. The face line anchors only on a known password stack
+  rule. Greeter face lines carry the `kr` keyring-continue arg: after a
+  cold login's face match sets the login password, the face line returns
+  `PAM_IGNORE`, so the password stack and its keyring module still run.
+  The face line anchors only on a known password stack
   (password-auth, system-auth, common-auth, login), and evaluation fails
   on any layout the placement cannot prove safe: no or ambiguous password
   delegation, an occupied or shared order slot, a numeric jump in the

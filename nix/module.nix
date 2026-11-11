@@ -14,7 +14,7 @@
 ##     `[success=1 default=ignore]`, NOT `sufficient`. It records the face
 ##     success but skips exactly one rule, so on a flat chain pam_kwallet /
 ##     pam_gnome_keyring still runs and unseals the wallet, and pam_unix
-##     grants on the token the daemon unsealed. `sufficient` would
+##     grants on the token the daemon unsealed. Without `kr`, `sufficient` would
 ##     short-circuit past the keyring and leave the session with a locked
 ##     wallet. A pam_permit landing rule catches the jump on services whose
 ##     auth nixpkgs renders as a `substack` (SDDM on current nixpkgs); there
@@ -23,14 +23,16 @@
 ##     whose pam_unix would fail on the empty Enter that armed the face
 ##     scan. Because that jump also skips any keyring rule inside the
 ##     substack, every greeter face line carries the `kr` (keyring-continue)
-##     arg, which re-drives the keyring handoff from the daemon, the same
-##     arg `irlume login enable` writes on FHS greeters
-##     (crates/irlume-cli/src/pamwire.rs). Flat chains get no landing; the
-##     face line goes immediately before the password-prompting pam_unix
-##     instead. The one login layout that DOES get `sufficient` is an
-##     `include` anchor: libpam expands an include inline, so a success=N
-##     jump would skip only its first expanded rule; the module IGNOREs on
-##     cold login and a face match returns immediately.
+##     arg, the same arg `irlume login enable` writes on FHS include-layout
+##     greeters (crates/irlume-cli/src/pamwire/stanzas.rs): on a cold login
+##     whose face match put the login password in PAM_AUTHTOK, the module
+##     returns IGNORE, so the jump is not taken and the substack runs with
+##     that password. Flat chains get no landing; the face line goes
+##     immediately before the password-prompting pam_unix instead. The one
+##     login layout that DOES get `sufficient` is an `include` anchor: libpam
+##     expands an include inline, so a success=N jump would skip only its
+##     first expanded rule; the module IGNOREs on cold login and a face match
+##     returns immediately.
 ##
 ##   * A lock screen (kde, swaylock, hyprlock) gets `sufficient`. The wallet is
 ##     already open in the live session, so there is no keyring handoff to make;
@@ -133,12 +135,15 @@ let
     "ondemand"
   ];
   # Greeter face lines carry `kr` (keyring-continue), the same arg the FHS
-  # wiring puts on every greeter line (pamwire.rs, include_greeter_line): a
-  # face grant skips the password stack, including any pam_kwallet /
-  # pam_gnome_keyring auth rule inside the skipped delegation, and `kr`
-  # re-drives the keyring handoff from the daemon so the session starts
-  # with the wallet unlocked. On cold login the module IGNOREs and `kr` is
-  # inert. Lock screens never carry it: the wallet is already open.
+  # wiring puts on its include-layout greeter lines (pamwire/stanzas.rs,
+  # include_greeter_line): a face grant skips the password stack, including
+  # any pam_kwallet / pam_gnome_keyring auth rule inside the skipped
+  # delegation. With `kr`, on a cold login (no live local graphical session
+  # yet) whose face match put the login password in PAM_AUTHTOK, the face
+  # line returns IGNORE instead of SUCCESS, so the password stack runs with
+  # that password and the session starts with the wallet unlocked. A warm
+  # login still returns SUCCESS. Lock screens never carry it: the wallet is
+  # already open.
   # No defer_wallet: these rules do not add the reseal session consumer.
   # NixOS intentionally supports only login-password envelopes.
   pamArgsLogin = pamArgs ++ [ "kr" ];

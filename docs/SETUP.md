@@ -375,7 +375,7 @@ give this guidance on Fedora 43 and 44.
 Password-backed and KDE-key arms should be checked and re-armed after a
 password change if needed. PAM also has a best-effort reseal path after
 password authentication; a failed reseal does not fail the login. Fingerprint
-login can use the same backend-specific handoff
+login gets its secret on irlume's `reseal` session line, routed by kind
 ([ADR-0003](adr/0003-fingerprint-keyring-unlock.md)).
 
 For KDE, the CLI or PAM session asks the packaged `irlume-kwallet-init` helper
@@ -451,14 +451,19 @@ it has no separate fingerprint service, unlike kscreenlocker, which drives the
 So a fingerprint login at the KDE greeter happens when your distro's shared
 stack carries `pam_fprintd.so` (that is what `irlume fingerprint enable` wires,
 via authselect on Fedora or pam-auth-update on Debian), inside the same
-`plasmalogin` transaction. A fingerprint provides no password, so irlume's
-`keyring` line, wired into the greeter whenever a reader is present, releases
-the TPM-sealed secret at the post-auth landing, and `pam_kwallet5.so`
-below it opens the wallet: a cold-boot fingerprint login unlocks KWallet with
-no prompt, same as face. The lock screen needs none of this: a warm unlock
-meets a wallet the login already opened, and irlumed releases nothing while
-the account has a live local desktop, so a fingerprint at the lock screen
-never re-opens a wallet or keyring you locked by hand.
+`plasmalogin` transaction. A fingerprint provides no password, and irlume's
+`keyring` line, wired into the greeter whenever a reader is present, only
+marks the post-auth landing and requests nothing. The TPM-sealed secret is
+released on irlume's `session optional pam_irlume.so reseal` line, which PAM
+runs only after authentication and account management succeeded. A KDE-key
+arm's wallet key goes to `irlume-kwallet-init`, which starts the wallet with
+it: a cold-boot fingerprint login unlocks KWallet with no prompt, same as
+face. A login-password arm's password goes to the GNOME keyring's control
+socket instead, so it does not open KWallet on a fingerprint login. The lock
+screen needs none of this: a warm unlock meets a wallet the login already
+opened, and a screen unlock opens no session, so no `reseal` session line
+runs there and a fingerprint at the lock screen never re-opens a wallet or
+keyring you locked by hand.
 
 #### GNOME: what has to be in place for the login keyring
 
@@ -502,14 +507,15 @@ either module's pair.
 `pam_fprintd.so` (it delegates to `auth substack fingerprint-auth`) nor any
 keyring module. So the [ADR-0003](adr/0003-fingerprint-keyring-unlock.md)
 fingerprint keyring unlock needs both an anchor that recognizes the substack and
-a consumer to read the released password. `login enable` supplies both:
+a keyring daemon to take the released secret. `login enable` supplies both:
 
 ```
 auth        substack      fingerprint-auth
-auth       optional       pam_irlume.so keyring          ← releases the sealed secret
--auth      optional       pam_gnome_keyring.so           ← reads and stashes it
+auth       optional       pam_irlume.so keyring          ← landing marker, requests nothing
+-auth      optional       pam_gnome_keyring.so
 ...
--session   optional       pam_gnome_keyring.so auto_start  ← unlocks, starts the daemon
+-session   optional       pam_gnome_keyring.so auto_start  ← starts the daemon
+session    optional       pam_irlume.so reseal           ← releases the sealed secret to it
 ```
 
 The two `pam_gnome_keyring.so` lines are added **only** when the stack has no

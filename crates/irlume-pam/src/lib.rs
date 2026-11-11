@@ -9,37 +9,119 @@
 //!
 //! Two modes, selected by a module argument in the PAM line:
 //!   * default (`auth sufficient pam_irlume.so`): VERIFY only. Sends
-//!     `Authenticate`; a live match grants WITHOUT touching the password. Use for
-//!     `sudo`, polkit, and in-session unlocks where the keyring is already open.
-//!     Shared privileged services first offer one hidden field through PAM:
-//!     `yes` selects one face attempt, while any other non-empty value remains
-//!     the authentication token for the downstream password provider.
+//!     `Authenticate`; a live match grants WITHOUT touching the password.
+//!     Use for `sudo`, polkit, and in-session unlocks where the keyring is
+//!     already open. Shared privileged services first offer one hidden field
+//!     through PAM: `yes` selects one face attempt, while any other non-empty
+//!     value remains the authentication token for the downstream password
+//!     provider. On such a service the module returns `PAM_IGNORE` before
+//!     that field when the device is known to be RGB-only
+//!     (`privileged_face_is_rgb_only`), and the owner can waive the field
+//!     (`privileged_face_consent` in settings.conf; irlumed checks the same
+//!     key).
 //!   * `unseal` (`auth sufficient pam_irlume.so unseal`): VERIFY + KEYRING
-//!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases the
-//!     TPM-sealed login password, which we set as `PAM_AUTHTOK` so a downstream
-//!     `pam_kwallet5` / `pam_gnome_keyring` unlocks the wallet. Use for login
-//!     (SDDM/GDM) and the lock screen after a cold boot.
+//!     UNLOCK. Sends `UnsealPassword`; on a live match the daemon releases a
+//!     TPM-sealed keyring secret, which `release_secret` delivers by kind: a
+//!     login password becomes `PAM_AUTHTOK` so a downstream `pam_kwallet5` /
+//!     `pam_gnome_keyring` unlocks the wallet, a KDE wallet key goes to
+//!     `irlume-kwallet-init`, which starts the wallet daemon with it, and a
+//!     GNOME keyring token waits in PAM data for the `reseal` session line.
+//!     A release grants only when that hand-off or stash succeeded
+//!     (`code_for`); a failed one earns `PAM_IGNORE`, as a refused match does,
+//!     and `wait` tries again.
+//!     Use for login (SDDM/GDM) and the lock screen after a cold boot.
 //!
-//! Further module arguments (combinable with either mode): `wait` keeps the
-//! module retrying for ~20s instead of doing a single capture. This is what the
-//! KDE lock screen needs: kscreenlocker starts the non-interactive auth stack
-//! the moment the screen appears, so the window is what lets the user sit back
-//! down and be recognized without touching a key. A one-shot capture fires long
-//! before they return and is useless there. `reseal` re-seals the keyring
-//! secret under a new PAM-verified password, `keyring`/`kr` route a keyring
-//! (not login) secret, `facefirst` orders face before the password provider,
-//! and `ondemand` restricts the module to explicitly requested attempts (see
-//! the per-argument docs in `parse_module_args` and the wiring recipes in
-//! irlume-cli's `pamwire`).
-//! `defer_wallet` is for login stacks with a `session ... reseal` consumer:
-//! it stashes a face-released KDE key only when the helper reports that the
-//! runtime directory does not exist yet. Other delivery failures still fall
-//! back to the password, and legacy stacks without it keep their behavior.
+//! When `is_remote_session` reports a remote session, every auth line except
+//! the `begin reseal` marker returns `PAM_IGNORE` before any request or stash.
+//! In either mode a password the user already typed keeps the camera off: the
+//! module returns `PAM_IGNORE` and leaves the password to the modules below
+//! it. On an `unseal` line without `wait` or `facefirst` the module asks PAM
+//! once for that password, and only an empty answer selects face (`ondemand`
+//! on `cosmic-greeter` replaces this probe, below); elsewhere it reads a
+//! `PAM_AUTHTOK` an earlier module set. On a shared privileged service, a
+//! `wait` or `unseal` line returns `PAM_IGNORE` before any face attempt.
+//!
+//! Further module arguments act within a mode. `wait` works in either mode;
+//! `kr`, `ondemand`, `facefirst` and `defer_wallet` act only with `unseal`.
+//!   * `wait` keeps the module retrying for ~20s instead of doing a single
+//!     capture. This is what the KDE lock screen needs: kscreenlocker starts
+//!     the non-interactive auth stack the moment the screen appears, so the
+//!     window is what lets the user sit back down and be recognized without
+//!     touching a key. A one-shot capture fires long before they return and
+//!     is useless there. `scripts/deploy-keyring-unlock.sh` writes `wait` on
+//!     that non-interactive `kde-fingerprint` stack; irlume-cli's wiring
+//!     never writes it and puts `unseal ondemand` on KDE's submit-driven
+//!     `kde` lock service instead.
+//!   * `kr` (keyring-continue): when the release set the login password as
+//!     `PAM_AUTHTOK` and the user has no live local graphical session yet (a
+//!     cold login), the line returns `PAM_IGNORE` instead of `PAM_SUCCESS`,
+//!     so the stack goes on past it (a `sufficient` line continues, a
+//!     `success=1` jump is not taken) and `pam_unix` and the keyring module
+//!     below authenticate and unlock from that password. A warm unlock, the
+//!     identity-only fallback and every other kind of delivery still return
+//!     `PAM_SUCCESS`.
+//!   * `ondemand`: on `cosmic-greeter`, whose frontend drops empty input, an
+//!     `ondemand` line without `wait` or `facefirst` replaces the probe with
+//!     one hidden prompt for a password or `yes`: only a fresh `yes` selects
+//!     face, and any other non-empty answer stays the password. Elsewhere it
+//!     leaves the probe as it is. On `cosmic-greeter` and elsewhere, a
+//!     release the daemon refuses before any face attempt
+//!     (`UnsealUnavailable`) falls back, in that attempt, to one
+//!     identity-only verify (`Authenticate`), which delivers nothing; a
+//!     denial, a transport error or a failed delivery does not.
+//!   * `facefirst` skips the password probe and scans at once, for a greeter
+//!     whose PAM conversation can block on that probe until the user types;
+//!     irlume-cli writes it for GDM with a GNOME Shell older than 46 or not
+//!     detected, and for greeters not yet validated for the probe. It gets
+//!     the same identity-only fallback as `ondemand`.
+//!   * `defer_wallet` is for login stacks with a `session ... reseal`
+//!     consumer: it stashes a face-released KDE key only when the helper
+//!     reports that the runtime directory does not exist yet. Other delivery
+//!     failures still fall back to the password, and legacy stacks without
+//!     it keep their behavior.
+//!
+//! These lines run neither mode; their `authenticate` and session hooks always
+//! return `PAM_IGNORE` (`setcred` returns `PAM_SUCCESS` on every line):
+//!   * `begin reseal service=SERVICE` (auth, at the top of a login stack)
+//!     discards the attempt state an earlier authentication attempt left in
+//!     PAM data (`session_state`), as every mode line does when it starts,
+//!     but before a password or fingerprint provider can end authentication.
+//!     `begin` acts only beside `reseal`, which keeps the line inert on older
+//!     modules too, and it resets only when the line carries exactly one
+//!     `service=` naming this transaction's PAM service, so it is inert where
+//!     another service's stack includes it.
+//!   * `reseal` on its auth line (after the password provider) copies a
+//!     non-empty `PAM_AUTHTOK` into PAM data bound to the user and service,
+//!     and contacts nothing. On its session line (`open_session`, which PAM
+//!     runs only after authentication and account management succeeded) it
+//!     takes that state once. When the auth line stashed a password and
+//!     `read_wallet_salt` succeeds, it asks irlumed (`ResealPassword`) to
+//!     re-seal the armed envelope with that password if the PCRs or the
+//!     password changed (irlumed checks it against the login hash where it
+//!     can read one). It then delivers the keyring secret this login still
+//!     needs: a KDE wallet key or GNOME token the auth phase stashed, else
+//!     the reply to one `UnsealKeyring` query. A GNOME token or login
+//!     password goes to the keyring daemon's control socket through
+//!     `irlume-gkr-unlock`, a KDE wallet key to `irlume-kwallet-init`.
+//!     `close_session` discards whatever state is left.
+//!   * `keyring` is the fingerprint lane's landing marker: it requests and
+//!     releases nothing, and that lane's secret is released on the `reseal`
+//!     session line instead.
+//!
+//! See the comments in `authenticate` and the wiring recipes in irlume-cli's
+//! `pamwire`.
 //!
 //! Per NIST SP 800-63B-4, face is one factor and a non-biometric fallback MUST
 //! always exist: on any decline/timeout we return `PAM_IGNORE` so the stack
 //! cleanly cascades to the password module (never `AUTH_ERR`, which would just
-//! log a failure; the password is always the floor).
+//! log a failure; the password is always the floor). Two paths return
+//! `PAM_ABORT` instead: a `yes` or empty token that `clear_authtok` cannot
+//! clear at the face-intent check of a shared privileged service or of
+//! `cosmic-greeter`, and an older daemon's explicit decline at a polkit
+//! consent prompt. The control on the PAM line decides what follows:
+//! `abort=die`, which irlume-cli's polkit stanza carries, ends the stack;
+//! under plain `sufficient` or a `success=1 default=ignore` jump the code
+//! is ignored and the stack goes on to the password module.
 
 use irlume_common::pam_service::ServiceKind;
 use irlume_common::{IntentAttestation, Request, Response, SecretBytes};
@@ -599,10 +681,13 @@ impl PamServiceModule for IrlumePam {
             if keyring {
                 return PamError::IGNORE;
             }
-            // `facefirst` (GNOME/GDM wiring): GDM's PAM conversation BLOCKS on the
-            // active password probe until the user types (unlike plasmalogin/SDDM,
-            // which answer instantly from the buffered field), so skip the probe and
-            // scan right away; a typed password still wins via the modules after us.
+            // `facefirst` (irlume-cli writes it for GDM below GNOME Shell 46 or
+            // with an undetected version, and for greeters not yet validated
+            // for the probe): older GDM's PAM conversation BLOCKS on the active
+            // password probe until the user types (unlike plasmalogin/SDDM,
+            // which answer instantly from the buffered field), so skip the
+            // probe and scan right away; a typed password still wins via the
+            // modules after us.
             let facefirst = args.iter().any(|a| a == "facefirst");
 
             // `ondemand`: explicit input selects face, with the warm
@@ -764,7 +849,7 @@ impl PamServiceModule for IrlumePam {
                     )
                 };
                 // A polkit decline is terminal (legacy daemons produced it from a
-                // head shake; current daemons from an explicit cancel):
+                // head shake; current daemons never send one):
                 // try_verify returned ABORT, so
                 // abort the whole PAM stack instead of cascading to the password. The
                 // attempt then fails with no password prompt, and the polkit agent
@@ -1311,7 +1396,7 @@ fn situation_prompt(situation: &str) -> Option<&'static str> {
 
 /// One verify attempt (sudo / polkit / in-session unlock): no password released.
 /// Returns `SUCCESS` on a live match; `ABORT` on a DELIBERATE decline
-/// at a polkit consent dialog (legacy head-shake daemon, or an explicit cancel),
+/// at a polkit consent dialog (only a legacy head-shake daemon sends one),
 /// so the whole stack aborts and the agent closes its
 /// window; and `IGNORE` on anything else so the password fallback survives. Passes
 /// the PAM service so the daemon can apply tier×operation-class gating (an RGB-only
@@ -1559,8 +1644,8 @@ fn hand_key_to_wallet_daemon(
     // wallet daemon already runs for this login: pam_kwallet5's session hook
     // started it, which runs before irlume's `reseal` session line on the
     // Arch include layout, or an earlier irlume line did. For the latter the
-    // `keyring` line already tells irlumed a wallet runs, so a warm face
-    // `unseal` ahead of it normally gets no second key; this check is the
+    // `reseal` session line tells irlumed a wallet runs, so after a warm face
+    // `unseal` it normally gets no second key; this check is the
     // defence in depth for an irlumed that releases one anyway (one older
     // than `have_password`, or a concurrent re-arm). A second helper would
     // unlink that daemon's socket and leave it orphaned with the key in

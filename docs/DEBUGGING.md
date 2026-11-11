@@ -399,6 +399,58 @@ watch the skew in `irlume camera diagnostics --json` for drift. This has
 been fleet practice since the capture-path program landed, for exactly that
 reason.
 
+## Camera role lines in the journal
+
+irlumed records which capture node of a camera is RGB and which is IR, for
+the camera's current connection. A daemon start, a replug and any kernel
+event for the camera's video nodes or its USB device start a new connection,
+and under the Dual face sensor policy the daemon scans the nodes again at
+its next poll, every 2 seconds:
+
+```text
+irlumed: classified the capture nodes of 1 connected camera(s) that had no roles yet (ADR-0029 §1)
+```
+
+The line says a scan of the camera's nodes ran. One at the daemon's start is
+normal, and so is one at a login or a switch of the active console on
+desktops where that emits `change` events for the video nodes. Until the
+camera has roles again (after this line, when the scan could read the nodes,
+or once the TUI's Cameras page lists the cameras), automatic camera
+selection finds no classified pair for an account when none of its enrolled
+cameras has roles, and the face attempt is refused to the password: `no
+eligible enrolled camera is connected (NoEnrolledCameraConnected)`. Where
+the greeter releases a sealed keyring secret (after `irlume keyring arm`),
+its refusal is journaled as `irlumed: UnsealPassword: denied for ...`. At a
+greeter without one, at the lock screen and at sudo the attempt is an
+`Authenticate` request, and the reason is journaled only where face
+decisions are (the convenience tier, or `IRLUME_LOG=debug`). A pinned pair,
+the `IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE` pair and an enrollment without a
+complete camera binding keep using the standing pair.
+
+```text
+irlumed: a camera was not seen to keep its roles for 30 s after any of 4 scans in a row (a udev change each time, nodes that could not be read, or no complete camera inventory in between); its next scans are spaced up to 600 s apart
+```
+
+The camera was not seen to keep its roles for 30 seconds after any of four
+scans in a row: it was unclassified again, or still, each time, or the
+camera inventory was incomplete in between. The daemon now opens it less
+often: while it keeps changing, each next scan comes at least 60, 300 and
+then 600 seconds after the previous one. A camera whose nodes cannot be read
+follows its retries instead (5, 30, 120 and 600 seconds); the notice then
+comes with its fifth try, after which it is left alone with `irlumed: camera
+... is still unclassified after 5 tries`. Session changes in quick
+succession, each within 30 seconds of the scan that served the one before,
+write the notice at the fifth scan too; the scan at the daemon's start
+counts as the first only when the first change comes within 30 seconds of
+it. The spacing ends once the camera has not been seen unclassified for 30
+seconds (its roles held, or it was unplugged), or after 15 minutes without a
+scan. A camera that changes, or leaves the bus, 30 seconds or more after
+each scan is not spaced and gets no notice: the `classified the capture
+nodes` line then repeats about every 32 seconds. The TUI's Cameras page
+classifies the cameras at once. `udevadm monitor --kernel
+--subsystem-match=video4linux --subsystem-match=usb` shows the events that
+keep changing the camera.
+
 ## YUYV IR camera listed as UVC RGB
 
 By its formats, a camera node that offers only YUYV is an RGB camera: most

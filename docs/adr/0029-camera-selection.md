@@ -403,6 +403,9 @@ A camera that comes back unclassified after each scan, as a camera that
 answered an open with a udev change would, is scanned ever less often, down
 to once every 10 minutes, so it is never reopened every few seconds; other
 cameras keep their own pace.
+(Amended 2026-11-11: the spacing counts only a camera seen unclassified
+again, or still, within 30 seconds, and starts with the fifth scan of a run;
+see the amendment of that date.)
 The classifier runs only under the face sensor policy that permits background
 requalification (Dual), so the IR-only policy's camera discovery stays off.
 
@@ -410,3 +413,60 @@ The coordinator stays camera-free. The classifier lives in the daemon, so a
 CLI process that starts a supervisor opens nothing in the background.
 Authentication, selection and the split listing stay camera-free reads of the
 recorded roles, as item 1 and ADR-0032 require.
+
+## Amendment 2026-11-11: a run of scans ends once the roles held
+
+The 2026-10-18 amendment spaces the scans of a camera that comes back
+unclassified after each scan. The rule counted every scan at a camera's port
+that came within 15 minutes of the previous one, whatever had made the camera
+unclassified again, and the scan at the daemon's start counted as the first.
+Any kernel event for a camera's video nodes starts a new connection
+generation and drops its recorded roles. Events from outside within that
+time were therefore spaced as if the camera had answered each scan: after the
+start scan, the second such event waited up to 10 seconds for its scan, the
+third up to 60, the fourth up to 300 and later ones up to 600. Until its
+scan, account routing found no classified pair and refused to the password
+with `NoEnrolledCameraConnected`, as before #887.
+
+Measured on 2026-11-11 on an Arch Linux machine (systemd 262, Plasma 6.8, a
+Logitech BRIO): each switch of the seat's active console emitted one burst of
+synthetic `change` events for every video4linux node, and a scan that the
+spacing did not hold back followed one to two seconds later. Earlier on that
+machine a switch to a text console, a login there, the logout and the switch
+back, all within four minutes of a daemon start, were followed by scans 10,
+60 and 300 seconds apart, so the camera most likely had no roles for about
+five minutes.
+
+Two rules change.
+
+A run now ends at the first poll of a Current publication that comes 30
+seconds or more after its camera was last seen unclassified (at the last
+scan at its port, or at a later such poll that listed it); in that time the
+camera had its roles or was gone. Its next new generation starts a new run
+and is classified at the next poll. A camera seen unclassified again, or
+still, before then keeps its run, whether it had its roles or was gone in
+between. A publication that is not Current ends no run.
+
+The first scans of a run are no longer spaced. The second, third and fourth
+scan follow at the poll interval, the fifth waits 10 seconds after the
+fourth, and the waits of 60, 300 and 600 seconds start with the sixth. The
+notice that scans are being spaced is written at the fifth scan of a run.
+
+Limits. Changes that each come within 30 seconds of the last time the
+camera was seen unclassified still count as one run: the fifth scan of such
+a run, the scan at the daemon's start included, writes the notice, and the
+sixth waits up to 60 seconds. A camera that answered
+each scan with a change 30 seconds or more after it, or that left the bus
+for 30 seconds or more each time, would not be spaced: it would be scanned
+once per change, as often as every 32 seconds (30 seconds and the next
+poll, about 110 scans an hour against 6 at the cap), and no notice would be
+written; none is known. After a stretch without a Current publication, a
+camera that comes back unclassified continues its run whatever it did in
+between. A camera replaced by another at the same port within 30 seconds
+inherits the run. Each new generation still leaves
+the camera unclassified until the scan at the next poll has run (up to 2
+seconds and the scan, longer behind queued camera requests), and an
+authentication that account routing serves in that time is refused to the
+password. Keeping a camera's roles across a `change` event whose rescan
+finds the same device would remove that window; it changes how item 1 keys
+the roles and is not decided here.

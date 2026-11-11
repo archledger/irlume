@@ -293,6 +293,8 @@ so the vulnerable code is never reached. `deny.toml` therefore takes a
 justified ignore for it, with that rationale and a tracking issue, as
 AGENTS.md's dependency rule allows; `ring` is not used because it offers no
 RSA encryption.
+(Amended 2026-11-11, below: `rsa` 0.10.0 is outside the advisory's range,
+and `deny.toml` no longer ignores the advisory.)
 
 ### 7. Privacy
 
@@ -328,6 +330,7 @@ check.
   half a megabyte), and gains `x509-cert`, `rsa`, `p256`, `p384` and `p521`
   as normal dependencies of irlume-core, with a justified ignore of
   RUSTSEC-2023-0071 (section 6).
+  (Amended 2026-11-11, below: with `rsa` 0.10.0 the ignore is gone.)
 - The wire gains one root-only request.
 
 ## Phasing
@@ -404,6 +407,8 @@ left open:
   the der 0.8 and digest 0.11 generation irlume already uses; 0.9 would
   duplicate the previous generation. The RUSTSEC-2023-0071 ignore is tracked
   in #1112.
+  (Amended 2026-11-11, below: `=0.10.0-rc.22` since #1300, then the
+  requirement `0.10`, resolved to 0.10.0; the ignore is gone.)
 
 ## Amendment 2026-10-17: Phase 2 TPM details
 
@@ -551,6 +556,23 @@ irlumed's `TpmEndorsement` request (section 4) is wired as follows:
   Administrator: it asks first, then runs `sudo irlume doctor --user
   <account>` in the cooked terminal, as the Logs view runs `sudo irlume
   logs`.
+
+## Amendment 2026-11-11: rsa 0.10.0 and the RUSTSEC-2023-0071 ignore
+
+`rsa` 0.10.0 is the first release RustSec lists as patched for
+RUSTSEC-2023-0071 (`patched = [">= 0.10.0"]`, advisory-db 7a40350e,
+2026-11-08); its release candidates stay inside the advisory's range.
+irlume moves from 0.10.0-rc.22 to 0.10.0 in both lockfiles, with
+`crypto-bigint` 0.7.11, which 0.10.0 requires, and `deny.toml` no longer
+ignores the advisory (#1112). The requirement becomes `0.10`: the exact
+pin was for the release candidates, whose interfaces changed between
+one another, and no release candidate satisfies `0.10`. The justified
+ignore of section 6 and the Consequences entry that names it record the
+state before this amendment, and the Phase 1 pin the state before #1300,
+which moved it from `=0.10.0-rc.19` to `=0.10.0-rc.22`. irlume's use of
+`rsa` is unchanged: verification of RSA PKCS#1 v1.5 and PSS signatures on
+EK and CA certificates and the RSA-OAEP encryption of section 2.4, with no
+RSA private key outside test code.
 
 ## Acceptance tests
 

@@ -76,11 +76,12 @@ der        = { version = "0.8", features = ["derive", "pem", "alloc", "oid"] }  
 spki       = { version = "0.8", features = ["alloc", "pem"] }  # SubjectPublicKeyInfo container for the PCR signing key
 # TPM endorsement-key certificate verification (ADR-0036 section 6): parse,
 # then verify RSA PKCS#1 v1.5 / PSS and ECDSA P-256 / P-384 / P-521 signatures.
-# Public-key operations only. rsa 0.10 is pinned exactly while it is a release
-# candidate: 0.9 sits on the previous RustCrypto generation (der 0.7, digest
-# 0.10, rand_core 0.6) and would duplicate that stack.
+# Public-key operations only. rsa 0.10.0 is the first release RustSec lists as
+# patched for RUSTSEC-2023-0071 (#1112); a 0.10 requirement never resolves to
+# one of its pre-releases. 0.9 sits on the previous RustCrypto generation
+# (der 0.7, digest 0.10, rand_core 0.6) and would duplicate that stack.
 x509-cert  = { version = "0.3", default-features = false }
-rsa        = { version = "=0.10.0-rc.22", default-features = false, features = ["pkcs1v15"] }
+rsa        = { version = "0.10", default-features = false, features = ["pkcs1v15"] }
 p256       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
 p384       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }
 p521       = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"] }

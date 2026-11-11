@@ -487,15 +487,15 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
         }),
         // NexiGo HelloCam N930W "60fps" variant; IR on streaming interface 3; MS-XU unit 4.
         //
-        // #449 reported this identity with an IR stream while an earlier
-        // survey had called it RGB-only; both are settled by the hardware now.
-        // Its descriptor advertises MSXU_CONTROL_FACE_AUTHENTICATION on the IR
-        // chain (VC interface 2, unit 4, bmControls bit 5 -> selector 0x06),
-        // GET_LEN reports 9 and GET_MAX 0x03 (D0|D1 supported, D2 not). The
-        // interface-3 D1 payload below drove the illuminator: GET_CUR read back
-        // 01 03 02 .. while lit and 01 03 01 .. after restoration, and captured
-        // IR frames alternate dark/lit (means 0.9 and 222.7) in D1 while
-        // staying flat in D0.
+        // On record for this identity: #449 reports the camera with an IR
+        // stream, and one unit was measured end to end. Its descriptor
+        // advertises MSXU_CONTROL_FACE_AUTHENTICATION on the IR chain (VC
+        // interface 2, unit 4, bmControls bit 5 -> selector 0x06), GET_LEN
+        // reports 9 and GET_MAX 0x03 (D0|D1, not D2), an interface-3 D1 write
+        // read back as written, captured IR frames alternate dark/lit (means
+        // 0.9 and 222.7) while D0 stays flat, and GET_CUR returned to
+        // 01 03 01 .. afterwards. irlume's own ir-setup derives the same bytes
+        // from GET_MAX/GET_DEF.
         (0x3443, 0x930d) => Some(EmitterControl {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,

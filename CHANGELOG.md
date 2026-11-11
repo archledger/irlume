@@ -5,6 +5,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- An unseal that the TPM refuses on its policy reads the PCRs for its
+  diagnosis on the TPM conversation that is already open, instead of
+  opening a second one beside it (ADR-0026, #1320). On the raw device the
+  second open failed with EBUSY: the TSS library logged three TCTI error
+  lines ahead of irlume's own message, and the read went through the
+  resource manager. Where no second transport could be opened
+  (`IRLUME_TCTI` naming the raw device, or no usable `/dev/tpmrm0`), a
+  moved PCR was reported as a plain TPM error; it is now named there too,
+  with the daemon's PCR-drift hint. The message that names the moved PCR
+  is unchanged, and the TSS library still logs the refused command itself.
+
 ### Security
 
 - Move `rsa` from 0.10.0-rc.22 to 0.10.0 in both the application and fuzz

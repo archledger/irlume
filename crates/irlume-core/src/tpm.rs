@@ -118,6 +118,10 @@ fn tpm_err<E: std::fmt::Display>(e: E) -> Error {
 pub(crate) struct TpmContext {
     ctx: Context,
     _conversation: Option<RawConversation>,
+    // Counts this context in `OPEN_CONTEXTS` while it lives (#1320). Last, so
+    // the count falls after the transport and the marker are gone.
+    #[cfg(test)]
+    _counted: CountedContext,
 }
 
 impl std::ops::Deref for TpmContext {
@@ -130,6 +134,42 @@ impl std::ops::Deref for TpmContext {
 impl std::ops::DerefMut for TpmContext {
     fn deref_mut(&mut self) -> &mut Context {
         &mut self.ctx
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(live, peak)`: the TPM contexts this thread holds now, and the most it
+    /// held at once since a test last reset the peak. An unseal whose
+    /// diagnosis opened a second context beside its own (#1320) peaks at two.
+    /// Per thread, and only contexts built by `open_context_from`: one opened
+    /// on another thread, or with `Context::new` directly, is not counted.
+    static OPEN_CONTEXTS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// One live `TpmContext`, counted in `OPEN_CONTEXTS`.
+#[cfg(test)]
+struct CountedContext;
+
+#[cfg(test)]
+impl CountedContext {
+    fn new() -> Self {
+        let _ = OPEN_CONTEXTS.try_with(|open| {
+            let (live, peak) = open.get();
+            open.set((live + 1, peak.max(live + 1)));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CountedContext {
+    fn drop(&mut self) {
+        let _ = OPEN_CONTEXTS.try_with(|open| {
+            let (live, peak) = open.get();
+            open.set((live.saturating_sub(1), peak));
+        });
     }
 }
 
@@ -178,6 +218,8 @@ fn open_context_from(
             Ok(TpmContext {
                 ctx,
                 _conversation: conversation,
+                #[cfg(test)]
+                _counted: CountedContext::new(),
             })
         });
         match attempt {
@@ -2366,7 +2408,7 @@ fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u
                 }
                 let data = ctx
                     .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
-                    .map_err(|e| policy_aware_err(e, env))?;
+                    .map_err(|e| policy_aware_err(ctx, e, env))?;
                 Ok(Zeroizing::new(data.to_vec()))
             })
         })();
@@ -2522,7 +2564,7 @@ fn unseal_authorized(
                 .map_err(tpm_err)?;
             let data = ctx
                 .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
-                .map_err(|e| policy_aware_err(e, env));
+                .map_err(|e| policy_aware_err(ctx, e, env));
             let _ = ctx.flush_context(sealed_handle.into());
             Ok(Zeroizing::new(data?.to_vec()))
         })
@@ -3173,11 +3215,11 @@ fn unseal_pcrlock(
                 ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
                     ctx.policy_authorize_nv(policy, NvAuth::Owner, nv)
                 })
-                .map_err(|e| policy_aware_err(e, env))?;
+                .map_err(|e| policy_aware_err(ctx, e, env))?;
 
                 let data = ctx
                     .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
-                    .map_err(|e| policy_aware_err(e, env))?;
+                    .map_err(|e| policy_aware_err(ctx, e, env))?;
                 Ok(Zeroizing::new(data.to_vec()))
             })
         })();
@@ -3328,11 +3370,22 @@ pub fn unsupported_policy_pcrs() -> Vec<u32> {
 /// [`is_pcr_mismatch`] keys on it, so the two stay in sync here.
 const PCR_MISMATCH_MARKER: &str = "PCR mismatch";
 
-/// If the TSS error looks like a policy mismatch, enrich it with the list of
-/// PCRs that have changed since seal time.
-fn policy_aware_err(e: tss_esapi::Error, env: &SealedEnvelope) -> Error {
+/// Turn a failed policy or unseal command into an [`Error`]: the PCR-counter
+/// race stays retryable, and any other failure names the PCRs that changed
+/// since seal time, if any.
+///
+/// The PCRs are read on `ctx`, the conversation whose command failed. A
+/// second conversation opened beside it would meet EBUSY on the raw device,
+/// which takes one opener at a time (#1320). After a TPM error response the
+/// read is valid: `PCR_Read` takes no handle and no authorization,
+/// `execute_with_session` has put the earlier session slots (none) back
+/// before `map_err` runs, and ESYS takes the next command on the context.
+/// After a failure that is not a TPM response (transport, response check)
+/// ESYS refuses further commands on the context: the read fails and the
+/// failure stays a plain TPM error.
+fn policy_aware_err(ctx: &mut Context, e: tss_esapi::Error, env: &SealedEnvelope) -> Error {
     // The counter race first, and it must not be diagnosed as drift: it is not
-    // a statement about any PCR's VALUE, so `diagnose_pcrs` would find nothing
+    // a statement about any PCR's VALUE, so the diagnosis would find nothing
     // changed and the failure would be reported as a plain TPM error that
     // nothing retries. `Unseal` itself can return it, not just `PolicyPCR`.
     let retryable = retryable_tpm_err(e);
@@ -3340,7 +3393,7 @@ fn policy_aware_err(e: tss_esapi::Error, env: &SealedEnvelope) -> Error {
         return retryable;
     }
     let base = e.to_string();
-    match diagnose_pcrs(env) {
+    match diagnose_pcrs_on(ctx, env) {
         Ok(changed) if !changed.is_empty() => Error::Policy(format!(
             "{base}: {PCR_MISMATCH_MARKER}: {changed:?} changed since seal"
         )),
@@ -3357,6 +3410,10 @@ pub fn is_pcr_mismatch(e: &Error) -> bool {
 
 /// Compare current PCR values against those stored in the envelope. Returns the
 /// PCRs whose SHA-256 differs (empty ⇒ no drift, or no values captured at seal).
+/// With values captured at seal it opens a TPM conversation of its own, so
+/// call it only while this thread holds none (on the raw device a second open
+/// meets EBUSY); a refused unseal reads them on its own conversation instead
+/// (#1320).
 #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
 pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
     env.validate_version()?;
@@ -3364,7 +3421,18 @@ pub fn diagnose_pcrs(env: &SealedEnvelope) -> Result<Vec<u32>> {
         return Ok(Vec::new());
     }
     let mut ctx = open_context()?;
-    let current = read_pcr_values(&mut ctx, &env.pcrs)?;
+    diagnose_pcrs_on(&mut ctx, env)
+}
+
+/// [`diagnose_pcrs`] on `ctx`, a conversation already open. Every caller has
+/// checked the envelope's version: `diagnose_pcrs` first, and the unseals of
+/// `unseal_with_mode` before they open a conversation. With no values
+/// captured at seal it sends no command.
+fn diagnose_pcrs_on(ctx: &mut Context, env: &SealedEnvelope) -> Result<Vec<u32>> {
+    if env.pcr_values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let current = read_pcr_values(ctx, &env.pcrs)?;
     Ok(env
         .pcr_values
         .iter()
@@ -3993,6 +4061,10 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     #[ignore = "needs a TPM; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
                 runs it anywhere"]
     fn a_pcr_snapshot_larger_than_one_read_is_complete() {
+        // Held against the tests that move PCR 16, which this one reads.
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut pcrs: Vec<u32> = (0..=16).rev().collect();
         pcrs.push(23);
         let mut ctx = open_context().expect("TPM context");
@@ -5203,6 +5275,170 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
             std::env::var("IRLUME_TCTI").is_ok_and(|tcti| tcti.starts_with("swtpm:")),
             "this test writes persistent handles: run it on swtpm, never on a real TPM"
         );
+    }
+
+    /// `body`'s value, and the most TPM contexts this thread held at once
+    /// while it ran, beyond those it held already (#1320).
+    fn most_contexts_open_during<T>(body: impl FnOnce() -> T) -> (T, usize) {
+        let before = OPEN_CONTEXTS.with(|open| {
+            let (live, _) = open.get();
+            open.set((live, live));
+            live
+        });
+        let out = body();
+        (out, OPEN_CONTEXTS.with(|open| open.get().1) - before)
+    }
+
+    /// Extends PCR 16, so a policy bound to its earlier value refuses.
+    fn extend_pcr_16() {
+        let mut ctx = open_context().expect("TPM context");
+        let mut digests = tss_esapi::structures::DigestValues::new();
+        digests.set(
+            HashingAlgorithm::Sha256,
+            Digest::try_from(vec![0x16u8; 32]).expect("digest"),
+        );
+        ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.pcr_extend(tss_esapi::handles::PcrHandle::Pcr16, digests)
+        })
+        .expect("extend PCR 16");
+    }
+
+    /// Puts PCR 16 back at its reset value. PCR 16 resets from any locality
+    /// (ADR-0035 item 5), so a test that moves it can put it back at the
+    /// value a fresh swtpm starts with.
+    fn reset_pcr_16() -> Result<()> {
+        let mut ctx = open_context()?;
+        ctx.execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.pcr_reset(tss_esapi::handles::PcrHandle::Pcr16)
+        })
+        .map_err(tpm_err)
+    }
+
+    /// Resets PCR 16 when made and again when dropped, also while a failed
+    /// assertion unwinds.
+    struct Pcr16Reset;
+
+    impl Pcr16Reset {
+        fn new() -> Self {
+            reset_pcr_16().expect("reset PCR 16");
+            Self
+        }
+    }
+
+    impl Drop for Pcr16Reset {
+        fn drop(&mut self) {
+            // No panic here: a second one while a failed assertion unwinds
+            // aborts the test binary.
+            let _ = reset_pcr_16();
+        }
+    }
+
+    /// #1320: an unseal refused because a bound PCR moved is reported as drift
+    /// naming that PCR, with the type and text the daemon matches on, and the
+    /// PCRs are read on the refused conversation: no second TPM context is
+    /// open beside it. On the raw device a second open meets EBUSY and the
+    /// TSS logs three TCTI errors. swtpm serves any number of contexts, so
+    /// the count of contexts open at once is the check.
+    #[test]
+    #[ignore = "needs swtpm (moves PCR 16); CI runs it by name on swtpm, and \
+                scripts/with-swtpm.sh runs it anywhere"]
+    fn tpm_a_policy_failure_is_diagnosed_without_a_second_context() {
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _dirs = StateDirs::new("pcr-diagnosis");
+        let secret = b"irlume-1320-one-context-diagnosis";
+        let reset = Pcr16Reset::new();
+        let envelope = seal_with_pcrs(secret, &[16]).expect("seal over PCR 16");
+        extend_pcr_16();
+
+        let (refused, most_open) = most_contexts_open_during(|| unseal(&envelope));
+        // While PCR 16 is still moved: the public diagnosis, on a conversation
+        // of its own.
+        let named = diagnose_pcrs(&envelope);
+        // PCR 16 back at the value the envelope was sealed to.
+        drop(reset);
+        let Err(err) = refused else {
+            panic!("SECURITY: unseal succeeded with PCR 16 off its sealed value");
+        };
+        assert!(
+            matches!(err, Error::Policy(_)),
+            "drift is a policy error: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "policy: a policy check failed (associated with session number 1): \
+             PCR mismatch: [16] changed since seal",
+            "drift keeps its text"
+        );
+        assert!(
+            is_pcr_mismatch(&err),
+            "the daemon's drift check matches: {err}"
+        );
+        assert_eq!(
+            most_open, 1,
+            "the diagnosis opened a second TPM context beside the refused one"
+        );
+        assert_eq!(
+            named.expect("the public diagnosis"),
+            [16],
+            "the public diagnosis names the moved PCR too"
+        );
+        assert_eq!(
+            &*unseal(&envelope).expect("unseal at the sealed value again"),
+            secret
+        );
+    }
+
+    /// #1320 at the pcrlock unseal: a `PolicyAuthorizeNV` refused because a
+    /// predicted PCR moved is reported as drift naming that PCR, and the PCRs
+    /// are read on the refused conversation. Here the read follows a refused
+    /// command other than `Unseal`.
+    #[test]
+    #[ignore = "needs swtpm (moves PCR 16); CI runs it by name on swtpm, and \
+                scripts/with-swtpm.sh runs it anywhere"]
+    fn tpm_a_refused_pcrlock_policy_names_the_moved_pcr_on_one_context() {
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _dirs = StateDirs::new("pcrlock-diagnosis");
+        const NV_INDEX: u32 = 0x0181_C320;
+        let secret = b"irlume-1320-pcrlock-one-context!";
+        let reset = Pcr16Reset::new();
+        let fixture = PcrlockFixture::provision(NV_INDEX);
+        // The prediction and the index now bind PCR 16 at its reset value.
+        fixture.reprovision(&[16]);
+        let envelope = seal_with_pcrlock(secret, NV_INDEX).expect("pcrlock seal");
+        assert_eq!(envelope.pcrs, [16], "the envelope records PCR 16");
+        assert_eq!(&*unseal(&envelope).expect("unseal before the move"), secret);
+        extend_pcr_16();
+
+        let (refused, most_open) = most_contexts_open_during(|| unseal(&envelope));
+        // PCR 16 back at the predicted value.
+        drop(reset);
+        let Err(err) = refused else {
+            panic!("SECURITY: pcrlock unseal succeeded with PCR 16 off its predicted value");
+        };
+        assert!(
+            is_pcr_mismatch(&err),
+            "a refused PolicyAuthorizeNV with a moved PCR is drift: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .ends_with("PCR mismatch: [16] changed since seal"),
+            "drift names PCR 16: {err}"
+        );
+        assert_eq!(
+            most_open, 1,
+            "the diagnosis opened a second TPM context beside the refused one"
+        );
+        assert_eq!(
+            &*unseal(&envelope).expect("unseal at the predicted value again"),
+            secret
+        );
+        drop(fixture);
     }
 
     /// ADR-0034 §3.3 on swtpm: before irlumed persists the DA-exempt key a
@@ -7701,7 +7937,16 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         })
         .unwrap();
         drop(ctx);
-        assert!(unseal(&env).is_err(), "stale policy must not unseal");
+        let (stale, most_open) = most_contexts_open_during(|| unseal(&env));
+        assert!(
+            matches!(stale, Err(Error::Tpm(_))),
+            "stale policy must not unseal, and with no bound PCR moved it is no drift: {:?}",
+            stale.as_ref().err()
+        );
+        assert_eq!(
+            most_open, 1,
+            "the refused PolicyAuthorizeNV is diagnosed on its own conversation (#1320)"
+        );
         assert!(
             !with_json(&firmware, "stale.json").expect("the pcrlock check"),
             "a stale index: the seal would fall back to the literal policy"

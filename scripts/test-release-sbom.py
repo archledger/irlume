@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -172,7 +173,7 @@ elif args[0] == "cyclonedx":
     assert not (stage / ".git").exists()
     if os.environ.get("DRIFT"):
         (stage / "Cargo.lock").write_text("changed dependency graph")
-    for short in ("cli", "daemon", "pam", "kwallet-init", "gkr-unlock", "password-verify"):
+    for short in ("cli", "daemon", "pam", "pam-view", "kwallet-init", "gkr-unlock", "password-verify"):
         crate = "irlume-" + short
         ref = f"path+file://{stage}/crates/{crate}#99.0.0"
         doc = {"bomFormat": "CycloneDX", "specVersion": "1.3",
@@ -201,7 +202,8 @@ else:
         generations = [call for call in calls if call["args"][0] == "cyclonedx" and "--version" not in call["args"]]
         self.assertEqual(len(generations), 1)
         self.assertNotEqual(generations[0]["cwd"], str(self.repo))
-        self.assertEqual(len(list(self.out.glob("*.cdx.json"))), 6)
+        self.assertEqual(sorted(path.name for path in self.out.glob("*.cdx.json")),
+                         sorted(f"irlume-99.0.0-sbom-{short}.cdx.json" for short in GENERATOR.CRATES))
         self.assertEqual(self.before, {p.name: p.read_bytes() for p in self.repo.iterdir() if p.is_file()})
         self.assertFalse(subprocess.check_output(["git", "status", "--porcelain"], cwd=self.repo).strip())
         for path in self.out.glob("*.json"):
@@ -238,6 +240,37 @@ else:
                 with tarfile.open(fileobj=data) as archive:
                     with self.assertRaises(ValueError):
                         GENERATOR.extract_source(archive, self.root)
+
+
+class ShippedArtifactCoverage(unittest.TestCase):
+    """docs/RELEASING.md: one SBOM per crate that builds a shipped binary."""
+
+    # The Rust artifacts the packaging recipes install, and the crate each is
+    # built from. A recipe that installs another artifact fails here until the
+    # artifact is listed and its crate has an SBOM.
+    ARTIFACT_CRATE = {
+        "irlume": "cli",
+        "irlumed": "daemon",
+        "libpam_irlume.so": "pam",
+        "libpam_irlume_view.so": "pam-view",
+        "irlume-kwallet-init": "kwallet-init",
+        "irlume-gkr-unlock": "gkr-unlock",
+        "irlume-password-verify": "password-verify",
+    }
+    RECIPES = ("packaging/arch/PKGBUILD", "packaging/arch-git/PKGBUILD",
+               "packaging/debian/nfpm.yaml", "packaging/fedora/irlume.spec",
+               "packaging/ppa/debian/rules")
+
+    def test_every_installed_rust_artifact_has_an_sbom_crate(self):
+        root = Path(__file__).resolve().parent.parent
+        for recipe in self.RECIPES:
+            with self.subTest(recipe=recipe):
+                installed = set(re.findall(r"target/release/([A-Za-z0-9_.-]+)",
+                                           (root / recipe).read_text()))
+                self.assertEqual(installed, set(self.ARTIFACT_CRATE))
+        self.assertEqual(sorted(self.ARTIFACT_CRATE.values()), sorted(GENERATOR.CRATES))
+        for short in GENERATOR.CRATES:
+            self.assertTrue((root / "crates" / f"irlume-{short}" / "Cargo.toml").is_file(), short)
 
 
 if __name__ == "__main__":

@@ -33,6 +33,15 @@ const PAM_DIRS: &[&str] = &[
     "/lib/x86_64-linux-gnu/security",
 ];
 
+/// The modules irlume installs in a PAM module directory: the authentication
+/// module and the session-only module of LightDM's private PAM view (crate
+/// `irlume-pam-view`). Every packaging recipe and `scripts/install-host.sh`
+/// installs both, so neither is a leftover, whether or not a package query
+/// can confirm it: Debian's `dpkg -S` matches the recorded path only, and on
+/// a merged-usr system the scanned `/lib/...` directory is an alias of the
+/// `/usr/lib/...` path the package records.
+const MANAGED_PAM_MODULES: &[&str] = &["pam_irlume.so", "pam_irlume_view.so"];
+
 /// Print doctor lines for stray irlume-named files and overlaid managed
 /// binaries. Silent when everything is clean (matching the wiring-drift
 /// check: doctor stays quiet unless something needs attention).
@@ -90,7 +99,7 @@ fn report_strays(report: &mut crate::doctor_report::Report) -> bool {
         collect_strays(dir, "irlume", &["irlume", "irlumed"], &mut strays);
     }
     for dir in PAM_DIRS {
-        collect_strays(dir, "pam_irlume", &["pam_irlume.so"], &mut strays);
+        collect_strays(dir, "pam_irlume", MANAGED_PAM_MODULES, &mut strays);
     }
     // On merged-usr hosts two scanned directories can be the same place
     // (Arch: /usr/lib64 -> /usr/lib), listing one file under both names;
@@ -291,7 +300,7 @@ fn cmd_output_lossy(prog: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_strays, is_stray_name, overlaid_paths};
+    use super::{collect_strays, is_stray_name, overlaid_paths, MANAGED_PAM_MODULES};
 
     #[test]
     fn collect_finds_backup_files_but_not_managed_names_or_dirs() {
@@ -326,6 +335,38 @@ mod tests {
         let mut none = Vec::new();
         collect_strays("/nonexistent-irlume-test-dir", "irlume", &[], &mut none);
         assert!(none.is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn both_installed_pam_modules_are_managed_and_their_backups_are_strays() {
+        let dir =
+            std::env::temp_dir().join(format!("irlume-strays-pam-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "pam_irlume.so",
+            "pam_irlume_view.so",
+            "pam_irlume.so.bak",
+            "pam_irlume_view.so.rpm-0.16.0",
+            "pam_unix.so",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+
+        let mut out = Vec::new();
+        collect_strays(
+            dir.to_str().unwrap(),
+            "pam_irlume",
+            MANAGED_PAM_MODULES,
+            &mut out,
+        );
+        out.sort();
+        let expected: Vec<String> = ["pam_irlume.so.bak", "pam_irlume_view.so.rpm-0.16.0"]
+            .iter()
+            .map(|f| dir.join(f).to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(out, expected);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -153,11 +153,17 @@ fresh v0.14.0 attended qualification campaign.
 
 **The NexiGo N930W name does not identify one camera design.** The HelloCam
 measured by this project is `3443:c803` and carries an IR sensor. A prior survey
-identified `3443:930d` as an RGB-only 60fps N930W, but #449 reports another
-`3443:930d` unit that exposes a 640x360 GREY IR stream and works with Windows
-Hello. Do not infer the sensor or emitter capability from the box or USB ID
-alone. Check the nodes with `irlume doctor`, and inspect an unrecognised emitter
-with `sudo irlume ir-setup --dry-run` before allowing any write.
+identified `3443:930d` as an RGB-only 60fps N930W, but two `3443:930d` units
+with a 640x360 GREY IR stream are on record: the one #449 reports, which works
+with Windows Hello, and the one whose descriptor and `irlume ir-setup` output
+are recorded in #1311. irlume has a built-in emitter control for that ID. It
+writes that control when an IR stream opens only if the device has one
+configuration and the open node's own function carries the Microsoft
+camera-control unit that advertises it; `IRLUME_IR_EMITTER` (an override or
+`off`) and a control saved by `ir-setup` come first. Do not infer the sensor or
+emitter capability from the box or USB ID alone. Check the nodes with
+`irlume doctor`, and inspect an unrecognised emitter with
+`sudo irlume ir-setup --dry-run` before allowing any write.
 
 More generally, a camera advertised as "Windows Hello compatible" is not
 evidence of anything irlume can use. Microsoft's own implementation guide

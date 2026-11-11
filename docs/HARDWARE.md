@@ -51,12 +51,27 @@ answers "broken, an unusable class, or configuration" in one round trip.
 - **RGB:** `/dev/video0`: MJPG 1280x720@30 (RGB primary)
 - **IR:** `/dev/video2`: GREY 640x360, strobe ~2.4fps burst / ~15fps delivered lit frames
 - **Capture mode:** sequential: measured (capture_mode.3443:c803+3443:c803=sequential persisted)
-- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output via burst_dump PGM evidence, restoration); 3443:930d deliberately NOT in the table (identity ambiguous, see ir_emitter.rs). steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
+- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), D1 alternative-frame illumination: validated (write, read-back, optical output via burst_dump PGM evidence, restoration); the 3443:930d sibling is a separate row. steady-state delivered-rate margin ~1.2% over floor (tolerance 97%)
 - **Anti-spoofing:** ViT RGB + FLIR IR qualified; SecureDark stage 2+3 measured on this host
 - **Evidence (irlume 0.11.1-1 (Arch)):**
   - slice4: sequential PASS as unprivileged runner (2026-08-24, sha a9c410e0: 0 drops)
   - auth: true-dark grants via ir/dark path (0.944/0.954, FLIR p_fake <= 0.001, 2026-08-24)
   - suspend: 3x S3 cycles, daemon active zero-anomaly (2026-08-24)
+
+### NexiGo HelloCam N930W 60fps (community report, CachyOS)
+
+- **Module:** NexiGo HelloCam N930W 60fps, bcdDevice 0.06 (`3443:930d`)
+- **IR:** GREY 640x360, the only IR frame size in the descriptor; the node name is not in the record
+- **Capture mode:** not measured: no irlume capture outside `ir-setup`, and no enrollment or authentication, is on record for this unit
+- **IR emitter:** MS-XU unit 4 selector 0x06 (face authentication), interface 3 D1 payload 01 03 02 00 00 00 00 00 00: `irlume ir-setup` 0.15.0 output posted by VIGO-VI, 2026-11-11: value built from the camera's GET_DEF and GET_MAX, write, read-back, restore of the original with read-back, alternating illumination that began and ended with that change (in the frames or in the camera's per-frame records; the output does not say which), D1 applied again and saved. one unit; the contributor's own tool read 01 03 01 (D0) before the run and 01 03 02 (D1) after it, and the frame means in the pull request description are from that tool; the setup output names no USB ID, and the line that run saved, posted afterwards, reads `3443:930d 4:6` (the sysfs dump posted with the output is 3443:930d at bcdDevice 0006); the built-in entry itself has not been run on this hardware
+- **Evidence (irlume 0.15.0 (AUR package); kernel 7.3.3-1-cachyos with the distribution's uvcvideo module, as the contributor stated):**
+  - source: https://github.com/archledger/irlume/pull/1311#issuecomment-6788607935 (the maintainer's reply quoting, unchanged, the output VIGO-VI posted at 2026-11-11T05:33:07Z in #issuecomment-6787983313)
+  - saved control: https://github.com/archledger/irlume/pull/1311#issuecomment-6788746641 (VIGO-VI, 2026-11-11): /var/lib/irlume/ir_emitter.conf reads `3443:930d 4:6`
+  - descriptor: crates/irlume-camera/tests/fixtures/nexigo-3443-930d.descriptors, 1071 bytes, sha256 eafaaee9e6b9f03d380a426f21989feb0d849740fcf8461cf80b8e70c14359fc
+  - emitter: dry run: unit 3 vendor-defined advertising nothing, unit 4 Microsoft camera control advertising 0x06 and 0x09; setup: IR emitter enabled 4:6:1,3,2,0,0,0,0,0,0, accepted: interface 0x03 set to D1 (alternative illumination)
+  - second unit: #449: a dry run listing the same two units; that reporter wrote that the camera worked with irlume around 0.6 and earlier and that its IR LED no longer lit in later versions, and v0.7.0 and earlier wrote this payload to any camera named N930W; no output of a non-dry `ir-setup` run of that unit was posted, and the reporter's last comment (2026-08-28), that enrollment worked with the IR LED after the maintainer had asked for a reinstall, `ir-setup` and an enrollment, came with a support report that the maintainer read as an enrollment on the RGB-only path (`source=no_ir_pair`)
+  - auth: not tested
+  - suspend: not tested
 
 ### ThinkPad T480 (community report, Ubuntu 26.04)
 
@@ -85,10 +100,11 @@ answers "broken, an unusable class, or configuration" in one round trip.
 
 ## Built-in IR emitter controls (`known_control`)
 
-Read from source at generation time. These are the modules whose emitter payload was validated end to end (write, read-back, optical output, restoration). Everything else uses `irlume ir-setup`.
+Read from source at generation time. These are the modules whose emitter payload has on-device evidence of the write, its read-back, the alternating illumination and the restoration; the host rows above say how each was recorded. Everything else uses `irlume ir-setup`.
 
 - `3277:0059` MS-XU unit 14, selector 0x06 (face authentication) (Shinetech "ASUS FHD webcam" in the Zenbook S 14; MS-XU is unit 14.)
 - `3443:c803` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W; MS-XU is unit 4.)
+- `3443:930d` MS-XU unit 4, selector 0x06 (face authentication) (NexiGo HelloCam N930W 60fps; MS-XU is unit 4.)
 - `5986:1141` MS-XU unit 8, selector 0x06 (face authentication) (Bison Integrated IR Camera in the ThinkPad T480; MS-XU is unit 8.)
 
 <!-- generated: schema 1; inputs: docs/hardware/fleet-evidence.json + ir_emitter.rs known_control; regenerate with scripts/generate-hardware-matrix.py -->

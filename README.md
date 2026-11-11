@@ -126,7 +126,7 @@ unlock · **fingerprint** → companion factor.
 
 ## Status
 
-**v0.15.0 is the latest published release.**
+**v0.16.0 is the latest published release.**
 Recorded face-authentication results cover Fedora, Ubuntu and
 Arch; Debian install checks and a NixOS module are also available. Build and
 test dates differ: see the [versioned support matrix](docs/PLATFORMS.md).

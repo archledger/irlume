@@ -45,6 +45,13 @@ The version suffix preserves the earlier populated-profile, wired-login and
 hardware snapshots as additional compatibility cases. These files keep the
 capture script's bytes, including the reported engine version.
 
+The `*-0.16.0.json` fixtures were captured the same way from the installed
+0.16.0 candidate: as root, in a disposable Ubuntu 24.04 guest, after its
+upgrade/rollback trial. That guest has an emulated TPM and no camera,
+enrollment, graphical login manager or armed wallet, so `doctor-0.16.0.json`
+carries the checks 0.16.0 adds (TPM, boot chain, IR node access) with that
+guest's values.
+
 Two things are not verbatim, and both are deliberate:
 
 - profile and scan display names are replaced with placeholders, because they

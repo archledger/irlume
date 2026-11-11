@@ -355,6 +355,12 @@ restorecon /run/irlume.sock 2>/dev/null || :
 
 
 %changelog
+* Wed Nov 11 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.16.0-1
+- Seal under a second TPM storage key that the TPM lockout does not apply to
+- Add TPM and Secure Boot checks to irlume doctor
+- Add built-in IR emitter controls for two more cameras
+- Include keyring, recovery, PAM wiring and LightDM corrections
+
 * Mon Sep 28 2026 Wisbendji Fimerlus <archledger236@gmail.com> - 0.15.0-1
 - Prepare the 0.15.0 candidate with PAM wiring and keyring updates
 - Refresh TUI account views, diagnostics and capture tracing

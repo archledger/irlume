@@ -17,10 +17,12 @@ login or locks a person out. It is critical-tier
 - Two paths return `PAM_ABORT` on purpose; keep them and add no other: a
   consumed `yes` or empty intent token that `clear_authtok` cannot clear
   (`IntentConfirmation::Abort`, from `resolve_intent_input` or
-  `confirm_cosmic_face`), so it never reaches the password module; and an older
-  daemon's explicit polkit decline (`declined_by_gesture` and
-  `is_polkit_consent` in `try_verify`), which `abort=die` in
-  `POLKIT_VERIFY_STANZA` makes one failed attempt.
+  `confirm_cosmic_face`); and an older daemon's explicit polkit decline
+  (`declined_by_gesture` and `is_polkit_consent` in `try_verify`), which
+  `abort=die` in `POLKIT_VERIFY_STANZA` makes one failed attempt. The
+  control on the line decides what an abort does: plain `sufficient` and a
+  `success=1 default=ignore` jump ignore it, and the stack goes on to the
+  password module.
 - In `authenticate`, `PAM_SUCCESS` only for a daemon grant. In unseal mode that
   is a release whose secret reached its consumer (`code_for`, `Released`,
   `only_a_real_delivery_continues_the_stack`) or the identity-only fallback

@@ -131,8 +131,9 @@ let
   # Modules that may sit inside a stack the face success skips whole (an
   # include anchor's expansion, or a substack the jump clears): password
   # verification, the keyring handoff modules, and the denial terminator.
-  # The face line's kr arg re-drives the keyring handoff itself, so those
-  # rules being skipped is fine. Anything else - an allowlist
+  # On a cold login whose face match set the login password as PAM_AUTHTOK,
+  # kr makes the face line return IGNORE, so those rules run with it; their
+  # being skipped otherwise is fine. Anything else - an allowlist
   # (sufficient pam_succeed_if), faillock, nologin, an exec, a permit - is
   # policy or a side effect the face path would silently skip, so the
   # wiring is refused as unproven.

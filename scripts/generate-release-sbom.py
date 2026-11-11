@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""Generate six Rust release SBOMs from a committed, isolated source snapshot."""
+"""Generate the Rust release SBOMs from a committed, isolated source snapshot.
+
+One document per crate that builds a shipped binary (docs/RELEASING.md).
+"""
 import argparse
 import json
 from pathlib import Path, PurePosixPath
@@ -14,7 +17,9 @@ import tomllib
 from release_sbom import normalize_sbom
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES = ("cli", "daemon", "pam", "kwallet-init", "gkr-unlock", "password-verify")
+# The crates whose artifacts the packages install. scripts/test-release-sbom.py
+# compares this list with what the packaging recipes ship.
+CRATES = ("cli", "daemon", "pam", "pam-view", "kwallet-init", "gkr-unlock", "password-verify")
 
 
 def extract_source(tree, stage):

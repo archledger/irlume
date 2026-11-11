@@ -866,6 +866,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The release SBOM set includes `irlume-pam-view`:
+  `scripts/generate-release-sbom.sh` writes a document for the crate
+  behind `pam_irlume_view.so`, which #1010 added to the packages after
+  0.15.0, so the set again has one SBOM per crate that builds a shipped
+  binary (docs/RELEASING.md). A test compares the list with the
+  artifacts the packaging recipes install.
+
 - Cold-boot face login can defer a KDE wallet key until the session creates
   its runtime directory. The login stacks irlume wires carry `defer_wallet`
   on the face line and open their auth chain with

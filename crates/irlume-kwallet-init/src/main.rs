@@ -19,8 +19,9 @@
 //!
 //! Invoked as `irlume-kwallet-init <username> [--strict-runtime]` with the key
 //! on **stdin**, never in argv, which is world-readable through `/proc`.
-//! The optional argument is a capability handshake: older helpers reject it,
-//! so callers can rely on exit 4 meaning only an absent runtime directory.
+//! The optional argument is a capability handshake: helpers from 0.12.0 through
+//! 0.15.0 reject it, and earlier ones ignore it and have no exit 4, so callers
+//! can rely on exit 4 meaning only an absent runtime directory.
 //!
 //! It is launched from the PAM process rather than from `irlumed` on purpose:
 //! that places `ksecretd` in the session's cgroup, where `pam_kwallet5` puts it.

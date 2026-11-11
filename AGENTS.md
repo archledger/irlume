@@ -28,15 +28,15 @@ code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
 | `crates/irlume-daemon` | `irlumed`: socket, per-request authorization, the single worker. | [its AGENTS.md](crates/irlume-daemon/AGENTS.md) |
 | `crates/irlume-pam` | `pam_irlume.so`, a thin socket client. | [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
 | `crates/irlume-cli` | `irlume`: CLI, TUI, `--json` API, PAM wiring (`crates/irlume-cli/src/pamwire.rs`). | [its AGENTS.md](crates/irlume-cli/AGENTS.md), [docs/TUI.md](docs/TUI.md), [docs/MACHINE-API.md](docs/MACHINE-API.md) |
-| other `crates/` | libexec helpers (`gkr-unlock`, `kwallet-init`, `password-verify`) and the fprintd wrapper. | [crates/README.md](crates/README.md) |
+| other `crates/` | libexec helpers (`gkr-unlock`, `kwallet-init`, `password-verify`), the fprintd wrapper and `irlume-pam-view` (`pam_irlume_view.so`, a session-only module that detaches LightDM's private PAM view before the desktop session starts). | [crates/README.md](crates/README.md), `crates/irlume-pam-view/src/lib.rs` |
 | `docs/adr/` | Architecture decision records. | [its AGENTS.md](docs/adr/AGENTS.md) |
 | `kcm/` | KDE module (C++/QML, CMake): read-only, launches the TUI. | [docs/KCM.md](docs/KCM.md) |
 | `fuzz/` | Separate nightly cargo-fuzz workspace with its own `Cargo.lock`. | `fuzz/fuzz_targets/`, `fuzz/seeds/` |
 | `packaging/`, `nix/` | Distro and Nix lanes, systemd units, AppArmor, SELinux, polkit. | [packaging/README.md](packaging/README.md) |
-| `schemas/`, `models/` | Machine API schema and fixtures; model hashes and BOM. | [models/README.md](models/README.md) |
+| `schemas/`, `models/` | Machine API schema and fixtures, and the nightly-candidate schema; model hashes and BOM. | [models/README.md](models/README.md) |
 
 Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); terms: [CONTEXT.md](CONTEXT.md).
-The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not read them whole.
+The main TUI, camera, daemon and auth files run 18k to 29k lines: search, do not read them whole.
 
 ## Setup
 
@@ -47,13 +47,11 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   step in `ci.yml` (later steps add swtpm, ffmpeg and more).
 - The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
   directories at system paths, and the daemon's activation-startup,
-  shared-greeter runtime-directory and software-TPM eyes-open tests, and the
+  token-delivery private-root (build `irlume-cli` first), shared-greeter
+  runtime-directory and software-TPM eyes-open tests, and the
   optional auth request-evaluator fixture exec `/usr/bin/bwrap` (Ubuntu 24.04:
-  `bash scripts/ci-bubblewrap.sh --check`). The selection-provenance CLI test
-  also needs bubblewrap, a C compiler, pax-utils `lddtree` and Python
-  `jsonschema`; it starts an empty-root sandbox before running the CLI.
-  Other CLI black-box tests do not. Without pamtester and pam_wrapper most
-  PAM end-to-end tests pass
+  `bash scripts/ci-bubblewrap.sh --check`). The CLI's other black-box tests
+  do not. Without pamtester and pam_wrapper most PAM end-to-end tests pass
   vacuously and the COSMIC ones fail; `IRLUME_REQUIRE_PAM_TOOLS=1`, set in CI,
   makes them all fail ([the PAM AGENTS.md](crates/irlume-pam/AGENTS.md)).
 - There is no `rust-toolchain` file. Outside Nix, run fmt, clippy and doc as
@@ -65,16 +63,13 @@ The main TUI, camera, daemon and auth files run 16k to 25k lines: search, do not
   packaged copy present, else the system loader, is used; if that fails to
   load, engine-backed tests and the `irlume-auth` examples fail at once with a
   load error.
-- The evidence reference tests require ONNX Runtime 1.28.1 and the pinned
-  LiteRT library in `IRLUME_TFLITE_LIB`. The CI step downloads and verifies
-  that library into its temporary directory; it does not install it.
 
 ## Gate commands
 
 The required "fmt · clippy · build · test" job (`.github/workflows/ci.yml`) runs
 these in order among other steps, then the swtpm, v4l2loopback, pam_wrapper,
-shared-greeter and root-only password-helper lanes. Run all of these plus the
-matching rows below.
+GNOME keyring, shared-greeter and root-only password-helper lanes. Run all of
+these plus the matching rows below.
 
 ```sh
 cargo fmt --all --check
@@ -91,16 +86,17 @@ cargo build --release --locked
 | When you touch | Also run |
 |---|---|
 | `irlume-vision` features, any dependency bump | `cargo check -p irlume-vision --all-features --locked` |
-| `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback) |
+| `--json` output, `schemas/` | `python3 scripts/test-machine-api-conformance.py && bash scripts/test-machine-api-isolated.sh "${CARGO_TARGET_DIR:-target}/release/irlume"` (needs Python `jsonschema`, pax-utils `lddtree`, a C compiler and bubblewrap; refuses host fallback); for `schemas/nightly-candidate-v1.schema.json` run `python3 -B scripts/ci/test-nightly-snapshot.py` instead (needs Python `jsonschema` and `yaml`) |
 | `scripts/ir-evaluation/` | `python3 -m unittest discover -s scripts/ir-evaluation -p 'test_*.py'` |
 | `packaging/`, versions, `docs/hardware/`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs`, `crates/irlume-cli/src/uninstall.rs` | `bash scripts/check-packaging-parity.sh` (needs `desktop-file-validate`); for `packaging/apparmor/` also `apparmor_parser -QK <profile>`; for maintainer scripts also `python3 scripts/test-package-service-hooks.py` and `python3 scripts/test-ppa-service-hooks.py` (CI runs it in an Ubuntu container) |
 | systemd units | `systemd-analyze verify packaging/systemd/<unit>` for each changed unit (CI first stubs `/usr/bin/irlumed` and `/usr/bin/irlume` with `/bin/true` when absent), then `systemd-analyze security --offline=true --threshold=37 packaging/systemd/irlumed.service` (94 for `packaging/systemd/irlume-reconcile.service`) |
 | dependencies | `cargo deny check advisories bans licenses sources`, `cargo deny --manifest-path fuzz/Cargo.toml check advisories` (`audit.yml` scans the fuzz lockfile) and `(cd fuzz && cargo fetch --locked)` |
-| fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`; then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`, seed details in `fuzz/README.md`) |
+| fuzzed parsers | in `fuzz/`: `cargo fetch --locked`, then `mkdir -p corpus/<t> && cp -n seeds/<t>/* corpus/<t>/`; then `cargo +nightly-2026-07-15 fuzz run <t> -- -max_total_time=45 -rss_limit_mb=4096` (targets in `fuzz/fuzz_targets/`, seed details in `fuzz/README.md`); the `fuzz` job in `ci.yml` runs only the targets its fuzz step lists, so add a new target there (`python3 -B scripts/ci/test-fuzz-targets-contract.py` fails when that list, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/` and `fuzz/seeds/` differ) |
 | `scripts/install.sh` | `bash scripts/test-install-script.sh` |
 | `.github/workflows/` | `bash scripts/check-action-pins.sh`, `zizmor .github/workflows` and `actionlint` (as in `workflow-audit.yml`); for `hardware-suite.yml` also `python3 scripts/test-nightly-ir-capture.py`, `python3 scripts/ci/test-setup-coverage-tools.py` and `python3 scripts/ci/test-nightly-coverage-contract.py`; use `persist-credentials: false`, least-privilege `permissions`, and pass untrusted values through `env:`; never interpolate an untrusted `${{ }}` expression inside `run:` (`workflow-audit.yml`) |
 | `flake.nix`, `nix/` | `nix flake check --no-build --show-trace` and `nix build .#default --no-link --print-out-paths --show-trace`; after a dependency or fork bump also `nix build --no-link .#default.cargoDeps .#onnxruntime-bin` |
 | `kcm/` | `cmake -S kcm -B target/kcm-build -DBUILD_TESTING=ON && cmake --build target/kcm-build`, then the bridge, page and load test, `kcmshell6` and qmllint steps of `kcm.yml` |
+| `crates/irlume-gkr-unlock` | after `cargo build --release --locked`, as an ordinary user with no display: `env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY bash scripts/gkr-token-waiter-check.sh` (needs gnome-keyring, `dbus-daemon`, `dbus-monitor`, `secret-tool`, `systemd-socket-activate`, Python `jeepney`, a C compiler, pkg-config with gio-2.0 and gcr's `libgcr-base-3.so.1`; a missing tool fails it) |
 | `crates/irlume-pam` | the commands in [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
 | an `AGENTS.md`, or a file, link or gate command one cites | `python3 scripts/check-agents-md.py` |
 
@@ -197,13 +193,18 @@ cargo build --release --locked
    `SO_PEERCRED` is checked per connection. Four replies carry a
    secret, never `Authenticate`'s: root-only `UnsealPassword` after a live
    face match and `UnsealKeyring` (login password, KDE wallet key or GNOME
-   keyring token) without one, for the fingerprint path on a login or unlock
-   service; and, to root or the account's owner, the GNOME keyring token in
+   keyring token) without one, on a login or unlock service, for the
+   fingerprint path and for the GNOME keyring token of a typed-password
+   login; and, to root or the account's owner, the GNOME keyring token in
    `SealPassword`'s `TokenSealed` and in `ReleaseTokenForDisarm` (after the
    password opens the token's password wrap), so the caller can re-key the
    keyring (ADR-0003, `crates/irlume-common/src/lib.rs`;
    [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Privilege separation",
-   "Authentication flow").
+   "Authentication flow"). No request, command or flag removes a GNOME keyring
+   token envelope: `DisarmKeyring` and `ForgetPassword` (`forget_non_token`)
+   erase only a login-password or KDE wallet-key envelope and keep a token or
+   unreadable one, and `irlume uninstall` refuses while a token envelope
+   exists (ADR-0003, amendment 2026-11-10).
 4. **Posture and wire.** Every `Request` variant has an explicit arm, with no
    wildcard, in the daemon's posture tables. Socket changes stay additive, as
    old and new binaries meet during upgrades (daemon AGENTS.md). `--json` is a

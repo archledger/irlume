@@ -19,9 +19,10 @@ other irlume crate, and nearly every crate depends on it
   (recipe step 4). `state_dir()` reads `IRLUME_STATE_DIR` through `std::env`
   too: never call it from code the PAM module runs.
 - The key=value files (`/etc/irlume/settings.conf`,
-  `/etc/irlume/cameras.conf`) are written only through `write_kv` or
-  `write_kvs`. They refuse, before any I/O, a key or value that would not read
-  back as one line, and never rebuild a file they cannot read.
+  `/etc/irlume/cameras.conf`) are written only through `write_kv`, `write_kvs`
+  or `publish_kv_changes` (sets and removals in one publish, for
+  `split_publish`). They refuse, before any I/O, a key or value that would not
+  read back as one line, and never rebuild a file they cannot read.
 - Ordinary advisory/startup selection reads `/etc/irlume/cameras.conf` through
   `read_camera_pin`. Engine request gates use `split_publish::read_camera_selection`
   to retain strict ordinary selection and split verification together;
@@ -49,6 +50,9 @@ other irlume crate, and nearly every crate depends on it
    `IRLUME_<KEY>` override, then `observe_kv("settings.conf", key)`, mapping
    `Value`, `Absent` (the documented default) and `Unknown` (a file this process
    cannot read).
+   A security key that must fail closed on a malformed or repeated line reads
+   one settings.conf snapshot through `strict_setting` instead, as
+   `observe_split_camera_pairs` does.
 3. Resolve `Unknown` to the safe default in the decision function, as
    `privileged_face_consent_required` does (ADR-0018). Booleans use `truthy`
    or `falsy`; an opt-in accepts only an explicit affirmative.

@@ -5,7 +5,9 @@
 Accepted 2026-10-31, on the maintainer's decision. Implementation follows in a
 separate pull request.
 
-Withdraws ADR-0022. Amends ADR-0038 sections 1, 3 and 7. ADR-0033 section 7, as
+Withdraws ADR-0022. Amends ADR-0038 sections 1, 3, 5, 6 and 7, its second, fourth
+and fifth consequences, its first, second, third and sixth acceptance tests and its
+amendment of 2026-10-30. ADR-0033 section 7, as
 narrowed by ADR-0038 section 2, stays in force. Closes #1244 as not planned.
 
 ## Context

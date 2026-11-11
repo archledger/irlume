@@ -138,13 +138,12 @@ pub(super) const VERIFY_STANZA: &str = "auth       sufficient                   
 /// terminates the stack on that ABORT, which polkit reports as one failed attempt.
 /// SUCCESS still grants and every other result (IGNORE on a timeout, no-match, or a
 /// panicked module) still cascades to the password, so ONLY an explicit decline
-/// (legacy head-shake daemon; current daemons cancel via the explicit-cancel
-/// arm) changes
+/// (only a legacy head-shake daemon sends one) changes
 /// behaviour. Confirmed against pam.conf(5) on this platform, which defines
 /// `sufficient` as `[success=done new_authtok_reqd=done default=ignore]` and `die` as
-/// terminating the stack. sudo keeps the plain [`VERIFY_STANZA`]: pam_irlume never
-/// returns ABORT for it, so an abort=die there would be an inert claim on a
-/// higher-privilege surface.
+/// terminating the stack. sudo keeps the plain [`VERIFY_STANZA`]: pam_irlume
+/// returns ABORT there only for a `yes` or empty intent token it cannot clear,
+/// and plain `sufficient` ignores that code and goes on to the password.
 ///
 /// What the USER sees is the desktop agent's call, not ours. polkit's helper runs
 /// `pam_authenticate` once and reports a single FAILURE (polkitagenthelper-pam.c),

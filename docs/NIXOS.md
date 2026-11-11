@@ -92,8 +92,8 @@ Name a PAM service under `pam.services` and the module classifies it:
   `[success=1 default=ignore]`. This records the face success but skips
   exactly one rule, so `pam_kwallet` or `pam_gnome_keyring` still runs and
   unseals the wallet, and `pam_unix` grants on the token the daemon
-  unsealed. Plain `sufficient` would short-circuit past the keyring and
-  leave you with a locked wallet after login.
+  unsealed. Without `kr`, plain `sufficient` would short-circuit past the
+  keyring and leave you with a locked wallet after login.
 - Lock screens (`kde`, `swaylock`, `hyprlock`, `gtklock`, `waylock`) get
   `sufficient`. The wallet is already open in the live session, so there
   is no keyring handoff; and `pam_unix` on a verify-only unlock cannot
@@ -126,7 +126,10 @@ failed password attempt fatal, so the permit cannot authenticate a
 failure. On a flat chain the face line sits immediately before the
 password-prompting `pam_unix` and no landing is rendered: the jump skips
 that prompt, and the keyring module plus the `try_first_pass` `pam_unix`
-still see the released token. A password chain reached through an
+still see the released token. On a cold login whose face match put the
+login password in `PAM_AUTHTOK`, `kr` (below) makes the face line return
+`PAM_IGNORE`, so no jump is taken and the prompting `pam_unix` runs with
+that password too. A password chain reached through an
 `include` takes the `sufficient` form instead, with no jump and no
 landing: libpam expands an include inline, so a `success=N` jump would
 skip only its first expanded rule; the module ignores on cold login and a
@@ -134,10 +137,13 @@ face match returns immediately, the same form `irlume login enable`
 writes for include layouts on FHS distros. Because both delegation forms
 skip the password stack whole, and that stack may carry the keyring
 module (`security.pam.services.login.kwallet.enable` puts it inside
-`login`), every greeter face line carries the `kr` keyring-continue arg,
-which re-drives the keyring handoff from the daemon; the session starts
-with the wallet unlocked either way. Lock screens stay a single
-`sufficient` line without `kr`.
+`login`), every greeter face line carries the `kr` keyring-continue arg:
+on a cold login (no live local graphical session yet) whose face match
+put the login password in `PAM_AUTHTOK`, the face line returns
+`PAM_IGNORE` instead of `PAM_SUCCESS`, so neither form skips the
+password stack, and its `pam_unix` and keyring module run with that
+password. The session starts with the wallet unlocked either way. Lock
+screens stay a single `sufficient` line without `kr`.
 
 Evaluation refuses, instead of rendering a broken stack: delegations
 without exactly one known password stack among them (a lone unrecognized

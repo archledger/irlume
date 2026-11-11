@@ -2,7 +2,7 @@
 
 The root [AGENTS.md](../../AGENTS.md) applies; this adds socket protocol and
 posture rules for `irlumed`, a critical-tier component ([SECURITY.md](../../SECURITY.md)).
-`src/main.rs` is about 18k lines: search for the names below.
+`src/main.rs` is about 29k lines: search for the names below.
 
 ## Wire compatibility
 
@@ -42,7 +42,8 @@ the `Request::ListProfiles` doc in `crates/irlume-common/src/lib.rs`).
   other reply enums, such as `KeyringSecretKind`, have none.
 - Never add a field to a `#[serde(deny_unknown_fields)]` wire type
   (`EnrollmentDecision` in `crates/irlume-common/src/lib.rs`, the `*Wire` types
-  in `crates/irlume-common/src/live_camera.rs`): an older peer rejects the whole
+  in `crates/irlume-common/src/live_camera.rs` and
+  `crates/irlume-common/src/split_wire.rs`): an older peer rejects the whole
   message. Add a new variant or request instead. The `LiveStatus` and
   `SupportSnapshot` decoders also reject any other `live_schema` or
   `support_schema` and any value over their `MAX_*` bounds: bumping a schema
@@ -64,7 +65,8 @@ does not compile until its posture is chosen. Never add `_ =>`.
 | `approval_operation` | `src/operation_authorization.rs` | polkit action or `None`; adding trust needs one |
 | `request_kind` | `src/live.rs` | live-status kind and whether it mutates |
 | `diagnostic_operation_class` | `src/main.rs` | diagnostic trace class |
-| `dispatch_scoped_session_inner` | `src/main.rs` | the worker's handler arm |
+| `request_label` | `src/main.rs` | the variant's journal label |
+| `dispatch_after_authorization` | `src/main.rs` | the worker's handler arm (reached through `dispatch_scoped_session_inner`, which runs the pregate and authorization first) |
 
 `Status` requests are answered on the connection thread and must not reach the
 TPM, a camera or the engine there. File reads are fine
@@ -127,7 +129,8 @@ root-or-account read, ask.
 ## Tests in this crate
 
 - Build `cargo build --locked -p irlume-cli` before the daemon suite: the
-  `token_delivery` private-root test runs the real installed sibling helper.
+  `token_delivery` private-root test runs the real installed sibling helper
+  inside `/usr/bin/bwrap` (`bash scripts/ci-bubblewrap.sh --check`).
   For instrumented or relocated test binaries, set `IRLUME_TEST_CLI` to the
   CLI's `compiler-artifact.executable` from `--message-format=json`, built
   with the same toolchain, target, profile and flags. An invalid explicit

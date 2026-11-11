@@ -5,6 +5,8 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-11
+
 ### Removed
 
 - NPU inference, which no tagged release carried (ADR-0039, #1244). The
@@ -1595,7 +1597,7 @@ All notable changes to irlume are documented here. This project adheres to
 - `irlume login enable` and reconcile take irlume's lines out of a stack
   they find no anchor in when an earlier release wired it (ly and
   cinnamon-screensaver's `auth include login`, whose included stack starts
-  with `pam_nologin.so`, stopped qualifying in 0.15), as `login disable`
+  with `pam_nologin.so`, stopped qualifying in 0.15.0), as `login disable`
   takes them out, with the same checks for the numeric jumps that count
   them, and report both facts. This covers a stack irlume edits in place,
   where a matching backup is restored as a disable restores it, and an
@@ -6925,7 +6927,8 @@ is always the fallback: no lockout, ever.
 
 - Not lab-certified: self-tested against ISO/IEC 30107-3, no paid iBeta pass.
 
-[Unreleased]: https://github.com/archledger/irlume/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/archledger/irlume/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/archledger/irlume/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/archledger/irlume/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/archledger/irlume/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/archledger/irlume/compare/v0.12.0...v0.13.0

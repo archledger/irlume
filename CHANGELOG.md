@@ -874,7 +874,9 @@ All notable changes to irlume are documented here. This project adheres to
   `/lib` alias of the `/usr/lib` path the package records, and on a source
   install, the check reported the installed module as a leftover that was
   safe to remove and `install-hygiene` read `warn`. Both names are now
-  managed; a backup copy of either is still reported.
+  managed; a backup copy of either is still reported, and a hand-installed
+  build over the packaged `pam_irlume_view.so` is reported like one over
+  `pam_irlume.so`.
 
 - The release SBOM set includes `irlume-pam-view`:
   `scripts/generate-release-sbom.sh` writes a document for the crate

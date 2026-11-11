@@ -33,6 +33,9 @@ const PAM_DIRS: &[&str] = &[
     "/lib/x86_64-linux-gnu/security",
 ];
 
+/// The binaries irlume installs in a binary directory, by file name.
+const MANAGED_BINARIES: &[&str] = &["irlume", "irlumed"];
+
 /// The modules irlume installs in a PAM module directory: the authentication
 /// module and the session-only module of LightDM's private PAM view (crate
 /// `irlume-pam-view`). Every packaging recipe and `scripts/install-host.sh`
@@ -96,7 +99,7 @@ fn report_shadow(report: &mut crate::doctor_report::Report, origin: &InstallOrig
 fn report_strays(report: &mut crate::doctor_report::Report) -> bool {
     let mut strays: Vec<String> = Vec::new();
     for dir in BIN_DIRS {
-        collect_strays(dir, "irlume", &["irlume", "irlumed"], &mut strays);
+        collect_strays(dir, "irlume", MANAGED_BINARIES, &mut strays);
     }
     for dir in PAM_DIRS {
         collect_strays(dir, "pam_irlume", MANAGED_PAM_MODULES, &mut strays);
@@ -232,7 +235,9 @@ fn report_overlay(report: &mut crate::doctor_report::Report, origin: &InstallOri
 }
 
 /// Parse a package-verify report (rpm -V / dpkg --verify / pacman -Qkk) down
-/// to the managed irlume paths whose content changed.
+/// to the managed irlume paths whose content changed: a path whose file name
+/// is one of the managed binaries or PAM modules, the same names the stray
+/// scan treats as managed.
 ///
 /// rpm and dpkg share the attribute-column format: a 9-character flag string
 /// where position 3 ('5') marks a digest mismatch, then an optional one-char
@@ -245,7 +250,6 @@ fn report_overlay(report: &mut crate::doctor_report::Report, origin: &InstallOri
 /// "… checksum mismatch" and "Size mismatch" mean the file content changed;
 /// mtime/permission/owner drift does not make a file an overlay.
 fn overlaid_paths(verify_output: &str) -> Vec<String> {
-    const WATCHED: &[&str] = &["/irlume", "/irlumed", "/pam_irlume.so"];
     let mut hits = Vec::new();
     for line in verify_output.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
@@ -266,7 +270,9 @@ fn overlaid_paths(verify_output: &str) -> Vec<String> {
             };
             (flags.contains('5'), *path)
         };
-        let watched = WATCHED.iter().any(|w| path.ends_with(w));
+        let watched = path.rsplit_once('/').is_some_and(|(_, name)| {
+            MANAGED_BINARIES.contains(&name) || MANAGED_PAM_MODULES.contains(&name)
+        });
         if content_changed && watched && !hits.contains(&path.to_string()) {
             hits.push(path.to_string());
         }
@@ -446,6 +452,36 @@ mod tests {
         assert!(overlaid_paths(summary).is_empty());
         // A missing mtree makes -Qkk print this to stdout; not an overlay.
         assert!(overlaid_paths("irlume: no mtree file\n").is_empty());
+    }
+
+    #[test]
+    fn overlay_watch_covers_both_pam_modules() {
+        // The session-only LightDM view module is installed and verified like
+        // the authentication module, in each package manager's report shape.
+        let rpm = "S.5....T.    /usr/lib64/security/pam_irlume_view.so\n";
+        assert_eq!(
+            overlaid_paths(rpm),
+            vec!["/usr/lib64/security/pam_irlume_view.so"]
+        );
+        let dpkg = "??5??????   /usr/lib/x86_64-linux-gnu/security/pam_irlume_view.so\n";
+        assert_eq!(
+            overlaid_paths(dpkg),
+            vec!["/usr/lib/x86_64-linux-gnu/security/pam_irlume_view.so"]
+        );
+        let pacman =
+            "warning: irlume: /usr/lib/security/pam_irlume_view.so (SHA256 checksum mismatch)\n";
+        assert_eq!(
+            overlaid_paths(pacman),
+            vec!["/usr/lib/security/pam_irlume_view.so"]
+        );
+        // mtime-only drift on it is not an overlay, as for the other files.
+        let mtime = ".......T.    /usr/lib64/security/pam_irlume_view.so\n";
+        assert!(overlaid_paths(mtime).is_empty());
+        // A file that only starts with a managed name is not watched.
+        let backup = "S.5....T.    /usr/lib64/security/pam_irlume_view.so.bak\n";
+        assert!(overlaid_paths(backup).is_empty());
+        // A bare name without a directory is not a path the verifiers print.
+        assert!(overlaid_paths("S.5....T.    irlume\n").is_empty());
     }
 
     #[test]

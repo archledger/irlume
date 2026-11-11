@@ -15866,7 +15866,11 @@ mod tests {
         // writer held long enough to turn that into WouldBlock (#380 follow-up).
         let _passwd = passwd_lock();
         use std::io::{BufRead, BufReader, Write};
-        let me = std::env::var("USER").unwrap_or_else(|_| "root".into());
+        // The served peer is identified by SO_PEERCRED, which reports the
+        // effective uid, so that is the account the request has to name.
+        // SAFETY: geteuid takes no arguments, reads only this process's own
+        // effective uid, and always succeeds.
+        let me = users::name_for_uid(unsafe { libc::geteuid() }).unwrap_or_else(|| "root".into());
         let arbiter = std::sync::Arc::new(arbiter::Arbiter::<Queued>::new());
         // The engine has NOT been published yet: exactly the startup window.
         let ready = std::sync::atomic::AtomicBool::new(false);

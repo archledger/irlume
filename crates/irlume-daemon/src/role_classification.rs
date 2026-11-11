@@ -81,7 +81,8 @@ const RUN_ENDS_AFTER: Duration = Duration::from_secs(900);
 /// on the seat, a replug) and is classified at the next poll. A camera seen
 /// unclassified again sooner keeps its run, whatever the cause, and whether
 /// it had its roles or was gone in between. A publication that is not
-/// Current shows neither, and ends no run.
+/// Current shows neither: it ends no run and counts as no sighting, and the
+/// next Current one decides.
 const SCAN_HELD: Duration = Duration::from_secs(30);
 
 /// The scans in a run at which the classifier says it is spacing them: the
@@ -127,15 +128,18 @@ impl RoleClassifier {
             .map(|camera| (camera.instance_id.clone(), camera.generation))
             .collect();
         self.tries.retain(|key, _| listed.contains(key));
+        // A run ends before this poll's sightings count: a camera first
+        // seen unclassified again SCAN_HELD or more after the last sighting
+        // starts a new run with that sighting.
+        self.runs.retain(|_, run| {
+            now.saturating_duration_since(run.scanned) < RUN_ENDS_AFTER
+                && now.saturating_duration_since(run.unclassified) < SCAN_HELD
+        });
         for camera in &view.unclassified {
             if let Some(run) = self.runs.get_mut(&camera.topology) {
                 run.unclassified = run.unclassified.max(now);
             }
         }
-        self.runs.retain(|_, run| {
-            now.saturating_duration_since(run.scanned) < RUN_ENDS_AFTER
-                && now.saturating_duration_since(run.unclassified) < SCAN_HELD
-        });
         view.unclassified
             .iter()
             .filter(|camera| match self.runs.get(&camera.topology) {
@@ -238,10 +242,9 @@ pub(crate) fn tick(
     );
     if classifier.scanned(&topologies, now) == THROTTLE_NOTICE_AT {
         irlume_common::jout_notice!(
-            "irlumed: a camera was not seen to keep its roles for {} s after any of {} \
-             scans in a row (a udev change each time, nodes that could not be read, or \
-             no complete camera inventory in between); its next scans are spaced up to \
-             {} s apart",
+            "irlumed: a camera was unclassified again, or still, within {} s of each of \
+             {} scans in a row (a udev change each time, or nodes that could not be \
+             read); its next scans are spaced up to {} s apart",
             SCAN_HELD.as_secs(),
             THROTTLE_NOTICE_AT - 1,
             SCAN_GAP[SCAN_GAP.len() - 1].as_secs()
@@ -871,9 +874,10 @@ mod tests {
     }
 
     #[test]
-    fn a_camera_unclassified_again_by_the_hold_keeps_its_spacing() {
-        // Not listed at every poll short of the hold, and a new generation
-        // at the hold itself: the run goes on, and the scans are spaced.
+    fn a_camera_unclassified_again_before_the_hold_keeps_its_spacing() {
+        // Not listed at the polls after each scan, and a new generation at
+        // the last poll short of the hold: the run goes on, and the scans
+        // are spaced.
         let mut classifier = RoleClassifier::default();
         let mut now = Instant::now();
         let classified = view(CameraInventoryState::Current, &[]);
@@ -891,17 +895,42 @@ mod tests {
                 // The wait since the previous scan covered its gap.
                 let gap = SCAN_GAP[scans - 2];
                 assert!(
-                    now.duration_since(waited_from) + SCAN_HELD >= gap,
+                    now.duration_since(waited_from) + SCAN_HELD - POLL >= gap,
                     "{gap:?}"
                 );
             }
             let mut poll = now + POLL;
-            while poll < now + SCAN_HELD {
+            while poll < now + SCAN_HELD - POLL {
                 assert!(classifier.due(&classified, poll).is_empty());
                 poll += POLL;
             }
-            now += SCAN_HELD;
+            now += SCAN_HELD - POLL;
         }
+    }
+
+    #[test]
+    fn a_camera_first_seen_again_at_the_hold_starts_a_new_run() {
+        // No poll saw the camera between its last scan and the hold (the
+        // publications were incomplete, or the classifier was busy), and
+        // the first that does lists a new generation. The run ended before
+        // that sighting counts, so it starts a new one and is due at once.
+        let mut classifier = RoleClassifier::default();
+        let mut now = Instant::now();
+        for _ in 0..SCAN_GAP.len() {
+            classifier.scanned(&[topology("a")], now);
+            now += POLL;
+        }
+        let last_scan = now - POLL;
+        let refreshing = view(CameraInventoryState::Refreshing, &[]);
+        assert!(classifier
+            .due(&refreshing, last_scan + SCAN_HELD - POLL)
+            .is_empty());
+        let back = view(CameraInventoryState::Current, &[("a", 9)]);
+        assert_eq!(classifier.due(&back, last_scan + SCAN_HELD), [key("a", 9)]);
+        assert_eq!(
+            classifier.scanned(&[topology("a")], last_scan + SCAN_HELD),
+            1
+        );
     }
 
     #[test]
@@ -1001,48 +1030,58 @@ mod tests {
 
     #[test]
     fn a_camera_gone_for_less_than_the_hold_keeps_its_run() {
-        // A camera that never held its roles and drops off the bus for a
-        // few seconds is the same camera when it returns: its run goes on.
+        // A camera that never held its roles and drops off the bus for
+        // less than the hold is the same camera when it returns: its run
+        // goes on.
         let mut classifier = RoleClassifier::default();
         let mut now = Instant::now();
         for _ in 0..THROTTLE_NOTICE_AT {
             classifier.scanned(&[topology("a")], now);
             now += POLL;
         }
-        // Unclassified again after its last scan, and still so past the hold.
-        let seen = now + SCAN_HELD + POLL;
+        // Still unclassified at every poll until past the hold.
         let listed = view(CameraInventoryState::Current, &[("a", 7)]);
-        assert!(classifier.due(&listed, seen).is_empty());
-        // Gone for a few polls, less than the hold.
+        let until = now + SCAN_HELD;
+        while now <= until {
+            assert!(classifier.due(&listed, now).is_empty());
+            now += POLL;
+        }
+        let last_seen = now - POLL;
+        // Gone for less than the hold since it was last seen, then back.
         let gone = view(CameraInventoryState::Current, &[]);
-        assert!(classifier.due(&gone, seen + POLL).is_empty());
-        assert!(classifier.due(&gone, seen + SCAN_HELD - POLL).is_empty());
+        assert!(classifier.due(&gone, last_seen + POLL).is_empty());
+        assert!(classifier
+            .due(&gone, last_seen + SCAN_HELD - POLL * 2)
+            .is_empty());
+        let back = view(CameraInventoryState::Current, &[("a", 8)]);
+        classifier.due(&back, last_seen + SCAN_HELD - POLL);
         assert_eq!(
-            classifier.scanned(&[topology("a")], seen + SCAN_HELD - POLL),
+            classifier.scanned(&[topology("a")], last_seen + SCAN_HELD - POLL),
             THROTTLE_NOTICE_AT + 1
         );
     }
 
     #[test]
     fn a_held_camera_starts_a_new_run_while_another_stays_unclassified() {
-        // `b` stays unclassified (its nodes could not be read) while `a`,
-        // spaced to the cap, kept its roles past the hold. The hold is per
-        // port: `a`'s next change starts a new run and is due at once.
+        // `b` is listed as unclassified at every poll (its nodes cannot be
+        // read) while `a`, spaced to the cap, keeps its roles past the hold.
+        // The hold is per port: `b`'s sightings do not keep `a`'s run, so
+        // `a`'s next change starts a new run and is due at once.
         let mut classifier = RoleClassifier::default();
         let mut now = Instant::now();
         for _ in 0..SCAN_GAP.len() {
             classifier.scanned(&[topology("a")], now);
             now += POLL;
         }
-        let held = now + SCAN_HELD;
         let only_b = view(CameraInventoryState::Current, &[("b", 1)]);
-        let due = classifier.due(&only_b, held);
-        assert_eq!(due, [key("b", 1)]);
-        assert_eq!(classifier.scanned(&[topology("b")], held), 1);
-        classifier.tried(&due, held);
+        let held = now + SCAN_HELD;
+        while now < held {
+            classifier.due(&only_b, now);
+            now += POLL;
+        }
         let both = view(CameraInventoryState::Current, &[("a", 9), ("b", 1)]);
-        assert_eq!(classifier.due(&both, held + POLL), [key("a", 9)]);
-        assert_eq!(classifier.scanned(&[topology("a")], held + POLL), 1);
+        assert!(classifier.due(&both, now).contains(&key("a", 9)));
+        assert_eq!(classifier.scanned(&[topology("a")], now), 1);
     }
 
     #[test]

@@ -428,28 +428,27 @@ the `IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE` pair and an enrollment without a
 complete camera binding keep using the standing pair.
 
 ```text
-irlumed: a camera was not seen to keep its roles for 30 s after any of 4 scans in a row (a udev change each time, nodes that could not be read, or no complete camera inventory in between); its next scans are spaced up to 600 s apart
+irlumed: a camera was unclassified again, or still, within 30 s of each of 4 scans in a row (a udev change each time, or nodes that could not be read); its next scans are spaced up to 600 s apart
 ```
 
-The camera was not seen to keep its roles for 30 seconds after any of four
-scans in a row: it was unclassified again, or still, each time, or the
-camera inventory was incomplete in between. The daemon now opens it less
-often: while it keeps changing, each next scan comes at least 60, 300 and
-then 600 seconds after the previous one. A camera whose nodes cannot be read
-follows its retries instead (5, 30, 120 and 600 seconds); the notice then
-comes with its fifth try, after which it is left alone with `irlumed: camera
-... is still unclassified after 5 tries`. Session changes in quick
-succession, each within 30 seconds of the scan that served the one before,
-write the notice at the fifth scan too; the scan at the daemon's start
-counts as the first only when the first change comes within 30 seconds of
-it. The spacing ends once the camera has not been seen unclassified for 30
-seconds (its roles held, or it was unplugged), or after 15 minutes without a
-scan. A camera that changes, or leaves the bus, 30 seconds or more after
-each scan is not spaced and gets no notice: the `classified the capture
-nodes` line then repeats about every 32 seconds. The TUI's Cameras page
-classifies the cameras at once. `udevadm monitor --kernel
---subsystem-match=video4linux --subsystem-match=usb` shows the events that
-keep changing the camera.
+The camera was seen unclassified again, or still, within 30 seconds of each
+of four scans in a row, so the daemon opens it less often: while it keeps
+changing, each next scan comes at least 60, 300 and then 600 seconds after
+the previous one. A camera whose nodes cannot be read follows its retries
+instead (5, 30, 120 and 600 seconds); the notice then comes with its fifth
+try, after which it is left alone with `irlumed: camera ... is still
+unclassified after 5 tries`. Session changes in quick succession, each
+within 30 seconds of the scan that served the one before, write the notice
+at the fifth scan too; the scan at the daemon's start counts as the first
+only when the first change comes within 30 seconds of it. The spacing ends
+once the camera has not been seen unclassified for 30 seconds (its roles
+held, or it was unplugged), or after 15 minutes without a scan. A camera
+whose change is first seen 30 seconds or more after each scan, or that
+leaves the bus for that long, is not spaced and gets no notice: the
+`classified the capture nodes` line then repeats every 30 seconds or more.
+The TUI's Cameras page classifies the cameras at once. `udevadm monitor
+--kernel --subsystem-match=video4linux --subsystem-match=usb` shows the
+events that keep changing the camera.
 
 ## YUYV IR camera listed as UVC RGB
 

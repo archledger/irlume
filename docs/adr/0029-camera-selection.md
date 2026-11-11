@@ -445,28 +445,26 @@ scan at its port, or at a later such poll that listed it); in that time the
 camera had its roles or was gone. Its next new generation starts a new run
 and is classified at the next poll. A camera seen unclassified again, or
 still, before then keeps its run, whether it had its roles or was gone in
-between. A publication that is not Current ends no run.
+between. A poll of a publication that is not Current ends no run and counts
+as no sighting; the next Current one decides.
 
 The first scans of a run are no longer spaced. The second, third and fourth
 scan follow at the poll interval, the fifth waits 10 seconds after the
 fourth, and the waits of 60, 300 and 600 seconds start with the sixth. The
 notice that scans are being spaced is written at the fifth scan of a run.
 
-Limits. Changes that each come within 30 seconds of the last time the
-camera was seen unclassified still count as one run: the fifth scan of such
-a run, the scan at the daemon's start included, writes the notice, and the
-sixth waits up to 60 seconds. A camera that answered
-each scan with a change 30 seconds or more after it, or that left the bus
-for 30 seconds or more each time, would not be spaced: it would be scanned
-once per change, as often as every 32 seconds (30 seconds and the next
-poll, about 110 scans an hour against 6 at the cap), and no notice would be
-written; none is known. After a stretch without a Current publication, a
-camera that comes back unclassified continues its run whatever it did in
-between. A camera replaced by another at the same port within 30 seconds
-inherits the run. Each new generation still leaves
-the camera unclassified until the scan at the next poll has run (up to 2
-seconds and the scan, longer behind queued camera requests), and an
-authentication that account routing serves in that time is refused to the
-password. Keeping a camera's roles across a `change` event whose rescan
-finds the same device would remove that window; it changes how item 1 keys
-the roles and is not decided here.
+Limits. Changes that each come within 30 seconds of the last time the camera
+was seen unclassified still count as one run: the fifth scan of such a run,
+the scan at the daemon's start included, writes the notice, and the sixth
+waits up to 60 seconds. A camera whose change after each scan was first seen
+30 seconds or more after it (the change itself up to one poll earlier), or
+that left the bus for that long each time, would not be spaced: it would be
+scanned once per change, as often as every 30 seconds (about 120 scans an
+hour against 6 at the cap), and no notice would be written; none is known. A
+camera replaced by another at the same port within 30 seconds inherits the
+run. Each new generation still leaves the camera unclassified until the scan
+at the next poll has run (up to 2 seconds and the scan, longer behind queued
+camera requests), and an authentication that account routing serves in that
+time is refused to the password. Keeping a camera's roles across a `change`
+event whose rescan finds the same device would remove that window; it changes
+how item 1 keys the roles and is not decided here.

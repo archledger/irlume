@@ -1237,10 +1237,13 @@ All notable changes to irlume are documented here. This project adheres to
   under the Dual face sensor policy: the camera worker scans only that
   camera's capture nodes, as discovery does (no stream, no emitter),
   behind any queued request and never while an authentication is
-  pending. A
-  camera that stays unclassified is tried again with a backoff, and one
-  that comes back unclassified after every scan is scanned at most every
-  10 minutes.
+  pending. A camera that stays unclassified is tried again with a
+  backoff, and one that is unclassified again within 30 seconds of each
+  scan is scanned ever less often, down to once every 10 minutes. The
+  first four scans of such a series follow at the 2-second poll, and a
+  change that comes after the roles held for 30 seconds, such as a
+  switch to a text console and back, is classified at the next poll
+  (ADR-0029, amendment 2026-11-11).
 
 - The PPA container build no longer copies its source tree into itself.
   It staged into `/work/ppa-build`, inside the tree

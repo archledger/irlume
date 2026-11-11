@@ -135,7 +135,9 @@ def render_host(h: dict) -> list[str]:
         )
     ir = h.get("ir")
     if ir:
-        lines.append(f"- **IR:** `/dev/{ir['node']}`: {ir['format']}")
+        # A community record may hold no node name.
+        node = f"`/dev/{ir['node']}`: " if ir.get("node") else ""
+        lines.append(f"- **IR:** {node}{ir['format']}")
     else:
         lines.append("- **IR:** none (RGB-only host; convenience tier only)")
     lines.append(f"- **Capture mode:** {h['capture_mode']}: {h['capture_mode_source']}")
@@ -169,8 +171,10 @@ def main() -> int:
     out.append("## Built-in IR emitter controls (`known_control`)\n")
     out.append(
         "Read from source at generation time. These are the modules whose"
-        " emitter payload was validated end to end (write, read-back, optical"
-        " output, restoration). Everything else uses `irlume ir-setup`.\n"
+        " emitter payload has on-device evidence of the write, its read-back,"
+        " the alternating illumination and the restoration; the host rows"
+        " above say how each was recorded. Everything else uses"
+        " `irlume ir-setup`.\n"
     )
     for e in known_control_entries():
         note = f" ({e['comment']})" if e["comment"] else ""

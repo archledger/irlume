@@ -467,8 +467,8 @@ impl From<f32> for SetupMeasurement {
 /// descriptor before anything is written; see [`control_is_documented`].
 ///
 /// All entries address Microsoft's Face Authentication control (0x06). Each
-/// payload was validated on that hardware and is kept verbatim: it is not
-/// derived from a rule irlume knows, so it is not extrapolated to other cameras.
+/// payload was validated on that hardware and is kept verbatim for that USB
+/// identity only; none is extrapolated to another camera.
 fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
     const HELLO_FACE_AUTH: [u8; 9] = [1, 3, 2, 0, 0, 0, 0, 0, 0];
     const T480_FACE_AUTH: [u8; 9] = [1, 1, 2, 0, 0, 0, 0, 0, 0];
@@ -485,17 +485,24 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
             payload: HELLO_FACE_AUTH.to_vec(),
         }),
-        // NexiGo HelloCam N930W "60fps" variant; IR on streaming interface 3; MS-XU unit 4.
+        // NexiGo HelloCam N930W 60fps; MS-XU is unit 4.
         //
-        // On record for this identity: #449 reports the camera with an IR
-        // stream, and one unit was measured end to end. Its descriptor
-        // advertises MSXU_CONTROL_FACE_AUTHENTICATION on the IR chain (VC
-        // interface 2, unit 4, bmControls bit 5 -> selector 0x06), GET_LEN
-        // reports 9 and GET_MAX 0x03 (D0|D1, not D2), an interface-3 D1 write
-        // read back as written, captured IR frames alternate dark/lit (means
-        // 0.9 and 222.7) while D0 stays flat, and GET_CUR returned to
-        // 01 03 01 .. afterwards. irlume's own ir-setup derives the same bytes
-        // from GET_MAX/GET_DEF.
+        // The product name does not identify one design (docs/PLATFORMS.md),
+        // and an earlier survey listed this ID as RGB-only. On record is one
+        // unit at bcdDevice 0.06: its descriptor
+        // (tests/fixtures/nexigo-3443-930d.descriptors) and the output of
+        // `irlume ir-setup` 0.15.0. Its success line means that setup built
+        // this payload from the camera's GET_DEF and GET_MAX, wrote it and
+        // read it back, wrote the original back and read that back, saw the
+        // alternating illumination begin and end with that change (in the
+        // frames or in the camera's per-frame records; the output does not
+        // say which) and applied the payload again:
+        // https://github.com/archledger/irlume/pull/1311#issuecomment-6788607935
+        // The contributor's own tool read D0 before that run and D1 after
+        // it. The output names no USB ID; the line that run saved, posted
+        // afterwards, reads `3443:930d 4:6`. #449 holds a second unit's
+        // dry run with the same two units. The built-in entry itself has
+        // not been run on this hardware.
         (0x3443, 0x930d) => Some(EmitterControl {
             unit: 4,
             selector: crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION,
@@ -10815,9 +10822,9 @@ mod tests {
             crate::uvc_descriptor::MSXU_FACE_AUTHENTICATION
         );
 
-        // The same model name, and a second validated identity: #449's report
-        // is confirmed on that hardware, which reaches the same MS-XU unit 4 /
-        // selector 0x06 / interface-3 D1 payload, and ends back in D0.
+        // The same model name under a second USB identity. One unit's
+        // descriptor and `ir-setup` run are on record (#1311): unit 4,
+        // selector 0x06 and the interface-3 D1 payload, as for c803.
         assert_eq!(
             known_control(0x3443, 0x930d),
             Some(EmitterControl {
@@ -10826,6 +10833,7 @@ mod tests {
                 payload: vec![1, 3, 2, 0, 0, 0, 0, 0, 0],
             })
         );
+        assert_eq!(known_control(0x3443, 0x930e), None); // same vendor, other product
 
         // A different camera gets nothing, however it names itself. The old
         // table matched `card.contains("ASUS")`, so any camera with that word
@@ -10833,6 +10841,83 @@ mod tests {
         assert_eq!(known_control(0x046d, 0x085e), None); // Logitech Brio
         assert_eq!(known_control(0x3277, 0x0060), None); // same vendor, other product
         assert_eq!(known_control(0x0000, 0x0000), None);
+    }
+
+    /// The `3443:930d` identity over the descriptor file its contributor
+    /// posted (#1311), as read through the given VideoControl interface.
+    fn identity_930d(interface_number: u8) -> crate::uvc_descriptor::CameraIdentity {
+        crate::uvc_descriptor::CameraIdentity {
+            descriptors: include_bytes!("../tests/fixtures/nexigo-3443-930d.descriptors").to_vec(),
+            active_configuration: 1,
+            interface_number,
+            vid: 0x3443,
+            pid: 0x930d,
+            serial: None,
+            usb_devpath: "/devices/pci0000:00/0000:00:14.0/usb1/1-3".into(),
+        }
+    }
+
+    #[test]
+    fn the_930d_entry_applies_on_its_ir_function_and_not_on_its_colour_function() {
+        let _lock = crate::testenv::env_lock();
+        let _env = EnvGuard::set(
+            "IRLUME_IR_EMITTER_CONF",
+            "/definitely/missing/930d-emitter.conf",
+        );
+        let entry = known_control(0x3443, 0x930d).expect("930d entry");
+
+        // The IR function (VideoControl interface 2) carries Microsoft unit 4
+        // advertising selector 0x06 in a one-configuration device, so a
+        // capture with nothing saved plans the built-in payload.
+        let ir = identity_930d(2);
+        assert!(control_is_documented(&ir, &entry));
+        assert_eq!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &ir),
+            CaptureAction::KnownPayload(entry.clone())
+        );
+
+        // The colour function has the same unit number, advertising nothing.
+        let colour = identity_930d(0);
+        assert!(!control_is_documented(&colour, &entry));
+        assert_eq!(
+            planned_action(&RecoveryOutcome::NothingPending, None, &colour),
+            CaptureAction::Nothing
+        );
+
+        // The payload names the IR function's own streaming interface. It is
+        // the value `ir-setup` builds from the GET_DEF and GET_MAX the
+        // contributor's tool read from this unit (01 03 01 and 01 03 03),
+        // and the mode `ir-setup` printed for it.
+        let function = ir.ir_function_evidence().expect("the IR function");
+        assert_eq!(entry.payload[1], function.streaming_interface);
+        assert_eq!(
+            face_auth_payload(&[1, 3, 1, 0, 0, 0, 0, 0, 0], &[1, 3, 3, 0, 0, 0, 0, 0, 0]),
+            Ok(entry.payload.clone())
+        );
+        assert_eq!(
+            face_auth_mode_evidence(&entry.payload).as_deref(),
+            Some("interface 0x03 set to D1 (alternative illumination)")
+        );
+    }
+
+    /// A table arm names one product, not a family. The point checks in this
+    /// module try one or two neighbours per vendor (3277:0060 and 3443:930e
+    /// above, 5986:2113 and 5986:1142 in the T480 test below), so an arm
+    /// widened to a range or an alternation around a listed product would
+    /// still pass them; this walks every product ID of each vendor in the
+    /// table.
+    #[test]
+    fn known_control_matches_only_the_listed_products_of_each_vendor() {
+        for (vid, listed) in [
+            (0x3277_u16, &[0x0059_u16][..]),
+            (0x3443, &[0x930d, 0xc803][..]),
+            (0x5986, &[0x1141][..]),
+        ] {
+            let matched: Vec<u16> = (0..=u16::MAX)
+                .filter(|&pid| known_control(vid, pid).is_some())
+                .collect();
+            assert_eq!(matched, listed, "vendor {vid:04x}");
+        }
     }
 
     #[test]

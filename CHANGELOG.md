@@ -40,6 +40,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The NexiGo HelloCam N930W 60fps (`3443:930d`) has a built-in emitter
+  control (unit 4, selector 6, D1 on interface 3): the value that
+  `irlume ir-setup` 0.15.0 built from the camera's own reports, wrote,
+  read back, restored and applied again after its D1 check on one unit
+  at bcdDevice 0.06, whose descriptor is now a test fixture (#1311,
+  #449). irlume writes it when an IR stream opens on a
+  one-configuration device with that ID whose node's own function
+  carries that unit advertising the selector; `IRLUME_IR_EMITTER` (an
+  override or `off`) and a control saved by `ir-setup` come first. No
+  capture, enrollment or authentication with the built-in entry is on
+  record for this camera. Thanks to @VIGO-VI for the entry and the
+  hardware record.
+
 - `DisarmKeyring` daemon request, used by `irlume keyring forget`: irlumed
   reads the envelope's kind when the request runs and decides from that,
   whatever kind the client read earlier. It erases a sealed login password

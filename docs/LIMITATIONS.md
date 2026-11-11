@@ -121,8 +121,9 @@ summary lives on the [README](../README.md); this is the detail.
   that: on minihost
   ([startup flush measurement](research/2026-08-22-startup-flush-fleet-measurement.md))
   and, as the IR side of a split pair, 14.76 fps on archhost (#1063). Other
-  cameras sold as the N930W, such as `3443:930d` units, are different designs
-  and were not measured ([PLATFORMS.md](PLATFORMS.md)). A capture that dips
+  cameras sold as the N930W, such as `3443:930d` units, are different designs,
+  and their delivered rate was not measured ([PLATFORMS.md](PLATFORMS.md)). A
+  capture that dips
   below the floor refuses with `delivered rate below floor`: an
   authentication then falls back to the password, and an enrollment ends with
   that error and saves nothing, so an existing enrollment stays as it was. On

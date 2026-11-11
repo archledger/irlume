@@ -3094,6 +3094,89 @@ mod tests {
         }
     }
 
+    /// A NexiGo N930W 60fps (USB 3443:930d, bcdDevice 0.06): the sysfs
+    /// `descriptors` file its contributor posted on #1311, 1071 bytes
+    /// (sha256 `eafaaee9…`). Its IR function is byte for byte the
+    /// `3443:c803` one. Its colour function has the same entity IDs, a
+    /// vendor unit with a one-byte bitmap and a 60 fps interval on each MJPEG
+    /// frame, and a USB Audio function (interfaces 4 and 5) follows.
+    const NEXIGO_930D: &[u8] = include_bytes!("../tests/fixtures/nexigo-3443-930d.descriptors");
+
+    /// The file is the identity it is filed under, with one configuration
+    /// as long as its header says, and walks by `bLength` to its last byte.
+    /// The built-in emitter entry applies only to a one-configuration
+    /// device.
+    #[test]
+    fn the_930d_file_is_one_whole_configuration_of_that_identity() {
+        let bytes = NEXIGO_930D;
+        assert_eq!(bytes.len(), 1071);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 0x3443);
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 0x930d);
+        assert_eq!(u16::from_le_bytes([bytes[12], bytes[13]]), 0x0006);
+        assert_eq!(bytes[17], 1, "bNumConfigurations");
+        assert_eq!(
+            usize::from(u16::from_le_bytes([bytes[20], bytes[21]])),
+            bytes.len() - 18
+        );
+        let mut i = 0;
+        while i < bytes.len() {
+            let len = bytes[i] as usize;
+            assert!(len >= 2, "zero-length descriptor at {i}");
+            assert!(i + len <= bytes.len(), "descriptor at {i} overruns");
+            i += len;
+        }
+        assert_eq!(i, bytes.len());
+        assert_eq!(active_descriptor_view(bytes, 1).as_deref(), Some(bytes));
+    }
+
+    /// Its IR function is the one that carries the face-authentication
+    /// control, on Microsoft unit 4 with streaming interface 3. The units
+    /// are what `ir-setup --dry-run` listed on this unit and on the one in
+    /// #449: a vendor unit advertising nothing and the Microsoft unit
+    /// advertising selectors 0x06 and 0x09. The colour function has the
+    /// same two unit IDs, with the vendor unit advertising selectors 1 to 6
+    /// and 8 and the Microsoft unit advertising nothing.
+    #[test]
+    fn the_930d_ir_function_carries_the_face_authentication_unit() {
+        fn listed(interface: u8) -> Vec<(u8, bool, Vec<u8>)> {
+            extension_units_for_interface(NEXIGO_930D, interface)
+                .iter()
+                .map(|unit| {
+                    (
+                        unit.unit_id,
+                        unit.is_microsoft_xu(),
+                        (1u8..=64).filter(|s| unit.advertises(*s)).collect(),
+                    )
+                })
+                .collect()
+        }
+        assert_eq!(
+            ir_function_evidence(NEXIGO_930D, 2),
+            Ok(IrFunctionEvidence {
+                msxu_unit: 4,
+                streaming_interface: 3,
+            })
+        );
+        assert_eq!(listed(2), [(3, false, vec![]), (4, true, vec![6, 9])]);
+        assert_eq!(
+            ir_function_evidence(NEXIGO_930D, 0),
+            Err(IrFunctionRefusal::NoFaceAuthentication)
+        );
+        assert_eq!(
+            listed(0),
+            [(3, false, vec![1, 2, 3, 4, 5, 6, 8]), (4, true, vec![])]
+        );
+        for interface in [0, 2] {
+            assert_eq!(
+                video_control_function(NEXIGO_930D, interface)
+                    .expect("a well-formed function")
+                    .extension_units,
+                extension_units_for_interface(NEXIGO_930D, interface),
+                "interface {interface}"
+            );
+        }
+    }
+
     /// The header must list a VideoStreaming interface of the same
     /// configuration: listing the control interface itself, or one that
     /// does not exist, is a malformed function, not a stream.

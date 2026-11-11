@@ -473,11 +473,19 @@ pub enum AtomicWrite {
     /// fsync failed and it may not survive a power loss. A caller that must know
     /// what is visible now has to treat this as published.
     ///
-    /// NOT COVERED BY A TEST. Nothing available here can make a directory fsync
-    /// fail; provoking it needs filesystem fault injection, and a mutant that
-    /// reverts this arm to `?` propagation survives the suite. The branch rests
-    /// on `rename(2)` being atomic and immediate and `fsync(2)` being a separate
-    /// step, not on anything observed.
+    /// Covered on a real file system by
+    /// `a_write_into_a_directory_without_read_permission_is_visible_not_durable`:
+    /// in a directory at mode 0300 (write and search, no read) the temp file is
+    /// created, synced and renamed in, and then the `open(2)` of the directory
+    /// for its sync fails with EACCES, so this arm is reached after a real
+    /// rename, with the new content readable under the target name. That test
+    /// fails where read permission does not bind (root, CAP_DAC_OVERRIDE,
+    /// CAP_DAC_READ_SEARCH). NOT COVERED: a directory `fsync(2)` that runs and
+    /// fails, such as an I/O error from the device, which needs filesystem
+    /// fault injection; whether that `fsync(2)` runs at all, since a writer
+    /// that opens the directory and then skips the sync, or ignores its
+    /// result, still passes that test; and what survives a power loss after
+    /// either failure.
     VisibleNotDurable(std::io::Error),
 }
 
@@ -3562,6 +3570,128 @@ mod tests {
         let missing = dir.join("no-such-dir").join("f");
         assert!(super::write_atomic_reporting(&missing, b"x", 0o600).is_err());
         assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Holds a directory at mode 0300 (write and search, no read) and puts it
+    /// back at 0700 when dropped, so neither a failed assertion nor an early
+    /// return leaves a scratch directory that cannot be listed or removed.
+    #[cfg(unix)]
+    struct WithoutReadPermission<'a>(&'a std::path::Path);
+
+    #[cfg(unix)]
+    impl<'a> WithoutReadPermission<'a> {
+        fn set(dir: &'a std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
+                .expect("chmod 0300");
+            Self(dir)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WithoutReadPermission<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// The `VisibleNotDurable` arm on a real file system, without root.
+    ///
+    /// In a directory at mode 0300 the writer can create, sync and rename its
+    /// temp file, but the `open(2)` of the directory for its sync fails with
+    /// EACCES. The rename has happened by then, so the replacement is what a
+    /// reader sees under the target name, and no temp file is left. The strict
+    /// `write_0600_atomic` reports the same outcome as an error although its
+    /// bytes are visible. Once the directory is readable again the next write
+    /// reports `Durable`. This shows the writer's report after a failed
+    /// directory sync step; it is not a crash or power-loss test, and while
+    /// the directory is at 0300 its `fsync(2)` never runs.
+    ///
+    /// Fails, with a message, where the process opens the directory anyway
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): there the failure cannot
+    /// be provoked, and a pass would say this arm ran when it did not. The
+    /// suite runs as an unprivileged user in every lane.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_into_a_directory_without_read_permission_is_visible_not_durable() {
+        use std::os::unix::fs::PermissionsExt;
+        // Per-process, as the test above names its directory.
+        let dir =
+            std::env::temp_dir().join(format!("irlume-atomic-not-durable-{}", std::process::id()));
+        // A run killed while the directory was at 0300 leaves it unlistable.
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let names = |dir: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("list")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+        let path = dir.join("f");
+        assert!(matches!(
+            super::write_atomic_reporting(&path, b"old", 0o600).expect("first write"),
+            super::AtomicWrite::Durable
+        ));
+
+        let unreadable = WithoutReadPermission::set(&dir);
+        if std::fs::File::open(&dir).is_ok() {
+            drop(unreadable);
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!(
+                "this process opens a directory without read permission (root, \
+                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                 be made to fail here: run the tests as an unprivileged user"
+            );
+        }
+        let error = match super::write_atomic_reporting(&path, b"new", 0o600).expect("published") {
+            super::AtomicWrite::VisibleNotDurable(e) => e,
+            super::AtomicWrite::Durable => {
+                panic!("the directory could not be opened for its sync, yet the write was Durable")
+            }
+        };
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES), "{error}");
+        // Read by name, which needs search permission only: the rename landed.
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // The strict wrapper reports the same outcome as an error although its
+        // bytes are visible too; a caller that needs durability, such as the
+        // storage-key record write, relies on that error.
+        let strict = super::write_0600_atomic(&path, b"strict").expect_err("not durable");
+        assert_eq!(strict.raw_os_error(), Some(libc::EACCES), "{strict}");
+        assert_eq!(std::fs::read(&path).expect("read"), b"strict");
+        drop(unreadable);
+
+        assert_eq!(
+            names(&dir),
+            ["f"],
+            "the temp file was renamed, none is left"
+        );
+        assert!(
+            matches!(
+                super::write_atomic_reporting(&path, b"newer", 0o600).expect("later write"),
+                super::AtomicWrite::Durable
+            ),
+            "a write once the directory is readable again reports Durable"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"newer");
+        assert_eq!(names(&dir), ["f"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

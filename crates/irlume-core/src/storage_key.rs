@@ -3576,6 +3576,163 @@ mod tests {
         assert!(no_lock, "no lock without a recorded DA-exempt key");
     }
 
+    /// Holds a directory at mode 0300 (write and search, no read) and puts it
+    /// back at 0700 when dropped, before the sandbox that removes it.
+    struct WithoutReadPermission<'a>(&'a Path);
+
+    impl<'a> WithoutReadPermission<'a> {
+        fn set(dir: &'a Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
+                .expect("chmod 0300");
+            Self(dir)
+        }
+    }
+
+    impl Drop for WithoutReadPermission<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// The not-durable case of
+    /// `a_move_off_the_original_key_is_recorded_before_it_publishes`, through
+    /// `publish_envelope` itself, so with the production record and envelope
+    /// writers and this boot's ID: the keyring directory at mode 0300 lets the
+    /// new envelope be renamed in and then refuses the `open(2)` its directory
+    /// sync needs (EACCES), so the writer reports `VisibleNotDurable`. The move
+    /// returns that, the new envelope is what a reader loads, `unused_since`
+    /// is cleared and the pending entry stays. The record is in the state
+    /// directory, which keeps its mode, so its own write succeeds. That the
+    /// record is written before the envelope is shown by the test named above,
+    /// not here. Not a crash or power-loss test: nothing is lost or rolled
+    /// back here, and the keyring directory's `fsync(2)` never runs.
+    ///
+    /// Fails, with a message, where the process opens the directory anyway
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass there would say
+    /// this case ran when it did not.
+    #[test]
+    fn a_move_whose_real_envelope_write_is_not_durable_keeps_its_entry() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-move-real-not-durable");
+        save_record(&Record {
+            unused_since: Some(BOOT.into()),
+            ..persisted_record(0x8101_0003, b"ours")
+        })
+        .unwrap();
+        let bob = keyring::envelope_path("bob");
+        envelope(false).save(&bob).unwrap();
+        let keyring_dir = bob.parent().expect("the keyring directory").to_path_buf();
+        // publish_envelope records the move under this boot's ID.
+        let boot = irlume_common::boot_id().expect("this boot's ID");
+
+        let unreadable = WithoutReadPermission::set(&keyring_dir);
+        if std::fs::File::open(&keyring_dir).is_ok() {
+            drop(unreadable);
+            drop(sandbox);
+            panic!(
+                "this process opens a directory without read permission (root, \
+                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                 be made to fail here: run the tests as an unprivileged user"
+            );
+        }
+        let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
+        let after = entries();
+        let unused_since = load_record().unused_since;
+        let parent = crate::envelope::SealedEnvelope::load(&bob).map(|env| env.parent);
+        drop(unreadable);
+        drop(sandbox);
+
+        match published.expect("published") {
+            irlume_common::AtomicWrite::VisibleNotDurable(e) => {
+                assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}");
+            }
+            irlume_common::AtomicWrite::Durable => {
+                panic!("the keyring directory could not be opened for its sync, yet Durable")
+            }
+        }
+        assert_eq!(
+            after,
+            [entry("bob", EnvelopeKind::KeyringSecret, &boot)],
+            "a write that is not durable keeps the entry"
+        );
+        assert_eq!(unused_since, None, "the move clears it");
+        assert_eq!(
+            parent.expect("the new envelope loads").map(|key| key.name),
+            Some(hex(b"ours")),
+            "readers see the envelope under the DA-exempt key"
+        );
+    }
+
+    /// The "not durable" half of `publish_envelope`'s rule that a record
+    /// write that fails, or is not durable, stops the move (the failing half
+    /// is in `a_move_off_the_original_key_is_recorded_before_it_publishes`),
+    /// through `publish_envelope` itself, so with the production record
+    /// writer: the state directory at mode 0300 (write and search, no read)
+    /// still lets the record lock be created, the record be read by name and
+    /// renamed in, and then refuses the `open(2)` its directory sync needs
+    /// (EACCES), so `save_record` (the strict `write_0600_atomic`) returns an
+    /// error and the envelope is not written: bob's file keeps its bytes. The
+    /// record's rename has landed, so the record a reader loads holds the
+    /// entry and a cleared `unused_since`. Not a crash or power-loss test:
+    /// nothing is lost or rolled back here, and the state directory's
+    /// `fsync(2)` never runs during the move.
+    ///
+    /// Fails, with a message, where the process opens the directory anyway
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass there would say
+    /// this case ran when it did not.
+    #[test]
+    fn a_move_whose_real_record_write_is_not_durable_publishes_no_envelope() {
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sandbox = Sandbox::new("storage-key-move-real-record-not-durable");
+        save_record(&Record {
+            unused_since: Some(BOOT.into()),
+            ..persisted_record(0x8101_0003, b"ours")
+        })
+        .unwrap();
+        let bob = keyring::envelope_path("bob");
+        envelope(false).save(&bob).unwrap();
+        let before = std::fs::read(&bob).unwrap();
+        let state_dir = irlume_common::state_dir();
+        // publish_envelope records the move under this boot's ID.
+        let boot = irlume_common::boot_id().expect("this boot's ID");
+
+        let unreadable = WithoutReadPermission::set(&state_dir);
+        if std::fs::File::open(&state_dir).is_ok() {
+            drop(unreadable);
+            drop(sandbox);
+            panic!(
+                "this process opens a directory without read permission (root, \
+                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                 be made to fail here: run the tests as an unprivileged user"
+            );
+        }
+        let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
+        let bob_unchanged = std::fs::read(&bob).unwrap() == before;
+        let after = entries();
+        let unused_since = load_record().unused_since;
+        drop(unreadable);
+        drop(sandbox);
+
+        let error = published.expect_err("a record write that is not durable stops the move");
+        assert!(
+            matches!(&error, Error::Io(message) if message.contains("os error 13")),
+            "{error}"
+        );
+        assert!(bob_unchanged, "the envelope keeps its bytes");
+        assert_eq!(
+            after,
+            [entry("bob", EnvelopeKind::KeyringSecret, &boot)],
+            "the record's rename landed"
+        );
+        assert_eq!(unused_since, None, "the record's rename landed");
+    }
+
     /// A write that moves an envelope to another key publishes only onto the
     /// key the record holds now, checked under the record lock that the
     /// start-up step holds, so a start that superseded the candidate's key

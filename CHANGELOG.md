@@ -5,6 +5,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- Move `rsa` from 0.10.0-rc.22 to 0.10.0 in both the application and fuzz
+  lockfiles, with `crypto-bigint` 0.7.11, which it requires. 0.10.0 is the
+  first `rsa` release outside the range of RUSTSEC-2023-0071, so
+  `deny.toml` no longer carries an exception for it and the release VEX
+  document records a clean scan. The requirement is now `0.10`, which no
+  release candidate satisfies. irlume still uses `rsa` for public-key
+  operations only: endorsement-certificate signatures and the RSA-OAEP
+  encryption of MakeCredential (ADR-0036 section 6, amendment 2026-11-11,
+  #1112).
+
 ## [0.16.0] - 2026-11-11
 
 ### Removed

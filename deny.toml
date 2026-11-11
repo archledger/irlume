@@ -38,23 +38,16 @@ allow = ["CDLA-Permissive-2.0"]
 
 [advisories]
 version = 2
-# Every entry carries its rationale in the comment above it, and a tracking
-# issue: scripts/generate-vex.py maps that comment to an OpenVEX
-# justification and refuses unmapped wording. The three zip 8.6.0 build
+# Empty on purpose. Any future entry must carry its rationale in the comment
+# above it, and a tracking issue: scripts/generate-vex.py maps that comment
+# to an OpenVEX justification and refuses unmapped wording. The rsa
+# exception (RUSTSEC-2023-0071, #1112) was dropped when rsa moved to 0.10.0,
+# the first release the advisory lists as patched. The three zip 8.6.0 build
 # dependency exceptions (RUSTSEC-2026-0367/0368/0369, #1103) were dropped
 # when edgefirst-tflite/-sys were pinned to the upstream zip-9 revision;
 # the graph guard in crates/irlume-vision/src/lib.rs keeps both lockfiles
 # on zip >= 9.0.5 so these cannot silently become applicable again.
-ignore = [
-    # rsa (the Marvin attack): a timing side channel in operations with an RSA
-    # private key, unpatched in every release. irlume-core's EK certificate
-    # verifier (crates/irlume-core/src/ek_cert.rs, ADR-0036) uses rsa for
-    # public-key verification and encryption only: irlume holds no RSA
-    # private key and makes no private-key operations, so the vulnerable code
-    # is not reached. The PCR signing key in tpm.rs is still parsed with
-    # der/spki alone. Drop this with #1112.
-    "RUSTSEC-2023-0071",
-]
+ignore = []
 
 [bans]
 # Duplicate crate versions cost compile time and binary size but are not errors.

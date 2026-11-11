@@ -6436,6 +6436,658 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// How often a [`Counted`] TPM was asked to prove the original key by a
+    /// fresh derivation of its template, and to evict it.
+    #[derive(Default)]
+    struct RetirementCalls {
+        proofs: std::cell::Cell<usize>,
+        evictions: std::cell::Cell<usize>,
+    }
+
+    impl RetirementCalls {
+        /// The proofs and evictions asked for so far.
+        fn get(&self) -> (usize, usize) {
+            (self.proofs.get(), self.evictions.get())
+        }
+    }
+
+    /// [`DaExemptKeyTpm`] on swtpm, every call passed through, counting the
+    /// proofs of the original key and its evictions in `calls`: a proof's
+    /// derivation is transient, so the TPM keeps nothing of it to read back.
+    struct Counted<'a> {
+        tpm: DaExemptKeyTpm,
+        calls: &'a RetirementCalls,
+    }
+
+    impl<'a> Counted<'a> {
+        fn open(calls: &'a RetirementCalls) -> Result<Self> {
+            Ok(Self {
+                tpm: DaExemptKeyTpm::open()?,
+                calls,
+            })
+        }
+    }
+
+    impl storage_key::KeyTpm for Counted<'_> {
+        fn name_at(&mut self, handle: u32) -> Result<Option<Vec<u8>>> {
+            storage_key::KeyTpm::name_at(&mut self.tpm, handle)
+        }
+        fn persistent_avail(&mut self) -> Result<u32> {
+            storage_key::KeyTpm::persistent_avail(&mut self.tpm)
+        }
+        fn derive(&mut self) -> std::result::Result<Vec<u8>, storage_key::Failure> {
+            storage_key::KeyTpm::derive(&mut self.tpm)
+        }
+        fn owner_names(&mut self) -> Result<Vec<(u32, Vec<u8>)>> {
+            storage_key::KeyTpm::owner_names(&mut self.tpm)
+        }
+        fn persist(&mut self, handle: u32) -> std::result::Result<(), storage_key::Failure> {
+            storage_key::KeyTpm::persist(&mut self.tpm, handle)
+        }
+        fn derives_original(&mut self, handle: u32) -> Result<Option<bool>> {
+            self.calls.proofs.set(self.calls.proofs.get() + 1);
+            storage_key::KeyTpm::derives_original(&mut self.tpm, handle)
+        }
+        fn evict(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+            self.calls.evictions.set(self.calls.evictions.get() + 1);
+            storage_key::KeyTpm::evict(&mut self.tpm, handle, name)
+        }
+        fn holds_da_exempt_key(&mut self, handle: u32, name: &[u8]) -> Result<bool> {
+            storage_key::KeyTpm::holds_da_exempt_key(&mut self.tpm, handle, name)
+        }
+        fn is_weak(&mut self, handle: u32) -> Result<bool> {
+            storage_key::KeyTpm::is_weak(&mut self.tpm, handle)
+        }
+        fn derived_is_weak(&mut self) -> Result<bool> {
+            storage_key::KeyTpm::derived_is_weak(&mut self.tpm)
+        }
+        fn firmware(&mut self) -> Result<[u32; 2]> {
+            storage_key::KeyTpm::firmware(&mut self.tpm)
+        }
+    }
+
+    /// Writes `record` as `storage_key`'s own writer, `save_record`, which is
+    /// private to that module, does: pretty JSON through
+    /// `irlume_common::write_0600_atomic` at `state_dir()/tpm-storage-key`.
+    /// [`RetirementDue::check`] checks that it gives the bytes that writer
+    /// wrote at the start in boot A.
+    fn write_record(record: &storage_key::Record) -> Result<()> {
+        let bytes =
+            serde_json::to_vec_pretty(record).map_err(|e| Error::Protocol(e.to_string()))?;
+        irlume_common::write_0600_atomic(
+            &irlume_common::state_dir().join("tpm-storage-key"),
+            &bytes,
+        )
+        .map_err(|e| Error::Io(e.to_string()))
+    }
+
+    /// What [`retirement_due`] did, for [`RetirementDue::check`] once the
+    /// test has put the swtpm back.
+    struct RetirementDue {
+        persisted: Result<(Option<storage_key::Outcome>, bool)>,
+        template_moved: Result<Option<MoveGain>>,
+        password_moved: Result<crate::keyring::Reseal>,
+        recorded: Result<(Option<storage_key::Outcome>, bool)>,
+        marked: Result<Option<storage_key::Settled>>,
+        /// The record as the start in boot A wrote it.
+        written: Vec<u8>,
+    }
+
+    /// With `alice`'s template key sealed under the original key, and her
+    /// login password `password` sealed under it here: the start-up step
+    /// persists the DA-exempt key, both move onto it at their move points
+    /// (irlumed's start, a login's reseal), the next start records the
+    /// original key's name as matching today's derivation, and a start in
+    /// boot A marks the key unused, so the first start in a later boot
+    /// retires it.
+    fn retirement_due(password: &[u8]) -> RetirementDue {
+        crate::keyring::seal_password("alice", password).expect("arm the password");
+        let persisted = storage_key::ensure_at_start_reporting();
+        let template_moved = crate::template_key::move_to_stronger_policy("alice");
+        let password_moved = crate::keyring::reseal_password("alice", password, None);
+        let recorded = storage_key::ensure_at_start_reporting();
+        let marked = storage_key::settle_at_start_in(Some(BOOT_A), false);
+        let written =
+            std::fs::read(irlume_common::state_dir().join("tpm-storage-key")).unwrap_or_default();
+        RetirementDue {
+            persisted,
+            template_moved,
+            password_moved,
+            recorded,
+            marked,
+            written,
+        }
+    }
+
+    impl RetirementDue {
+        /// Asserts that each step went as [`retirement_due`] says, with the
+        /// DA-exempt key persisted at `preferred`.
+        fn check(self, preferred: u32) {
+            assert!(
+                matches!(
+                    self.persisted.expect("the step"),
+                    (Some(storage_key::Outcome::Persisted { handle }), true) if handle == preferred
+                ),
+                "the DA-exempt key is persisted"
+            );
+            assert_eq!(
+                self.template_moved.expect("the move"),
+                Some(MoveGain::DaExemptKey)
+            );
+            assert_eq!(
+                self.password_moved.expect("the reseal"),
+                crate::keyring::Reseal::MovedToDaExemptKey
+            );
+            assert!(
+                matches!(
+                    self.recorded.expect("the step"),
+                    (Some(storage_key::Outcome::Present { .. }), true)
+                ),
+                "the start that records the original key derived it"
+            );
+            let marked = self.marked.expect("the step").expect("recorded");
+            assert_eq!(
+                marked.census,
+                storage_key::Census::Unused {
+                    since: BOOT_A.into()
+                }
+            );
+            assert_eq!(marked.retirement, None, "marked in boot A");
+            let parsed: storage_key::Record =
+                serde_json::from_slice(&self.written).expect("the record boot A wrote");
+            assert!(
+                serde_json::to_vec_pretty(&parsed).expect("json") == self.written,
+                "write_record gives the bytes the start's own writer gave"
+            );
+        }
+    }
+
+    /// The error the save closure of the test below returns once it has
+    /// written a record that holds the attempt.
+    const RETURNED_AFTER_THE_ATTEMPT: &str = "the test's save returns here, after the attempt";
+
+    /// ADR-0034, Phase 3 amendment, on swtpm with fake boot IDs: recovery
+    /// from a record that holds a retirement attempt of boot B with no
+    /// failure while the original key is still at its handle, the state a
+    /// retirement leaves once its attempt is saved and before its proof
+    /// derives anything. The retirement itself builds it on swtpm, through
+    /// `settle_in` with a save closure that writes each record as the start
+    /// does and returns an error once one holds the attempt, so the
+    /// retirement returns there. This is the recorded state on a real TPM,
+    /// not a process kill or a power loss. A restart in boot B runs the
+    /// start-up step, is deferred, and asks for no proof and no eviction.
+    /// The first start in boot C, after the start-up step, which keeps the
+    /// attempt, tries the whole retirement again: one proof, one eviction,
+    /// and the attempt cleared, which leaves the record as the start in boot
+    /// A wrote it. The template key and the login password moved onto the
+    /// DA-exempt key still unseal.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_retirement_attempt_left_recorded_before_its_proof_is_retried_in_a_later_boot() {
+        use crate::storage_key::{
+            ensure_at_start_reporting, settle_in, unhex, Census, Outcome, Retirement,
+        };
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retire-attempt-before-proof");
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4172);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        // A record that cannot be read or parsed is `Null` here, so it fails
+        // an assertion only after the cleanup below.
+        let record = || -> serde_json::Value {
+            std::fs::read(&record_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .unwrap_or_default()
+        };
+        let due = retirement_due(b"alice-password");
+        let marked = record();
+
+        // Boot B: each record is written, and the save returns an error once
+        // the one it wrote holds the attempt, so the retirement returns there.
+        let calls = RetirementCalls::default();
+        let mut saved = Vec::new();
+        let returned = settle_in(
+            Some(BOOT_B),
+            false,
+            || Counted::open(&calls),
+            |next| {
+                write_record(next)?;
+                let next = serde_json::to_value(next).expect("json");
+                let attempt = next.get("retirement_attempt").is_some();
+                saved.push(next);
+                if attempt {
+                    Err(Error::Io(RETURNED_AFTER_THE_ATTEMPT.into()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let left = record();
+        let recorded_name = left["original"]["name"].as_str().and_then(unhex);
+        let at_handle = name_at_handle(original);
+        let calls_in_b = calls.get();
+        // A restart in boot B, in irlumed's order: the start-up step, then
+        // the census and the retirement, told what the step derived
+        // (irlumed's repoint and template-key moves between them are not
+        // run).
+        let ensured_on_restart = ensure_at_start_reporting();
+        let derived_on_restart = ensured_on_restart
+            .as_ref()
+            .map_or(true, |(_, derived)| *derived);
+        let restart = settle_in(
+            Some(BOOT_B),
+            derived_on_restart,
+            || Counted::open(&calls),
+            write_record,
+        );
+        let after_restart = (record(), name_at_handle(original), calls.get());
+        // The first start in boot C, in irlumed's order: the start-up step,
+        // then the census and the retirement, told what the step derived
+        // (irlumed's repoint and template-key moves between them are not
+        // run).
+        let ensured = ensure_at_start_reporting();
+        let before_retry = record();
+        let derived = ensured.as_ref().map_or(true, |(_, derived)| *derived);
+        let mut saved_in_c = Vec::new();
+        let retried = settle_in(
+            Some(BOOT_C),
+            derived,
+            || Counted::open(&calls),
+            |next| {
+                saved_in_c.push(serde_json::to_value(next).expect("json"));
+                write_record(next)
+            },
+        );
+        let cleared = record();
+        let template_key = crate::template_key::load_key("alice");
+        let password = crate::keyring::unseal_password("alice");
+        let after_retry = handles();
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        due.check(PREFERRED);
+        let settled = |settled: Result<Option<crate::storage_key::Settled>>| {
+            settled.expect("the step").expect("recorded")
+        };
+        let unused_since_a = Census::Unused {
+            since: BOOT_A.into(),
+        };
+        // The state before any recovery.
+        let returned = settled(returned);
+        assert_eq!(returned.census, unused_since_a);
+        assert!(
+            matches!(
+                &returned.retirement,
+                Some(Retirement::Unchecked { detail }) if detail.contains(RETURNED_AFTER_THE_ATTEMPT)
+            ),
+            "the retirement returned at the attempt's save: {:?}",
+            returned.retirement
+        );
+        assert_eq!(saved.len(), 1, "the attempt was the only record written");
+        let attempt_b = serde_json::json!({ "boot_id": BOOT_B });
+        assert_eq!(saved[0]["retirement_attempt"], attempt_b);
+        assert_eq!(
+            left["retirement_attempt"], attempt_b,
+            "the attempt is on disk with no failure"
+        );
+        let mut without_attempt = left.clone();
+        without_attempt
+            .as_object_mut()
+            .expect("an object")
+            .remove("retirement_attempt");
+        assert_eq!(
+            without_attempt, marked,
+            "nothing else in the record changed"
+        );
+        assert_eq!(left["original"]["matched"], serde_json::json!(true));
+        assert!(
+            at_handle.is_some() && at_handle == recorded_name,
+            "the original key the record names is still at its handle"
+        );
+        assert_eq!(calls_in_b, (0, 0), "no proof and no eviction");
+        // A restart in boot B.
+        assert!(
+            matches!(
+                ensured_on_restart.expect("the step"),
+                (Some(Outcome::Present { handle }), false) if handle == PREFERRED
+            ),
+            "the start-up step finds the DA-exempt key and derives nothing"
+        );
+        let restart = settled(restart).retirement;
+        assert!(
+            matches!(
+                &restart,
+                Some(Retirement::Deferred { handle, detail })
+                    if *handle == original && detail.contains("did not finish")
+            ),
+            "{restart:?}"
+        );
+        assert_eq!(
+            after_restart,
+            (left, recorded_name, (0, 0)),
+            "a restart in the same boot changes nothing and asks for no proof and no eviction"
+        );
+        // The first start in boot C.
+        assert!(
+            matches!(
+                ensured.expect("the step"),
+                (Some(Outcome::Present { handle }), false) if handle == PREFERRED
+            ),
+            "the start-up step finds the DA-exempt key and derives nothing"
+        );
+        assert_eq!(
+            before_retry["retirement_attempt"], attempt_b,
+            "the start-up step keeps the attempt"
+        );
+        let retried = settled(retried);
+        assert_eq!(retried.census, unused_since_a);
+        assert_eq!(
+            retried.retirement,
+            Some(Retirement::Retired { handle: original })
+        );
+        assert_eq!(calls.get(), (1, 1), "one proof and one eviction");
+        assert_eq!(saved_in_c.len(), 2, "{saved_in_c:?}");
+        assert_eq!(
+            saved_in_c[0]["retirement_attempt"],
+            serde_json::json!({ "boot_id": BOOT_C }),
+            "the retry records its own attempt first"
+        );
+        assert_eq!(
+            saved_in_c[1], marked,
+            "the retry's second save writes the record as the start in boot A wrote it"
+        );
+        assert_eq!(
+            cleared, marked,
+            "the retry leaves the record as the start in boot A wrote it"
+        );
+        assert!(
+            !after_retry.contains(&original) && after_retry.contains(&PREFERRED),
+            "the original key is evicted and the DA-exempt key stays: {after_retry:x?}"
+        );
+        assert!(
+            template_key.expect("the key").as_slice() == key.as_slice(),
+            "the template key unseals through the DA-exempt key"
+        );
+        assert!(
+            password.expect("unseal").as_slice() == b"alice-password",
+            "the login password unseals through the DA-exempt key"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// The error the save closure of the test below returns, writing
+    /// nothing, for the save that clears the attempt.
+    const CLEAR_REFUSED: &str = "the test's save refuses the write that clears the attempt";
+
+    /// ADR-0034, Phase 3 amendment, on swtpm with fake boot IDs: recovery
+    /// from a record that still holds the retirement attempt of boot B
+    /// while the original key's handle is empty, the state a retirement
+    /// leaves once its eviction succeeded and before the save that clears
+    /// the attempt. The retirement itself builds it on swtpm, through
+    /// `settle_in`: its proof and eviction run, and the save closure writes
+    /// the attempt and then refuses the save that clears it, which the
+    /// retirement ignores. This is the recorded state on a real TPM, not a
+    /// process kill or a power loss. A restart in boot B and, with the
+    /// record the retirement left written back, the first start in boot C
+    /// each run the start-up step, which keeps the attempt, find the handle
+    /// empty and drop the attempt, asking for no proof and no eviction, and
+    /// write the record the refused save would have. The template key and
+    /// the login password moved onto the DA-exempt key still unseal.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_retirement_attempt_left_recorded_after_its_eviction_is_dropped_at_the_next_start() {
+        use crate::storage_key::{
+            ensure_at_start_reporting, settle_in, Census, Outcome, Retirement,
+        };
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("retire-attempt-after-eviction");
+        let _prediction = PredictionFixture::new();
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4173);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let record_path = format!("{}/tpm-storage-key", dirs.dir);
+        // A record that cannot be read or parsed is `Null` here, so it fails
+        // an assertion only after the cleanup below.
+        let record = || -> serde_json::Value {
+            std::fs::read(&record_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .unwrap_or_default()
+        };
+        let due = retirement_due(b"alice-password");
+
+        // Boot B: each record is written, except the one that clears the
+        // attempt after a record holding it was written.
+        let calls_in_b = RetirementCalls::default();
+        let mut saved = Vec::new();
+        let evicted = settle_in(
+            Some(BOOT_B),
+            false,
+            || Counted::open(&calls_in_b),
+            |next| {
+                let value = serde_json::to_value(next).expect("json");
+                let clears = value.get("retirement_attempt").is_none()
+                    && saved
+                        .iter()
+                        .any(|s: &serde_json::Value| s.get("retirement_attempt").is_some());
+                saved.push(value);
+                if clears {
+                    Err(Error::Io(CLEAR_REFUSED.into()))
+                } else {
+                    write_record(next)
+                }
+            },
+        );
+        let left = record();
+        let left_bytes = std::fs::read(&record_path).unwrap_or_default();
+        let at_handle = name_at_handle(original);
+        let left_handles = handles();
+        // A restart in boot B, in irlumed's order: the start-up step, then
+        // the census and the retirement, told what the step derived
+        // (irlumed's repoint and template-key moves between them are not
+        // run).
+        let ensured_on_restart = ensure_at_start_reporting();
+        let derived_on_restart = ensured_on_restart
+            .as_ref()
+            .map_or(true, |(_, derived)| *derived);
+        let calls_on_restart = RetirementCalls::default();
+        let mut saved_on_restart = Vec::new();
+        let restarted = settle_in(
+            Some(BOOT_B),
+            derived_on_restart,
+            || Counted::open(&calls_on_restart),
+            |next| {
+                saved_on_restart.push(serde_json::to_value(next).expect("json"));
+                write_record(next)
+            },
+        );
+        let handles_on_restart = handles();
+        // The restart changed no handle and asked for no proof and no
+        // eviction (asserted below), so writing back the record the
+        // retirement left gives the first start in boot C the state the
+        // restart found.
+        let left_put_back = std::fs::write(&record_path, &left_bytes);
+        // The first start in boot C, in irlumed's order: the start-up step,
+        // then the census and the retirement, told what the step derived
+        // (irlumed's repoint and template-key moves between them are not
+        // run).
+        let ensured = ensure_at_start_reporting();
+        let before_drop = record();
+        let derived = ensured.as_ref().map_or(true, |(_, derived)| *derived);
+        let calls_in_c = RetirementCalls::default();
+        let mut saved_in_c = Vec::new();
+        let dropped = settle_in(
+            Some(BOOT_C),
+            derived,
+            || Counted::open(&calls_in_c),
+            |next| {
+                saved_in_c.push(serde_json::to_value(next).expect("json"));
+                write_record(next)
+            },
+        );
+        let cleared = record();
+        let template_key = crate::template_key::load_key("alice");
+        let password = crate::keyring::unseal_password("alice");
+        let after_drop = handles();
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        due.check(PREFERRED);
+        let settled = |settled: Result<Option<crate::storage_key::Settled>>| {
+            settled.expect("the step").expect("recorded")
+        };
+        let unused_since_a = Census::Unused {
+            since: BOOT_A.into(),
+        };
+        // The state before any recovery.
+        let evicted = settled(evicted);
+        assert_eq!(evicted.census, unused_since_a);
+        assert_eq!(
+            evicted.retirement,
+            Some(Retirement::Retired { handle: original }),
+            "retired whatever the clearing save did"
+        );
+        assert_eq!(calls_in_b.get(), (1, 1), "the real proof and eviction ran");
+        let attempt_b = serde_json::json!({ "boot_id": BOOT_B });
+        assert_eq!(saved.len(), 2, "{saved:?}");
+        assert_eq!(saved[0]["retirement_attempt"], attempt_b);
+        assert!(
+            saved[1].get("retirement_attempt").is_none(),
+            "the refused save would have cleared the attempt"
+        );
+        assert_eq!(
+            left, saved[0],
+            "the record on disk is the attempt's, with no failure"
+        );
+        assert_eq!(at_handle, None, "the original key's handle is empty");
+        assert!(
+            !left_handles.contains(&original) && left_handles.contains(&PREFERRED),
+            "{left_handles:x?}"
+        );
+        // A restart in boot B.
+        assert!(
+            matches!(
+                ensured_on_restart.expect("the step"),
+                (Some(Outcome::Present { handle }), false) if handle == PREFERRED
+            ),
+            "the start-up step finds the DA-exempt key and derives nothing"
+        );
+        let restarted = settled(restarted);
+        assert_eq!(restarted.census, unused_since_a);
+        assert_eq!(
+            restarted.retirement, None,
+            "a restart in the same boot finds the handle empty"
+        );
+        assert_eq!(
+            calls_on_restart.get(),
+            (0, 0),
+            "no proof and no eviction at a restart"
+        );
+        assert_eq!(
+            saved_on_restart,
+            vec![saved[1].clone()],
+            "a restart writes the record the refused save would have"
+        );
+        assert_eq!(
+            handles_on_restart, left_handles,
+            "a restart changes no handle"
+        );
+        assert!(
+            left_put_back.is_ok() && !left_bytes.is_empty(),
+            "the record the retirement left is back for boot C"
+        );
+        // The first start in boot C.
+        assert!(
+            matches!(
+                ensured.expect("the step"),
+                (Some(Outcome::Present { handle }), false) if handle == PREFERRED
+            ),
+            "the start-up step finds the DA-exempt key and derives nothing"
+        );
+        assert_eq!(
+            before_drop["retirement_attempt"], attempt_b,
+            "the start-up step keeps the attempt"
+        );
+        let dropped = settled(dropped);
+        assert_eq!(dropped.census, unused_since_a);
+        assert_eq!(dropped.retirement, None, "nothing left to retire");
+        assert_eq!(
+            calls_in_c.get(),
+            (0, 0),
+            "no proof and no eviction once the handle is empty"
+        );
+        assert_eq!(
+            saved_in_c,
+            vec![saved[1].clone()],
+            "the start in boot C writes the record the refused save would have"
+        );
+        assert_eq!(cleared, saved[1], "the stale attempt is dropped");
+        assert!(
+            !after_drop.contains(&original) && after_drop.contains(&PREFERRED),
+            "{after_drop:x?}"
+        );
+        assert!(
+            template_key.expect("the key").as_slice() == key.as_slice(),
+            "the template key unseals through the DA-exempt key"
+        );
+        assert!(
+            password.expect("unseal").as_slice() == b"alice-password",
+            "the login password unseals through the DA-exempt key"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
     /// ADR-0034, Phase 3 amendment (#1073 item 2), on swtpm: a recorded
     /// DA-exempt key with the ROCA fingerprint (a key with the DA-exempt
     /// template's shape and another modulus, which the test names weak,

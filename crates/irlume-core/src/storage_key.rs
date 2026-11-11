@@ -3609,8 +3609,9 @@ mod tests {
     /// not here. Not a crash or power-loss test: nothing is lost or rolled
     /// back here, and the keyring directory's `fsync(2)` never runs.
     ///
-    /// Skipped, with a message, where the process opens the directory anyway
-    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH).
+    /// Fails, with a message, where the process opens the directory anyway
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass there would say
+    /// this case ran when it did not.
     #[test]
     fn a_move_whose_real_envelope_write_is_not_durable_keeps_its_entry() {
         let _env = crate::testenv::ENV_LOCK
@@ -3632,12 +3633,11 @@ mod tests {
         if std::fs::File::open(&keyring_dir).is_ok() {
             drop(unreadable);
             drop(sandbox);
-            eprintln!(
-                "skipping: this process opens a directory without read permission (root, \
+            panic!(
+                "this process opens a directory without read permission (root, \
                  CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
-                 be made to fail here"
+                 be made to fail here: run the tests as an unprivileged user"
             );
-            return;
         }
         let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
         let after = entries();
@@ -3681,8 +3681,9 @@ mod tests {
     /// nothing is lost or rolled back here, and the state directory's
     /// `fsync(2)` never runs during the move.
     ///
-    /// Skipped, with a message, where the process opens the directory anyway
-    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH).
+    /// Fails, with a message, where the process opens the directory anyway
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass there would say
+    /// this case ran when it did not.
     #[test]
     fn a_move_whose_real_record_write_is_not_durable_publishes_no_envelope() {
         let _env = crate::testenv::ENV_LOCK
@@ -3705,12 +3706,11 @@ mod tests {
         if std::fs::File::open(&state_dir).is_ok() {
             drop(unreadable);
             drop(sandbox);
-            eprintln!(
-                "skipping: this process opens a directory without read permission (root, \
+            panic!(
+                "this process opens a directory without read permission (root, \
                  CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
-                 be made to fail here"
+                 be made to fail here: run the tests as an unprivileged user"
             );
-            return;
         }
         let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
         let bob_unchanged = std::fs::read(&bob).unwrap() == before;

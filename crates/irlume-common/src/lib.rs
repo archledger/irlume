@@ -479,7 +479,7 @@ pub enum AtomicWrite {
     /// created, synced and renamed in, and then the `open(2)` of the directory
     /// for its sync fails with EACCES, so this arm is reached after a real
     /// rename, with the new content readable under the target name. That test
-    /// skips where read permission does not bind (root, CAP_DAC_OVERRIDE,
+    /// fails where read permission does not bind (root, CAP_DAC_OVERRIDE,
     /// CAP_DAC_READ_SEARCH). NOT COVERED: a directory `fsync(2)` that runs and
     /// fails, such as an I/O error from the device, which needs filesystem
     /// fault injection; whether that `fsync(2)` runs at all, since a writer
@@ -3609,9 +3609,10 @@ mod tests {
     /// directory sync step; it is not a crash or power-loss test, and while
     /// the directory is at 0300 its `fsync(2)` never runs.
     ///
-    /// Skipped, with a message, where the process opens the directory anyway
+    /// Fails, with a message, where the process opens the directory anyway
     /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): there the failure cannot
-    /// be provoked, and asserting `Durable` instead would test nothing.
+    /// be provoked, and a pass would say this arm ran when it did not. The
+    /// suite runs as an unprivileged user in every lane.
     #[cfg(unix)]
     #[test]
     fn a_write_into_a_directory_without_read_permission_is_visible_not_durable() {
@@ -3647,12 +3648,11 @@ mod tests {
         if std::fs::File::open(&dir).is_ok() {
             drop(unreadable);
             let _ = std::fs::remove_dir_all(&dir);
-            eprintln!(
-                "skipping: this process opens a directory without read permission (root, \
+            panic!(
+                "this process opens a directory without read permission (root, \
                  CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
-                 be made to fail here"
+                 be made to fail here: run the tests as an unprivileged user"
             );
-            return;
         }
         let error = match super::write_atomic_reporting(&path, b"new", 0o600).expect("published") {
             super::AtomicWrite::VisibleNotDurable(e) => e,

@@ -412,56 +412,97 @@ fn pamtester_available() -> bool {
         .is_ok()
 }
 
-/// The cdylib cargo built for this test run. `cargo test -p irlume-pam` builds
-/// the lib target (producing libpam_irlume.so) alongside this test binary, so
-/// the authoritative location is THIS executable's own artifact dir: that is
-/// what keeps a `cargo llvm-cov` run loading the instrumented .so from
-/// target/llvm-cov-target instead of a stale plain-target build (the test
-/// process does not see CARGO_TARGET_DIR, so env-based resolution picks the
-/// wrong tree there). Fallbacks cover direct `cargo build` layouts.
+/// The module to load: `libpam_irlume.so` as cargo built it for this run.
+///
+/// Cargo up to 1.99 builds the library beside this test executable. That file
+/// is taken first, which also keeps a `cargo llvm-cov` run on the
+/// instrumented module in its own target directory. Cargo 1.100 builds every
+/// unit in its own directory (`build/<package>/<hash>/out`) and says to read
+/// its JSON messages rather than that layout, so there cargo names the file.
+/// Nothing else is tried: a module that an earlier `cargo build` left in the
+/// target directory may come from other sources.
 fn built_module() -> PathBuf {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        // <target>/<profile>/deps/pamwrap-<hash> → the cdylib sits in the same
-        // deps dir (unhashed name), or uplifted one level up by `cargo build`.
-        if let Some(deps) = exe.parent() {
-            candidates.push(deps.to_path_buf());
-            if let Some(profile_dir) = deps.parent() {
-                candidates.push(profile_dir.to_path_buf());
+    static MODULE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    MODULE
+        .get_or_init(|| {
+            let beside = std::env::current_exe()
+                .ok()
+                .and_then(|exe| Some(exe.parent()?.join("libpam_irlume.so")));
+            match beside {
+                Some(module) if module.is_file() => module,
+                _ => cargo_cdylib(env!("CARGO_PKG_NAME"), "pam_irlume"),
             }
-        }
-    }
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
+        })
+        .clone()
+}
+
+/// The file cargo names for `package`'s cdylib: the `.so` in the
+/// `compiler-artifact` message of a build of that library alone, read the way
+/// the ASan lane reads it (`.github/workflows/asan.yml`). The build uses this
+/// test's target directory and profile. It reuses the library this run built
+/// when both builds select the same features, and builds it again from the
+/// same sources when they do not. A run with `--target` names no profile this
+/// way and stops with cargo's message.
+/// `crates/irlume-cli/tests/lightdm_enforce.rs` has the same function.
+fn cargo_cdylib(package: &str, library: &str) -> PathBuf {
+    let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("cargo's directory for test data is inside the target directory");
+    // `<target>/debug` belongs to the dev profile; every other profile's
+    // directory has the profile's name.
+    let exe = std::env::current_exe().expect("this test executable's path");
+    let profile = match exe
+        .strip_prefix(target_dir)
+        .ok()
+        .and_then(|below| below.components().next())
+    {
+        Some(first) if first.as_os_str() == "debug" => "dev".to_owned(),
+        Some(first) => first.as_os_str().to_string_lossy().into_owned(),
+        None if cfg!(debug_assertions) => "dev".to_owned(),
+        None => "release".to_owned(),
     };
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        let dir = PathBuf::from(dir);
-        // A relative CARGO_TARGET_DIR is relative to where cargo was invoked,
-        // which for this workspace is its root.
-        let dir = if dir.is_absolute() {
-            dir
-        } else {
-            workspace.join(dir)
-        };
-        candidates.push(dir.join(profile).join("deps"));
-        candidates.push(dir.join(profile));
-    }
-    candidates.push(workspace.join("target").join(profile).join("deps"));
-    candidates.push(workspace.join("target").join(profile));
-    for dir in &candidates {
-        let so = dir.join("libpam_irlume.so");
-        if so.exists() {
-            return so;
-        }
-    }
-    panic!(
-        "libpam_irlume.so not found under {candidates:?}; \
-         `cargo test -p irlume-pam` builds it, so this points at a target-dir \
-         resolution bug in this harness"
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .args(["build", "--lib", "--message-format=json"])
+        .args(["--package", package, "--profile", &profile, "--target-dir"])
+        .arg(target_dir)
+        // The workspace root, where cargo was started for this run.
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .output()
+        .expect("run cargo to find the built library");
+    assert!(
+        output.status.success(),
+        "cargo could not build {package}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let mut found = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let target = &message["target"];
+        let is_cdylib = target["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "cdylib"));
+        if message["reason"] != "compiler-artifact" || target["name"] != library || !is_cdylib {
+            continue;
+        }
+        found.extend(
+            message["filenames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|name| name.ends_with(".so"))
+                .map(PathBuf::from),
+        );
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "cargo named {found:?} as the cdylib of {package}"
+    );
+    found.remove(0)
 }
 
 // ------------------------------------------------------------- fake daemon

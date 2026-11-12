@@ -153,13 +153,18 @@ pub(super) mod shared_greeter {
             .map(PathBuf::from)
             .find(|path| path.is_file())
             .expect("install pam_wrapper for this explicitly requested integration test");
-            let exe = std::env::current_exe().unwrap();
-            let deps = exe.parent().unwrap();
+            // Beside this executable when cargo up to 1.99 built irlume-pam
+            // in the same run; otherwise in the profile directory, where
+            // `cargo build -p irlume-pam` puts it under either layout.
             let module = [
-                deps.join("libpam_irlume.so"),
-                deps.parent().unwrap().join("libpam_irlume.so"),
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| Some(exe.parent()?.to_path_buf())),
+                crate::test_support::profile_dir(),
             ]
             .into_iter()
+            .flatten()
+            .map(|dir| dir.join("libpam_irlume.so"))
             .find(|path| path.is_file())
             .expect("build irlume-pam with the same toolchain/target directory first");
             let source = root.join("driver.c");

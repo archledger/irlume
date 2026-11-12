@@ -497,20 +497,19 @@ pub(crate) mod tests {
         let _g = crate::test_support::env_read();
         let fixture = Fixture::new();
         let exe = std::env::current_exe().unwrap();
-        // Instrumented Cargo builds can place this test outside debug/deps.
-        // Their runner supplies the CLI's compiler-artifact executable receipt.
-        // Keep the ordinary stable workspace build usable without an override.
+        // A lane that builds with its own toolchain, target or flags names
+        // the CLI it built through IRLUME_TEST_CLI. An ordinary workspace
+        // build needs no override: cargo puts the CLI in the profile
+        // directory.
         let cli = match std::env::var_os("IRLUME_TEST_CLI") {
             Some(path) => PathBuf::from(path),
-            None => {
-                let deps = exe.parent().unwrap();
-                assert_eq!(
-                    deps.file_name().unwrap(),
-                    "deps",
-                    "pass IRLUME_TEST_CLI from Cargo's compiler-artifact executable receipt"
-                );
-                deps.parent().unwrap().join("irlume")
-            }
+            None => crate::test_support::profile_dir()
+                .expect(
+                    "this test executable is outside cargo's profile directory (a separate \
+                     build.build-dir?): pass IRLUME_TEST_CLI from Cargo's compiler-artifact \
+                     executable receipt",
+                )
+                .join("irlume"),
         };
         assert!(
             cli.is_file(),

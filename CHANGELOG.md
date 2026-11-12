@@ -7,6 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The camera-busy texts for a camera only irlume holds, and irlumed's
+  journal lines for a caught panic, point to `irlume support-report`
+  instead of `irlume doctor` output or a backtrace that release builds
+  do not print. The new camera wording also shows in the stream checks'
+  `detail` in `irlume doctor --json`, in `irlume camera census --json`
+  evidence and on the System Settings module's Diagnostics and Cameras
+  pages; both JSON values are text for people, not for matching, and no
+  JSON shape changes. The panic lines ask for the file
+  `irlume support-report` writes and, only if asked, the 'panicked at'
+  line without its date, host name or home folder (#1329).
+
 - A failed `scripts/install.sh` run, whichever step failed, ends with
   where to report a problem, the private route first. A missing or
   failed signature, a key that cannot be imported and a checksum

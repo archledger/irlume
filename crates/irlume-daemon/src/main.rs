@@ -595,6 +595,20 @@ fn carry_camera_pair(
     fresh
 }
 
+/// The journal line for a panic caught in the worker's background camera
+/// work. Release builds print no backtrace, so the line asks for the
+/// support report, and for the 'panicked at' line only if asked (#1329).
+const BACKGROUND_PANIC_LINE: &str = "irlumed: background camera work PANICKED and was abandoned. \
+     This is an irlume bug: please report it with the file `irlume support-report` writes; if \
+     asked, add the 'panicked at' line above without its date, host name or home folder.";
+
+/// The journal line for a panic caught in a request handler: what happened
+/// to the request, then the same ask as `BACKGROUND_PANIC_LINE`.
+const HANDLER_PANIC_LINE: &str = "irlumed: request handler PANICKED; this request was denied \
+     (PAM falls back to the password). Rebuilding the engine for a clean state. This is an \
+     irlume bug: please report it with the file `irlume support-report` writes; if asked, add \
+     the 'panicked at' line above without its date, host name or home folder.";
+
 /// What irlumed's start found about the original storage key's use.
 fn log_census(census: &irlume_core::storage_key::Census) {
     use irlume_core::storage_key::Census;
@@ -1366,10 +1380,7 @@ fn main() {
                                     }))
                                     .is_err()
                                     {
-                                        jout_err!(
-                                            "irlumed: background camera work PANICKED and was \
-                                             abandoned; please report this with the backtrace above"
-                                        );
+                                        jout_err!("{BACKGROUND_PANIC_LINE}");
                                     }
                                     arbiter.finish(arbiter::Class::Camera, 0);
                                     note_worker_idle();
@@ -1460,11 +1471,7 @@ fn main() {
                                 Ok(resp) => resp,
                                 Err(_) => {
                                     diagnostic_state.live().set_stage(irlume_common::live::LiveStage::Rebuilding);
-                                    jout_err!(
-                                        "irlumed: request handler PANICKED; this request was denied \
-                                         (PAM falls back to the password). Rebuilding the engine for a \
-                                         clean state; please report this with the backtrace above."
-                                    );
+                                    jout_err!("{HANDLER_PANIC_LINE}");
                                     // AssertUnwindSafe only silences the compiler, it
                                     // does not prove the ONNX sessions are in a
                                     // supported state after an unwind, so a fresh engine
@@ -12846,6 +12853,53 @@ mod tests {
             .expect("the rebuild must carry the old engine's camera pair");
         assert!(carried < rebuild.find("WorkerEngine::attach(fresh").unwrap());
         assert!(carried < rebuild.find("publish_engine_bits").unwrap());
+    }
+
+    /// A caught panic's journal lines ask for the support report and, only
+    /// if asked, the 'panicked at' line, since release builds print no
+    /// backtrace (#1329). Each line is printed by exactly one call site, in
+    /// its own handler.
+    #[test]
+    fn panic_lines_ask_for_the_support_report_not_a_backtrace() {
+        let ask = "This is an irlume bug: please report it with the file \
+             `irlume support-report` writes; if asked, add the 'panicked at' line \
+             above without its date, host name or home folder.";
+        for line in [BACKGROUND_PANIC_LINE, HANDLER_PANIC_LINE] {
+            assert!(line.starts_with("irlumed: "), "{line}");
+            assert!(line.contains("PANICKED"), "{line}");
+            assert!(line.contains("`irlume support-report`"), "{line}");
+            assert!(line.contains("if asked"), "{line}");
+            assert!(line.contains("'panicked at'"), "{line}");
+            assert!(line.contains("home folder"), "{line}");
+            assert!(line.ends_with(ask), "{line}");
+            assert!(!line.contains("backtrace"), "{line}");
+        }
+        let source = include_str!("main.rs");
+        assert!(!source.contains(concat!("the back", "trace above")));
+        // The background line sits between the background arm and its
+        // camera release, the request line between the rebuild stage and
+        // the rebuild. The markers are split so this test cannot match them.
+        for (call, from, to) in [
+            (
+                concat!("jout_err!(\"{", "BACKGROUND_PANIC_LINE}\")"),
+                concat!("arbiter::Work::", "Background(task)"),
+                concat!("arbiter.finish(arbiter::", "Class::Camera, 0)"),
+            ),
+            (
+                concat!("jout_err!(\"{", "HANDLER_PANIC_LINE}\")"),
+                concat!("LiveStage::", "Rebuilding"),
+                concat!("match build_engine", "(None)"),
+            ),
+        ] {
+            assert_eq!(source.matches(call).count(), 1, "{call}");
+            let at = source.find(call).unwrap();
+            let start = source.find(from).expect(from);
+            let end = source.find(to).expect(to);
+            assert!(
+                start < at && at < end,
+                "{call} is not between {from} and {to}"
+            );
+        }
     }
 
     /// A post-panic rebuild binds the startup config's pair. After a runtime

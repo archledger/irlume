@@ -7,6 +7,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- SUPPORT.md says where to report a problem, in the same lines that
+  end `irlume support-report` and human `irlume doctor` output with a
+  warning or failure, with both addresses as links, and lists what the
+  maintainer never asks for: your password, recovery passphrase,
+  keyring token, template files or photos of you. Its sentence on the
+  password fallback reads as the CLI's does. README.md links the page
+  as "Problems?" (ADR-0008, support report contract, #1329).
+
+- The documents that say what to send agree with the issue forms.
+  docs/HARDWARE.md points to the Hardware report form and names what it
+  asks for, no longer `irlume status`,
+  `irlume camera diagnostics --json` or `sudo irlume doctor --probe`,
+  a flag doctor does not read. docs/INTEGRATION.md no longer says that
+  `doctor --json` holds no device paths or user names. CONTRIBUTING.md
+  and AGENTS.md ask for names replaced and scores deleted in journal
+  lines posted to a pull request, and docs/COMMANDS.md and
+  docs/PLATFORMS.md follow the forms (ADR-0008, support report
+  contract, #1329).
+
 - "Report it privately" now gives the address of the private report
   form itself,
   `https://github.com/archledger/irlume/security/advisories/new`, in

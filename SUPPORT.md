@@ -5,6 +5,30 @@ support a release receives; the security-reporting side lives in
 [SECURITY.md](SECURITY.md) and the trust boundaries in
 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
+## Where to report a problem
+
+```text
+Security problem (a photo, video, mask or another person got in,
+face sign-in worked without your face, or face data was exposed),
+or not sure? Never post it publicly. Report it privately:
+https://github.com/archledger/irlume/security/advisories/new
+or the e-mail address in SECURITY.md.
+Anything else: https://github.com/archledger/irlume/issues/new/choose
+```
+
+As links: [report privately][private] or [open an issue][issues].
+
+[private]: https://github.com/archledger/irlume/security/advisories/new
+[issues]: https://github.com/archledger/irlume/issues/new/choose
+
+The maintainer never asks for:
+
+- your password
+- your recovery passphrase
+- your keyring token
+- template files
+- photos of you
+
 ## Supported versions
 
 | Version | Support |
@@ -35,5 +59,7 @@ stops receiving security updates at that moment, and the release notes plus
 ## No professional support
 
 There is no SLA, no dedicated support channel and no paid tier. If irlume
-breaks your login, the password fallback always works - that is a design
-invariant, not a best effort.
+breaks your login, your password still works: irlume never blocks it, and a
+failed face sign-in falls back to it. That is a design invariant, not a best
+effort. The operating system's own lockout after repeated failed logins
+(`pam_faillock`) is separate; `irlume doctor` reports it and how to clear it.

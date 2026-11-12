@@ -10,9 +10,9 @@ Ways to help, in rough order of usefulness right now:
   not. These feed [`docs/HARDWARE.md`](docs/HARDWARE.md), which is generated
   from measured evidence, and they shape which capture paths get fixed next.
   Use the *Hardware report* issue template.
-- **Bug reports** with daemon journal excerpts (`journalctl -u irlumed`,
-  timestamps, camera model, distro and package). Use the *Bug report* issue
-  template; the more of its fields you fill, the faster the triage.
+- **Bug reports** with the file `irlume support-report` writes, camera model,
+  distro and package. Use the *Bug report* issue template; the more of its
+  fields you fill, the faster the triage.
 - **Code and docs**: fixes, tests, and documentation improvements, following
   the ground rules below.
 - **Packaging**: the Fedora, Arch, Debian/PPA, and Nix lanes live under
@@ -122,7 +122,8 @@ that gate yourself and are not expected to. What helps review move fast:
 
 - Say what you tested, on what hardware (camera model, RGB-only or rgb+ir,
   distro and package version), and what happened, including relevant
-  `journalctl -u irlumed` lines.
+  `journalctl -u irlumed` lines. A pull request is public: replace user,
+  computer and face profile names in those lines and delete match scores.
 - A change that adds or reclassifies a PAM service should name where the
   service ships (the distro, greeter, or lock screen that creates the
   `/etc/pam.d/` file); classifications are sourced, not guessed.

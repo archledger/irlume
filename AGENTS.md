@@ -326,7 +326,8 @@ cargo build --release --locked
   Under Testing list the commands run with results, new test names and what you
   could not run; never tick an unverified box ("Hardware-validated" only for
   hardware you name). PAM, daemon or capture changes add camera model, RGB-only
-  or RGB+IR, distro, package and `journalctl -u irlumed` lines. A contributor
+  or RGB+IR, distro, package and `journalctl -u irlumed` lines (user, computer
+  and profile names replaced, scores deleted). A contributor
   adds the AI line, e.g. "AI assistance: a coding agent drafted the parser and
   tests; I reviewed every line and ran the gate." Describe the final change,
   not the session. A fork's first PR waits for workflow approval

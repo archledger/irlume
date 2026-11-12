@@ -16,7 +16,7 @@ IR camera. Enrollment stores embeddings, never images. Password fallback stays a
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/FAQ.md)
 
-**[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[All docs](docs/)**
+**[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[Problems?](SUPPORT.md)** · **[All docs](docs/)**
 
 <br>
 

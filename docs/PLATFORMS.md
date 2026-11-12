@@ -5,7 +5,9 @@ implemented behavior, installation checks and attended authentication results.
 Historical validation applies to its named build and environment, not every
 later release. Inferred compatibility is labelled. If you run irlume
 anywhere not listed, an issue report with your distro, camera, and
-`irlume doctor` output extends this page: https://github.com/archledger/irlume/issues
+`irlume doctor` output (it shows your account name and an added camera's
+serial number; you may replace both) extends this page:
+https://github.com/archledger/irlume/issues/new/choose
 
 ## v0.14.0 behavior and support boundaries
 

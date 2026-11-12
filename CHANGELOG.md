@@ -14,12 +14,13 @@ All notable changes to irlume are documented here. This project adheres to
   (no frames, templates, credentials, user names, camera serial numbers,
   raw device paths, journal text or scores; it lists when the account
   recently used irlume and how each attempt ended, every account's
-  with irlume older than 0.15.0, the kernel version and how the
-  cameras connect), `irlume doctor` output (the account
-  name and, once a second camera was added, that camera's serial
-  number) and journal lines (user and computer names, and possibly
-  profile names and face-match scores). They no longer call the report
-  "sanitized and safe to share" (#1329).
+  with irlume or a running irlumed older than 0.15.0, the kernel
+  version and how the cameras connect), `irlume doctor` output (the
+  account name and, once a second camera was added, that camera's
+  serial number) and journal lines (user and computer names, and
+  possibly profile names and face-match scores). They no longer call
+  the report "sanitized and safe to share" (ADR-0008, support report
+  contract, #1329).
 
 ### Fixed
 

@@ -31,6 +31,20 @@ LIGHTDM_REFRESH = ("irlume-lightdm-refresh.path", "irlume-lightdm-refresh.timer"
 FEDORA_PRESET = [line.split()[1] for line in
                  (ROOT / "packaging/fedora/90-irlume.preset").read_text().splitlines()
                  if line.startswith("enable ")]
+# Where to report a problem: what the Arch and Debian hooks print on a first
+# install, the lines scripts/install.sh prints after a failure or for a daemon
+# that is not active.
+SECURITY_URL = "https://github.com/archledger/irlume/security"
+CHOOSER_URL = "https://github.com/archledger/irlume/issues/new/choose"
+WHERE_TO_REPORT = (
+    "Security problem (a photo, video, mask or another person got in,",
+    "face sign-in worked without your face, or face data was exposed),",
+    "or not sure? Never post it publicly. Report it privately:",
+    SECURITY_URL,
+    "or the e-mail address in SECURITY.md.",
+    f"Anything else: {CHOOSER_URL}",
+)
+ATTACH_A_REPORT = "Your own words are fine; attach the file `irlume support-report` writes."
 
 # Model the systemctl command boundary, including enable vs. --now and masks.
 # Unsupported commands are recorded as errors even when a hook ignores status.
@@ -115,7 +129,9 @@ elif name == "mkdir" and args == ["-p", "-m", "0700", os.environ["HOOK_STATE_DIR
 elif name == "touch" and args == [os.environ["HOOK_STATE_DIR"] + "/.reconcile-timer-armed"]:
     Path(args[0]).touch()
 elif name == "apparmor_parser" and args == ["-r", "/etc/apparmor.d/usr.bin.irlumed"]:
-    pass
+    if state.get("parser_fails", False):
+        print("synthetic AppArmor parser failure", file=sys.stderr)
+        status = 1
 else:
     status = unexpected()
 
@@ -153,11 +169,12 @@ class PackageServiceHookTests(unittest.TestCase):
 
     def run_hook(self, family, service, socket, old="0.11.3", reconcile=("enabled", False),
                  timer_armed=True, hook="postinstall", action="configure", systemd=True,
-                 fail_systemctl=False, dpkg_root=False):
+                 fail_systemctl=False, dpkg_root=False, parser_fails=False):
         # reconcile is one (enabled, active) pair for all three units, or a
         # dict giving each unit its own. timer_armed=False leaves out the
         # one-time timer marker, as on an install from before 0.7.0 or an
-        # Arch install that has not been upgraded since.
+        # Arch install that has not been upgraded since. parser_fails=True
+        # makes apparmor_parser fail, the one case a hook may write to stderr.
         if isinstance(reconcile, tuple):
             reconcile = dict.fromkeys(RECONCILE, reconcile)
         with tempfile.TemporaryDirectory(prefix="irlume-hook-test-") as temp:
@@ -192,7 +209,7 @@ class PackageServiceHookTests(unittest.TestCase):
                                    *LIGHTDM_REFRESH, "irlume-lightdm-prepare.service", "lightdm.service")},
                 },
                 "preset": FEDORA_PRESET, "calls": [], "errors": [],
-                "fail_systemctl": fail_systemctl,
+                "fail_systemctl": fail_systemctl, "parser_fails": parser_fails,
             }))
             for name in ("systemctl", "systemd-tmpfiles", "apparmor_parser", "mkdir", "touch"):
                 shim = directory / name
@@ -241,8 +258,10 @@ class PackageServiceHookTests(unittest.TestCase):
             state = json.loads(state_path.read_text())
             state["timer_armed"] = marker.exists()
             self.assertEqual(process.returncode, 0, stderr)
-            self.assertEqual(stderr, "", stdout)
+            if not parser_fails:
+                self.assertEqual(stderr, "", stdout)
             self.assertEqual(state["errors"], [], "unexpected or unsafe hook command")
+            state["stdout"], state["stderr"] = stdout, stderr
             return state
 
     def assert_unit(self, state, unit, enabled, active, starts=0, restarts=0):
@@ -502,6 +521,46 @@ class PackageServiceHookTests(unittest.TestCase):
                 with self.subTest(family=family, old=old):
                     state = self.run_hook(family, ("enabled", False), ("disabled", False), old)
                     self.assert_unit(state, SOCKET, "disabled", False)
+
+    def test_first_install_says_where_to_report(self):
+        block = "\n\n" + "\n".join((*WHERE_TO_REPORT, ATTACH_A_REPORT)) + "\n"
+        for family in ("debian", "arch"):
+            with self.subTest(family=family):
+                state = self.run_hook(family, ("disabled", False), ("disabled", False), None)
+                stdout = state["stdout"]
+                self.assertEqual(stdout.count(block), 1, stdout)
+                self.assertEqual(stdout.count(SECURITY_URL), 1, stdout)
+                self.assertEqual(stdout.count(CHOOSER_URL), 1, stdout)
+                self.assertLess(stdout.index("irlume installed. Next steps:"), stdout.index(block))
+
+    def test_upgrade_does_not_repeat_where_to_report(self):
+        for family, old, says in (("debian", "0.11.3", "irlume installed. Next steps:"),
+                                  ("arch", "0.11.3-1", None),
+                                  ("arch", "0.1.9-1", "irlume 0.2.0: the IR adapter was removed.")):
+            with self.subTest(family=family, old=old):
+                state = self.run_hook(family, ("enabled", True), ("enabled", True), old)
+                stdout = state["stdout"]
+                if says is not None:
+                    self.assertIn(says, stdout)
+                for text in (SECURITY_URL, CHOOSER_URL, WHERE_TO_REPORT[0], ATTACH_A_REPORT):
+                    self.assertNotIn(text, stdout)
+
+    def test_universal_deb_parser_failure_links_the_issue_chooser(self):
+        for old in (None, "0.11.3"):
+            with self.subTest(old=old):
+                service = ("disabled", False) if old is None else ("enabled", True)
+                state = self.run_hook("debian", service, service, old, parser_fails=True)
+                stderr = state["stderr"]
+                # The hook sends the parser's own output to stdout (2>&1).
+                self.assertIn("synthetic AppArmor parser failure", state["stdout"])
+                self.assertEqual(stderr.count("WARNING:"), 1, stderr)
+                self.assertIn("the AppArmor profile did not load", stderr)
+                self.assertIn("run unconfined", stderr)
+                self.assertIn(f"Report the parser error above at\nirlume: {CHOOSER_URL}\n", stderr)
+                self.assertNotIn(SECURITY_URL, stderr)
+                # Not fatal: the daemon still starts on a first install and
+                # restarts on an upgrade.
+                self.assert_unit(state, DAEMON, "enabled", True, starts=int(old is None), restarts=1)
 
 
 if __name__ == "__main__":

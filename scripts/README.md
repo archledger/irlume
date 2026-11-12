@@ -11,7 +11,7 @@ pages, so it must never move.
 | Script | What it does |
 |---|---|
 | `install.sh` | The one-step installer users run via a published `curl` URL. Detects the distro, installs from Copr, the PPA, the AUR or a checksum-verified `.deb`, and wires nothing into PAM. |
-| `test-install-script.sh` | Tests the channel `install.sh` chooses on Ubuntu, Debian and a derivative, with stand-ins on `PATH`: no network and no root. |
+| `test-install-script.sh` | Tests the channel `install.sh` chooses on Ubuntu, Debian and a derivative, and what it prints and its exit status: a success on Ubuntu and Debian, failures there and on Fedora and Arch, the verification failures, where to report a problem and a daemon that is not active. Stand-ins on `PATH`: no network and no root. |
 | `install-host.sh` | Installs a locally built checkout onto this host: binaries and the systemd unit only. For developers, not users. |
 | `fetch-models.sh` | Fetches the ONNX weights from the `models-v1` release and verifies each sha256. Replaces `git lfs pull`; every packaging lane calls it before building. |
 | `build-ppa-source.sh` | Builds the Ubuntu PPA **source** package. Launchpad's builders have no network, so the orig tarball carries vendored crates and the bundled runtime. |

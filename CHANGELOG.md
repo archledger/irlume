@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- A failed `scripts/install.sh` run, whichever step failed, ends with
+  where to report a problem, the private route first. A missing or
+  failed signature, a key that cannot be imported and a checksum
+  mismatch also say not to override verification and to report
+  privately; the missing-signature message no longer names the
+  override variable, which a comment in the script still documents.
+  The Arch, Debian and PPA packages print where to report on first
+  install, and the Debian and PPA AppArmor warnings link the issue
+  chooser (#1329).
+
 - `irlume support-report`, the TUI's Create Support Report, and human
   `irlume doctor` output that has a warning or failure, also with
   `--check`, end with where to report a problem: a security problem, or
@@ -56,6 +66,17 @@ All notable changes to irlume are documented here. This project adheres to
   report contract, #1329).
 
 ### Fixed
+
+- `scripts/install.sh` says the machine side is ready only when
+  `irlumed.service` is active. For any other state it gives the state
+  on one line, how to see why and where to report, and still exits 0;
+  it used to print "ready" for a stopped or failed daemon, with the
+  state split over two lines (#1329).
+
+- On the release-RPM fallback of `scripts/install.sh`, a download or
+  verification that fails is no longer followed by a line saying the
+  latest release has no RPM for that Fedora release; the line now says
+  no verified RPM was found and points to the reason above it (#1329).
 
 - An unseal that the TPM refuses on its policy reads the PCRs for its
   diagnosis on the TPM conversation that is already open, instead of

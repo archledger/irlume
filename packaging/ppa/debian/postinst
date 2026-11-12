@@ -38,7 +38,7 @@ MSG
 Security problem (a photo, video, mask or another person got in,
 face sign-in worked without your face, or face data was exposed),
 or not sure? Never post it publicly. Report it privately:
-https://github.com/archledger/irlume/security
+https://github.com/archledger/irlume/security/advisories/new
 or the e-mail address in SECURITY.md.
 Anything else: https://github.com/archledger/irlume/issues/new/choose
 Your own words are fine; attach the file `irlume support-report` writes.

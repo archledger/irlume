@@ -80,7 +80,7 @@ report_block() {
   warn "Security problem (a photo, video, mask or another person got in,"
   warn "face sign-in worked without your face, or face data was exposed),"
   warn "or not sure? Never post it publicly. Report it privately:"
-  warn "https://github.com/archledger/irlume/security"
+  warn "https://github.com/archledger/irlume/security/advisories/new"
   warn "or the e-mail address in SECURITY.md."
   warn "Anything else: https://github.com/archledger/irlume/issues/new/choose"
   warn "Your own words are fine; paste the lines above, not the sudo prompt."
@@ -91,7 +91,8 @@ report_block() {
 die_verify() {
   printf '\033[1;31m[irlume]\033[0m %s\n' "$1" >&2
   printf '\033[1;31m[irlume]\033[0m %s\n' "Do not override verification or install the download by hand;" >&2
-  printf '\033[1;31m[irlume]\033[0m %s\n' "report it privately: https://github.com/archledger/irlume/security" >&2
+  printf '\033[1;31m[irlume]\033[0m %s\n' "report it privately:" >&2
+  printf '\033[1;31m[irlume]\033[0m %s\n' "https://github.com/archledger/irlume/security/advisories/new" >&2
   exit 1
 }
 

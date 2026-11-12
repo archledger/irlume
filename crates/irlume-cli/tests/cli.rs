@@ -2009,6 +2009,226 @@ fn sock(sb: &Sandbox) -> PathBuf {
     sb.path("no-daemon.sock")
 }
 
+const SERVED_RGB_DESCRIPTOR: &str = "1212121212121212";
+const SERVED_IR_DESCRIPTOR: &str = "abababababababab";
+const SERVED_QUALIFICATION: &str = "3434343434343434";
+const SERVED_RUNTIME: &str = "5656565656565656";
+
+/// The support snapshot the fake daemon serves: an RGB and an IR camera row
+/// sharing one qualification token, as irlumed publishes a pair, and a
+/// capture section with that token and a runtime context.
+fn served_support_snapshot() -> serde_json::Value {
+    let stream = |height: u32, fourcc: &str| {
+        serde_json::json!({
+            "width": 640,
+            "height": height,
+            "fourcc": fourcc,
+            "interval": { "numerator": 1, "denominator": 30 },
+        })
+    };
+    let camera = |role: &str, interface: u8, descriptor: &str, stream: serde_json::Value| {
+        serde_json::json!({
+            "vid": 0x046d,
+            "pid": 0x085e,
+            "role": role,
+            "interface_number": interface,
+            "driver": "uvcvideo",
+            "backend": "uvc-v4l2",
+            "speed_millimbps": 5_000_000,
+            "controller": "0000:00:14.0",
+            "usb_bus": 4,
+            "usb_port_chain": [2],
+            "lifecycle_generation": 3,
+            "serial_present": true,
+            "descriptor_token": descriptor,
+            "qualification_token": SERVED_QUALIFICATION,
+            "requested": stream.clone(),
+            "accepted": stream,
+        })
+    };
+    serde_json::json!({
+        "support_schema": 1,
+        "daemon_uptime_ms": 42_000,
+        "retained_history_ms": 60_000,
+        "capture": {
+            "schedule": "sequential",
+            "source": "stored_qualification",
+            "runtime_context": SERVED_RUNTIME,
+            "qualification_state": "measured_sequential",
+            "qualification_context": SERVED_QUALIFICATION,
+        },
+        "cameras": [
+            camera("rgb", 0, SERVED_RGB_DESCRIPTOR, stream(480, "YUYV")),
+            camera("ir", 2, SERVED_IR_DESCRIPTOR, stream(400, "GREY")),
+        ],
+        "events": [],
+        "unavailable": [],
+    })
+}
+
+/// The descriptor values, the camera rows' qualification values and the
+/// capture section's runtime and qualification values of a text report.
+fn printed_report_tokens(text: &str) -> (Vec<String>, Vec<String>, String, String) {
+    let mut descriptors = Vec::new();
+    let mut qualifications = Vec::new();
+    let mut contexts = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("    tokens: descriptor=") {
+            let (descriptor, qualification) = rest.split_once(" qualification=").unwrap();
+            descriptors.push(descriptor.to_owned());
+            qualifications.push(qualification.to_owned());
+        } else if let Some(rest) = line.strip_prefix("  contexts: runtime=") {
+            let (runtime, rest) = rest.split_once(" qualification=").unwrap();
+            let (qualification, _) = rest.split_once(" degradation=").unwrap();
+            contexts.push((runtime.to_owned(), qualification.to_owned()));
+        }
+    }
+    assert_eq!(contexts.len(), 1, "one contexts line: {text}");
+    let (runtime, qualification) = contexts.remove(0);
+    (descriptors, qualifications, runtime, qualification)
+}
+
+/// Each support report keys the daemon's context tokens for that report
+/// alone (ADR-0008, amendment 2026-11-12). Within one report the camera
+/// rows and the capture section carry one qualification value; two reports
+/// carry different values, and none carries the daemon's. The descriptor
+/// tokens are the daemon's.
+#[test]
+fn support_report_keys_context_tokens_for_each_report() {
+    let sb = Sandbox::new("support-report-tokens");
+    for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+        sb.fake_tool(tool, "exit 1");
+    }
+    let snapshot: irlume_common::diagnostics::SupportSnapshot =
+        serde_json::from_value(served_support_snapshot()).unwrap();
+    let log = serve(&sock(&sb), move |request| match request {
+        Request::SupportSnapshot { .. } => Response::SupportSnapshot(Box::new(snapshot.clone())),
+        _ => Response::Error("bad request".into()),
+    });
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let (code, stdout, stderr) =
+            run(&mut sb.cmd_with_fakes(&["support-report", "--json", "--contract", "1"]));
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["ok"], true, "{stdout}");
+        let daemon = &document["data"]["daemon"];
+        let cameras = daemon["cameras"].as_array().expect("camera rows");
+        assert_eq!(cameras.len(), 2, "{stdout}");
+        assert_eq!(cameras[0]["descriptor_token"], SERVED_RGB_DESCRIPTOR);
+        assert_eq!(cameras[1]["descriptor_token"], SERVED_IR_DESCRIPTOR);
+        let qualification = daemon["capture"]["qualification_context"]
+            .as_str()
+            .expect("a qualification context")
+            .to_owned();
+        let runtime = daemon["capture"]["runtime_context"]
+            .as_str()
+            .expect("a runtime context")
+            .to_owned();
+        for camera in cameras {
+            assert_eq!(camera["qualification_token"], qualification.as_str());
+        }
+        assert_eq!(qualification.len(), 16);
+        assert_eq!(runtime.len(), 16);
+        for served in [SERVED_QUALIFICATION, SERVED_RUNTIME] {
+            assert!(!stdout.contains(served), "{served} in {stdout}");
+        }
+        seen.push(qualification);
+        seen.push(runtime);
+    }
+
+    let output = sb.path("work/report.txt");
+    let (code, _, stderr) =
+        run(&mut sb.cmd_with_fakes(&["support-report", "--output", output.to_str().unwrap()]));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let text = std::fs::read_to_string(&output).unwrap();
+    let (descriptors, qualifications, runtime, qualification) = printed_report_tokens(&text);
+    assert_eq!(
+        descriptors,
+        [SERVED_RGB_DESCRIPTOR, SERVED_IR_DESCRIPTOR],
+        "{text}"
+    );
+    assert_eq!(
+        qualifications,
+        [qualification.as_str(), qualification.as_str()],
+        "{text}"
+    );
+    for served in [SERVED_QUALIFICATION, SERVED_RUNTIME] {
+        assert!(!text.contains(served), "{served} in {text}");
+    }
+    seen.push(qualification);
+    seen.push(runtime);
+
+    // Two values from each of the three reports, all different.
+    let mut distinct = seen.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), seen.len(), "{seen:?}");
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert!(requests
+        .iter()
+        .all(|request| matches!(request, Request::SupportSnapshot { .. })));
+}
+
+/// A probe report, run as root in a user namespace against the fake daemon,
+/// prints the probe snapshot's context tokens keyed for that report, as a
+/// report without a probe does. The probe's own copy of the snapshot is
+/// not printed; the unit tests in `support_report.rs` cover it.
+#[test]
+fn support_report_probe_prints_keyed_context_tokens() {
+    let sb = Sandbox::new("support-report-probe-tokens");
+    let result: irlume_common::diagnostics::SupportProbeResult =
+        serde_json::from_value(serde_json::json!({
+            "snapshot": served_support_snapshot(),
+            "schedule": "sequential",
+            "source": "stored_qualification",
+            "outcome": "captured",
+            "rgb": "captured",
+            "ir": "captured",
+        }))
+        .unwrap();
+    let log = serve(&sock(&sb), move |request| match request {
+        Request::SupportProbe { .. } => Response::SupportProbe(Box::new(result.clone())),
+        _ => Response::Error("bad request".into()),
+    });
+    let output = sb.path("work/probe-report.txt");
+    let (code, _, stderr) = run(&mut sb.isolated_root_cmd(
+        &[
+            "support-report",
+            "--probe",
+            "--output",
+            output.to_str().unwrap(),
+        ],
+        &[],
+    ));
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(
+        text.contains("  probe: sequential via stored_qualification (captured)\n"),
+        "{text}"
+    );
+    let (descriptors, qualifications, runtime, qualification) = printed_report_tokens(&text);
+    assert_eq!(
+        descriptors,
+        [SERVED_RGB_DESCRIPTOR, SERVED_IR_DESCRIPTOR],
+        "{text}"
+    );
+    assert_eq!(
+        qualifications,
+        [qualification.as_str(), qualification.as_str()],
+        "{text}"
+    );
+    assert_ne!(qualification, runtime);
+    for served in [SERVED_QUALIFICATION, SERVED_RUNTIME] {
+        assert!(!text.contains(served), "{served} in {text}");
+    }
+    let requests = log.lock().unwrap();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(matches!(requests[0], Request::SupportProbe { .. }));
+}
+
 #[test]
 fn split_json_flags_preserve_serials_and_older_daemon_never_triggers_fallback() {
     let guard = r#"{"supervisor_id":"0123456789abcdef0123456789abcdef","revision":7,"rgb":{"instance_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":1,"endpoint":"/dev/video0"},"ir":{"instance_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","generation":2,"endpoint":"/dev/video1"}}"#;

@@ -139,6 +139,78 @@ fn platform_facts(os_release: &str) -> (&'static str, CheckState) {
     )
 }
 
+/// The HMAC input ahead of the daemon's 8 token bytes.
+const REPORT_TOKEN_DOMAIN: &[u8] = b"irlume-support-report-token-v1\0";
+
+/// A key drawn for one support report (ADR-0008, amendment 2026-11-12).
+///
+/// Each qualification and runtime context token of the report becomes the
+/// first 8 bytes of HMAC-SHA-256 under this key, so equal tokens still
+/// match within the report and two reports carry unrelated values. The key
+/// is never stored, printed or put in the report, and its buffer is wiped
+/// when it drops.
+struct ReportTokenKey(zeroize::Zeroizing<[u8; 32]>);
+
+impl ReportTokenKey {
+    /// A new key from `rand::rng()`, the CSPRNG that `random_id` in
+    /// `machine.rs` also uses.
+    fn fresh() -> Self {
+        use rand::Rng as _;
+        let mut key = zeroize::Zeroizing::new([0_u8; 32]);
+        rand::rng().fill_bytes(key.as_mut_slice());
+        Self(key)
+    }
+
+    #[cfg(test)]
+    fn from_bytes_for_test(bytes: [u8; 32]) -> Self {
+        Self(zeroize::Zeroizing::new(bytes))
+    }
+
+    /// The report's value for one token from the daemon.
+    fn token(&self, value: DigestToken) -> DigestToken {
+        use hmac::{KeyInit as _, Mac as _};
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(self.0.as_slice())
+            .expect("HMAC takes a key of any length");
+        mac.update(REPORT_TOKEN_DOMAIN);
+        mac.update(value.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        DigestToken::from_bytes(bytes)
+    }
+
+    /// Key each camera's qualification token and the capture section's
+    /// qualification and runtime contexts. An absent token stays absent;
+    /// the descriptor tokens stay as the daemon sent them.
+    fn apply(&self, snapshot: &mut SupportSnapshot) {
+        for camera in &mut snapshot.cameras {
+            camera.qualification_token = camera.qualification_token.map(|value| self.token(value));
+        }
+        if let Some(capture) = snapshot.capture.as_mut() {
+            capture.qualification_context =
+                capture.qualification_context.map(|value| self.token(value));
+            capture.runtime_context = capture.runtime_context.map(|value| self.token(value));
+        }
+    }
+
+    /// Key a support reply: a snapshot, or a probe result's snapshot, which
+    /// a probe report also copies into its daemon section. Other replies
+    /// pass through unchanged.
+    fn apply_to_reply(&self, reply: Response) -> Response {
+        match reply {
+            Response::SupportSnapshot(mut snapshot) => {
+                self.apply(&mut snapshot);
+                Response::SupportSnapshot(snapshot)
+            }
+            Response::SupportProbe(mut result) => {
+                self.apply(&mut result.snapshot);
+                Response::SupportProbe(result)
+            }
+            other => other,
+        }
+    }
+}
+
 pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     let install_channel = match crate::commands::install_origin() {
         crate::commands::InstallOrigin::Copr => InstallChannel::FedoraCopr,
@@ -193,6 +265,11 @@ pub(crate) fn collect(since: Duration, probe: bool) -> SupportReport {
     } else {
         Request::SupportSnapshot { since_ms }
     });
+    // One key for every context token of this report, before a probe
+    // result's snapshot is copied, so both copies carry the same values;
+    // the key is a local of `collect` and is not kept.
+    let token_key = ReportTokenKey::fresh();
+    let response = response.map(|reply| token_key.apply_to_reply(reply));
     let (daemon, probe_result, mut unavailable, daemon_state) = match response {
         Ok(Response::SupportSnapshot(snapshot)) => {
             (Some(*snapshot), None, Vec::new(), CheckState::Pass)
@@ -1302,6 +1379,451 @@ mod tests {
         for forbidden in ["alice", "/dev/video9", "Face Profile 1", "detail"] {
             assert!(!text.contains(forbidden));
         }
+    }
+
+    const FIXTURE_CONTROLLER: &str = "/devices/pci0000:00/0000:00:14.0";
+    const FIXTURE_USB_DEVPATH: &str = "/devices/pci0000:00/0000:00:14.0/usb4/4-2";
+
+    /// An RGB+IR pair context built through the camera crate's public
+    /// constructors, as the daemon builds one from an opened pair.
+    fn fixture_pair_context() -> irlume_camera::capture_qualification::QualificationContext {
+        use irlume_camera::capture_qualification::{
+            AcceptedStream, CameraEndpoint, ConnectionContext, ExactInterval, ExactRate,
+            QualificationContext, QualifiedStreamRole, RequestedStream, StreamContract,
+        };
+        let endpoint = |role, interface_number, descriptor: &str| {
+            CameraEndpoint::new(
+                descriptor.repeat(32),
+                0x046d,
+                0x085e,
+                None,
+                interface_number,
+                FIXTURE_USB_DEVPATH.into(),
+                role,
+                ConnectionContext::new(
+                    FIXTURE_CONTROLLER.into(),
+                    5_000_000,
+                    "uvcvideo".into(),
+                    "uvc-v4l2".into(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let stream = |role, fourcc: &str, height: u32, floor: ExactRate| {
+            StreamContract::new(
+                role,
+                RequestedStream::new(
+                    640,
+                    height,
+                    fourcc.into(),
+                    ExactInterval::new(1, 30).unwrap(),
+                )
+                .unwrap(),
+                AcceptedStream::new(
+                    640,
+                    height,
+                    fourcc.into(),
+                    1_280,
+                    640 * height * 2,
+                    0,
+                    8,
+                    1,
+                    1,
+                    0,
+                    ExactInterval::new(1, 30).unwrap(),
+                )
+                .unwrap(),
+                floor,
+            )
+            .unwrap()
+        };
+        QualificationContext::new(
+            endpoint(QualifiedStreamRole::Rgb, 0, "ab"),
+            endpoint(QualifiedStreamRole::Ir, 2, "cd"),
+            stream(
+                QualifiedStreamRole::Rgb,
+                "YUYV",
+                480,
+                ExactRate::new(15, 2).unwrap(),
+            ),
+            stream(
+                QualifiedStreamRole::Ir,
+                "GREY",
+                400,
+                ExactRate::new(15, 1).unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    /// The tokens a rendered report prints: each camera row's descriptor
+    /// and qualification values, then the capture section's runtime and
+    /// qualification values.
+    struct PrintedTokens {
+        descriptors: Vec<String>,
+        qualifications: Vec<String>,
+        runtime: String,
+        capture_qualification: String,
+    }
+
+    fn printed_tokens(text: &str) -> PrintedTokens {
+        let mut descriptors = Vec::new();
+        let mut qualifications = Vec::new();
+        let mut contexts = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("    tokens: descriptor=") {
+                let (descriptor, qualification) = rest.split_once(" qualification=").unwrap();
+                descriptors.push(descriptor.to_owned());
+                qualifications.push(qualification.to_owned());
+            } else if let Some(rest) = line.strip_prefix("  contexts: runtime=") {
+                let (runtime, rest) = rest.split_once(" qualification=").unwrap();
+                let (qualification, _) = rest.split_once(" degradation=").unwrap();
+                assert!(contexts.is_none(), "one contexts line: {text}");
+                contexts = Some((runtime.to_owned(), qualification.to_owned()));
+            }
+        }
+        let (runtime, capture_qualification) = contexts.expect("a contexts line");
+        PrintedTokens {
+            descriptors,
+            qualifications,
+            runtime,
+            capture_qualification,
+        }
+    }
+
+    /// Two reports of one daemon snapshot, each keyed with a fresh key, as
+    /// `collect` keys each report: within a report the two camera rows and
+    /// the capture section carry one qualification value; between the
+    /// reports every keyed value differs, and neither report carries the
+    /// daemon's (ADR-0008, amendment 2026-11-12).
+    #[test]
+    fn report_tokens_match_within_a_report_and_differ_between_reports() {
+        let context = fixture_pair_context();
+        let context_key = context.runtime_key().unwrap();
+        let cameras = context.diagnostic_camera_contexts(3, 3).unwrap();
+        // The daemon's value today: the first 8 bytes of the pair's context
+        // key, the same on both rows.
+        let daemon_qualification = DigestToken::from_sha256_hex(&context_key).unwrap();
+        assert!(cameras
+            .iter()
+            .all(|camera| camera.qualification_token == Some(daemon_qualification)));
+        // Any runtime context does: the report keys the 8 bytes it is sent.
+        let daemon_runtime = DigestToken::from_bytes([0x5a; 8]);
+        let mut served = fixture_camera_report_with_rate_shortfalls(None, None)
+            .daemon
+            .unwrap();
+        served.cameras = cameras.to_vec();
+        let capture = served.capture.as_mut().unwrap();
+        capture.qualification_context = cameras[0].qualification_token;
+        capture.runtime_context = Some(daemon_runtime);
+
+        let reports: Vec<(PrintedTokens, String, serde_json::Value)> = (0..2)
+            .map(|_| {
+                let mut snapshot = served.clone();
+                ReportTokenKey::fresh().apply(&mut snapshot);
+                let mut report = fixture_camera_report_with_rate_shortfalls(None, None);
+                report.daemon = Some(snapshot);
+                let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+                let json = serde_json::to_string(&report).unwrap();
+                for output in [&text, &json] {
+                    // The report carries keyed values, not the served ones.
+                    for absent in [
+                        digest_token_text(daemon_qualification).as_str(),
+                        context_key.as_str(),
+                        digest_token_text(daemon_runtime).as_str(),
+                    ] {
+                        assert!(!output.contains(absent), "{absent} in {output}");
+                    }
+                    // The share-safe projection still holds no path.
+                    for absent in ["/devices/", "/dev/video"] {
+                        assert!(!output.contains(absent), "{absent} in {output}");
+                    }
+                }
+                (
+                    printed_tokens(&text),
+                    text,
+                    serde_json::from_str(&json).unwrap(),
+                )
+            })
+            .collect();
+
+        for (printed, text, json) in &reports {
+            assert_eq!(
+                printed.descriptors,
+                [
+                    digest_token_text(cameras[0].descriptor_token),
+                    digest_token_text(cameras[1].descriptor_token),
+                ],
+                "descriptor tokens are the daemon's: {text}"
+            );
+            assert_eq!(
+                printed.qualifications,
+                [
+                    printed.capture_qualification.clone(),
+                    printed.capture_qualification.clone(),
+                ],
+                "{text}"
+            );
+            let daemon = &json["daemon"];
+            for (row, camera) in daemon["cameras"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(camera["qualification_token"], printed.qualifications[row]);
+                assert_eq!(camera["descriptor_token"], printed.descriptors[row]);
+            }
+            assert_eq!(
+                daemon["capture"]["qualification_context"],
+                printed.capture_qualification
+            );
+            assert_eq!(daemon["capture"]["runtime_context"], printed.runtime);
+        }
+        let (first, second) = (&reports[0].0, &reports[1].0);
+        assert_ne!(first.capture_qualification, second.capture_qualification);
+        assert_ne!(first.runtime, second.runtime);
+    }
+
+    /// A known answer for a fixed key: HMAC-SHA-256 over the domain string
+    /// and the daemon's 8 bytes, cut to 8 bytes (values computed separately
+    /// with Python's `hmac` and `hashlib`). Applied to a snapshot, it keys
+    /// each qualification and runtime value from its own served value and
+    /// leaves the descriptor's.
+    #[test]
+    fn report_token_key_gives_the_known_answers() {
+        let key = ReportTokenKey::from_bytes_for_test([7; 32]);
+        assert_eq!(
+            digest_token_text(key.token(DigestToken::from_bytes([0x34; 8]))),
+            "fcda260f0a840c2b"
+        );
+        assert_eq!(
+            digest_token_text(key.token(DigestToken::from_bytes([0x56; 8]))),
+            "b01f9ad8d0b2d5fb"
+        );
+        assert_eq!(
+            digest_token_text(key.token(DigestToken::from_bytes([0x78; 8]))),
+            "ac6b647e8cd3d729"
+        );
+
+        let mut report = fixture_camera_report();
+        let snapshot = report.daemon.as_mut().unwrap();
+        // A capture value other than the row's, so each is keyed from its own.
+        snapshot.capture.as_mut().unwrap().qualification_context =
+            Some(DigestToken::from_bytes([0x78; 8]));
+        key.apply(snapshot);
+        let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+        assert!(
+            text.contains("tokens: descriptor=1212121212121212 qualification=fcda260f0a840c2b"),
+            "{text}"
+        );
+        assert!(
+            text.contains("contexts: runtime=b01f9ad8d0b2d5fb qualification=ac6b647e8cd3d729 "),
+            "{text}"
+        );
+    }
+
+    /// A token the daemon did not send, as on an RGB-only host, is not
+    /// made up: the report still prints `none`.
+    #[test]
+    fn report_token_key_leaves_an_absent_token_absent() {
+        let mut report = fixture_camera_report_with_rate_shortfalls(None, None);
+        let snapshot = report.daemon.as_mut().unwrap();
+        snapshot.cameras[0].qualification_token = None;
+        let capture = snapshot.capture.as_mut().unwrap();
+        capture.qualification_context = None;
+        capture.runtime_context = None;
+        ReportTokenKey::fresh().apply(snapshot);
+
+        let snapshot = report.daemon.as_ref().unwrap();
+        assert_eq!(snapshot.cameras()[0].qualification_token, None);
+        let capture = snapshot.capture().unwrap();
+        assert_eq!(capture.qualification_context, None);
+        assert_eq!(capture.runtime_context, None);
+        let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+        assert!(
+            text.contains("tokens: descriptor=1212121212121212 qualification=none"),
+            "{text}"
+        );
+        assert!(
+            text.contains("contexts: runtime=none qualification=none "),
+            "{text}"
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        for field in [
+            "\"qualification_token\"",
+            "\"qualification_context\"",
+            "\"runtime_context\"",
+        ] {
+            assert!(!json.contains(field), "{field} in {json}");
+        }
+    }
+
+    /// A probe reply's snapshot, which a probe report also copies into its
+    /// daemon section, is keyed exactly as a snapshot reply is under the
+    /// same key; other replies pass through.
+    #[test]
+    fn report_token_key_keys_a_probe_reply_like_a_snapshot_reply() {
+        let key = ReportTokenKey::from_bytes_for_test([7; 32]);
+        let served = fixture_camera_report().daemon.unwrap();
+        let mut expected = served.clone();
+        key.apply(&mut expected);
+        assert_eq!(
+            expected
+                .capture()
+                .unwrap()
+                .runtime_context
+                .map(digest_token_text)
+                .as_deref(),
+            Some("b01f9ad8d0b2d5fb")
+        );
+
+        let Response::SupportSnapshot(snapshot) =
+            key.apply_to_reply(Response::SupportSnapshot(Box::new(served.clone())))
+        else {
+            panic!("a snapshot reply stays a snapshot reply");
+        };
+        assert_eq!(*snapshot, expected);
+
+        let probe = SupportProbeResult {
+            snapshot: served,
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::StoredQualification,
+            outcome: ProbeOutcome::Captured,
+            fallback_reason: None,
+            rgb: ProbeRoleOutcome::Captured,
+            ir: ProbeRoleOutcome::Captured,
+        };
+        let Response::SupportProbe(result) =
+            key.apply_to_reply(Response::SupportProbe(Box::new(probe)))
+        else {
+            panic!("a probe reply stays a probe reply");
+        };
+        assert_eq!(result.snapshot, expected);
+        assert!(matches!(key.apply_to_reply(Response::Pong), Response::Pong));
+    }
+
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    struct ScratchDir(PathBuf);
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `collect` twice in one process against a fake daemon, as the TUI
+    /// collects one report after another: first without a probe, then with
+    /// one. Each report carries its own keyed values, and neither carries
+    /// the daemon's. In the probe report, the probe result's snapshot and
+    /// the copy the report prints as its daemon section carry the same
+    /// values. The text report prints only the copy, and `--json` never
+    /// probes, so no command output shows the probe result's own snapshot.
+    #[test]
+    fn collect_draws_one_key_per_report_and_keys_a_probe_copy_with_it() {
+        use std::io::{BufRead as _, Write as _};
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A random name, not the process ID: a run in another PID namespace
+        // can get the same process ID. Short, as `sun_path` holds 108 bytes.
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-support-report-{:08x}",
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let _scratch = ScratchDir(dir.clone());
+        let socket = dir.join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let served = fixture_camera_report().daemon.unwrap();
+        let snapshot_reply = Response::SupportSnapshot(Box::new(served.clone()));
+        let probe_reply = Response::SupportProbe(Box::new(SupportProbeResult {
+            snapshot: served.clone(),
+            schedule: CaptureSchedule::Sequential,
+            source: CaptureScheduleSource::StoredQualification,
+            outcome: ProbeOutcome::Captured,
+            fallback_reason: None,
+            rgb: ProbeRoleOutcome::Captured,
+            ir: ProbeRoleOutcome::Captured,
+        }));
+        // IRLUME_SOCKET is process-wide: a request another test's worker
+        // sends gets an error reply, and the server waits for the snapshot
+        // request, then the probe request.
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut answered = 0;
+            while answered < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no snapshot and probe requests within 10 s"
+                );
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("fake daemon accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                let wanted = match (answered, serde_json::from_str::<Request>(&line)) {
+                    (0, Ok(Request::SupportSnapshot { .. })) => Some(&snapshot_reply),
+                    (1, Ok(Request::SupportProbe { .. })) => Some(&probe_reply),
+                    _ => None,
+                };
+                let answer = match wanted {
+                    Some(reply) => {
+                        answered += 1;
+                        reply.clone()
+                    }
+                    None => Response::Error("fake daemon: not the request under test".into()),
+                };
+                writeln!(stream, "{}", serde_json::to_string(&answer).unwrap()).unwrap();
+            }
+        });
+        let previous = std::env::var_os("IRLUME_SOCKET");
+        std::env::set_var("IRLUME_SOCKET", &socket);
+        let first = collect(Duration::from_secs(60), false);
+        let second = collect(Duration::from_secs(60), true);
+        match previous {
+            Some(value) => std::env::set_var("IRLUME_SOCKET", value),
+            None => std::env::remove_var("IRLUME_SOCKET"),
+        }
+        server.join().unwrap();
+
+        let (served_camera, served_capture) = (&served.cameras()[0], served.capture().unwrap());
+        for report in [&first, &second] {
+            let daemon = report.daemon.as_ref().expect("a daemon section");
+            let camera = &daemon.cameras()[0];
+            assert_eq!(camera.descriptor_token, served_camera.descriptor_token);
+            assert!(camera.qualification_token.is_some());
+            assert_ne!(
+                camera.qualification_token,
+                served_camera.qualification_token
+            );
+            let capture = daemon.capture().unwrap();
+            assert_eq!(capture.qualification_context, camera.qualification_token);
+            assert!(capture.runtime_context.is_some());
+            assert_ne!(capture.runtime_context, served_capture.runtime_context);
+        }
+        assert!(first.probe.is_none());
+        let probe = second.probe.as_ref().expect("the probe result");
+        assert_eq!(Some(&probe.snapshot), second.daemon.as_ref());
+        // The same served values give each report its own keyed values.
+        let keyed = |report: &SupportReport| {
+            let daemon = report.daemon.as_ref().unwrap();
+            (
+                daemon.cameras()[0].qualification_token,
+                daemon.capture().unwrap().runtime_context,
+            )
+        };
+        let (first_qualification, first_runtime) = keyed(&first);
+        let (second_qualification, second_runtime) = keyed(&second);
+        assert_ne!(first_qualification, second_qualification);
+        assert_ne!(first_runtime, second_runtime);
     }
 
     #[test]

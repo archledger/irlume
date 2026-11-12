@@ -7,6 +7,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- A support report keys its qualification and runtime context tokens with a
+  key drawn for that report alone and not kept: the camera rows and the
+  capture section of one report still carry matching values, and two reports
+  carry unrelated ones. This covers the text report, the TUI's report and
+  `support-report --json`; the descriptor token, the daemon and the report
+  format are unchanged (ADR-0008, amendment 2026-11-12).
+
 - The bug and hardware issue forms open with where a security problem,
   or one the reporter is not sure about, goes: GitHub's private
   reporting or the e-mail address in SECURITY.md, not a public issue.

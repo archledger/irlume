@@ -1523,7 +1523,7 @@
           }
         },
         "daemon": {
-          "description": "The daemon's share-safe snapshot (uptime, retained history, capture schedule, sanitized camera context, recent share-safe events). Absent when the daemon did not answer; `unavailable` then names why.",
+          "description": "The daemon's share-safe snapshot (uptime, retained history, capture schedule, sanitized camera context, recent share-safe events). Absent when the daemon did not answer; `unavailable` then names why. The cameras' `qualification_token` and the capture's `qualification_context` and `runtime_context` are keyed for each document, so values equal in the daemon's snapshot stay equal within one document and two documents carry unrelated values (ADR-0008, amendment 2026-11-12).",
           "type": "object"
         },
         "unavailable": {

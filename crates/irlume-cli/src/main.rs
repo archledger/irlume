@@ -51,6 +51,7 @@ mod trace;
 mod tui;
 mod uninstall;
 mod upgrade_notice;
+mod where_to_report;
 
 pub(crate) fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     // BOTH standard spellings. `--name=value` used to be invisible here, and the
@@ -415,6 +416,7 @@ fn enroll(args: &[String]) -> std::process::ExitCode {
                      recognition use `irlume profiles add-scan --profile '{profile}'`."
                 );
             }
+            println!("[enroll] if face sign-in stops working, `irlume tui` shows why.");
             std::process::ExitCode::SUCCESS
         }
         Ok(Response::Error(e)) => {
@@ -5505,18 +5507,28 @@ fn doctor_wants_check(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--check")
 }
 
+/// The end of a human doctor run with at least one warning or failure: the
+/// summary line, a blank line, then where to report a problem. Nothing for
+/// a run without either; `unknown` and `info` are not findings.
+fn doctor_closing(summary: crate::doctor_report::Summary) -> Option<String> {
+    if summary.warnings + summary.failures == 0 {
+        return None;
+    }
+    Some(format!(
+        "[doctor] summary: {} warning(s), {} failure(s). Scripts: `irlume doctor --check` exits 1 on warnings, 2 on failures.\n{}",
+        summary.warnings,
+        summary.failures,
+        crate::where_to_report::after_doctor()
+    ))
+}
+
 fn doctor(args: &[String]) -> std::process::ExitCode {
     let wants_check = doctor_wants_check(args);
     let mut report = crate::doctor_report::Report::new(crate::doctor_report::Mode::Human);
     let run = doctor_run(&mut report, args);
     let summary = report.summary();
-    if summary.warnings + summary.failures > 0 {
-        dout!(
-            report,
-            "[doctor] summary: {} warning(s), {} failure(s). Scripts: `irlume doctor --check` exits 1 on warnings, 2 on failures.",
-            summary.warnings,
-            summary.failures
-        );
+    if let Some(closing) = doctor_closing(summary) {
+        dout!(report, "{closing}");
     }
     if wants_check {
         std::process::ExitCode::from(summary.check_exit_code())
@@ -5878,6 +5890,19 @@ fn face_kept_off_login_line(user: &str, dm: &str) -> String {
         "[doctor] ⚠ {user} is enrolled, but {dm}'s login screen has no face line: irlume\n     \
          keeps face off it while it serves remote login screens (the {dm} note below\n     \
          says why and how to turn that off). `irlume login enable` does not change that."
+    )
+}
+
+/// Doctor's line for an active display manager irlume has no wiring recipe
+/// for. The same condition makes the `display-manager` check a warning, so
+/// the run ends with where to report a problem (`doctor_closing`).
+fn unknown_display_manager_line(dm: &str) -> String {
+    format!(
+        "[doctor] ⚠ irlume has no PAM wiring recipe for the active display manager\n     \
+         '{dm}', so face login cannot be wired for it (your password still works).\n     \
+         This is usually a display manager that is new, or was renamed by an update.\n     \
+         Please report its name so we can add it; where to report is at the\n     \
+         end of this output."
     )
 }
 
@@ -6890,14 +6915,7 @@ fn doctor_run(
         );
     }
     if let Some((dm, false)) = crate::pamwire::active_dm_recognized() {
-        dout!(
-            report,
-            "[doctor] ⚠ irlume has no PAM wiring recipe for the active display manager\n     \
-             '{dm}', so face login cannot be wired for it (your password still works).\n     \
-             This is usually a display manager that is new, or was renamed by an update.\n     \
-             Please report it at https://github.com/archledger/irlume/issues so we can\n     \
-             add it."
-        );
+        dout!(report, "{}", unknown_display_manager_line(&dm));
     }
     // authselect / pam-auth-update awareness: on hosts where a distro tool owns
     // the PAM stacks, confirm the self-heal watcher is in place so the user
@@ -8553,6 +8571,74 @@ mod tests {
         assert!(!doctor_wants_check(&[]));
         assert!(!doctor_wants_check(&["--checkout".to_string()]));
         assert!(!doctor_wants_check(&["--check=1".to_string()]));
+    }
+
+    /// A doctor run with a warning or failure ends with its summary line and
+    /// then where to report a problem, the private route first; a run with
+    /// neither prints no closing lines.
+    #[test]
+    fn doctor_closes_with_where_to_report_only_after_findings() {
+        use crate::doctor_report::Summary;
+        assert_eq!(doctor_closing(Summary::default()), None);
+        for (warnings, failures) in [(1, 0), (0, 2), (3, 1)] {
+            let closing = doctor_closing(Summary { warnings, failures }).expect("a closing");
+            let summary = format!(
+                "[doctor] summary: {warnings} warning(s), {failures} failure(s). Scripts: \
+                 `irlume doctor --check` exits 1 on warnings, 2 on failures.\n\n"
+            );
+            assert!(closing.starts_with(&summary), "{closing}");
+            let rest = &closing[summary.len()..];
+            let security = rest
+                .find("https://github.com/archledger/irlume/security\n")
+                .expect("security URL");
+            let issues = rest
+                .find("https://github.com/archledger/irlume/issues/new/choose\n")
+                .expect("issue chooser URL");
+            assert!(security < issues, "{closing}");
+            assert!(rest.contains("attach the file `irlume support-report` writes"));
+            assert!(
+                rest.contains(
+                    "\nDoctor output shows your account name and an added camera's serial\n\
+                     number; you may replace both before posting.\n"
+                ),
+                "{closing}"
+            );
+            assert!(!closing.ends_with('\n'), "dout! adds the newline");
+        }
+    }
+
+    /// Doctor asks for an unknown display manager's name and points to the
+    /// end of its output for where to report, instead of linking the issue
+    /// list itself.
+    #[test]
+    fn an_unknown_display_manager_is_asked_for_by_name_without_a_link() {
+        let line = unknown_display_manager_line("newdm");
+        assert!(line.contains("'newdm'"), "{line}");
+        assert!(
+            line.contains(
+                "Please report its name so we can add it; where to report is at the\n     \
+                 end of this output."
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("https://"), "{line}");
+        assert!(!line.contains('\u{2014}'), "{line}");
+        for row in line.lines() {
+            assert!(row.chars().count() <= 80, "{row}");
+        }
+        // Doctor prints this line, and no longer links the issue list there.
+        // Split literals keep this test's own text from matching.
+        let source = include_str!("main.rs");
+        assert_eq!(
+            source
+                .matches(concat!("unknown_display_manager_line(", "&dm)"))
+                .count(),
+            1
+        );
+        assert!(!source.contains(concat!(
+            "Please report it at https://",
+            "github.com/archledger/irlume/issues so"
+        )));
     }
 
     /// Doctor's unwired-login and polkit lines name `irlume login enable`

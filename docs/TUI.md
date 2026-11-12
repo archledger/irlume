@@ -401,8 +401,11 @@ who started the TUI. The TPM checks (firmware, PCR bank, lockout, storage keys
 and endorsement) come from irlumed's root-only requests, so they read
 `unknown` there. **Full Diagnostics as Administrator** asks first, then runs
 `sudo irlume doctor --user <account>`, the CLI's root readout; it changes
-nothing. The default support report does not capture
+nothing. Both readouts end with where to report a problem when a check
+warns or fails. The default support report does not capture
 camera data; an IR test or camera probe still requires an explicit action.
+After writing the report, the TUI prints its path, with your home shown as
+`~` (in full when the TUI runs as root), and where to report a problem.
 
 ## Faces
 

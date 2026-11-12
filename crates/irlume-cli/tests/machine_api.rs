@@ -99,6 +99,15 @@ fn support_report_json_is_one_document_and_creates_no_file() {
         output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
         1
     );
+    // Where to report is for people: it stays out of the document, also
+    // inside a string.
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for url in [
+        "https://github.com/archledger/irlume/security",
+        "https://github.com/archledger/irlume/issues/new/choose",
+    ] {
+        assert!(!raw.contains(url), "{url} in {raw}");
+    }
     let document: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
     assert_eq!(document["command"], "support-report");
     assert_eq!(document["ok"], true);
@@ -574,6 +583,13 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
         !raw.contains("[doctor]"),
         "the human report must not leak into machine mode: {raw}"
     );
+    // Nor its closing lines, also inside a check's detail.
+    for url in [
+        "https://github.com/archledger/irlume/security",
+        "https://github.com/archledger/irlume/issues/new/choose",
+    ] {
+        assert!(!raw.contains(url), "{url} in {raw}");
+    }
 
     let document: Value = serde_json::from_str(&raw).expect("valid JSON");
     assert_eq!(document["command"], "doctor");

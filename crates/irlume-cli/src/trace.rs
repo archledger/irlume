@@ -1007,7 +1007,6 @@ mod tests {
     };
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn fixture_record(sequence: u64, event: TraceEventKind, terminal: bool) -> TraceRecord {
         TraceRecord {
@@ -1022,15 +1021,45 @@ mod tests {
         }
     }
 
-    fn sandbox(label: &str) -> PathBuf {
-        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    struct Sandbox(PathBuf);
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new, empty scratch directory for one test, and the guard that
+    /// removes it. Bind the guard to a named variable so that it lives to
+    /// the end of the test. The name is random, not built from the process
+    /// ID: a later run in another PID namespace can get the same process ID
+    /// and would meet a directory an earlier run left. The random part is
+    /// 32 bits, kept short because tests bind `daemon.sock` here and
+    /// `sun_path` holds 108 bytes.
+    fn sandbox(label: &str) -> (PathBuf, Sandbox) {
         let path = std::env::temp_dir().join(format!(
-            "irlume-trace-{label}-{}-{sequence}",
-            std::process::id()
+            "irlume-trace-{label}-{:08x}",
+            rand::random::<u32>()
         ));
         std::fs::create_dir(&path).unwrap();
-        path
+        (path.clone(), Sandbox(path))
+    }
+
+    #[test]
+    fn sandboxes_are_distinct_and_removed_when_their_test_fails() {
+        let (first, guard) = sandbox("unwind");
+        let (second, _second) = sandbox("unwind");
+        assert_ne!(first, second);
+        std::fs::write(first.join("left.txt"), b"x").unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = guard;
+            panic!("fixture failure");
+        });
+        assert!(unwound.is_err());
+        assert!(!first.exists());
+        assert!(second.is_dir());
     }
 
     fn serve_fixture(listener: UnixListener, limits: TraceLimits, records: Vec<TraceRecord>) {
@@ -1115,7 +1144,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("setup-unavailable");
+        let (dir, _sandbox) = sandbox("setup-unavailable");
         let target = dir.join("capture.jsonl");
         let unrelated = dir.join("untouched.txt");
         std::fs::write(&unrelated, b"keep").unwrap();
@@ -1170,7 +1199,7 @@ mod tests {
         ];
         let mut leftovers = Vec::new();
         for (label, mut reply, expected_error) in cases {
-            let dir = sandbox(label);
+            let (dir, _sandbox) = sandbox(label);
             let socket = dir.join("daemon.sock");
             let target = dir.join("capture.jsonl");
             let unrelated = dir.join("untouched.txt");
@@ -1225,7 +1254,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("setup-cleanup-error");
+        let (dir, _sandbox) = sandbox("setup-cleanup-error");
         let socket = dir.join("daemon.sock");
         let target = dir.join("capture.jsonl");
         let fixture_dir = dir.clone();
@@ -1278,7 +1307,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("storage-before-subscribe");
+        let (dir, _sandbox) = sandbox("storage-before-subscribe");
         let socket = dir.join("daemon.sock");
         let invalid_parent = dir.join("not-a-directory");
         std::fs::write(&invalid_parent, b"synthetic").unwrap();
@@ -1347,7 +1376,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("publish");
+        let (dir, _sandbox) = sandbox("publish");
         let socket = dir.join("daemon.sock");
         let target = dir.join("capture.jsonl");
         let limits = TraceLimits::bounded(10);
@@ -1394,7 +1423,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("negotiated-byte-limit");
+        let (dir, _sandbox) = sandbox("negotiated-byte-limit");
         let socket = dir.join("daemon.sock");
         let target = dir.join("capture.jsonl");
         let mut limits = TraceLimits::bounded(10);
@@ -1436,7 +1465,7 @@ mod tests {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = sandbox("partial");
+        let (dir, _sandbox) = sandbox("partial");
         let socket = dir.join("daemon.sock");
         let target = dir.join("capture.jsonl");
         let limits = TraceLimits::bounded(10);
@@ -1475,7 +1504,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         for schema in [1, CURRENT_TRACE_SCHEMA_VERSION] {
-            let dir = sandbox("negotiated");
+            let (dir, _sandbox) = sandbox("negotiated");
             let socket = dir.join("daemon.sock");
             let target = dir.join("capture.jsonl");
             let limits = TraceLimits::bounded(10);
@@ -1532,7 +1561,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         for mislabeled_event in [false, true] {
-            let dir = sandbox("schema-refusal");
+            let (dir, _sandbox) = sandbox("schema-refusal");
             let socket = dir.join("daemon.sock");
             let target = dir.join("capture.jsonl");
             let limits = TraceLimits::bounded(10);
@@ -1867,7 +1896,7 @@ mod tests {
             570_000,
             true,
         ));
-        let dir = sandbox("analyze-v5");
+        let (dir, _sandbox) = sandbox("analyze-v5");
         let path = dir.join("trace.jsonl");
         let mut bytes = Vec::new();
         for record in &records {
@@ -2100,7 +2129,7 @@ mod tests {
         // group, not this operation.
         records.last_mut().unwrap().operation_id =
             irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
-        let dir = sandbox("analyze-partial");
+        let (dir, _sandbox) = sandbox("analyze-partial");
         let path = dir.join("trace.jsonl");
         let mut bytes = Vec::new();
         for record in &records {
@@ -2170,7 +2199,7 @@ mod tests {
             }
             std::fs::write(path, bytes).unwrap();
         };
-        let dir = sandbox("analyze-refusals");
+        let (dir, _sandbox) = sandbox("analyze-refusals");
         let older = dir.join("older.jsonl");
         let mut bytes = Vec::new();
         for record in &records {
@@ -2604,7 +2633,7 @@ mod tests {
             }
             std::fs::write(path, bytes).unwrap();
         };
-        let dir = sandbox("explain-v5");
+        let (dir, _sandbox) = sandbox("explain-v5");
         let current = dir.join("current.jsonl");
         write(&current, &records);
         let rendered = explain(&current).unwrap();

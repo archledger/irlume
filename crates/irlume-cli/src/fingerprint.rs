@@ -1169,6 +1169,8 @@ mod tests {
             "auth sufficient pam_fprintd.so\nauth include system-auth\n"
         );
         let _ = std::fs::remove_file(&path);
+        // write_pam_edit backs the original up to `<path>.pre-irlume`.
+        let _ = std::fs::remove_file(format!("{}.pre-irlume", path.display()));
     }
 
     #[test]

@@ -257,4 +257,27 @@ pub(crate) mod testenv {
             }
         }
     }
+
+    /// Holds a directory at mode 0300 (write and search, no read) and sets it
+    /// to 0700 when dropped. Declare it after the guard that removes the
+    /// directory, so it drops first. Where read permission does not bind
+    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH) the directory still
+    /// opens.
+    pub(crate) struct WithoutReadPermission<'a>(&'a std::path::Path);
+
+    impl<'a> WithoutReadPermission<'a> {
+        pub(crate) fn set(dir: &'a std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
+                .expect("chmod 0300");
+            Self(dir)
+        }
+    }
+
+    impl Drop for WithoutReadPermission<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
 }

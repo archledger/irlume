@@ -157,9 +157,11 @@ useful contribution right now:
 [Security](SECURITY.md)
 
 If irlume is useful to you and you feel like it, star the repository to help
-others find it; there is also a Ko-fi, or PayPal through the Sponsor button.
+others find it; there is also GitHub Sponsors, a Ko-fi, or PayPal, all
+through the Sponsor button.
 No obligation; the project stays free and GPL either way.
 
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-sponsor-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/archledger)
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/O3J824YGEK)
 
 ---

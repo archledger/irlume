@@ -7088,6 +7088,405 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// The record on disk as JSON, or `Null` when it cannot be read or
+    /// parsed, so a missing or broken record fails an assertion only after
+    /// the test's cleanup.
+    fn record_value() -> serde_json::Value {
+        std::fs::read(irlume_common::state_dir().join("tpm-storage-key"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// `record` with `field` set to `value`, or without it when `value` is
+    /// `Null`: a whole record for a test to write or to expect. A `record`
+    /// that is not an object is returned unchanged.
+    fn with_field(
+        record: &serde_json::Value,
+        field: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut next = record.clone();
+        if let Some(object) = next.as_object_mut() {
+            if value.is_null() {
+                object.remove(field);
+            } else {
+                object.insert(field.to_owned(), value);
+            }
+        }
+        next
+    }
+
+    /// What one start's storage-key steps returned ([`start_in`]).
+    struct Start {
+        ensured: Result<(Option<storage_key::Outcome>, bool)>,
+        repointed: Result<Vec<storage_key::Repointed>>,
+        moved: Vec<Result<Option<MoveGain>>>,
+        settled: Result<Option<storage_key::Settled>>,
+        /// The proofs and evictions the retirement asked for.
+        calls: (usize, usize),
+        /// Each record the census and the retirement handed to their save,
+        /// in order.
+        saves: Vec<serde_json::Value>,
+        /// The record after the start ([`record_value`]).
+        record: serde_json::Value,
+    }
+
+    /// What [`Start::present`] and [`Start::settled`] hand on to a test.
+    struct AfterStart {
+        census: storage_key::Census,
+        retirement: Option<storage_key::Retirement>,
+        calls: (usize, usize),
+        saves: Vec<serde_json::Value>,
+        record: serde_json::Value,
+    }
+
+    /// irlumed's storage-key steps at one start, in main.rs's order (pinned
+    /// there by
+    /// `the_startup_storage_key_steps_run_in_the_order_the_core_start_tests_follow`):
+    /// the start-up step, the repoint, the template-key move of each account
+    /// in `accounts`, then the census and the retirement in boot `boot`, told
+    /// whether the start-up step derived a key (a step that failed counts as
+    /// one that did, as in main.rs). Only the census and the retirement are
+    /// given `boot`: the start-up step and the moves read this boot's ID.
+    /// Every result is kept, as irlumed logs each and goes on. The steps are
+    /// called in this process, not in irlumed. Not run: the IR compatibility
+    /// sweep before them, the startup TPM gate and the log lines; irlumed
+    /// moves the template keys of the accounts `storage::list_users` lists,
+    /// here those named. The retirement's proofs and evictions are counted
+    /// through [`Counted`], and the census and the retirement write through
+    /// [`write_record`].
+    fn start_in(boot: &str, accounts: &[&str]) -> Start {
+        let ensured = storage_key::ensure_at_start_reporting();
+        let derived = ensured.as_ref().map_or(true, |(_, derived)| *derived);
+        let repointed = storage_key::repoint_at_start();
+        let moved = accounts
+            .iter()
+            .map(|user| crate::template_key::move_to_stronger_policy(user))
+            .collect();
+        let calls = RetirementCalls::default();
+        let mut saves = Vec::new();
+        let settled = storage_key::settle_in(
+            Some(boot),
+            derived,
+            || Counted::open(&calls),
+            |next| {
+                saves.push(serde_json::to_value(next).unwrap_or_default());
+                write_record(next)
+            },
+        );
+        Start {
+            ensured,
+            repointed,
+            moved,
+            settled,
+            calls: calls.get(),
+            saves,
+            record: record_value(),
+        }
+    }
+
+    impl Start {
+        /// Asserts that the repoint changed nothing, that the template-key
+        /// moves gave `moved` and that the census ran on a recorded DA-exempt
+        /// key; returns the start-up step's answer and the rest. For use
+        /// after the cleanup.
+        fn settled(
+            self,
+            moved: &[Option<MoveGain>],
+        ) -> (Result<(Option<storage_key::Outcome>, bool)>, AfterStart) {
+            assert_eq!(
+                self.repointed.expect("the repoint"),
+                Vec::new(),
+                "nothing to repoint"
+            );
+            let got: Vec<_> = self
+                .moved
+                .into_iter()
+                .map(|result| result.expect("the move"))
+                .collect();
+            assert_eq!(got, moved, "the template-key moves");
+            let settled = self
+                .settled
+                .expect("the census")
+                .expect("a DA-exempt key is recorded");
+            let after = AfterStart {
+                census: settled.census,
+                retirement: settled.retirement,
+                calls: self.calls,
+                saves: self.saves,
+                record: self.record,
+            };
+            (self.ensured, after)
+        }
+
+        /// [`Start::settled`], asserting also that the start-up step found
+        /// the DA-exempt key at `preferred` and derived nothing.
+        fn present(self, preferred: u32, moved: &[Option<MoveGain>]) -> AfterStart {
+            let (ensured, after) = self.settled(moved);
+            assert!(
+                matches!(
+                    ensured.expect("the start-up step"),
+                    (Some(storage_key::Outcome::Present { handle }), false) if handle == preferred
+                ),
+                "the start-up step finds the DA-exempt key and derives nothing"
+            );
+            after
+        }
+    }
+
+    /// ADR-0034 §3.3 and the Phase 3 amendment, on swtpm with fake later
+    /// boots: recovery from a record that reads as none. After the
+    /// envelopes moved onto the DA-exempt key and a start in boot A marked
+    /// the original key unused, the test writes over the record in two
+    /// cases, one after the other. The first is boot A's record with a newer
+    /// release's version, which this release finds after a downgrade or an
+    /// edit from outside. The second is the first half of boot A's bytes,
+    /// which does not parse; a file system that does not keep a rename
+    /// atomic, or an edit from outside, can leave it, and irlume's writer on
+    /// its own never does. In each case the first start in this boot reads no
+    /// record: the start-up step derives the DA-exempt key and adopts the
+    /// copy at its handle by its TPM name, persisting nothing, which counts
+    /// as a derivation, and writes a record holding that key only, so the
+    /// census marks this boot and nothing is retired. The first start in a
+    /// later boot records the original key again, which derives it, and
+    /// retires nothing. From the record cut short, the start in the boot
+    /// after retires the key with one proof and one eviction. Each start is
+    /// irlumed's storage-key steps in its order, without its IR
+    /// compatibility sweep ([`start_in`]). The template key and the login
+    /// password unseal through the DA-exempt key after the record is written
+    /// again and after the retirement. This is the recorded state on a real
+    /// TPM and real files, not a process kill or a power loss.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_record_that_reads_as_none_is_rebuilt_and_the_retirement_waits_two_more_starts() {
+        use crate::storage_key::{Census, Outcome, Retirement};
+        use serde_json::json;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("record-reads-as-none");
+        let _prediction = PredictionFixture::new();
+        // The first start of each case is in this boot.
+        let boot = irlume_common::boot_id().expect("this boot's ID");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4177);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let record_path = irlume_common::state_dir().join("tpm-storage-key");
+        // Whether the template key and the login password unseal to what
+        // was sealed, compared here so that no assertion prints a secret.
+        // `load_key` moves the envelope when a move is available, as the
+        // start's move does; each read follows a start whose move found
+        // nothing to move (asserted below).
+        let unsealed = || {
+            (
+                crate::template_key::load_key("alice")
+                    .map(|unsealed| unsealed.as_slice() == key.as_slice()),
+                crate::keyring::unseal_password("alice")
+                    .map(|unsealed| unsealed.as_slice() == b"alice-password"),
+            )
+        };
+        let due = retirement_due(b"alice-password");
+        let marked = record_value();
+        let due_handles = handles();
+
+        // Boot A's record with a newer release's version.
+        let newer = serde_json::to_vec_pretty(&with_field(&marked, "version", json!(2)))
+            .unwrap_or_default();
+        let newer_written = std::fs::write(&record_path, &newer);
+        let newer_first = start_in(&boot, &["alice"]);
+        let newer_first_handles = handles();
+        let newer_first_unsealed = unsealed();
+        let newer_later = start_in(BOOT_B, &["alice"]);
+        // The first case's starts persisted, evicted and moved nothing
+        // (asserted below); this writes over the record they changed. The
+        // first half of the bytes boot A wrote, which does not parse.
+        let cut = due.written[..due.written.len() / 2].to_vec();
+        let cut_written = std::fs::write(&record_path, &cut);
+        let cut_first = start_in(&boot, &["alice"]);
+        let cut_first_handles = handles();
+        let cut_first_unsealed = unsealed();
+        let cut_later = start_in(BOOT_B, &["alice"]);
+        let cut_after_that = start_in(BOOT_C, &["alice"]);
+        let after_retirement = handles();
+        let after_retirement_unsealed = unsealed();
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        due.check(PREFERRED);
+        // The state before each case.
+        assert_eq!(
+            (&marked["version"], &marked["unused_since"]),
+            (&json!(1), &json!(BOOT_A)),
+            "boot A's record marks the original key unused in boot A: {marked}"
+        );
+        assert_eq!(
+            marked["original"]["matched"],
+            json!(true),
+            "boot A's record keeps the original key as matching: {marked}"
+        );
+        assert!(
+            newer_written.is_ok() && serde_json::from_slice::<storage_key::Record>(&newer).is_ok(),
+            "boot A's record with a newer version is in place, and parses as a record"
+        );
+        assert!(
+            cut_written.is_ok()
+                && !cut.is_empty()
+                && serde_json::from_slice::<serde_json::Value>(&cut).is_err(),
+            "the first half of boot A's record is in place, and does not parse"
+        );
+        let unused_since_this_boot = Census::Unused {
+            since: boot.clone(),
+        };
+        let rebuilt = json!({
+            "version": 1,
+            "persisted": marked["persisted"],
+            "unused_since": boot,
+        });
+        let recorded_again = with_field(&rebuilt, "original", marked["original"].clone());
+        for (case, first, first_handles, first_unsealed, later) in [
+            (
+                "a newer release's record",
+                newer_first,
+                newer_first_handles,
+                newer_first_unsealed,
+                newer_later,
+            ),
+            (
+                "a record cut short",
+                cut_first,
+                cut_first_handles,
+                cut_first_unsealed,
+                cut_later,
+            ),
+        ] {
+            // The first start in this boot.
+            let (ensured, first) = first.settled(&[None]);
+            assert!(
+                matches!(
+                    ensured.expect("the start-up step"),
+                    (Some(Outcome::Adopted { handle }), true) if handle == PREFERRED
+                ),
+                "{case}: the start-up step reads no record, derives the DA-exempt key and \
+                 adopts the copy at its handle"
+            );
+            assert_eq!(
+                first.census, unused_since_this_boot,
+                "{case}: the census marks this boot"
+            );
+            assert_eq!(
+                (first.retirement, first.calls),
+                (None, (0, 0)),
+                "{case}: no proof and no eviction"
+            );
+            assert_eq!(
+                first.saves,
+                [rebuilt.clone()],
+                "{case}: the census writes the mark of this boot"
+            );
+            assert_eq!(
+                first.record, rebuilt,
+                "{case}: the record holds the DA-exempt key and the mark of this boot only"
+            );
+            assert_eq!(
+                first_handles, due_handles,
+                "{case}: nothing is persisted or evicted"
+            );
+            assert!(
+                matches!(first_unsealed, (Ok(true), Ok(true))),
+                "{case}: the template key and the login password unseal: {first_unsealed:?}"
+            );
+            // The first start in boot B.
+            let (ensured, later) = later.settled(&[None]);
+            assert!(
+                matches!(
+                    ensured.expect("the start-up step"),
+                    (Some(Outcome::Present { handle }), true) if handle == PREFERRED
+                ),
+                "{case}: the start-up step finds the DA-exempt key and derives the original key \
+                 to record it"
+            );
+            assert_eq!(
+                later.census, unused_since_this_boot,
+                "{case}: the mark of this boot stands"
+            );
+            assert_eq!(
+                (later.retirement, later.calls),
+                (None, (0, 0)),
+                "{case}: a start that derived a key retires nothing"
+            );
+            assert_eq!(
+                later.saves,
+                Vec::<serde_json::Value>::new(),
+                "{case}: the census writes no record"
+            );
+            assert_eq!(
+                later.record, recorded_again,
+                "{case}: the original key is recorded again as boot A's record had it"
+            );
+        }
+        // From the record cut short, the start in boot C.
+        let after_that = cut_after_that.present(PREFERRED, &[None]);
+        assert_eq!(
+            after_that.census, unused_since_this_boot,
+            "the mark of this boot stands"
+        );
+        assert_eq!(
+            after_that.retirement,
+            Some(Retirement::Retired { handle: original }),
+            "the start in boot C retires the original key"
+        );
+        assert_eq!(after_that.calls, (1, 1), "one proof and one eviction");
+        assert_eq!(
+            after_that.saves,
+            [
+                with_field(
+                    &recorded_again,
+                    "retirement_attempt",
+                    json!({ "boot_id": BOOT_C })
+                ),
+                recorded_again.clone(),
+            ],
+            "the attempt, then the record as the start before wrote it"
+        );
+        assert_eq!(
+            after_that.record, recorded_again,
+            "the record as the start before wrote it"
+        );
+        assert!(
+            !after_retirement.contains(&original) && after_retirement.contains(&PREFERRED),
+            "the original key is evicted and the DA-exempt key stays: {after_retirement:x?}"
+        );
+        assert!(
+            matches!(after_retirement_unsealed, (Ok(true), Ok(true))),
+            "the template key and the login password unseal after the retirement: \
+             {after_retirement_unsealed:?}"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
     /// ADR-0034, Phase 3 amendment (#1073 item 2), on swtpm: a recorded
     /// DA-exempt key with the ROCA fingerprint (a key with the DA-exempt
     /// template's shape and another modulus, which the test names weak,

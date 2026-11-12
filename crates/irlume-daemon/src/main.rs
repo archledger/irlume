@@ -27594,6 +27594,56 @@ mod tests {
         );
     }
 
+    /// irlumed's storage-key steps at a start run in this order, before the
+    /// engine is marked ready: the IR compatibility sweep's loads; the step
+    /// that persists the DA-exempt key, whose answer alone tells the census
+    /// whether this start derived a key (a step that failed counts as one
+    /// that did); the repoint; each account's template-key move; then the
+    /// census and the retirement. Checked in this file's source text, not
+    /// by running irlumed. The irlume-core swtpm tests that go through
+    /// `tpm::tests::start_in` run the same steps in this order, without the
+    /// sweep: a change of order here is a change to that helper too.
+    #[test]
+    fn the_startup_storage_key_steps_run_in_the_order_the_core_start_tests_follow() {
+        let source = include_str!("main.rs");
+        // The production start only, cut out first, so that the steps below,
+        // which this test also holds, are found in it alone.
+        let start = source
+            .split("let sweep_needed = !irlume_core::storage::retag_done_for(")
+            .nth(1)
+            .expect("the IR compatibility sweep")
+            .split("engine_ready.store(true")
+            .next()
+            .expect("the engine marked ready");
+        let steps = [
+            "irlume_core::storage::load(&user)",
+            "let mut derived_at_start = true;",
+            "irlume_core::storage_key::ensure_at_start_reporting()",
+            "derived_at_start = *derived;",
+            "irlume_core::storage_key::repoint_at_start()",
+            "irlume_core::template_key::move_to_stronger_policy(&user)",
+            "irlume_core::storage_key::settle_at_start(derived_at_start)",
+        ];
+        let mut from = 0;
+        for step in steps {
+            assert_eq!(
+                start.matches(step).count(),
+                1,
+                "{step}: once in irlumed's start"
+            );
+            let at = start[from..]
+                .find(step)
+                .unwrap_or_else(|| panic!("{step}: after the step before it"));
+            from += at + step.len();
+        }
+        assert_eq!(
+            start.matches("derived_at_start").count(),
+            3,
+            "derived_at_start: declared, set from the start-up step's answer and read by the \
+             census, nothing else"
+        );
+    }
+
     #[test]
     fn remove_camera_group_removes_the_group_through_dispatch() {
         let _g = env_lock();

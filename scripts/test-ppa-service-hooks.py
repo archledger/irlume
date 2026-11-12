@@ -29,7 +29,7 @@ UNITS = (DAEMON, SOCKET, *RECONCILE)
 # Where to report a problem: what the postinst prints on a first install, the
 # lines scripts/install.sh prints after a failure or for a daemon that is not
 # active.
-SECURITY_URL = "https://github.com/archledger/irlume/security"
+SECURITY_URL = "https://github.com/archledger/irlume/security/advisories/new"
 CHOOSER_URL = "https://github.com/archledger/irlume/issues/new/choose"
 WHERE_TO_REPORT = (
     "Security problem (a photo, video, mask or another person got in,",

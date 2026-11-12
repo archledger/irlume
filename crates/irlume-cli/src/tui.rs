@@ -18092,7 +18092,7 @@ mod tests {
             )
         );
         assert!(
-            printed.contains("https://github.com/archledger/irlume/security\n"),
+            printed.contains("https://github.com/archledger/irlume/security/advisories/new\n"),
             "{printed}"
         );
         assert_eq!(

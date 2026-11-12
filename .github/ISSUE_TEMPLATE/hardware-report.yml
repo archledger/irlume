@@ -12,8 +12,8 @@ body:
         **Security problem, or not sure?** If a photo, video, mask or another
         person got in, face sign-in worked without your face, or face data was
         exposed, do not file it here and do not post it publicly. Report it
-        privately: https://github.com/archledger/irlume/security (or the
-        e-mail address in
+        privately: https://github.com/archledger/irlume/security/advisories/new
+        (or the e-mail address in
         [SECURITY.md](https://github.com/archledger/irlume/blob/main/SECURITY.md)).
 
 

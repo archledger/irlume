@@ -34,7 +34,7 @@ FEDORA_PRESET = [line.split()[1] for line in
 # Where to report a problem: what the Arch and Debian hooks print on a first
 # install, the lines scripts/install.sh prints after a failure or for a daemon
 # that is not active.
-SECURITY_URL = "https://github.com/archledger/irlume/security"
+SECURITY_URL = "https://github.com/archledger/irlume/security/advisories/new"
 CHOOSER_URL = "https://github.com/archledger/irlume/issues/new/choose"
 WHERE_TO_REPORT = (
     "Security problem (a photo, video, mask or another person got in,",

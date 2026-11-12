@@ -8589,7 +8589,7 @@ mod tests {
             assert!(closing.starts_with(&summary), "{closing}");
             let rest = &closing[summary.len()..];
             let security = rest
-                .find("https://github.com/archledger/irlume/security\n")
+                .find("https://github.com/archledger/irlume/security/advisories/new\n")
                 .expect("security URL");
             let issues = rest
                 .find("https://github.com/archledger/irlume/issues/new/choose\n")

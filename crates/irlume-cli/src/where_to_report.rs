@@ -17,7 +17,7 @@ const WHERE_TO_REPORT: &str = "\
 Security problem (a photo, video, mask or another person got in,
 face sign-in worked without your face, or face data was exposed),
 or not sure? Never post it publicly. Report it privately:
-https://github.com/archledger/irlume/security
+https://github.com/archledger/irlume/security/advisories/new
 or the e-mail address in SECURITY.md.
 Anything else: https://github.com/archledger/irlume/issues/new/choose";
 
@@ -227,7 +227,7 @@ pub(crate) fn display_path(path: &Path, homes: &[PathBuf]) -> String {
 mod tests {
     use super::*;
 
-    const SECURITY_URL: &str = "https://github.com/archledger/irlume/security";
+    const SECURITY_URL: &str = "https://github.com/archledger/irlume/security/advisories/new";
     const ISSUES_URL: &str = "https://github.com/archledger/irlume/issues/new/choose";
 
     /// Every value a report run can take.
@@ -557,7 +557,7 @@ mod tests {
 Security problem (a photo, video, mask or another person got in,
 face sign-in worked without your face, or face data was exposed),
 or not sure? Never post it publicly. Report it privately:
-https://github.com/archledger/irlume/security
+https://github.com/archledger/irlume/security/advisories/new
 or the e-mail address in SECURITY.md.
 Anything else: https://github.com/archledger/irlume/issues/new/choose
 ";

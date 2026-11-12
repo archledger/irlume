@@ -458,7 +458,7 @@ fn support_report_publishes_one_private_inspectable_text_file() {
     );
     // Where to report follows, the private route first.
     let security = stdout
-        .find("\nhttps://github.com/archledger/irlume/security\n")
+        .find("\nhttps://github.com/archledger/irlume/security/advisories/new\n")
         .unwrap_or_else(|| panic!("no security line: {stdout}"));
     let issues = stdout
         .find("\nAnything else: https://github.com/archledger/irlume/issues/new/choose\n")
@@ -524,7 +524,7 @@ fn a_root_support_report_says_who_can_read_it() {
     assert!(!stdout.contains("attach this report file"), "{stdout}");
     assert!(!stdout.contains("every account"), "{stdout}");
     assert!(
-        stdout.contains("\nhttps://github.com/archledger/irlume/security\n"),
+        stdout.contains("\nhttps://github.com/archledger/irlume/security/advisories/new\n"),
         "{stdout}"
     );
     let text = std::fs::read_to_string(&output).unwrap();
@@ -621,7 +621,7 @@ fn a_user_report_from_an_older_irlumed_asks_for_one_made_after_a_restart() {
         let text = std::fs::read_to_string(&output).unwrap();
         let checklist = text.split_once("Privacy checklist\n").unwrap().1;
         assert!(
-            stdout.contains("\nhttps://github.com/archledger/irlume/security\n"),
+            stdout.contains("\nhttps://github.com/archledger/irlume/security/advisories/new\n"),
             "{stdout}"
         );
         if is_root() {
@@ -2863,7 +2863,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
         .find("\n[doctor] summary: ")
         .unwrap_or_else(|| panic!("no summary line: {out}"));
     let security = out
-        .find("\nhttps://github.com/archledger/irlume/security\n")
+        .find("\nhttps://github.com/archledger/irlume/security/advisories/new\n")
         .unwrap_or_else(|| panic!("no security line: {out}"));
     let issues = out
         .find("\nAnything else: https://github.com/archledger/irlume/issues/new/choose\n")
@@ -2888,7 +2888,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
         .find("\n[doctor] summary: ")
         .unwrap_or_else(|| panic!("no summary line: {out}"));
     assert!(
-        out[summary..].contains("\nhttps://github.com/archledger/irlume/security\n"),
+        out[summary..].contains("\nhttps://github.com/archledger/irlume/security/advisories/new\n"),
         "{out}"
     );
     let check = upgrade_check(&sb);

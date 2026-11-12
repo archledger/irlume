@@ -103,7 +103,7 @@ fn support_report_json_is_one_document_and_creates_no_file() {
     // inside a string.
     let raw = String::from_utf8_lossy(&output.stdout);
     for url in [
-        "https://github.com/archledger/irlume/security",
+        "https://github.com/archledger/irlume/security/advisories/new",
         "https://github.com/archledger/irlume/issues/new/choose",
     ] {
         assert!(!raw.contains(url), "{url} in {raw}");
@@ -585,7 +585,7 @@ fn doctor_json_reports_every_check_with_a_stable_id() {
     );
     // Nor its closing lines, also inside a check's detail.
     for url in [
-        "https://github.com/archledger/irlume/security",
+        "https://github.com/archledger/irlume/security/advisories/new",
         "https://github.com/archledger/irlume/issues/new/choose",
     ] {
         assert!(!raw.contains(url), "{url} in {raw}");

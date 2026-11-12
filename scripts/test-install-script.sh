@@ -219,12 +219,12 @@ chmod +x "$work"/bin/curl "$work"/bin/gpg "$work"/bin/add-apt-repository "$work"
   "$work"/bin/dpkg-query "$work"/bin/sudo
 
 # Where install.sh says to report a problem, as stderr shows it without colour.
-security_url='https://github.com/archledger/irlume/security'
+security_url='https://github.com/archledger/irlume/security/advisories/new'
 chooser_url='https://github.com/archledger/irlume/issues/new/choose'
 block='[irlume] Security problem (a photo, video, mask or another person got in,
 [irlume] face sign-in worked without your face, or face data was exposed),
 [irlume] or not sure? Never post it publicly. Report it privately:
-[irlume] https://github.com/archledger/irlume/security
+[irlume] https://github.com/archledger/irlume/security/advisories/new
 [irlume] or the e-mail address in SECURITY.md.
 [irlume] Anything else: https://github.com/archledger/irlume/issues/new/choose
 [irlume] Your own words are fine; paste the lines above, not the sudo prompt.'
@@ -297,7 +297,8 @@ want_verify_failure() {
   want_rc 1
   want_err "$1"
   want_err 'Do not override verification or install the download by hand;'
-  want_err "report it privately: $security_url"
+  [[ $'\n'"$(cat "$work/plain")"$'\n' == *$'\n''[irlume] report it privately:'$'\n''[irlume] '"$security_url"$'\n'* ]] \
+    || fail "$label: stderr lacks the private route after the verification failure"
   want_no_err 'IRLUME_INSECURE_NO_SIG'
   want_no_err 'The machine side is ready.'
   want_block 2

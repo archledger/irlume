@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- "Report it privately" now gives the address of the private report
+  form itself,
+  `https://github.com/archledger/irlume/security/advisories/new`, in
+  the lines that end `irlume support-report` and human `irlume doctor`
+  output with a warning or failure, in `scripts/install.sh`, in the
+  Arch, Debian and PPA package scripts and in the two issue forms. It
+  gave the repository's Security page, where a reporter first had to
+  find the "Report a vulnerability" button (#1329).
+
 - The camera-busy texts for a camera only irlume holds, and irlumed's
   journal lines for a caught panic, point to `irlume support-report`
   instead of `irlume doctor` output or a backtrace that release builds

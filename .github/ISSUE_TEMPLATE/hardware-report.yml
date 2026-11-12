@@ -5,16 +5,51 @@ labels: ["hardware"]
 body:
   - type: markdown
     attributes:
-      value: |
-        Most hardware fixes start from the same three command outputs. Filling them in
-        up front usually saves a full round-trip. If you can, also attach the
-        output of `irlume support-report` (sanitized and safe to share), and
-        `irlume camera census --json` (it classifies every camera-like device
-        with the evidence each row keyed on, so "broken, unsupported class, or
-        configuration" is answered before the first reply). Before filing, also
-        try the two-minute kernel check in
+      # Folded on purpose: GitHub shows every newline of this text as a line
+      # break, so a paragraph is one folded line, and two blank lines
+      # separate paragraphs.
+      value: >
+        **Security problem, or not sure?** If a photo, video, mask or another
+        person got in, face sign-in worked without your face, or face data was
+        exposed, do not file it here and do not post it publicly. Report it
+        privately: https://github.com/archledger/irlume/security (or the
+        e-mail address in
+        [SECURITY.md](https://github.com/archledger/irlume/blob/main/SECURITY.md)).
+
+
+        A report in your own words is fine; if a command below does not run,
+        say so in its box.
+
+
+        Most hardware fixes start from the same three command outputs.
+        Filling them in up front usually saves a full round-trip.
+
+
+        If you can, also attach the file `irlume support-report` writes: run
+        it as your own user, not as root or with sudo, read it, then attach
+        it in the last box ("What happened"), since the other boxes take
+        text only. The file has no frames, templates, credentials, user
+        names, camera serial numbers, raw device paths, journal text or
+        scores. It does list when your account recently used irlume (each
+        face or keyring attempt, and how it ended), your kernel version, and
+        how your cameras connect (USB IDs, ports, drivers). It lists every
+        account's attempts, not only yours, when it is made as root, with
+        irlume older than 0.15.0, or with a daemon still running from an
+        older version. A file is uploaded as soon as you attach it, and
+        anyone with its link can open it.
+
+
+        Also add `irlume camera census --json` (it classifies every
+        camera-like device with the evidence each row keyed on, so "broken,
+        unsupported class, or configuration" is answered before the first
+        reply). Before filing, also try the two-minute kernel check in
         docs/DEBUGGING.md ("Cameras: check the kernel first"): most camera
         misbehavior has a uvcvideo quirk-table entry for your exact USB ID.
+
+
+        Never paste or attach captures, embeddings, template files,
+        `irlume trace` files, or the output of `irlume identify` or
+        `irlume status`.
   - type: input
     id: machine
     attributes:
@@ -34,6 +69,14 @@ body:
     id: doctor
     attributes:
       label: Output of `irlume doctor`
+      description: >
+        Your account name appears in its `templates (...)` and
+        `sealed storage (...)` lines, in its `pam_faillock` lines when run
+        with sudo, and in some warnings. If you added a second camera, its
+        `camera group` lines can show that camera's serial number. A file
+        path shows your home folder only if you pointed irlume at a file
+        there yourself. You may replace your account name, for example with
+        `user`, and that serial number before you paste.
       render: text
     validations:
       required: true
@@ -56,6 +99,14 @@ body:
     id: problem
     attributes:
       label: What happened, and what you expected
-      description: If login or enrollment failed, add the relevant lines from `irlume logs --since "10 min ago"`
+      description: >
+        Attach the support report file here if you made one (see the top of
+        this form). If login or enrollment failed, paste lines from
+        `irlume logs --since "10 min ago"` only if you have no report file or
+        a maintainer asks. They show your user and computer names, and can
+        show face profile names and face-match scores: replace the names and
+        delete the scores first. Paste no line from a time when debug logging
+        was on; `irlume logs debug` tells only whether it is on now, not
+        whether it was.
     validations:
       required: true

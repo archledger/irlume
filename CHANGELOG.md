@@ -5,6 +5,21 @@ All notable changes to irlume are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- The bug and hardware issue forms open with where a security problem,
+  or one the reporter is not sure about, goes: GitHub's private
+  reporting or the e-mail address in SECURITY.md, not a public issue.
+  They say what each output they ask for holds: the support report file
+  (no frames, templates, credentials, user names, camera serial numbers,
+  raw device paths, journal text or scores; it lists when the account
+  recently used irlume and how each attempt ended, the kernel version
+  and how the cameras connect), `irlume doctor` output (the account
+  name and, once a second camera was added, that camera's serial
+  number) and journal lines (user and computer names, and possibly
+  profile names and face-match scores). They no longer call the report
+  "sanitized and safe to share" (#1329).
+
 ### Fixed
 
 - An unseal that the TPM refuses on its policy reads the PCRs for its

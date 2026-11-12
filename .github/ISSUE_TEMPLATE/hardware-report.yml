@@ -102,7 +102,8 @@ body:
         `irlume logs --since "10 min ago"` only if you have no report file or
         a maintainer asks. They show your user and computer names, and can
         show face profile names and face-match scores: replace the names and
-        delete the scores first, and leave out any line logged while debug
-        logging was on (`irlume logs debug` tells you whether it is on now).
+        delete the scores first. Paste no line from a time when debug logging
+        was on; `irlume logs debug` tells only whether it is on now, not
+        whether it was.
     validations:
       required: true

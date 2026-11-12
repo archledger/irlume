@@ -3296,7 +3296,7 @@ fn camera_busy_error(device: &str, holders: Holders) -> Error {
         Holders::SelfOnly => format!(
             "{device}: camera busy, and the only process holding it is irlume itself \
                      (pid {}). That is an irlume bug, not an app you can close; please report \
-                     it with the output of `irlume doctor`.",
+                     it (`irlume support-report` says where).",
             std::process::id()
         ),
         Holders::UnknownBlind => format!(
@@ -3376,7 +3376,7 @@ fn describe_camera_holder(holders: Holders) -> Option<String> {
         // can close, so say what it is.
         Holders::SelfOnly => Some(format!(
             "irlume itself (pid {}), which is a bug in irlume rather than another app; \
-             please report it with the output of `irlume doctor`",
+             please report it (`irlume support-report` says where)",
             std::process::id()
         )),
         // We cannot see every process (#207), so the holder may be an app whose
@@ -18936,6 +18936,11 @@ mod tests {
             own.contains("bug in irlume rather than another app"),
             "{own}"
         );
+        assert!(
+            own.ends_with("please report it (`irlume support-report` says where)"),
+            "{own}"
+        );
+        assert!(!own.contains("irlume doctor"), "{own}");
         // A blind scan cannot name a holder, regardless of the test runner's
         // privileges or which processes its PID namespace makes visible.
         assert_eq!(describe_camera_holder(Holders::UnknownBlind), None);
@@ -18943,6 +18948,106 @@ mod tests {
 
         // Nothing holds a nonexistent path.
         assert_eq!(camera_holder("/dev/irlume-test-missing"), None);
+    }
+
+    /// The busy text for a node only this process holds, as
+    /// `camera_busy_error` words it.
+    fn self_held_busy_text(device: &str) -> String {
+        format!(
+            "{device}: camera busy, and the only process holding it is irlume itself (pid {}). \
+             That is an irlume bug, not an app you can close; please report it \
+             (`irlume support-report` says where).",
+            std::process::id()
+        )
+    }
+
+    /// The holder text for such a node, as `describe_camera_holder` words it.
+    fn self_held_holder_text() -> String {
+        format!(
+            "irlume itself (pid {}), which is a bug in irlume rather than another app; \
+             please report it (`irlume support-report` says where)",
+            std::process::id()
+        )
+    }
+
+    /// A camera only irlume holds is reported as an irlume bug, with
+    /// `irlume support-report` as the place that says where to report it,
+    /// not doctor output (#1329).
+    #[test]
+    fn a_self_held_camera_points_at_the_support_report() {
+        match camera_busy_error("/dev/fixture", Holders::SelfOnly) {
+            Error::Hardware(text) => assert_eq!(text, self_held_busy_text("/dev/fixture")),
+            other => panic!("a self-held camera is an irlume bug, not a busy camera: {other:?}"),
+        }
+        assert_eq!(
+            describe_camera_holder(Holders::SelfOnly),
+            Some(self_held_holder_text())
+        );
+    }
+
+    /// Both self-held texts on a real camera node that this process alone
+    /// holds (#1329). The test opens the node read-only, checks that it is a
+    /// video4linux character device, starts no stream and touches no
+    /// emitter. The holder scan must then read every process it lists and
+    /// find this process's handle and nothing else. On an ordinary desktop
+    /// the scan is blind and the test fails, so run it in a private PID
+    /// namespace, for example under `unshare --user --map-root-user --pid
+    /// --fork --mount-proc`. There the scan sees only this test's
+    /// processes and cannot see a holder outside the namespace, so check
+    /// with `sudo fuser -v <node>` before and after the run that nothing
+    /// else holds the node. The node comes from
+    /// `IRLUME_TEST_SELF_HOLD_NODE`, which only this test reads; library
+    /// code never does. CI never selects it.
+    #[test]
+    #[ignore = "needs a camera node this process alone holds; set IRLUME_TEST_SELF_HOLD_NODE"]
+    fn self_held_real_node_names_irlume_and_the_support_report() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        crate::hostfs::test::host();
+        let node = std::env::var("IRLUME_TEST_SELF_HOLD_NODE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_SELF_HOLD_NODE is unset. This test is #[ignore]d, so running it is \
+                 a request for a camera node this process alone holds; it will not silently \
+                 pass without one."
+            )
+        });
+        // Held across the scan: a test that forks meanwhile copies this fd
+        // into its child, and the scan would then name that child.
+        let _guard = crate::testenv::env_lock();
+        let held = std::fs::File::open(&node)
+            .unwrap_or_else(|e| panic!("could not open {node} read-only: {e}"));
+        // Any openable path would pass the scan, so the node must be a
+        // video4linux device: a character device with major 81.
+        let meta = held
+            .metadata()
+            .unwrap_or_else(|e| panic!("could not stat {node}: {e}"));
+        assert!(
+            meta.file_type().is_char_device() && libc::major(meta.rdev()) == 81,
+            "{node} is not a video4linux character device (major 81)"
+        );
+        let holder = camera_holder(&node);
+        let busy = map_io(&node, std::io::Error::from_raw_os_error(libc::EBUSY));
+        eprintln!("{node} holder: {holder:?}");
+        eprintln!("{node} busy: {busy}");
+        assert_eq!(
+            holder,
+            Some(self_held_holder_text()),
+            "the scan must read every process it lists and find only this one"
+        );
+        match busy {
+            Error::Hardware(text) => assert_eq!(text, self_held_busy_text(&node)),
+            other => panic!("a self-held node is an irlume bug, not a busy camera: {other:?}"),
+        }
+    }
+
+    /// Only tests read `IRLUME_TEST_SELF_HOLD_NODE`: in this file its name
+    /// appears only inside the tests module (#1329).
+    #[test]
+    fn only_tests_read_the_self_hold_node_variable() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        assert!(!production.contains(concat!("IRLUME_TEST_", "SELF_HOLD_NODE")));
     }
 
     /// Another process holding the node wins over our own handle, because that

@@ -47,6 +47,31 @@ use zeroize::Zeroize;
 pub(crate) mod test_support {
     static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+    /// The profile directory of the build that made this test executable
+    /// (`target/debug` in a default build), where cargo puts the workspace's
+    /// finished binaries and libraries. Cargo up to 1.99 runs a test from
+    /// `<profile>/deps`, cargo 1.100 from
+    /// `<profile>/build/<package>/<hash>/out`. `None` anywhere else, such as
+    /// under a separate `build.build-dir`: the caller then asks for its
+    /// override and takes no file from another place.
+    pub(crate) fn profile_dir() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let named = |level: usize, name: &str| {
+            exe.ancestors()
+                .nth(level)
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|found| found == name)
+        };
+        let level = if named(1, "deps") {
+            2
+        } else if named(1, "out") && named(4, "build") {
+            5
+        } else {
+            return None;
+        };
+        exe.ancestors().nth(level).map(std::path::Path::to_path_buf)
+    }
+
     /// Shared: this test only READS the environment, which is what a passwd
     /// lookup does inside glibc.
     pub(crate) fn env_read() -> std::sync::RwLockReadGuard<'static, ()> {

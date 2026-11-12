@@ -25,16 +25,17 @@ body:
 
 
         If you can, attach the file `irlume support-report --since 10m`
-        writes: run it without sudo, read it, then attach it in the
-        "What happened" box, since the log box takes text only. The file has
-        no frames, templates, credentials, user names, camera serial numbers,
-        raw device paths, journal text or scores. It does list when your
-        account recently used irlume (each face or keyring attempt, and how
-        it ended), your kernel version, and how your cameras connect
-        (USB IDs, ports, drivers). With irlume older than 0.15.0, or with its
-        daemon still running from an older version, it lists every account's
-        attempts, not only yours. A file is uploaded as soon as you attach
-        it, and anyone with its link can open it.
+        writes: run it as your own user, not as root or with sudo, read it,
+        then attach it in the "What happened" box, since the log box takes
+        text only. The file has no frames, templates, credentials, user
+        names, camera serial numbers, raw device paths, journal text or
+        scores. It does list when your account recently used irlume (each
+        face or keyring attempt, and how it ended), your kernel version, and
+        how your cameras connect (USB IDs, ports, drivers). It lists every
+        account's attempts, not only yours, when it is made as root, with
+        irlume older than 0.15.0, or with a daemon still running from an
+        older version. A file is uploaded as soon as you attach it, and
+        anyone with its link can open it.
 
 
         Never paste or attach captures, embeddings, template files,

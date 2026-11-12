@@ -7487,6 +7487,677 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         );
     }
 
+    /// The PID in the names of the temporary files [`temp_beside`] writes:
+    /// above the largest PID the kernel allocates (`pid_max`, one more than
+    /// the largest PID, is at most 2^22; proc_sys_kernel(5)), so no writer
+    /// of this run creates or removes one of them.
+    const OTHER_PID: u32 = 4_194_304;
+
+    /// Writes `bytes` at mode 0600 under the name `irlume_common`'s atomic
+    /// writer gives the temporary file of a write to `path`
+    /// (`.<name>.tmp.<pid>.<seq>`), for [`OTHER_PID`] and sequence number 0:
+    /// the file a write that stopped before its rename leaves. Returns its
+    /// path.
+    fn temp_beside(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let temp = path.with_file_name(format!(".{name}.tmp.{OTHER_PID}.0"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?
+            .write_all(bytes)?;
+        Ok(temp)
+    }
+
+    /// Fails where this process opens a directory held at mode 0300 (root,
+    /// CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): there a write whose directory
+    /// sync a test means to refuse is durable, so the test cannot build its
+    /// state. Call it before any TPM work, so that its failure leaves the
+    /// TPM as it was.
+    fn require_read_permission_to_bind(dir: &std::path::Path) {
+        let unreadable = crate::testenv::WithoutReadPermission::set(dir);
+        let opened = std::fs::File::open(dir).is_ok();
+        drop(unreadable);
+        assert!(
+            !opened,
+            "this process opens a directory without read permission (root, \
+             CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+             be made to fail here: run the tests as an unprivileged user"
+        );
+    }
+
+    /// ADR-0034, Phase 3 amendment, condition 1, on swtpm with fake later
+    /// boots: recovery from two moves of one account left recorded in this
+    /// boot. The move of alice's template key runs with the state directory
+    /// refusing the read its directory sync needs: the record write lands
+    /// and reports an error, so the move stops with its entry recorded and
+    /// her envelope still under the original key. The move of her login
+    /// password then runs at a login with the keyring directory refusing the
+    /// same: the new envelope is visible, and the move's entry stays. Files
+    /// under the atomic writer's temporary names, written by the test for a
+    /// PID no process has, lie beside the record and both envelopes. This is
+    /// the recorded state on a real TPM and real files, not a process kill
+    /// or a power loss: nothing is lost or rolled back, and the state
+    /// directory's fsync(2) never runs during the template key's move, nor
+    /// the keyring directory's during the login password's move. Each start
+    /// is irlumed's storage-key steps in its order, without its IR
+    /// compatibility sweep ([`start_in`]). A login is
+    /// `keyring::reseal_password`, called here without irlumed's checks
+    /// before it. A restart in this boot moves the template key onto the
+    /// DA-exempt key, which the stopped move did not, and removes only the
+    /// template key's entry, keeping the keyring entry of this boot; its
+    /// census writes no record and marks nothing, and doctor names alice's
+    /// keyring secret as the move it waits for. The first start in a later
+    /// boot drops the keyring entry, which names an earlier boot, and marks
+    /// that later boot, and the start in the boot after retires the original
+    /// key with one proof and one eviction, leaving the record as the start
+    /// before wrote it. The temporary files are left as they were. The
+    /// template key and the login password unseal through the DA-exempt key.
+    ///
+    /// Fails, with a message, where the process opens a directory without
+    /// read permission (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass
+    /// there would say these states were built when they were not.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_moves_left_recorded_in_this_boot_keep_the_original_key_until_a_second_later_boot() {
+        use crate::storage_key::{Census, Outcome, Retirement};
+        use irlume_common::tpm_readiness::{
+            EnvelopeKind, OriginalKey, OriginalKeyEnvelope, OriginalKeyEnvelopes, RetirementWait,
+        };
+        use serde_json::json;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("moves-left-recorded");
+        let _prediction = PredictionFixture::new();
+        let state_dir = irlume_common::state_dir();
+        let keyring_dir = crate::keyring::keyring_dir();
+        // Before any TPM work, so a failure here leaves the swtpm as it was.
+        require_read_permission_to_bind(&state_dir);
+        require_read_permission_to_bind(&keyring_dir);
+        // The moves record this boot's ID, and the restart is in this boot.
+        let boot = irlume_common::boot_id().expect("this boot's ID");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4174);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        crate::keyring::seal_password("alice", b"alice-password").expect("arm the password");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        let template_path = crate::template_key::key_path("alice");
+        let keyring_path = crate::keyring::envelope_path("alice");
+        let record_path = state_dir.join("tpm-storage-key");
+
+        // The start-up step persists the DA-exempt key; the next one records
+        // the original key as matching today's derivation.
+        let persisted = storage_key::ensure_at_start_reporting();
+        let recorded = storage_key::ensure_at_start_reporting();
+        let record_bytes = std::fs::read(&record_path).unwrap_or_default();
+        let before_moves = record_value();
+        let old_template = std::fs::read(&template_path).unwrap_or_default();
+        // The template key's move, as irlumed's start makes it.
+        let template_moved = {
+            let _unreadable = crate::testenv::WithoutReadPermission::set(&state_dir);
+            crate::template_key::move_to_stronger_policy("alice")
+        };
+        let after_template = record_value();
+        // The login password's move, as a login's reseal makes it.
+        let keyring_moved = {
+            let _unreadable = crate::testenv::WithoutReadPermission::set(&keyring_dir);
+            crate::keyring::reseal_password("alice", b"alice-password", None)
+        };
+        let template_kept = std::fs::read(&template_path).unwrap_or_default() == old_template;
+        let keyring_parent = SealedEnvelope::load(&keyring_path)
+            .ok()
+            .and_then(|env| env.parent);
+        let left = record_value();
+        let new_keyring = std::fs::read(&keyring_path).unwrap_or_default();
+        // Beside the record, the whole record the start-up step wrote; beside
+        // each envelope, the first half of its bytes, which no reader parses.
+        let temp_content = [
+            record_bytes.clone(),
+            old_template[..old_template.len() / 2].to_vec(),
+            new_keyring[..new_keyring.len() / 2].to_vec(),
+        ];
+        let temps = [&record_path, &template_path, &keyring_path]
+            .into_iter()
+            .zip(&temp_content)
+            .map(|(path, bytes)| temp_beside(path, bytes))
+            .collect::<Vec<_>>();
+        let temp_bytes = || {
+            temps
+                .iter()
+                .map(|temp| temp.as_ref().ok().and_then(|path| std::fs::read(path).ok()))
+                .collect::<Vec<_>>()
+        };
+        let temps_written = temp_bytes();
+
+        // A restart in this boot.
+        let restart = start_in(&boot, &["alice"]);
+        let template_parent = SealedEnvelope::load(&template_path)
+            .ok()
+            .and_then(|env| env.parent);
+        let reported = storage_key::report();
+        // The first start in a later boot, and the start in the boot after.
+        let later = start_in(BOOT_B, &["alice"]);
+        let after_that = start_in(BOOT_C, &["alice"]);
+        let after_retirement = handles();
+        let temps_after = temp_bytes();
+        // Compared here, so that no assertion prints a secret.
+        let unsealed = (
+            crate::template_key::load_key("alice")
+                .map(|unsealed| unsealed.as_slice() == key.as_slice()),
+            crate::keyring::unseal_password("alice")
+                .map(|unsealed| unsealed.as_slice() == b"alice-password"),
+        );
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        // The state before any recovery.
+        assert!(
+            matches!(
+                persisted.expect("the step"),
+                (Some(Outcome::Persisted { handle: PREFERRED }), true)
+            ),
+            "the start-up step persists the DA-exempt key"
+        );
+        assert!(
+            matches!(
+                recorded.expect("the step"),
+                (Some(Outcome::Present { .. }), true)
+            ),
+            "the start that records the original key derived it"
+        );
+        assert_eq!(
+            before_moves["original"]["matched"],
+            json!(true),
+            "the record keeps the original key as matching: {before_moves}"
+        );
+        let refused =
+            template_moved.expect_err("a record write that is not durable stops the move");
+        assert!(
+            matches!(&refused, Error::Io(message) if message.contains("os error 13")),
+            "{refused}"
+        );
+        assert!(
+            !old_template.is_empty() && template_kept,
+            "the template key's envelope keeps its bytes"
+        );
+        let entry = |kind: &str| json!({ "user": "alice", "kind": kind, "boot_id": boot });
+        assert_eq!(
+            after_template,
+            with_field(&before_moves, "moves", json!([entry("template_key")])),
+            "the template key's move is recorded with this boot, and nothing else changed"
+        );
+        assert_eq!(
+            keyring_moved.expect("the login's reseal"),
+            crate::keyring::Reseal::MovedToDaExemptKey,
+            "a move whose new envelope is visible is a move"
+        );
+        assert_eq!(
+            keyring_parent.map(|parent| parent.handle),
+            Some(PREFERRED),
+            "readers load the keyring envelope from the DA-exempt key"
+        );
+        assert_eq!(
+            left,
+            with_field(
+                &before_moves,
+                "moves",
+                json!([entry("template_key"), entry("keyring_secret")])
+            ),
+            "both moves are recorded with this boot, and nothing else changed"
+        );
+        assert!(
+            serde_json::from_slice::<storage_key::Record>(&record_bytes).is_ok(),
+            "the bytes written beside the record parse as a record"
+        );
+        let unparsed = |half: &Vec<u8>| {
+            !half.is_empty() && serde_json::from_slice::<SealedEnvelope>(half).is_err()
+        };
+        assert!(
+            temp_content[1..].iter().all(unparsed),
+            "the bytes written beside each envelope are not empty and do not parse as an \
+             envelope"
+        );
+        assert_eq!(
+            temps_written,
+            temp_content.iter().cloned().map(Some).collect::<Vec<_>>(),
+            "the temporary files are in place"
+        );
+        // A restart in this boot.
+        let restart = restart.present(PREFERRED, &[Some(MoveGain::DaExemptKey)]);
+        assert_eq!(
+            restart.census,
+            Census::Unsettled,
+            "the keyring entry is this boot's"
+        );
+        assert_eq!(
+            (restart.retirement, restart.calls),
+            (None, (0, 0)),
+            "nothing is retired, no proof and no eviction"
+        );
+        assert_eq!(
+            restart.saves,
+            Vec::<serde_json::Value>::new(),
+            "the census writes no record"
+        );
+        assert_eq!(
+            restart.record,
+            with_field(&before_moves, "moves", json!([entry("keyring_secret")])),
+            "the template key's second move removes its own entry only"
+        );
+        assert_eq!(
+            template_parent.map(|parent| parent.handle),
+            Some(PREFERRED),
+            "the restart moves the template key onto the DA-exempt key"
+        );
+        let reported = reported.expect("the report");
+        assert_eq!(
+            reported.handle,
+            Some(PREFERRED),
+            "doctor finds the DA-exempt key at its handle"
+        );
+        let wait = match reported.original_key {
+            Some(OriginalKey::Waiting { handle, wait, .. }) if handle == original => Some(wait),
+            _ => None,
+        };
+        assert_eq!(
+            wait,
+            Some(RetirementWait::UnsettledMoves {
+                envelopes: vec![OriginalKeyEnvelope {
+                    user: "alice".into(),
+                    kind: EnvelopeKind::KeyringSecret,
+                }],
+                total: 1,
+            }),
+            "doctor names the move this boot waits for"
+        );
+        assert_eq!(
+            reported.on_original_key,
+            Some(OriginalKeyEnvelopes::default()),
+            "doctor finds no envelope under the original key"
+        );
+        // The first start in a later boot.
+        let marked = with_field(&before_moves, "unused_since", json!(BOOT_B));
+        let later = later.present(PREFERRED, &[None]);
+        assert_eq!(
+            later.census,
+            Census::Unused {
+                since: BOOT_B.into()
+            },
+            "the first start in boot B marks boot B"
+        );
+        assert_eq!(
+            (later.retirement, later.calls),
+            (None, (0, 0)),
+            "marked in this boot"
+        );
+        assert_eq!(
+            later.saves,
+            [marked.clone()],
+            "another boot's entry is dropped, the boot marked"
+        );
+        assert_eq!(later.record, marked, "the record the census wrote");
+        // The start in the boot after.
+        let after_that = after_that.present(PREFERRED, &[None]);
+        assert_eq!(
+            after_that.census,
+            Census::Unused {
+                since: BOOT_B.into()
+            },
+            "the mark of boot B stands"
+        );
+        assert_eq!(
+            after_that.retirement,
+            Some(Retirement::Retired { handle: original }),
+            "the start in boot C retires the original key"
+        );
+        assert_eq!(after_that.calls, (1, 1), "one proof and one eviction");
+        assert_eq!(
+            after_that.saves,
+            [
+                with_field(&marked, "retirement_attempt", json!({ "boot_id": BOOT_C })),
+                marked.clone(),
+            ],
+            "the attempt, then the record as the start before wrote it"
+        );
+        assert_eq!(
+            after_that.record, marked,
+            "the record as the start before wrote it"
+        );
+        assert!(
+            !after_retirement.contains(&original) && after_retirement.contains(&PREFERRED),
+            "the original key is evicted and the DA-exempt key stays: {after_retirement:x?}"
+        );
+        assert_eq!(
+            temps_after, temps_written,
+            "the temporary files are left as they were"
+        );
+        assert!(
+            matches!(unsealed, (Ok(true), Ok(true))),
+            "the template key and the login password unseal through the DA-exempt key: \
+             {unsealed:?}"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
+    /// ADR-0034, Phase 3 amendment, condition 1, on swtpm with fake boot IDs:
+    /// recovery from a keyring envelope under the original key while the
+    /// record says no envelope has been under it since a start in boot A.
+    /// bob's GNOME keyring token, sealed under the original key before
+    /// irlumed persisted the DA-exempt key, comes back (the test writes its
+    /// bytes to its path) after that start marked the key unused. The first
+    /// start in this boot counts it as in use, clears the mark, and asks for
+    /// no proof and no eviction; doctor says envelopes wait, and names it.
+    /// At bob's login after that start, the token's move runs with the state
+    /// directory refusing the read its directory sync needs: the record
+    /// write lands and reports an error, so the move stops with its entry
+    /// recorded with this boot and the token still under the original key,
+    /// and the login returns the error. This is the recorded state on a real
+    /// TPM and real files, not a process kill or a power loss: nothing is
+    /// lost or rolled back, and the state directory's fsync(2) never runs
+    /// during that move. A restart in this boot and the first start in a
+    /// later boot each count the token as in use, leave the record as the
+    /// stopped login wrote it, the entry included, and ask for no proof and
+    /// no eviction. bob's next login moves the token onto the DA-exempt key,
+    /// replacing the entry and removing it once the write is durable. The
+    /// start in the boot after that later boot marks the key unused and,
+    /// having marked it in its own boot, retires nothing. Each start is
+    /// irlumed's storage-key steps in its order, without its IR
+    /// compatibility sweep ([`start_in`]). A login is
+    /// `keyring::reseal_password`, called here without irlumed's checks
+    /// before it. The token keeps its kind, uid and recovery wrap, which
+    /// opens under bob's password, and unseals; alice's template key and
+    /// login password unseal.
+    ///
+    /// Fails, with a message, where the process opens a directory without
+    /// read permission (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH): a pass
+    /// there would say these states were built when they were not.
+    #[test]
+    #[ignore = "needs swtpm; CI runs it by name on swtpm, and scripts/with-swtpm.sh \
+                runs it anywhere"]
+    fn tpm_a_keyring_token_under_the_original_key_counts_as_in_use_until_a_login_moves_it() {
+        use crate::envelope::SecretKind;
+        use crate::keyring::{envelope_path, reseal_password, unseal_password, Reseal};
+        use crate::storage_key::Census;
+        use irlume_common::tpm_readiness::{
+            EnvelopeKind, OriginalKey, OriginalKeyEnvelope, OriginalKeyEnvelopes, RetirementWait,
+        };
+        use serde_json::json;
+        const PREFERRED: u32 = 0x8101_0003;
+        require_swtpm();
+        let _env = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dirs = StateDirs::new("token-under-original");
+        let _prediction = PredictionFixture::new();
+        let state_dir = irlume_common::state_dir();
+        // Before any TPM work, so a failure here leaves the swtpm as it was.
+        require_read_permission_to_bind(&state_dir);
+        // The login's move records this boot's ID; the first start and the
+        // restart are in this boot.
+        let boot = irlume_common::boot_id().expect("this boot's ID");
+        let handles = || {
+            let mut ctx = open_context().expect("context");
+            persistent_handles(&mut ctx).expect("handle scan")
+        };
+        let original = persistent_srk_raw();
+        let _alice = crate::account::remember("alice", 4175);
+        let _bob = crate::account::remember("bob", 4176);
+        let key = crate::crypto::generate_key();
+        crate::template_key::reseal_key("alice", &key).expect("seal the template key");
+        // The first seal persists the original key when no earlier test did.
+        let before = handles();
+        assert!(
+            before.contains(&original) && !before.contains(&PREFERRED),
+            "the original key is persisted and the handle this test uses is free: {before:x?}"
+        );
+        // bob's token, sealed under the original key and held back: on disk
+        // now, it would keep boot A's start from marking the key unused.
+        let token = b"bob-gnome-keyring-token-for-tests";
+        let mut armed = seal_with_pcrs(token, &[7]).expect("seal the token");
+        armed.secret = SecretKind::GnomeKeyringToken;
+        armed.password_wrap = Some(crate::recovery::wrap(b"bob-password", token).expect("wrap"));
+        armed.uid = Some(4176);
+        let older = serde_json::to_vec_pretty(&armed).expect("the token's envelope");
+        let bob_path = envelope_path("bob");
+
+        let due = retirement_due(b"alice-password");
+        let marked = record_value();
+        // An older copy of bob's token comes back under the original key.
+        let older_written = armed.save(&bob_path);
+        let came_back = SealedEnvelope::load(&bob_path)
+            .ok()
+            .map(|env| env.parent.is_none());
+        // The first start in this boot.
+        let first = start_in(&boot, &["alice"]);
+        let reported = storage_key::report();
+        // bob's login, as a login's reseal makes it.
+        let stopped_login = {
+            let _unreadable = crate::testenv::WithoutReadPermission::set(&state_dir);
+            reseal_password("bob", b"bob-password", None)
+        };
+        let bob_kept = std::fs::read(&bob_path).is_ok_and(|bytes| bytes == older);
+        let left = record_value();
+        // A restart in this boot, and the first start in a later boot.
+        let restart = start_in(&boot, &["alice"]);
+        let later = start_in(BOOT_B, &["alice"]);
+        // bob's next login, and the start in the boot after.
+        let login = reseal_password("bob", b"bob-password", None);
+        let after_login = record_value();
+        let after_that = start_in(BOOT_C, &["alice"]);
+        let token_env = SealedEnvelope::load(&bob_path);
+        // Compared here, so that no assertion prints a secret.
+        let token_opens = unseal_password("bob").map(|unsealed| unsealed.as_slice() == token);
+        let unsealed = (
+            crate::template_key::load_key("alice")
+                .map(|unsealed| unsealed.as_slice() == key.as_slice()),
+            unseal_password("alice").map(|unsealed| unsealed.as_slice() == b"alice-password"),
+        );
+        let before_cleanup = handles();
+
+        let removed = evict_da_exempt_srks();
+        let put_back = seal_with_pcrs(b"puts the original key back", &[]);
+        let after = handles();
+        drop(dirs);
+
+        due.check(PREFERRED);
+        // The state before the first start.
+        assert_eq!(
+            (&marked["version"], &marked["unused_since"]),
+            (&json!(1), &json!(BOOT_A)),
+            "boot A's record marks the original key unused in boot A: {marked}"
+        );
+        assert_eq!(
+            marked["original"]["matched"],
+            json!(true),
+            "boot A's record keeps the original key as matching: {marked}"
+        );
+        assert!(
+            older_written.is_ok() && came_back == Some(true),
+            "bob's older token is in place, under the original key"
+        );
+        let unmarked = with_field(&marked, "unused_since", serde_json::Value::Null);
+        // The first start in this boot.
+        let first = first.present(PREFERRED, &[None]);
+        assert_eq!(first.census, Census::InUse, "the token counts as in use");
+        assert_eq!(
+            (first.retirement, first.calls),
+            (None, (0, 0)),
+            "nothing is retired, no proof and no eviction"
+        );
+        assert_eq!(
+            first.saves,
+            [unmarked.clone()],
+            "the census clears the mark"
+        );
+        assert_eq!(first.record, unmarked, "the record without the mark");
+        let reported = reported.expect("the report");
+        assert_eq!(
+            reported.handle,
+            Some(PREFERRED),
+            "doctor finds the DA-exempt key at its handle"
+        );
+        let wait = match reported.original_key {
+            Some(OriginalKey::Waiting { handle, wait, .. }) if handle == original => Some(wait),
+            _ => None,
+        };
+        assert_eq!(
+            wait,
+            Some(RetirementWait::Envelopes),
+            "doctor says envelopes wait"
+        );
+        assert_eq!(
+            reported.on_original_key,
+            Some(OriginalKeyEnvelopes {
+                named: vec![OriginalKeyEnvelope {
+                    user: "bob".into(),
+                    kind: EnvelopeKind::KeyringSecret,
+                }],
+                total: 1,
+            }),
+            "doctor names bob's token"
+        );
+        // bob's login.
+        let refused = stopped_login.expect_err("a record write that is not durable stops the move");
+        assert!(
+            matches!(&refused, Error::Io(message) if message.contains("os error 13")),
+            "{refused}"
+        );
+        assert!(bob_kept, "bob's envelope keeps its bytes");
+        let entry = json!({ "user": "bob", "kind": "keyring_secret", "boot_id": boot });
+        assert_eq!(
+            left,
+            with_field(&unmarked, "moves", json!([entry])),
+            "the move is recorded with this boot, and nothing else changed"
+        );
+        // A restart in this boot, and the first start in a later boot.
+        for (name, start) in [
+            ("a restart in this boot", restart),
+            ("the first start in boot B", later),
+        ] {
+            let start = start.present(PREFERRED, &[None]);
+            assert_eq!(
+                start.census,
+                Census::InUse,
+                "{name}: the token counts as in use"
+            );
+            assert_eq!(
+                (start.retirement, start.calls),
+                (None, (0, 0)),
+                "{name}: nothing is retired, no proof and no eviction"
+            );
+            assert_eq!(
+                start.saves,
+                Vec::<serde_json::Value>::new(),
+                "{name}: the census writes no record"
+            );
+            assert_eq!(
+                start.record, left,
+                "{name}: the entry stays while the token is under the original key"
+            );
+        }
+        // bob's next login.
+        assert_eq!(
+            login.expect("the login's reseal"),
+            Reseal::MovedToDaExemptKey,
+            "the login moves the token"
+        );
+        assert_eq!(
+            after_login, unmarked,
+            "the move replaces the entry and removes it once its write is durable"
+        );
+        // The start in boot C.
+        let marked_in_c = with_field(&unmarked, "unused_since", json!(BOOT_C));
+        let after_that = after_that.present(PREFERRED, &[None]);
+        assert_eq!(
+            after_that.census,
+            Census::Unused {
+                since: BOOT_C.into()
+            },
+            "the start in boot C marks boot C"
+        );
+        assert_eq!(
+            (after_that.retirement, after_that.calls),
+            (None, (0, 0)),
+            "marked in this boot"
+        );
+        assert_eq!(
+            after_that.saves,
+            [marked_in_c.clone()],
+            "the census writes the mark of boot C"
+        );
+        assert_eq!(
+            after_that.record, marked_in_c,
+            "the record the census wrote"
+        );
+        // bob's token after its move.
+        let token_env = token_env.expect("bob's envelope");
+        assert_eq!(
+            token_env.parent.map(|parent| parent.handle),
+            Some(PREFERRED),
+            "bob's token is under the DA-exempt key"
+        );
+        assert_eq!(
+            token_env.secret,
+            SecretKind::GnomeKeyringToken,
+            "the token keeps its kind"
+        );
+        assert_eq!(token_env.uid, Some(4176), "the token keeps its uid");
+        assert!(
+            token_env.password_wrap.as_ref().is_some_and(|wrap| {
+                crate::recovery::unwrap(b"bob-password", wrap)
+                    .is_ok_and(|unwrapped| unwrapped.as_slice() == token)
+            }),
+            "the token's wrap opens under bob's password to the token"
+        );
+        assert!(
+            matches!(token_opens, Ok(true)),
+            "the token unseals: {token_opens:?}"
+        );
+        assert!(
+            matches!(unsealed, (Ok(true), Ok(true))),
+            "the template key and the login password unseal: {unsealed:?}"
+        );
+        assert!(
+            before_cleanup.contains(&original) && before_cleanup.contains(&PREFERRED),
+            "the original key and the DA-exempt key are both still persisted: \
+             {before_cleanup:x?}"
+        );
+        assert_eq!(removed.expect("evict"), vec![PREFERRED]);
+        assert!(put_back.is_ok());
+        assert_eq!(
+            after, before,
+            "the test leaves the TPM's handles as it found them"
+        );
+    }
+
     /// ADR-0034, Phase 3 amendment (#1073 item 2), on swtpm: a recorded
     /// DA-exempt key with the ROCA fingerprint (a key with the DA-exempt
     /// template's shape and another modulus, which the test names weak,

@@ -2240,6 +2240,7 @@ fn save_record(record: &Record) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::WithoutReadPermission;
     use std::collections::BTreeMap;
 
     const BOOT: &str = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
@@ -3574,26 +3575,6 @@ mod tests {
         assert!(on_key.is_ok() && onto_original.is_ok() && unrecorded.is_ok());
         assert_eq!(saves.get(), 0, "no record write without a move off the key");
         assert!(no_lock, "no lock without a recorded DA-exempt key");
-    }
-
-    /// Holds a directory at mode 0300 (write and search, no read) and puts it
-    /// back at 0700 when dropped, before the sandbox that removes it.
-    struct WithoutReadPermission<'a>(&'a Path);
-
-    impl<'a> WithoutReadPermission<'a> {
-        fn set(dir: &'a Path) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
-                .expect("chmod 0300");
-            Self(dir)
-        }
-    }
-
-    impl Drop for WithoutReadPermission<'_> {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
-        }
     }
 
     /// The not-durable case of

@@ -31,8 +31,9 @@ body:
         raw device paths, journal text or scores. It does list when your
         account recently used irlume (each face or keyring attempt, and how
         it ended), your kernel version, and how your cameras connect
-        (USB IDs, ports, drivers). A file is uploaded as soon as you attach
-        it, and anyone with its link can open it.
+        (USB IDs, ports, drivers). With irlume older than 0.15.0 it lists
+        every account's attempts, not only yours. A file is uploaded as soon
+        as you attach it, and anyone with its link can open it.
 
 
         Never paste or attach captures, embeddings, template files,

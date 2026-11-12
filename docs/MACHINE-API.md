@@ -587,7 +587,7 @@ daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
 | `platform` | `Debian-family`, `Fedora-family`, `Arch-family`, or `other/unknown` |
 | `install_channel` | How irlume was installed, as doctor's `install-origin` reads it: `fedora_copr`, `local_rpm`, `ubuntu_ppa`, `local_deb`, `arch_package`, `source`, or a [nightly channel](adr/0037-nightly-channel.md) lane, `fedora_copr_nightly`, `ubuntu_ppa_nightly` or `arch_git` (added after 0.15.0) |
 | `checks` | `id` (`platform_supported`, `install_channel`, `daemon_reachable`, `tpm_present`, `secure_boot`) and `state`, as doctor's states |
-| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer |
+| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer. The cameras' `qualification_token` and the capture's `qualification_context` and `runtime_context` are keyed for each document, so values equal in the daemon's snapshot stay equal within one document and two documents carry unrelated values ([ADR-0008](adr/0008-privacy-bounded-diagnostics.md), amendment 2026-11-12) |
 | `unavailable` | Each section the report could not fill (`daemon`, `camera_context`, `capture_schedule`, `recent_events`, `support_probe`) and why (`daemon_unavailable`, `daemon_restarted`, `no_camera`, `no_ir_pair`, `not_authorized`, `collection_failed`) |
 
 ### Error codes

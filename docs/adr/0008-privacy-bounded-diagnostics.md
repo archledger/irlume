@@ -84,6 +84,9 @@ names. A camera serial is represented only as present/absent. Descriptor and
 qualification digests may be truncated tokens sufficient to correlate sections
 within one report.
 
+**Amended 2026-11-12:** the qualification and runtime context tokens are keyed
+for each report; see the amendment of that date below.
+
 `--since` is bounded to the typed in-memory event history; it does not widen
 the command into an arbitrary journal reader. When the daemon is unavailable,
 the report remains useful and labels daemon-owned sections unavailable rather
@@ -375,3 +378,30 @@ and non-blocking producer side channel remain unchanged. Validation uses
 synthetic socket pairs, including trickling and non-reading consumers,
 half-close/hangup distinctions, expiry races, replacement ownership and complete
 drain within grace; this is not a new hardware qualification.
+
+## Amendment 2026-11-12: report tokens are scoped to one report
+
+The CLI draws a fresh 256-bit key for each support report from `rand::rng()`,
+the CSPRNG the CLI already uses. Each camera's qualification token and the
+capture section's qualification and runtime context tokens
+(`cameras[].qualification_token`, `capture.qualification_context`,
+`capture.runtime_context`) become the first 8 bytes of HMAC-SHA-256 under that
+key, over the domain string `irlume-support-report-token-v1`, a NUL byte and
+the daemon's 8 token bytes. Equal tokens in one report stay equal, so its
+camera rows and capture section still correlate; tokens from two reports are
+unrelated. A token the daemon did not send stays absent: the text report
+prints `none` and `--json` omits the field.
+
+The key is never stored, printed or returned, and is dropped once the report
+is collected. This applies to the text report, the TUI's report and
+`support-report --json`. A `--probe` report keys the probe result's snapshot
+once, before copying it into its daemon section, so both carry the same
+values.
+
+The descriptor token is unchanged: it is a digest of the USB descriptor bytes,
+equal for every unit with the same descriptors. The daemon, the snapshot it
+serves, the wire types, the report's format and the capture-qualification
+store are unchanged. Unit tests pin a known answer for a fixed key, equal
+values within one report and different values between two reports;
+black-box tests run the command against a fake daemon. This is not a hardware
+qualification.

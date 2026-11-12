@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 sha2.workspace = true
+hmac.workspace = true   # support-report context tokens, keyed per report (ADR-0008)
 zeroize.workspace = true
 irlume-common.workspace = true
 irlume-vision.workspace = true

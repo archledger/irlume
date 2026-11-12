@@ -433,13 +433,18 @@ fn support_report_publishes_one_private_inspectable_text_file() {
         sandbox.fake_tool(tool, "exit 1");
     }
     let output = sandbox.path("work/report.txt");
-    let (code, stdout, stderr) = run(&mut sandbox.cmd_with_fakes(&[
-        "support-report",
-        "--output",
-        output.to_str().unwrap(),
-        "--since",
-        "5m",
-    ]));
+    // A home that holds neither the sandbox nor the report, so the report's
+    // path prints in full whatever the host's HOME and TMPDIR.
+    let home = sandbox.path("home");
+    let (code, stdout, stderr) = run(sandbox
+        .cmd_with_fakes(&[
+            "support-report",
+            "--output",
+            output.to_str().unwrap(),
+            "--since",
+            "5m",
+        ])
+        .env("HOME", &home));
 
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains(output.to_str().unwrap()));
@@ -451,10 +456,231 @@ fn support_report_publishes_one_private_inspectable_text_file() {
         std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    // Where to report follows, the private route first.
+    let security = stdout
+        .find("\nhttps://github.com/archledger/irlume/security\n")
+        .unwrap_or_else(|| panic!("no security line: {stdout}"));
+    let issues = stdout
+        .find("\nAnything else: https://github.com/archledger/irlume/issues/new/choose\n")
+        .unwrap_or_else(|| panic!("no issue chooser line: {stdout}"));
+    assert!(security < issues, "{stdout}");
+    assert!(
+        stdout.contains(
+            "\nirlume never blocks your password; a failed face sign-in falls back to it.\n"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(stdout.contains("made as root"), is_root(), "{stdout}");
+    assert_eq!(
+        stdout.contains("\nYour own words are fine; attach this report file.\n"),
+        !is_root(),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("https://"), "{stderr}");
 
-    let (second_code, _, _) =
+    let (second_code, second_stdout, second_stderr) =
         run(&mut sandbox.cmd_with_fakes(&["support-report", "--output", output.to_str().unwrap()]));
     assert_ne!(second_code, 0, "an existing report must never be replaced");
+    // A failed report says what failed, without where to report.
+    for stream in [&second_stdout, &second_stderr] {
+        assert!(!stream.contains("https://"), "{stream}");
+    }
+}
+
+/// A report made as root (here root of a user namespace, with no daemon)
+/// says that only root can read it and how to make one with only your
+/// account, and asks for that one; its path prints in full even inside
+/// HOME. The file lists no other account's events, so the note names none.
+#[test]
+fn a_root_support_report_says_who_can_read_it() {
+    let sandbox = Sandbox::new("support-report-root");
+    let output = sandbox.path("work/r.txt");
+    let (code, stdout, stderr) = run(sandbox
+        .isolated_root_cmd(
+            &["support-report", "--output", output.to_str().unwrap()],
+            &[],
+        )
+        .env("HOME", sandbox.path("work")));
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    assert!(
+        stdout.starts_with(&format!(
+            "Support report created: {}\nInspect it before sharing.\n",
+            output.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "This report was made as root, so only root can read the file.\n\
+             Run it as your own user, not as root or with sudo, to include only\n\
+             your account.\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\nYour own words are fine; attach a report made as your own user.\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("attach this report file"), "{stdout}");
+    assert!(!stdout.contains("every account"), "{stdout}");
+    assert!(
+        stdout.contains("\nhttps://github.com/archledger/irlume/security\n"),
+        "{stdout}"
+    );
+    let text = std::fs::read_to_string(&output).unwrap();
+    assert!(text.contains("  privilege: root\n"), "{text}");
+}
+
+/// A report path inside the running account's home prints as `~/...` for
+/// an ordinary user, and in full for root.
+#[test]
+fn support_report_shows_a_path_in_the_running_home_as_tilde() {
+    let sandbox = Sandbox::new("support-report-tilde");
+    for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+        sandbox.fake_tool(tool, "exit 1");
+    }
+    let output = sandbox.path("work/r.txt");
+    let (code, stdout, stderr) = run(sandbox
+        .cmd_with_fakes(&["support-report", "--output", output.to_str().unwrap()])
+        .env("HOME", sandbox.path("work")));
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let expected = if is_root() {
+        format!("Support report created: {}\n", output.display())
+    } else {
+        "Support report created: ~/r.txt\n".to_owned()
+    };
+    assert!(stdout.starts_with(&expected), "{stdout}");
+    assert!(output.is_file());
+}
+
+/// An ordinary user's report from an irlumed that withholds nothing (one
+/// older than this irlume, still running after an upgrade) lists every
+/// account's authentications, as its checklist says; the lines after it
+/// say so, say how to restart irlumed and ask for the new report, not for
+/// this file. Without an authentication or status event such a report can
+/// still list other accounts' events, here an enrollment, and the lines
+/// say that, while its checklist names no authentication. From an irlumed
+/// that withholds the other accounts, the report lists only this
+/// account's and is the one to attach.
+#[test]
+fn a_user_report_from_an_older_irlumed_asks_for_one_made_after_a_restart() {
+    use irlume_common::diagnostics::{
+        CategoricalOutcome, OperationClass, OperationId, ShareSafeEvent, ShareSafeEventKind,
+        SupportSection, SupportSnapshot, SupportUnavailable, UnavailableReason,
+    };
+    for (name, withholds, operation) in [
+        (
+            "support-report-older-daemon",
+            false,
+            OperationClass::Authentication,
+        ),
+        (
+            "support-report-current-daemon",
+            true,
+            OperationClass::Authentication,
+        ),
+        (
+            "support-report-older-daemon-enrollment",
+            false,
+            OperationClass::Enrollment,
+        ),
+    ] {
+        let authentication = operation == OperationClass::Authentication;
+        let sb = Sandbox::new(name);
+        for tool in ["rpm", "dnf", "dpkg-query", "apt-cache", "pacman"] {
+            sb.fake_tool(tool, "exit 1");
+        }
+        let mut snapshot: SupportSnapshot =
+            serde_json::from_value(served_support_snapshot()).unwrap();
+        snapshot.events = vec![ShareSafeEvent {
+            sequence: 1,
+            age_ms: 1_000,
+            operation_id: OperationId::from_bytes([1; 16]),
+            operation,
+            kind: ShareSafeEventKind::OperationFinished {
+                outcome: CategoricalOutcome::Denied,
+            },
+        }];
+        if withholds {
+            snapshot.unavailable = vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }];
+        }
+        serve(&sock(&sb), move |request| match request {
+            Request::SupportSnapshot { .. } => {
+                Response::SupportSnapshot(Box::new(snapshot.clone()))
+            }
+            _ => Response::Error("bad request".into()),
+        });
+        let output = sb.path("work/report.txt");
+        let (code, stdout, stderr) = run(sb
+            .cmd_with_fakes(&["support-report", "--output", output.to_str().unwrap()])
+            .env("HOME", sb.path("home")));
+        assert_eq!(code, 0, "{stdout} {stderr}");
+        let text = std::fs::read_to_string(&output).unwrap();
+        let checklist = text.split_once("Privacy checklist\n").unwrap().1;
+        assert!(
+            stdout.contains("\nhttps://github.com/archledger/irlume/security\n"),
+            "{stdout}"
+        );
+        if is_root() {
+            // Root reads every account's events from any irlumed.
+            assert!(stdout.contains("made as root"), "{stdout}");
+            assert!(
+                stdout.contains("attach a report made as your own user"),
+                "{stdout}"
+            );
+            continue;
+        }
+        if withholds {
+            assert!(
+                checklist.contains("[!] this account's recent authentications"),
+                "{checklist}"
+            );
+            assert!(
+                stdout.contains("\nYour own words are fine; attach this report file.\n"),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("older than this"), "{stdout}");
+            assert!(!stdout.contains("every account"), "{stdout}");
+        } else {
+            let (lists, checklist_line) = if authentication {
+                (
+                    "It lists every account's recent authentications: when each happened\n\
+                     and its outcome.\n",
+                    "[!] recent authentications of every account",
+                )
+            } else {
+                (
+                    "It can list other accounts' recent events: when each happened and\n\
+                     its outcome.\n",
+                    "[x] no authentication times or outcomes",
+                )
+            };
+            assert!(checklist.contains(checklist_line), "{checklist}");
+            assert!(
+                stdout.contains(&format!(
+                    "\nThis report was made with a running irlumed that is older than this\n\
+                     irlume and does not keep other accounts' events out of a report.\n\
+                     {lists}\
+                     Restart irlumed (`sudo systemctl restart irlumed`), or finish the upgrade,\n\
+                     and make the report again.\n\n"
+                )),
+                "{stdout}"
+            );
+            assert!(
+                stdout
+                    .contains("\nYour own words are fine; attach the new report, not this one.\n"),
+                "{stdout}"
+            );
+            assert!(!stdout.contains("attach this report file"), "{stdout}");
+            if !authentication {
+                assert!(!stdout.contains("every account"), "{stdout}");
+            }
+        }
+        assert!(!stdout.contains("made as root"), "{stdout}");
+    }
 }
 
 /// Run with `input` piped to stdin.
@@ -2194,7 +2420,7 @@ fn support_report_probe_prints_keyed_context_tokens() {
         _ => Response::Error("bad request".into()),
     });
     let output = sb.path("work/probe-report.txt");
-    let (code, _, stderr) = run(&mut sb.isolated_root_cmd(
+    let (code, stdout, stderr) = run(&mut sb.isolated_root_cmd(
         &[
             "support-report",
             "--probe",
@@ -2204,6 +2430,29 @@ fn support_report_probe_prints_keyed_context_tokens() {
         &[],
     ));
     assert_eq!(code, 0, "stderr: {stderr}");
+    // A probe needs root, and root's snapshot is not filtered by account:
+    // the lines after the report say that it can list other accounts'
+    // events and how to make one with only your account, and ask for this
+    // one or one made as your own user.
+    assert!(
+        stdout.contains(
+            "\nIt can list other accounts' recent events: when each happened and\n\
+             its outcome.\n\
+             A probe needs root. To include only your account, run it as your own\n\
+             user without --probe, not as root or with sudo.\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "\nYour own words are fine; attach this report file, or one made as your own user.\n"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("attach a report made as your own user"),
+        "{stdout}"
+    );
     let text = std::fs::read_to_string(&output).unwrap();
     assert!(
         text.contains("  probe: sequential via stored_qualification (captured)\n"),
@@ -2607,6 +2856,40 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
     assert!(
         out.contains(NOTICE) && out.contains(FORGET),
         "doctor must give the pre-upgrade step: {out} {err}"
+    );
+    // The warning makes doctor end with where to report, after its summary
+    // line, the private route first.
+    let summary = out
+        .find("\n[doctor] summary: ")
+        .unwrap_or_else(|| panic!("no summary line: {out}"));
+    let security = out
+        .find("\nhttps://github.com/archledger/irlume/security\n")
+        .unwrap_or_else(|| panic!("no security line: {out}"));
+    let issues = out
+        .find("\nAnything else: https://github.com/archledger/irlume/issues/new/choose\n")
+        .unwrap_or_else(|| panic!("no issue chooser line: {out}"));
+    assert!(summary < security && security < issues, "{out}");
+    assert!(
+        out[issues..].contains(
+            "\nDoctor output shows your account name and an added camera's serial\n\
+             number; you may replace both before posting.\n"
+        ),
+        "{out}"
+    );
+    assert!(!err.contains("https://"), "{err}");
+    // `--check` keeps its exit code for the warning and still ends with
+    // where to report, as the output stays human.
+    let (code, out, err) = run(&mut command(
+        &sb,
+        &["doctor", "--check", "--user", "tester"],
+    ));
+    assert!(code == 1 || code == 2, "{code}: {out} {err}");
+    let summary = out
+        .find("\n[doctor] summary: ")
+        .unwrap_or_else(|| panic!("no summary line: {out}"));
+    assert!(
+        out[summary..].contains("\nhttps://github.com/archledger/irlume/security\n"),
+        "{out}"
     );
     let check = upgrade_check(&sb);
     assert_eq!(check["state"], "warn", "{check}");
@@ -6296,7 +6579,13 @@ fn enroll_reports_a_new_profile_and_forwards_the_flags() {
         "enroll", "--user", "tester", "--name", "Night", "--scans", "3",
     ]));
     assert_eq!(code, 0);
-    assert!(out.contains("enrolled 'Night' with 3 scans"), "{out}");
+    assert!(
+        out.contains(
+            "[enroll] enrolled 'Night' with 3 scans\n\
+             [enroll] if face sign-in stops working, `irlume tui` shows why.\n"
+        ),
+        "{out}"
+    );
 
     let log = log.lock().unwrap();
     match &log[0] {
@@ -6338,6 +6627,10 @@ fn enroll_merge_points_at_add_scan() {
     assert!(
         out.contains("profiles add-scan --profile 'Face Profile 1'"),
         "the merge message must name the follow-up command: {out}"
+    );
+    assert!(
+        out.ends_with("\n[enroll] if face sign-in stops working, `irlume tui` shows why.\n"),
+        "{out}"
     );
 }
 

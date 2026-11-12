@@ -333,7 +333,7 @@ enum Suspend {
     Diag,
     /// The full `irlume doctor` text readout in the cooked terminal: the
     /// complete authoritative dump (incl. the info-only lines the Repair
-    /// checklist omits), copy-pasteable for a bug report.
+    /// checklist omits). It shows the account name.
     Doctor,
     /// `irlume doctor` as root (`sudo irlume doctor --user <user>`): its TPM
     /// checks come from irlumed's root-only requests, which a doctor run as
@@ -4396,6 +4396,13 @@ impl App {
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
                     WMsg::Done { ambient_lit } => {
+                        // Before the completion: the collapsed Activity strip
+                        // shows the newest entry, which stays the completion
+                        // or the ambient-light warning below.
+                        self.log(
+                            '·',
+                            "If face sign-in stops working, the Overview shows why.",
+                        );
                         self.log('✓', "enrollment complete");
                         let ambient_lit =
                             ambient_lit + self.enroll.as_ref().map(|e| e.ambient_base).unwrap_or(0);
@@ -4900,22 +4907,21 @@ impl App {
                 &["irlume", "doctor", "--user", &target],
             ),
             Suspend::SupportReport => match crate::support_report::create_read_only_default() {
-                Ok(path) => {
+                Ok((path, who)) => {
                     // Print on the SUSPENDED terminal too: the report lands in
                     // the TUI's working directory, and a success line buried in
                     // the Activity log read as "nothing happened" (user report
                     // 2026-08-23: "[s] seems to not work"). Absolute path so
-                    // the file is findable from wherever the TUI was launched.
-                    let shown = std::fs::canonicalize(&path).unwrap_or(path.clone());
-                    println!("Support report created: {}", shown.display());
-                    println!("Inspect it before sharing (no camera data was captured).");
-                    self.log(
-                        '✓',
-                        format!(
-                            "Support report created: {} — inspect before sharing",
-                            path.display()
-                        ),
+                    // the file is findable from wherever the TUI was launched,
+                    // with the running account's home shown as `~`.
+                    let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+                    let (printed, logged) = support_report_created(
+                        &absolute,
+                        &crate::where_to_report::display_homes(),
+                        who,
                     );
+                    print!("{printed}");
+                    self.log('✓', logged);
                 }
                 Err(error) => {
                     println!("Support report FAILED: {error}");
@@ -5882,7 +5888,7 @@ impl App {
                 ));
             }
             (SC_REPAIR, KeyCode::Char('d')) => {
-                self.log('→', "irlume doctor: the complete platform readout (copy-pasteable)");
+                self.log('→', "irlume doctor: the complete platform readout (it shows your account name)");
                 self.suspend = Some(Suspend::Doctor);
             }
             // The same readout as root, for the checks irlumed answers only
@@ -11330,6 +11336,26 @@ fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
+}
+
+/// What the suspended terminal prints after the TUI wrote a support report,
+/// and its Activity entry: the report's absolute path with the running
+/// account's home (`homes`, empty for root) shown as `~`, then where to
+/// report a problem.
+fn support_report_created(
+    absolute: &std::path::Path,
+    homes: &[std::path::PathBuf],
+    who: crate::where_to_report::ReportRun,
+) -> (String, String) {
+    let shown = crate::where_to_report::display_path(absolute, homes);
+    (
+        format!(
+            "Support report created: {shown}\n\
+             Inspect it before sharing (no camera data was captured).\n{}",
+            crate::where_to_report::after_support_report(who)
+        ),
+        format!("Support report created: {shown}; inspect it before sharing"),
+    )
 }
 
 fn section(title: &str) -> Line<'static> {
@@ -18022,6 +18048,73 @@ mod tests {
         assert!(branch.contains("create_read_only_default"));
         assert!(!branch.contains("--probe"));
         assert!(!branch.contains("trace"));
+        // The written path, with the home as `~`, and where to report, both
+        // from `support_report_created`.
+        assert!(branch.contains("canonicalize(&path)"));
+        assert!(branch.contains("support_report_created("));
+        assert!(branch.contains("&crate::where_to_report::display_homes()"));
+        assert!(branch.contains("print!(\"{printed}\")"));
+        assert!(branch.contains("self.log('✓', logged)"));
+        assert!(!branch.contains('\u{2014}'));
+        // The TUI's report is made and described without a probe.
+        let report_source = include_str!("support_report.rs");
+        let default_report = report_source
+            .split("pub(crate) fn create_read_only_default()")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("create_read_only_default");
+        assert!(
+            default_report.contains("report_run(&report, false)"),
+            "{default_report}"
+        );
+        assert!(!default_report.contains("true"), "{default_report}");
+    }
+
+    /// After the TUI writes a support report, the suspended terminal shows
+    /// its path with the running account's home as `~` (in full for root,
+    /// whose `homes` are empty), then where to report; the Activity entry
+    /// shows the same path.
+    #[test]
+    fn the_tui_support_report_shows_the_home_as_tilde_then_where_to_report() {
+        use crate::where_to_report::{OtherAccounts, ReportRun};
+        let user = ReportRun::User {
+            other_accounts: OtherAccounts::Nothing,
+        };
+        let absolute = std::path::Path::new("/home/alice/work/irlume-support-1.txt");
+        let homes = [std::path::PathBuf::from("/home/alice")];
+        let (printed, logged) = support_report_created(absolute, &homes, user);
+        assert_eq!(
+            printed,
+            format!(
+                "Support report created: ~/work/irlume-support-1.txt\n\
+                 Inspect it before sharing (no camera data was captured).\n{}",
+                crate::where_to_report::after_support_report(user)
+            )
+        );
+        assert!(
+            printed.contains("https://github.com/archledger/irlume/security\n"),
+            "{printed}"
+        );
+        assert_eq!(
+            logged,
+            "Support report created: ~/work/irlume-support-1.txt; inspect it before sharing"
+        );
+        assert!(!printed.contains('\u{2014}') && !logged.contains('\u{2014}'));
+
+        let root = ReportRun::Root {
+            other_accounts: OtherAccounts::Nothing,
+            probe: false,
+        };
+        let (printed, logged) = support_report_created(absolute, &[], root);
+        assert!(
+            printed.starts_with("Support report created: /home/alice/work/irlume-support-1.txt\n"),
+            "{printed}"
+        );
+        assert!(printed.contains("made as root"), "{printed}");
+        assert!(
+            logged.contains("/home/alice/work/irlume-support-1.txt"),
+            "{logged}"
+        );
     }
 
     #[test]
@@ -18825,6 +18918,67 @@ mod tests {
             "completion must be logged"
         );
         assert!(app.error.is_none());
+        drain_loads(&mut app);
+    }
+
+    /// The enrollment hint is logged before "enrollment complete", so the
+    /// collapsed Activity strip, which shows the newest entry, still shows
+    /// the completion, or the ambient-light warning when there is one.
+    #[test]
+    fn the_enrollment_hint_never_hides_the_completion_or_the_ambient_warning() {
+        const HINT: &str = "If face sign-in stops working, the Overview shows why.";
+        for ambient_lit in [2, 0] {
+            let _sock = dead_socket();
+            let mut app = test_app();
+            let (tx, enroll) = fake_enroll(0, 4);
+            app.enroll = Some(enroll);
+            tx.send(WMsg::Done { ambient_lit }).unwrap();
+            app.poll();
+            let logged: Vec<(char, String)> = app.activity.to_vec();
+            assert!(app.enroll.is_none());
+            // Wait for the refresh the finished enrollment started.
+            drain_loads(&mut app);
+            wait_live_done(&mut app);
+
+            let hint = logged
+                .iter()
+                .position(|(icon, m)| *icon == '·' && m == HINT)
+                .unwrap_or_else(|| panic!("no hint: {logged:?}"));
+            let complete = logged
+                .iter()
+                .position(|(icon, m)| *icon == '✓' && m == "enrollment complete")
+                .unwrap_or_else(|| panic!("no completion: {logged:?}"));
+            assert_eq!(complete, hint + 1, "{logged:?}");
+            if ambient_lit > 0 {
+                assert_eq!(complete + 2, logged.len(), "{logged:?}");
+                let (icon, warning) = logged.last().unwrap();
+                assert_eq!(*icon, '!', "{logged:?}");
+                assert!(warning.starts_with("2 scan(s) were lit"), "{logged:?}");
+            } else {
+                assert_eq!(complete + 1, logged.len(), "{logged:?}");
+            }
+        }
+    }
+
+    /// The Diagnostics doctor entry says that doctor output shows the
+    /// account name.
+    #[test]
+    fn the_doctor_entry_says_it_shows_the_account_name() {
+        let _sock = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_REPAIR;
+        app.on_key(KeyCode::Char('d'));
+        assert!(matches!(app.suspend, Some(Suspend::Doctor)));
+        let (icon, entry) = app.activity.last().expect("an entry");
+        assert_eq!(*icon, '→');
+        assert_eq!(
+            entry,
+            "irlume doctor: the complete platform readout (it shows your account name)"
+        );
+        assert!(!app
+            .activity
+            .iter()
+            .any(|(_, m)| m.contains("copy-pasteable")));
         drain_loads(&mut app);
     }
 

@@ -178,6 +178,7 @@ Look at the camera. It captures ten scans and saves a profile:
 [enroll] 'you': capturing a new face profile; stay in frame, look at the camera…
 [enroll] if this camera pair has no measured capture mode yet, irlume measures it first (one time, up to a minute; the IR emitter fires)
 [enroll] enrolled 'Face Profile 1' with 10 scans
+[enroll] if face sign-in stops working, `irlume tui` shows why.
 ```
 
 Options: `--name "Alex"` names the profile, `--scans K` sets the scan count,

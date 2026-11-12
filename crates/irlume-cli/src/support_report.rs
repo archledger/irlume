@@ -3,6 +3,7 @@
 
 //! Privacy-bounded support report collection, rendering, and publication.
 
+use crate::where_to_report::{self, OtherAccounts, ReportRun};
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
     CaptureSchedule, CaptureScheduleSource, DigestToken, ExactStreamContract, OperationClass,
@@ -594,10 +595,16 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         eprintln!("irlume support-report: probe requested; the camera and IR emitter may activate");
     }
     let output = parsed.output.unwrap_or_else(default_output_path);
-    match publish(collect(parsed.since, parsed.probe), &output) {
+    let report = collect(parsed.since, parsed.probe);
+    let who = report_run(&report, parsed.probe);
+    match publish(report, &output) {
         Ok(path) => {
-            println!("Support report created: {}", path.display());
+            println!(
+                "Support report created: {}",
+                where_to_report::display_path(&path, &where_to_report::display_homes())
+            );
             println!("Inspect it before sharing.");
+            print!("{}", where_to_report::after_support_report(who));
             ExitCode::SUCCESS
         }
         Err(message) => {
@@ -607,12 +614,48 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     }
 }
 
-pub(crate) fn create_read_only_default() -> Result<PathBuf, String> {
+/// The TUI's report: the default history, no probe, in the working
+/// directory. Returns the written path and who made the report, for the
+/// lines printed after it.
+pub(crate) fn create_read_only_default() -> Result<(PathBuf, ReportRun), String> {
     let output = default_output_path();
-    publish(
-        collect(Duration::from_millis(DEFAULT_HISTORY_MS), false),
-        &output,
-    )
+    let report = collect(Duration::from_millis(DEFAULT_HISTORY_MS), false);
+    let who = report_run(&report, false);
+    publish(report, &output).map(|path| (path, who))
+}
+
+/// Who made `report` and which other accounts' events it lists, from the
+/// same decision its privacy checklist line makes. A current irlumed marks
+/// the snapshot of every reader but root as withholding other accounts'
+/// events. A snapshot without that mark is root's, or an ordinary user's
+/// from an older irlumed, and can list every account's events whatever it
+/// holds: with no authentication or status event it is `OtherEvents`.
+pub(crate) fn report_run(report: &SupportReport, probe: bool) -> ReportRun {
+    // A snapshot whose recent events are not marked as withheld lists every
+    // account's: root's view of a current irlumed, or any caller's view of
+    // an older one.
+    let every_account = report
+        .daemon
+        .as_ref()
+        .is_some_and(|snapshot| !withholds_other_accounts(snapshot));
+    let other_accounts = match authentication_timeline(report) {
+        AuthenticationTimeline::EveryAccount => OtherAccounts::Authentications,
+        AuthenticationTimeline::OlderDaemonStatusEvents => OtherAccounts::StatusEvents,
+        AuthenticationTimeline::NoAuthentications | AuthenticationTimeline::ThisAccount => {
+            if every_account {
+                OtherAccounts::OtherEvents
+            } else {
+                OtherAccounts::Nothing
+            }
+        }
+    };
+    match report.effective_privilege {
+        EffectivePrivilege::Root => ReportRun::Root {
+            other_accounts,
+            probe,
+        },
+        EffectivePrivilege::User => ReportRun::User { other_accounts },
+    }
 }
 
 fn publish(report: SupportReport, output: &Path) -> Result<PathBuf, String> {
@@ -981,12 +1024,24 @@ fn withholds_other_accounts(snapshot: &SupportSnapshot) -> bool {
     })
 }
 
-/// The privacy checklist's line for the authentication timeline: when the
-/// recent events include authentications, whose they are, since their
-/// times and outcomes (granted, denied, failed) are account history.
-fn authentication_checklist_line(report: &SupportReport) -> &'static str {
+/// What the recent events say about authentications, and whose.
+enum AuthenticationTimeline {
+    /// No daemon section, or no authentication and no status event that
+    /// may stand for one.
+    NoAuthentications,
+    /// Status events from a daemon that did not withhold other accounts'.
+    OlderDaemonStatusEvents,
+    /// Authentications, with other accounts' withheld.
+    ThisAccount,
+    /// Authentications, none withheld: root's view, or an older daemon's.
+    EveryAccount,
+}
+
+/// The authentication timeline a report holds, which its privacy checklist
+/// line and the lines printed after it both follow.
+fn authentication_timeline(report: &SupportReport) -> AuthenticationTimeline {
     let Some(snapshot) = report.daemon.as_ref() else {
-        return "  [x] no authentication times or outcomes";
+        return AuthenticationTimeline::NoAuthentications;
     };
     let has = |class: OperationClass| {
         snapshot
@@ -1001,15 +1056,33 @@ fn authentication_checklist_line(report: &SupportReport) -> &'static str {
         // the report cannot tell such a daemon from root's view of this
         // one, so status events are not taken as proof there are none.
         if has(OperationClass::Status) && !withholds_other_accounts(snapshot) {
-            return "  [!] recent status events, which an older irlumed also uses for keyring \
-                    arms and token releases: when each happened and its outcome";
+            return AuthenticationTimeline::OlderDaemonStatusEvents;
         }
-        return "  [x] no authentication times or outcomes";
+        return AuthenticationTimeline::NoAuthentications;
     }
     if withholds_other_accounts(snapshot) {
-        "  [!] this account's recent authentications: when each happened and its outcome"
+        AuthenticationTimeline::ThisAccount
     } else {
-        "  [!] recent authentications of every account: when each happened and its outcome"
+        AuthenticationTimeline::EveryAccount
+    }
+}
+
+/// The privacy checklist's line for the authentication timeline: when the
+/// recent events include authentications, whose they are, since their
+/// times and outcomes (granted, denied, failed) are account history.
+fn authentication_checklist_line(report: &SupportReport) -> &'static str {
+    match authentication_timeline(report) {
+        AuthenticationTimeline::NoAuthentications => "  [x] no authentication times or outcomes",
+        AuthenticationTimeline::OlderDaemonStatusEvents => {
+            "  [!] recent status events, which an older irlumed also uses for keyring \
+             arms and token releases: when each happened and its outcome"
+        }
+        AuthenticationTimeline::ThisAccount => {
+            "  [!] this account's recent authentications: when each happened and its outcome"
+        }
+        AuthenticationTimeline::EveryAccount => {
+            "  [!] recent authentications of every account: when each happened and its outcome"
+        }
     }
 }
 
@@ -1370,6 +1443,223 @@ mod tests {
             }],
         ));
         assert!(checklist.contains("  [x] no authentication times or outcomes\n"));
+    }
+
+    /// The run the lines after a report describe follows the report's own
+    /// privacy checklist: every account's authentications or status events
+    /// only when the checklist names them, whoever made the report; an
+    /// ordinary user's report from a daemon that withheld the other
+    /// accounts lists none of theirs.
+    #[test]
+    fn a_report_run_follows_the_privacy_checklist() {
+        use EffectivePrivilege::{Root, User};
+        let withheld = || {
+            vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }]
+        };
+        let cases = [
+            (
+                Root,
+                vec![OperationClass::CameraDiagnostics],
+                Vec::new(),
+                OtherAccounts::OtherEvents,
+                "  [x] no authentication times or outcomes\n",
+            ),
+            (
+                Root,
+                vec![OperationClass::Authentication],
+                Vec::new(),
+                OtherAccounts::Authentications,
+                "  [!] recent authentications of every account:",
+            ),
+            (
+                Root,
+                vec![OperationClass::Status],
+                Vec::new(),
+                OtherAccounts::StatusEvents,
+                "  [!] recent status events, which an older irlumed",
+            ),
+            (
+                User,
+                vec![OperationClass::Authentication],
+                withheld(),
+                OtherAccounts::Nothing,
+                "  [!] this account's recent authentications:",
+            ),
+            (
+                User,
+                vec![OperationClass::Status],
+                withheld(),
+                OtherAccounts::Nothing,
+                "  [x] no authentication times or outcomes\n",
+            ),
+            // An older irlumed, which withholds nothing from a user.
+            (
+                User,
+                vec![OperationClass::Authentication],
+                Vec::new(),
+                OtherAccounts::Authentications,
+                "  [!] recent authentications of every account:",
+            ),
+            (
+                User,
+                vec![OperationClass::Status, OperationClass::Enrollment],
+                Vec::new(),
+                OtherAccounts::StatusEvents,
+                "  [!] recent status events, which an older irlumed",
+            ),
+        ];
+        for (privilege, operations, unavailable, other_accounts, checklist) in cases {
+            let root = matches!(privilege, Root);
+            let report = fixture_report_with_events(privilege, &operations, unavailable);
+            let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+            let listed = text.split_once("Privacy checklist\n").unwrap().1;
+            assert!(listed.contains(checklist), "{operations:?}: {listed}");
+            for probe in [false, true] {
+                let expected = if root {
+                    ReportRun::Root {
+                        other_accounts,
+                        probe,
+                    }
+                } else {
+                    ReportRun::User { other_accounts }
+                };
+                assert_eq!(report_run(&report, probe), expected, "{operations:?}");
+            }
+        }
+        // No daemon section: nothing from any account.
+        assert_eq!(
+            report_run(&fixture_report(), false),
+            ReportRun::User {
+                other_accounts: OtherAccounts::Nothing
+            }
+        );
+    }
+
+    /// A current irlumed marks recent events withheld for every reader but
+    /// root, with or without events, so an ordinary user's report without
+    /// the mark is from an older irlumed whatever it holds: with no
+    /// authentication or status event it can still list other accounts'
+    /// enrollment, identification or camera-diagnostics events. Without a
+    /// daemon section, or with the mark, it lists none of theirs. Root's
+    /// snapshot never has the mark, so a root report with a daemon section
+    /// is treated the same way. The checklist line is the one the events
+    /// give, for both.
+    #[test]
+    fn a_user_report_without_the_withholding_mark_is_from_an_older_irlumed() {
+        use OperationClass::{
+            Authentication, CameraDiagnostics, Enrollment, Identification, Status,
+        };
+        use OtherAccounts::{Authentications, Nothing, OtherEvents, StatusEvents};
+        const NONE: &str = "  [x] no authentication times or outcomes\n";
+        let withheld = || {
+            vec![SupportUnavailable {
+                section: SupportSection::RecentEvents,
+                reason: UnavailableReason::NotAuthorized,
+            }]
+        };
+        // (events, marked, user's other accounts, root's, checklist line)
+        let cases: [(&[OperationClass], bool, OtherAccounts, OtherAccounts, &str); 12] = [
+            (&[], true, Nothing, Nothing, NONE),
+            (
+                &[Enrollment, CameraDiagnostics],
+                true,
+                Nothing,
+                Nothing,
+                NONE,
+            ),
+            (
+                &[Authentication],
+                true,
+                Nothing,
+                Nothing,
+                "  [!] this account's recent authentications:",
+            ),
+            (&[Status], true, Nothing, Nothing, NONE),
+            (&[], false, OtherEvents, OtherEvents, NONE),
+            (&[Enrollment], false, OtherEvents, OtherEvents, NONE),
+            (&[CameraDiagnostics], false, OtherEvents, OtherEvents, NONE),
+            (&[Identification], false, OtherEvents, OtherEvents, NONE),
+            (
+                &[Authentication],
+                false,
+                Authentications,
+                Authentications,
+                "  [!] recent authentications of every account:",
+            ),
+            (
+                &[Enrollment, Authentication],
+                false,
+                Authentications,
+                Authentications,
+                "  [!] recent authentications of every account:",
+            ),
+            (
+                &[Status],
+                false,
+                StatusEvents,
+                StatusEvents,
+                "  [!] recent status events, which an older irlumed",
+            ),
+            (
+                &[CameraDiagnostics, Status],
+                false,
+                StatusEvents,
+                StatusEvents,
+                "  [!] recent status events, which an older irlumed",
+            ),
+        ];
+        for (operations, marked, user, root, checklist) in cases {
+            let unavailable = if marked { withheld() } else { Vec::new() };
+            for (as_root, expected) in [(false, user), (true, root)] {
+                let privilege = if as_root {
+                    EffectivePrivilege::Root
+                } else {
+                    EffectivePrivilege::User
+                };
+                let report = fixture_report_with_events(privilege, operations, unavailable.clone());
+                let text = String::from_utf8(render_text(&report).unwrap()).unwrap();
+                let listed = text.split_once("Privacy checklist\n").unwrap().1;
+                assert!(listed.contains(checklist), "{operations:?}: {listed}");
+                for probe in [false, true] {
+                    let want = if as_root {
+                        ReportRun::Root {
+                            other_accounts: expected,
+                            probe,
+                        }
+                    } else {
+                        ReportRun::User {
+                            other_accounts: expected,
+                        }
+                    };
+                    assert_eq!(
+                        report_run(&report, probe),
+                        want,
+                        "root={as_root} {operations:?} marked={marked}"
+                    );
+                }
+            }
+        }
+        // Without a daemon section there is no snapshot to lack the mark.
+        let mut report = fixture_report();
+        assert_eq!(
+            report_run(&report, false),
+            ReportRun::User {
+                other_accounts: Nothing
+            }
+        );
+        report.effective_privilege = EffectivePrivilege::Root;
+        for probe in [false, true] {
+            assert_eq!(
+                report_run(&report, probe),
+                ReportRun::Root {
+                    other_accounts: Nothing,
+                    probe
+                }
+            );
+        }
     }
 
     #[test]

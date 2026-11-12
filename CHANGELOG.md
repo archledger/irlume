@@ -7,6 +7,31 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume support-report`, the TUI's Create Support Report, and human
+  `irlume doctor` output that has a warning or failure, also with
+  `--check`, end with where to report a problem: a security problem, or
+  one you are not sure about, privately through GitHub's private
+  reporting or the e-mail address in SECURITY.md, and anything else
+  through the issue chooser. The lines after a report say which file to
+  attach. A report made as your own user is that file. A report made
+  as root can be read by root only and can list every account's
+  events, so it asks for one made as your own user; with `--probe`,
+  which needs root, it asks for that file or one made as your own
+  user. A report made as your own user while an irlumed older than
+  this irlume is still running, which does not keep other accounts'
+  events out of it, says so and asks for a new one made after irlumed
+  is restarted (`sudo systemctl restart irlumed`) or the upgrade is
+  finished. An absolute report path inside your home prints as
+  `~/...`, except for a report made as root. Doctor's closing lines
+  say that doctor output shows your account name and an added
+  camera's serial number, and the TUI's doctor entry that it shows
+  your account name. `irlume enroll` and the TUI's enrollment say
+  where to see why face sign-in stops working, and doctor's line for
+  an unknown display manager asks for its name instead of linking the
+  issue list. The report file, `doctor --json` and
+  `support-report --json` are unchanged (ADR-0008, support report
+  contract and TUI surface, #1329).
+
 - A support report keys its qualification and runtime context tokens with a
   key drawn for that report alone and not kept: the camera rows and the
   capture section of one report still carry matching values, and two reports

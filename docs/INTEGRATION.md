@@ -195,8 +195,12 @@ at `/run/irlume.sock` is not.
 ## Reporting a problem
 
 Include the output of `irlume doctor --json` and `irlume version --json`. Neither
-contains camera frames, embeddings, templates, passwords, TPM secrets, device
-paths, or usernames, so both are safe to attach to a public issue.
+contains camera frames, embeddings, templates, passwords or TPM secrets. The
+`detail` texts of `doctor --json` are English elaboration. Depending on what a
+check finds, one can name the account checked (other accounts too when doctor
+runs as root) or a `/dev/video*` node. Read the output before you attach it to a
+public issue; you may replace the names. A security problem goes to the private
+route in [SECURITY.md](../SECURITY.md), never into a public issue.
 
 ## PAM credential-release retries
 

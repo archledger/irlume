@@ -13,7 +13,8 @@ if command -v apparmor_parser >/dev/null 2>&1; then
     # worse), but a confinement that did not take is not something to hide.
     if ! apparmor_parser -r /etc/apparmor.d/usr.bin.irlumed 2>&1; then
         echo "irlume: WARNING: the AppArmor profile did not load; irlumed will" >&2
-        echo "irlume: run unconfined. Report the parser error above." >&2
+        echo "irlume: run unconfined. Report the parser error above at" >&2
+        echo "irlume: https://github.com/archledger/irlume/issues/new/choose" >&2
     fi
 fi
 systemctl daemon-reload 2>/dev/null || true
@@ -84,3 +85,18 @@ irlume installed. Next steps:
  sudo irlume ir-setup writes to the camera and tells you so first)
 Password login remains available when face authentication is retry-limited.
 EOF
+# Where to report a problem, on first install only ($2 empty): the six lines
+# of WHERE_TO_REPORT in crates/irlume-cli/src/where_to_report.rs, whose test
+# compares every copy with it.
+if [ -z "${2:-}" ]; then
+    cat <<'EOF'
+
+Security problem (a photo, video, mask or another person got in,
+face sign-in worked without your face, or face data was exposed),
+or not sure? Never post it publicly. Report it privately:
+https://github.com/archledger/irlume/security
+or the e-mail address in SECURITY.md.
+Anything else: https://github.com/archledger/irlume/issues/new/choose
+Your own words are fine; attach the file `irlume support-report` writes.
+EOF
+fi

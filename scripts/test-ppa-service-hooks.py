@@ -26,6 +26,20 @@ DAEMON = "irlumed.service"
 SOCKET = "irlumed.socket"
 RECONCILE = ("irlume-reconcile.path", "irlume-reconcile.service", "irlume-reconcile.timer")
 UNITS = (DAEMON, SOCKET, *RECONCILE)
+# Where to report a problem: what the postinst prints on a first install, the
+# lines scripts/install.sh prints after a failure or for a daemon that is not
+# active.
+SECURITY_URL = "https://github.com/archledger/irlume/security"
+CHOOSER_URL = "https://github.com/archledger/irlume/issues/new/choose"
+WHERE_TO_REPORT = (
+    "Security problem (a photo, video, mask or another person got in,",
+    "face sign-in worked without your face, or face data was exposed),",
+    "or not sure? Never post it publicly. Report it privately:",
+    SECURITY_URL,
+    "or the e-mail address in SECURITY.md.",
+    f"Anything else: {CHOOSER_URL}",
+)
+ATTACH_A_REPORT = "Your own words are fine; attach the file `irlume support-report` writes."
 
 # The real Debian wrapper decides which units reach systemctl and asks the real
 # test policy executable first. Only the side effects at those boundaries are
@@ -287,6 +301,9 @@ class PpaServiceHookTests(unittest.TestCase):
                 self.assertEqual(state["stderr"].count("WARNING:"), 1)
                 self.assertIn("AppArmor profile did not load", state["stderr"])
                 self.assertIn("may run unconfined", state["stderr"])
+                self.assertIn(f"Report the parser error above at\nirlume: {CHOOSER_URL}\n",
+                              state["stderr"])
+                self.assertNotIn(SECURITY_URL, state["stderr"])
                 self.assertFalse(state["profile_loaded"])
                 for unit in (DAEMON, SOCKET):
                     self.assert_unit(state, unit, "enabled", True,
@@ -304,6 +321,23 @@ class PpaServiceHookTests(unittest.TestCase):
                 self.assertTrue(state["profile_loaded"])
                 self.assertEqual(state["stderr"], "")
                 self.assertNotIn("WARNING:", state["stdout"])
+
+    def test_first_install_says_where_to_report(self):
+        block = "\n\n" + "\n".join((*WHERE_TO_REPORT, ATTACH_A_REPORT)) + "\n"
+        state = self.run_hook(("disabled", False), ("disabled", False), old=None)
+        stdout = state["stdout"]
+        self.assertEqual(stdout.count(block), 1, stdout)
+        self.assertEqual(stdout.count(SECURITY_URL), 1, stdout)
+        self.assertEqual(stdout.count(CHOOSER_URL), 1, stdout)
+        self.assertLess(stdout.index("irlume installed. Next steps:"), stdout.index(block))
+        self.assertEqual(state["stderr"], "")
+
+    def test_upgrade_does_not_repeat_where_to_report(self):
+        state = self.run_hook(old="0.15.0-1")
+        self.assertIn("irlume installed. Next steps:", state["stdout"])
+        for text in (SECURITY_URL, CHOOSER_URL, WHERE_TO_REPORT[0], ATTACH_A_REPORT):
+            self.assertNotIn(text, state["stdout"])
+        self.assertEqual(state["stderr"], "")
 
     def test_absent_parser_stays_quiet_without_host_fallback(self):
         for old in (None, "0.15.0-1"):

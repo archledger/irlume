@@ -278,6 +278,47 @@ mod tests {
         },
     ];
 
+    /// The shell copies hold the same lines: each package script once, in
+    /// a heredoc after a blank line and followed by its attach line, and
+    /// the installer once, behind `warn`. This compares text only; that
+    /// the scripts print it is checked by `scripts/test-install-script.sh`
+    /// and the package-hook tests.
+    #[test]
+    fn shell_copies_print_the_same_report_lines() {
+        let heredoc = format!("\n{WHERE_TO_REPORT}\n{ATTACH_A_REPORT}\n");
+        for (name, script) in [
+            (
+                "packaging/arch/irlume.install",
+                include_str!("../../../packaging/arch/irlume.install"),
+            ),
+            (
+                "packaging/arch-git/irlume.install",
+                include_str!("../../../packaging/arch-git/irlume.install"),
+            ),
+            (
+                "packaging/debian/postinstall.sh",
+                include_str!("../../../packaging/debian/postinstall.sh"),
+            ),
+            (
+                "packaging/ppa/debian/postinst",
+                include_str!("../../../packaging/ppa/debian/postinst"),
+            ),
+        ] {
+            assert_eq!(script.matches(&heredoc).count(), 1, "{name}");
+        }
+        let installer: String = WHERE_TO_REPORT
+            .lines()
+            .map(|line| format!("  warn \"{line}\"\n"))
+            .collect();
+        assert_eq!(
+            include_str!("../../../scripts/install.sh")
+                .matches(&installer)
+                .count(),
+            1,
+            "scripts/install.sh"
+        );
+    }
+
     /// The security line comes first and says not to post publicly before
     /// it names the private route; the issue chooser comes last. Each
     /// address ends its line, so a terminal's link detection takes all of

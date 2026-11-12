@@ -31,9 +31,10 @@
 #   - The repo paths (Fedora Copr, Ubuntu PPA) are cryptographically verified by
 #     dnf / apt against their signing keys.
 #   - The release-asset paths verify a SHA256 checksum from the release's
-#     SHA256SUMS and ABORT on any mismatch. When the release also publishes a
-#     GPG signature (SHA256SUMS.asc), this script verifies it against the pinned
-#     irlume signing key before trusting the checksums.
+#     SHA256SUMS and ABORT on any mismatch. Every release also publishes a
+#     GPG signature (SHA256SUMS.asc): this script verifies it against the pinned
+#     irlume signing key before trusting the checksums, and refuses to install
+#     when the signature is missing or does not verify.
 #
 # Safety:
 #   - The whole script is wrapped in main() and only runs once fully downloaded,
@@ -69,6 +70,40 @@ PLCYfTcC
 say()  { printf '\033[1;34m[irlume]\033[0m %s\n' "$1" >&2; }
 warn() { printf '\033[1;33m[irlume]\033[0m %s\n' "$1" >&2; }
 die()  { printf '\033[1;31m[irlume]\033[0m %s\n' "$1" >&2; exit 1; }
+
+# Where to report a problem: the six lines of WHERE_TO_REPORT in
+# crates/irlume-cli/src/where_to_report.rs, whose test compares this copy and
+# the package scripts' (packaging/arch/irlume.install,
+# packaging/debian/postinstall.sh, packaging/ppa/debian/postinst) with it.
+report_block() {
+  warn ""
+  warn "Security problem (a photo, video, mask or another person got in,"
+  warn "face sign-in worked without your face, or face data was exposed),"
+  warn "or not sure? Never post it publicly. Report it privately:"
+  warn "https://github.com/archledger/irlume/security"
+  warn "or the e-mail address in SECURITY.md."
+  warn "Anything else: https://github.com/archledger/irlume/issues/new/choose"
+  warn "Your own words are fine; paste the lines above, not the sudo prompt."
+}
+
+# A failed verification. It names the private route itself: it runs inside
+# fetch_verified's $(...) subshell, where main()'s EXIT trap does not run.
+die_verify() {
+  printf '\033[1;31m[irlume]\033[0m %s\n' "$1" >&2
+  printf '\033[1;31m[irlume]\033[0m %s\n' "Do not override verification or install the download by hand;" >&2
+  printf '\033[1;31m[irlume]\033[0m %s\n' "report it privately: https://github.com/archledger/irlume/security" >&2
+  exit 1
+}
+
+# main()'s EXIT trap. Every exit that is not 0, by a die or by a command that
+# fails under set -e, ends here and says where to report a problem; an exit 0
+# adds nothing. The exit status is kept.
+on_exit() {
+  rc=$?
+  trap - EXIT
+  if [ "$rc" -ne 0 ]; then report_block || true; fi
+  exit "$rc"
+}
 
 need() { command -v "$1" >/dev/null 2>&1 || die "this installer needs '$1' but it is not on PATH."; }
 
@@ -107,19 +142,19 @@ fetch_sums() {
   command -v gpg >/dev/null 2>&1 \
     || die "gpg is required to verify the release signature. Install gnupg, or (not recommended) set IRLUME_INSECURE_NO_SIG=1 to trust HTTPS + SHA256 only."
   curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null \
-    || die "SHA256SUMS.asc not found for this release. Every irlume release is signed; a missing signature may mean the download was tampered with. Refusing to install. (Override at your own risk with IRLUME_INSECURE_NO_SIG=1.)"
+    || die_verify "SHA256SUMS.asc not found for this release. Every irlume release is signed; a missing signature may mean the download was tampered with. Refusing to install."
 
   # Throwaway keyring holding only the pinned key: nothing else can sign,
   # and the user's own keyring is never read or written.
   kh="${d}/gnupg"
   mkdir -p "$kh" && chmod 700 "$kh"
   printf '%s\n' "$KEY_ASC" | GNUPGHOME="$kh" gpg --batch --import >/dev/null 2>&1 \
-    || die "could not import the pinned irlume key; cannot verify the release signature."
+    || die_verify "could not import the pinned irlume key; cannot verify the release signature."
   if GNUPGHOME="$kh" gpg --batch --status-fd 1 --verify "${d}/SHA256SUMS.asc" "${d}/SHA256SUMS" 2>/dev/null \
        | grep -q "VALIDSIG ${KEY_FP}"; then
     say "SHA256SUMS GPG signature verified against the pinned irlume key."
   else
-    die "SHA256SUMS signature did NOT verify against the pinned irlume key ${KEY_FP}; refusing to install."
+    die_verify "SHA256SUMS signature did NOT verify against the pinned irlume key ${KEY_FP}; refusing to install."
   fi
 }
 
@@ -152,7 +187,7 @@ fetch_verified() {
     || die "download of ${name} failed."
   say "verifying checksum ..."
   ( cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1 ) \
-    || die "CHECKSUM MISMATCH on ${name}; refusing to install."
+    || die_verify "CHECKSUM MISMATCH on ${name}; refusing to install."
   printf '%s/%s\n' "$tmp" "$name"
 }
 
@@ -197,7 +232,7 @@ install_rpm_release() {
   ver="${VERSION_ID:-}"
   [ -n "$ver" ] || die "Fedora family without VERSION_ID; cannot pick a release RPM. Install from Copr when it is back."
   rpm_path="$(fetch_verified ".fc${ver}.x86_64.rpm")" || \
-    die "no release RPM for fc${ver} in the latest release. Install from Copr when it is back."
+    die "no verified release RPM for fc${ver}; the lines above say why. Install from Copr when it is back."
   # `dnf install <local.rpm>` handles both fresh install and upgrade, and is
   # a no-op ("Nothing to do") when the installed version is not older: exactly
   # the upgrade-only semantics the fallback needs (`dnf upgrade` alone cannot
@@ -273,6 +308,9 @@ ppa_serves() {
 }
 
 main() {
+  # First, so every later exit runs it. A $(...) subshell does not.
+  trap on_exit EXIT
+
   # Privilege: run package commands as root, via sudo when not already root.
   SUDO=""
   if [ "$(id -u)" -ne 0 ]; then
@@ -391,9 +429,18 @@ main() {
   # postinst does this too; this is a safety net across packaging paths.
   $SUDO systemctl enable --now irlumed.service >/dev/null 2>&1 || true
 
-  state="$(systemctl is-active irlumed.service 2>/dev/null || echo unknown)"
+  # is-active prints the state even when it exits non-zero.
+  state="$(systemctl is-active irlumed.service 2>/dev/null)" || true
+  [ -n "$state" ] || state=unknown
   say ""
-  say "installed; the irlume daemon is ${state}. The machine side is ready."
+  if [ "$state" = active ]; then
+    say "installed; the irlume daemon is active. The machine side is ready."
+  else
+    warn "installed, but the irlume daemon is ${state}, not active."
+    warn "The machine side is not ready. See why with:"
+    warn "  systemctl status irlumed.service"
+    report_block
+  fi
   say ""
   say "What is left is personal and interactive (it cannot be scripted): enroll"
   say "your face or fingerprint, arm your login password, set a recovery passphrase."

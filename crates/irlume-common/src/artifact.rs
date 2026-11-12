@@ -257,18 +257,55 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn sandbox(label: &str) -> PathBuf {
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    struct Sandbox(PathBuf);
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new, empty scratch directory for one test, and the guard that
+    /// removes it. Bind the guard to a named variable so that it lives to
+    /// the end of the test. The time in the name keeps a later run whose
+    /// process ID repeats (another PID namespace) from meeting a directory
+    /// an earlier run left; the counter separates tests that start in the
+    /// same clock tick.
+    fn sandbox(label: &str) -> (PathBuf, Sandbox) {
         static SEQUENCE: AtomicU64 = AtomicU64::new(0);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("irlume-{label}-{}-{sequence}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "irlume-{label}-{}-{sequence}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
         std::fs::create_dir(&dir).unwrap();
-        dir
+        (dir.clone(), Sandbox(dir))
+    }
+
+    #[test]
+    fn sandboxes_are_distinct_and_removed_when_their_test_fails() {
+        let (first, guard) = sandbox("artifact-unwind");
+        let (second, _second) = sandbox("artifact-unwind");
+        assert_ne!(first, second);
+        std::fs::write(first.join("left.txt"), b"x").unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = guard;
+            panic!("fixture failure");
+        });
+        assert!(unwound.is_err());
+        assert!(!first.exists());
+        assert!(second.is_dir());
     }
 
     #[test]
     fn commit_publishes_one_0600_file_without_replacing() {
-        let dir = sandbox("artifact-publish");
+        let (dir, _sandbox) = sandbox("artifact-publish");
         let target = dir.join("report.txt");
         let mut first = SecureArtifact::create(&target, 32).unwrap();
         first.write_chunk(b"first").unwrap();
@@ -290,7 +327,7 @@ mod tests {
 
     #[test]
     fn an_uncommitted_writer_leaves_only_a_named_partial() {
-        let dir = sandbox("artifact-partial");
+        let (dir, _sandbox) = sandbox("artifact-partial");
         let target = dir.join("trace.jsonl");
         let partial = {
             let mut artifact = SecureArtifact::create(&target, 32).unwrap();
@@ -303,7 +340,7 @@ mod tests {
 
     #[test]
     fn byte_limit_is_enforced_before_the_extra_chunk_is_written() {
-        let dir = sandbox("artifact-limit");
+        let (dir, _sandbox) = sandbox("artifact-limit");
         let target = dir.join("report.txt");
         let mut artifact = SecureArtifact::create(&target, 5).unwrap();
         artifact.write_chunk(b"12345").unwrap();
@@ -316,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_symlink_at_the_destination_is_not_followed_or_replaced() {
-        let dir = sandbox("artifact-symlink");
+        let (dir, _sandbox) = sandbox("artifact-symlink");
         let victim = dir.join("victim.txt");
         let target = dir.join("report.txt");
         std::fs::write(&victim, b"victim").unwrap();
@@ -337,7 +374,7 @@ mod tests {
 
     #[test]
     fn a_shared_partial_is_refused_before_any_extra_bytes_are_written() {
-        let dir = sandbox("artifact-shared-write");
+        let (dir, _sandbox) = sandbox("artifact-shared-write");
         let target = dir.join("trace.jsonl");
         let mut artifact = SecureArtifact::create(&target, 32).unwrap();
         let partial = artifact.partial_path().to_owned();
@@ -353,7 +390,7 @@ mod tests {
 
     #[test]
     fn a_shared_partial_is_never_published() {
-        let dir = sandbox("artifact-shared-commit");
+        let (dir, _sandbox) = sandbox("artifact-shared-commit");
         let target = dir.join("trace.jsonl");
         let mut artifact = SecureArtifact::create(&target, 32).unwrap();
         artifact.write_chunk(b"recoverable").unwrap();
@@ -370,7 +407,7 @@ mod tests {
 
     #[test]
     fn an_owner_mismatch_refuses_writing_and_publication() {
-        let dir = sandbox("artifact-owner-mismatch");
+        let (dir, _sandbox) = sandbox("artifact-owner-mismatch");
         let target = dir.join("trace.jsonl");
         let mut artifact = SecureArtifact::create(&target, 32).unwrap();
         let partial = artifact.partial_path().to_owned();

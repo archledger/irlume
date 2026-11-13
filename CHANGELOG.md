@@ -126,6 +126,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- The `.pre-irlume` copy that `irlume fingerprint enable` and `disable`
+  keep of a PAM file they edit (`sudo` and `polkit-1` on Omarchy) has
+  that file's mode and owner. It was written with the default mode for a
+  new file, whatever the file's, and `irlume login disable` and
+  `irlume uninstall` move a matching copy back over the file. The copy
+  is now created readable by its owner only, takes the file's mode and
+  owner before it is published, and appears complete or not at all. An
+  existing copy is kept as it is.
+  When the copy cannot be made, or a symlink, a directory or a file with
+  a second hard link is at the copy's name, the file is left as it is
+  and the command fails with the method unchanged.
+
 - `irlume doctor --json` names no account and no camera device path
   (`/dev/video*` or a `/dev/v4l/` link) in a check's `detail`, as
   docs/MACHINE-API.md says of machine output. `sealed-storage` and

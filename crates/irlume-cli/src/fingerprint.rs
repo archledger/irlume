@@ -404,21 +404,187 @@ fn unwire_omarchy() -> bool {
     ok
 }
 
-/// One PAM edit with the same discipline pamwire uses: back the original up
-/// once beside the file, write the new content ATOMICALLY (temp + rename +
-/// fsync, so a crash or full disk mid-edit leaves the previous bytes intact
-/// instead of a truncated auth stack), and preserve the existing file's mode
+/// One PAM edit: keep the original once beside the file as
+/// `<path>.pre-irlume` ([`backup_once`]), then write the new content
+/// ATOMICALLY (temp + rename + fsync, so a crash or full disk mid-edit leaves
+/// the previous bytes intact instead of a truncated auth stack), keeping the
+/// existing file's permission bits (never wider; a umask can narrow them)
 /// rather than forcing 0644 (2026-08-29 audit: a 0600 stack file came back
 /// world-readable).
+///
+/// Nothing at `path` yet: there is nothing to copy, and the file is created.
+/// Anything at `path` is copied first unless a copy is already kept; when
+/// that fails, `path` is left as it is and the edit reports failure.
 fn write_pam_edit(path: &str, next: &str) -> bool {
-    let backup = format!("{path}.pre-irlume");
-    if !std::path::Path::new(&backup).exists() {
-        if let Ok(current) = std::fs::read_to_string(path) {
-            let _ = std::fs::write(&backup, current);
+    let target = std::path::Path::new(path);
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => {
+            if let Err(e) = backup_once(target) {
+                eprintln!("[fingerprint] {e}");
+                return false;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("[fingerprint] stat {path}: {e}");
+            return false;
         }
     }
-    irlume_common::write_atomic_preserving(std::path::Path::new(path), next.as_bytes(), 0o644)
-        .is_ok()
+    irlume_common::write_atomic_preserving(target, next.as_bytes(), 0o644).is_ok()
+}
+
+/// Keep `path` once beside itself as `<path>.pre-irlume`, the name under which
+/// `irlume login` keeps its own copy of the same file; its disable moves a
+/// matching copy back over the file, which then has the copy's mode and
+/// owner.
+///
+/// The copy is created readable and writable by its owner only (a umask can
+/// only narrow that) and holds the bytes read from one open file. It then
+/// takes that open file's owner and then its mode (the permission, set-ID
+/// and sticky bits). The owner goes first because setting the owner, even
+/// to the same one, clears a set-user-ID bit and can clear a set-group-ID
+/// bit; the mode is set with fchmod(2), which the umask does not affect.
+/// Only the owner and the mode are carried over. The copy is synced and
+/// published by a hard link, which never replaces a name, so it appears
+/// complete or not at all, and then the directory is synced. A regular file
+/// with no other name already there is kept as it is; anything else there,
+/// such as a symlink, a directory or a file with a second hard link, refuses
+/// the copy.
+fn backup_once(path: &std::path::Path) -> Result<(), String> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let bak = std::path::PathBuf::from(format!("{}{}", path.display(), crate::pamwire::BACKUP));
+    if existing_copy(&bak)? {
+        return Ok(());
+    }
+    let mut source =
+        std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let meta = source
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    // Only a regular file is copied: anything else has no fixed bytes to keep.
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut contents = Vec::new();
+    source
+        .read_to_end(&mut contents)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    drop(source);
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("pam");
+    // Unique per copy: the process ID and a counter, so two copies made by one
+    // process never share a name. It is not a name pamwire's sweep of
+    // abandoned scratch files removes
+    // (`.{service}.irlume-{new,bak}.{pid}.{seq}.tmp`): that sweep runs each
+    // time the PAM lock is taken, and this edit does not take that lock. A
+    // run killed mid-copy can leave this file behind, as the edit's own
+    // temporary file already can. Killed between the link below and the
+    // removal after it, the run leaves this name as a second link to the
+    // copy, which this edit then refuses until this file is removed.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(
+        ".{name}.irlume-fpbak.{}.{seq}.tmp",
+        std::process::id()
+    ));
+    let linked = (|| -> Result<bool, String> {
+        let mut file = match create_scratch(&tmp) {
+            // Same process ID and counter as a killed earlier run: drop its
+            // file rather than write into it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp).map_err(|e| format!("remove {}: {e}", tmp.display()))?;
+                create_scratch(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?
+            }
+            other => other.map_err(|e| format!("create {}: {e}", tmp.display()))?,
+        };
+        file.write_all(&contents)
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()))
+            .map_err(|e| format!("chown {}: {e}", tmp.display()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+            .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        // Before the link, so the name never refers to a copy not yet on disk.
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        publish_copy(&tmp, &bak).map_err(|e| format!("backup {}: {e}", path.display()))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    settle_copy(linked?, &bak, dir)
+}
+
+/// After the publish and the scratch file's removal: sync the directory
+/// when the copy got its name; otherwise look at the name again, keep a
+/// copy another run published there first, and refuse anything else.
+fn settle_copy(linked: bool, bak: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    if linked {
+        irlume_common::fsync_dir(dir)
+    } else if existing_copy(bak)? {
+        // Another run published its copy first; that one is kept.
+        Ok(())
+    } else {
+        Err(format!(
+            "{} changed while the copy was made; run again",
+            bak.display()
+        ))
+    }
+}
+
+/// Create the scratch file a copy is written into: a new file, never one
+/// already at `tmp`, readable and writable by its owner only (a umask can
+/// only narrow that).
+fn create_scratch(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
+/// Give the finished copy at `tmp` the name `bak` with a hard link, which
+/// never replaces a name: `Ok(true)` when `bak` now names the copy and
+/// `Ok(false)` when something is already at `bak`, which is left as it is.
+fn publish_copy(tmp: &std::path::Path, bak: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::hard_link(tmp, bak) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a copy is already at `bak` to keep: `Ok(true)` for a regular file
+/// with no other name, `Ok(false)` for nothing there, and an error for
+/// anything else, which is left for the administrator to move away.
+fn existing_copy(bak: &std::path::Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(bak) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("stat {}: {e}", bak.display())),
+    };
+    let what = if meta.file_type().is_symlink() {
+        "a symlink".to_string()
+    } else if meta.file_type().is_dir() {
+        "a directory".to_string()
+    } else if !meta.file_type().is_file() {
+        "a special file".to_string()
+    } else if meta.nlink() > 1 {
+        format!(
+            "a file with {} hard links (an interrupted run can leave the other as a \
+             .*.irlume-fpbak.*.tmp file in the same directory)",
+            meta.nlink()
+        )
+    } else {
+        return Ok(true);
+    };
+    Err(format!(
+        "{} is {what}, not a copy to keep; move it away and run again",
+        bak.display()
+    ))
 }
 
 fn enable(user: &str, args: &[String]) -> ExitCode {
@@ -1145,16 +1311,82 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
 mod tests {
     use super::*;
 
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new, empty scratch directory for one test, and the guard that
+    /// removes it. Bind the guard to a named variable so that it lives to the
+    /// end of the test. The name is random, not built from the process ID: a
+    /// later run in another PID namespace can get the same process ID and
+    /// would meet a directory an earlier run left. Creation is strict, so
+    /// such a directory fails the test instead of being adopted.
+    fn scratch(label: &str) -> (std::path::PathBuf, Scratch) {
+        let path = std::env::temp_dir().join(format!(
+            "irlume-pamedit-{label}-{:08x}",
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        (path.clone(), Scratch(path))
+    }
+
+    /// A file holding `body` at exactly `mode`. The mode is part of each
+    /// test's precondition: a file system that does not keep a bit fails
+    /// here, not later as a backup that matches by accident.
+    fn file_at(path: &std::path::Path, body: &str, mode: u32) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+            mode,
+            "precondition: {} did not take mode {mode:o}",
+            path.display()
+        );
+    }
+
+    fn backup_of(path: &std::path::Path) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}{}", path.display(), crate::pamwire::BACKUP))
+    }
+
+    /// Every name in `dir`, sorted, so a test sees a scratch file or a stray
+    /// copy left beside the ones it expects.
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn scratch_dirs_are_distinct_and_removed_when_their_test_fails() {
+        let (first, guard) = scratch("unwind");
+        let (second, _second) = scratch("unwind");
+        assert_ne!(first, second);
+        std::fs::write(first.join("sudo.pre-irlume"), b"x").unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = guard;
+            panic!("fixture failure");
+        });
+        assert!(unwound.is_err());
+        assert!(!first.exists());
+        assert!(second.is_dir());
+    }
+
     #[test]
     fn write_pam_edit_preserves_a_tighter_existing_mode_and_replaces_content() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!(
-            "irlume-pamedit-mode-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, "auth include system-auth\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (dir, _scratch) = scratch("tighter-mode");
+        let path = dir.join("system-auth");
+        file_at(&path, "auth include system-auth\n", 0o600);
         assert!(write_pam_edit(
             path.to_str().unwrap(),
             "auth sufficient pam_fprintd.so\nauth include system-auth\n"
@@ -1168,9 +1400,364 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "auth sufficient pam_fprintd.so\nauth include system-auth\n"
         );
-        let _ = std::fs::remove_file(&path);
-        // write_pam_edit backs the original up to `<path>.pre-irlume`.
-        let _ = std::fs::remove_file(format!("{}.pre-irlume", path.display()));
+    }
+
+    /// The `.pre-irlume` copy of a PAM file has the file's mode (set-ID and
+    /// sticky bits included), owner and bytes, whatever the umask, and no
+    /// scratch file is left beside it. `irlume login disable` moves a
+    /// matching copy back over the file, so the file comes back with the
+    /// copy's mode. The 0400, set-ID and sticky rows differ from every mode
+    /// `std::fs::write` gives a new file under a umask that keeps the owner's
+    /// write bit. Run as an ordinary user, the test can only see the owner
+    /// kept, not changed.
+    #[test]
+    fn a_pam_edit_backup_has_the_mode_and_owner_of_the_file_it_copies() {
+        use std::os::unix::fs::MetadataExt as _;
+        for mode in [0o600, 0o640, 0o644, 0o400, 0o4644, 0o2640, 0o1644] {
+            let (dir, _scratch) = scratch("backup-mode");
+            let path = dir.join("sudo");
+            file_at(&path, "auth include system-auth\n", mode);
+            let original = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                write_pam_edit(
+                    path.to_str().unwrap(),
+                    "auth sufficient pam_fprintd.so\nauth include system-auth\n"
+                ),
+                "{mode:o}"
+            );
+            let bak = std::fs::symlink_metadata(backup_of(&path)).unwrap();
+            assert!(bak.file_type().is_file(), "{mode:o}");
+            assert_eq!(bak.nlink(), 1, "{mode:o}");
+            assert_eq!(bak.mode() & 0o7777, mode, "the backup of a {mode:o} file");
+            assert_eq!(
+                (bak.uid(), bak.gid()),
+                (original.uid(), original.gid()),
+                "{mode:o}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(backup_of(&path)).unwrap(),
+                "auth include system-auth\n",
+                "{mode:o}"
+            );
+            // The edit keeps the permission bits as before: never wider.
+            let live = std::fs::symlink_metadata(&path).unwrap().mode() & 0o7777;
+            assert_eq!(live & !(mode & 0o777), 0, "{mode:o} edited to {live:o}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "auth sufficient pam_fprintd.so\nauth include system-auth\n",
+                "{mode:o}"
+            );
+            assert_eq!(names_in(&dir), ["sudo", "sudo.pre-irlume"], "{mode:o}");
+        }
+    }
+
+    /// A copy already there is kept as it is, mode included: it holds the
+    /// file from before irlume's first edit. One that is not a plain file of
+    /// its own (a second name of another file, or a directory) is not taken
+    /// for a copy, and the edit is refused.
+    #[test]
+    fn a_pam_edit_keeps_an_existing_backup_and_refuses_one_that_is_not_a_plain_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (dir, _scratch) = scratch("existing-backup");
+        let path = dir.join("sudo");
+        file_at(&path, "the stack now\n", 0o600);
+        file_at(&backup_of(&path), "the stack before irlume\n", 0o640);
+        assert!(write_pam_edit(path.to_str().unwrap(), "the edit\n"));
+        assert_eq!(
+            std::fs::read_to_string(backup_of(&path)).unwrap(),
+            "the stack before irlume\n"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(backup_of(&path)).unwrap().mode() & 0o7777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the edit\n");
+
+        let linked = dir.join("polkit-1");
+        file_at(&linked, "the stack\n", 0o644);
+        let other = dir.join("other");
+        file_at(&other, "another file\n", 0o644);
+        std::fs::hard_link(&other, backup_of(&linked)).unwrap();
+        let dir_at = dir.join("system-auth");
+        file_at(&dir_at, "the stack\n", 0o644);
+        std::fs::create_dir(backup_of(&dir_at)).unwrap();
+        for path in [&linked, &dir_at] {
+            assert!(
+                !write_pam_edit(path.to_str().unwrap(), "the edit\n"),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "the stack\n",
+                "{} was edited",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "another file\n");
+        // The obstacles were the only reason: without them the same edits go
+        // through and keep a plain copy.
+        std::fs::remove_file(backup_of(&linked)).unwrap();
+        std::fs::remove_dir(backup_of(&dir_at)).unwrap();
+        for path in [&linked, &dir_at] {
+            assert!(
+                write_pam_edit(path.to_str().unwrap(), "the edit\n"),
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(backup_of(path)).unwrap(),
+                "the stack\n",
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "the edit\n",
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "another file\n");
+        assert_eq!(
+            names_in(&dir),
+            [
+                "other",
+                "polkit-1",
+                "polkit-1.pre-irlume",
+                "sudo",
+                "sudo.pre-irlume",
+                "system-auth",
+                "system-auth.pre-irlume"
+            ]
+        );
+    }
+
+    /// A symlink at the copy's name is never written through or replaced,
+    /// whether it names a file or nothing, and the edit is refused.
+    #[test]
+    fn a_pam_edit_refuses_a_symlink_at_the_backup_path() {
+        let (dir, _scratch) = scratch("backup-symlink");
+        let elsewhere = dir.join("elsewhere");
+        file_at(&elsewhere, "not a PAM backup\n", 0o644);
+        let nothing = dir.join("nothing-here");
+        for (name, points_at) in [("sudo", &elsewhere), ("polkit-1", &nothing)] {
+            let path = dir.join(name);
+            file_at(&path, "the stack\n", 0o600);
+            std::os::unix::fs::symlink(points_at, backup_of(&path)).unwrap();
+            assert!(
+                !write_pam_edit(path.to_str().unwrap(), "the edit\n"),
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "the stack\n",
+                "{name}"
+            );
+            assert!(
+                std::fs::symlink_metadata(backup_of(&path))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}"
+            );
+            // The link was the only reason: without it the same edit goes
+            // through and keeps a plain copy.
+            std::fs::remove_file(backup_of(&path)).unwrap();
+            assert!(
+                write_pam_edit(path.to_str().unwrap(), "the edit\n"),
+                "{name}"
+            );
+            assert!(
+                std::fs::symlink_metadata(backup_of(&path))
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(backup_of(&path)).unwrap(),
+                "the stack\n",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "not a PAM backup\n"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&nothing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "a dangling link was written through"
+        );
+        assert_eq!(
+            names_in(&dir),
+            [
+                "elsewhere",
+                "polkit-1",
+                "polkit-1.pre-irlume",
+                "sudo",
+                "sudo.pre-irlume"
+            ]
+        );
+    }
+
+    /// A file that is not there yet is created, with nothing to copy.
+    #[test]
+    fn a_pam_edit_that_creates_the_file_makes_no_backup() {
+        let (dir, _scratch) = scratch("create");
+        let path = dir.join("polkit-1");
+        assert!(write_pam_edit(
+            path.to_str().unwrap(),
+            OMARCHY_MINIMAL_POLKIT
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            OMARCHY_MINIMAL_POLKIT
+        );
+        assert_eq!(names_in(&dir), ["polkit-1"], "no backup of a new file");
+    }
+
+    /// Printed by `scratch_file_mode_child` once every check has passed.
+    const SCRATCH_MODE_CHECKED: &str = "IRLUME_SCRATCH_MODE_CHECKED";
+
+    /// The scratch file a copy is written into is new and readable and
+    /// writable by its owner only from the moment it is created, before any
+    /// byte is written or any mode set: the mode is read from the open file
+    /// the creation returns. The check runs in a child process of this test
+    /// binary whose umask, set only there, is 000, so a file created with the
+    /// default mode gets 0666 there whatever the umask of the test run. A
+    /// default ACL on the directory replaces the umask; when it makes such a
+    /// file 0600 too, the two cannot be told apart and the child fails at its
+    /// precondition instead of passing. The parent fails unless the child
+    /// ran that one test to its end.
+    #[test]
+    fn a_pam_edit_backup_scratch_file_is_created_new_and_owner_only() {
+        use std::os::unix::process::CommandExt as _;
+        let (dir, _scratch) = scratch("scratch-mode");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--ignored",
+                "--exact",
+                "fingerprint::tests::scratch_file_mode_child",
+                "--nocapture",
+            ])
+            .env("IRLUME_TEST_SCRATCH_DIR", dir);
+        // SAFETY: umask(2) is async-signal-safe and always succeeds. It runs
+        // in the forked child just before exec and sets only that process's
+        // umask.
+        unsafe {
+            child.pre_exec(|| {
+                libc::umask(0);
+                Ok(())
+            });
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+        // A name that matches no test, or an ignored test left out, also
+        // exits 0; a child that returns early prints no marker.
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child ran no test:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(SCRATCH_MODE_CHECKED),
+            "the child did not finish its checks:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The check of the test above, run only as its child process.
+    #[test]
+    #[ignore = "fresh-exec child of a_pam_edit_backup_scratch_file_is_created_new_and_owner_only"]
+    fn scratch_file_mode_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::var_os("IRLUME_TEST_SCRATCH_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set by a_pam_edit_backup_scratch_file_is_created_new_and_owner_only");
+        let default_mode = std::fs::File::create_new(dir.join("default-mode")).unwrap();
+        let plain = default_mode.metadata().unwrap().permissions().mode() & 0o7777;
+        assert_ne!(
+            plain, 0o600,
+            "precondition: a file created with the default mode gets 0600 here \
+             too, so the umask is not 000 or a default ACL sets the mode"
+        );
+        let tmp = dir.join("scratch");
+        let file = create_scratch(&tmp).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "the scratch file as created"
+        );
+        assert_eq!(
+            create_scratch(&tmp).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a name already there was opened"
+        );
+        println!("{SCRATCH_MODE_CHECKED}");
+    }
+
+    /// A finished copy is published with a hard link, which never replaces
+    /// a name: when something is already at the copy's name at that moment,
+    /// the publish does not happen and that file keeps its bytes and inode.
+    /// The copy routine then looks again: a plain copy there is kept instead
+    /// of the new one, and anything else, such as a second name of another
+    /// file or nothing there any more, refuses the copy and so the edit. The
+    /// name was the only reason: once it is free, the same publish goes
+    /// through.
+    #[test]
+    fn a_pam_edit_backup_publish_never_replaces_a_name_already_there() {
+        use std::io::Write as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let (dir, _scratch) = scratch("publish");
+        let tmp = dir.join("scratch");
+        let mut file = create_scratch(&tmp).unwrap();
+        file.write_all(b"the new copy\n").unwrap();
+        drop(file);
+        let bak = dir.join("sudo.pre-irlume");
+        let left_as_it_is = |body: &str| {
+            let ino = std::fs::symlink_metadata(&bak).unwrap().ino();
+            assert!(!publish_copy(&tmp, &bak).unwrap(), "{body:?} replaced");
+            assert_eq!(std::fs::read_to_string(&bak).unwrap(), body);
+            assert_eq!(
+                std::fs::symlink_metadata(&bak).unwrap().ino(),
+                ino,
+                "{body:?}"
+            );
+        };
+
+        file_at(&bak, "the copy already there\n", 0o600);
+        left_as_it_is("the copy already there\n");
+        assert_eq!(
+            settle_copy(false, &bak, &dir),
+            Ok(()),
+            "a plain copy there is kept"
+        );
+        std::fs::remove_file(&bak).unwrap();
+
+        let other = dir.join("other");
+        file_at(&other, "another file\n", 0o644);
+        std::fs::hard_link(&other, &bak).unwrap();
+        left_as_it_is("another file\n");
+        let refusal = settle_copy(false, &bak, &dir).unwrap_err();
+        assert!(refusal.contains("2 hard links"), "{refusal}");
+        std::fs::remove_file(&bak).unwrap();
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "another file\n");
+        let refusal = settle_copy(false, &bak, &dir).unwrap_err();
+        assert!(
+            refusal.contains("changed while the copy was made"),
+            "{refusal}"
+        );
+
+        assert!(publish_copy(&tmp, &bak).unwrap());
+        assert_eq!(
+            std::fs::symlink_metadata(&bak).unwrap().ino(),
+            std::fs::symlink_metadata(&tmp).unwrap().ino()
+        );
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "the new copy\n");
+        assert_eq!(names_in(&dir), ["other", "scratch", "sudo.pre-irlume"]);
     }
 
     #[test]

@@ -1436,6 +1436,33 @@ mod tests {
         );
     }
 
+    /// A busy row whose holder is irlume itself, or could not be seen and so
+    /// may be irlumed, ends with the report pointer and never asks to close
+    /// it (#1338); its evidence names no device path, the node field being the
+    /// only one a census document may carry.
+    #[test]
+    fn a_busy_row_never_asks_to_close_irlume() {
+        for holder in [crate::Holders::SelfOnly, crate::Holders::UnknownBlind] {
+            let entry = unreadable_entry(&crate::Unreadable {
+                path: "/dev/video4".into(),
+                at: crate::FailedAt::Open,
+                errno: Some(libc::EBUSY),
+                holder: Some(holder),
+            });
+            let line = render_line(&entry);
+            assert!(
+                line.ends_with("please report it (`irlume support-report` says where)"),
+                "{line}"
+            );
+            assert!(!line.contains("Close that app and retry"), "{line}");
+            assert!(
+                entry.evidence.iter().all(|e| !e.contains("/dev/")),
+                "{:?}",
+                entry.evidence
+            );
+        }
+    }
+
     #[test]
     fn render_line_prints_class_verdict_and_evidence_together() {
         let entry = node_entry_from_facts(&facts("/dev/video2", Role::Ir, &[b"GREY"]));
@@ -1566,7 +1593,7 @@ mod tests {
                 path: "/dev/fixture-busy".into(),
                 at: crate::FailedAt::Open,
                 errno: Some(libc::EBUSY),
-                holder: Some("ffmpeg".into()),
+                holder: Some(crate::Holders::Other("ffmpeg".into())),
             }],
             mc_centric: Vec::new(),
             listing_error: None,

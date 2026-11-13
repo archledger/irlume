@@ -3293,9 +3293,21 @@ const GREY_FOURCCS: [&[u8; 4]; 3] = [b"GREY", b"Y8  ", b"Y800"];
 /// classification treats these as IR too, and capture decodes them to 8-bit.
 const GREY16_FOURCCS: [&[u8; 4]; 3] = [b"Y16 ", b"Y10 ", b"Y12 "];
 
+/// The next steps for a busy node whose holder the scan could not see
+/// (#207). The holder may be another app, irlumed at work (for example a
+/// sign-in, an enrollment, a preview or setup), which is normal, or irlumed
+/// holding the camera after its work ended, which is a bug; each step reads
+/// true for all of them (#1338). Shared by `camera_busy_error` and
+/// [`Unreadable::cause`]. With `hardware: ` the busy text is 224 characters
+/// at `/dev/video0`, 2 more per extra digit, within the 240 characters
+/// irlumed's journal keeps of a bare error.
+const UNSEEN_HOLDER_STEPS: &str = "Close that app, or wait for irlumed to finish, then retry; \
+     if irlumed keeps holding it, please report it (`irlume support-report` says where)";
+
 // Only a driver EBUSY reaches this mapping. Preserve the observed-holder
 // distinction: an identified self-only conflict is an Irlume bug, not advice
-// to close another app. An incomplete scan does not identify an owner.
+// to close another app. An incomplete scan does not identify an owner, so its
+// text gives the step for each holder it may be (#1338).
 fn camera_busy_error(device: &str, holders: Holders) -> Error {
     let self_only = matches!(holders, Holders::SelfOnly);
     let message = match holders {
@@ -3310,9 +3322,8 @@ fn camera_busy_error(device: &str, holders: Holders) -> Error {
             std::process::id()
         ),
         Holders::UnknownBlind => format!(
-            "{device}: camera busy. irlume could not identify the holder, because it \
-                     cannot read every process (see issue #207); `sudo fuser -v {device}` will \
-                     name it. Close that app and retry."
+            "{device}: camera busy; `sudo fuser -v {device}` names the holder. \
+             {UNSEEN_HOLDER_STEPS}."
         ),
         Holders::None => format!(
             "{device}: camera busy, another app is using it. \
@@ -3371,10 +3382,13 @@ fn map_io(device: &str, e: std::io::Error) -> Error {
     }
 }
 
-/// Best-effort: which process currently holds `device` open, for a clearer
-/// camera-busy message. Scans `/proc/<pid>/fd` for a symlink to the device;
-/// needs root to see other users' processes (the daemon runs as root). Returns
-/// e.g. "kamoso (pid 2567)", or `None` if it can't tell.
+/// Best-effort: which process currently holds `device` open, worded as
+/// `describe_camera_holder` words it. Scans `/proc/<pid>/fd` for a symlink to
+/// the device; needs root to see other users' processes (the daemon runs as
+/// root). Returns e.g. "kamoso (pid 2567)", or `None` if it can't tell. Tests
+/// only: `uvc_scan` keeps the [`Holders`] verdict itself, so
+/// [`Unreadable::cause`] can word each kind (#1338).
+#[cfg(test)]
 fn camera_holder(device: &str) -> Option<String> {
     describe_camera_holder(camera_holders(device))
 }
@@ -3399,9 +3413,12 @@ fn describe_camera_holder(holders: Holders) -> Option<String> {
     }
 }
 
-/// Who holds `device` open, separating another process from this one, and both
-/// from the case where the scan could not see enough to answer.
-enum Holders {
+/// Who holds a video node open, separating another process from this one,
+/// and both from the case where the scan could not see enough to answer.
+/// Public because [`Unreadable`] carries it: the kind, not only a holder's
+/// name, decides what its text tells the reader to do (#1338).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holders {
     /// Some other process has it. The one the user has to close.
     Other(String),
     /// Our own handle, on a scan that could read every process. irlume
@@ -3616,11 +3633,13 @@ pub struct Unreadable {
     /// `None` when the failure carried no OS error, which the v4l crate can
     /// produce for a malformed response rather than a syscall failure.
     pub errno: Option<i32>,
-    /// The process holding the node, captured at scan time because a holder
-    /// named a minute later may not be the one that caused the failure. Only
-    /// looked up for EBUSY, and best-effort even then: `camera_holder` reads
-    /// /proc and cannot see a holder owned by another uid (#207).
-    pub holder: Option<String>,
+    /// What the holder scan found for a busy node, at scan time because a
+    /// holder named a minute later may not be the one that caused the
+    /// failure. `None` when no scan ran: only [`scan_nodes`] looks, and only
+    /// for EBUSY. Best-effort even then: the scan reads /proc and cannot see
+    /// a holder owned by another uid (#207), which it reports as
+    /// [`Holders::UnknownBlind`] rather than naming a process it did not see.
+    pub holder: Option<Holders>,
 }
 
 impl Unreadable {
@@ -3641,12 +3660,29 @@ impl Unreadable {
                 "permission denied; add your user to the 'video' group (camera) and re-login"
                     .to_string()
             }
-            Some(libc::EBUSY) => match &self.holder {
-                Some(h) => format!("camera busy, in use by {h}. Close that app and retry"),
-                None => {
-                    "camera busy, another app is using it. Close that app and retry".to_string()
+            Some(libc::EBUSY) => {
+                let named = self.holder.clone().and_then(describe_camera_holder);
+                match (&self.holder, named) {
+                    // The scan could not read every process (#207): the steps
+                    // `camera_busy_error` gives, without the node's path. A
+                    // census document names a node only in its `node` field;
+                    // scripts/machine-api-conformance.py rejects `/dev/video`
+                    // anywhere else (docs/MACHINE-API.md).
+                    (Some(Holders::UnknownBlind), _) => format!(
+                        "camera busy; `sudo fuser -v` on this node names the holder. \
+                         {UNSEEN_HOLDER_STEPS}"
+                    ),
+                    // irlume itself is not an app to close: its text already
+                    // says to report it (#1338).
+                    (Some(Holders::SelfOnly), Some(own)) => format!("camera busy, in use by {own}"),
+                    (_, Some(who)) => {
+                        format!("camera busy, in use by {who}. Close that app and retry")
+                    }
+                    (_, None) => {
+                        "camera busy, another app is using it. Close that app and retry".to_string()
+                    }
                 }
-            },
+            }
             Some(libc::ENODEV) | Some(libc::ENXIO) => {
                 "the node is present but the device behind it is gone, which is what an \
                  unplugged or reset USB camera leaves behind"
@@ -4033,7 +4069,23 @@ fn file_node(scan: &mut NodeScan, path: String, outcome: Result<NodeKind, Unread
     }
 }
 
-/// `with_holders` walks /proc for each busy node to name what holds it. That
+/// Record what `holders` finds holding a node that failed with EBUSY, and
+/// leave every other outcome as it is without calling `holders`. The kind
+/// stored decides the busy text (#1338). [`uvc_scan`] passes the /proc walk;
+/// a test passes its own, since only a real busy camera reaches that walk.
+fn record_busy_holder(
+    outcome: Result<NodeKind, Unreadable>,
+    holders: impl FnOnce(&str) -> Holders,
+) -> Result<NodeKind, Unreadable> {
+    outcome.map_err(|mut u| {
+        if u.errno == Some(libc::EBUSY) {
+            u.holder = Some(holders(&u.path));
+        }
+        u
+    })
+}
+
+/// `with_holders` walks /proc for each busy node to record what holds it. That
 /// is worth a report a person reads and not worth it for the camera-picking
 /// callers, which run on the TUI's refresh path.
 fn uvc_scan(with_holders: bool) -> NodeScan {
@@ -4041,12 +4093,12 @@ fn uvc_scan(with_holders: bool) -> NodeScan {
     let listing = video_node_paths();
     scan.listing_error = listing.error;
     for path in listing.paths {
-        let outcome = classify_node(&path).map_err(|mut u| {
-            if with_holders && u.errno == Some(libc::EBUSY) {
-                u.holder = camera_holder(&u.path);
-            }
-            u
-        });
+        let outcome = classify_node(&path);
+        let outcome = if with_holders {
+            record_busy_holder(outcome, camera_holders)
+        } else {
+            outcome
+        };
         file_node(&mut scan, path, outcome);
     }
     scan
@@ -15901,12 +15953,12 @@ mod tests {
         assert_eq!(spec(640, 480, Some(7.5)).meets(&HELLO_RGB_MIN), Some(true));
     }
 
-    fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<&str>) -> Unreadable {
+    fn unreadable(at: FailedAt, errno: Option<i32>, holder: Option<Holders>) -> Unreadable {
         Unreadable {
             path: "/dev/video4".into(),
             at,
             errno,
-            holder: holder.map(str::to_string),
+            holder,
         }
     }
 
@@ -15923,12 +15975,16 @@ mod tests {
 
         // A named holder is the difference between "something has your camera"
         // and knowing which app to close.
-        let busy =
-            unreadable(FailedAt::Open, Some(libc::EBUSY), Some("firefox (pid 42)")).explain();
+        let busy = unreadable(
+            FailedAt::Open,
+            Some(libc::EBUSY),
+            Some(Holders::Other("firefox (pid 42)".into())),
+        )
+        .explain();
         assert!(busy.contains("in use by firefox (pid 42)"), "{busy}");
         assert!(!busy.contains("'video' group"), "{busy}");
 
-        // /proc could not name it (another uid, #207): still busy, no invention.
+        // No holder scan ran (`classify_node` alone): still busy, no invention.
         let anon = unreadable(FailedAt::Open, Some(libc::EBUSY), None).explain();
         assert!(anon.contains("another app is using it"), "{anon}");
 
@@ -15942,6 +15998,137 @@ mod tests {
         assert!(odd.contains("errno 5"), "{odd}");
         let none = unreadable(FailedAt::Open, None, None).explain();
         assert!(none.contains("no OS error reported"), "{none}");
+    }
+
+    /// The busy sentence for each kind the holder scan reports (#1338):
+    /// "Close that app and retry" only after another process, never after
+    /// irlume itself, which the sentence calls a bug to report, and the
+    /// unseen-holder steps `camera_busy_error` gives. No arm names a device
+    /// path: census evidence is this text, and a census document names a
+    /// node only in its `node` field; scripts/machine-api-conformance.py
+    /// rejects `/dev/video` anywhere else (docs/MACHINE-API.md).
+    #[test]
+    fn a_busy_node_cause_never_contradicts_its_holder() {
+        let busy =
+            |holder: Option<Holders>| unreadable(FailedAt::Open, Some(libc::EBUSY), holder).cause();
+        let code = format!(
+            "could not be opened (errno {}: {}).",
+            libc::EBUSY,
+            std::io::Error::from_raw_os_error(libc::EBUSY)
+        );
+        assert_eq!(
+            busy(Some(Holders::Other("firefox (pid 42)".into()))),
+            format!("{code} camera busy, in use by firefox (pid 42). Close that app and retry")
+        );
+        assert_eq!(
+            busy(Some(Holders::SelfOnly)),
+            format!("{code} camera busy, in use by {}", self_held_holder_text())
+        );
+        assert_eq!(
+            busy(Some(Holders::UnknownBlind)),
+            format!(
+                "{code} camera busy; `sudo fuser -v` on this node names the holder. Close that \
+                 app, or wait for irlumed to finish, then retry; if irlumed keeps holding it, \
+                 please report it (`irlume support-report` says where)"
+            )
+        );
+        for holder in [None, Some(Holders::None)] {
+            assert_eq!(
+                busy(holder),
+                format!("{code} camera busy, another app is using it. Close that app and retry")
+            );
+        }
+        for holder in [
+            None,
+            Some(Holders::Other("firefox (pid 42)".into())),
+            Some(Holders::SelfOnly),
+            Some(Holders::UnknownBlind),
+            Some(Holders::None),
+        ] {
+            let cause = busy(holder);
+            assert!(!cause.contains("/dev/"), "{cause}");
+        }
+    }
+
+    /// The step `uvc_scan` takes for a busy node stores the kind its holder
+    /// scan found, at every stage the node can fail at, so the busy text
+    /// matches the holder (#1338). Only a real busy camera reaches that step
+    /// in `uvc_scan`, so a fake scan stands in for the /proc walk here.
+    #[test]
+    fn a_busy_node_keeps_the_holder_kind_its_scan_found() {
+        for at in [FailedAt::Open, FailedAt::QueryCaps, FailedAt::EnumFormats] {
+            for kind in [
+                Holders::Other("firefox (pid 42)".into()),
+                Holders::SelfOnly,
+                Holders::UnknownBlind,
+                Holders::None,
+            ] {
+                let scans = std::cell::Cell::new(0_u32);
+                let scan = |path: &str| {
+                    scans.set(scans.get() + 1);
+                    assert_eq!(path, "/dev/video4");
+                    kind.clone()
+                };
+                let busy = unreadable(at, Some(libc::EBUSY), None);
+                let u = record_busy_holder(Err(busy), scan).unwrap_err();
+                assert_eq!(scans.get(), 1, "{at:?} {kind:?}");
+                assert_eq!(u.holder, Some(kind), "{at:?}");
+                assert_eq!(
+                    (u.path.as_str(), u.at, u.errno),
+                    ("/dev/video4", at, Some(libc::EBUSY))
+                );
+            }
+        }
+    }
+
+    /// Only a busy node is scanned for its holder: the /proc walk is skipped
+    /// for any other failure and for a node that answered, and neither gets a
+    /// holder.
+    #[test]
+    fn only_a_busy_node_is_scanned_for_its_holder() {
+        fn never(path: &str) -> Holders {
+            panic!("{path} is not busy, yet was scanned")
+        }
+        for errno in [
+            Some(libc::EACCES),
+            Some(libc::EPERM),
+            Some(libc::ENODEV),
+            Some(libc::EIO),
+            None,
+        ] {
+            let failed = unreadable(FailedAt::Open, errno, None);
+            let u = record_busy_holder(Err(failed), never).unwrap_err();
+            assert_eq!(u.holder, None, "{errno:?}");
+            assert_eq!(u.errno, errno);
+        }
+        let rgb = Ok(NodeKind::Camera(Role::Rgb));
+        assert_eq!(
+            record_busy_holder(rgb, never).ok(),
+            Some(NodeKind::Camera(Role::Rgb))
+        );
+    }
+
+    /// `uvc_scan`, asked for holders, hands each node's outcome to
+    /// `record_busy_holder` with the /proc walk and files what comes back.
+    /// Only a real busy camera gets a holder through that call, so the wiring
+    /// is pinned by shape; the step itself is tested in
+    /// `a_busy_node_keeps_the_holder_kind_its_scan_found`.
+    #[test]
+    fn uvc_scan_gives_a_busy_node_to_the_holder_walk() {
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        let body = compact(source_body(include_str!("lib.rs"), "\nfn uvc_scan("));
+        assert!(
+            body.contains(
+                "letoutcome=classify_node(&path);letoutcome=ifwith_holders{\
+                 record_busy_holder(outcome,camera_holders)}else{outcome};\
+                 file_node(&mutscan,path,outcome);"
+            ),
+            "uvc_scan must pass camera_holders to record_busy_holder and file the result: {body}"
+        );
+        assert!(
+            !body.contains(".holder"),
+            "uvc_scan must not set a holder itself: {body}"
+        );
     }
 
     /// The old scan probed /dev/video0..9 by construction, so a tenth node was
@@ -18995,6 +19182,34 @@ mod tests {
         );
     }
 
+    /// The busy text for a node whose holder the scan could not see, as
+    /// `camera_busy_error` words it.
+    fn unseen_holder_busy_text(device: &str) -> String {
+        format!(
+            "{device}: camera busy; `sudo fuser -v {device}` names the holder. Close that app, \
+             or wait for irlumed to finish, then retry; if irlumed keeps holding it, please \
+             report it (`irlume support-report` says where)."
+        )
+    }
+
+    /// A holder the scan could not see (#207) may be another app, irlumed at
+    /// work, which is normal, or irlumed holding the camera after its work
+    /// ended, which is a bug: the text gives the step for each and stays a
+    /// retryable busy camera (#1338). irlumed's journal keeps 240 characters
+    /// of a bare error (`journal_prose` in irlume-daemon), and the pointer to
+    /// the report ends this one, so it must fit for a two-digit node.
+    #[test]
+    fn unseen_holder_busy_text_gives_the_step_for_every_holder() {
+        match camera_busy_error("/dev/video99", Holders::UnknownBlind) {
+            Error::CameraBusy(text) => {
+                assert_eq!(text, unseen_holder_busy_text("/dev/video99"));
+                let shown = Error::CameraBusy(text).to_string();
+                assert_eq!(irlume_common::single_line(&shown, 240), shown, "{shown}");
+            }
+            other => panic!("an unseen holder is a busy camera: {other:?}"),
+        }
+    }
+
     /// Both self-held texts on a real camera node that this process alone
     /// holds (#1329). The test opens the node read-only, checks that it is a
     /// video4linux character device, starts no stream and touches no
@@ -19007,7 +19222,8 @@ mod tests {
     /// with `sudo fuser -v <node>` before and after the run that nothing
     /// else holds the node. The node comes from
     /// `IRLUME_TEST_SELF_HOLD_NODE`, which only this test reads; library
-    /// code never does. CI never selects it.
+    /// code never does. CI never selects it. It also checks the census cause
+    /// the same scan gives the node: no "Close that app" after irlume (#1338).
     #[test]
     #[ignore = "needs a camera node this process alone holds; set IRLUME_TEST_SELF_HOLD_NODE"]
     fn self_held_real_node_names_irlume_and_the_support_report() {
@@ -19047,6 +19263,21 @@ mod tests {
             Error::Hardware(text) => assert_eq!(text, self_held_busy_text(&node)),
             other => panic!("a self-held node is an irlume bug, not a busy camera: {other:?}"),
         }
+        let cause = Unreadable {
+            path: node.clone(),
+            at: FailedAt::Open,
+            errno: Some(libc::EBUSY),
+            holder: Some(camera_holders(&node)),
+        }
+        .cause();
+        eprintln!("{node} census cause: {cause}");
+        assert!(
+            cause.ends_with(&format!(
+                "camera busy, in use by {}",
+                self_held_holder_text()
+            )),
+            "a self-held node's census row asks for a report, not a close: {cause}"
+        );
     }
 
     /// Only tests read `IRLUME_TEST_SELF_HOLD_NODE`: in this file its name
@@ -19058,6 +19289,74 @@ mod tests {
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("the tests module moved; update this test")];
         assert!(!production.contains(concat!("IRLUME_TEST_", "SELF_HOLD_NODE")));
+    }
+
+    /// Both unseen-holder texts on a real camera node, as a desktop user's
+    /// scan sees it (#1338). The test opens the node read-only, checks that it
+    /// is a video4linux character device, starts no stream and touches no
+    /// emitter. The scan must be blind, as it is on an ordinary desktop, where
+    /// the fd directories of root's processes are unreadable to the desktop
+    /// user; run as root, in a private PID namespace or with /proc mounted
+    /// `hidepid=2`, the scan reads every process it lists and the test fails.
+    /// If another process of the same user holds the node, the scan names it
+    /// and the test fails too: check with `sudo fuser -v <node>` first. The
+    /// node comes from `IRLUME_TEST_BLIND_HOLD_NODE`, which only this test
+    /// reads. CI never selects it.
+    #[test]
+    #[ignore = "needs a camera node and a holder scan that cannot read every process; set IRLUME_TEST_BLIND_HOLD_NODE"]
+    fn blind_real_node_names_every_next_step() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        crate::hostfs::test::host();
+        let node = std::env::var("IRLUME_TEST_BLIND_HOLD_NODE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_BLIND_HOLD_NODE is unset. This test is #[ignore]d, so running it is \
+                 a request for a camera node; it will not silently pass without one."
+            )
+        });
+        // Held across the scan, as in the self-held test: a fork meanwhile
+        // would copy this fd into a child the scan would name.
+        let _guard = crate::testenv::env_lock();
+        let held = std::fs::File::open(&node)
+            .unwrap_or_else(|e| panic!("could not open {node} read-only: {e}"));
+        let meta = held
+            .metadata()
+            .unwrap_or_else(|e| panic!("could not stat {node}: {e}"));
+        assert!(
+            meta.file_type().is_char_device() && libc::major(meta.rdev()) == 81,
+            "{node} is not a video4linux character device (major 81)"
+        );
+        let holders = camera_holders(&node);
+        assert_eq!(
+            holders,
+            Holders::UnknownBlind,
+            "the scan must be blind: run as the desktop user, outside a private PID namespace, \
+             with /proc not mounted hidepid=2 and no other process of that user holding {node}"
+        );
+        let busy = map_io(&node, std::io::Error::from_raw_os_error(libc::EBUSY));
+        let cause = Unreadable {
+            path: node.clone(),
+            at: FailedAt::Open,
+            errno: Some(libc::EBUSY),
+            holder: Some(holders),
+        }
+        .cause();
+        eprintln!("{node} busy: {busy}");
+        eprintln!("{node} census cause: {cause}");
+        match busy {
+            Error::CameraBusy(text) => assert_eq!(text, unseen_holder_busy_text(&node)),
+            other => panic!("an unseen holder is a busy camera: {other:?}"),
+        }
+        assert!(!cause.contains("/dev/"), "{cause}");
+    }
+
+    /// Only tests read `IRLUME_TEST_BLIND_HOLD_NODE` (#1338).
+    #[test]
+    fn only_tests_read_the_blind_hold_node_variable() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        assert!(!production.contains(concat!("IRLUME_TEST_", "BLIND_HOLD_NODE")));
     }
 
     /// Another process holding the node wins over our own handle, because that

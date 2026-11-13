@@ -248,10 +248,11 @@ cargo build --release --locked
     the root `Cargo.toml` `[patch.crates-io]`, never by branch or tag (ADR-0012);
     `fuzz/Cargo.toml` repeats the tss-esapi patch by branch, frozen by
     `fuzz/Cargo.lock`. `edgefirst-tflite` is pinned to registry `=0.11.1`;
-    both lockfiles pin the reviewed wrapper/sys versions and checksums
-    (#1103, [docs/research/tflite-0.11.1-audit.md](docs/research/tflite-0.11.1-audit.md)).
+    `Cargo.lock` pins the reviewed wrapper/sys versions and checksums, and
+    `fuzz/Cargo.lock` holds neither crate nor `zip`
+    (#1103, #1339, [docs/research/tflite-0.11.1-audit.md](docs/research/tflite-0.11.1-audit.md)).
     Keep the graph guards and ZIP >= 9.0.5 floor when updating this pair.
-    A tss-esapi or tflite bump updates both lockfiles, a pamsm bump only
+    A tss-esapi bump updates both lockfiles, a tflite or pamsm bump only
     `Cargo.lock`; fork revision changes also update `nix/package.nix`
     `outputHashes`. Registry packages need no Git output hash.
 
@@ -288,7 +289,7 @@ cargo build --release --locked
   never reaches, each with its rationale and a tracking issue
   (`scripts/generate-vex.py` maps the rationale to OpenVEX). Commit
   `Cargo.lock`, and `fuzz/Cargo.lock`
-  when a dependency of common, core, camera or vision changes.
+  when a dependency of common, core or camera changes.
 - Vulnerabilities go only to GitHub Private Vulnerability Reporting or the
   address in [SECURITY.md](SECURITY.md). If you find one, stop and tell the human,
   who files it; describe it nowhere public (issue, PR, commit, branch name,

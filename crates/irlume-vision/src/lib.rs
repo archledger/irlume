@@ -3962,9 +3962,11 @@ mod model_tests {
 #[cfg(test)]
 mod tflite_dependency_graph_tests {
     //! Guards the reviewed registry release that replaces the temporary
-    //! tflite zip-9 Git pin (#1103). Both lockfiles must retain the reviewed
-    //! version, registry source and package checksums, without restoring an
-    //! older ZIP dependency. See docs/research/tflite-0.11.1-audit.md.
+    //! tflite zip-9 Git pin (#1103). The application lockfile must retain
+    //! the reviewed version, registry source and package checksums, without
+    //! restoring an older ZIP dependency; the fuzz lockfile must not resolve
+    //! irlume-vision, either tflite crate or zip (#1339). See
+    //! docs/research/tflite-0.11.1-audit.md.
 
     use toml::Value;
 
@@ -4081,6 +4083,39 @@ mod tflite_dependency_graph_tests {
         }
     }
 
+    /// Packages the fuzz workspace must not resolve. It builds irlume-common,
+    /// irlume-core and irlume-camera, and none of them depends on this crate
+    /// (#1339), so fuzz/Cargo.lock holds neither the tflite pair nor the zip
+    /// build dependency the pair pulls.
+    const FUZZ_ABSENT: [&str; 4] = [
+        "irlume-vision",
+        "edgefirst-tflite",
+        "edgefirst-tflite-sys",
+        "zip",
+    ];
+
+    fn assert_fuzz_lock_free_of_vision(lock: &str, label: &str) {
+        let names: Vec<String> = packages(lock)
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "irlume-core"),
+            "{label}: no irlume-core entry, so this is not the fuzz workspace's lockfile"
+        );
+        let present: Vec<&String> = names
+            .iter()
+            .filter(|name| FUZZ_ABSENT.contains(&name.as_str()))
+            .collect();
+        assert!(
+            present.is_empty(),
+            "{label}: {present:?} entered the fuzz graph; give {label} the \
+             reviewed-release and advisory-floor checks Cargo.lock has \
+             (docs/research/tflite-0.11.1-audit.md) before accepting them"
+        );
+    }
+
     fn reviewed_lock_fixture() -> Value {
         let text = TFLITE_PACKAGES
             .iter()
@@ -4161,8 +4196,22 @@ mod tflite_dependency_graph_tests {
     }
 
     #[test]
-    fn fuzz_lock_zip_is_at_or_above_the_advisory_floor() {
-        assert_zip_above_floor(FUZZ_LOCK, "fuzz/Cargo.lock");
+    fn fuzz_lock_guard_rejects_each_listed_package_and_a_lock_without_core() {
+        let core = "[[package]]\nname = \"irlume-core\"\nversion = \"0.16.0\"\n";
+        assert_fuzz_lock_free_of_vision(core, "fixture");
+        for name in FUZZ_ABSENT {
+            let lock = format!("{core}\n[[package]]\nname = {name:?}\nversion = \"9.2.2\"\n");
+            assert!(
+                std::panic::catch_unwind(|| assert_fuzz_lock_free_of_vision(&lock, "fixture"))
+                    .is_err(),
+                "accepted {name}"
+            );
+        }
+        let without_core = "[[package]]\nname = \"libc\"\nversion = \"0.2.191\"\n";
+        assert!(std::panic::catch_unwind(|| {
+            assert_fuzz_lock_free_of_vision(without_core, "fixture")
+        })
+        .is_err());
     }
 
     #[test]
@@ -4171,7 +4220,7 @@ mod tflite_dependency_graph_tests {
     }
 
     #[test]
-    fn fuzz_lock_resolves_both_tflite_crates_from_the_reviewed_release() {
-        assert_tflite_pinned(FUZZ_LOCK, "fuzz/Cargo.lock");
+    fn fuzz_lock_resolves_neither_irlume_vision_nor_tflite_nor_zip() {
+        assert_fuzz_lock_free_of_vision(FUZZ_LOCK, "fuzz/Cargo.lock");
     }
 }

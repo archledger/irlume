@@ -1,8 +1,8 @@
 # The irlume crates
 
-Thirteen crates. The base layer speaks wire formats and hardware, the
+Fourteen crates. The base layer speaks wire formats and hardware, the
 middle layer turns frames into verdicts, and the top layer is the two
-binaries and three integration shims users actually run, plus a
+binaries and four integration shims users actually run, plus a
 password-check helper the daemon runs. Solid arrows
 read "Cargo-depends on" (every edge verified against cargo metadata);
 dotted arrows are runtime links (socket IPC, or a helper the daemon
@@ -11,6 +11,7 @@ runs), not Cargo dependencies.
 ```mermaid
 flowchart TD
     pam["irlume-pam<br/>pam_irlume.so"]
+    pamview["irlume-pam-view<br/>pam_irlume_view.so"]
     cli["irlume-cli<br/>irlume CLI + TUI"]
     gkr["irlume-gkr-unlock<br/>libexec keyring helper"]
     kwi["irlume-kwallet-init<br/>libexec keyring helper"]
@@ -42,11 +43,10 @@ flowchart TD
     cli --> core
     cli --> common
     cli --> fp
+    cli --> pamview
     camera --> common
     vision --> common
-    liveness --> vision
     liveness --> common
-    core --> vision
     core --> common
     pam --> common
     gkr --> common
@@ -97,17 +97,19 @@ PAM (the `/etc/pam.d/irlume-retry-reset` service).
   benchmarks and model tools, so a change to any pipeline crate must be
   reviewed against the CLI's direct uses too, not only the Engine's.
 - **irlume-common** depends on no other irlume crate, and every other
-  crate except **irlume-password-verify** (which depends on none)
-  depends on it: the wire protocol has exactly one home.
-- The pipeline crates meet through data, with two deliberate edges:
-  **irlume-liveness** and **irlume-core** read **irlume-vision**'s output
-  types directly.
-- The integration shims (**irlume-pam**, the keyring helpers) stay thin,
-  one system interface each (plus, for **irlume-pam**, the daemon socket,
-  and for **irlume-gkr-unlock**, the user bus it only watches to learn when
-  gnome-keyring is ready), so the attack surface loaded into PAM stacks and
-  keyring startup is as small as it can be. The keyring helpers never talk to the daemon, and
-  no binary links another binary's crate.
+  crate except **irlume-password-verify** and **irlume-pam-view** (which
+  depend on none) depends on it: the wire protocol has exactly one home.
+- The pipeline crates meet only through data: **irlume-camera**,
+  **irlume-vision**, **irlume-liveness** and **irlume-core** depend on
+  no irlume crate but **irlume-common**, and **irlume-auth** (or the
+  CLI, for its tools) passes values between them.
+- The integration shims (**irlume-pam**, **irlume-pam-view**, the keyring
+  helpers) stay thin, one system interface each (plus, for **irlume-pam**,
+  the daemon socket, and for **irlume-gkr-unlock**, the user bus it only
+  watches to learn when gnome-keyring is ready), so the attack surface
+  loaded into PAM stacks and keyring startup is as small as it can be. The
+  keyring helpers never talk to the daemon, and no binary links another
+  binary's crate.
 
 Each crate's own source carries the detailed contracts; start at
 `irlume-auth/src/lib.rs` for the Engine's assess flow and

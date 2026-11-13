@@ -45,8 +45,9 @@ version = 2
 # the first release the advisory lists as patched. The three zip 8.6.0 build
 # dependency exceptions (RUSTSEC-2026-0367/0368/0369, #1103) were dropped
 # when edgefirst-tflite/-sys were pinned to the upstream zip-9 revision;
-# the graph guard in crates/irlume-vision/src/lib.rs keeps both lockfiles
-# on zip >= 9.0.5 so these cannot silently become applicable again.
+# the graph guard in crates/irlume-vision/src/lib.rs keeps Cargo.lock on
+# zip >= 9.0.5 and fuzz/Cargo.lock free of zip, so these cannot silently
+# become applicable again.
 ignore = []
 
 [bans]

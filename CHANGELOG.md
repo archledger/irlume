@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- `irlume-core` and `irlume-liveness` no longer depend on
+  `irlume-vision`, which neither uses; Cargo 1.100 reports both as
+  unused dependencies. The fuzz workspace reached `irlume-vision` only
+  through `irlume-core`, so `fuzz/Cargo.lock` no longer carries `ort`,
+  `edgefirst-tflite`, `edgefirst-tflite-sys` or the `zip` build
+  dependency, and `Cargo.lock` loses only the two edges. The graph tests
+  in `irlume-vision` keep the reviewed-release and `zip` floor checks on
+  `Cargo.lock` and now fail if `fuzz/Cargo.lock` resolves
+  `irlume-vision`, either tflite crate or `zip` (#1339).
+
 - SUPPORT.md says where to report a problem, in the same lines that
   end `irlume support-report` and human `irlume doctor` output with a
   warning or failure, with both addresses as links, and lists what the

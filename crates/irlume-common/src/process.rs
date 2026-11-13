@@ -257,6 +257,11 @@ struct ChildPermit(Arc<AtomicUsize>);
 
 impl ChildPermit {
     fn acquire(budget: Arc<AtomicUsize>) -> io::Result<Self> {
+        // MSRV hold: Rust 1.99 deprecates `fetch_update` for `try_update`,
+        // which needs 1.95; rename it and drop this `allow` at MSRV 1.95.
+        // `expect` would go unfulfilled on 1.88, which does not deprecate
+        // `fetch_update`.
+        #[allow(deprecated, reason = "MSRV 1.88 has no stable try_update")]
         budget
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_CHILDREN).then_some(n + 1)

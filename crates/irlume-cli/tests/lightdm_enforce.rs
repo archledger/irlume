@@ -744,10 +744,12 @@ fn cargo_cdylib(package: &str, library: &str) -> PathBuf {
     found.remove(0)
 }
 
-/// The sanitizer lane builds the session module instrumented while this probe
-/// stays a plain C binary, so the runtime the module was linked against must
-/// be preloaded for its dlopen to initialize. Found through ldd against the
-/// artifact the lane exported; every other layout returns None.
+/// The sanitizer runtime to preload into the plain C probe: the `asan`
+/// library ldd lists for `IRLUME_TEST_VIEW_MODULE`, which a module linked
+/// against a shared sanitizer runtime needs preloaded for its dlopen to
+/// initialize; None otherwise. The ASan lane exports a module built
+/// without the sanitizer (`.github/workflows/asan.yml`), so this returns
+/// None there too.
 fn session_module_asan_runtime() -> Option<String> {
     let module = std::env::var_os("IRLUME_TEST_VIEW_MODULE")?;
     let output = std::process::Command::new("ldd")

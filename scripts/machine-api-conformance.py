@@ -77,13 +77,22 @@ STREAMING_CAPABILITY_REFUSALS = {
         # would tell a consumer that frames were withheld by policy.
         (["auth", "test", "--events=jsonl", "--preview=ir-jpeg"], "usage-error"),
     ],
+    "camera-diagnostics": [
+        # Runs a bounded, gated capture through the daemon, so this script must
+        # not invoke it for real. Accepting an events flag and dropping it would
+        # start a camera capture where the consumer asked for a stream.
+        (["camera", "diagnostics", "--json", "--contract", "9"], "unsupported-contract"),
+        (["camera", "diagnostics", "--json", "--events=jsonl"], "usage-error"),
+    ],
 }
 
 # Commands whose output must never contain these, per the security and privacy
 # section of docs/MACHINE-API.md. Camera device nodes and PAM file paths are the
-# two that a well-meaning addition would most plausibly reintroduce. The census
-# explicitly publishes video nodes in its entries; only that field is exempt.
-FORBIDDEN_SUBSTRINGS = ["/dev/video", "/etc/pam.d", "/usr/lib/pam.d"]
+# two that a well-meaning addition would most plausibly reintroduce. Both camera
+# spellings are listed separately, since neither is a prefix of the other. The
+# census explicitly publishes video nodes in its entries; only that field is
+# exempt.
+FORBIDDEN_SUBSTRINGS = ["/dev/video", "/dev/v4l/", "/etc/pam.d", "/usr/lib/pam.d"]
 
 CONTRACT = 1
 

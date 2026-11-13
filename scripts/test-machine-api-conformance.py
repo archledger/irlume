@@ -69,7 +69,12 @@ class ContractTests(unittest.TestCase):
                 )
 
     def test_census_does_not_allow_pam_paths_or_malformed_nodes(self):
-        for path in ["/etc/pam.d/login", "/usr/lib/pam.d/login", "/dev/video0/secret"]:
+        for path in [
+            "/etc/pam.d/login",
+            "/usr/lib/pam.d/login",
+            "/dev/video0/secret",
+            "/dev/v4l/by-id/usb-Camera_000-video-index0",
+        ]:
             with self.subTest(path=path):
                 document = fixture("camera-census.json")
                 document["data"]["entries"][0]["node"] = path
@@ -84,14 +89,40 @@ class ContractTests(unittest.TestCase):
 
     def test_doctor_detail_may_not_name_a_video_node(self):
         # docs/MACHINE-API.md, "Security and privacy": doctor's `detail`
-        # names no camera device path, so it is not exempt as the census
-        # `node` field is.
+        # names no camera device path, in either spelling, so it is not
+        # exempt as the census `node` field is.
         document = fixture("doctor.json")
         self.assertEqual(CONFORMANCE.forbidden_paths(document, "doctor-json"), [])
-        document["data"]["checks"][0]["detail"] = "5986:1141 (/dev/video2): shared"
-        self.assertEqual(
-            CONFORMANCE.forbidden_paths(document, "doctor-json"), ["/dev/video"]
-        )
+        cases = [
+            ("5986:1141 (/dev/video2): shared", ["/dev/video"]),
+            ("5986:1141 (/dev/v4l/by-id/usb-IR_Camera_000-video-index0): shared", ["/dev/v4l/"]),
+        ]
+        for detail, expected in cases:
+            with self.subTest(detail=detail):
+                changed = copy.deepcopy(document)
+                changed["data"]["checks"][0]["detail"] = detail
+                self.assertEqual(
+                    CONFORMANCE.forbidden_paths(changed, "doctor-json"), expected
+                )
+
+    def test_camera_diagnostics_is_checked_by_refusal_not_skipped(self):
+        # `camera diagnostics --json` operates the camera through the daemon
+        # (docs/MACHINE-API.md), so an entry in neither table makes the
+        # conformance run skip it, and a skip reads as a pass. Its refusals
+        # must cover a contract negotiation refusal and a usage error.
+        self.assertNotIn("camera-diagnostics", CONFORMANCE.CAPABILITY_COMMANDS)
+        refusals = CONFORMANCE.STREAMING_CAPABILITY_REFUSALS["camera-diagnostics"]
+        codes = {expected for _, expected in refusals}
+        self.assertIn("unsupported-contract", codes)
+        self.assertIn("usage-error", codes)
+        for argv, expected in refusals:
+            with self.subTest(argv=argv):
+                # Without --json the CLI prints the human report, which is
+                # not a machine document, so every refusal must select
+                # machine mode.
+                self.assertEqual(argv[:2], ["camera", "diagnostics"])
+                self.assertIn("--json", argv)
+                self.assertIn(expected, {"usage-error", "unsupported-contract"})
 
 
 if __name__ == "__main__":

@@ -1,5 +1,13 @@
+# The contact link's text below sends a problem that is not a security
+# problem, and may not be a bug, to a blank issue, so blank issues stay
+# enabled.
 blank_issues_enabled: true
 contact_links:
-  - name: Questions and setup help
-    url: https://github.com/archledger/irlume/discussions
-    about: Ask in Discussions; issues are for bugs, hardware reports, and feature requests.
+  - name: Security problem, or not sure whether it is one
+    url: https://github.com/archledger/irlume/security/advisories/new
+    about: >-
+      If a photo, video, mask or another person got in, face sign-in worked
+      without your face, or face data was exposed, never post it publicly.
+      Report it privately here, or by the e-mail address in SECURITY.md.
+      Not a security problem, and not sure it is a bug? Open a blank issue;
+      a report in your own words is fine.

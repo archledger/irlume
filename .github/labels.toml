@@ -237,7 +237,7 @@ description = "Extra attention or verification welcome from anyone"
 
 [labels.question]
 color = "d876e3"
-description = "Usage question; usually redirects to Discussions"
+description = "Usage or setup question"
 
 [labels.duplicate]
 color = "cfd3d7"

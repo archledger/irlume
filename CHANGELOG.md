@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The issue chooser's link for questions and setup help, which went to
+  GitHub Discussions, is now a link to the private report form for a
+  security problem, or one the reporter is not sure about, and says
+  that a problem that is not a security problem and may not be a bug
+  can go in a blank issue, in the reporter's own words. CONTRIBUTING.md
+  and GOVERNANCE.md name issues as the place for questions, proposals and
+  design discussion, and README.md and docs/VERIFY.md no longer link
+  Discussions.
+
 - The camera-busy text for a holder irlume cannot see (its scan cannot
   read every process, #207) gives a step for each holder
   `sudo fuser -v` may name: close another app and retry, wait for

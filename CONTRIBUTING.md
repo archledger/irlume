@@ -17,10 +17,9 @@ Ways to help, in rough order of usefulness right now:
   the ground rules below.
 - **Packaging**: the Fedora, Arch, Debian/PPA, and Nix lanes live under
   `packaging/` and `nix/`; distro-specific fixes are welcome there.
-- **Questions and triage**: the
-  [discussions](https://github.com/archledger/irlume/discussions) area is the
-  place for setup questions and design talk; answering other people's
-  questions there is a real contribution.
+- **Questions and triage**: setup questions and design talk happen in
+  [issues](https://github.com/archledger/irlume/issues); answering other
+  people's questions there is a real contribution.
 
 How the project is run (who merges, how releases are signed and published) is
 documented in [`GOVERNANCE.md`](GOVERNANCE.md).

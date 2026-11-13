@@ -8,8 +8,7 @@ nobody has to guess.
 The maintainer (Wisbendji Fimerlus, GitHub `archledger`) decides what merges
 and what ships. Proposals,
 bug reports, and design discussion happen in public on
-[issues](https://github.com/archledger/irlume/issues) and
-[discussions](https://github.com/archledger/irlume/discussions); anyone can
+[issues](https://github.com/archledger/irlume/issues); anyone can
 argue for a change there, and the maintainer reads them. There is no voting
 body. If the project grows more maintainers, this file changes first.
 

@@ -5,16 +5,17 @@
 # Tests the channel scripts/install.sh chooses and what it prints when an
 # install fails or succeeds, without the network or root. Stand-ins first on
 # PATH log what they are asked. A copy of the script reads a fixture for
-# /etc/os-release, its only difference. Real gzip and grep judge a real
-# gzipped index, so a check of the wrong thing still fails here. Every run
-# keeps its exit status, and its stdout stays empty: install.sh's own lines go
-# to stderr.
+# /etc/os-release, its only difference; a second copy of that one calls
+# fetch_verified instead of main on its last line. Real gzip and grep judge
+# a real gzipped index, so a check of the wrong thing still fails here.
+# Every run keeps its exit status, and its stdout stays empty: install.sh's
+# own lines go to stderr.
 #
 #   bash scripts/test-install-script.sh
 #
-# The copy runs under the first `sh` on PATH (dash on Ubuntu, bash on Fedora);
-# put a directory holding an `sh` link to another shell first on PATH to run
-# it under that shell.
+# The copies run under the first `sh` on PATH (dash on Ubuntu, bash on
+# Fedora); put a directory holding an `sh` link to another shell first on
+# PATH to run them under that shell.
 #
 # Checked, on Ubuntu:
 #   - a PPA that lists irlume for this series is added
@@ -51,6 +52,17 @@
 #   - a daemon that is not active after the install is named with its state,
 #     or as unknown when systemctl gives none (no systemd), followed by where
 #     to report; the exit status stays 0
+#   - a Fedora VERSION_ID that is not a Fedora release number (9.4, 44+,
+#     44|) stops the release-RPM fallback at its own die, before anything
+#     is fetched
+#   - a SHA256SUMS that holds a NUL byte, which grep reads as binary data
+#     and prints no line of, so it gives no file name, stops the release
+#     lane before the asset is fetched
+# fetch_verified, called by itself from the second copy:
+#   - a SHA256SUMS line its pattern selects whose name is not a plain file
+#     name (one with a slash, . or ..) is refused before anything but
+#     SHA256SUMS and its signature is fetched. No caller's pattern selects
+#     such a name, so the test passes a match whose pattern does
 # What it leaves:
 #   - nothing in its temporary directory, which starts empty for every run:
 #     not after a release download that is refused, breaks off or is
@@ -82,6 +94,9 @@ trap 'rm -rf "$work"' EXIT
 sed "s#/etc/os-release#$work/os-release#g" "$script" > "$work/install.sh"
 [ "$(grep -c "$work/os-release" "$work/install.sh")" -ge 2 ] \
   || { echo "test-install-script: install.sh no longer reads /etc/os-release" >&2; exit 1; }
+sed 's/^main "\$@"$/fetch_verified "$@"/' "$work/install.sh" > "$work/fetch-verified.sh"
+[ "$(grep -cxF 'fetch_verified "$@"' "$work/fetch-verified.sh")" = 1 ] \
+  || { echo 'test-install-script: install.sh no longer has one main "$@" line' >&2; exit 1; }
 key_fp="$(sed -n 's/^KEY_FP="\([0-9A-F]\{40\}\)"$/\1/p' "$script")"
 [ -n "$key_fp" ] \
   || { echo "test-install-script: install.sh no longer pins KEY_FP" >&2; exit 1; }
@@ -115,7 +130,8 @@ cat > "$work/bin/curl" <<'EOF'
 # release by TEST_RELEASE: none refuses SHA256SUMS, which ends the run at the
 # release lane with no download; no_sig serves SHA256SUMS and refuses its
 # signature; bad_sum serves an asset that does not match SHA256SUMS;
-# no_version serves the release whose .deb names no version; cut
+# no_version serves the release whose .deb names no version; listed serves
+# the SHA256SUMS a case wrote to $TEST_DIR/SHA256SUMS.listed; cut
 # breaks the asset off after a few bytes, as curl exits 18 on a partial
 # transfer; interrupt_HUP, interrupt_INT and interrupt_TERM write a few bytes
 # of the asset, then send that signal to the shell running the download and
@@ -165,6 +181,8 @@ case "$url" in
     [ "$TEST_RELEASE" != none ] || exit 22
     if [ "$TEST_RELEASE" = no_version ]; then
       cat "$TEST_DIR/SHA256SUMS.no_version" > "$out"
+    elif [ "$TEST_RELEASE" = listed ]; then
+      cat "$TEST_DIR/SHA256SUMS.listed" > "$out"
     else
       cat "$TEST_DIR/SHA256SUMS" > "$out"
     fi
@@ -194,8 +212,8 @@ case "$url" in
 esac
 EOF
 # Stand-in gpg: the key always imports except under no_import, and only good,
-# bad_sum, no_version, cut and the interrupt modes (whose signature is fine)
-# report the pinned key's VALIDSIG.
+# bad_sum, no_version, listed, cut and the interrupt modes (whose signature
+# is fine) report the pinned key's VALIDSIG.
 cat > "$work/bin/gpg" <<'EOF'
 #!/bin/sh
 printf 'gpg %s\n' "$*" >> "$TEST_LOG"
@@ -206,7 +224,7 @@ case " $* " in
     ;;
   *" --verify "*)
     case "$TEST_RELEASE" in
-      good|bad_sum|no_version|cut|interrupt_*) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
+      good|bad_sum|no_version|listed|cut|interrupt_*) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
       *) exit 1 ;;
     esac
     ;;
@@ -362,6 +380,26 @@ install() {
   sed 's/\x1b\[[0-9;]*m//g' "$work/stderr" > "$work/plain"
   leftover="$(ls -A "$work/tmp")" || leftover="(the run removed TMPDIR itself)"
   [ ! -s "$work/stdout" ] || fail "$label: wrote to stdout; install.sh writes only to stderr"
+}
+
+# fetch_one <SHA256SUMS text> <match>: one call of fetch_verified <match> in
+# the second copy, with the release served as under listed, its SHA256SUMS
+# holding the text given, and TMPDIR a fresh, empty $work/tmp. Its status
+# lands in $rc, its streams in $work/stdout and $work/stderr, $work/plain
+# holds stderr without colour, and $leftover lists what the call left in
+# $work/tmp.
+fetch_one() {
+  printf '%s\n' "$1" > "$work/SHA256SUMS.listed"
+  : > "$work/log"
+  rm -rf "$work/tmp"
+  mkdir "$work/tmp"
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="$work/tmp" TERM=dumb \
+    TEST_LOG="$work/log" TEST_DIR="$work" \
+    TEST_PPA=lists TEST_RELEASE=listed TEST_DAEMON=active TEST_APT=ok \
+    TEST_KEY_FP="$key_fp" sh "$work/fetch-verified.sh" "$2" > "$work/stdout" 2> "$work/stderr" || rc=$?
+  sed 's/\x1b\[[0-9;]*m//g' "$work/stderr" > "$work/plain"
+  leftover="$(ls -A "$work/tmp")" || leftover="(the run removed TMPDIR itself)"
 }
 
 want_rc() { [ "$rc" = "$1" ] || fail "$label: exit status $rc, want $1"; }
@@ -538,6 +576,23 @@ want_no_err 'Do not override verification'
 want_block
 want_no_download
 
+# A VERSION_ID that is not a Fedora release number: a RHEL-family point
+# release, and a number followed by a + (which os-release(5) allows from
+# systemd 262 on) or a |. The release is served as under good, so only
+# the check itself stops the fetch.
+for version_id in '"9.4"' '"44+"' '"44|"'; do
+  label="Fedora's release-RPM fallback, with VERSION_ID=$version_id"
+  install "ID=fedora
+VERSION_ID=$version_id" lists good
+  want_rc 1
+  want_called 'dnf -y copr enable archledger/irlume'
+  want_err 'Fedora family with a VERSION_ID that is not a Fedora release number; cannot pick a release RPM. Install from Copr when it is back.'
+  if grep -q 'SHA256SUMS' "$work/log"; then fail "$label: fetched SHA256SUMS"; fi
+  want_no_err 'no verified release RPM for'
+  want_block
+  want_no_download
+done
+
 label="a release without its signature"
 install "$debian" lists no_sig
 want_verify_failure 'SHA256SUMS.asc not found for this release.'
@@ -586,6 +641,25 @@ want_rc 1
 want_err 'could not parse the release .deb filename: irlume__amd64.deb'
 if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get installed something"; fi
 want_no_err 'The machine side is ready.'
+want_block
+want_no_download
+
+# The release's SHA256SUMS with a NUL byte after its lines. grep counts the
+# one .deb line but reads the file as binary data and prints no line of it,
+# so the line gives no file name.
+label="a SHA256SUMS that holds a NUL byte"
+{ cat "$work/SHA256SUMS"; printf 'x\000y\n'; } > "$work/SHA256SUMS.listed"
+printed="$(grep '_amd64\.deb$' "$work/SHA256SUMS.listed" 2>/dev/null || true)"
+if [ "$(grep -c '_amd64\.deb$' "$work/SHA256SUMS.listed")" != 1 ] || [ -n "$printed" ]; then
+  fail "$label: grep does not count the .deb line once and print nothing for a file that holds a NUL byte"
+fi
+install "$debian" lists listed
+want_rc 1
+want_err "the SHA256SUMS entry for '_amd64.deb' is not a plain file name; refusing to download it."
+n="$(grep -c '^curl ' "$work/log" || true)"
+[ "$n" = 2 ] || fail "$label: curl ran $n times, want 2 (SHA256SUMS and its signature)"
+want_no_err 'downloading '
+if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get installed something"; fi
 want_block
 want_no_download
 
@@ -681,6 +755,30 @@ want_err 'no verified release RPM for fc44; the lines above say why.'
 if grep -q 'SHA256SUMS\|^curl refused' "$work/log"; then fail "$label: fetched without a temporary directory"; fi
 [ ! -e "$work/missing" ] || fail "$label: created $work/missing"
 want_block
+
+# fetch_verified, called by itself, with a SHA256SUMS line its pattern
+# selects whose name is not a plain file name. The checksum is the release
+# RPM's, so the name is the only thing wrong with the line.
+rpm_sum="$(sed -n 's/^\([0-9a-f]\{64\}\)  irlume-0\.99\.0-1\.fc44\.x86_64\.rpm$/\1/p' "$work/SHA256SUMS")"
+[ -n "$rpm_sum" ] \
+  || { echo "test-install-script: the release fixture lists no fc44 RPM" >&2; exit 1; }
+# want_name_refused <match> <name in the SHA256SUMS line>
+want_name_refused() {
+  label="fetch_verified '$1', whose SHA256SUMS line names $2"
+  fetch_one "$rpm_sum  $2" "$1"
+  want_rc 1
+  want_err "the SHA256SUMS entry for '$1' is not a plain file name; refusing to download it."
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/SHA256SUMS'
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/SHA256SUMS.asc'
+  n="$(grep -c '^curl ' "$work/log" || true)"
+  [ "$n" = 2 ] || fail "$label: curl ran $n times, want 2 (SHA256SUMS and its signature)"
+  want_no_err 'downloading '
+  [ ! -s "$work/stdout" ] || fail "$label: gave its caller a path"
+  want_no_download
+}
+want_name_refused 'a/b' 'a/b'
+want_name_refused '..' '..'
+want_name_refused '.' '.'
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

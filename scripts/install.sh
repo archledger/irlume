@@ -213,6 +213,13 @@ fetch_verified() (
   [ "$n_matches" -eq 1 ] || die "expected exactly one release asset matching '$match' in SHA256SUMS, found ${n_matches}."
   line="$(grep -E -- "$re" "${tmp}/SHA256SUMS")"
   name="$(printf '%s' "$line" | awk '{print $NF}')"
+  # The path handed back is a file directly in $tmp, so the name must be a
+  # plain file name: not empty, not . or .., and without a slash. Every
+  # name scripts/verify-release-assets.py accepts in a release's SHA256SUMS
+  # is one.
+  case "$name" in
+    ''|.|..|*/*) die "the SHA256SUMS entry for '${match}' is not a plain file name; refusing to download it." ;;
+  esac
   say "downloading ${name} ..."
   curl -fSL --progress-bar "${RELEASE_BASE}/${name}" -o "${tmp}/${name}" \
     || die "download of ${name} failed."
@@ -280,6 +287,12 @@ install_rpm_release() {
   # (none has been since v0.11.0, and only fc43/fc44 flavors existed).
   ver="${VERSION_ID:-}"
   [ -n "$ver" ] || die "Fedora family without VERSION_ID; cannot pick a release RPM. Install from Copr when it is back."
+  # A Fedora release number is digits (VERSION_ID=44), as is the N of the
+  # .fcN a release RPM's name carries, so any other value names no release
+  # RPM and stops here.
+  case "$ver" in
+    *[!0123456789]*) die "Fedora family with a VERSION_ID that is not a Fedora release number; cannot pick a release RPM. Install from Copr when it is back." ;;
+  esac
   rpm_path="$(fetch_verified ".fc${ver}.x86_64.rpm")" || \
     die "no verified release RPM for fc${ver}; the lines above say why. Install from Copr when it is back."
   download_dir="$(dirname "${rpm_path}")"

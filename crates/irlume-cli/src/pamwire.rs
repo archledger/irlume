@@ -63,7 +63,9 @@ use transform::*;
 // rather than inherited, which also keeps that surface visible in one place.
 #[cfg(test)]
 pub(crate) use files::restore_surface_with;
-pub(crate) use files::{is_managed_path, restore_surface, UNREADABLE};
+// `fingerprint.rs` keeps its `.pre-irlume` copies of sudo and polkit-1
+// through `backup`, under the names this module restores from.
+pub(crate) use files::{backup, is_managed_path, restore_surface, UNREADABLE};
 pub(crate) use lock::lock_pam;
 // The PAM-grammar items shared outside this module: `fingerprint.rs` and the
 // TUI must read stack lines with the same comment and rule-field semantics
@@ -3385,6 +3387,10 @@ fn wire_override(
             overrides::Write::Nothing => {}
             overrides::Write::Replace(content) => {
                 if decision.keep_copy {
+                    // Checked before the copy, as the write below checks it, so
+                    // a symlink or a file with a second hard link, which the
+                    // write refuses to replace, gets no copy beside it.
+                    inspect_target(etc)?;
                     keep_copy(etc)?;
                 }
                 // Checked against the bytes decided on, immediately before the
@@ -3670,6 +3676,10 @@ fn wire_service_with(
                 return already();
             }
             if apply {
+                // Checked before the copy, as the write below checks it, so a
+                // symlink or a file with a second hard link, which the write
+                // refuses to replace, gets no copy beside it.
+                inspect_target(etc)?;
                 backup(etc)?;
                 write_atomic(etc, &wired)?;
             }
@@ -4745,6 +4755,556 @@ mod tests {
         assert!(refused.contains("symlink"), "{refused}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    struct CopyDir(PathBuf);
+
+    impl Drop for CopyDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new, empty scratch directory for one test, and the guard that
+    /// removes it. Bind the guard to a named variable so that it lives to the
+    /// end of the test. The name is random, not built from the process ID: a
+    /// later run in another PID namespace can get the same process ID and
+    /// would meet a directory an earlier run left. Creation is strict, so
+    /// such a directory fails the test instead of being adopted.
+    fn copy_dir(label: &str) -> (PathBuf, CopyDir) {
+        let path = std::env::temp_dir().join(format!(
+            "irlume-pamcopy-{label}-{:08x}",
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        (path.clone(), CopyDir(path))
+    }
+
+    #[test]
+    fn copy_dirs_are_distinct_and_removed_when_their_test_fails() {
+        let (first, guard) = copy_dir("unwind");
+        let (second, _second) = copy_dir("unwind");
+        assert_ne!(first, second);
+        std::fs::write(first.join(format!("sudo{BACKUP}")), b"x").unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = guard;
+            panic!("fixture failure");
+        });
+        assert!(unwound.is_err());
+        assert!(!first.exists());
+        assert!(second.is_dir());
+    }
+
+    /// Every name in `dir`, sorted, so a test sees a scratch file or a stray
+    /// copy left beside the ones it expects.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A file holding `body` at exactly `mode`. The mode is part of each
+    /// test's precondition: a file system that does not keep a bit fails
+    /// here, not later as a copy that matches by accident.
+    fn file_at(path: &Path, body: &str, mode: u32) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+            mode,
+            "precondition: {} did not take mode {mode:o}",
+            path.display()
+        );
+    }
+
+    /// A backup has the mode (set-ID and sticky bits included) and owner of
+    /// the file it copies, read from the same open file as its bytes; through
+    /// a symlink, that is the file the link names, the one PAM reads. A
+    /// set-user-ID bit is kept because the owner is set before the mode, and
+    /// setting the owner clears that bit. The set-group-ID row keeps its bit
+    /// in either order (this process is in the file's group, and the file is
+    /// not group-executable), and so does the sticky row, so these two guard
+    /// the bits rather than the order. `keep_copy` is made the same way. Run
+    /// as an ordinary user, the test can only see the owner kept, not
+    /// changed.
+    #[test]
+    fn a_backup_has_the_mode_and_owner_of_the_file_it_reads() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (dir, _guard) = copy_dir("backup-mode");
+        let at = |name: &str, mode: u32| {
+            let path = dir.join(name);
+            file_at(&path, &format!("{name} stack\n"), mode);
+            path
+        };
+        for (name, mode) in [
+            ("sudo", 0o600),
+            ("polkit-1", 0o4644),
+            ("kde", 0o2640),
+            ("greetd", 0o1644),
+        ] {
+            let path = at(name, mode);
+            backup(&path).expect("backup");
+            let bak = std::fs::symlink_metadata(dir.join(format!("{name}{BACKUP}"))).unwrap();
+            assert!(bak.file_type().is_file(), "{name}");
+            assert_eq!(bak.mode() & 0o7777, mode, "the backup of a {mode:o} file");
+            let original = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (bak.uid(), bak.gid()),
+                (original.uid(), original.gid()),
+                "{name}"
+            );
+        }
+        let real = at("real-sddm", 0o600);
+        let link = dir.join("sddm");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        backup(&link).expect("backup through a symlink");
+        let bak = dir.join(format!("sddm{BACKUP}"));
+        let meta = std::fs::symlink_metadata(&bak).unwrap();
+        assert!(meta.file_type().is_file(), "a file, not a link");
+        assert_eq!(meta.mode() & 0o7777, 0o600, "the linked file's mode");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "real-sddm stack\n");
+        let kept = at("lightdm", 0o4644);
+        keep_copy(&kept).expect("keep a copy");
+        assert_eq!(
+            std::fs::symlink_metadata(dir.join(format!("lightdm{BACKUP}")))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o4644
+        );
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+    }
+
+    /// A backup takes its bytes and its mode from the file it opened: another
+    /// file renamed over the path after that open, with other bytes and
+    /// another mode, changes neither. Its owner is read from the same open
+    /// file; run as an ordinary user, the test cannot tell owners apart.
+    /// `keep_copy` reads its file the same way.
+    #[test]
+    fn a_backup_takes_its_mode_and_bytes_from_the_file_it_opened() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (dir, _guard) = copy_dir("backup-one-open");
+        let check = |name: &str, copy: fn(&Path) -> Result<(), String>| {
+            let target = dir.join(name);
+            file_at(&target, "the stack opened\n", 0o600);
+            arm(&SOURCE_REPLACED, &target);
+            copy(&target).expect(name);
+            disarm(&SOURCE_REPLACED, &target);
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "A NEWER FILE\n",
+                "precondition: {name} was replaced after the open"
+            );
+            let bak = dir.join(format!("{name}{BACKUP}"));
+            assert_eq!(
+                std::fs::read_to_string(&bak).unwrap(),
+                "the stack opened\n",
+                "{name}: the bytes of the file opened"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&bak).unwrap().mode() & 0o7777,
+                0o600,
+                "{name}: the mode of the file opened"
+            );
+        };
+        check("sudo", backup);
+        check("kde", keep_copy);
+        assert_eq!(
+            names_in(&dir),
+            ["kde", "kde.pre-irlume", "sudo", "sudo.pre-irlume"]
+        );
+    }
+
+    /// A finished backup is published with a hard link, which never replaces
+    /// a name: what appears at the backup's name after the check and before
+    /// the link keeps its bytes and its inode. A complete backup there is
+    /// kept as the backup. Anything else, such as a second name of the file
+    /// being backed up, or nothing there any more, refuses the backup, so the
+    /// caller does not edit a file whose backup was not kept. The name was the
+    /// only reason: once it is free, the same backup goes through.
+    #[test]
+    fn a_backup_never_replaces_a_name_that_appears_before_its_link() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (dir, _guard) = copy_dir("backup-appears");
+        let target = dir.join("sudo");
+        file_at(&target, "the original stack\n", 0o644);
+        let bak = dir.join(format!("sudo{BACKUP}"));
+
+        arm(&BACKUP_APPEARS, &bak);
+        backup(&target).expect("a complete backup there is kept");
+        disarm(&BACKUP_APPEARS, &bak);
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "SOMEONE ELSE'S BACKUP\n",
+            "the backup that appeared was replaced"
+        );
+        assert!(!published_here(&bak), "taken for this run's own");
+        std::fs::remove_file(&bak).unwrap();
+
+        arm(&BACKUP_LINK_APPEARS, &bak);
+        let refused = backup(&target).expect_err("a second name is no backup to keep");
+        disarm(&BACKUP_LINK_APPEARS, &bak);
+        assert!(refused.contains("2 hard links"), "{refused}");
+        assert_eq!(
+            std::fs::symlink_metadata(&bak).unwrap().ino(),
+            std::fs::symlink_metadata(&target).unwrap().ino(),
+            "the second name was replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "the original stack\n"
+        );
+        std::fs::remove_file(&bak).unwrap();
+
+        let refused = backup_already_there(&bak).expect_err("nothing there is no backup");
+        assert!(
+            refused.contains("changed while the backup was made"),
+            "{refused}"
+        );
+
+        backup(&target).expect("backup");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the original stack\n"
+        );
+        assert!(published_here(&bak), "this run's own backup");
+        assert_eq!(names_in(&dir), ["sudo", "sudo.pre-irlume"]);
+    }
+
+    /// `keep_copy` publishes its copy with a hard link too, so a file with
+    /// other bytes that appears at the copy's name after its check and before
+    /// its link keeps its bytes. As with a different copy found at the check,
+    /// that file is not taken for this one and the copy is refused. The name
+    /// was the only reason: once it is free, the same copy goes through.
+    #[test]
+    fn a_kept_copy_never_replaces_a_name_that_appears_before_its_link() {
+        let (dir, _guard) = copy_dir("keep-appears");
+        let target = dir.join("plasmalogin");
+        file_at(&target, "the edited override\n", 0o644);
+        let bak = dir.join(format!("plasmalogin{BACKUP}"));
+
+        arm(&BACKUP_APPEARS, &bak);
+        let refused = keep_copy(&target).expect_err("another file there is no copy of this one");
+        disarm(&BACKUP_APPEARS, &bak);
+        assert!(
+            refused.contains("already holds a different file"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "SOMEONE ELSE'S BACKUP\n",
+            "the file that appeared was replaced"
+        );
+        assert!(!published_here(&bak), "taken for this run's own");
+        assert_eq!(names_in(&dir), ["plasmalogin", "plasmalogin.pre-irlume"]);
+        std::fs::remove_file(&bak).unwrap();
+
+        keep_copy(&target).expect("keep a copy");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "the edited override\n"
+        );
+        assert!(published_here(&bak), "this run's own copy");
+        assert_eq!(names_in(&dir), ["plasmalogin", "plasmalogin.pre-irlume"]);
+    }
+
+    /// Printed by a child test below as its last statement, once every check
+    /// has passed.
+    const CHILD_CHECKED: &str = "IRLUME_PAMWIRE_CHILD_CHECKED";
+
+    /// Run the ignored test `pamwire::tests::{child}` alone, in a child
+    /// process of this test binary whose umask, set only there, is 000, with
+    /// `dir` in `IRLUME_TEST_SCRATCH_DIR`. There a file created with the
+    /// default mode gets 0666 whatever the umask of the test run, so the mode
+    /// a file is created with shows as it is. Fails unless the child ran that
+    /// one test to its end.
+    fn run_with_umask_000(child: &str, dir: &Path) {
+        use std::os::unix::process::CommandExt as _;
+        let name = format!("pamwire::tests::{child}");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", name.as_str(), "--nocapture"])
+            .env("IRLUME_TEST_SCRATCH_DIR", dir);
+        // SAFETY: umask(2) is async-signal-safe and always succeeds. It runs
+        // in the forked child just before exec and sets only that process's
+        // umask.
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0);
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{child} failed:\n{stdout}\n{stderr}"
+        );
+        // A name that matches no test, or an ignored test left out, also
+        // exits 0; a child that returns early prints no marker.
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "{child} ran no test:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains(CHILD_CHECKED),
+            "{child} did not finish its checks:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// The directory a child test below works in, which its parent names.
+    fn child_dir(parent: &str) -> PathBuf {
+        std::env::var_os("IRLUME_TEST_SCRATCH_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("set by {parent}"))
+    }
+
+    /// The mode a file created with the default mode gets in `dir`. A default
+    /// ACL on the directory replaces the umask; when it makes such a file
+    /// 0600, a file created at 0600 cannot be told apart from it, so the
+    /// caller fails here instead of passing.
+    fn default_mode_in(dir: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        let file = std::fs::File::create_new(dir.join("default-mode")).unwrap();
+        let mode = file.metadata().unwrap().mode() & 0o7777;
+        assert_ne!(
+            mode, 0o600,
+            "precondition: a file created with the default mode gets 0600 here, so the \
+             umask 000 did not apply or a default ACL sets the mode"
+        );
+        mode
+    }
+
+    /// The mode recorded in [`SCRATCH_FILLED_MODES`] for the scratch file
+    /// published at `at`.
+    fn filled_mode(at: &Path) -> u32 {
+        SCRATCH_FILLED_MODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(path, _)| path == at)
+            .map(|(_, mode)| *mode)
+            .expect("the hook ran")
+            .expect("the scratch file could be read")
+    }
+
+    /// A copy's bytes are never readable more widely than the file they come
+    /// from: its scratch file is created readable and writable by its owner
+    /// only, also at a name a killed run left, and takes the original's mode
+    /// and owner only once it holds the bytes. That moment is inside one
+    /// call, so a test hook looks at it there. The check runs in a child
+    /// process with umask 000 (see [`run_with_umask_000`]), so it does not
+    /// depend on the umask of the test run.
+    #[test]
+    fn a_backup_is_owner_only_until_it_takes_the_original_mode() {
+        let (dir, _guard) = copy_dir("backup-owner-only");
+        run_with_umask_000("backup_scratch_mode_child", &dir);
+    }
+
+    /// The check of the test above, run only as its child process.
+    #[test]
+    #[ignore = "fresh-exec child of a_backup_is_owner_only_until_it_takes_the_original_mode"]
+    fn backup_scratch_mode_child() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = child_dir("a_backup_is_owner_only_until_it_takes_the_original_mode");
+        let plain = default_mode_in(&dir);
+        // A file a killed run left at the scratch name is not written into:
+        // the scratch file is a new one, created owner-only.
+        let tmp = dir.join("scratch");
+        file_at(&tmp, "a killed run's bytes\n", 0o644);
+        let other = dir.join("other-name");
+        std::fs::hard_link(&tmp, &other).unwrap();
+        let created = create_scratch_mode(&tmp, 0o600)
+            .unwrap()
+            .metadata()
+            .unwrap();
+        assert_eq!(created.mode() & 0o7777, 0o600, "as created");
+        assert_eq!(created.len(), 0, "the file already there was opened");
+        assert_eq!(
+            std::fs::read_to_string(&other).unwrap(),
+            "a killed run's bytes\n"
+        );
+        assert_eq!(std::fs::metadata(&other).unwrap().nlink(), 1);
+        // The scratch file of a write with nothing to carry keeps the default.
+        let fresh = create_scratch(&dir.join("fresh")).unwrap();
+        assert_eq!(fresh.metadata().unwrap().mode() & 0o7777, plain);
+        let check = |name: &str, copy: fn(&Path) -> Result<(), String>| {
+            let target = dir.join(name);
+            file_at(&target, &format!("{name} stack\n"), 0o644);
+            let bak = dir.join(format!("{name}{BACKUP}"));
+            arm(&SCRATCH_FILLED, &bak);
+            copy(&target).expect(name);
+            assert_eq!(filled_mode(&bak), 0o600, "{name}: holding the bytes");
+            assert_eq!(
+                std::fs::symlink_metadata(&bak).unwrap().mode() & 0o7777,
+                0o644,
+                "{name}: then the original's mode"
+            );
+        };
+        check("sudo", backup);
+        check("lightdm", keep_copy);
+        println!("{CHILD_CHECKED}");
+    }
+
+    /// A write whose mode and owner are known when its scratch file is
+    /// created (those of the file it replaces, or ones the caller gives, as a
+    /// rollback and the LightDM private view do) creates that file readable
+    /// and writable by its owner only and gives it the mode and owner once it
+    /// holds the bytes. A new file with nothing to carry is created with the
+    /// default mode. The check runs in a child process with umask 000 (see
+    /// [`run_with_umask_000`]).
+    #[test]
+    fn a_write_with_known_attributes_starts_owner_only() {
+        let (dir, _guard) = copy_dir("write-owner-only");
+        run_with_umask_000("write_scratch_mode_child", &dir);
+    }
+
+    /// The check of the test above, run only as its child process.
+    #[test]
+    #[ignore = "fresh-exec child of a_write_with_known_attributes_starts_owner_only"]
+    fn write_scratch_mode_child() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = child_dir("a_write_with_known_attributes_starts_owner_only");
+        let plain = default_mode_in(&dir);
+        let mode_of = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let replaced = dir.join("sudo");
+        file_at(&replaced, "old\n", 0o644);
+        arm(&SCRATCH_FILLED, &replaced);
+        write_atomic(&replaced, "new\n").expect("write");
+        assert_eq!(filled_mode(&replaced), 0o600, "a replacement");
+        assert_eq!(mode_of(&replaced), 0o644, "the replaced file's mode");
+        // Recorded as this account: a change of owner needs root.
+        let owner = std::fs::metadata(&replaced).unwrap();
+        let restored = dir.join("kde-fingerprint");
+        arm(&SCRATCH_FILLED, &restored);
+        restore_surface(
+            &restored,
+            Some("restored\n"),
+            Some((0o644, owner.uid(), owner.gid())),
+            None,
+        )
+        .expect("restore");
+        assert_eq!(filled_mode(&restored), 0o600, "a restore");
+        assert_eq!(mode_of(&restored), 0o644, "the recorded mode");
+        let created = dir.join("polkit-1");
+        arm(&SCRATCH_FILLED, &created);
+        write_atomic(&created, "created\n").expect("create");
+        assert_eq!(filled_mode(&created), plain, "a new file");
+        println!("{CHILD_CHECKED}");
+    }
+
+    /// `login enable` checks a file before it keeps a copy of it, as the
+    /// write checks it, so a file the write refuses (a symlink, or one of
+    /// several names for a file) is left with no `.pre-irlume` copy beside
+    /// it. The file was the only reason: once it is a regular file with one
+    /// name, the same enable wires it and keeps the copy.
+    #[test]
+    fn an_enable_makes_no_copy_of_a_file_it_refuses() {
+        let (dir, _guard) = copy_dir("refused-no-copy");
+        std::fs::write(
+            dir.join("password-auth"),
+            "auth required pam_unix.so\nsession required pam_unix.so\n",
+        )
+        .unwrap();
+        let wire = |c: &str| wire_greeter_impl(c, true, true, false);
+        let etc = dir.join("gdm-password");
+        let svc = Svc {
+            etc: leak(&etc),
+            vendor: None,
+        };
+        let bak = dir.join(format!("gdm-password{BACKUP}"));
+
+        let real = dir.join("real-gdm-password");
+        std::fs::write(&real, GDM).unwrap();
+        std::os::unix::fs::symlink(&real, &etc).unwrap();
+        let refused = wire_service(&svc, true, true, &wire)
+            .err()
+            .expect("a symlink is refused");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert!(etc.is_symlink(), "the link was replaced");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), GDM);
+        assert_eq!(
+            names_in(&dir),
+            ["gdm-password", "password-auth", "real-gdm-password"]
+        );
+
+        std::fs::rename(&real, &etc).unwrap();
+        let peer = dir.join("gdm-password-peer");
+        std::fs::hard_link(&etc, &peer).unwrap();
+        let refused = wire_service(&svc, true, true, &wire)
+            .err()
+            .expect("a second name is refused");
+        assert!(refused.contains("hard link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&etc).unwrap(), GDM);
+        assert_eq!(
+            names_in(&dir),
+            ["gdm-password", "gdm-password-peer", "password-auth"]
+        );
+
+        std::fs::remove_file(&peer).unwrap();
+        let wired = wire_service(&svc, true, true, &wire).unwrap();
+        assert!(wired.message.contains("wired (backup"), "{wired}");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), GDM);
+        assert!(strays(&dir).is_empty(), "left scratch: {:?}", strays(&dir));
+    }
+
+    /// `login enable --force` checks an override before it keeps a copy of
+    /// it, as the write checks it, so one the write refuses (here a symlink)
+    /// is left with no `.pre-irlume` copy beside it. The link was the only
+    /// reason: once the override is a regular file again, the same rebuild
+    /// keeps the copy.
+    #[test]
+    fn a_forced_rebuild_makes_no_copy_of_a_file_it_refuses() {
+        let (root, _guard) = copy_dir("force-refused-no-copy");
+        ship_vendor_only(&root, "plasmalogin", UPSTREAM_FEDORA);
+        ship_fedora_stacks(&root.join("usr/lib/pam.d"));
+        let svc = under_root(&root, greeter("/etc/pam.d/plasmalogin"));
+        let wire = |c: &str| wire_greeter_impl(c, true, true, true);
+        wire_service(&svc, true, true, &wire).unwrap();
+        // A line irlume did not write, which only `--force` rebuilds over.
+        let anchor = "pam_selinux_permit.so\n";
+        let created = std::fs::read_to_string(svc.etc).unwrap();
+        assert!(created.contains(anchor), "{created}");
+        let edited = created.replacen(
+            anchor,
+            &format!("{anchor}auth       required     pam_faillock.so preauth   # local\n"),
+            1,
+        );
+        let real = root.join("real-plasmalogin");
+        std::fs::write(&real, &edited).unwrap();
+        std::fs::remove_file(svc.etc).unwrap();
+        std::os::unix::fs::symlink(&real, svc.etc).unwrap();
+        let force = WireOpts {
+            apply: true,
+            force: true,
+            ..WireOpts::default()
+        };
+        let bak = format!("{}{BACKUP}", svc.etc);
+
+        let refused = wire_service_with(&svc, true, &force, &wire)
+            .err()
+            .map(String::from)
+            .expect("a symlink is refused");
+        assert!(refused.contains("symlink"), "{refused}");
+        assert!(Path::new(svc.etc).is_symlink(), "the link was replaced");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), edited);
+        assert_eq!(names_in(&root.join("etc/pam.d")), ["plasmalogin"]);
+
+        std::fs::rename(&real, svc.etc).unwrap();
+        let rebuilt = wire_service_with(&svc, true, &force, &wire).unwrap();
+        assert_eq!(
+            rebuilt.change,
+            PlannedChange::MaterializeOverride,
+            "{rebuilt}"
+        );
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), edited);
     }
 
     #[test]

@@ -135,17 +135,29 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- The `.pre-irlume` copy that `irlume fingerprint enable` and `disable`
-  keep of a PAM file they edit (`sudo` and `polkit-1` on Omarchy) has
-  that file's mode and owner. It was written with the default mode for a
-  new file, whatever the file's, and `irlume login disable` and
-  `irlume uninstall` move a matching copy back over the file. The copy
-  is now created readable by its owner only, takes the file's mode and
-  owner before it is published, and appears complete or not at all. An
-  existing copy is kept as it is.
-  When the copy cannot be made, or a symlink, a directory or a file with
-  a second hard link is at the copy's name, the file is left as it is
-  and the command fails with the method unchanged.
+- `irlume login` and, on Omarchy, `irlume fingerprint enable` and
+  `disable` keep their `.pre-irlume` copies of PAM files the same way
+  and under the same names: `irlume login` keeps one before it wires
+  a file in place and before `--force` rebuilds an override that has
+  lines irlume did not write, and the fingerprint edits keep one of
+  an existing `sudo` or `polkit-1` before they change it.
+  `irlume login disable` and `irlume uninstall` move a matching copy
+  back over the file. Each copy is created readable and writable by
+  its owner only, then takes the owner and then the mode (set-ID and
+  sticky bits included) of the file it copies, both read from the
+  open file its bytes come from, and is published by a hard link, so
+  it appears complete or not at all and replaces nothing. Before
+  `irlume login` copies a file, it checks the file as the write that
+  follows does: a symlink or a file with a second hard link, which
+  that write refuses to replace, is refused before any copy is made.
+  The fingerprint edits keep a copy that is already there as it is;
+  when the copy cannot be made, or a symlink, a directory or a file
+  with a second hard link is at the copy's name, the file is left as
+  it is and the command fails with the method unchanged. They hold
+  the lock `irlume login` and its reconcile unit hold while they
+  change PAM, and wait while another irlume command holds it. An
+  `irlume login` write whose mode and owner are known creates its
+  scratch file readable and writable by its owner only.
 
 - `irlume doctor --json` names no account and no camera device path
   (`/dev/video*` or a `/dev/v4l/` link) in a check's `detail`, as

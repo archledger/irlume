@@ -230,7 +230,12 @@ platform family.
 
 `detail` is English elaboration for a support report. It is not stable and not
 for matching. A consumer that branches on that text has reintroduced the problem
-this command removes.
+this command removes. It names no account and no camera device path, except as
+[Security and privacy](#security-and-privacy) says. Outside those exceptions, a
+detail that would name the account doctor checked reads "this account" in its
+place, `ir-node-access` names the camera by its USB identity, and any other
+detail that would give a camera device path reads `<camera node>` instead. The
+human `irlume doctor` report gives the account's name and the paths.
 
 **The array is complete for the always-on checks.** Every check below reports
 on every run, including checks that do not apply to this machine, so a consumer
@@ -266,7 +271,7 @@ reused for a different meaning. The registry as of this contract:
 | `signed-pcr-policy` | whether the boot chain publishes a systemd signed-PCR (Tier 1) policy. New seals do not use it: it binds only PCR 11, which the booted OS extends. A Tier 1 envelope an earlier release wrote needs it to unseal until its next reseal moves it |
 | `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index: `pass` when a provisioned policy covers a firmware-measured PCR (0 to 7), so seals use it; `info` when none is provisioned or it covers OS-measured PCRs only |
 | `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths. A deliberately hardened no-records YUYV IR node (the `72-irlume-ir-nodes.rules` class, #1069) counts as IR capability even though the seat user's scan cannot open it: the daemon opens it as root. `unknown` is not used |
-| `ir-node-access` | whether the seat user can open the node of a descriptor-attested YUYV IR camera without per-frame illumination records (the `NO_RECORDS_YUYV_IR` class, keyed on the USB identity; #1069, ADR-0031 amendment 2026-10-17). Such a camera's burst proof needs the node closed, so `pass` means every node of the class on this machine is root-only (0600, no named ACL entry) (the proof stands without the experimental split opt-in); `warn` means one is still open to the seat (the proof stays inside the opt-in; the detail names the node and the remedy: the packaged udev rule applies it at the next plug or boot); `unknown` when a node's access state could not be read; `info` when no camera of the class is on this machine. Always emitted |
+| `ir-node-access` | whether the seat user can open the node of a descriptor-attested YUYV IR camera without per-frame illumination records (the `NO_RECORDS_YUYV_IR` class, keyed on the USB identity; #1069, ADR-0031 amendment 2026-10-17). Such a camera's burst proof needs the node closed, so `pass` means every node of the class on this machine is root-only (0600, no named ACL entry) (the proof stands without the experimental split opt-in); `warn` means one is still open to the seat (the proof stays inside the opt-in; the detail names the camera by its USB identity and gives the remedy: the packaged udev rule applies it at the next plug or boot; the human report also names its nodes); `unknown` when a node's access state could not be read; `info` when no camera of the class is on this machine. Always emitted |
 | `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
 | `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
 | `models` | the ONNX weights irlume needs, present and checksummed |
@@ -685,9 +690,9 @@ can hill-climb against it, adjusting a presentation until it crosses the
 threshold, which would turn a diagnostic into an oracle. `granted` and `live`
 are the facts a settings panel needs.
 
-The account is not echoed back, for the same reason ordinary machine output
-carries no usernames: the caller already knows which account it asked about, and
-a desktop may log the stream.
+The account is not echoed back, for the same reason machine output names no
+account ([Security and privacy](#security-and-privacy)): the caller already
+knows which account it asked about, and a desktop may log the stream.
 
 An exit status of zero means the test ran. It does not mean the face matched;
 read `granted` for that. A refusal before the stream begins is reported as a
@@ -1026,9 +1031,21 @@ undone. Such a surface is reported as not installed with the reason.
 
 ## Security and privacy
 
-Ordinary JSON output never includes camera frames, embeddings, templates,
-passwords, credential material, TPM secrets, device paths, or usernames.
-Errors contain stable codes instead of daemon prose.
+Machine output never includes camera frames, embeddings, templates,
+passwords, credential material or TPM secrets. It names no camera device
+path (a `/dev/video*` node or a `/dev/v4l/` link to one) except in the
+`node` field of `camera census --json`, which lists the nodes by design.
+It names no account, with two exceptions. Run as root, `doctor --json`'s
+`tpm-firmware`, `tpm-lockout` and `tpm-storage-keys` details name the
+accounts whose sealed envelopes they concern
+([ADR-0034](adr/0034-attempt-limiting-stays-in-software.md) section 4 and
+its amendment 2026-10-16), since the report behind them is root-only and
+an administrator acts on it. And a path that was configured and is
+reported back as set, such as the library `ORT_DYLIB_PATH` names, a model
+override, a state directory or a camera configured by a path outside
+`/dev/video*` and `/dev/v4l/`, can lie under a home directory and so
+contain an account name. Errors contain stable codes instead of daemon
+prose.
 
 The following are not part of contract version 1 yet and must not be inferred
 from human output or the private socket protocol:

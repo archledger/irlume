@@ -126,6 +126,25 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `irlume doctor --json` names no account and no camera device path
+  (`/dev/video*` or a `/dev/v4l/` link) in a check's `detail`, as
+  docs/MACHINE-API.md says of machine output. `sealed-storage` and
+  `keyring-os-upgrade` named the account asked about, and
+  `ir-node-access`, `capture-mode` and the two stream checks could name
+  a camera device path. The account now reads "this account",
+  `ir-node-access` names the camera by its USB identity, and any other
+  camera device path reads `<camera node>`; the System Settings
+  module's Diagnostics page, which displays `detail`, shows the same
+  text. The human `irlume doctor` report still names both. Run as
+  root, the `tpm-firmware`, `tpm-lockout` and `tpm-storage-keys`
+  details still name the accounts whose envelopes they concern
+  (ADR-0034 section 4, amendment 2026-10-16). The Security and privacy
+  section of docs/MACHINE-API.md now says so, names the `node` field
+  of `camera census --json`, and says that a path reported as
+  configured can lie under a home directory; docs/INTEGRATION.md lists
+  the same exceptions. `detail` is text for people, and no JSON shape
+  changes (#1338).
+
 - A busy camera's row in `irlume camera census`, `irlume doctor` and the
   System Settings module's Cameras page no longer ends with "Close that
   app and retry" when the holder is irlume itself, which the same row

@@ -82,6 +82,17 @@ class ContractTests(unittest.TestCase):
             CONFORMANCE.forbidden_paths(document, "camera-census"), ["/dev/video"]
         )
 
+    def test_doctor_detail_may_not_name_a_video_node(self):
+        # docs/MACHINE-API.md, "Security and privacy": doctor's `detail`
+        # names no camera device path, so it is not exempt as the census
+        # `node` field is.
+        document = fixture("doctor.json")
+        self.assertEqual(CONFORMANCE.forbidden_paths(document, "doctor-json"), [])
+        document["data"]["checks"][0]["detail"] = "5986:1141 (/dev/video2): shared"
+        self.assertEqual(
+            CONFORMANCE.forbidden_paths(document, "doctor-json"), ["/dev/video"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

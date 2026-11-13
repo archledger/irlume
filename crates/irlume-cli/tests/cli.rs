@@ -1232,6 +1232,58 @@ fn doctor_json_keeps_system_probe_output_private() {
     }
 }
 
+/// `doctor --json` names no account in any `detail` (docs/MACHINE-API.md,
+/// "Security and privacy"), while the human report names the account it
+/// checked, which `--user` can make an account other than the caller's: here
+/// doctor runs as root, `USER` names one account and the human run's `--user`
+/// another. Without a daemon `sealed-storage` is unknown, a reading whose
+/// detail refers to the account, and the root-only TPM checks have no report
+/// to name an account from. Namespace root with a private /dev, so no camera
+/// or TPM node: camera device paths are pinned by the `doctor_report` and
+/// `ir_node_access_rows` unit tests.
+#[test]
+fn doctor_json_details_name_no_account() {
+    const ACCOUNT: &str = "doctorjsonprobe";
+    const OTHER: &str = "doctorjsonother";
+    const TOOLS: [&str; 4] = ["systemctl", "authselect", "fprintd-verify", "fprintd-list"];
+    let sb = Sandbox::new("doctor-json-no-account");
+    for tool in TOOLS {
+        sb.fake_tool(tool, "exit 1");
+    }
+    let doctor = |args: &[&str]| {
+        let mut command = support::isolated_root_command(&sb.root, BIN, args, &TOOLS, &[], &[]);
+        command
+            .env("USER", ACCOUNT)
+            .env_remove("SUDO_USER")
+            .env("IRLUME_OS_RELEASE", sb.path("no-os-release"));
+        run(&mut command)
+    };
+    let (code, out, err) = doctor(&["doctor", "--json"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let document: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let checks = document["data"]["checks"].as_array().unwrap();
+    let sealed = checks
+        .iter()
+        .find(|check| check["id"] == "sealed-storage")
+        .unwrap();
+    assert_eq!(sealed["state"], "unknown", "{sealed}");
+    assert_eq!(
+        sealed["detail"], "irlumed did not say what is sealed for this account",
+        "{sealed}"
+    );
+    for check in checks {
+        let detail = check["detail"].as_str().unwrap_or_default();
+        assert!(!detail.contains(ACCOUNT), "{check}");
+    }
+    let (_, out, err) = doctor(&["doctor", "--user", OTHER]);
+    assert!(
+        out.contains(&format!(
+            "sealed storage ({OTHER}): irlumed did not say what is sealed for {OTHER}\n"
+        )),
+        "{out} {err}"
+    );
+}
+
 #[test]
 fn enroll_fails_cleanly_without_a_daemon() {
     let sb = Sandbox::new("enroll");
@@ -2809,8 +2861,13 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
         assert_eq!(code, 0, "{out} {err}");
         out
     };
+    // The account `doctor --json` asks about; its detail never names it
+    // (docs/MACHINE-API.md, "Security and privacy").
+    const PROBE: &str = "doctorjsonprobe";
     let upgrade_check = |sb: &Sandbox| -> serde_json::Value {
-        let (_, out, err) = run(&mut command(sb, &["doctor", "--json"]));
+        let (_, out, err) = run(command(sb, &["doctor", "--json"])
+            .env("USER", PROBE)
+            .env_remove("SUDO_USER"));
         let report: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|error| panic!("{error}: {out} {err}"));
         report["data"]["checks"]
@@ -2857,6 +2914,9 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
         out.contains(NOTICE) && out.contains(FORGET),
         "doctor must give the pre-upgrade step: {out} {err}"
     );
+    // The human report names the account it checked, which `--user` can make
+    // an account other than the caller's.
+    assert!(out.contains("retain tester's sealed token"), "{out}");
     // The warning makes doctor end with where to report, after its summary
     // line, the private route first.
     let summary = out
@@ -2896,6 +2956,10 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
     let detail = check["detail"].as_str().unwrap_or_default();
     assert!(
         detail.contains(NOTICE) && detail.contains(FORGET),
+        "{check}"
+    );
+    assert!(
+        detail.contains("retain this account's sealed token") && !detail.contains(PROBE),
         "{check}"
     );
 
@@ -3252,8 +3316,12 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     );
     let (check, _) = checks(&sb);
     assert_eq!(check["state"], "info", "{check}");
+    // `doctor --json` names no account (docs/MACHINE-API.md, "Security and
+    // privacy"); `seal_storage::tests::the_doctor_check_states` and
+    // `doctor_json_details_name_no_account` pin the human wording.
     assert!(
-        detail(&check).contains("nothing is sealed for tester"),
+        detail(&check).contains("nothing is sealed for this account")
+            && !detail(&check).contains("tester"),
         "{check}"
     );
     assert!(!asked(&log, sealed_storage), "{:?}", log.lock().unwrap());

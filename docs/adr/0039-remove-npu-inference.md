@@ -113,6 +113,11 @@ local include. A rule stays only if something else on the CPU path needs it. An 
 `intel-npu-stack` is an independent, application-neutral project. This decision does not
 change it. irlume stops referring to it as a reference installation.
 
+**Amended 2026-11-13:** the maintainer retired `intel-npu-stack` and deleted its
+repository. The two links to it in ADR-0022, to the repository and to its issue 20, no
+longer resolve. Mentions of its profile and packages in ADR-0022, ADR-0033 and the
+research notes of October 2026 are historical.
+
 ### 8. Revisiting
 
 A return needs a new ADR, and one of two things: evidence that CPU users face a failed

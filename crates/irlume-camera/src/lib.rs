@@ -3419,7 +3419,10 @@ fn describe_camera_holder(holders: Holders) -> Option<String> {
 /// name, decides what its text tells the reader to do (#1338).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holders {
-    /// Some other process has it. The one the user has to close.
+    /// Some other process has it. The one the user has to close, named by
+    /// its process name as `holder_name` shows it, then its pid
+    /// (`kamoso (pid 2567)`), or by its pid alone (`pid 2567`) when no name
+    /// is left.
     Other(String),
     /// Our own handle, on a scan that could read every process. irlume
     /// competing with itself is a defect, not something the user can act on.
@@ -3488,15 +3491,28 @@ fn camera_holders(device: &str) -> Holders {
             saw_self = true;
             continue;
         }
-        let comm = std::fs::read_to_string(ent.path().join("comm")).unwrap_or_default();
-        let comm = comm.trim();
-        return Holders::Other(if comm.is_empty() {
-            format!("pid {pid}")
-        } else {
-            format!("{comm} (pid {pid})")
+        // The process sets this name itself, so it is shown the way device
+        // text is (`holder_name`).
+        let comm = std::fs::read(ent.path().join("comm")).unwrap_or_default();
+        return Holders::Other(match holder_name(&comm) {
+            Some(name) => format!("{name} (pid {pid})"),
+            None => format!("pid {pid}"),
         });
     }
     holder_verdict(saw_self, blind)
+}
+
+/// A process's name for people, from the bytes of its `/proc/<pid>/comm`.
+/// The process sets this name itself (`prctl(PR_SET_NAME)`, or at exec the
+/// last part of the path it was started through), so it is shown the way
+/// device text is, through `camera_text`: on one visible line, at most 64
+/// characters, trimmed, and `None` when nothing is left. Bytes that are not
+/// UTF-8 read as U+FFFD: the kernel keeps 15 bytes of a name, which can end
+/// inside a character.
+fn holder_name(comm: &[u8]) -> Option<String> {
+    let name = camera_text(&String::from_utf8_lossy(comm));
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// What a scan that found no OTHER holder concluded, as a value.
@@ -19147,6 +19163,69 @@ mod tests {
         assert_eq!(camera_holder("/dev/irlume-test-missing"), None);
     }
 
+    /// A holder's name is the process's own choice, so it is shown the way
+    /// device text is: one visible line, at most 64 characters, U+FFFD for
+    /// bytes that are not UTF-8, and no name when nothing is left.
+    #[test]
+    fn a_holder_name_is_shown_as_device_text() {
+        // Ordinary names, as /proc/<pid>/comm gives them, are unchanged.
+        for name in [
+            "firefox",
+            "Web Content",
+            "Isolated Web Co",
+            "gst-launch-1.0",
+            "kamoso",
+        ] {
+            assert_eq!(
+                holder_name(format!("{name}\n").as_bytes()).as_deref(),
+                Some(name)
+            );
+        }
+        let cases: &[(&[u8], &str)] = &[
+            // Control characters become spaces: ESC and BEL, a C1 control
+            // (U+009B), carriage return, tab and newline.
+            (b"cam\x1b[31m\x07era\n", "cam [31m era"),
+            ("a\u{9b}31mb\n".as_bytes(), "a 31mb"),
+            (b"a\rb\tc\n", "a b c"),
+            (b"one\ntwo\n", "one two"),
+            // So do invisible formatting and a Unicode line separator.
+            (
+                "Integrated\u{202E}Camera\u{200B}\u{2066}x\u{FEFF}\n".as_bytes(),
+                "Integrated Camera  x",
+            ),
+            ("a\u{2028}b\n".as_bytes(), "a b"),
+            // Bytes that are not UTF-8 read as U+FFFD, a lone 0x9B among
+            // them, and so does a character the 15-byte limit cut short.
+            (b"cam\x9b31mx\n", "cam\u{FFFD}31mx"),
+            (b"\xff\xfe\n", "\u{FFFD}\u{FFFD}"),
+            (
+                b"webcam-\xe3\x83\x93\xe3\x83\x87\xe3\x82\n",
+                "webcam-\u{30D3}\u{30C7}\u{FFFD}",
+            ),
+            // Markup characters are text, as in device text.
+            (b"<b>cam</b> &amp;\n", "<b>cam</b> &amp;"),
+        ];
+        for &(comm, shown) in cases {
+            assert_eq!(holder_name(comm).as_deref(), Some(shown), "{comm:?}");
+        }
+        // Nothing left: no name, and the holder is named by its pid alone.
+        let blank: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"  \n",
+            b"\x1b\x07\n",
+            "\u{200B}\u{FEFF}\n".as_bytes(),
+        ];
+        for &comm in blank {
+            assert_eq!(holder_name(comm), None, "{comm:?}");
+        }
+        // Bounded as device text is.
+        assert_eq!(
+            holder_name(&[b'x'; 100]).map(|n| n.chars().count()),
+            Some(64)
+        );
+    }
+
     /// The busy text for a node only this process holds, as
     /// `camera_busy_error` words it.
     fn self_held_busy_text(device: &str) -> String {
@@ -19400,6 +19479,240 @@ mod tests {
             who.contains(&format!("pid {}", other.id())),
             "the OTHER process is the actionable holder; {verdict}"
         );
+    }
+
+    /// A test's scratch directory, removed when the test ends, whether it
+    /// passed or not.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        /// A new, empty directory with mode 0700 under the temporary
+        /// directory. Its name has a random part as well as the process ID,
+        /// since a run in another PID namespace can have the same process ID.
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = std::env::temp_dir().join(format!(
+                "irlume-cam-{label}-{}-{:016x}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .unwrap_or_else(|e| panic!("could not create {dir:?}: {e}"));
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A child process, killed and reaped when it goes out of scope, whether
+    /// its test passed or not.
+    struct Holder(std::process::Child);
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The first file named `name` in a PATH directory, for a test that runs
+    /// a program through a link to it.
+    fn program_on_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("no {name} on PATH"))
+    }
+
+    /// Wait until `/proc/<pid>/comm` reads `name`. Exec gives the process
+    /// its new name late, after `spawn` may already have returned.
+    fn wait_for_comm(pid: u32, name: &[u8]) {
+        let path = format!("/proc/{pid}/comm");
+        let mut want = name.to_vec();
+        want.push(b'\n');
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let read = std::fs::read(&path);
+            if read.as_deref().ok() == Some(&want[..]) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{path} never read {want:?}: {read:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Start `sleep 30` with `stdin` as its standard input, through a link
+    /// named `name` in the new directory `dir`, and wait until its
+    /// `/proc/<pid>/comm` shows that name: exec names a process after the
+    /// last part of the path it was started through, here the link, cut to
+    /// 15 bytes.
+    fn holder_named(dir: &std::path::Path, name: &[u8], stdin: std::fs::File) -> Holder {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        std::fs::create_dir(dir).unwrap_or_else(|e| panic!("could not create {dir:?}: {e}"));
+        let link = dir.join(std::ffi::OsStr::from_bytes(name));
+        std::os::unix::fs::symlink(program_on_path("sleep"), &link)
+            .unwrap_or_else(|e| panic!("could not create {link:?}: {e}"));
+        let holder = Holder(
+            std::process::Command::new(&link)
+                // A multi-call binary picks its program by this name.
+                .arg0("sleep")
+                .arg("30")
+                .stdin(stdin)
+                .spawn()
+                .unwrap_or_else(|e| panic!("could not start a holder through {link:?}: {e}")),
+        );
+        wait_for_comm(holder.0.id(), &name[..name.len().min(15)]);
+        holder
+    }
+
+    /// The scan names another process that holds a file by its name as
+    /// `holder_name` shows it, or by its pid alone when no name is left.
+    /// Each holder is `sleep`, started through a link whose file name is the
+    /// name to show (`holder_named`). The file is an ordinary one in a
+    /// scratch directory; no camera is opened.
+    #[test]
+    fn the_holder_scan_names_another_process_as_device_text() {
+        // Held for the spawns, as in `another_process_outranks_our_own_hold`:
+        // a fork copies this process's whole fd table.
+        let _guard = crate::testenv::env_lock();
+        let scratch = Scratch::new("holder-name");
+        let held = scratch.0.join("held");
+        std::fs::write(&held, b"x").unwrap();
+        let cases: &[(&[u8], &str)] = &[
+            // An escape sequence, markup and a BEL.
+            (b"cam\x1b[31m<b>\x07x", "cam [31m<b> x"),
+            // A byte that is not UTF-8.
+            (b"cam\x9b31mx", "cam\u{FFFD}31mx"),
+            // 16 bytes: the kernel keeps 15, ending inside the last character.
+            (
+                "webcam-\u{30D3}\u{30C7}\u{30AA}".as_bytes(),
+                "webcam-\u{30D3}\u{30C7}\u{FFFD}",
+            ),
+            // An ordinary name.
+            (b"kamoso", "kamoso"),
+        ];
+        for (index, &(name, shown)) in cases.iter().enumerate() {
+            let stdin = std::fs::File::open(&held).unwrap();
+            let holder = holder_named(&scratch.0.join(index.to_string()), name, stdin);
+            let pid = holder.0.id();
+            assert_eq!(
+                camera_holders(held.to_str().unwrap()),
+                Holders::Other(format!("{shown} (pid {pid})")),
+                "{name:?}"
+            );
+        }
+        // Nothing left once cleaned: the holder is named by its pid alone.
+        let stdin = std::fs::File::open(&held).unwrap();
+        let holder = holder_named(&scratch.0.join("blank"), b"\x1b\x07", stdin);
+        let pid = holder.0.id();
+        assert_eq!(
+            camera_holders(held.to_str().unwrap()),
+            Holders::Other(format!("pid {pid}"))
+        );
+    }
+
+    /// Another process holding a real camera node is named as `holder_name`
+    /// shows it, in the busy text and in the census cause. Each holder is
+    /// `sleep`, started through a link whose file name is the name to show
+    /// (`holder_named`), with the node, opened read-only, as its standard
+    /// input: nothing streams and no emitter is touched. The scan names the
+    /// first holder it finds, so no other process may hold the node: check
+    /// with `sudo fuser -v <node>` first. The node comes from
+    /// `IRLUME_TEST_OTHER_HOLD_NODE`, which only this test reads. CI never
+    /// selects it.
+    #[test]
+    #[ignore = "needs a camera node no other process holds; set IRLUME_TEST_OTHER_HOLD_NODE"]
+    fn another_holder_of_a_real_node_is_named_as_device_text() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        crate::hostfs::test::host();
+        let node = std::env::var("IRLUME_TEST_OTHER_HOLD_NODE").unwrap_or_else(|_| {
+            panic!(
+                "IRLUME_TEST_OTHER_HOLD_NODE is unset. This test is #[ignore]d, so running it is \
+                 a request for a camera node no other process holds; it will not silently pass \
+                 without one."
+            )
+        });
+        // Held for the spawns, as in `another_process_outranks_our_own_hold`.
+        let _guard = crate::testenv::env_lock();
+        let meta =
+            std::fs::metadata(&node).unwrap_or_else(|e| panic!("could not stat {node}: {e}"));
+        assert!(
+            meta.file_type().is_char_device() && libc::major(meta.rdev()) == 81,
+            "{node} is not a video4linux character device (major 81)"
+        );
+        let scratch = Scratch::new("real-holder");
+        let cases: &[(&[u8], &str)] = &[
+            // An ordinary name, shown as it is.
+            (b"irlume-look", "irlume-look"),
+            // An escape sequence, markup and a BEL.
+            (b"cam\x1b[31m<b>\x07x", "cam [31m<b> x"),
+            // 16 bytes: the kernel keeps 15, ending inside the last character.
+            (
+                "webcam-\u{30D3}\u{30C7}\u{30AA}".as_bytes(),
+                "webcam-\u{30D3}\u{30C7}\u{FFFD}",
+            ),
+        ];
+        for (index, &(name, shown)) in cases.iter().enumerate() {
+            let opened = std::fs::File::open(&node)
+                .unwrap_or_else(|e| panic!("could not open {node} read-only: {e}"));
+            let holder = holder_named(&scratch.0.join(index.to_string()), name, opened);
+            let pid = holder.0.id();
+            let who = format!("{shown} (pid {pid})");
+            let holders = camera_holders(&node);
+            assert_eq!(
+                holders,
+                Holders::Other(who.clone()),
+                "{name:?}: the scan names the first holder it finds; check `sudo fuser -v {node}`"
+            );
+            let busy = map_io(&node, std::io::Error::from_raw_os_error(libc::EBUSY));
+            let cause = Unreadable {
+                path: node.clone(),
+                at: FailedAt::Open,
+                errno: Some(libc::EBUSY),
+                holder: Some(holders),
+            }
+            .cause();
+            eprintln!("{node} busy: {busy:?}");
+            eprintln!("{node} census cause: {cause:?}");
+            match busy {
+                Error::CameraBusy(text) => assert_eq!(
+                    text,
+                    format!(
+                        "{node}: camera busy, in use by {who}. Close that app \
+                         (e.g. a camera/video/conferencing app) and retry."
+                    )
+                ),
+                other => panic!("another holder is a busy camera: {other:?}"),
+            }
+            assert!(
+                cause.ends_with(&format!(
+                    "camera busy, in use by {who}. Close that app and retry"
+                )),
+                "{cause:?}"
+            );
+        }
+    }
+
+    /// Only tests read `IRLUME_TEST_OTHER_HOLD_NODE`: in this file its name
+    /// appears only inside the tests module.
+    #[test]
+    fn only_tests_read_the_other_hold_node_variable() {
+        let lib = include_str!("lib.rs");
+        let production = &lib[..lib
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the tests module moved; update this test")];
+        assert!(!production.contains(concat!("IRLUME_TEST_", "OTHER_HOLD_NODE")));
     }
 
     #[test]

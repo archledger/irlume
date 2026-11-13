@@ -7,6 +7,15 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The release-RPM fallback of `scripts/install.sh` takes `VERSION_ID`
+  from `/etc/os-release` only when it is all digits, as a Fedora release
+  number and the N of a release RPM's `.fcN` are. Any other value, such
+  as a RHEL-family `9.4`, stops the fallback before it fetches
+  anything, with a message that names `VERSION_ID`. The release lane
+  also downloads an asset only when the name its `SHA256SUMS` line
+  gives is a plain file name, not `.` or `..` and without a slash;
+  every name `scripts/verify-release-assets.py` accepts is one.
+
 - The issue chooser's link for questions and setup help, which went to
   GitHub Discussions, is now a link to the private report form for a
   security problem, or one the reporter is not sure about, and says

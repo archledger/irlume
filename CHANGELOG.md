@@ -7,6 +7,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- CI parses the issue chooser's `.github/ISSUE_TEMPLATE/config.yml` and
+  checks the shape GitHub documents for it (a boolean
+  `blank_issues_enabled`, and contact links that each carry a name, an
+  http(s) URL and about text), and checks that the curated documents
+  (`README.md`, `CONTRIBUTING.md`, `GOVERNANCE.md`, `SECURITY.md`,
+  `docs/*.md` and the issue templates) link no repository feature that
+  is turned off, so a YAML mistake in the chooser, or a link to
+  Discussions, turned off with #1347, fails a check instead of shipping
+  quietly. The `vision` label's description in `.github/labels.toml`
+  now matches the label's text on GitHub, which changes nothing there:
+  the file sets a description only when it creates a label (#1346).
+
 - The name of a process holding a camera is shown the way irlume shows
   text a camera reports: on one line, with control characters, line
   separators and the zero-width and text-direction formatting characters

@@ -116,6 +116,18 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `scripts/install.sh` removes the directory it downloads a release
+  package into after a download that is refused or breaks off, a
+  signature or checksum that does not verify, a hangup, interrupt or
+  termination signal to the installer's process group (a closed
+  terminal or Ctrl-C sends one) during the download or its
+  verification, a package version that does not parse, or a package
+  command that fails. The directory stayed in the temporary directory
+  with what had been downloaded so far, up to the whole package
+  (591 MB for the 0.16.0 universal .deb). A temporary directory that
+  cannot be created now stops the release lane at once, with its own
+  message (#1338).
+
 - `scripts/install.sh` says the machine side is ready only when
   `irlumed.service` is active. For any other state it gives the state
   on one line, how to see why and where to report, and still exits 0;

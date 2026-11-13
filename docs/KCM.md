@@ -100,7 +100,8 @@ Fedora and Arch containers and runs, besides `kcmshell6` and `qmllint`:
   program) against fake programs;
 - `kcm_pagetest`: every page, offscreen, for each fixture set in
   `kcm/tests/fixtures/` at 420 and 1530 pixels wide, failing on any QML
-  warning, any text outside the page and any row or action out of place.
+  warning, any text outside the page, any row or action out of place and
+  any detail or evidence not shown as plain text.
 
 The fixture sets are synthetic documents owned by the module;
 `schemas/fixtures/` is not edited by hand.
@@ -109,8 +110,10 @@ The fixture sets are synthetic documents owned by the module;
 
 The module runs inside systemsettings as your own user. It execs exactly
 one program (`irlume`, resolved to the packaged absolute path, which the
-terminal launch passes on as well), renders JSON documents, and can start
-the TUI. It never reads or writes enrollment data, never edits PAM, and
-ships no privileged helper: the
+terminal launch passes on as well), renders JSON documents (the detail
+line of each check, the evidence line of each device and the other
+secondary lines as plain text), and can start the TUI. It never reads
+or writes enrollment data, never edits PAM, and ships no privileged
+helper: the
 [design doc](superpowers/specs/2026-09-18-kcm-plasma-settings-design.md)
 records the rejected alternatives (including a KAuth helper).

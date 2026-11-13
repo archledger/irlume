@@ -9,6 +9,7 @@
 // before and after Refresh:
 //   - no QML warning (a few environment lines are allowed by exact text);
 //   - no text outside the page, and no text wider than its item;
+//   - each check's detail and each device's evidence shown as plain text;
 //   - rows in model order, actions outside the lists, section headers
 //     with their counts, and the state and wording each fixture calls for.
 // Exits non-zero when any check fails.
@@ -270,6 +271,23 @@ void checkBounds(const Ctx &ctx)
     }
 }
 
+// A check's detail and a device's evidence are shown as written:
+// Text.PlainText (0), so nothing in them is read as markup.
+void checkPlainText(const Ctx &ctx)
+{
+    const auto items = allItems(ctx.page);
+    for (const QQuickItem *item : items) {
+        const QString name = item->objectName();
+        if (name == QLatin1String("detail") || name == QLatin1String("evidence")) {
+            const QVariant format = item->property("textFormat");
+            bool converted = false;
+            const int value = format.toInt(&converted);
+            check(format.isValid() && converted && value == Qt::PlainText,
+                  QStringLiteral("%1 is shown as plain text: %2").arg(name, textOf(item).left(60)));
+        }
+    }
+}
+
 QList<QVariantMap> modelRows(QAbstractItemModel *model)
 {
     QList<QVariantMap> rows;
@@ -378,6 +396,8 @@ void checkDiagnostics(const Ctx &c)
         check(sections == QStringList{QStringLiteral("Warnings (1)"), QStringLiteral("Not determined (2)"),
                                       QStringLiteral("Passing (21)"), QStringLiteral("Informational (7)")},
               QStringLiteral("sections in problem-first order with counts (%1)").arg(sections.join(QStringLiteral(", "))));
+        // So checkPlainText has a detail label to read.
+        check(c.item(QStringLiteral("detail")) != nullptr, QStringLiteral("a check's detail is on the page"));
         for (const QVariantMap &row : rows) {
             const QString id = row.value(QStringLiteral("checkId")).toString();
             check(row.value(QStringLiteral("title")).toString() != id, QStringLiteral("%1 has a title").arg(id));
@@ -447,6 +467,8 @@ void checkCameras(const Ctx &c)
     c.outsideContent(QStringLiteral("footerRefresh"));
     if (c.set == QLatin1String("real")) {
         c.order({QStringLiteral("device-/dev/video0"), QStringLiteral("device-/dev/video2"), QStringLiteral("alsoFound")});
+        // So checkPlainText has an evidence label to read.
+        check(c.item(QStringLiteral("evidence")) != nullptr, QStringLiteral("a device's evidence is on the page"));
         c.visible(QStringLiteral("device-/dev/video1"), false);
         c.textContains(QStringLiteral("alsoFound"), QStringLiteral("/dev/video1, /dev/video3 (metadata interfaces, not cameras)"));
         c.outsideContent(QStringLiteral("footerAction"));
@@ -469,6 +491,11 @@ void checkCameras(const Ctx &c)
             titled = titled || textOf(item) == QLatin1String("Intel IPU6 MIPI camera pipeline");
         }
         check(titled, QStringLiteral("a row without a node is titled from its class"));
+        // A busy camera's evidence reaches its label unchanged, markup
+        // characters included; checkPlainText checks that it is plain text.
+        c.showsText(QStringLiteral("device-/dev/video5"),
+                    QStringLiteral("could not be opened (errno 16: Device or resource busy (os error 16)). "
+                                   "camera busy, in use by cam & mic <2> (pid 4242). Close that app and retry"));
     } else if (c.set == QLatin1String("empty") || c.set == QLatin1String("short")) {
         c.visible(QStringLiteral("empty"));
     } else if (c.set == QLatin1String("refused")) {
@@ -602,6 +629,7 @@ bool runPage(const std::shared_ptr<QQmlEngine> &engine, const QString &modulePat
         waitSettled(module.get());
         ctx.visible(QStringLiteral("loading"), false);
         checkBounds(ctx);
+        checkPlainText(ctx);
         pageChecks(ctx);
     }
     check(module->property("launches").toStringList().isEmpty(), QStringLiteral("nothing was launched"));

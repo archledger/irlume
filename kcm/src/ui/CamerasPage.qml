@@ -250,6 +250,7 @@ KCMUtils.SimpleKCM {
                             Accessible.ignored: true
                         }
                         SecondaryLabel {
+                            objectName: "evidence"
                             Layout.fillWidth: true
                             visible: text.length > 0
                             text: device.evidence

@@ -19,7 +19,7 @@ IR camera pair; the other sets change it:
 | `failure` | requests that produce no document |
 | `empty` | no checks, no cameras, no login manager, no surface present |
 | `short` | documents without the lists the pages read |
-| `edge` | a failing check, an undetermined check without detail, a check state the module does not know, a camera row without a node, a closed privacy shutter, an unrecognized login manager, a service without a surface entry, no SELinux field, values from a newer engine |
+| `edge` | a failing check, an undetermined check without detail, a check state the module does not know, a camera row without a node, a closed privacy shutter, an unrecognized login manager, a service without a surface entry, no SELinux field, values from a newer engine, a busy camera whose evidence holds markup characters |
 | `long` | long identifiers, details and notes |
 
 The `refused` set is deliberately not something a real engine sends:

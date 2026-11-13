@@ -162,6 +162,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `scripts/machine-api-conformance.py` refuses `/dev/v4l/` device paths in
+  machine output, the spelling of a camera node by-id link, as it already
+  refused `/dev/video` paths, and no longer skips the `camera-diagnostics`
+  capability as one it does not know: the command operates the camera through
+  the daemon, so the script now checks that its refusals (an unsupported
+  contract, a usage error) arrive as one machine document, as it does for
+  `auth-test-events` (#1346).
+
 - `irlume login` and, on Omarchy, `irlume fingerprint enable` and
   `disable` keep their `.pre-irlume` copies of PAM files the same way
   and under the same names: `irlume login` keeps one before it wires

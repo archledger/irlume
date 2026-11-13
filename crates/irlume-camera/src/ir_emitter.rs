@@ -1642,7 +1642,9 @@ fn write_if_different_inner(
 /// is a separate fact, never an empty list.
 #[derive(Debug, Default, PartialEq)]
 struct ConsumerScan {
-    /// PIDs, with `comm`, of OTHER processes seen holding the node.
+    /// PIDs, with names as `holder_name` shows them ("?" when the name
+    /// cannot be read or nothing of it is left), of OTHER processes seen
+    /// holding the node.
     consumers: Vec<(u32, String)>,
     /// At least one process refused inspection. Reading another process's
     /// `/proc/<pid>/fd` is gated by PTRACE_MODE_READ_FSCREDS, not by file
@@ -1722,9 +1724,10 @@ fn foreign_consumers(proc_root: &std::path::Path, dev: &str, self_pid: u32) -> C
             }
         }
         if holds {
-            let comm = std::fs::read_to_string(entry.path().join("comm"))
-                .map(|c| c.trim().to_string())
-                .unwrap_or_else(|_| "?".into());
+            let comm = std::fs::read(entry.path().join("comm"))
+                .ok()
+                .and_then(|comm| crate::holder_name(&comm))
+                .unwrap_or_else(|| "?".into());
             scan.consumers.push((pid, comm));
         }
     }
@@ -6357,6 +6360,43 @@ mod tests {
                 == 1
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Each consumer is named the way device text is shown (`holder_name`),
+    /// and "?" stands for a name that is blank or cannot be read.
+    #[test]
+    fn foreign_consumers_name_each_consumer_as_device_text() {
+        // Removed when the test ends, whether it passed or not.
+        struct Tree(std::path::PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tree = Tree(fake_proc(
+            "names",
+            &[
+                (1234, "x", &["/dev/video2"]),
+                (1235, "x", &["/dev/video2"]),
+                (1236, "x", &["/dev/video2"]),
+                (1237, "chrome", &["/dev/video2"]),
+            ],
+        ));
+        let root = &tree.0;
+        std::fs::write(root.join("1234").join("comm"), b"cam\x1b[31m<b>\x07\x9bx\n").unwrap();
+        std::fs::write(root.join("1235").join("comm"), b"\x1b\x07\n").unwrap();
+        std::fs::remove_file(root.join("1236").join("comm")).unwrap();
+        let mut consumers = foreign_consumers(root, "/dev/video2", 9999).consumers;
+        consumers.sort();
+        assert_eq!(
+            consumers,
+            vec![
+                (1234, "cam [31m<b> \u{FFFD}x".to_string()),
+                (1235, "?".to_string()),
+                (1236, "?".to_string()),
+                (1237, "chrome".to_string()),
+            ]
+        );
     }
 
     #[test]

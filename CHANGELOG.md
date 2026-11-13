@@ -7,6 +7,19 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The name of a process holding a camera is shown the way irlume shows
+  text a camera reports: on one line, with control characters, line
+  separators and the zero-width and text-direction formatting characters
+  as spaces, and at most 64 characters. A name that is not valid UTF-8,
+  as when the kernel's 15-byte limit for a process name ends inside a
+  character, keeps its readable part, with U+FFFD in place of the rest.
+  This covers the camera-busy texts, the `irlume camera census` and
+  `irlume doctor` rows, the `detail` of `irlume doctor --json`, the
+  evidence of `irlume camera census --json`, the System Settings
+  module's Diagnostics and Cameras pages, and the journal line irlumed
+  writes when it leaves an IR emitter alone because another application
+  holds that camera. These are texts for people; no JSON shape changes.
+
 - The System Settings module shows the detail line of each check on the
   Diagnostics page, the evidence line of each device on the Cameras page
   and its other secondary lines as plain text, so characters such as `<`

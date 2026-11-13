@@ -864,7 +864,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::contracts::CameraInstanceId;
     use crate::inventory::fixtures::ObservationFixture;
-    use crate::{FailedAt, McCentric, Unreadable};
+    use crate::{FailedAt, Holders, McCentric, Unreadable};
 
     struct TestBackendGuard(Option<Arc<CameraSupervisor>>);
 
@@ -1385,7 +1385,7 @@ pub(crate) mod tests {
                 path: "/dev/fixture-busy".into(),
                 at: FailedAt::Open,
                 errno: Some(libc::EBUSY),
-                holder: Some("fixture-holder".into()),
+                holder: Some(Holders::Other("fixture-holder".into())),
             }],
             mc_centric: vec![(
                 "/dev/fixture-mc".into(),
@@ -1526,7 +1526,10 @@ pub(crate) mod tests {
         assert_eq!(scan.unreadable[0].path, "/dev/fixture-busy");
         assert_eq!(scan.unreadable[0].at, FailedAt::Open);
         assert_eq!(scan.unreadable[0].errno, Some(libc::EBUSY));
-        assert_eq!(scan.unreadable[0].holder.as_deref(), Some("fixture-holder"));
+        assert_eq!(
+            scan.unreadable[0].holder,
+            Some(Holders::Other("fixture-holder".into()))
+        );
         assert_eq!(
             scan.mc_centric,
             vec![(

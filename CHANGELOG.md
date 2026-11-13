@@ -7,6 +7,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The camera-busy text for a holder irlume cannot see (its scan cannot
+  read every process, #207) gives a step for each holder
+  `sudo fuser -v` may name: close another app and retry, wait for
+  irlumed to finish and retry, or, if irlumed keeps holding the camera,
+  report it (`irlume support-report` says where). It ended with "Close
+  that app and retry", with no step for irlumed. The text also shows in
+  the `detail` of the `capture-mode` and stream checks in
+  `irlume doctor --json` and on the System Settings module's Diagnostics
+  page; it is text for people, and no JSON shape changes (#1338).
+
 - `irlume-core` and `irlume-liveness` no longer depend on
   `irlume-vision`, which neither uses; Cargo 1.100 reports both as
   unused dependencies. The fuzz workspace reached `irlume-vision` only
@@ -115,6 +125,15 @@ All notable changes to irlume are documented here. This project adheres to
   report contract, #1329).
 
 ### Fixed
+
+- A busy camera's row in `irlume camera census`, `irlume doctor` and the
+  System Settings module's Cameras page no longer ends with "Close that
+  app and retry" when the holder is irlume itself, which the same row
+  calls a bug to report, and no longer says another app is using the
+  camera when the holder could not be seen; it gives the steps of the
+  camera-busy text instead. The node scan keeps the kind of holder it
+  found, not only its name. `irlume camera census --json` changes only
+  in that evidence string (#1338).
 
 - `scripts/install.sh` removes the directory it downloads a release
   package into after a download that is refused or breaks off, a

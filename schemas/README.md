@@ -58,8 +58,9 @@ Two things are not verbatim, and both are deliberate:
   are user text and the maintainer capturing a fixture should not have to
   publish their own. Counts, ordering and every other field are as captured;
 - the host facts are one machine's. The older `login-status.json` shows a Fedora KDE box
-  with plasmalogin wired, and `doctor.json` reports that machine's checks. Read
-  them as shapes, not as expected values.
+  with plasmalogin wired, and `doctor.json` reports the checks a Fedora 44
+  machine with the Copr package and an ordinary desktop user had on 0.16.0.
+  Read them as shapes, not as expected values.
 
 Regenerate before a release, and read the diff:
 

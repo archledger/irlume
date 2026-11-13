@@ -450,17 +450,67 @@ fn second_interloper_for_test(path: &Path) {
 #[cfg(test)]
 pub(super) static SECOND_INTERLOPER: TestHook = TestHook::new(Vec::new());
 
-/// Test-only: another writer's backup appears after [`backup`] found none,
-/// before its link publishes irlume's.
+/// Test-only: another writer's backup appears after [`backup`] or
+/// [`keep_copy`] found none, before its link publishes irlume's
+/// ([`BACKUP_APPEARS`]), or a second name of the file being copied does
+/// ([`BACKUP_LINK_APPEARS`]).
 #[cfg(test)]
-fn backup_appears_for_test(bak: &Path) {
+fn backup_appears_for_test(path: &Path, bak: &Path) {
     if fires(&BACKUP_APPEARS, bak) {
         let _ = std::fs::write(bak, "SOMEONE ELSE'S BACKUP\n");
+    }
+    if fires(&BACKUP_LINK_APPEARS, bak) {
+        let _ = std::fs::hard_link(path, bak);
     }
 }
 
 #[cfg(test)]
 pub(super) static BACKUP_APPEARS: TestHook = TestHook::new(Vec::new());
+
+#[cfg(test)]
+pub(super) static BACKUP_LINK_APPEARS: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: another file, with other bytes and another mode, is renamed
+/// over the path [`read_with_metadata`] has just opened, as a package
+/// replacing it at that moment would.
+#[cfg(test)]
+fn source_replaced_for_test(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if fires(&SOURCE_REPLACED, path) {
+        let replacement = path.with_extension("irlume-replacement");
+        let _ = std::fs::write(&replacement, "A NEWER FILE\n");
+        let _ = std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640));
+        let _ = std::fs::rename(&replacement, path);
+    }
+}
+
+#[cfg(test)]
+pub(super) static SOURCE_REPLACED: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: the mode of a scratch file once it holds its bytes and before
+/// any mode and owner it is published with are set, recorded by the path it
+/// is published at. That moment is inside one call to [`backup`],
+/// [`keep_copy`] or a write, so a test cannot look at it from outside.
+#[cfg(test)]
+fn scratch_filled_for_test(file: &std::fs::File, at: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    if fires(&SCRATCH_FILLED, at) {
+        let mode = file.metadata().map(|meta| meta.mode() & 0o7777).ok();
+        SCRATCH_FILLED_MODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((at.to_path_buf(), mode));
+    }
+}
+
+#[cfg(test)]
+pub(super) static SCRATCH_FILLED: TestHook = TestHook::new(Vec::new());
+
+/// Test-only: what [`scratch_filled_for_test`] saw, by the path the scratch
+/// file is published at.
+#[cfg(test)]
+pub(super) static SCRATCH_FILLED_MODES: std::sync::Mutex<Vec<(PathBuf, Option<u32>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Test-only: the mode of a target changes (same file, same bytes) after a
 /// write's last check and before its file is installed, as a `chmod` by an
@@ -632,10 +682,20 @@ const SCRATCH_KINDS: [&str; 2] = ["new", "bak"];
 
 /// Create the scratch file, never adopting one that is already there.
 pub(super) fn create_scratch(tmp: &Path) -> Result<std::fs::File, String> {
+    // 0o666 is the mode `OpenOptions` creates with when none is given, so the
+    // umask decides this file's mode at creation.
+    create_scratch_mode(tmp, 0o666)
+}
+
+/// [`create_scratch`] with `mode` set at creation: the umask can only clear
+/// bits of it, so the file is never more widely readable than `mode`.
+pub(super) fn create_scratch_mode(tmp: &Path, mode: u32) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let open = || {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(mode)
             .open(tmp)
     };
     match open() {
@@ -675,8 +735,9 @@ fn note_published(bak: &Path, identity: (u64, u64)) {
 /// there after its write as one it created, and a rollback then deletes it.
 /// That is right only for irlume's own: another writer can put a file there
 /// in between, and the publishing link then fails with `EEXIST`, which
-/// [`backup`] takes as a complete backup already in place. The identity has
-/// the limit [`inspect_target`] describes.
+/// [`backup`] takes, once [`backup_already_there`] accepts what is there, as
+/// a complete backup already in place. The identity has the limit
+/// [`inspect_target`] describes.
 pub(super) fn published_here(bak: &Path) -> bool {
     let Ok(Some(identity)) = inspect_target(bak) else {
         return false;
@@ -710,7 +771,17 @@ fn identity_of(file: &std::fs::File, tmp: &Path) -> Result<(u64, u64), String> {
 /// rename would be the same check-then-act split this file has been bitten by
 /// before, and would let a retry overwrite a good backup with the already-wired
 /// content.
-pub(super) fn backup(path: &Path) -> Result<(), String> {
+///
+/// The scratch copy is created readable and writable by its owner only (a
+/// umask can only narrow that), and once it holds the bytes it takes the
+/// owner and then the mode of the file it copies, both through the open
+/// scratch file and both read from the same open file as the bytes (see
+/// [`read_with_metadata`]). So the copy is never more widely readable than
+/// that file, and its mode and owner are those of the file its bytes came
+/// from. `irlume fingerprint` keeps its copies of sudo and polkit-1 through
+/// here too: they have the same names, and a disable moves a matching one
+/// back over the file.
+pub(crate) fn backup(path: &Path) -> Result<(), String> {
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
     // The backup is held to the same standard as the stack it came from, and it
     // was not. `exists()` follows a symlink, so a `.pre-irlume` pointing
@@ -723,33 +794,49 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
     if inspect_target(&bak)?.is_some() {
         return Ok(());
     }
-    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let meta =
-        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let (contents, meta) = read_with_metadata(path)?;
     let tmp = scratch_path(path, "bak");
     let written = (|| -> Result<(), String> {
         use std::io::Write as _;
-        let mut file = create_scratch(&tmp)?;
+        let mut file = create_scratch_mode(&tmp, 0o600)?;
         let ours = identity_of(&file, &tmp)?;
         file.write_all(&contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        apply_metadata(&tmp, &meta)?;
+        #[cfg(test)]
+        scratch_filled_for_test(&file, &bak);
+        apply_metadata(&file, &tmp, &meta)?;
         // Before the link, so the name never points at bytes that are not there.
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         #[cfg(test)]
-        backup_appears_for_test(&bak);
-        // Fails with EEXIST if another run got there first, which is the answer
-        // wanted: that backup is complete and this one is redundant.
+        backup_appears_for_test(path, &bak);
+        // Fails with EEXIST if another run got there first. What is there then
+        // is held to the same standard as at the check above.
         match std::fs::hard_link(&tmp, &bak) {
             Ok(()) => note_published(&bak, ours),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return backup_already_there(&bak)
+            }
             Err(e) => return Err(format!("backup {}: {e}", path.display())),
         }
         fsync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
     })();
     let _ = std::fs::remove_file(&tmp);
     written
+}
+
+/// After [`backup`]'s link found its name taken: a complete backup there,
+/// one [`inspect_target`] accepts, is kept and this copy is redundant.
+/// Anything else, or nothing there any more, refuses the backup, so a
+/// caller does not go on to edit a file whose backup was not kept.
+pub(super) fn backup_already_there(bak: &Path) -> Result<(), String> {
+    match inspect_target(bak)? {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "{} changed while the backup was made; run again",
+            bak.display()
+        )),
+    }
 }
 
 /// Keep the current file as `<path>.pre-irlume` before `login enable --force`
@@ -759,10 +846,11 @@ pub(super) fn backup(path: &Path) -> Result<(), String> {
 /// refuses to replace anything. Unlike `backup`, an existing copy is accepted
 /// only when it holds exactly these bytes: a different one (a stale backup
 /// from in-place wiring, left by a distribution upgrade) would otherwise be
-/// kept while the caller reported the new copy.
+/// kept while the caller reported the new copy. Its mode and owner are set as
+/// [`backup`] sets them.
 pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
     let bak = PathBuf::from(format!("{}{BACKUP}", path.display()));
-    let contents = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let (contents, meta) = read_with_metadata(path)?;
     let same_as_existing = || -> Result<(), String> {
         let existing = std::fs::read(&bak).map_err(|e| format!("read {}: {e}", bak.display()))?;
         if existing == contents {
@@ -777,18 +865,20 @@ pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
     if inspect_target(&bak)?.is_some() {
         return same_as_existing();
     }
-    let meta =
-        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     let tmp = scratch_path(path, "bak");
     let written = (|| -> Result<(), String> {
         use std::io::Write as _;
-        let mut file = create_scratch(&tmp)?;
+        let mut file = create_scratch_mode(&tmp, 0o600)?;
         let ours = identity_of(&file, &tmp)?;
         file.write_all(&contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        apply_metadata(&tmp, &meta)?;
+        #[cfg(test)]
+        scratch_filled_for_test(&file, &bak);
+        apply_metadata(&file, &tmp, &meta)?;
         file.sync_all()
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+        #[cfg(test)]
+        backup_appears_for_test(path, &bak);
         match std::fs::hard_link(&tmp, &bak) {
             Ok(()) => note_published(&bak, ours),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return same_as_existing(),
@@ -800,14 +890,46 @@ pub(super) fn keep_copy(path: &Path) -> Result<(), String> {
     written
 }
 
-/// Copy mode and ownership onto a path.
-pub(super) fn apply_metadata(path: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+/// Give a scratch copy, through its open file, the owner and then the mode
+/// (permission, set-ID and sticky bits) `meta` records. The owner goes
+/// first: setting the owner, even to the same one, clears a set-user-ID bit
+/// and can clear a set-group-ID bit, so the mode, set last with fchmod(2),
+/// which the umask does not affect, comes out as recorded. Until then the
+/// copy keeps the owner-only mode it was created with. `path` names the
+/// file in messages.
+pub(super) fn apply_metadata(
+    file: &std::fs::File,
+    path: &Path,
+    meta: &std::fs::Metadata,
+) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
-        .map_err(|e| format!("chown {}: {e}", path.display()))
+    std::os::unix::fs::fchown(file, Some(meta.uid()), Some(meta.gid()))
+        .map_err(|e| format!("chown {}: {e}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+/// The bytes of the file at `path` and its mode and owner, from one open
+/// file, so the two describe the same file. Through a symlink that is the
+/// file the link names, the one PAM reads. Only a regular file is read:
+/// anything else has no fixed bytes to keep.
+fn read_with_metadata(path: &Path) -> Result<(Vec<u8>, std::fs::Metadata), String> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    #[cfg(test)]
+    source_replaced_for_test(path);
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok((contents, meta))
 }
 
 /// A PAM write or removal that did not complete.
@@ -1285,13 +1407,22 @@ fn write_atomic_prepared(
     // still refers to this file and never to one swapped out of the path.
     let mut ours: Option<(u64, u64)> = None;
     let result = (|| -> Result<(), WriteError> {
-        let mut file = create_scratch(&tmp)?;
+        // When the mode and owner the file is to get are known here, it is
+        // created owner-only and takes them once it holds its bytes. A new
+        // file with no attributes to carry is created with the default mode,
+        // which the umask narrows.
+        let mut file = match attrs {
+            Some(_) => create_scratch_mode(&tmp, 0o600)?,
+            None => create_scratch(&tmp)?,
+        };
         let meta = file
             .metadata()
             .map_err(|e| format!("stat {}: {e}", tmp.display()))?;
         ours = Some((meta.dev(), meta.ino()));
         file.write_all(contents)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        #[cfg(test)]
+        scratch_filled_for_test(&file, path);
         if let Some((mode, uid, gid)) = attrs {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
                 .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;

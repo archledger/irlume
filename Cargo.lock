@@ -1225,7 +1225,6 @@ dependencies = [
  "der",
  "hmac",
  "irlume-common",
- "irlume-vision",
  "libc",
  "p256",
  "p384",
@@ -1291,7 +1290,6 @@ name = "irlume-liveness"
 version = "0.16.0"
 dependencies = [
  "irlume-common",
- "irlume-vision",
 ]
 
 [[package]]

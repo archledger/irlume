@@ -12,6 +12,7 @@
 ## onnxruntime is older than irlume's 1.24 floor and deadlocks at load.
 {
   lib,
+  stdenv,
   rustPlatform,
   pkg-config,
   desktop-file-utils,
@@ -156,11 +157,15 @@ rustPlatform.buildRustPackage {
       --replace-fail 'TryExec=irlume' "TryExec=$out/bin/irlume"
     desktop-file-validate "$out/share/applications/io.github.archledger.Irlume.desktop"
 
-    install -Dm0755 \
-      "$(find target -name libpam_irlume.so -print -quit)" \
+    # Both PAM modules come from cargo's artifact directory for this build,
+    # target/<host tuple>/$cargoBuildType, which the build hook selects with
+    # --target and --profile. Cargo documents that directory as public; the
+    # per-unit copies (deps/ up to Cargo 1.99, build/<package>/<hash>/out/
+    # from 1.100) are its internal build layout.
+    cargoProfileDir="target/${stdenv.hostPlatform.rust.cargoShortTarget}/$cargoBuildType"
+    install -Dm0755 "$cargoProfileDir/libpam_irlume.so" \
       "$out/lib/security/pam_irlume.so"
-    install -Dm0644 \
-      "$(find target -name libpam_irlume_view.so -print -quit)" \
+    install -Dm0644 "$cargoProfileDir/libpam_irlume_view.so" \
       "$out/lib/security/pam_irlume_view.so"
 
     # KDE wallet handoff helper. buildRustPackage puts every bin in $out/bin;

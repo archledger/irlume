@@ -4755,6 +4755,9 @@ impl App {
 
     /// Run an interactive sub-flow outside the alt-screen via the CLI handlers
     /// (no-echo passphrase / fprintd prompts), then wait for the user to return.
+    /// The arms that call a CLI handler returning `ExitCode` drop it
+    /// (`let _ =`): the handler prints its result, failures included, above
+    /// the Enter prompt below, and the TUI refreshes on return.
     fn run_suspended(&mut self, s: Suspend) {
         let none: [String; 0] = [];
         // The account this TUI is managing, for the steps that act on ONE user.
@@ -4817,10 +4820,10 @@ impl App {
                 }
             }
             Suspend::FingerprintAdd => {
-                crate::fingerprint::run(Some("add"), &for_user);
+                let _ = crate::fingerprint::run(Some("add"), &for_user);
             }
             Suspend::LoginStatus => {
-                crate::pamwire::run(Some("status"), &none);
+                let _ = crate::pamwire::run(Some("status"), &none);
             }
             // Wire the login stack for the current method+tier (adds the keyring
             // line where the DM needs it). Idempotent; runs as root.
@@ -4877,7 +4880,7 @@ impl App {
                 &["irlume", "logs", "debug", if on { "on" } else { "off" }],
             ),
             Suspend::FingerprintVerify => {
-                crate::fingerprint::run(Some("verify"), &for_user);
+                let _ = crate::fingerprint::run(Some("verify"), &for_user);
             }
             Suspend::FingerprintEnable => self.sudo_step(
                 "enable fingerprint login",
@@ -4892,7 +4895,7 @@ impl App {
                 &["irlume", "fingerprint", "reset", "--user", &target],
             ),
             Suspend::Update => {
-                crate::commands::update(&none);
+                let _ = crate::commands::update(&none);
             }
             Suspend::Diag => {
                 let _ = crate::commands::diag(&["--user".to_string(), self.user.clone()]);

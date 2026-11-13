@@ -6,8 +6,7 @@ your own machine and check against the docs. This page collects the
 reproductions, easiest first.
 
 If a claim in the README or docs has no reproduction path here and you think it
-should, open an [issue](https://github.com/archledger/irlume/issues) or a
-[discussion](https://github.com/archledger/irlume/discussions).
+should, open an [issue](https://github.com/archledger/irlume/issues).
 
 ---
 

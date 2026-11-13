@@ -152,7 +152,6 @@ their next write; hosts without a TPM retain root-only plaintext storage.
 
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:
-[Discussions](https://github.com/archledger/irlume/discussions) ·
 [Issues](https://github.com/archledger/irlume/issues) ·
 [Security](SECURITY.md)
 

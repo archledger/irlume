@@ -9,7 +9,11 @@
 //! rewrite could have produced tidier code and a differently-worded report, and
 //! the report is something people paste into bug threads. Recording next to the
 //! print also means the two outputs cannot drift, because there is only one pass
-//! over the machine's state.
+//! over the machine's state. Where a detail would name the account doctor
+//! checked or give a camera device path, the machine report reads "this
+//! account", the camera's USB identity or `<camera node>` instead
+//! (`Report::account`, `ir_node_access_rows` in main.rs and
+//! `Report::check_detail`); the human lines keep the name and the paths.
 
 use serde::Serialize;
 
@@ -82,13 +86,29 @@ impl Report {
         });
     }
 
-    /// Record one check with elaboration.
+    /// Record one check with elaboration. The detail is machine output
+    /// (`doctor --json`), which names no camera device path: each path in it
+    /// that starts with `/dev/video` or `/dev/v4l/` reads `<camera node>`
+    /// (`without_camera_nodes`). The human report prints its own lines
+    /// through `dout!` and keeps the paths.
     pub fn check_detail(&mut self, id: &'static str, state: State, detail: impl Into<String>) {
         self.checks.push(Check {
             id,
             state,
-            detail: Some(detail.into()),
+            detail: Some(without_camera_nodes(&detail.into())),
         });
+    }
+
+    /// How a detail names the account doctor reports on. The human report
+    /// gives its name, since `--user` can make it an account other than the
+    /// caller's; `doctor --json` reads "this account" for it
+    /// (docs/MACHINE-API.md, "Security and privacy").
+    pub fn account<'a>(&self, user: &'a str) -> &'a str {
+        if self.human() {
+            user
+        } else {
+            THIS_ACCOUNT
+        }
     }
 
     pub fn into_checks(self) -> Vec<Check> {
@@ -133,6 +153,65 @@ impl Summary {
     }
 }
 
+/// How `doctor --json` names the account it reports on ([`Report::account`]).
+const THIS_ACCOUNT: &str = "this account";
+
+/// What a camera device path reads as in a check's `detail`.
+const CAMERA_NODE: &str = "<camera node>";
+
+/// `text` with every camera device path replaced by [`CAMERA_NODE`]
+/// (docs/MACHINE-API.md, "Security and privacy"): a path that starts with
+/// `/dev/video` (a node such as `/dev/video2`, or a link such as
+/// `/dev/video-ir`) or `/dev/v4l/` (a by-id or by-path link), up to the next
+/// ASCII whitespace, backtick, quote, comma, semicolon, `)`, `]`, `}` or `>`,
+/// keeping a `:` or `.` that ends it. Only ASCII whitespace ends a path,
+/// since a by-id name keeps any non-ASCII text of the camera's USB strings.
+/// A configured path that only contains `/dev/video` or `/dev/v4l/`
+/// (`/home/u/dev/video-tools/...`) is rewritten too: the replacement errs
+/// toward hiding.
+fn without_camera_nodes(text: &str) -> String {
+    const NODE: &str = "/dev/video";
+    const LINK: &str = "/dev/v4l/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let (at, prefix) = match (rest.find(NODE), rest.find(LINK)) {
+            (None, None) => break,
+            (Some(node), None) => (node, NODE),
+            (None, Some(link)) => (link, LINK),
+            (Some(node), Some(link)) => {
+                if node < link {
+                    (node, NODE)
+                } else {
+                    (link, LINK)
+                }
+            }
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(CAMERA_NODE);
+        let path = &rest[at..];
+        // Every position below is an ASCII one: `find` returns the start of
+        // an ASCII needle or of an ASCII delimiter, and the trailing `:` or
+        // `.` is a single byte. Neither needle holds a delimiter, so each
+        // pass moves past a whole needle.
+        let mut end = path
+            .find(|c: char| {
+                c.is_ascii_whitespace()
+                    || matches!(c, '`' | '\'' | '"' | ',' | ';' | ')' | ']' | '}' | '>')
+            })
+            .unwrap_or(path.len());
+        // A by-path name holds `:` and `.` inside it
+        // (`pci-0000:00:14.0-usb-0:8:1.0-video-index0`), so only a trailing
+        // one is punctuation of the sentence.
+        while end > prefix.len() && matches!(path.as_bytes()[end - 1], b':' | b'.') {
+            end -= 1;
+        }
+        rest = &path[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Print a `doctor` line, unless this run is collecting for the machine report.
 #[macro_export]
 macro_rules! dout {
@@ -157,6 +236,77 @@ mod tests {
         let s = r.summary();
         assert_eq!(s.warnings, 1);
         assert_eq!(s.failures, 1);
+    }
+
+    #[test]
+    fn a_detail_names_no_camera_node() {
+        let mut r = Report::new(Mode::Collect);
+        r.check_detail(
+            "a",
+            State::Unknown,
+            "/dev/video2: camera busy; `sudo fuser -v /dev/video2` will name it; \
+             /dev/video10 and /dev/video* too",
+        );
+        r.check_detail("b", State::Pass, "5986:1141: closed to everyone but root");
+        r.check_detail(
+            "c",
+            State::Unknown,
+            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:8:1.0-video-index0: camera busy; \
+             `sudo fuser -v /dev/v4l/by-id/usb-Acme_Cam_0001-video-index0` names the holder.",
+        );
+        r.check_detail(
+            "d",
+            State::Unknown,
+            "could not resolve v2 capture status (/dev/v4l/by-id/usb-Acme-video-index0, \
+             /dev/video4); authentication stays sequential",
+        );
+        r.check_detail(
+            "e",
+            State::Unknown,
+            "/dev/v4l/by-id/usb-Acme\u{3000}Cam_SN42-video-index0: camera busy",
+        );
+        r.check_detail(
+            "f",
+            State::Unknown,
+            "/dev/video-ir: camera busy; the pin [/dev/video2] is kept",
+        );
+        let checks = r.into_checks();
+        assert_eq!(
+            checks[0].detail.as_deref(),
+            Some(
+                "<camera node>: camera busy; `sudo fuser -v <camera node>` will name it; \
+                 <camera node> and <camera node> too"
+            )
+        );
+        assert_eq!(
+            checks[1].detail.as_deref(),
+            Some("5986:1141: closed to everyone but root")
+        );
+        assert_eq!(
+            checks[2].detail.as_deref(),
+            Some("<camera node>: camera busy; `sudo fuser -v <camera node>` names the holder.")
+        );
+        assert_eq!(
+            checks[3].detail.as_deref(),
+            Some(
+                "could not resolve v2 capture status (<camera node>, <camera node>); \
+                 authentication stays sequential"
+            )
+        );
+        assert_eq!(
+            checks[4].detail.as_deref(),
+            Some("<camera node>: camera busy")
+        );
+        assert_eq!(
+            checks[5].detail.as_deref(),
+            Some("<camera node>: camera busy; the pin [<camera node>] is kept")
+        );
+    }
+
+    #[test]
+    fn only_the_human_report_names_the_account() {
+        assert_eq!(Report::new(Mode::Human).account("alice"), "alice");
+        assert_eq!(Report::new(Mode::Collect).account("alice"), "this account");
     }
 
     #[test]

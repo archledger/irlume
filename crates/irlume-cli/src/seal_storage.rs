@@ -786,14 +786,16 @@ pub(crate) fn arm_note(advice: &SealAdvice) -> String {
     format!("[keyring] {label}: {}", advice.text)
 }
 
-/// Doctor's `sealed-storage` check for `user`: `warn` with the guidance
-/// where no dm-crypt layer is found under the directory probed (or that
-/// cannot be established), `info` with it on encrypted storage (whose unlock
-/// method the storage does not show) and when nothing is sealed, and
-/// `unknown` when the daemon did not say what is sealed. `probe` runs only
-/// when something is sealed.
+/// Doctor's `sealed-storage` check for the account asked about: `warn` with
+/// the guidance where no dm-crypt layer is found under the directory probed
+/// (or that cannot be established), `info` with it on encrypted storage
+/// (whose unlock method the storage does not show) and when nothing is
+/// sealed, and `unknown` when the daemon did not say what is sealed. `account`
+/// is how the detail names that account: its name in the human report,
+/// "this account" in `doctor --json` (`doctor_report::Report::account`).
+/// `probe` runs only when something is sealed.
 pub(crate) fn check(
-    user: &str,
+    account: &str,
     sealed: &Sealed,
     probe: impl FnOnce() -> Vec<StorageDirectory>,
 ) -> (State, String) {
@@ -802,14 +804,14 @@ pub(crate) fn check(
             (
                 State::Info,
                 format!(
-                    "nothing is sealed for {user}: no keyring secret is armed and no template \
+                    "nothing is sealed for {account}: no keyring secret is armed and no template \
                      key is sealed"
                 ),
             )
         } else {
             (
                 State::Unknown,
-                format!("irlumed did not say what is sealed for {user}"),
+                format!("irlumed did not say what is sealed for {account}"),
             )
         };
     }
@@ -819,15 +821,15 @@ pub(crate) fn check(
         // Not reached: something is sealed, so there is guidance.
         None => (
             State::Unknown,
-            format!("irlumed did not say what is sealed for {user}"),
+            format!("irlumed did not say what is sealed for {account}"),
         ),
     }
 }
 
 /// [`check`] against the directories irlumed keeps what is sealed in
 /// ([`sealed_storage`]) and this system's storage.
-pub(crate) fn state_dir_check(user: &str, sealed: &Sealed) -> (State, String) {
-    check(user, sealed, || sealed_storage(sealed))
+pub(crate) fn state_dir_check(account: &str, sealed: &Sealed) -> (State, String) {
+    check(account, sealed, || sealed_storage(sealed))
 }
 
 #[cfg(test)]

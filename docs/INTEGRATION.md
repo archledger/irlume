@@ -194,13 +194,17 @@ at `/run/irlume.sock` is not.
 
 ## Reporting a problem
 
-Include the output of `irlume doctor --json` and `irlume version --json`. Neither
-contains camera frames, embeddings, templates, passwords or TPM secrets. The
-`detail` texts of `doctor --json` are English elaboration. Depending on what a
-check finds, one can name the account checked (other accounts too when doctor
-runs as root) or a `/dev/video*` node. Read the output before you attach it to a
-public issue; you may replace the names. A security problem goes to the private
-route in [SECURITY.md](../SECURITY.md), never into a public issue.
+Include the output of `irlume doctor --json` and `irlume version --json`, run as
+your own user. Neither contains camera frames, embeddings, templates, passwords
+or TPM secrets. The `detail` texts of `doctor --json` are English elaboration.
+They name no account and no camera device path, with the exceptions
+[MACHINE-API.md](MACHINE-API.md#security-and-privacy) lists: run as root, three
+TPM checks name the accounts whose sealed envelopes they concern, and a path you
+configured, such as a library, a model, or a camera path outside `/dev/video*`
+and `/dev/v4l/`, is shown as you set it and can lie under your home directory.
+Read the output before you attach it to a public issue; you may replace the
+names. A security problem goes to the private route in
+[SECURITY.md](../SECURITY.md), never into a public issue.
 
 ## PAM credential-release retries
 

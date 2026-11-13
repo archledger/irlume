@@ -5585,9 +5585,14 @@ type NodeAccessFact = (
 /// nodes (`Some(Role::Ir)`) and its unreadable nodes (`None`), with their USB
 /// identities where sysfs answered; anything else never reaches a row. A
 /// device with several candidate nodes (its capture and metadata nodes share
-/// the rule) gets one row over their worst state. Pure so the wording is
-/// testable without a camera.
-fn ir_node_access_rows(entries: Vec<NodeAccessFact>) -> Vec<(crate::doctor_report::State, String)> {
+/// the rule) gets one row over their worst state. The rows follow `report`,
+/// as `Report::account` does: the human report names the device's nodes;
+/// `doctor --json` names the device by its USB identity alone. Pure so the
+/// wording is testable without a camera.
+fn ir_node_access_rows(
+    entries: Vec<NodeAccessFact>,
+    report: &crate::doctor_report::Report,
+) -> Vec<(crate::doctor_report::State, String)> {
     use crate::doctor_report::State;
     use irlume_camera::node_access::NodeAccess;
     let mut devices: std::collections::BTreeMap<(u16, u16), Vec<(String, NodeAccess)>> =
@@ -5619,18 +5624,25 @@ fn ir_node_access_rows(entries: Vec<NodeAccessFact>) -> Vec<(crate::doctor_repor
             })
             .expect("a device row has at least one node");
         let id_text = format!("{:04x}:{:04x}", id.0, id.1);
+        // The human report names the nodes; `doctor --json` names the camera
+        // by its USB identity (docs/MACHINE-API.md, "Security and privacy").
+        let device = if report.human() {
+            format!("{id_text} ({paths})")
+        } else {
+            id_text
+        };
         let (state, detail) = match worst {
             NodeAccess::Hardened => (
                 State::Pass,
                 format!(
-                    "{id_text} ({paths}): closed to everyone but root; the burst proof \
+                    "{device}: closed to everyone but root; the burst proof \
                      stands without the experimental opt-in"
                 ),
             ),
             NodeAccess::Shared(why) => (
                 State::Warn,
                 format!(
-                    "{id_text} ({paths}): {why}, so a non-root program can reach the \
+                    "{device}: {why}, so a non-root program can reach the \
                      emitter control within a burst; the burst proof stays inside the \
                      experimental split opt-in until the packaged udev rule applies (it \
                      closes the node at the camera's next plug or boot) or an \
@@ -5639,7 +5651,7 @@ fn ir_node_access_rows(entries: Vec<NodeAccessFact>) -> Vec<(crate::doctor_repor
             ),
             NodeAccess::Unreadable => (
                 State::Unknown,
-                format!("{id_text} ({paths}): the node's access state could not be read"),
+                format!("{device}: the node's access state could not be read"),
             ),
         };
         rows.push((state, detail));
@@ -5847,7 +5859,9 @@ fn report_keyring_os_upgrade(report: &mut crate::doctor_report::Report, user: &s
     });
     match upgrade_notice::token_armed(&answer) {
         Some(true) => {
-            let advice = notice.advice(user);
+            // By name in the human report, as "this account" in the machine
+            // detail (`Report::account`).
+            let advice = notice.advice(report.account(user));
             dout!(
                 report,
                 "[doctor] \u{26a0} {user} has a GNOME keyring token armed on {}.\n     {advice}",
@@ -6280,7 +6294,7 @@ fn doctor_run(
                 unreadable.path.clone(),
             ));
         }
-        let rows = ir_node_access_rows(entries);
+        let rows = ir_node_access_rows(entries, report);
         for (_, detail) in &rows {
             dout!(report, "[doctor] IR node access: {detail}");
         }
@@ -6635,7 +6649,9 @@ fn doctor_run(
         template_key: seal_storage::template_key_sealed(&recovery),
         pcrlock_seals: pcrlock.1.is_some(),
     };
-    let (state, detail) = seal_storage::state_dir_check(&user, &sealed);
+    // The human line below names the account, in its prefix and in the
+    // detail; the machine detail reads "this account" (`Report::account`).
+    let (state, detail) = seal_storage::state_dir_check(report.account(&user), &sealed);
     dout!(
         report,
         "[doctor] {}sealed storage ({user}): {detail}",
@@ -7157,15 +7173,19 @@ mod tests {
     /// unreadable entry and must still get its row (Codex #1109 round 1).
     #[test]
     fn ir_node_access_rows_cover_classified_and_unreadable_nodes() {
-        use crate::doctor_report::State;
+        use crate::doctor_report::{Mode, Report, State};
         use irlume_camera::node_access::NodeAccess;
         let t480 = Some((0x5986, 0x1141));
+        let human = Report::new(Mode::Human);
         // One device, both its nodes unreadable to the seat user: one row,
         // pass, naming both nodes.
-        let rows = ir_node_access_rows(vec![
-            (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
-            (None, t480, NodeAccess::Hardened, "/dev/video1".into()),
-        ]);
+        let rows = ir_node_access_rows(
+            vec![
+                (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
+                (None, t480, NodeAccess::Hardened, "/dev/video1".into()),
+            ],
+            &human,
+        );
         let [(state, detail)] = rows.as_slice() else {
             panic!("one device gets one row, got {rows:?}")
         };
@@ -7178,37 +7198,43 @@ mod tests {
         );
         // An RGB node of even an in-class device, a records-capable IR camera
         // (the ASUS) and a node whose USB identity was not read never row.
-        assert!(ir_node_access_rows(vec![
-            (
-                Some(irlume_camera::Role::Rgb),
-                t480,
-                NodeAccess::Hardened,
-                "/dev/video0".into()
-            ),
-            (
-                Some(irlume_camera::Role::Ir),
-                Some((0x3277, 0x0059)),
-                NodeAccess::Shared("the seat tag is set".into()),
-                "/dev/video2".into()
-            ),
-            (
-                Some(irlume_camera::Role::Ir),
-                None,
-                NodeAccess::Shared("the seat tag is set".into()),
-                "/dev/video3".into()
-            ),
-        ])
+        assert!(ir_node_access_rows(
+            vec![
+                (
+                    Some(irlume_camera::Role::Rgb),
+                    t480,
+                    NodeAccess::Hardened,
+                    "/dev/video0".into()
+                ),
+                (
+                    Some(irlume_camera::Role::Ir),
+                    Some((0x3277, 0x0059)),
+                    NodeAccess::Shared("the seat tag is set".into()),
+                    "/dev/video2".into()
+                ),
+                (
+                    Some(irlume_camera::Role::Ir),
+                    None,
+                    NodeAccess::Shared("the seat tag is set".into()),
+                    "/dev/video3".into()
+                ),
+            ],
+            &human,
+        )
         .is_empty());
         // One shared node of the pair makes the device warn with the remedy.
-        let rows = ir_node_access_rows(vec![
-            (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
-            (
-                None,
-                t480,
-                NodeAccess::Shared("owned by uid 1000".into()),
-                "/dev/video1".into(),
-            ),
-        ]);
+        let rows = ir_node_access_rows(
+            vec![
+                (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
+                (
+                    None,
+                    t480,
+                    NodeAccess::Shared("owned by uid 1000".into()),
+                    "/dev/video1".into(),
+                ),
+            ],
+            &human,
+        );
         assert_eq!(rows[0].0, State::Warn);
         assert!(
             rows[0].1.contains("owned by uid 1000")
@@ -7218,14 +7244,52 @@ mod tests {
             rows[0].1
         );
         // Unreadable outranks hardened but never shared.
-        let rows = ir_node_access_rows(vec![(
-            None,
-            t480,
-            NodeAccess::Unreadable,
-            "/dev/video0".into(),
-        )]);
+        let rows = ir_node_access_rows(
+            vec![(None, t480, NodeAccess::Unreadable, "/dev/video0".into())],
+            &human,
+        );
         assert_eq!(rows[0].0, State::Unknown);
         assert!(rows[0].1.contains("/dev/video0"), "{}", rows[0].1);
+    }
+
+    /// `doctor --json` names the camera by its USB identity, never its nodes
+    /// (docs/MACHINE-API.md, "Security and privacy"), in each state; the
+    /// human report names them for the same nodes.
+    #[test]
+    fn ir_node_access_rows_for_the_machine_report_name_the_camera_only() {
+        use crate::doctor_report::{Mode, Report, State};
+        use irlume_camera::node_access::NodeAccess;
+        let t480 = Some((0x5986, 0x1141));
+        let machine = Report::new(Mode::Collect);
+        let human = Report::new(Mode::Human);
+        for (access, state) in [
+            (NodeAccess::Hardened, State::Pass),
+            (NodeAccess::Shared("seat ACL".into()), State::Warn),
+            (NodeAccess::Unreadable, State::Unknown),
+        ] {
+            let entries: Vec<NodeAccessFact> = vec![
+                (None, t480, NodeAccess::Hardened, "/dev/video0".into()),
+                (None, t480, access, "/dev/video1".into()),
+            ];
+            let rows = ir_node_access_rows(entries.clone(), &machine);
+            let [(row_state, detail)] = rows.as_slice() else {
+                panic!("one device gets one row, got {rows:?}")
+            };
+            assert_eq!(*row_state, state, "{detail}");
+            assert!(
+                detail.starts_with("5986:1141: ") && !detail.contains("/dev/"),
+                "{detail}"
+            );
+            let rows = ir_node_access_rows(entries, &human);
+            let [(row_state, detail)] = rows.as_slice() else {
+                panic!("one device gets one row, got {rows:?}")
+            };
+            assert_eq!(*row_state, state, "{detail}");
+            assert!(
+                detail.starts_with("5986:1141 (/dev/video0, /dev/video1): "),
+                "{detail}"
+            );
+        }
     }
 
     /// #1069: a shared node outranks an unreadable one, which outranks a

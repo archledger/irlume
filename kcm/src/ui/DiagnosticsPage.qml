@@ -313,6 +313,7 @@ KCMUtils.ScrollViewKCM {
 
                     SecondaryLabel {
                         id: detailLabel
+                        objectName: "detail"
                         Layout.fillWidth: true
                         visible: row.shown.length > 0
                         text: row.shown

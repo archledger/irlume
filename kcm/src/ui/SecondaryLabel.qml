@@ -15,6 +15,11 @@ Controls.Label {
     // Inside a highlighted list row: the highlighted text colour.
     property bool selected: false
 
+    // Most of these lines carry text from irlume's reports (a check's
+    // detail, a device's evidence). Plain text shows it as written, as Qt
+    // advises for text that comes from outside the application.
+    textFormat: Text.PlainText
+
     color: selected ? Kirigami.Theme.highlightedTextColor
                     : Kirigami.ColorUtils.linearInterpolation(Kirigami.Theme.textColor,
                                                               Kirigami.Theme.backgroundColor, 0.25)

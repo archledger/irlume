@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The System Settings module shows the detail line of each check on the
+  Diagnostics page, the evidence line of each device on the Cameras page
+  and its other secondary lines as plain text, so characters such as `<`
+  and `&` in them appear as written.
+
 - The release-RPM fallback of `scripts/install.sh` takes `VERSION_ID`
   from `/etc/os-release` only when it is all digits, as a Fedora release
   number and the N of a release RPM's `.fcN` are. Any other value, such

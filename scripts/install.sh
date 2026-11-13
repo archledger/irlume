@@ -96,12 +96,17 @@ die_verify() {
   exit 1
 }
 
-# main()'s EXIT trap. Every exit that is not 0, by a die or by a command that
-# fails under set -e, ends here and says where to report a problem; an exit 0
-# adds nothing. The exit status is kept.
+# main()'s EXIT trap. Every exit that is not 0 (a die, a command that fails
+# under set -e, or a package command that fails, with its own status) ends
+# here and says where to report a problem; an exit 0 adds nothing. A release
+# package the release lane downloaded and did not install (its version did
+# not parse, or the package command failed) is removed first; download_dir
+# is empty while the package command runs and after the release lane has
+# removed the directory itself. The exit status is kept.
 on_exit() {
   rc=$?
   trap - EXIT
+  if [ -n "${download_dir:-}" ]; then rm -rf "$download_dir" || true; fi
   if [ "$rc" -ne 0 ]; then report_block || true; fi
   exit "$rc"
 }
@@ -159,14 +164,39 @@ fetch_sums() {
   fi
 }
 
+# fetch_verified's EXIT trap. An exit that is not 0 (a die, a die_verify, a
+# command that fails under set -e, or one of the signals fetch_verified
+# traps) removes the download directory with whatever was downloaded into
+# it; an exit 0 keeps it for the release lane, which removes it once it is
+# done with the package. The exit status is kept.
+fetch_cleanup() {
+  rc=$?
+  trap - EXIT
+  if [ "$rc" -ne 0 ] && [ -n "$tmp" ]; then rm -rf "$tmp" || true; fi
+  exit "$rc"
+}
+
 # Download the release asset whose SHA256SUMS line contains the fixed string $1,
 # verify its checksum, and echo the local path on stdout. Aborts on mismatch.
-fetch_verified() {
+# The body is a subshell, as is the $(...) each caller reads the path
+# through, so the traps below are its own: main()'s EXIT trap is neither run
+# nor replaced here.
+fetch_verified() (
   match="$1"
-  # No EXIT trap here: this function runs in a command-substitution subshell, so
-  # an EXIT trap would delete the download the moment the path is returned. The
-  # caller removes the parent dir after installing.
-  tmp="$(mktemp -d)"
+  # The traps are set before mktemp runs. Until it answers, tmp is empty, so
+  # the EXIT trap removes only a directory mktemp has named.
+  tmp=""
+  trap fetch_cleanup EXIT
+  # A hangup, interrupt or termination signal that reaches this subshell (a
+  # closed terminal or Ctrl-C sends one to the whole process group) ends it
+  # through that trap too, with the status a shell reports for a command the
+  # signal ended (128 plus its number).
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Checked here, not left to set -e, which bash ignores inside this
+  # function when the caller adds `|| die`, as the release-RPM path does.
+  tmp="$(mktemp -d)" || die "could not create a temporary directory for the download."
   fetch_sums "$tmp"
   # Anchored patterns: a future .sig/.sha256 sibling must never be selected
   # as "the package", and multiple matches are an error, not first-wins.
@@ -190,7 +220,7 @@ fetch_verified() {
   ( cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1 ) \
     || die_verify "CHECKSUM MISMATCH on ${name}; refusing to install."
   printf '%s/%s\n' "$tmp" "$name"
-}
+)
 
 # --- Channel-resilience helpers ---------------------------------------------
 # The release lane is the fallback for every distro lane. Guards make the
@@ -207,6 +237,23 @@ should_install_deb() {
   return 0
 }
 
+# Install the verified release package with the package command "$@", as
+# root, then remove its directory. download_dir is empty while the command
+# runs, as bash runs on_exit as soon as a hangup or termination signal
+# reaches the script, while the command may still be reading the package.
+# A command that fails ends the run with its own exit status; on_exit then
+# removes the package.
+install_verified() {
+  pkg_dir="$download_dir"
+  download_dir=""
+  pkg_rc=0
+  $SUDO "$@" || pkg_rc=$?
+  download_dir="$pkg_dir"
+  [ "$pkg_rc" -eq 0 ] || exit "$pkg_rc"
+  download_dir=""
+  rm -rf "$pkg_dir"
+}
+
 install_deb_release() {
   # The archive's lists must be present for the .deb's dependencies
   # (libtss2-tctildr0 and friends come from the Ubuntu repositories), so
@@ -215,16 +262,17 @@ install_deb_release() {
   # continues: the existing lists may already satisfy the dependencies.
   $SUDO apt-get update || warn "apt-get update failed; installing with the current package lists."
   deb="$(fetch_verified '_amd64.deb')"
+  download_dir="$(dirname "$deb")"
   cand="$(basename "$deb" | sed -n 's/^irlume_\(.*\)_amd64.deb$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release .deb filename: $(basename "$deb")"
   have="$(deb_version_installed)"
   if ! should_install_deb "$cand" "$have"; then
     say "release .deb ${cand} is not newer than the installed ${have}; already current."
+    download_dir=""
     rm -rf "$(dirname "$deb")"
     return 0
   fi
-  $SUDO apt-get install -y "$deb"
-  rm -rf "$(dirname "$deb")"
+  install_verified apt-get install -y "$deb"
 }
 
 install_rpm_release() {
@@ -234,27 +282,28 @@ install_rpm_release() {
   [ -n "$ver" ] || die "Fedora family without VERSION_ID; cannot pick a release RPM. Install from Copr when it is back."
   rpm_path="$(fetch_verified ".fc${ver}.x86_64.rpm")" || \
     die "no verified release RPM for fc${ver}; the lines above say why. Install from Copr when it is back."
+  download_dir="$(dirname "${rpm_path}")"
   # `dnf install <local.rpm>` handles both fresh install and upgrade, and is
   # a no-op ("Nothing to do") when the installed version is not older: exactly
   # the upgrade-only semantics the fallback needs (`dnf upgrade` alone cannot
   # fresh-install).
-  $SUDO dnf -y install "${rpm_path}"
-  rm -rf "$(dirname "${rpm_path}")"
+  install_verified dnf -y install "${rpm_path}"
 }
 
 install_pkg_release() {
   need vercmp
   pkg="$(fetch_verified '_x86_64.pkg.tar.zst')"
+  download_dir="$(dirname "$pkg")"
   cand="$(basename "$pkg" | sed -n 's/^irlume-\(.*\)-x86_64.pkg.tar.zst$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release package filename: $(basename "$pkg")"
   have="$(pacman -Qi irlume 2>/dev/null | awk '/^Version/ {print $3}')"
   if [ -n "$have" ] && [ "$(vercmp "$cand" "$have")" -ne 1 ]; then
     say "release package ${cand} is not newer than the installed ${have}; already current."
+    download_dir=""
     rm -rf "$(dirname "$pkg")"
     return 0
   fi
-  $SUDO pacman -U --noconfirm "$pkg"
-  rm -rf "$(dirname "$pkg")"
+  install_verified pacman -U --noconfirm "$pkg"
 }
 
 # Newest verified release package for THIS distro, upgrade-only. Used by
@@ -309,7 +358,10 @@ ppa_serves() {
 }
 
 main() {
-  # First, so every later exit runs it. A $(...) subshell does not.
+  # The directory on_exit removes: empty, whatever the environment holds,
+  # until the release lane has downloaded and verified a package.
+  download_dir=""
+  # Next, so every later exit runs it. A $(...) subshell does not.
   trap on_exit EXIT
 
   # Privilege: run package commands as root, via sudo when not already root.

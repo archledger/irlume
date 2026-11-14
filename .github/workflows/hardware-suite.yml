@@ -333,11 +333,14 @@ jobs:
 
   # Hardware-inclusive statement coverage with a nightly ratchet. The TPM-gated
   # tests run on real silicon and the camera/PAM matrices are included, so this
-  # is the only measurement that can reach the OpenSSF Best Practices silver
+  # is the measurement that can reach the OpenSSF Best Practices silver
   # criterion (test_statement_coverage80, 80% statement coverage). The floor
-  # below catches coverage declines within 24 hours of a merge; it is the only
-  # coverage gate in the project after the hosted "line-coverage ratchet" was
-  # removed (the job named that measured no coverage since 2026-08-07).
+  # below catches coverage declines within 24 hours of a merge. A hosted lane
+  # (.github/workflows/coverage.yml) now measures the software-only lanes on
+  # every pull request; this nightly remains the only coverage gate that
+  # includes real hardware. The earlier hosted "line-coverage ratchet" was
+  # removed on 2026-08-10 after it silently measured no coverage since
+  # 2026-08-07 (#409).
   # Runs after the smoke job so the two never contend for the camera.
   coverage:
     name: coverage (hardware-inclusive, nightly floor)

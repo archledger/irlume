@@ -587,11 +587,15 @@ jobs:
       - name: test
         run: ./scripts/run-tests-guarded.sh --min 2720 -- cargo test --workspace --locked
 
-  # Statement coverage is measured nightly on the hardware-suite job (real TPM
-  # + loopback cameras + PAM FFI), which is the only measurement that can reach
-  # the OpenSSF Best Practices silver criterion (test_statement_coverage80).
-  # The hosted coverage job was removed 2026-08-10: it measured no coverage
-  # since 2026-08-07 and its checks were a strict subset of the `units` job.
+  # Statement coverage is measured on every pull request by the hosted lane
+  # (.github/workflows/coverage.yml: the guarded test lanes above under
+  # cargo-llvm-cov, with a line-coverage floor) and nightly on the
+  # hardware-suite job (real TPM + loopback cameras + PAM FFI), which stays
+  # the hardware-inclusive measurement that can reach the OpenSSF Best
+  # Practices silver criterion (test_statement_coverage80). The hosted
+  # coverage job removed on 2026-08-10 had measured no coverage since
+  # 2026-08-07 and its checks were a strict subset of the `units` job; the
+  # new hosted lane replaces it with real instrumented runs.
   deny:
     name: cargo-deny (advisories · licenses · duplicate versions)
     runs-on: ubuntu-24.04
@@ -698,10 +702,11 @@ jobs:
           python3 scripts/test-nightly-ir-capture.py
           python3 scripts/ci/test-irlume-ci-capture.py
 
-      - name: nightly coverage setup and contracts (fixtures only, no install or hardware)
+      - name: coverage setup and contracts (fixtures only, no install or hardware)
         run: |
           python3 scripts/ci/test-setup-coverage-tools.py
           python3 scripts/ci/test-nightly-coverage-contract.py
+          python3 scripts/ci/test-hosted-coverage-contract.py
 
       # ci-alert.yml runs only on main, once a day, so a mistake in its verdicts
       # shows up as silence. Its step runs here against a fake gh and the real

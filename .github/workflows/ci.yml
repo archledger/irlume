@@ -724,6 +724,18 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
           python3 scripts/ci/test-auto-label.py
 
+      # The issue chooser (.github/ISSUE_TEMPLATE/config.yml) and the curated
+      # documents: a YAML mistake in the chooser changes what reporters see
+      # while everything else stays green, and a link to a repository feature
+      # that is turned off (GitHub Discussions, off since #1347) leads people
+      # to a page that accepts nothing. The step checks the repository's real
+      # files: fixtures only, no network.
+      - name: Issue chooser and curated links (fixtures only, no network)
+        run: |
+          set -euo pipefail
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
+          python3 scripts/ci/test-github-hygiene.py
+
       - name: systemd boot-order contract (no host service changes)
         run: python3 scripts/test-systemd-boot-order.py
 

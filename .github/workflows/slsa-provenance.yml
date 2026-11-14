@@ -120,9 +120,10 @@ jobs:
           # every release after v0.16.0 attests with this workflow.
           # A prerelease tag sorts after its final release in sort -V
           # (v0.16.0-rc1 > v0.16.0) but is a legacy release all the same,
-          # so the comparison uses the version core: everything from the
-          # first dash on is the prerelease or build part.
+          # and build metadata (+...) also sorts after the bare version:
+          # strip both, and compare the version core alone.
           tag_core="${RELEASE_TAG%%-*}"
+          tag_core="${tag_core%%+*}"
           if [ "$(printf '%s\n' "$tag_core" v0.16.0 | sort -V | head -1)" = "$tag_core" ]; then
             echo "::error::$RELEASE_TAG is at or below v0.16.0, whose releases carry the generator's bundle; refusing to clobber it"
             exit 1

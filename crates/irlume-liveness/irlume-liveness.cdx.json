@@ -2,9 +2,9 @@
   "bomFormat": "CycloneDX",
   "specVersion": "1.3",
   "version": 1,
-  "serialNumber": "urn:uuid:9c6ad8ff-51ca-4003-aef7-f34febe27af3",
+  "serialNumber": "urn:uuid:47cb2255-40c9-4155-a76b-8f0f00f3ae76",
   "metadata": {
-    "timestamp": "2026-11-13T21:24:47.695040122Z",
+    "timestamp": "2026-11-14T06:45:23.545769219Z",
     "tools": [
       {
         "vendor": "CycloneDX",

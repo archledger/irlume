@@ -43,7 +43,9 @@ Ubuntu archive at build time (a mutable source a base-image digest does
 not cover), and the Fedora and Arch toolchains come from their
 distributions. Cargo builds run `--locked` or `--frozen`,
 so they refuse to drift from the committed `Cargo.lock`, and cargo verifies
-each fetched registry crate against the checksums recorded there.
+each fetched registry crate against the checksums recorded there. The PPA
+lane's vendoring step runs `cargo vendor --locked` too, so the staged
+lockfile cannot be re-resolved before its `--frozen` build accepts it.
 
 The ONNX Runtime version and sha256 are written in several places (the PPA
 and `.deb` scripts, the Fedora spec, the Nix files); CI's packaging parity
@@ -127,7 +129,10 @@ machine and compare those digests.
    `python3 scripts/verify-release-assets.py <asset-dir>` (it needs
    GnuPG, `dpkg-deb`, `tar` with zstd support, the separate `zstd`
    executable for the Arch assets, and `rpm` when an RPM
-   asset is present) to check the signature and coverage. Check out the
+   asset is present) to check the signature and coverage. A historical
+   release may need the verifier's conditional options: `--require deb`
+   when it has no Arch asset, and `--allow-no-metadata` when it predates
+   the SBOM/VEX policy (the script's `--help` states the defaults). Check out the
    release tag you are comparing first: the next step builds the source
    tree that is currently checked out, so running it on another
    revision compares against a different artifact. Rebuild the

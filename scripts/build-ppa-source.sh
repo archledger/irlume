@@ -89,7 +89,7 @@ tar -xzf "$TFLITE_TGZ" -C "$TREE/tflite-prebuilt" --strip-components=1
 echo "==> vendoring crates"
 cd "$TREE"
 mkdir -p .cargo
-cargo vendor vendor > .cargo/config.toml
+cargo vendor --locked vendor > .cargo/config.toml
 
 if [ "${SKIP_BUILD_CHECK:-0}" != "1" ]; then
     echo "==> offline build check (catches missing vendor bits before upload)"

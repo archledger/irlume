@@ -12,7 +12,7 @@ All notable changes to irlume are documented here. This project adheres to
   base images), how the PPA orig tarball is packed deterministically from
   the release tag's commit date, what is not claimed (no bit-for-bit
   rebuild comparison exists for any shipped artifact), and how a third
-  party rebuilds each channel and what to compare.
+  party rebuilds each channel and what to compare (#1366).
 
 ### Changed
 

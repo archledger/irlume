@@ -21,7 +21,7 @@ digests below is [`RELEASING.md`](RELEASING.md).
 | Model weights | per-file sha256, `models-v1` release assets |
 | ONNX Runtime | 1.28.1 tarball sha256 (`scripts/fetch-ort.sh`) |
 | TensorFlow Lite runtime | v2.19.0 asset sha256 (`build-ppa-source.sh`) |
-| Container base images | digest-pinned `ubuntu:26.04`, `debian:12` |
+| Container base images | digest-pinned `ubuntu:26.04`, `debian:12` (the PPA container route still installs its `cargo`/`rustc` from the Ubuntu archive at build time, which a digest does not pin) |
 
 The model digests are recorded in `scripts/fetch-models.sh`,
 `models/SHA256SUMS` and `nix/package.nix`, and the two bundled runtimes'
@@ -33,8 +33,10 @@ takes it from rust-overlay, which `flake.lock` pins; the CI `check` job
 installs it with the `dtolnay/rust-toolchain` action pinned by commit SHA;
 the universal `.deb` container installs it with rustup. The PPA, Fedora and
 Arch lanes build with their distribution's toolchains, which this repository
-does not pin (the container routes pin the base image digest, which pins the
-toolchain the image ships). Cargo builds run `--locked` or `--frozen`,
+does not pin: the PPA container route installs `cargo`/`rustc` from the
+Ubuntu archive at build time (a mutable source a base-image digest does
+not cover), and the Fedora and Arch toolchains come from their
+distributions. Cargo builds run `--locked` or `--frozen`,
 so they refuse to drift from the committed `Cargo.lock`, and cargo verifies
 each fetched registry crate against the checksums recorded there.
 
@@ -73,14 +75,20 @@ environments), so each release uploads from one route only.
 ## Nix builds
 
 `nix build .#default` builds irlume in a sandbox with no network and no view
-of host state (with Nix's default sandboxing enabled): every input, from the
+of host state (with Nix's default sandboxing enabled): every build input,
+from the
 nixpkgs revision through the pinned toolchain to the vendored crates
 (`Cargo.lock` via `importCargoLock`, with
-recorded hashes for the fork crates), the model weights and ONNX Runtime,
+recorded hashes for the fork crates) and the model weights,
 enters the sandbox as a fixed, content-addressed store path. Host impurities
 such as the checkout location or locally installed libraries cannot reach the
 build. The package build takes its toolchain from the pinned nixpkgs and
 rust-overlay revisions; only `nix develop` additionally selects 1.88.0.
+ONNX Runtime is deliberately NOT a build input of the default package
+(`nix/package.nix` loads it at runtime, and the flake ships it as the
+separate `onnxruntime-bin` output): a full rebuild-and-run comparison
+builds `.#onnxruntime-bin` beside `.#default`, and the runtime's own
+sha256 pin is what the table above records.
 
 To compare two machines: run `nix build .#default --no-link --print-out-paths`
 on the same commit in both. The printed store path is derived from the
@@ -107,8 +115,13 @@ machine and compare those digests.
 
 1. **Release packages.** Download the release assets, `SHA256SUMS` and its
    detached `SHA256SUMS.asc`, then run
-   `python3 scripts/verify-release-assets.py <asset-dir>` (needs GnuPG) to
-   check the signature and coverage. Rebuild the universal `.deb` with
+   `python3 scripts/verify-release-assets.py <asset-dir>` (it needs
+   GnuPG, `dpkg-deb`, `tar` with zstd support, and `rpm` when an RPM
+   asset is present) to check the signature and coverage. Check out the
+   release tag you are comparing first: the next step builds the source
+   tree that is currently checked out, so running it on another
+   revision compares against a different artifact. Rebuild the
+   universal `.deb` with
    `packaging/debian/build-deb-container.sh` (digest-pinned `debian:12`,
    rustup 1.88.0) and compare its sha256 against the release's `SHA256SUMS`
    line. A mismatch is a data point, not proof of tampering: this lane is

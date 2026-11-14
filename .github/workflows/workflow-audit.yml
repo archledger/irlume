@@ -43,8 +43,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # Config lives at .github/zizmor.yml and is auto-discovered. It carves out
-      # exactly one exception: the SLSA generator must be tag-referenced.
+      # Config lives at .github/zizmor.yml and is auto-discovered. Every
+      # `uses:` reference is hash-pinned; no exceptions are configured.
       - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
         with:
           # Pinned rather than `latest`, so a new zizmor release cannot turn a

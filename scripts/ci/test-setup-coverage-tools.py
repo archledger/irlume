@@ -27,9 +27,17 @@ class SetupTests(unittest.TestCase):
                         RUNNER_TEMP=str(self.root), GITHUB_ENV=str(self.env_file),
                         CALLS=str(self.calls))
         for key in ['INSTALL_FAIL', 'COV_MAJOR', 'PROFDATA_MAJOR', 'BAD_VERSION',
-                    'MISSING_LLVM', 'RUST_BAD']:
+                    'MISSING_LLVM', 'RUST_BAD', 'FAKE_SYSROOT']:
             self.env.pop(key, None)
-        self.write('rustc', '#!/bin/bash\n[ "${RUST_BAD:-0}" = 0 ] || exit 3\necho "LLVM version: 22.1.2"\n')
+        # The stand-in rustc answers `--print sysroot` for the rustup mode and
+        # reports the host triple the sysroot layout is keyed on; the system
+        # mode reads only the LLVM line.
+        self.write('rustc', '#!/bin/bash\n'
+                  'if [ "$1" = --print ] && [ "$2" = sysroot ]; then '
+                  'echo "${FAKE_SYSROOT:?FAKE_SYSROOT is required}"; exit 0; fi\n'
+                  '[ "${RUST_BAD:-0}" = 0 ] || exit 3\n'
+                  'echo "host: x86_64-unknown-linux-gnu"\n'
+                  'echo "LLVM version: 22.1.2"\n')
         for tool, key in [('llvm-cov', 'COV_MAJOR'), ('llvm-profdata', 'PROFDATA_MAJOR')]:
             self.write(tool, f'#!/bin/bash\n[ "${{MISSING_LLVM:-0}}" = 0 ] || exit 4\necho "LLVM version ${{{key}:-22}}.1.2"\n')
         self.write('cargo', r'''#!/usr/bin/python3
@@ -49,9 +57,20 @@ p=Path(a[a.index('--root')+1])/'bin';p.mkdir()
         p.write_text(body)
         p.chmod(0o755)
 
-    def run_setup(self, **env):
-        return subprocess.run(['/bin/bash', str(SCRIPT)], env=dict(self.env, **env),
+    def run_setup(self, *args, **env):
+        return subprocess.run(['/bin/bash', str(SCRIPT), *args], env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=10)
+
+    def make_sysroot(self):
+        """A fake rustup toolchain layout holding the llvm-tools binaries."""
+        sysroot = self.root / 'toolchain'
+        bin_dir = sysroot / 'lib/rustlib/x86_64-unknown-linux-gnu/bin'
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for tool, key in [('llvm-cov', 'COV_MAJOR'), ('llvm-profdata', 'PROFDATA_MAJOR')]:
+            p = bin_dir / tool
+            p.write_text(f'#!/bin/bash\necho "LLVM version ${{{key}:-22}}.1.2"\n')
+            p.chmod(0o755)
+        return sysroot
 
     def test_fresh_runner_installs_pinned_tool_and_exports_exact_paths(self):
         p = self.run_setup()
@@ -90,6 +109,48 @@ p=Path(a[a.index('--root')+1])/'bin';p.mkdir()
 
     def test_wrong_installed_version_fails(self):
         self.assertNotEqual(self.run_setup(BAD_VERSION='0.1.0').returncode, 0)
+        self.assertEqual(self.env_file.read_text(), '')
+
+    def test_rustup_mode_exports_toolchain_llvm_tools(self):
+        sysroot = self.make_sysroot()
+        p = self.run_setup('rustup', FAKE_SYSROOT=str(sysroot))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        env = dict(x.split('=', 1) for x in self.env_file.read_text().splitlines())
+        tool_bin = sysroot / 'lib/rustlib/x86_64-unknown-linux-gnu/bin'
+        self.assertEqual(env['LLVM_COV'], str(tool_bin / 'llvm-cov'))
+        self.assertEqual(env['LLVM_PROFDATA'], str(tool_bin / 'llvm-profdata'))
+        self.assertTrue(Path(env['IRLUME_COVERAGE_BIN']).is_file())
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+    def test_rustup_mode_ignores_path_llvm_tools(self):
+        # The hosted runner image ships its own llvm-cov of an unrelated LLVM;
+        # rustup mode must not fall back to it when the component exists.
+        sysroot = self.make_sysroot()
+        self.run_setup('rustup', FAKE_SYSROOT=str(sysroot))
+        env = dict(x.split('=', 1) for x in self.env_file.read_text().splitlines())
+        self.assertNotEqual(env['LLVM_COV'], str(self.bin / 'llvm-cov'))
+
+    def test_rustup_mode_missing_component_fails_before_install(self):
+        empty = self.root / 'empty-toolchain'
+        empty.mkdir()
+        p = self.run_setup('rustup', FAKE_SYSROOT=str(empty))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('llvm-tools-preview', p.stderr)
+        self.assertFalse(self.calls.exists())
+        self.assertEqual(self.env_file.read_text(), '')
+
+    def test_rustup_mode_mismatched_llvm_refuses(self):
+        for key in ['COV_MAJOR', 'PROFDATA_MAJOR']:
+            with self.subTest(key=key):
+                p = self.run_setup('rustup', FAKE_SYSROOT=str(self.make_sysroot()),
+                                   **{key: '21'})
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn('LLVM', p.stderr)
+                self.assertFalse(self.calls.exists())
+                self.assertEqual(self.env_file.read_text(), '')
+
+    def test_unknown_mode_is_a_usage_error(self):
+        self.assertEqual(self.run_setup('cmake').returncode, 2)
         self.assertEqual(self.env_file.read_text(), '')
 
     def test_workflow_uses_pinned_program_after_setup(self):

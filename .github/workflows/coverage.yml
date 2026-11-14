@@ -1,0 +1,349 @@
+# Hosted statement coverage: the guarded test lanes of ci.yml's `check` job,
+# executed under cargo-llvm-cov instrumentation on a GitHub-hosted runner, with
+# a line-coverage floor at the end.
+#
+# Why this exists again: the previous hosted "coverage (line-coverage
+# ratchet)" job was removed on 2026-08-10 (#409) because it ran ZERO tests,
+# repeated only shell checks the `units` job already ran, and its
+# --fail-under-lines flag had been silently dropped in a refactor (#325); it
+# had measured no coverage since 2026-08-07. This lane is built so it cannot
+# degrade the same way: every instrumented run goes through
+# scripts/run-tests-guarded.sh with a --min or --require guard (a lane whose
+# filter stops matching tests fails instead of reporting green), the clean
+# step always precedes the first run, and losing the report step, a guard or
+# the floor fails scripts/ci/test-hosted-coverage-contract.py in the required
+# `units` job. The nightly hardware suite (hardware-suite.yml) stays the
+# hardware-inclusive gate: real TPM silicon and the real IR camera are beyond
+# a hosted runner; this lane covers swtpm, v4l2loopback cameras and the PAM
+# FFI matrix on every pull request, so a coverage drop is caught at the PR
+# instead of the next nightly.
+#
+# The floor is a placeholder (1) in this first version: it proves the
+# mechanism (the lane fails only if coverage measurement itself collapses).
+# Calibrate it from the first hosted run's summary before treating it as a
+# ratchet. A floor lowered without a measurement is how the old hosted
+# ratchet went 79 to 76 in four steps and was then dropped (#409).
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  # No base-branch filter: stacked PRs (a branch targeting another feature
+  # branch) previously ran ZERO checks elsewhere in this repository.
+  pull_request:
+
+# Least privilege for GITHUB_TOKEN: this workflow only reads the repo and
+# uploads artifacts; nothing here publishes or writes.
+permissions:
+  contents: read
+
+# A newer push cancels the in-flight run on PRs only. On main every push
+# keeps its run: two pushes in quick succession otherwise leave the first
+# commit with cancelled (never-completed) checks.
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Hosted-only on purpose: pull_request runs the PR's own merge branch, and
+# this lane must stay away from the maintainer's machines (the fork-PR rule
+# in hardware-checks.yml and hardware-suite.yml).
+jobs:
+  coverage:
+    name: coverage (hosted, line floor)
+    runs-on: ubuntu-24.04
+    # Instrumented builds of the whole workspace plus every guarded lane; the
+    # cold v4l2loopback module build alone can cost about 17 minutes (see the
+    # budget note on ci.yml's check job).
+    timeout-minutes: 90
+    steps:
+      # Actions are pinned to a commit SHA (the tag in the comment is what it
+      # was) so a moved tag cannot change what runs. Dependabot bumps these.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config for later steps to reach.
+          persist-credentials: false
+
+      - name: Prefer the Ubuntu archive for package downloads
+        # Same mirror-timeout reason as ci.yml's check job: the image's Azure
+        # mirror can keep sending data too slowly to trip its read timeout.
+        run: sudo python3 scripts/ci/prefer-ubuntu-archive.py
+
+      # Same dependency set as ci.yml's check job: build tools, the PAM FFI
+      # lane's pamtester and libpam-wrapper (IRLUME_REQUIRE_PAM_TOOLS below
+      # turns a missing tool into a failure), tpm2-tss for the swtpm lanes,
+      # bubblewrap and the Python tools for the isolated CLI tests the
+      # workspace lane execs.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev libpam0g-dev libpam-wrapper pamtester libtss2-dev libudev-dev libdbus-1-dev dbus-daemon strace bubblewrap apparmor python3-yaml pax-utils python3-pyelftools python3-jsonschema
+
+      # The ONNX weights (~614 MB) are fetched from the models-v1 release,
+      # not Git LFS; cache them exactly like ci.yml's check job, keyed on
+      # models/SHA256SUMS (changes exactly when the weights do) so a warm run
+      # skips the download (fetch-models.sh verifies the cached copies).
+      - name: Cache model weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: models
+          key: models-${{ hashFiles('models/SHA256SUMS') }}
+
+      - name: Fetch model weights (models-v1 release, sha256-verified)
+        run: bash scripts/fetch-models.sh
+
+      - name: Prepare and verify isolated CLI test namespaces
+        run: bash scripts/ci-bubblewrap.sh
+
+      # Same pinned rust-toolchain action and MSRV as ci.yml's check job. On
+      # a rustup-managed toolchain the profile readers must come from the
+      # toolchain's own llvm-tools-preview component (there is no system
+      # llvm-cov paired with it); setup-coverage-tools.sh rustup resolves,
+      # version-checks and exports them.
+      - name: Install Rust 1.88 (MSRV) with llvm-tools
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master snapshot (2026-09-12)
+        with:
+          # Pinned to a SHA, the action can't read the version from the tag, so
+          # name the toolchain explicitly (it is a required input then).
+          toolchain: "1.88.0"
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # PRs RESTORE from main's cache but never SAVE their own: per-PR
+          # entries were filling the repo's 10 GB cache quota, and LRU
+          # eviction would eventually knock out the model cache that guards
+          # the (scarcer) LFS bandwidth quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Fetch the ONNX runtime (ort loads it dynamically at runtime)
+        run: |
+          ver=1.28.1
+          bash scripts/fetch-ort.sh "$ver"
+          echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Set up pinned coverage tools (rustup toolchain)
+        run: bash scripts/ci/setup-coverage-tools.sh rustup
+
+      # `--no-report` runs keep earlier build artifacts, and the report reads
+      # every instrumented binary under the target directory. A binary left
+      # from an earlier run's tree counts each file changed since then twice
+      # (on 2026-09-28 that halved the nightly's measured coverage, #906).
+      # Remove the workspace's instrumented builds and profiles first;
+      # dependencies stay built.
+      - name: Remove earlier coverage builds and profiles
+        run: |
+          "$IRLUME_COVERAGE_BIN" llvm-cov clean --workspace
+
+      - name: Start swtpm (software TPM)
+        run: |
+          command -v swtpm >/dev/null || sudo apt-get install -y --no-install-recommends swtpm libtss2-tcti-swtpm0
+          mkdir -p /tmp/swtpm
+          swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
+            --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
+
+      - name: Start virtual cameras (v4l2loopback + ffmpeg feeders)
+        run: |
+          # Ubuntu's packaged v4l2loopback (0.12.x) predates this runner
+          # kernel's V4L2 API and fails to load; build upstream at a pinned
+          # commit instead. videodev may be in the core or extra modules
+          # package, depending on the running kernel's packaging.
+          # PAM test prerequisites are installed in the initial dependency step,
+          # independently of whether virtual camera nodes already exist.
+          # video8/9 are fed by ffmpeg; video10 is a spare the camera streaming
+          # tests feed themselves.
+          # The self-hosted runner provisions video8/9/10 persistently
+          # (v4l2loopback-dkms + modules-load.d + a udev rule granting group
+          # video); build-from-source only on a runner without them.
+          if [ ! -e /dev/video8 ]; then
+          kernel="$(uname -r)"
+          sudo apt-get install -y --no-install-recommends "linux-headers-$kernel" ffmpeg
+          # A rolling image can have loadable modules whose old package name
+          # is no longer in APT. Require the actual capability, not -extra.
+          # Azure 7.0 supplies videodev in linux-modules, without -extra.
+          if ! sudo modprobe videodev; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-$kernel"
+            if ! sudo modprobe videodev; then
+              sudo apt-get install -y --no-install-recommends "linux-modules-extra-$kernel"
+              sudo modprobe videodev
+            fi
+          fi
+          git clone https://github.com/v4l2loopback/v4l2loopback /tmp/v4l2loopback
+          git -C /tmp/v4l2loopback checkout 0f9ee86760b7f2bea174b7e3e7a1d38845da0ab4 # v0.15.4
+          make -C /tmp/v4l2loopback -j"$(nproc)"
+          sudo insmod /tmp/v4l2loopback/v4l2loopback.ko devices=3 video_nr=8,9,10 exclusive_caps=0
+          # Let udev finish applying its default (root:video 0660) perms BEFORE
+          # our chmod, otherwise a late udev event overrides it and a test opens
+          # the node with EACCES ("permission denied"), an intermittent flake.
+          sudo udevadm settle
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10
+          fi
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video8 >/tmp/feeder-rgb.log 2>&1 &
+          nohup ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video9 >/tmp/feeder-ir.log 2>&1 &
+          # Readiness gate, derived from the v4l2loopback source and measured
+          # on real hardware rather than assumed:
+          #
+          #  * /sys/.../videoN/state is the cheap, non-blocking truth:
+          #    "output" = no producer attached, "capture" = one is streaming.
+          #    Measured to flip 45ms after a feeder starts.
+          #  * A read only happens once state says capture, so the common
+          #    "not started yet" case never touches a blocking ioctl.
+          #  * timeout -k is mandatory, not decorative: an ffmpeg blocked in
+          #    DQBUF ignores SIGTERM (measured alive 8+ minutes under plain
+          #    `timeout`), because SIGTERM cannot reach a task in that ioctl.
+          #    Only the follow-up SIGKILL ends it.
+          #  * A read that times out AFTER state=capture means the producer
+          #    vanished mid-read: that is a hard failure, not something to
+          #    retry, so say so and stop.
+          #
+          # Do NOT "fix" a flaky feeder with the module's keep_format=1 or
+          # timeout=N options: both make a DEAD feeder look like a live one,
+          # which is the failure this gate exists to catch.
+          wait_for_frame() {
+            local dev limit sys deadline rc
+            dev="$1"; limit="${2:-30}"
+            sys="/sys/devices/virtual/video4linux/${dev##*/}"
+            deadline=$(( SECONDS + limit ))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if [ "$(cat "$sys/state" 2>/dev/null)" = capture ]; then
+                timeout -k 1 5 ffmpeg -nostdin -loglevel error \
+                  -f v4l2 -i "$dev" -frames:v 1 -f null - >/dev/null 2>&1
+                rc=$?
+                [ "$rc" = 0 ] && return 0
+                if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+                  echo "::error::$dev: read blocked in DQBUF, producer vanished mid-read"
+                  return 1
+                fi
+              fi
+              sleep 0.2
+            done
+            echo "::error::$dev: no frame in ${limit}s (state=$(cat "$sys/state" 2>/dev/null)," \
+                 "format=$(cat "$sys/format" 2>/dev/null), buffers=$(cat "$sys/buffers" 2>/dev/null))"
+            return 1
+          }
+          sudo chmod 666 /dev/video8 /dev/video9 /dev/video10 2>/dev/null || true
+          for d in /dev/video8 /dev/video9; do
+            if ! wait_for_frame "$d" 30; then
+              # Every diagnostic channel this step used to discard.
+              echo "--- feeder processes:"; ps -o pid,stat,wchan:20,cmd -C ffmpeg || true
+              echo "--- rgb feeder log:"; tail -20 /tmp/feeder-rgb.log 2>/dev/null || true
+              echo "--- ir feeder log:";  tail -20 /tmp/feeder-ir.log 2>/dev/null || true
+              exit 1
+            fi
+          done
+          ls -l /dev/video8 /dev/video9 /dev/video10
+
+      # Each lane is guarded separately, in ci.yml's own order (workspace,
+      # TPM, cameras, PAM). Guarding the job as a whole would let the
+      # workspace run satisfy the minimum for every filtered lane after it,
+      # which is the failure being guarded against. The floors are ci.yml's
+      # own, so this lane drifts if the check job's floors drift, and only
+      # deliberately.
+      - name: Coverage (workspace)
+        run: |
+          ./scripts/run-tests-guarded.sh --min 2720 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report --workspace --locked
+
+      # ci.yml's swtpm lanes, under --no-report: the shared-socket lanes ride
+      # the swtpm started above through IRLUME_TCTI; the lockout and
+      # endorsement tests get a swtpm of their own on fixed ports.
+      - name: Coverage (TPM-gated, against swtpm)
+        env:
+          IRLUME_TCTI: swtpm:host=127.0.0.1,port=2321
+        run: |
+          ./scripts/run-tests-guarded.sh --require seal_unseal_roundtrip_real_tpm,arm_and_unseal_roundtrip,reseal_only_when_stale,tpm_key_and_recovery_lifecycle,tpm_tampered_seal_falls_back_then_recovery_heals,seal_unseal_pcrlock_roundtrip_provisioned_nv,a_token_envelope_heals_from_whichever_half_survives,rearming_reuses_the_existing_token_rather_than_minting,releasing_a_token_for_disarm_needs_the_right_password,resealing_preserves_the_secret_kind,a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap,a_password_change_also_moves_the_token_to_a_stronger_policy,the_template_key_moves_at_startup_not_during_authentication,evict_persistent_srk_removes_ours_then_reports_absent,evict_persistent_srk_never_touches_a_same_template_foreign_key,a_read_only_unseal_uses_a_transient_srk_while_another_key_holds_the_handle,tpm_loading_an_encrypted_store_whose_key_is_gone_seals_no_new_key,software_digests_match_a_trial_session,a_literal_seal_commits_to_the_policy_a_live_session_presents,a_pcr_snapshot_larger_than_one_read_is_complete,the_storage_key_check_reads_the_persisted_key,tpm_the_derived_key_check_tells_a_planted_key_from_irlumes,tpm_a_sealed_secret_records_its_uid_and_is_not_released_to_another_account,tpm_a_template_key_records_its_uid_and_a_new_enrollment_replaces_it,tpm_only_irlumes_da_exempt_key_is_evicted,tpm_the_da_exempt_key_is_persisted_found_and_refused,tpm_new_seals_go_under_the_da_exempt_key_once_it_is_persisted,tpm_envelopes_on_the_original_key_move_onto_the_da_exempt_key,tpm_an_envelope_whose_handle_another_stack_took_is_recovered_by_name,tpm_the_original_key_name_is_recorded_at_a_start_that_derives_nothing_else,tpm_uninstall_evicts_both_keys_through_the_transport_irlumed_names,tpm_an_envelope_back_under_a_retired_original_key_moves_at_its_move_point,tpm_the_original_key_is_retired_at_irlumeds_start_once_proved,tpm_a_key_todays_derivation_does_not_give_is_never_retired,tpm_a_failed_proof_is_recorded_and_tried_again_in_a_later_boot,tpm_a_retirement_attempt_left_recorded_before_its_proof_is_retried_in_a_later_boot,tpm_a_retirement_attempt_left_recorded_after_its_eviction_is_dropped_at_the_next_start,tpm_a_record_that_reads_as_none_is_rebuilt_and_the_retirement_waits_two_more_starts,tpm_moves_left_recorded_in_this_boot_keep_the_original_key_until_a_second_later_boot,tpm_a_keyring_token_under_the_original_key_counts_as_in_use_until_a_login_moves_it,tpm_a_weak_da_exempt_key_is_replaced_and_its_envelopes_move,tpm_a_policy_failure_is_diagnosed_without_a_second_context,tpm_a_refused_pcrlock_policy_names_the_moved_pcr_on_one_context \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale tpm_key_and_recovery_lifecycle tpm_tampered_seal_falls_back_then_recovery_heals seal_unseal_pcrlock_roundtrip_provisioned_nv a_token_envelope_heals_from_whichever_half_survives rearming_reuses_the_existing_token_rather_than_minting releasing_a_token_for_disarm_needs_the_right_password resealing_preserves_the_secret_kind a_tier_climb_keeps_both_the_kind_and_the_recovery_wrap a_password_change_also_moves_the_token_to_a_stronger_policy the_template_key_moves_at_startup_not_during_authentication evict_persistent_srk_removes_ours_then_reports_absent evict_persistent_srk_never_touches_a_same_template_foreign_key a_read_only_unseal_uses_a_transient_srk_while_another_key_holds_the_handle tpm_loading_an_encrypted_store_whose_key_is_gone_seals_no_new_key software_digests_match_a_trial_session a_literal_seal_commits_to_the_policy_a_live_session_presents a_pcr_snapshot_larger_than_one_read_is_complete the_storage_key_check_reads_the_persisted_key tpm_the_derived_key_check_tells_a_planted_key_from_irlumes tpm_a_sealed_secret_records_its_uid_and_is_not_released_to_another_account tpm_a_template_key_records_its_uid_and_a_new_enrollment_replaces_it tpm_only_irlumes_da_exempt_key_is_evicted tpm_the_da_exempt_key_is_persisted_found_and_refused tpm_new_seals_go_under_the_da_exempt_key_once_it_is_persisted tpm_envelopes_on_the_original_key_move_onto_the_da_exempt_key tpm_an_envelope_whose_handle_another_stack_took_is_recovered_by_name tpm_the_original_key_name_is_recorded_at_a_start_that_derives_nothing_else tpm_uninstall_evicts_both_keys_through_the_transport_irlumed_names tpm_an_envelope_back_under_a_retired_original_key_moves_at_its_move_point tpm_the_original_key_is_retired_at_irlumeds_start_once_proved tpm_a_key_todays_derivation_does_not_give_is_never_retired tpm_a_failed_proof_is_recorded_and_tried_again_in_a_later_boot tpm_a_retirement_attempt_left_recorded_before_its_proof_is_retried_in_a_later_boot tpm_a_retirement_attempt_left_recorded_after_its_eviction_is_dropped_at_the_next_start tpm_a_record_that_reads_as_none_is_rebuilt_and_the_retirement_waits_two_more_starts tpm_moves_left_recorded_in_this_boot_keep_the_original_key_until_a_second_later_boot tpm_a_keyring_token_under_the_original_key_counts_as_in_use_until_a_login_moves_it tpm_a_weak_da_exempt_key_is_replaced_and_its_envelopes_move tpm_a_policy_failure_is_diagnosed_without_a_second_context tpm_a_refused_pcrlock_policy_names_the_moved_pcr_on_one_context --test-threads=1
+          # ADR-0034 acceptance: this test puts the TPM in dictionary-attack
+          # lockout (1000 s on a fresh swtpm), so it gets a swtpm of its own.
+          # Its port is fixed below the kernel's ephemeral range (32768-60999):
+          # with-swtpm.sh's random default (20000-52767) can land on a port a
+          # live connection holds, and then swtpm cannot bind.
+          IRLUME_TEST_OWN_SWTPM=1 IRLUME_SWTPM_PORT=2331 ./scripts/with-swtpm.sh \
+            ./scripts/run-tests-guarded.sh \
+            --require tpm_the_da_exempt_key_keeps_irlume_working_through_a_lockout \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            tpm_the_da_exempt_key_keeps_irlume_working_through_a_lockout --test-threads=1
+          # ADR-0036 Phase 2: these provision EK certificates under platform
+          # authorization and set the endorsement authorization, so they get
+          # a swtpm of their own too, on the next fixed port pair.
+          IRLUME_TEST_OWN_SWTPM=1 IRLUME_SWTPM_PORT=2333 ./scripts/with-swtpm.sh \
+            ./scripts/run-tests-guarded.sh \
+            --require tpm_endorsement_rsa_and_ecc_certificates_pass_with_their_ca_and_are_unknown_without,tpm_endorsement_a_certificate_for_another_key_warns,tpm_endorsement_a_credential_bound_to_another_key_is_refused_by_the_tpm,tpm_endorsement_with_the_endorsement_authorization_set_nothing_is_tried,tpm_endorsement_a_low_range_template_and_nonce_derive_the_certified_ek,tpm_endorsement_a_refused_chain_warns_before_any_tpm_work_for_it,tpm_endorsement_a_persistent_ek_with_the_certified_key_is_used,tpm_endorsement_the_chain_indices_supply_the_issuing_ca,tpm_endorsement_two_certificates_beside_irlumes_persisted_storage_key_pass,tpm_endorsement_a_fifth_storage_certificate_is_named_and_keeps_pass_away,tpm_endorsement_other_indices_are_never_taken_for_a_certificate,tpm_endorsement_stops_before_the_next_command_once_the_deadline_passes \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            tpm_endorsement_ --test-threads=1
+          # And the endorsement check in lockout, alone like the one above.
+          IRLUME_TEST_OWN_SWTPM=1 IRLUME_SWTPM_PORT=2335 ./scripts/with-swtpm.sh \
+            ./scripts/run-tests-guarded.sh \
+            --require tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-core --lib --locked -- --ignored \
+            tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 1 \
+            --require tpm_split_whole_unseal_releases_once_at_each_skew_and_resets_only_after_delivery \
+            --require tpm_split_whole_unwritten_credential_keeps_the_charge_after_one_real_release \
+            --require tpm_split_whole_broken_credential_envelope_refuses_release_and_keeps_charge \
+            --require tpm_split_whole_centroid_identity_releases_once_at_each_skew \
+            --require tpm_split_whole_reset_preserves_template_key_and_next_authenticate_routes \
+            --require tpm_endorsement_report_keeps_its_deadline_and_notes_progress \
+            -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
+
+      - name: Coverage (camera + capture paths, against v4l2loopback)
+        env:
+          IRLUME_TEST_RGB_DEVICE: /dev/video8
+          IRLUME_TEST_IR_DEVICE: /dev/video9
+          IRLUME_TEST_SPARE_DEVICE: /dev/video10
+          # Loopback nodes have no physical bus; the exact-path escape lets
+          # verify_pinned and the lifecycle inventory accept just these three
+          # harness-owned nodes (see THREAT_MODEL.md).
+          IRLUME_TEST_ALLOW_VIRTUAL_CAMERA: /dev/video8,/dev/video9,/dev/video10
+        run: |
+          ./scripts/run-tests-guarded.sh --min 19 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-camera -p irlume-auth -p irlume-daemon --locked -- --ignored loopback_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 6 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-cli --test cli_capture --locked -- --ignored loopback_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 5 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-cli --test cli_bench --locked -- --ignored bench_ --test-threads=1
+          ./scripts/run-tests-guarded.sh --min 1 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-daemon --test shutdown --locked -- --ignored --test-threads=1
+
+      # IRLUME_REQUIRE_PAM_TOOLS makes a missing pamtester or pam_wrapper fail
+      # each pamwrap test instead of skipping it (a pamwrap test checks that
+      # ci.yml's and hardware-suite.yml's steps set it; this step's line is
+      # pinned by scripts/ci/test-hosted-coverage-contract.py).
+      - name: Coverage (PAM FFI, against pam_wrapper)
+        env:
+          IRLUME_REQUIRE_PAM_TOOLS: "1"
+        run: ./scripts/run-tests-guarded.sh --min 59 -- "$IRLUME_COVERAGE_BIN" llvm-cov --no-report -p irlume-pam --locked -- --include-ignored --test-threads=1
+
+      # Export before the report: the lcov trace and the summary are the
+      # calibration evidence for the floor, and they upload even when the
+      # floor fails.
+      - name: Export lcov trace
+        run: |
+          mkdir -p coverage
+          "$IRLUME_COVERAGE_BIN" llvm-cov export --format lcov --output-path coverage/lcov.info
+
+      # PLACEHOLDER FLOOR: 1 proves the mechanism on the first hosted run
+      # (the lane fails only if coverage measurement itself collapses). Take
+      # the measured line percentage from the first run's summary, subtract a
+      # reviewed margin, and set it here in the same change that starts
+      # treating this number as a ratchet. The floor lives in exactly one
+      # place; scripts/ci/test-hosted-coverage-contract.py fails if it leaves
+      # this step or drops below 1.
+      # Runs even when a lane or the lcov export failed: the summary is the
+      # calibration evidence for the floor, and a job that is already red
+      # loses nothing by keeping it.
+      - name: Report and enforce the line-coverage floor
+        if: always()
+        run: |
+          set -euo pipefail
+          "$IRLUME_COVERAGE_BIN" llvm-cov report --summary-only --fail-under-lines 1 | tee coverage/summary.txt
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hosted-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/
+          if-no-files-found: warn
+          # No personal-machine data here (unlike the hardware suite's
+          # forensics bundles), but modest retention still applies: the lcov
+          # trace is large and only useful for the current run's triage and
+          # floor calibration.
+          retention-days: 7

@@ -127,7 +127,7 @@ services or runner labels. Keep failed qualification evidence and report the
 remaining hardware gate accurately.
 
 
-## Nightly coverage prerequisites
+## Coverage prerequisites (nightly and hosted lane)
 
 Both nightly jobs first import `elftools` and `jsonschema`, then run
 `test-isolated-cli.py` before downloads, builds or hardware work. Provision
@@ -147,6 +147,22 @@ It builds with `cargo install --locked` into a unique directory under
 missing or older runner-user installation cannot change the tool used. The
 runner cleans the temporary directory after the job; setup requires no sudo and
 does not replace tools in the runner's Cargo home.
+
+The hosted coverage lane (`.github/workflows/coverage.yml`) calls the same
+script with one argument, `setup-coverage-tools.sh rustup`: its rustc comes
+from a rustup-managed MSRV toolchain carrying the `llvm-tools-preview`
+component, so the profile readers are resolved from the active toolchain's
+sysroot (`<sysroot>/lib/rustlib/<host>/bin`) instead of `command -v`, and
+their LLVM major versions are checked against `rustc -vV` exactly like the
+system path. A missing component or a version mismatch fails setup before
+any test capture; the default argumentless invocation keeps the system-Rust
+behavior the nightly depends on. `test-setup-coverage-tools.py` covers both
+modes with executable fixtures, including a fake rustup toolchain layout in
+a temporary directory, the exported paths, and every refusal case. The
+hosted lane's own shape (clean before the first `--no-report` run, a guard
+on every instrumented invocation, the report floor, the artifact upload) is
+pinned by `test-hosted-coverage-contract.py`, which runs in ci.yml's
+required `units` job beside the nightly contract.
 
 The next step runs `cargo llvm-cov clean --workspace`. The lanes pass
 `--no-report`, which keeps earlier build artifacts, and the report reads every

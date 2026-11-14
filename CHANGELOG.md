@@ -7,12 +7,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
-- A [build reproducibility guide](docs/REPRODUCIBILITY.md) documents what
-  every lane pins (compiler, crates, model weights, ONNX Runtime, container
-  base images), how the PPA orig tarball is packed deterministically from
+- The reproducibility claim has a recorded scope,
+  [ADR-0040](docs/adr/0040-reproducibility-scope.md): every input of a
+  lane the repository controls is pinned and digest-verified, the PPA
+  orig tarball is packed deterministically, and no lane is certified
+  bit-for-bit reproducible. A [build reproducibility
+  guide](docs/REPRODUCIBILITY.md) documents what every lane pins
+  (compiler, crates, model weights, ONNX Runtime, container base
+  images), how the PPA orig tarball is packed deterministically from
   the release tag's commit date, what is not claimed (no bit-for-bit
   rebuild comparison exists for any shipped artifact), and how a third
-  party rebuilds each channel and what to compare (#1366).
+  party rebuilds each channel and what to compare (ADR-0040 §1, #1366).
 
 ### Changed
 

@@ -3,9 +3,14 @@
 irlume's shipped binaries are not certified bit-for-bit reproducible: no
 independent rebuild of a released `.deb`, RPM or PPA binary has been compared
 against the published digests. What the project does maintain, and checks in
-CI, is that every build starts from pinned, digest-verified inputs, and that
-one artifact class, the PPA orig tarball, is packed deterministically. This
-page says exactly what that means and what a third party can compare.
+CI, is that the inputs of every lane the repository controls are pinned and
+digest-verified (crates, model weights, bundled runtimes, container base
+images), that cargo builds refuse to drift from the committed lockfile, and
+that one artifact class, the PPA orig tarball, is packed deterministically.
+The distribution lanes build with toolchains this repository does not pin;
+the table below states that per lane. This page says exactly what that means
+and what a third party can compare, and its scope is the decision of
+[ADR-0040](adr/0040-reproducibility-scope.md).
 
 To reproduce irlume's *behavior claims* (anti-spoof numbers, encryption at
 rest), see [`VERIFY.md`](VERIFY.md). The release process that publishes the
@@ -131,10 +136,14 @@ machine and compare those digests.
    it.
 2. **PPA orig tarball.** From a checkout of tag `vX.Y.Z`, run
    `scripts/build-ppa-source.sh` (needs `rsync`, `cargo`,
-   `dpkg-buildpackage` and `curl`), then run it again and compare
-   `sha256sum ~/ppa-build/irlume_X.Y.Z.orig.tar.gz` across the two runs.
-   Comparing the container route works the same way; compare like with like,
-   since the two routes are not byte-identical to each other.
+   `dpkg-buildpackage` and `curl`). It writes
+   `~/ppa-build/irlume_X.Y.Z.orig.tar.gz` and deletes and recreates that
+   path on every run, so before rerunning, either copy the first tarball
+   aside or record its `sha256sum`. Run the script again and compare the
+   fresh tarball's digest against the recorded one; equal digests are the
+   deterministic-packing check. Comparing the container route works the
+   same way; compare like with like, since the two routes are not
+   byte-identical to each other.
 3. **Nix.** `nix build .#default --no-link --print-out-paths` and
    `nix hash path <store-path>`, as above, on two machines.
 4. **Weights and runtime.** `bash scripts/fetch-models.sh` and

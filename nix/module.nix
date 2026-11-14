@@ -310,7 +310,7 @@ in
       # from pkgs (where `src` is a renamed alias) instead of the file default.
       default = pkgs.callPackage ./package.nix { src = lib.cleanSource ../.; };
       defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { src = lib.cleanSource ../.; }";
-      description = "The irlume package providing irlumed, the PAM module, and the model weights.";
+      description = "The irlume package providing irlumed, the PAM modules, and the model weights.";
     };
 
     kcm = {

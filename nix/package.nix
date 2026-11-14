@@ -1,8 +1,9 @@
 ## irlume, built from source with buildRustPackage.
 ##
-## Produces $out/bin/{irlume,irlumed}, the PAM module at
-## $out/lib/security/pam_irlume.so, and the shipped ONNX weights under
-## $out/share/irlume/models/. The NixOS module (nix/module.nix) points the
+## Produces $out/bin/{irlume,irlumed}, the PAM modules at
+## $out/lib/security/pam_irlume.so and pam_irlume_view.so, and the shipped
+## ONNX weights under $out/share/irlume/models/. The NixOS module
+## (nix/module.nix) points the
 ## daemon's IRLUME_*_MODEL env vars at that share dir, so nothing is copied
 ## into /etc on a Nix system.
 ##

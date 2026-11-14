@@ -182,7 +182,10 @@ void waitLayoutStable(QQuickItem *page)
         }
     }
     if (stable < 3) {
-        std::printf("pagetest: the item tree did not settle within the bound; checks read a moving tree\n");
+        // A page that never settles cannot be bounds-checked
+        // deterministically: the checks would read a moving tree and
+        // could pass by luck. That is a failure, not a warning.
+        check(false, QStringLiteral("the item tree settles before the checks read it"));
     }
 }
 

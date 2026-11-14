@@ -149,12 +149,42 @@ class HostedCoverageContractTests(unittest.TestCase):
                 steps.append([])
             if steps:
                 steps[-1].append(trimmed)
+        # !cancelled(), not always(): the summary and the trace are the
+        # calibration evidence after a lane failure, but a run cancelled by a
+        # newer push should not pay for a full report and an upload. The
+        # condition is asserted on the exact steps that need it, not
+        # somewhere in the file: a stray `if:` elsewhere must not cover a
+        # step losing its own.
         for name_fragment in ('Report and enforce the line-coverage floor',
                               'Upload coverage artifacts'):
             matching = [step for step in steps
                         if step and name_fragment in step[0]]
             self.assertEqual(len(matching), 1, name_fragment)
-            self.assertIn('if: always()', matching[0], name_fragment)
+            self.assertIn("if: ${{ !cancelled() }}", matching[0],
+                          name_fragment)
+
+    def test_floor_step_enforcement_reaches_the_job(self):
+        # The floor is only a floor if its failure fails the job. The report
+        # step pipes into tee, so without pipefail a nonzero
+        # --fail-under-lines exit is swallowed by the pipe's last command and
+        # the job goes green with the floor "enforced". The step must carry
+        # set -euo pipefail (or drop the pipe), and nothing may add
+        # continue-on-error to it: both are edits this contract exists to
+        # refuse (#325/#409's silent-degradation mode).
+        steps = []
+        for line in WORKFLOW.read_text().splitlines():
+            trimmed = line.strip()
+            if trimmed.startswith('- name:') or trimmed.startswith('- uses:'):
+                steps.append([])
+            if steps:
+                steps[-1].append(trimmed)
+        matching = [step for step in steps
+                    if step and 'Report and enforce' in step[0]]
+        self.assertEqual(len(matching), 1)
+        self.assertIn('set -euo pipefail', matching[0])
+        self.assertFalse(
+            any('continue-on-error' in line for line in matching[0]),
+            matching[0])
 
     def test_setup_uses_the_rustup_toolchain_path_and_pinned_binary(self):
         joined = workflow_text()

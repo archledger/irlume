@@ -338,9 +338,11 @@ jobs:
       # step or drops below the calibrated minimum.
       # Runs even when a lane or the lcov export failed: the summary is the
       # calibration evidence for the floor, and a job that is already red
-      # loses nothing by keeping it.
+      # loses nothing by keeping it. !cancelled() rather than always(): a run
+      # superseded by a newer push (cancel-in-progress) should not pay for a
+      # full report and upload whose numbers no one will read.
       - name: Report and enforce the line-coverage floor
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           # A lane failure skips the export step above, and with it this
@@ -351,7 +353,7 @@ jobs:
           "$IRLUME_COVERAGE_BIN" llvm-cov report --summary-only --fail-under-lines 87 | tee coverage/summary.txt
 
       - name: Upload coverage artifacts
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hosted-coverage-${{ github.run_id }}-${{ github.run_attempt }}

@@ -9,5 +9,5 @@ numpy>=2.0,<3
 requests>=2.32,<3
 pytest>=9.0.3
 scipy>=1.11
-pyarrow>=17
+pyarrow>=23.0.1
 huggingface_hub>=0.30

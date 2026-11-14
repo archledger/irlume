@@ -33,9 +33,11 @@ except ImportError:
 # Links to repository features that are turned off. A curated document
 # carrying one points people at a page GitHub shows as unavailable.
 # Discussions went off after #1347; add a URL when another feature goes,
-# drop one when a feature returns.
+# drop one when a feature returns. Both schemes are listed: an http link
+# reaches the same unavailable page.
 TURNED_OFF_URLS = (
     'https://github.com/archledger/irlume/discussions',
+    'http://github.com/archledger/irlume/discussions',
 )
 
 # Documents whose links direct people. Dated records under docs
@@ -164,8 +166,12 @@ class CuratedLinks(unittest.TestCase):
         self.assertEqual(turned_off_links(page), [TURNED_OFF_URLS[0]])
         subpage = 'https://github.com/archledger/irlume/discussions/new'
         self.assertEqual(turned_off_links(subpage), [TURNED_OFF_URLS[0]])
+        # The plain-http spelling reaches the same unavailable page.
+        insecure = 'see http://github.com/archledger/irlume/discussions'
+        self.assertEqual(turned_off_links(insecure), [TURNED_OFF_URLS[1]])
         self.assertEqual(turned_off_links('https://github.com/archledger/irlume/issues'), [])
         self.assertEqual(turned_off_links('https://github.com/another/project/discussions'), [])
+        self.assertEqual(turned_off_links('http://github.com/another/project/discussions'), [])
 
 
 if __name__ == '__main__':

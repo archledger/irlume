@@ -30,7 +30,6 @@ import copy
 import json
 import os
 import re
-import re
 import subprocess
 import sys
 
@@ -396,8 +395,15 @@ def check_engine(results, binary, validate, validate_note):
             results.ok(what)
 
 
-def check_fixtures(results, fixtures_dir, validate, validate_note):
+def check_fixtures(results, fixtures_dir, validate, validate_note, repo_fixtures_dir):
     print(f"\nfixtures: {fixtures_dir}")
+    # The account-name rule governs this repository's committed captures,
+    # which the capture script redacts before writing. A third party
+    # pointing --fixtures at their own captures from a 0.15.0 or 0.16.0
+    # engine sees valid contract-1 documents whose engine wrote a real
+    # account into the sealed-storage detail; only the repository's own
+    # fixture directory is held to the placeholder.
+    own_fixtures = os.path.realpath(fixtures_dir) == os.path.realpath(repo_fixtures_dir)
     try:
         names = sorted(n for n in os.listdir(fixtures_dir) if n.endswith(".json"))
     except OSError as error:
@@ -424,13 +430,19 @@ def check_fixtures(results, fixtures_dir, validate, validate_note):
         # A fixture must not publish a real account name: the sealed-storage
         # detail reads "nothing is sealed for {account}", and the capture
         # script redacts that name to the placeholder before writing.
-        for account in re.findall(r"nothing is sealed for (\S+?):", raw):
-            if account != "user":
+        if own_fixtures:
+            unredacted = [
+                account
+                for account in re.findall(r"nothing is sealed for (\S+?):", raw)
+                if account != "user"
+            ]
+            if unredacted:
                 results.fail(
                     what,
-                    f"sealed-storage detail names account {account!r};"
+                    f"sealed-storage detail names account {unredacted[0]!r};"
                     " the capture script redacts it to 'user'",
                 )
+                continue
         if validate is None:
             results.skip(what, validate_note)
             continue
@@ -551,7 +563,10 @@ def main():
     if not args.no_engine:
         check_engine(results, args.irlume, validate, validate_note)
     if not args.no_fixtures:
-        check_fixtures(results, args.fixtures, validate, validate_note)
+        check_fixtures(
+            results, args.fixtures, validate, validate_note,
+            os.path.join(root, "schemas", "fixtures", "v1"),
+        )
 
     print(
         f"\n{results.passed} passed, {len(results.failed)} failed, "

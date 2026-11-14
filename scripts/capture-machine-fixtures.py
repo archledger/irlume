@@ -25,6 +25,7 @@ Usage:  scripts/capture-machine-fixtures.py [--irlume PATH] [--out DIR]
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -73,6 +74,15 @@ def run(binary, argv, env_extra=None):
     return proc
 
 
+def redact_sealed_account(raw):
+    """Redact the account name the sealed-storage detail names, keeping every
+    other byte as written: the detail reads "nothing is sealed for {account}",
+    and the account is the capturing machine's, not engine text. The
+    conformance suite rejects a fixture whose detail names any account other
+    than the placeholder."""
+    return re.sub(r"(nothing is sealed for )\S+?:", r"\1user:", raw)
+
+
 def redact_profiles(raw):
     """Replace user-chosen display names with placeholders, keeping the counts,
     the ordering and every other field as captured."""
@@ -101,7 +111,7 @@ def main():
         ("version.json", ["version", "--json"], None, None),
         ("status-daemon-running.json", ["status", "--json"], None, None),
         ("status-daemon-unreachable.json", ["status", "--json"], unreachable, None),
-        ("doctor.json", ["doctor", "--json"], None, None),
+        ("doctor.json", ["doctor", "--json"], None, redact_sealed_account),
         ("login-status.json", ["login", "status", "--json"], None, None),
         ("profiles-list.json", ["profiles", "list", "--json"], None, redact_profiles),
         ("models-list.json", ["models", "list", "--json"], None, None),

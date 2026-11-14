@@ -43,17 +43,23 @@ candidate in a disposable Ubuntu 24.04 guest, after its upgrade/rollback trial.
 That guest has no camera, enrollment, graphical login manager or armed wallet.
 The version suffix preserves the earlier populated-profile, wired-login and
 hardware snapshots as additional compatibility cases. These files keep the
-capture script's bytes, including the reported engine version.
+capture script's bytes, including the reported engine version, apart from the
+sealed-storage account name listed below.
 
 The `*-0.16.0.json` fixtures were captured the same way from the installed
 0.16.0 candidate: as root, in a disposable Ubuntu 24.04 guest, after its
 upgrade/rollback trial. That guest has an emulated TPM and no camera,
 enrollment, graphical login manager or armed wallet, so `doctor-0.16.0.json`
 carries the checks 0.16.0 adds (TPM, boot chain, IR node access) with that
-guest's values.
+guest's values, and the same one deliberate substitution applies to their
+bytes.
 
-Two things are not verbatim, and both are deliberate:
+Three things are not verbatim, and all are deliberate:
 
+- the account name in the sealed-storage detail is replaced with `user`,
+  because it names the capturing machine's account, not engine text. The
+  capture script redacts it before a fixture is written, and the conformance
+  suite rejects a fixture that names any other account there;
 - profile and scan display names are replaced with placeholders, because they
   are user text and the maintainer capturing a fixture should not have to
   publish their own. Counts, ordering and every other field are as captured;

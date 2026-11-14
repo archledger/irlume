@@ -83,6 +83,10 @@ case "$("$ENGINE" --version 2>/dev/null)" in
     esac
     ;;
 esac
+# RUST_VER reaches the container when it is set here, so a dev run can move
+# the pinned toolchain without editing the script; the default lives there.
+RUST_ENV=()
+[ -n "${RUST_VER:-}" ] && RUST_ENV=(-e "RUST_VER=$RUST_VER")
 trap cleanup EXIT
 
 echo "==> exporting $TAG (git archive) + real models into a clean tree"
@@ -93,6 +97,7 @@ echo "==> building PPA source in $BASE (SERIES=$SERIES, SOURCE_DATE_EPOCH=$SDE)"
 "$ENGINE" run --rm \
   -v "$WORK:/work:z" -v "$BUILD:/out:z" -v "$HELPER:/helper:ro,z" \
   -e "SOURCE_DATE_EPOCH=$SDE" -e "SERIES=$SERIES" -e "PPAREV=${PPAREV:-0ppa1}" \
+  "${RUST_ENV[@]}" \
   "${OWNER_ENV[@]}" \
   "$BASE" bash /helper/container-build.sh
 

@@ -37,12 +37,17 @@ Every lane the repository builds itself pins cargo 1.88.0: `nix develop`
 takes it from rust-overlay, which `flake.lock` pins; the CI `check` job
 installs it with the `dtolnay/rust-toolchain` action pinned by commit SHA;
 the universal `.deb` container and the PPA container install it with
-rustup (`RUST_VER`). The Fedora and Arch lanes build with their
+rustup (`RUST_VER`), and the rustup installer itself is pinned
+(`RUSTUP_VER`) and verified against its published checksum before it
+runs, in both container lanes. The Fedora and Arch lanes build with their
 distribution's toolchains, which this repository does not pin. The PPA
 container route also installs the archive's `cargo`/`rustc` packages, but
 only to satisfy the source package's Build-Depends gate, which Launchpad's
 own builders re-check on their side; the build inside the container runs
-the pinned toolchain. Cargo builds run `--locked` or `--frozen`,
+the pinned toolchain. The offline build check that gate exists for checks
+the vendored set under the pinned toolchain; it does not preview
+Launchpad's own build, which runs under whatever the archive serves the
+builder that day. Cargo builds run `--locked` or `--frozen`,
 so they refuse to drift from the committed `Cargo.lock`, and cargo verifies
 each fetched registry crate against the checksums recorded there. The PPA
 lane's vendoring step runs `cargo vendor --locked` too, so the staged
@@ -94,12 +99,17 @@ two different machines, from clean checkouts of the same lane, with
 
 | Host | Engine | `irlume_0.16.0.orig.tar.gz` sha256 |
 |---|---|---|
-| archhost (Arch Linux, kernel 7.2.15, x86_64) | podman 6.2.0, rootless | `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d` |
-| minihost (CachyOS, kernel 7.2.9, x86_64) | Docker 29.9.1, rootful | `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d` |
+| archhost (Arch Linux, kernel 7.2.15, x86_64) | podman 6.2.0, rootless | `8d46e41188390f96ea1ed65fdef5078b870f9777a3eb3bb110d6c1d5f2d44e47` |
+| minihost (CachyOS, kernel 7.2.9, x86_64) | Docker 29.9.1, rootful | `8d46e41188390f96ea1ed65fdef5078b870f9777a3eb3bb110d6c1d5f2d44e47` |
 
-Both runs used the digest-pinned `ubuntu:26.04` image, rustup-pinned
-`RUST_VER=1.88.0` and `SOURCE_DATE_EPOCH=1794402902` (the tag's commit
-date), and produced a byte-identical orig tarball. The four Debian
+Both runs used the digest-pinned `ubuntu:26.04` image, the
+checksum-verified `rustup-init` (`RUSTUP_VER=1.29.3`) installing
+`RUST_VER=1.88.0`, and `SOURCE_DATE_EPOCH=1794402902` (the tag's commit
+date), and produced a byte-identical orig tarball. An earlier pair of
+runs the same day, before `--no-modify-path`, produced a different but
+also cross-host-identical digest (`694fdb07...`): that orig carried a
+stray `.profile` rustup had written into the source tree, which is why
+the corrected runs above are the published ones. The four Debian
 control files the route writes beside it (`debian.tar.xz`, `.dsc`,
 `.buildinfo`, `.changes`) differ between the two runs: they record the
 packaging run itself, and the determinism guarantee covers the orig

@@ -332,6 +332,11 @@ def build(clone: Path, work: Path, commit: str, when: int, upstream: str, pparev
         "-e", f"PPA_CHANGELOG={changelog}",
         "-e", f"PPA_NAME={PPA}",
     ]
+    # RUST_VER reaches the container when it is set in this process's
+    # environment, mirroring build-ppa-container.sh; the default lives in
+    # the container script.
+    if rust_ver := os.environ.get("RUST_VER"):
+        env += ["-e", f"RUST_VER={rust_ver}"]
     if own := owner():
         uid, gid = own.split(":")
         env += ["-e", f"HOST_UID={uid}", "-e", f"HOST_GID={gid}"]

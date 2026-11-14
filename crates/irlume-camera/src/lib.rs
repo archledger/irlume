@@ -19451,32 +19451,33 @@ mod tests {
         // held (#251). The crate lock is the only serialisation point that
         // covers process-global state, and the fd table is process-global.
         let _guard = crate::testenv::env_lock();
-        let dir = std::env::temp_dir().join(format!("irlume-cam-two-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("held");
+        // Declared before the handles below so the drops run in this order
+        // even on a failed expect: reap the child, close our own hold, then
+        // remove the directory. A child left behind keeps the file open by
+        // inheritance, and a failed run of the old shape left both for the
+        // whole `sleep 30`.
+        let scratch = Scratch::new("two-holders");
+        let path = scratch.0.join("held");
         std::fs::write(&path, b"x").unwrap();
 
         // We hold it...
         let _mine = std::fs::File::open(&path).unwrap();
         // ...and so does a child that outlives the scan.
-        let mut other = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::from(
-                std::fs::File::open(&path).unwrap(),
-            ))
-            .spawn()
-            .expect("spawn holder");
+        let _other = Holder(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::from(
+                    std::fs::File::open(&path).unwrap(),
+                ))
+                .spawn()
+                .expect("spawn holder"),
+        );
 
         let who = camera_holder(path.to_str().unwrap()).expect("holder found");
         let verdict = format!("holder was: {who}");
-        let _ = other.kill();
-        let _ = other.wait();
-        drop(_mine);
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
-            who.contains(&format!("pid {}", other.id())),
+            who.contains(&format!("pid {}", _other.0.id())),
             "the OTHER process is the actionable holder; {verdict}"
         );
     }

@@ -6334,46 +6334,71 @@ mod tests {
         root
     }
 
+    /// A fake /proc tree, removed when the test ends whether it passed or
+    /// not. `restore` names a subdirectory the test stripped the listing
+    /// permission from: it goes back to 0o755 first, because a directory
+    /// this uid cannot read cannot be traversed for removal either.
+    struct Tree {
+        root: std::path::PathBuf,
+        restore: Option<std::path::PathBuf>,
+    }
+
+    impl Tree {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                root,
+                restore: None,
+            }
+        }
+
+        /// A tree whose `denied` subdirectory the test chmod'ed; the drop
+        /// restores its listing permission before removing the tree.
+        fn denied(root: std::path::PathBuf, denied: std::path::PathBuf) -> Self {
+            Self {
+                root,
+                restore: Some(denied),
+            }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            if let Some(denied) = &self.restore {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn foreign_consumers_finds_other_processes_holding_the_node() {
-        let root = fake_proc(
+        let tree = Tree::new(fake_proc(
             "basic",
             &[
                 (1234, "chrome", &["/dev/video2", "/home/user/x.log"]),
                 (5678, "bash", &["/dev/pts/0"]),
                 (9999, "irlumed", &["/dev/video2"]), // self: must be excluded
             ],
-        );
-        let got = foreign_consumers(&root, "/dev/video2", 9999);
+        ));
+        let root = &tree.root;
+        let got = foreign_consumers(root, "/dev/video2", 9999);
         assert_eq!(got.consumers, vec![(1234, "chrome".to_string())]);
         // Everything in this tree was readable, so nothing was a blind spot.
         assert!(!got.permission_denied);
         // A different node has no foreign consumers here.
-        assert!(foreign_consumers(&root, "/dev/video0", 9999)
+        assert!(foreign_consumers(root, "/dev/video0", 9999)
             .consumers
             .is_empty());
         // The self pid holding it is not "foreign".
-        assert!(
-            foreign_consumers(&root, "/dev/video2", 1234)
-                .consumers
-                .len()
-                == 1
-        );
-        std::fs::remove_dir_all(&root).unwrap();
+        assert!(foreign_consumers(root, "/dev/video2", 1234).consumers.len() == 1);
     }
 
     /// Each consumer is named the way device text is shown (`holder_name`),
     /// and "?" stands for a name that is blank or cannot be read.
     #[test]
     fn foreign_consumers_name_each_consumer_as_device_text() {
-        // Removed when the test ends, whether it passed or not.
-        struct Tree(std::path::PathBuf);
-        impl Drop for Tree {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let tree = Tree(fake_proc(
+        let tree = Tree::new(fake_proc(
             "names",
             &[
                 (1234, "x", &["/dev/video2"]),
@@ -6382,7 +6407,7 @@ mod tests {
                 (1237, "chrome", &["/dev/video2"]),
             ],
         ));
-        let root = &tree.0;
+        let root = &tree.root;
         std::fs::write(root.join("1234").join("comm"), b"cam\x1b[31m<b>\x07\x9bx\n").unwrap();
         std::fs::write(root.join("1235").join("comm"), b"\x1b\x07\n").unwrap();
         std::fs::remove_file(root.join("1236").join("comm")).unwrap();
@@ -6410,13 +6435,13 @@ mod tests {
             foreign_consumers(std::path::Path::new("/nonexistent-proc"), "/dev/video2", 1);
         assert!(missing.consumers.is_empty());
         assert!(!missing.permission_denied);
-        let root = fake_proc("odd", &[(4321, "sleep", &[])]);
+        let tree = Tree::new(fake_proc("odd", &[(4321, "sleep", &[])]));
+        let root = &tree.root;
         std::fs::remove_dir_all(root.join("4321").join("fd")).unwrap();
-        let fdless = foreign_consumers(&root, "/dev/video2", 1);
+        let fdless = foreign_consumers(root, "/dev/video2", 1);
         assert!(fdless.consumers.is_empty());
         assert!(!fdless.permission_denied);
-        assert_eq!(foreign_consumers(&root, "", 1), ConsumerScan::default());
-        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(foreign_consumers(root, "", 1), ConsumerScan::default());
     }
 
     #[test]
@@ -6429,20 +6454,19 @@ mod tests {
         let root = fake_proc("denied-list", &[(4321, "chrome", &["/dev/video2"])]);
         let fd_dir = root.join("4321").join("fd");
         std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let tree = Tree::denied(root, fd_dir.clone());
         if std::fs::read_dir(&fd_dir).is_ok() {
             // A privileged run bypasses the denial this test constructs, so it
             // would prove nothing; say so instead of passing vacuously.
             eprintln!("not exercised: this uid bypasses directory permissions");
         } else {
-            let scan = foreign_consumers(&root, "/dev/video2", 1);
+            let scan = foreign_consumers(&tree.root, "/dev/video2", 1);
             assert!(scan.consumers.is_empty());
             assert!(
                 scan.permission_denied,
                 "a denied fd listing must mark the scan incomplete"
             );
         }
-        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -6454,9 +6478,10 @@ mod tests {
         let root = fake_proc("denied-link", &[(4321, "chrome", &["/dev/video2"])]);
         let fd_dir = root.join("4321").join("fd");
         std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let tree = Tree::denied(root, fd_dir.clone());
         match std::fs::read_link(fd_dir.join("0")) {
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                let scan = foreign_consumers(&root, "/dev/video2", 1);
+                let scan = foreign_consumers(&tree.root, "/dev/video2", 1);
                 assert!(scan.consumers.is_empty());
                 assert!(
                     scan.permission_denied,
@@ -6465,8 +6490,6 @@ mod tests {
             }
             _ => eprintln!("not exercised: this uid bypasses directory permissions"),
         }
-        std::fs::set_permissions(&fd_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -8452,11 +8475,72 @@ mod tests {
     /// succeed no matter what the code did.
     #[test]
     fn a_locked_camera_is_not_queried_or_written() {
+        use std::os::unix::process::CommandExt;
+
+        // The scratch directory, removed when the test ends, whether it
+        // passed or not. Declared before the holder so the holder is dead
+        // and its lock released first: the lock file must not be unlinked
+        // while a holder still has it open, or a later run could lock a
+        // fresh inode beside the still-live one.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        // The `flock` holder and every process it started, killed as one
+        // process group when the test ends, whether it passed or not.
+        // SIGKILL to the `flock` process alone leaves the `sh`/`sleep` it
+        // runs alive with the lock fd inherited, so the lock would stay
+        // taken (and the child alive) for the whole `sleep 30`.
+        struct GroupHolder {
+            child: std::process::Child,
+            lock_path: std::path::PathBuf,
+        }
+
+        // A lock we can take ourselves; a path we cannot open counts as
+        // free, since nothing can be holding a lock through it.
+        fn lock_is_free(path: &std::path::Path) -> bool {
+            use std::os::unix::io::AsRawFd;
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(file) => {
+                    // SAFETY: flock(2) only examines this live fd we own.
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+                }
+                Err(_) => true,
+            }
+        }
+
+        impl Drop for GroupHolder {
+            fn drop(&mut self) {
+                // Group kill: the shell and `sleep` inherit both the lock fd
+                // and the process group.
+                // SAFETY: kill(2) on this test's own child process group.
+                let _ = unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                // kill(2) is asynchronous, so confirm the lock fd is really
+                // gone before the Scratch guard unlinks the file.
+                for _ in 0..200 {
+                    if lock_is_free(&self.lock_path) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        }
+
         let _lock = crate::testenv::env_lock();
         let dir = std::env::temp_dir().join("irlume-recovery-locked");
         let _ = std::fs::remove_dir_all(&dir);
         let _env = EnvGuard::set("IRLUME_STATE_DIR", &dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
+        let _scratch = Scratch(dir.clone());
         let _lockdir = EnvGuard::set("IRLUME_EMITTER_LOCK_DIR", &dir);
 
         let id = identity(0x3277, 0x0059);
@@ -8477,14 +8561,21 @@ mod tests {
         // child had not started yet, our own attempt succeeded, and the test
         // failed with nothing wrong in the code.
         let ready = dir.join("holder-has-the-lock");
-        let mut holder = std::process::Command::new("flock")
+        let holder = std::process::Command::new("flock")
             .args([
                 path.to_str().expect("path"),
                 "-c",
                 &format!("touch {}; sleep 30", ready.display()),
             ])
+            // Its own process group, so the drop guard can kill the shell
+            // and `sleep` the holder spawns along with it.
+            .process_group(0)
             .spawn()
             .expect("spawn the lock holder");
+        let _holder = GroupHolder {
+            child: holder,
+            lock_path: path,
+        };
 
         let mut taken = false;
         for _ in 0..600 {
@@ -8502,10 +8593,6 @@ mod tests {
         } else {
             (RecoveryOutcome::NothingPending, Vec::new())
         };
-
-        let _ = holder.kill();
-        let _ = holder.wait();
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(taken, "the second process never took the lock");
         assert_eq!(

@@ -25,6 +25,7 @@ Usage:  scripts/capture-machine-fixtures.py [--irlume PATH] [--out DIR]
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -73,6 +74,15 @@ def run(binary, argv, env_extra=None):
     return proc
 
 
+def redact_sealed_account(raw):
+    """Redact the account name the sealed-storage detail names, keeping every
+    other byte as written: the detail reads "nothing is sealed for {account}",
+    and the account is the capturing machine's, not engine text. The
+    conformance suite rejects a fixture whose detail names any account other
+    than the placeholder."""
+    return re.sub(r"(nothing is sealed for )\S+?:", r"\1user:", raw)
+
+
 def redact_profiles(raw):
     """Replace user-chosen display names with placeholders, keeping the counts,
     the ordering and every other field as captured."""
@@ -87,13 +97,66 @@ def redact_profiles(raw):
     return json.dumps(document, separators=(",", ":"), sort_keys=False) + "\n"
 
 
+def redact_existing(paths):
+    """Apply the fixture redactions to already-committed fixture files.
+
+    A versioned fixture's original machine cannot be re-captured (its
+    installed engine and disposable guest are gone), so a redaction fix
+    reaches those files through this path instead of a hand edit: the
+    same function a capture runs, applied to the committed bytes. Every
+    file must stay what the engine writes: one line, valid JSON.
+    """
+    failures = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError as error:
+            failures.append(f"{path}: {error}")
+            continue
+        redacted = redact_sealed_account(raw)
+        if redacted == raw:
+            print(f"{path}: nothing to redact")
+            continue
+        try:
+            document = json.loads(redacted)
+        except json.JSONDecodeError as error:
+            failures.append(f"{path}: redaction broke the JSON ({error}); NOT written")
+            continue
+        if redacted.count("\n") != 1 or not redacted.endswith("\n"):
+            failures.append(f"{path}: redaction broke the one-line shape; NOT written")
+            continue
+        if document.get("ok") is not True:
+            failures.append(f"{path}: not an ok document; NOT written")
+            continue
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(redacted)
+        print(f"{path}: sealed-storage account redacted")
+    if failures:
+        print("\nnot redacted:", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(here)
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--irlume", default="irlume", help="the binary to capture from")
     parser.add_argument("--out", default=os.path.join(root, "schemas", "fixtures", "v1"))
+    parser.add_argument(
+        "--redact-existing",
+        metavar="PATH",
+        nargs="+",
+        help="apply the capture redactions (the sealed-storage account name) to "
+        "already-committed fixture files and exit; for versioned fixtures whose "
+        "original machine cannot be re-captured",
+    )
     args = parser.parse_args()
+    if args.redact_existing:
+        return redact_existing(args.redact_existing)
     os.makedirs(args.out, exist_ok=True)
 
     unreachable = {"IRLUME_SOCKET": UNREACHABLE_SOCKET}
@@ -101,7 +164,7 @@ def main():
         ("version.json", ["version", "--json"], None, None),
         ("status-daemon-running.json", ["status", "--json"], None, None),
         ("status-daemon-unreachable.json", ["status", "--json"], unreachable, None),
-        ("doctor.json", ["doctor", "--json"], None, None),
+        ("doctor.json", ["doctor", "--json"], None, redact_sealed_account),
         ("login-status.json", ["login", "status", "--json"], None, None),
         ("profiles-list.json", ["profiles", "list", "--json"], None, redact_profiles),
         ("models-list.json", ["models", "list", "--json"], None, None),

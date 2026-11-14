@@ -30,6 +30,7 @@ import copy
 import json
 import os
 import re
+import re
 import subprocess
 import sys
 
@@ -420,6 +421,16 @@ def check_fixtures(results, fixtures_dir, validate, validate_note):
         if raw.count("\n") != 1 or not raw.endswith("\n"):
             results.fail(what, "a fixture must be one line, as written by the engine")
             continue
+        # A fixture must not publish a real account name: the sealed-storage
+        # detail reads "nothing is sealed for {account}", and the capture
+        # script redacts that name to the placeholder before writing.
+        for account in re.findall(r"nothing is sealed for (\S+?):", raw):
+            if account != "user":
+                results.fail(
+                    what,
+                    f"sealed-storage detail names account {account!r};"
+                    " the capture script redacts it to 'user'",
+                )
         if validate is None:
             results.skip(what, validate_note)
             continue

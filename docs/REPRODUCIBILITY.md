@@ -16,7 +16,7 @@ digests below is [`RELEASING.md`](RELEASING.md).
 | Input | Pinned by |
 |---|---|
 | Rust crates | committed `Cargo.lock`; forks by `rev` in `Cargo.toml` |
-| Rust compiler | 1.88.0, the MSRV (repo-built lanes; see below) |
+| Rust compiler | 1.88.0, the MSRV (the lanes that build with it directly: the CI check job, `nix develop`, the universal `.deb` container; the nix package build uses the toolchain of the pinned nixpkgs/rust-overlay revisions) |
 | Nix package set | `flake.lock` (nixpkgs, rust-overlay, flake-utils) |
 | Model weights | per-file sha256, `models-v1` release assets |
 | ONNX Runtime | 1.28.1 tarball sha256 (`scripts/fetch-ort.sh`) |
@@ -116,14 +116,16 @@ machine and compare those digests.
 1. **Release packages.** Download the release assets, `SHA256SUMS` and its
    detached `SHA256SUMS.asc`, then run
    `python3 scripts/verify-release-assets.py <asset-dir>` (it needs
-   GnuPG, `dpkg-deb`, `tar` with zstd support, and `rpm` when an RPM
+   GnuPG, `dpkg-deb`, `tar` with zstd support, the separate `zstd`
+   executable for the Arch assets, and `rpm` when an RPM
    asset is present) to check the signature and coverage. Check out the
    release tag you are comparing first: the next step builds the source
    tree that is currently checked out, so running it on another
    revision compares against a different artifact. Rebuild the
    universal `.deb` with
    `packaging/debian/build-deb-container.sh` (digest-pinned `debian:12`,
-   rustup 1.88.0) and compare its sha256 against the release's `SHA256SUMS`
+   rustup 1.88.0; the host needs podman or Docker, rootless is fine)
+   and compare its sha256 against the release's `SHA256SUMS`
    line. A mismatch is a data point, not proof of tampering: this lane is
    not certified byte-reproducible, so report it rather than conclude from
    it.

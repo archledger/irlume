@@ -41,9 +41,14 @@ on:
 permissions:
   contents: read
 
-# A newer push cancels the in-flight run on PRs only. On main every push
-# keeps its run: two pushes in quick succession otherwise leave the first
-# commit with cancelled (never-completed) checks.
+# A newer push cancels the in-flight run on PRs only. On main no run is
+# cancelled, but GitHub keeps at most one PENDING run per group and a newer
+# pending run replaces an older one: when several pushes land while a main
+# run is active, only the newest waiting commit gets its own run and the
+# intermediate commits do not. That is accepted here (the newest main commit
+# carries the floor, and the nightly still gates within 24 hours); the
+# commit-by-commit record lives in the per-run artifacts of the runs that
+# did execute.
 concurrency:
   group: coverage-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

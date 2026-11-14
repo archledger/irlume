@@ -74,7 +74,13 @@ class HostedCoverageContractTests(unittest.TestCase):
         # lane step carrying `if: false` or `continue-on-error: true` would
         # still satisfy every guard assertion while running zero tests, which
         # is the 2026-08 failure mode wearing a different flag. Lane steps
-        # and the clean step must carry neither switch.
+        # and the clean step must carry neither switch, and the job itself
+        # must be unconditional: this workflow has one job whose top-level
+        # keys sit at four spaces of indentation, so a job-level `if:` is
+        # any exactly-four-space `if:` line, which the parser below the
+        # step markers would never collect.
+        joined = workflow_text()
+        self.assertNotRegex(joined, r'(?m)^    if:')
         steps = []
         for line in WORKFLOW.read_text().splitlines():
             trimmed = line.strip()

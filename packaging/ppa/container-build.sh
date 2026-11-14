@@ -29,6 +29,18 @@ apt-get install -y -qq --no-install-recommends \
   cmake extra-cmake-modules qt6-base-dev qt6-declarative-dev \
   libkf6kcmutils-dev libkf6coreaddons-dev libkf6kio-dev >/dev/null
 cd /work
+# Pinned Rust toolchain, the same version the universal .deb lane pins
+# (packaging/debian/build-deb-container.sh): the build in here must not
+# depend on what the Ubuntu archive served at build time. The archive's
+# cargo/rustc installed above only satisfy the source package's
+# Build-Depends gate, which Launchpad's own builders re-check on their
+# side. Installed under /opt, outside /work, so the staging rsync in
+# build-ppa-source.sh cannot pick it up.
+RUST_VER="${RUST_VER:-1.88.0}"   # >= ort's MSRV (edition 2024)
+export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_VER" --profile minimal >/dev/null
+export PATH="/opt/cargo/bin:$PATH"
+export CARGO_HOME=/work/.cargo-home
 # The build root is a mount of its own, outside the tree build-ppa-source.sh
 # stages from: that script copies the tree with rsync, and a tag's copy older
 # than its in-tree exclusion (v0.15.0 and before) would copy a build root

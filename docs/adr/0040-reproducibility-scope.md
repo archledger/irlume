@@ -67,3 +67,23 @@ this decision makes.
   uses `--locked` or `--frozen`.
 - The nightly PPA lane packs its orig with a fixed `SOURCE_DATE_EPOCH`
   taken from the built commit's date, the same recipe as a release.
+
+## Amendment 2026-11-14: the PPA container build is toolchain-pinned, and the orig comparison is published
+
+Section 2's first example no longer applies: the PPA container route no
+longer builds with the Ubuntu archive's Rust toolchain. It installs
+rustup-pinned `RUST_VER` (1.88.0, the same pin as the universal `.deb`
+lane) inside the digest-pinned base image; the archive's `cargo`/`rustc`
+packages remain installed only because the source package's
+Build-Depends names them, which Launchpad's own builders re-check on
+their side. The Fedora and Arch lanes keep their distribution
+toolchains, and PPA binaries are still built by Launchpad, as section 2
+records.
+
+Section 1.2's claim now has published evidence: for tag v0.16.0, two
+runs of the container route on two different machines (podman 6.2.0
+rootless and Docker 29.9.1 rootful, same image digest, same pinned
+toolchain, same `SOURCE_DATE_EPOCH`) produced a byte-identical orig
+tarball, sha256 `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d`.
+The guide carries the comparison table; released binaries remain outside
+it (#1366).

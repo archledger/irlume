@@ -15,11 +15,24 @@ All notable changes to irlume are documented here. This project adheres to
   guide](docs/REPRODUCIBILITY.md) documents what every lane pins
   (compiler, crates, model weights, ONNX Runtime, container base
   images), how the PPA orig tarball is packed deterministically from
-  the release tag's commit date, what is not claimed (no bit-for-bit
-  rebuild comparison exists for any shipped artifact), and how a third
-  party rebuilds each channel and what to compare (ADR-0040 §1, #1366).
+  the release tag's commit date, what is not claimed (no released
+  binary has a bit-for-bit rebuild comparison; the PPA orig tarball has
+  a published two-host one), and how a third party rebuilds each
+  channel and what to compare (ADR-0040 §1, #1366).
 
 ### Changed
+
+- The PPA container route builds with a pinned Rust toolchain: instead
+  of the Ubuntu archive's `cargo`/`rustc`, the container installs
+  rustup-pinned `RUST_VER` (1.88.0, the same pin the universal `.deb`
+  lane uses) beside its digest-pinned base image; the archive packages
+  stay installed only to satisfy the source package's Build-Depends,
+  which Launchpad's own builders re-check. For tag v0.16.0, two runs of
+  the route on two machines (podman rootless and Docker rootful, same
+  image and toolchain pins, `SOURCE_DATE_EPOCH` from the tag) produced
+  a byte-identical `irlume_0.16.0.orig.tar.gz`, and
+  docs/REPRODUCIBILITY.md publishes the comparison (ADR-0040 amendment
+  of 2026-11-14, #1366).
 
 - Release provenance comes from GitHub artifact attestations
   (`actions/attest-build-provenance`, SHA-pinned) instead of the

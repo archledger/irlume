@@ -21,12 +21,12 @@ digests below is [`RELEASING.md`](RELEASING.md).
 | Input | Pinned by |
 |---|---|
 | Rust crates | committed `Cargo.lock`; forks by `rev` in `Cargo.toml` |
-| Rust compiler | 1.88.0, the MSRV (the lanes that build with it directly: the CI check job, `nix develop`, the universal `.deb` container; the nix package build uses the toolchain of the pinned nixpkgs/rust-overlay revisions) |
+| Rust compiler | 1.88.0, the MSRV (the lanes that build with it directly: the CI check job, `nix develop`, the universal `.deb` container, the PPA container route; the nix package build uses the toolchain of the pinned nixpkgs/rust-overlay revisions) |
 | Nix package set | `flake.lock` (nixpkgs, rust-overlay, flake-utils) |
 | Model weights | per-file sha256, `models-v1` release assets |
 | ONNX Runtime | 1.28.1 tarball sha256 (`scripts/fetch-ort.sh`) |
 | TensorFlow Lite runtime | v2.19.0 asset sha256 (`build-ppa-source.sh`) |
-| Container base images | digest-pinned `ubuntu:26.04`, `debian:12` (the PPA container route still installs its `cargo`/`rustc` from the Ubuntu archive at build time, which a digest does not pin) |
+| Container base images | digest-pinned `ubuntu:26.04`, `debian:12`; the PPA container's build toolchain is rustup-pinned `RUST_VER` (1.88.0, the same pin the universal `.deb` lane uses; the archive's `cargo`/`rustc` stay installed only to satisfy the source package's Build-Depends gate) |
 
 The model digests are recorded in `scripts/fetch-models.sh`,
 `models/SHA256SUMS` and `nix/package.nix`, and the two bundled runtimes'
@@ -36,12 +36,13 @@ both).
 Every lane the repository builds itself pins cargo 1.88.0: `nix develop`
 takes it from rust-overlay, which `flake.lock` pins; the CI `check` job
 installs it with the `dtolnay/rust-toolchain` action pinned by commit SHA;
-the universal `.deb` container installs it with rustup. The PPA, Fedora and
-Arch lanes build with their distribution's toolchains, which this repository
-does not pin: the PPA container route installs `cargo`/`rustc` from the
-Ubuntu archive at build time (a mutable source a base-image digest does
-not cover), and the Fedora and Arch toolchains come from their
-distributions. Cargo builds run `--locked` or `--frozen`,
+the universal `.deb` container and the PPA container install it with
+rustup (`RUST_VER`). The Fedora and Arch lanes build with their
+distribution's toolchains, which this repository does not pin. The PPA
+container route also installs the archive's `cargo`/`rustc` packages, but
+only to satisfy the source package's Build-Depends gate, which Launchpad's
+own builders re-check on their side; the build inside the container runs
+the pinned toolchain. Cargo builds run `--locked` or `--frozen`,
 so they refuse to drift from the committed `Cargo.lock`, and cargo verifies
 each fetched registry crate against the checksums recorded there. The PPA
 lane's vendoring step runs `cargo vendor --locked` too, so the staged
@@ -81,7 +82,28 @@ recipe fixes timestamps, ownership and order but not permission bits:
 between runs changes the tarball. What it does not: the container route
 (`packaging/ppa/build-ppa-container.sh`) and a native Ubuntu run do not
 produce identical bytes (gzip and `cargo vendor` differ between
-environments), so each release uploads from one route only.
+environments), so each release uploads from one route only. Two runs of
+the container route itself, on different machines, do: see the published
+comparison below.
+
+### A published two-host comparison
+
+For tag `v0.16.0`, the container route ran twice on 2026-11-14, from
+two different machines, from clean checkouts of the same lane, with
+`umask 022`:
+
+| Host | Engine | `irlume_0.16.0.orig.tar.gz` sha256 |
+|---|---|---|
+| archhost (Arch Linux, kernel 7.2.15, x86_64) | podman 6.2.0, rootless | `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d` |
+| minihost (CachyOS, kernel 7.2.9, x86_64) | Docker 29.9.1, rootful | `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d` |
+
+Both runs used the digest-pinned `ubuntu:26.04` image, rustup-pinned
+`RUST_VER=1.88.0` and `SOURCE_DATE_EPOCH=1794402902` (the tag's commit
+date), and produced a byte-identical orig tarball. The four Debian
+control files the route writes beside it (`debian.tar.xz`, `.dsc`,
+`.buildinfo`, `.changes`) differ between the two runs: they record the
+packaging run itself, and the determinism guarantee covers the orig
+tarball only.
 
 ## Nix builds
 
@@ -109,9 +131,10 @@ machine and compare those digests.
 
 ## What is not claimed
 
-- No published bit-for-bit rebuild comparison exists for any shipped
-  artifact. Nothing on this page has been verified against the release
-  `SHA256SUMS` by an independent rebuild.
+- No released binary (`.deb`, RPM, PPA binary) has a published
+  bit-for-bit rebuild comparison; the published comparison above covers
+  the PPA orig tarball only. Nothing on this page has been verified
+  against the release `SHA256SUMS` by an independent rebuild.
 - A plain cargo build does not prove byte-identical binaries across
   machines: the linker, the build-id and paths the compiler embeds can
   differ with the build environment. The pinned toolchain and lockfile are

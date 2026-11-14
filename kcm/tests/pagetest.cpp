@@ -132,6 +132,60 @@ bool shown(const QQuickItem *item)
     return item != nullptr && item->isVisible() && item->opacity() > 0.0;
 }
 
+// The state the page checks read from the item tree: which text-bearing
+// items (and detail/evidence labels) exist, and whether each is shown,
+// sized and elided. A Refresh rebuilds list delegates over several event
+// loop turns, so a fixed wait cannot say the tree has stopped changing;
+// this signature can.
+QString treeSignature(QQuickItem *root)
+{
+    QStringList parts;
+    const auto items = allItems(root);
+    for (const QQuickItem *item : items) {
+        const QString name = item->objectName();
+        const QVariant text = item->property("text");
+        const bool bearing = text.isValid() && text.typeId() == QMetaType::QString && !text.toString().isEmpty();
+        if (!bearing && name != QLatin1String("detail") && name != QLatin1String("evidence")) {
+            continue;
+        }
+        const QVariant contentWidth = item->property("contentWidth");
+        const QPointF origin = item->mapToScene(QPointF(0, 0));
+        parts << QStringLiteral("%1|%2|%3|%4|%5x%6|%7@%8,%9")
+                     .arg(QString::fromLatin1(item->metaObject()->className()), name, text.toString().left(60),
+                          shown(item) ? QStringLiteral("y") : QStringLiteral("n"))
+                     .arg(item->width())
+                     .arg(item->height())
+                     .arg(contentWidth.isValid() ? QString::number(contentWidth.toReal(), 'f', 1) : QString())
+                     .arg(QString::number(origin.x(), 'f', 1), QString::number(origin.y(), 'f', 1));
+    }
+    parts.sort();
+    return parts.join(QLatin1Char(';'));
+}
+
+// Wait until treeSignature stops changing: bindings, layouts, polish and
+// lazy delegate creation have all landed. Bounded, like every other wait.
+// The signature carries each item's scene position as well, because the
+// bounds checks read painted coordinates: a page whose items only move
+// has not settled yet either.
+void waitLayoutStable(QQuickItem *page)
+{
+    QString signature = treeSignature(page);
+    int stable = 0;
+    for (int waited = 0; waited < 5000 && stable < 3; waited += 15) {
+        spin(15);
+        const QString next = treeSignature(page);
+        if (next == signature) {
+            ++stable;
+        } else {
+            signature = next;
+            stable = 0;
+        }
+    }
+    if (stable < 3) {
+        std::printf("pagetest: the item tree did not settle within the bound; checks read a moving tree\n");
+    }
+}
+
 // The words an item shows: `text`, or `value` for a StateValue row.
 QString textOf(const QQuickItem *item)
 {
@@ -627,6 +681,7 @@ bool runPage(const std::shared_ptr<QQmlEngine> &engine, const QString &modulePat
             }
         }
         waitSettled(module.get());
+        waitLayoutStable(current);
         ctx.visible(QStringLiteral("loading"), false);
         checkBounds(ctx);
         checkPlainText(ctx);

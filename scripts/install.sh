@@ -7,9 +7,11 @@
 #
 # What it does, by distro:
 #   Fedora / RHEL family : enable the signed Copr repo, then dnf install irlume.
-#                           Copr is the only Fedora lane: releases carry no RPM
-#                           assets (the release-RPM fallback code path exists
-#                           but finds none today).
+#                           Copr is the primary Fedora lane. The release-RPM
+#                           fallback exists for a Copr outage and installs
+#                           only when the release carries RPMs; the last
+#                           release RPMs were v0.11.1's fc43/fc44 x86_64
+#                           builds.
 #   Ubuntu                : where the PPA serves this release (the current LTS),
 #                           add it, then apt install irlume. Elsewhere, or when
 #                           it is down, the verified universal .deb.
@@ -284,7 +286,7 @@ install_deb_release() {
 
 install_rpm_release() {
   # Match a release RPM for this Fedora release, when one is published
-  # (none has been since v0.11.0, and only fc43/fc44 flavors existed).
+  # (the last release RPMs were v0.11.1's fc43/fc44 x86_64 builds).
   ver="${VERSION_ID:-}"
   [ -n "$ver" ] || die "Fedora family without VERSION_ID; cannot pick a release RPM. Install from Copr when it is back."
   # A Fedora release number is digits (VERSION_ID=44), as is the N of the

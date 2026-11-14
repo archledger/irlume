@@ -7,6 +7,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The tracked CycloneDX SBOM documents in `crates/` are refreshed to the
+  current tree by the new `scripts/refresh-tracked-sboms.py`: components now
+  carry version 0.16.0, `irlume-core` and `irlume-liveness` no longer list
+  the removed `irlume-vision` dependency, and no local checkout paths remain
+  in bom-refs or package URLs (#1346).
+
 - CI parses the issue chooser's `.github/ISSUE_TEMPLATE/config.yml` and
   checks the shape GitHub documents for it (a boolean
   `blank_issues_enabled`, and contact links that each carry a name, an

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""SBOM graph regressions and isolated generation with a real Git snapshot."""
+"""SBOM graph regressions, isolated release generation and tracked refresh."""
 import copy
 import importlib.util
 import io
@@ -21,6 +21,11 @@ from release_sbom import clean_purl, normalize_sbom, validate_sbom
 SPEC = importlib.util.spec_from_file_location("generator", Path(__file__).with_name("generate-release-sbom.py"))
 GENERATOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GENERATOR)
+
+REFRESH_SPEC = importlib.util.spec_from_file_location(
+    "refresh", Path(__file__).with_name("refresh-tracked-sboms.py"))
+REFRESH = importlib.util.module_from_spec(REFRESH_SPEC)
+REFRESH_SPEC.loader.exec_module(REFRESH)
 
 
 def cargo_bom(prefix="/private/build one"):
@@ -240,6 +245,118 @@ else:
                 with tarfile.open(fileobj=data) as archive:
                     with self.assertRaises(ValueError):
                         GENERATOR.extract_source(archive, self.root)
+
+
+class TrackedRefreshTests(unittest.TestCase):
+    """Regeneration of the committed crates/*/irlume-*.cdx.json documents."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="irlume-sbom-tracked-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "tracked checkout"
+        self.root.mkdir()
+        self.lock_text = "# fixture lock\nversion = 4\n"
+        self.root.joinpath("Cargo.toml").write_text('[workspace.package]\nversion = "99.0.0"\n')
+        self.root.joinpath("Cargo.lock").write_text(self.lock_text)
+        document = self.root / "crates" / "irlume-demo" / "irlume-demo.cdx.json"
+        document.parent.mkdir(parents=True)
+        document.write_text(json.dumps(self.document("irlume-demo", "98.0.0", "/stale/checkout")))
+        environment = dict(os.environ, HOME=str(self.temp.name), GIT_CONFIG_NOSYSTEM="1",
+                           GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
+                           GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
+        for command in (("git", "init"), ("git", "add", "."), ("git", "commit", "-m", "fixture")):
+            subprocess.run(command, cwd=self.root, env=environment, check=True, capture_output=True)
+        self.stale = document.read_bytes()
+        self.tools = self.root.parent / "tools"
+        self.tools.mkdir()
+        tool = self.tools / "cargo"
+        tool.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if args == ["cyclonedx", "--version"]:
+    print(os.environ.get("TOOL_VERSION", "cargo-cyclonedx 0.5.9"))
+elif args and args[0] == "metadata":
+    # cargo metadata --locked refuses a lockfile the manifest disagrees
+    # with before any generation runs; DRIFT simulates that refusal.
+    sys.exit(1 if os.environ.get("DRIFT") else 0)
+else:
+    assert args[0] == "cyclonedx" and "--format" in args and "--spec-version" in args
+    root = pathlib.Path(args[args.index("--manifest-path") + 1]).parent
+    if os.environ.get("DRIFT_AFTER"):
+        (root / "Cargo.lock").write_text("changed dependency graph")
+    members = ["irlume-demo"] + os.environ.get("EXTRA_MEMBER", "").split()
+    for crate in members:
+        name = "irlume-stranger" if os.environ.get("WRONG_NAME") and crate == "irlume-demo" else crate
+        ref = f"path+file://{root}/crates/{crate}#99.0.0"
+        doc = {"bomFormat": "CycloneDX", "specVersion": "1.3",
+               "metadata": {"component": {"name": name, "version": "99.0.0",
+                   "bom-ref": ref, "purl": f"pkg:cargo/{name}@99.0.0?download_url=file://."}},
+               "components": [], "dependencies": [{"ref": ref, "dependsOn": []}]}
+        path = root / "crates" / crate / (crate + ".cdx.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc))
+''')
+        tool.chmod(0o755)
+        self.environment = {"PATH": str(self.tools) + os.pathsep + os.environ["PATH"]}
+
+    def document(self, crate, version, checkout):
+        ref = f"path+file://{checkout}/crates/{crate}#{version}"
+        return {"bomFormat": "CycloneDX", "specVersion": "1.3",
+                "metadata": {"component": {"name": crate, "version": version,
+                    "bom-ref": ref,
+                    "purl": f"pkg:cargo/{crate}@{version}?download_url=file://."}},
+                "components": [], "dependencies": [{"ref": ref, "dependsOn": []}]}
+
+    def test_tracked_documents_are_renormalized_and_untracked_extras_removed(self):
+        with patch.dict(os.environ, {**self.environment, "EXTRA_MEMBER": "irlume-extra"}):
+            REFRESH.refresh(self.root)
+        path = self.root / "crates" / "irlume-demo" / "irlume-demo.cdx.json"
+        text = path.read_text()
+        self.assertTrue(text.endswith("\n"))
+        document = json.loads(text)
+        component = document["metadata"]["component"]
+        self.assertEqual((component["name"], component["version"]), ("irlume-demo", "99.0.0"))
+        self.assertEqual(component["bom-ref"], "pkg:cargo/irlume-demo@99.0.0")
+        self.assertEqual(component["purl"], "pkg:cargo/irlume-demo@99.0.0")
+        validate_sbom(document)
+        self.assertFalse((self.root / "crates" / "irlume-extra" / "irlume-extra.cdx.json").exists())
+        self.assertEqual(self.root.joinpath("Cargo.lock").read_text(), self.lock_text)
+        status = subprocess.check_output(["git", "status", "--porcelain"],
+                                         cwd=self.root, text=True)
+        self.assertEqual(status.splitlines(), [" M crates/irlume-demo/irlume-demo.cdx.json"])
+
+    def test_unpinned_tool_version_is_refused_without_touching_the_tree(self):
+        with patch.dict(os.environ, {**self.environment, "TOOL_VERSION": "cargo-cyclonedx 0.6.0"}):
+            with self.assertRaisesRegex(ValueError, "need cargo-cyclonedx 0.5.9"):
+                REFRESH.refresh(self.root)
+        path = self.root / "crates" / "irlume-demo" / "irlume-demo.cdx.json"
+        self.assertEqual(path.read_bytes(), self.stale)
+
+    def test_lockfile_drift_is_refused_before_anything_is_touched(self):
+        with patch.dict(os.environ, {**self.environment, "DRIFT": "1"}):
+            with self.assertRaises(subprocess.CalledProcessError):
+                REFRESH.refresh(self.root)
+        self.assertEqual(self.root.joinpath("Cargo.lock").read_text(), self.lock_text)
+        path = self.root / "crates" / "irlume-demo" / "irlume-demo.cdx.json"
+        self.assertEqual(path.read_bytes(), self.stale)
+
+    def test_a_lock_change_during_generation_is_refused(self):
+        with patch.dict(os.environ, {**self.environment, "DRIFT_AFTER": "1"}):
+            with self.assertRaisesRegex(ValueError, "changed Cargo.lock"):
+                REFRESH.refresh(self.root)
+        self.assertEqual(self.root.joinpath("Cargo.lock").read_text(), "changed dependency graph")
+
+    def test_foreign_component_identity_is_refused(self):
+        with patch.dict(os.environ, {**self.environment, "WRONG_NAME": "1"}):
+            with self.assertRaisesRegex(ValueError, "unexpected SBOM component identity"):
+                REFRESH.refresh(self.root)
+
+    def test_repository_without_tracked_documents_is_refused(self):
+        (self.root / "crates" / "irlume-demo" / "irlume-demo.cdx.json").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True, capture_output=True)
+        with patch.dict(os.environ, self.environment):
+            with self.assertRaisesRegex(ValueError, "no tracked SBOM documents"):
+                REFRESH.refresh(self.root)
 
 
 class ShippedArtifactCoverage(unittest.TestCase):

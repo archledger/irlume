@@ -313,19 +313,20 @@ jobs:
 
       # Export before the report: the lcov trace and the summary are the
       # calibration evidence for the floor, and they upload even when the
-      # floor fails.
+      # floor fails. cargo-llvm-cov 0.9.1 has no export subcommand; the
+      # lcov trace is a report-format flag there.
       - name: Export lcov trace
         run: |
           mkdir -p coverage
-          "$IRLUME_COVERAGE_BIN" llvm-cov export --format lcov --output-path coverage/lcov.info
+          "$IRLUME_COVERAGE_BIN" llvm-cov report --lcov --output-path coverage/lcov.info
 
-      # PLACEHOLDER FLOOR: 1 proves the mechanism on the first hosted run
-      # (the lane fails only if coverage measurement itself collapses). Take
-      # the measured line percentage from the first run's summary, subtract a
-      # reviewed margin, and set it here in the same change that starts
-      # treating this number as a ratchet. The floor lives in exactly one
-      # place; scripts/ci/test-hosted-coverage-contract.py fails if it leaves
-      # this step or drops below 1.
+      # FLOOR: the first hosted run (2026-11-14, pull request 1364) measured
+      # 88.17% line coverage with every lane green; the floor sits 1.2 points
+      # below it, the same margin style as the nightly's #409 floor (set 1.6
+      # under its measurement). Raise it with the change that moves the
+      # measurement, never after. The floor lives in exactly one place;
+      # scripts/ci/test-hosted-coverage-contract.py fails if it leaves this
+      # step or drops below 1.
       # Runs even when a lane or the lcov export failed: the summary is the
       # calibration evidence for the floor, and a job that is already red
       # loses nothing by keeping it.
@@ -333,7 +334,7 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          "$IRLUME_COVERAGE_BIN" llvm-cov report --summary-only --fail-under-lines 1 | tee coverage/summary.txt
+          "$IRLUME_COVERAGE_BIN" llvm-cov report --summary-only --fail-under-lines 87 | tee coverage/summary.txt
 
       - name: Upload coverage artifacts
         if: always()

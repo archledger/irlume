@@ -102,7 +102,8 @@ class HostedCoverageContractTests(unittest.TestCase):
         # least 1, so the flag cannot be dropped silently again.
         joined = workflow_text()
         report = [line.strip() for line in joined.splitlines()
-                  if 'llvm-cov report' in line]
+                  if '--summary-only' in line
+                  and 'llvm-cov report' in line]
         self.assertEqual(len(report), 1)
         self.assertIn('--summary-only', report[0])
         match = re.search(r'--fail-under-lines ([0-9]+)', report[0])
@@ -114,11 +115,18 @@ class HostedCoverageContractTests(unittest.TestCase):
     def test_export_and_artifact_upload_exist(self):
         # The lcov trace and the summary are the calibration evidence for the
         # floor; they must upload even when the floor fails, and the upload
-        # must use the pinned artifact action with modest retention.
+        # must use the pinned artifact action with modest retention. The
+        # pinned cargo-llvm-cov 0.9.1 has no export subcommand: the trace is
+        # a report-format flag, so the exact invocation is pinned to keep a
+        # future syntax drift from silently skipping the export.
         joined = workflow_text()
-        self.assertIn('llvm-cov export --format lcov --output-path coverage/lcov.info',
-                      joined)
-        self.assertLess(joined.index('llvm-cov export'), joined.index('llvm-cov report'))
+        self.assertIn(
+            'llvm-cov report --lcov --output-path coverage/lcov.info',
+            joined)
+        self.assertLess(joined.rindex('llvm-cov --no-report'),
+                        joined.index('llvm-cov report --lcov'))
+        self.assertLess(joined.index('llvm-cov report --lcov'),
+                        joined.index('llvm-cov report --summary-only'))
         self.assertRegex(joined, r'uses: actions/upload-artifact@[0-9a-f]{40}')
         self.assertRegex(joined, r'if: always\(\)')
         self.assertRegex(joined, r'retention-days: [0-9]+')

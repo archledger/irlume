@@ -127,12 +127,16 @@ gh workflow run slsa-provenance.yml -f "tag=$TAG"
 ```
 
 Wait for completion and verify the uploaded `multiple.intoto.jsonl` against every
-package as described in [VERIFY.md](VERIFY.md). The provenance workflow checks the
-returned release ID and downloads the expected nonempty attachment. A green job
+package as described in [VERIFY.md](VERIFY.md). The provenance workflow attaches
+the signed attestation bundle and its confirm job re-downloads the asset and
+checks it byte for byte. A green job
 that did not upload provenance is not completion. Partial or empty releases fail
 verification; asset upload itself is not a reliable workflow trigger, so request
 an explicit final run when needed. These attestations cover off-CI package bytes,
-not a claim that the package build ran in the generator's isolated environment.
+not a claim that the package build ran in CI. Do not re-dispatch this workflow
+for releases at or below v0.16.0: their `multiple.intoto.jsonl` was produced by
+the generator this workflow replaces, and a re-dispatch would overwrite a
+bundle `slsa-verifier` can check with one only `gh attestation` reads.
 
 Record final run URLs, candidate OID, package digests, provenance coverage,
 channel publication results, runner health, remaining limitations, and rollback

@@ -21,6 +21,17 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Release provenance comes from GitHub artifact attestations
+  (`actions/attest-build-provenance`, SHA-pinned) instead of the
+  unmaintained `slsa-github-generator` reusable workflow, which had to be
+  referenced by a version tag and was the repository's last unpinned
+  workflow reference. Releases still attach the signed bundle as the
+  `multiple.intoto.jsonl` asset, covering every `SHA256SUMS` entry (packages
+  plus the SBOM and VEX documents, as before). Verify releases with
+  `gh attestation verify <package> --repo archledger/irlume` (add `--bundle
+  multiple.intoto.jsonl` for offline checks); releases up to and including
+  v0.16.0 still verify with slsa-verifier.
+
 - The tracked CycloneDX SBOM documents in `crates/` are refreshed to the
   current tree by the new `scripts/refresh-tracked-sboms.py`: components now
   carry version 0.16.0, `irlume-core` and `irlume-liveness` no longer list

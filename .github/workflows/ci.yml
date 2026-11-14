@@ -197,7 +197,7 @@ jobs:
           bash scripts/fetch-ort.sh "$ver"
           echo "ORT_DYLIB_PATH=$PWD/onnxruntime-linux-x64-${ver}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
 
-      - name: Action pins (SHA-pinned; SLSA generator excepted)
+      - name: Action pins (SHA-pinned)
         run: bash scripts/check-action-pins.sh
 
       - name: Non-granting IR harness offline tests (no camera)

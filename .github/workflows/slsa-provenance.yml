@@ -58,19 +58,68 @@ jobs:
             echo "tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
+  # Only digest lines cross from the hashes job into this one. The job that
+  # downloads and parses release packages holds contents: read alone; this
+  # job, which mints an OIDC token and writes to the release, never touches
+  # package bytes. The attestation therefore covers exactly the digests the
+  # strict verifier confirmed against the signed manifest.
   provenance:
     needs: hashes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
-      actions: read
       id-token: write
+      attestations: write
       contents: write
-    # The generator's verification identity requires a version tag, not a SHA.
-    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
-    with:
-      base64-subjects: ${{ needs.hashes.outputs.digests }}
-      upload-assets: true
-      upload-tag-name: ${{ needs.hashes.outputs.tag }}
-      provenance-name: multiple.intoto.jsonl
+    outputs:
+      bundle-digest: ${{ steps.attach.outputs.digest }}
+    steps:
+      - name: Materialize the verified subjects
+        env:
+          SUBJECTS: ${{ needs.hashes.outputs.digests }}
+        run: |
+          set -euo pipefail
+          # The hashes job emits base64 so the output stays one line; the
+          # attestation action wants shasum-style lines (hex digest, two
+          # spaces, filename) in a file. Refuse to attest anything that is
+          # not exactly that shape, so a malformed output cannot become a
+          # signed statement.
+          printf '%s' "$SUBJECTS" | base64 --decode > subjects.checksums
+          awk 'BEGIN { bad = 0 }
+               !/^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._+-]*$/ {
+                 printf "unexpected subject line: %s\n", $0 > "/dev/stderr"
+                 bad = 1
+               }
+               END { exit bad }' subjects.checksums
+          test -s subjects.checksums
+
+      # GitHub's artifact attestation action, pinned by full SHA like every
+      # other reference check-action-pins.sh reads. It signs the subjects
+      # above as SLSA build provenance and uploads the attestation to the
+      # repository's attestation API; its bundle-path output is the signed
+      # bundle written to disk.
+      - name: Attest the verified digests
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: subjects.checksums
+
+      - name: Attach the attestation bundle to the release
+        id: attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.hashes.outputs.tag }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          # The stable asset name is part of docs/VERIFY.md and of Scorecard's
+          # Signed-Releases check. --clobber so re-dispatching after a
+          # corrected upload replaces the stale bundle.
+          test -s "$BUNDLE"
+          cp "$BUNDLE" multiple.intoto.jsonl
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber multiple.intoto.jsonl
+          digest="$(sha256sum multiple.intoto.jsonl | cut -d' ' -f1)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   confirm-upload:
     needs: [hashes, provenance]
@@ -83,11 +132,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.hashes.outputs.tag }}
-          UPLOADED_RELEASE: ${{ needs.provenance.outputs.release-id }}
+          UPLOADED_DIGEST: ${{ needs.provenance.outputs.bundle-digest }}
         run: |
           set -euo pipefail
-          test -n "$UPLOADED_RELEASE"
-          expected="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .id)"
-          test "$UPLOADED_RELEASE" = "$expected"
+          test -n "$UPLOADED_DIGEST"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern multiple.intoto.jsonl
           test -s multiple.intoto.jsonl
+          printf '%s  multiple.intoto.jsonl\n' "$UPLOADED_DIGEST" | sha256sum --check -

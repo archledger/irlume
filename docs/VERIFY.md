@@ -191,10 +191,38 @@ structure without installing packages. Both Debian and Arch packages are require
 missing assets fail. For an explicitly selected historical Debian-only release,
 use `--require deb`; that exception is not used by the current release workflows.
 
-The provenance workflow separately attests these verified package digests. It
-includes `.deb`, `.pkg.tar.zst`, and any signed `irlume-selinux-*.rpm` assets, and
-uses the stable filename `multiple.intoto.jsonl`. Check each package with
-[slsa-verifier](https://github.com/slsa-framework/slsa-verifier):
+The provenance workflow separately attests these verified digests as GitHub
+artifact attestations. Every entry in `SHA256SUMS` is a subject: the `.deb`,
+`.pkg.tar.zst` and any `irlume-selinux-*.rpm` packages plus the SBOM and VEX
+documents. The workflow exports the signed bundle to the stable release asset
+`multiple.intoto.jsonl`. Check each downloaded package (the command takes one
+artifact at a time; replace `<version>` with the release's) with
+[`gh attestation verify`](https://cli.github.com/manual/gh_attestation_verify),
+which fetches the attestations from GitHub:
+
+```bash
+gh attestation verify irlume_<version>_amd64.deb --repo archledger/irlume
+gh attestation verify irlume-<version>-1-x86_64.pkg.tar.zst --repo archledger/irlume
+```
+
+For offline verification, pass the downloaded bundle instead of querying the
+attestation API (the certificate's repository identity is still checked
+against `--repo`):
+
+```bash
+gh attestation verify irlume_<version>_amd64.deb \
+  --bundle multiple.intoto.jsonl --repo archledger/irlume
+```
+
+Stricter identity checking is available through `--signer-workflow
+archledger/irlume/.github/workflows/slsa-provenance.yml`, which pins the
+signing workflow recorded in the attestation certificate, not just the
+repository.
+
+Releases up to and including v0.16.0 predate the migration: their
+`multiple.intoto.jsonl` was produced by the slsa-github-generator, which
+[slsa-verifier](https://github.com/slsa-framework/slsa-verifier) checks, not
+`gh attestation`:
 
 ```bash
 slsa-verifier verify-artifact irlume_*.deb irlume-*.pkg.tar.zst \
@@ -202,17 +230,19 @@ slsa-verifier verify-artifact irlume_*.deb irlume-*.pkg.tar.zst \
   --source-uri github.com/archledger/irlume
 ```
 
-If a SELinux RPM is published, include its actual filename too. Older releases
-may have per-package provenance names: v0.11.3 has
-`irlume_0.11.3_amd64.deb.intoto.jsonl`, covering only the Debian package. Do not
-infer Arch coverage from a successful Debian verification.
+If such a release published a SELinux RPM, include its actual filename in that
+command too. Older releases still may have per-package provenance names:
+v0.11.3 has
+`irlume_0.11.3_amd64.deb.intoto.jsonl`, covering only the Debian package. Do
+not infer Arch coverage from a successful Debian verification.
 
-The packages are built outside CI. This attestation records digests supplied to
-the generator; it does not prove a reproducible or isolated package build.
-`.github/workflows/verify-release.yml` strictly checks version releases, and
-`.github/workflows/slsa-provenance.yml` checks the same complete signed inputs
-before generating provenance and confirming its upload. Neither workflow treats
-an incomplete release as verified. Follow [release finalization](RELEASING.md).
+The packages are built outside CI. This attestation records the digests the
+strict verifier confirmed; it does not prove a reproducible or isolated
+package build. `.github/workflows/verify-release.yml` strictly checks version
+releases, and `.github/workflows/slsa-provenance.yml` checks the same complete
+signed inputs before attesting, attaches the bundle to the release and
+confirms the uploaded bytes. Neither workflow treats an incomplete release as
+verified. Follow [release finalization](RELEASING.md).
 
 ---
 

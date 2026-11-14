@@ -202,7 +202,7 @@ jobs:
           # journal and create a lock when the daemon has not used this camera.
           # Video-group membership alone cannot authorize those operations.
           burst="${CARGO_TARGET_DIR:-target}/debug/examples/burst_dump"
-          cargo build -q -p irlume-camera --example burst_dump
+          cargo build -q --locked -p irlume-camera --example burst_dump
           if [ ! -x "$burst" ]; then
             echo "::error::burst_dump not built at $burst"
             exit 1

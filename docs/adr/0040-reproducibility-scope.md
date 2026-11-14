@@ -33,7 +33,8 @@ the badge texts state one thing, not two.
    the lockfile.
 2. The PPA orig tarball is packed deterministically from the release
    tag's commit date, so the same tag yields the same tarball on the
-   same route.
+   same route when the staged tree's file modes match: the recipe fixes
+   timestamps, ownership and order, not permission bits.
 3. No lane is certified bit-for-bit reproducible and none is claimed to
    be. A mismatch on an independent rebuild is a data point to report,
    not evidence of tampering and not a release blocker.

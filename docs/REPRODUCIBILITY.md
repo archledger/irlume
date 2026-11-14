@@ -72,7 +72,11 @@ The nightly PPA lane (`scripts/ppa-nightly.py`) passes the same kind of value
 deterministic the same way.
 
 What this gives you: re-running the same route from the same tag produces a
-byte-identical orig tarball. What it does not: the container route
+byte-identical orig tarball when the staged tree's file modes match. The
+recipe fixes timestamps, ownership and order but not permission bits:
+`fetch-models.sh` writes the weights with the writing umask's bits,
+`rsync -a` preserves them and tar records them, so a umask difference
+between runs changes the tarball. What it does not: the container route
 (`packaging/ppa/build-ppa-container.sh`) and a native Ubuntu run do not
 produce identical bytes (gzip and `cargo vendor` differ between
 environments), so each release uploads from one route only.
@@ -134,16 +138,22 @@ machine and compare those digests.
    line. A mismatch is a data point, not proof of tampering: this lane is
    not certified byte-reproducible, so report it rather than conclude from
    it.
-2. **PPA orig tarball.** From a checkout of tag `vX.Y.Z`, run
-   `scripts/build-ppa-source.sh` (needs `rsync`, `cargo`,
-   `dpkg-buildpackage` and `curl`). It writes
+2. **PPA orig tarball.** Build from a clean disposable checkout of tag
+   `vX.Y.Z` (a fresh `git clone --depth 1 --branch vX.Y.Z`, or
+   `git worktree add` on the tag): `build-ppa-source.sh` stages the
+   working tree with `rsync -a`, which does not honor `.gitignore`, so
+   ignored local files (downloaded weights, enrollment templates left by
+   a test run) would be bundled into the orig. The container route does
+   this by design already: it git-archives the tag to a clean tree. From
+   that checkout, run `scripts/build-ppa-source.sh` (needs `rsync`,
+   `cargo`, `dpkg-buildpackage` and `curl`). It writes
    `~/ppa-build/irlume_X.Y.Z.orig.tar.gz` and deletes and recreates that
    path on every run, so before rerunning, either copy the first tarball
    aside or record its `sha256sum`. Run the script again and compare the
    fresh tarball's digest against the recorded one; equal digests are the
-   deterministic-packing check. Comparing the container route works the
-   same way; compare like with like, since the two routes are not
-   byte-identical to each other.
+   deterministic-packing check, subject to the permission-bits caveat
+   above. Comparing the container route works the same way; compare like
+   with like, since the two routes are not byte-identical to each other.
 3. **Nix.** `nix build .#default --no-link --print-out-paths` and
    `nix hash path <store-path>`, as above, on two machines.
 4. **Weights and runtime.** `bash scripts/fetch-models.sh` and

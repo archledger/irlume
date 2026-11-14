@@ -99,7 +99,11 @@ class HostedCoverageContractTests(unittest.TestCase):
         # The report step is the measurement: without it the job runs tests
         # and enforces nothing (the 2026-08 failure mode). It must run after
         # every instrumented lane and carry a --fail-under-lines floor of at
-        # least 1, so the flag cannot be dropped silently again.
+        # least the calibrated minimum, so the flag cannot be dropped or
+        # quietly lowered back to a placeholder again. The first hosted run
+        # measured 88.17% (2026-11-14); the floor was set to 87. A floor
+        # moves only with the change that moves the measurement, and this
+        # minimum moves with it.
         joined = workflow_text()
         report = [line.strip() for line in joined.splitlines()
                   if '--summary-only' in line
@@ -108,7 +112,7 @@ class HostedCoverageContractTests(unittest.TestCase):
         self.assertIn('--summary-only', report[0])
         match = re.search(r'--fail-under-lines ([0-9]+)', report[0])
         self.assertIsNotNone(match, report[0])
-        self.assertGreaterEqual(int(match.group(1)), 1)
+        self.assertGreaterEqual(int(match.group(1)), 87)
         self.assertLess(joined.rindex('llvm-cov --no-report'),
                         joined.index('llvm-cov report'))
 
@@ -118,7 +122,10 @@ class HostedCoverageContractTests(unittest.TestCase):
         # must use the pinned artifact action with modest retention. The
         # pinned cargo-llvm-cov 0.9.1 has no export subcommand: the trace is
         # a report-format flag, so the exact invocation is pinned to keep a
-        # future syntax drift from silently skipping the export.
+        # future syntax drift from silently skipping the export. The
+        # always-conditions are asserted on the exact steps that need them,
+        # not somewhere in the file: a stray `if: always()` elsewhere must
+        # not cover a step losing its own.
         joined = workflow_text()
         self.assertIn(
             'llvm-cov report --lcov --output-path coverage/lcov.info',
@@ -128,8 +135,20 @@ class HostedCoverageContractTests(unittest.TestCase):
         self.assertLess(joined.index('llvm-cov report --lcov'),
                         joined.index('llvm-cov report --summary-only'))
         self.assertRegex(joined, r'uses: actions/upload-artifact@[0-9a-f]{40}')
-        self.assertRegex(joined, r'if: always\(\)')
         self.assertRegex(joined, r'retention-days: [0-9]+')
+        steps = []
+        for line in WORKFLOW.read_text().splitlines():
+            trimmed = line.strip()
+            if trimmed.startswith('- name:') or trimmed.startswith('- uses:'):
+                steps.append([])
+            if steps:
+                steps[-1].append(trimmed)
+        for name_fragment in ('Report and enforce the line-coverage floor',
+                              'Upload coverage artifacts'):
+            matching = [step for step in steps
+                        if step and name_fragment in step[0]]
+            self.assertEqual(len(matching), 1, name_fragment)
+            self.assertIn('if: always()', matching[0], name_fragment)
 
     def test_setup_uses_the_rustup_toolchain_path_and_pinned_binary(self):
         joined = workflow_text()

@@ -18,10 +18,14 @@
 # FFI matrix on every pull request, so a coverage drop is caught at the PR
 # instead of the next nightly.
 #
-# The floor is a placeholder (1) in this first version: it proves the
-# mechanism (the lane fails only if coverage measurement itself collapses).
-# Calibrate it from the first hosted run's summary before treating it as a
-# ratchet. A floor lowered without a measurement is how the old hosted
+# Deliberately NOT a required check: the required gates stay the seven
+# contexts of ci.yml plus the nightly hardware floor; this lane reports and
+# fails loudly per pull request, and promoting its context to a required
+# check is a branch-protection change the maintainer decides separately.
+#
+# The floor started as a placeholder (1) that proved the mechanism, and was
+# calibrated from the first hosted run's measured 88.17% (2026-11-14) to 87
+# before merge. A floor lowered without a measurement is how the old hosted
 # ratchet went 79 to 76 in four steps and was then dropped (#409).
 name: Coverage
 
@@ -326,7 +330,7 @@ jobs:
       # under its measurement). Raise it with the change that moves the
       # measurement, never after. The floor lives in exactly one place;
       # scripts/ci/test-hosted-coverage-contract.py fails if it leaves this
-      # step or drops below 1.
+      # step or drops below the calibrated minimum.
       # Runs even when a lane or the lcov export failed: the summary is the
       # calibration evidence for the floor, and a job that is already red
       # loses nothing by keeping it.

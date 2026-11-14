@@ -180,6 +180,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
+  writing and prints one message naming the model when curl itself
+  fails, the way a checksum mismatch already did. Before, a curl
+  failure aborted the script under `set -e` and left the partial
+  file behind, with no message for that model (#1346).
+
 - `scripts/machine-api-conformance.py` refuses `/dev/v4l/` device paths in
   machine output, the spelling of a camera node by-id link, as it already
   refused `/dev/video` paths, and no longer skips the `camera-diagnostics`

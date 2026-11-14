@@ -33,7 +33,11 @@ verify_or_fetch() {
         return 0
     fi
     echo "fetch-models: downloading $name"
-    curl -fSL --retry 3 --retry-delay 2 -o "$out.tmp" "$BASE/$name"
+    if ! curl -fSL --retry 3 --retry-delay 2 -o "$out.tmp" "$BASE/$name"; then
+        echo "fetch-models: download failed for $name" >&2
+        rm -f "$out.tmp"
+        return 1
+    fi
     local got
     got=$(sha256sum "$out.tmp" | cut -d' ' -f1)
     if [ "$got" != "$sha" ]; then

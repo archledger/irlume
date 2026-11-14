@@ -25,6 +25,11 @@ set -euo pipefail
 # moving the base (the tag is `debian:12` as of this digest).
 BASE="${BASE:-debian:12@sha256:9344f8b8992482f80cba753f323adeaf17690076c095ccff6cc9536be98185dc}"
 RUST_VER="${RUST_VER:-1.88.0}"   # >= ort's MSRV (edition 2024)
+# The installer is a lane input like any other: pinned by version and
+# verified against its published checksum before it runs (same pin as the
+# PPA container lane; keep the two in step).
+RUSTUP_VER="${RUSTUP_VER:-1.29.3}"
+RUSTUP_SHA256="${RUSTUP_SHA256:-b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55}"
 # nfpm builds the .deb; pin it and verify its published checksum rather than
 # fetching a floating "latest" (a compromised/behavior-changed nfpm would
 # otherwise silently alter every universal .deb).
@@ -51,9 +56,13 @@ echo "==> building universal .deb in $BASE (rustup $RUST_VER)"
     # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
     apt-get install -y -qq curl ca-certificates build-essential pkg-config \
         libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon clang libclang-dev git xz-utils >/dev/null
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain '"$RUST_VER"' --profile minimal >/dev/null
-    . "$HOME/.cargo/env"
-    # Pinned nfpm, verified against its published (goreleaser-signed) checksums.
+    curl -fsSL "https://static.rust-lang.org/rustup/archive/'"$RUSTUP_VER"'/x86_64-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init \
+      || { echo "rustup-init download failed"; exit 1; }
+    echo '"$RUSTUP_SHA256"'  /tmp/rustup-init | sha256sum -c - \
+      || { echo "rustup-init failed sha256 check; refusing."; exit 1; }
+    chmod +x /tmp/rustup-init
+    /tmp/rustup-init -y --default-toolchain '"$RUST_VER"' --profile minimal --no-modify-path >/dev/null
+    . "$HOME/.cargo/env"    # Pinned nfpm, verified against its published (goreleaser-signed) checksums.
     curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_amd64.deb" -o /tmp/nfpm.deb
     curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/checksums.txt" -o /tmp/nfpm.sums
     ( cd /tmp && want=$(grep "nfpm_${NFPM_VER}_amd64.deb\$" nfpm.sums | awk "{print \$1}"); \

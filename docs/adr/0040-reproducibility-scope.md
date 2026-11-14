@@ -87,3 +87,18 @@ toolchain, same `SOURCE_DATE_EPOCH`) produced a byte-identical orig
 tarball, sha256 `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199d`.
 The guide carries the comparison table; released binaries remain outside
 it (#1366).
+
+## Amendment 2026-11-14: the installer is pinned, and the orig is clean
+
+The earlier amendment today left two gaps a review of the change found. The
+rustup installer was fetched from the unpinned `sh.rustup.rs` pipe, so
+one lane input was not digest-verified as section 1.1 claims; both
+container lanes now pin `rustup-init` by version
+(`RUSTUP_VER=1.29.3`) and verify its published sha256 before it runs.
+And without `--no-modify-path`, rustup wrote a `.profile` sourcing the
+toolchain into `HOME` (=/work in the PPA container), which the staging
+rsync shipped inside the orig tarball: the first published comparison
+digest included that stray file. The comparison was re-run on both hosts
+with the fixed lane; the table above carries the corrected digest.
+`RUST_VER` is also passed through by both callers now, so the pin is
+overridable as documented instead of only by editing the script.

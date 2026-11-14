@@ -112,6 +112,22 @@ jobs:
           BUNDLE: ${{ steps.attest.outputs.bundle-path }}
         run: |
           set -euo pipefail
+          # Releases through v0.16.0 carry the slsa-github-generator's
+          # bundle, and docs/VERIFY.md still teaches slsa-verifier for
+          # them: clobbering an attestation bundle over that would break
+          # the verification path those releases document. The migration
+          # to actions/attest-build-provenance (#1367) is the boundary;
+          # every release after v0.16.0 attests with this workflow.
+          # A prerelease tag sorts after its final release in sort -V
+          # (v0.16.0-rc1 > v0.16.0) but is a legacy release all the same,
+          # and build metadata (+...) also sorts after the bare version:
+          # strip both, and compare the version core alone.
+          tag_core="${RELEASE_TAG%%-*}"
+          tag_core="${tag_core%%+*}"
+          if [ "$(printf '%s\n' "$tag_core" v0.16.0 | sort -V | head -1)" = "$tag_core" ]; then
+            echo "::error::$RELEASE_TAG is at or below v0.16.0, whose releases carry the generator's bundle; refusing to clobber it"
+            exit 1
+          fi
           # The stable asset name is part of docs/VERIFY.md and of Scorecard's
           # Signed-Releases check. --clobber so re-dispatching after a
           # corrected upload replaces the stale bundle.

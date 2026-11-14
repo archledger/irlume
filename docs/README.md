@@ -38,6 +38,7 @@ points at.
 | [MACHINE-API.md](MACHINE-API.md) | The versioned machine API, field by field |
 | [DESKTOP-AUTH.md](DESKTOP-AUTH.md) | Face auth for desktop apps and lock screens |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Dev shell, tests, and the local loop |
+| [REPRODUCIBILITY.md](REPRODUCIBILITY.md) | Rebuild the artifacts, and what is pinned |
 | [CREDITS.md](CREDITS.md) | The projects irlume builds on |
 | [ROADMAP.md](ROADMAP.md) | What is planned |
 

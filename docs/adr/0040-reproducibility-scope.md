@@ -88,9 +88,9 @@ tarball, sha256 `694fdb072fc6aaadcfebd27ce7b8e10b82c681d4eb854c78b9a86f600cb3199
 The guide carries the comparison table; released binaries remain outside
 it (#1366).
 
-## Amendment 2026-11-14, second: the installer is pinned, and the orig is clean
+## Amendment 2026-11-14: the installer is pinned, and the orig is clean
 
-The first amendment left two gaps a review of the change found. The
+The earlier amendment today left two gaps a review of the change found. The
 rustup installer was fetched from the unpinned `sh.rustup.rs` pipe, so
 one lane input was not digest-verified as section 1.1 claims; both
 container lanes now pin `rustup-init` by version

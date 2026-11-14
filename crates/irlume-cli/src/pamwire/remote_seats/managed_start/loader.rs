@@ -363,12 +363,34 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).unwrap();
+            // 0o755 outright: a public read walks the fixture root as well.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             Tree(path)
+        }
+
+        /// Creates `relative` and every directory above it at 0o755 rather
+        /// than the ambient umask's default: `readable_by_anyone` needs
+        /// others-search on every fixture component, whatever umask the
+        /// tests run under.
+        fn dir(&self, relative: impl AsRef<Path>) -> PathBuf {
+            let mut path = self.0.clone();
+            for component in relative.as_ref().components() {
+                path.push(component.as_os_str());
+                match std::fs::create_dir(&path) {
+                    Ok(()) => {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                            .unwrap()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => panic!("{}: {e}", path.display()),
+                }
+            }
+            path
         }
 
         fn put(&self, relative: &str, text: &str) -> PathBuf {
             let path = self.0.join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            self.dir(Path::new(relative).parent().unwrap());
             std::fs::write(&path, text).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             path
@@ -518,7 +540,7 @@ mod tests {
         tree.put("etc/lightdm/lightdm.conf", "[LightDM]\n\n");
         let edited = tree.observe().unwrap().digest;
         assert_ne!(main, edited, "a byte change");
-        std::fs::create_dir_all(tree.0.join("etc/xdg/lightdm/lightdm.conf.d")).unwrap();
+        tree.dir("etc/xdg/lightdm/lightdm.conf.d");
         let directory = tree.observe().unwrap().digest;
         assert_ne!(edited, directory, "an empty directory appearing");
         tree.put("etc/xdg/lightdm/lightdm.conf.d/00.conf", "");
@@ -553,7 +575,7 @@ mod tests {
     fn symlinked_candidates_are_followed_like_lightdm() {
         let tree = Tree::new("symlink");
         let target = tree.put("elsewhere/remote.ini", XDMCP_ON);
-        std::fs::create_dir_all(tree.0.join("etc/lightdm/lightdm.conf.d")).unwrap();
+        tree.dir("etc/lightdm/lightdm.conf.d");
         symlink(
             &target,
             tree.0.join("etc/lightdm/lightdm.conf.d/remote.conf"),
@@ -574,7 +596,7 @@ mod tests {
     fn inputs_lightdm_would_not_read_plainly_are_refused() {
         let tree = Tree::new("refuse");
         assert!(tree.observe().is_ok(), "the empty closure is readable");
-        std::fs::create_dir_all(tree.0.join("etc/lightdm/lightdm.conf.d/dir.conf")).unwrap();
+        tree.dir("etc/lightdm/lightdm.conf.d/dir.conf");
         assert!(
             tree.observe().is_err(),
             "a directory named like a candidate"
@@ -613,8 +635,7 @@ mod tests {
         assert!(observe(&tree.0, &Profile::standard(), true).is_err());
         assert!(observe(&tree.0, &Profile::standard(), false).is_ok());
         std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let dir = tree.0.join("etc/lightdm/lightdm.conf.d");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tree.dir("etc/lightdm/lightdm.conf.d");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
         assert!(observe(&tree.0, &Profile::standard(), true).is_err());
     }
@@ -623,11 +644,10 @@ mod tests {
     fn public_reads_reject_private_intermediate_file_links() {
         let tree = Tree::new("private-file-link");
         let target = tree.put("public/remote.ini", XDMCP_ON);
-        let hidden = tree.0.join("hidden");
-        std::fs::create_dir(&hidden).unwrap();
+        let hidden = tree.dir("hidden");
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink(&target, hidden.join("hop")).unwrap();
-        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        tree.dir("etc/lightdm");
         symlink(hidden.join("hop"), tree.0.join("etc/lightdm/lightdm.conf")).unwrap();
 
         assert!(
@@ -644,11 +664,10 @@ mod tests {
     fn public_reads_reject_private_intermediate_directory_links() {
         let tree = Tree::new("private-directory-link");
         tree.put("public/remote.conf", XDMCP_ON);
-        let hidden = tree.0.join("hidden");
-        std::fs::create_dir(&hidden).unwrap();
+        let hidden = tree.dir("hidden");
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink("../public", hidden.join("hop")).unwrap();
-        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        tree.dir("etc/lightdm");
         symlink(
             hidden.join("hop"),
             tree.0.join("etc/lightdm/lightdm.conf.d"),
@@ -669,10 +688,9 @@ mod tests {
     fn public_reads_preserve_search_checks_before_parent_components() {
         let tree = Tree::new("private-parent-component");
         tree.put("public/remote.ini", XDMCP_ON);
-        let hidden = tree.0.join("hidden");
-        std::fs::create_dir(&hidden).unwrap();
+        let hidden = tree.dir("hidden");
         std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        tree.dir("etc/lightdm");
         symlink(
             tree.0.join("hidden/../public/remote.ini"),
             tree.0.join("etc/lightdm/lightdm.conf"),
@@ -693,10 +711,10 @@ mod tests {
     fn public_reads_accept_searchable_indirect_links() {
         let tree = Tree::new("public-link-chain");
         let target = tree.put("public/remote.ini", XDMCP_ON);
-        std::fs::create_dir_all(tree.0.join("links")).unwrap();
+        tree.dir("links");
         symlink("../public/remote.ini", tree.0.join("links/relative")).unwrap();
         symlink(tree.0.join("links/relative"), tree.0.join("links/absolute")).unwrap();
-        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        tree.dir("etc/lightdm");
         symlink(
             tree.0.join("links/absolute"),
             tree.0.join("etc/lightdm/lightdm.conf"),
@@ -714,9 +732,9 @@ mod tests {
     fn public_reads_accept_searchable_indirect_directory_links() {
         let tree = Tree::new("public-directory-chain");
         tree.put("public/remote.conf", XDMCP_ON);
-        std::fs::create_dir_all(tree.0.join("links")).unwrap();
+        tree.dir("links");
         symlink("../public", tree.0.join("links/directory")).unwrap();
-        std::fs::create_dir_all(tree.0.join("etc/lightdm")).unwrap();
+        tree.dir("etc/lightdm");
         symlink(
             tree.0.join("links/directory"),
             tree.0.join("etc/lightdm/lightdm.conf.d"),
@@ -762,10 +780,7 @@ mod tests {
     fn public_path_checks_preserve_non_utf8_link_targets() {
         use std::os::unix::ffi::OsStringExt as _;
         let tree = Tree::new("public-non-utf8-target");
-        let directory = tree
-            .0
-            .join(std::ffi::OsString::from_vec(b"public-\xff".to_vec()));
-        std::fs::create_dir(&directory).unwrap();
+        let directory = tree.dir(std::ffi::OsString::from_vec(b"public-\xff".to_vec()));
         let target = directory.join("remote.ini");
         std::fs::write(&target, XDMCP_OFF).unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();

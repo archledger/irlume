@@ -512,7 +512,21 @@ mod tests {
 
         fn config(&self, relative: &str, text: &str) {
             let path = self.root.join(relative);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Directories above the file at 0o755, not the umask default:
+            // prepare observes the configuration as any user must be able
+            // to, which needs others-search on every component.
+            let mut dir = self.root.clone();
+            for component in Path::new(relative).parent().unwrap().components() {
+                dir.push(component.as_os_str());
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => {
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                            .unwrap()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => panic!("{}: {e}", dir.display()),
+                }
+            }
             std::fs::write(&path, text).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }

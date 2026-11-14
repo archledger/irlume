@@ -343,6 +343,11 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          # A lane failure skips the export step above, and with it this
+          # step's only creator of coverage/; without this mkdir the tee
+          # below would fail to open its output and the summary (the floor
+          # calibration evidence) would be lost exactly when a lane failed.
+          mkdir -p coverage
           "$IRLUME_COVERAGE_BIN" llvm-cov report --summary-only --fail-under-lines 87 | tee coverage/summary.txt
 
       - name: Upload coverage artifacts

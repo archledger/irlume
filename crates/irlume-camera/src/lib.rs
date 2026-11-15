@@ -3298,13 +3298,11 @@ const GREY16_FOURCCS: [&[u8; 4]; 3] = [b"Y16 ", b"Y10 ", b"Y12 "];
 /// sign-in, an enrollment, a preview or setup), which is normal, or irlumed
 /// holding the camera after its work ended, which is a bug; each step reads
 /// true for all of them (#1338). Shared by `camera_busy_error` and
-/// [`Unreadable::cause`]. With `hardware: ` the busy text is 216 characters
-/// at `/dev/video0`, one more per extra digit, within the 240 characters
-/// irlumed's journal keeps of a bare error. The fixed steps lead the text, so
-/// they also survive truncation of a longer pinned path.
-const UNSEEN_HOLDER_STEPS: &str =
-    "Close the other app, or wait for irlumed to finish, then retry; \
-     if irlumed keeps holding it, please report it (`irlume support-report` says where)";
+/// [`Unreadable::cause`]. The text stays compact enough that a realistic
+/// pinned by-id fuser command and the report pointer both fit irlumed's
+/// 240-character journal budget.
+const UNSEEN_HOLDER_STEPS: &str = "Close the other app or let irlumed finish, then retry; \
+     if it stays held, please report it (`irlume support-report` says where)";
 
 /// A named non-self PID can be an external irlumed. Its `comm` is display
 /// text, not proof of daemon identity, so the advice covers both possibilities
@@ -3317,7 +3315,7 @@ const NAMED_HOLDER_STEPS: &str = "For irlumed, let it finish, then retry; otherw
 // distinction: an identified self-only conflict is an Irlume bug, not advice
 // to close another app. An incomplete scan does not identify an owner, so its
 // text gives the step for each holder it may be (#1338). Fixed guidance leads
-// every arm so journal truncation cannot hide it behind a device path.
+// every arm except the fuser command, whose complete argument must also fit.
 fn camera_busy_error(device: &str, holders: Holders) -> Error {
     let self_only = matches!(holders, Holders::SelfOnly);
     let message = match holders {
@@ -3330,9 +3328,24 @@ fn camera_busy_error(device: &str, holders: Holders) -> Error {
              holding it is irlume itself (pid {}).",
             std::process::id()
         ),
-        Holders::UnknownBlind => format!(
-            "{UNSEEN_HOLDER_STEPS}. camera busy; `sudo fuser -v {device}` names the holder."
-        ),
+        Holders::UnknownBlind => {
+            // A pinned by-id symlink can contain a serial that journal
+            // redaction masks. The command targets the same resolved node the
+            // holder scan used, normally the short `/dev/videoN` name.
+            let resolved =
+                std::fs::canonicalize(device).unwrap_or_else(|_| std::path::PathBuf::from(device));
+            let command = resolved.to_str().and_then(|fuser_device| {
+                let command =
+                    format!("camera busy; `sudo fuser -v {fuser_device}`. {UNSEEN_HOLDER_STEPS}.");
+                ("hardware: ".len() + command.chars().count() <= 240).then_some(command)
+            });
+            command.unwrap_or_else(|| {
+                // Do not let journal truncation cut a command's argument or
+                // turn non-UTF-8 path bytes into a different name. The
+                // complete remedy still leads the fallback text.
+                format!("{UNSEEN_HOLDER_STEPS}. camera busy; {device}.")
+            })
+        }
         Holders::None => format!(
             "Close the other app (e.g. a camera/video/conferencing app) and retry. \
              {device}: camera busy, another app is using it."
@@ -16057,8 +16070,8 @@ mod tests {
             busy(Some(Holders::UnknownBlind)),
             format!(
                 "{code} camera busy; `sudo fuser -v` on this node names the holder. Close the \
-                 other app, or wait for irlumed to finish, then retry; if irlumed keeps holding it, \
-                 please report it (`irlume support-report` says where)"
+                 other app or let irlumed finish, then retry; if it stays held, please report it \
+                 (`irlume support-report` says where)"
             )
         );
         for holder in [None, Some(Holders::None)] {
@@ -19277,11 +19290,21 @@ mod tests {
     /// The busy text for a node whose holder the scan could not see, as
     /// `camera_busy_error` words it.
     fn unseen_holder_busy_text(device: &str) -> String {
-        format!(
-            "Close the other app, or wait for irlumed to finish, then retry; if irlumed keeps holding \
-             it, please report it (`irlume support-report` says where). camera busy; \
-             `sudo fuser -v {device}` names the holder."
-        )
+        let resolved =
+            std::fs::canonicalize(device).unwrap_or_else(|_| std::path::PathBuf::from(device));
+        let command = resolved.to_str().and_then(|fuser_device| {
+            let command = format!(
+                "camera busy; `sudo fuser -v {fuser_device}`. Close the other app or \
+                 let irlumed finish, then retry; if it stays held, please report it (`irlume support-report` says where)."
+            );
+            ("hardware: ".len() + command.chars().count() <= 240).then_some(command)
+        });
+        command.unwrap_or_else(|| {
+            format!(
+                "Close the other app or let irlumed finish, then retry; if it stays held, please \
+                 report it (`irlume support-report` says where). camera busy; {device}."
+            )
+        })
     }
 
     /// A holder the scan could not see (#207) may be another app, irlumed at
@@ -19300,6 +19323,54 @@ mod tests {
             }
             other => panic!("an unseen holder is a busy camera: {other:?}"),
         }
+    }
+
+    /// A realistic pinned by-id path leaves the whole fuser command and the
+    /// report pointer inside irlumed's 240-character journal budget. An
+    /// arbitrary-length path must not leave a command that truncation turns
+    /// into a different, unusable instruction.
+    #[test]
+    fn unseen_holder_fuser_commands_never_get_cut_by_the_journal() {
+        let dir = std::env::temp_dir().join(format!("irlume-fuser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let realistic = dir.join("usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0");
+        std::os::unix::fs::symlink("/dev/null", &realistic).unwrap();
+        let wire =
+            camera_busy_error(realistic.to_str().unwrap(), Holders::UnknownBlind).to_string();
+        let shown = irlume_common::single_line(&wire, 240);
+        assert_eq!(shown, wire);
+        assert!(shown.contains("`sudo fuser -v /dev/null`"), "{shown}");
+        assert!(shown.contains("`irlume support-report`"), "{shown}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let long = format!("/dev/{}", "x".repeat(4091));
+        let error = camera_busy_error(&long, Holders::UnknownBlind);
+        let text = match error {
+            Error::CameraBusy(text) => text,
+            other => panic!("an unseen holder is a busy camera: {other:?}"),
+        };
+        assert!(!text.contains("sudo fuser"), "{text}");
+        let shown = irlume_common::single_line(&format!("hardware: {text}"), 240);
+        assert!(shown.contains("`irlume support-report`"), "{shown}");
+
+        use std::os::unix::ffi::OsStringExt;
+        let dir = std::env::temp_dir().join(format!("irlume-fuser-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join(std::ffi::OsString::from_vec(b"node-\xff".to_vec()));
+        std::fs::File::create(&target).unwrap();
+        let alias = dir.join("valid-utf8-alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let error = camera_busy_error(alias.to_str().unwrap(), Holders::UnknownBlind);
+        let text = match error {
+            Error::CameraBusy(text) => text,
+            other => panic!("an unseen holder is a busy camera: {other:?}"),
+        };
+        assert!(!text.contains("sudo fuser"), "{text}");
+        assert!(!text.contains('\u{fffd}'), "{text}");
+        assert!(text.contains("`irlume support-report`"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A different PID running irlumed is an observed other holder, not
@@ -19330,9 +19401,10 @@ mod tests {
         }
     }
 
-    /// Every remedy precedes variable device text, so the daemon's 240-plus-
-    /// ellipsis journal budget cannot cut it off. The realistic path does not
-    /// make the short None arm overflow; the other three arms do overflow.
+    /// Remedies precede variable device text unless an unseen-holder fuser
+    /// command comes first. That arm includes the command only when the whole
+    /// message fits the daemon's 240-character journal budget, so truncation
+    /// cannot cut its path argument or hide the report pointer.
     #[test]
     fn busy_remedies_survive_path_lengths_and_journal_truncation() {
         const REALISTIC: &str =
@@ -19346,7 +19418,7 @@ mod tests {
                 true,
             ),
             (Holders::SelfOnly, "not an app you can close", true),
-            (Holders::UnknownBlind, "Close the other app, or wait", true),
+            (Holders::UnknownBlind, "Close the other app or let", true),
             (Holders::None, "Close the other app (e.g.", false),
         ];
         for device in ["/dev/video0", "/dev/video99", REALISTIC, long.as_str()] {
@@ -19361,14 +19433,18 @@ mod tests {
                 if let Holders::Other(who) = holders {
                     assert!(text.find(who).expect("named holder") < path_at, "{text}");
                 }
-                assert!(text.find(remedy).expect("remedy") < path_at, "{text}");
-                if *has_report {
-                    assert!(
-                        text.find("`irlume support-report`")
-                            .expect("report pointer")
-                            < path_at,
-                        "{text}"
-                    );
+                let has_fuser = matches!(holders, Holders::UnknownBlind)
+                    && text.contains(&format!("`sudo fuser -v {device}`"));
+                if !has_fuser {
+                    assert!(text.find(remedy).expect("remedy") < path_at, "{text}");
+                    if *has_report {
+                        assert!(
+                            text.find("`irlume support-report`")
+                                .expect("report pointer")
+                                < path_at,
+                            "{text}"
+                        );
+                    }
                 }
                 match holders {
                     Holders::Other(_) => assert!(text.contains("close that app"), "{text}"),
@@ -19388,7 +19464,16 @@ mod tests {
                 if device.len() <= "/dev/video99".len() {
                     assert_eq!(shown, wire, "{shown}");
                 }
-                let realistic_overflow = device == REALISTIC && !matches!(holders, Holders::None);
+                let realistic_overflow = device == REALISTIC
+                    && !matches!(holders, Holders::None | Holders::UnknownBlind);
+                if has_fuser {
+                    assert_eq!(shown, wire, "{shown}");
+                    assert!(
+                        shown.contains(&format!("`sudo fuser -v {device}`"))
+                            && shown.contains("`irlume support-report`"),
+                        "{shown}"
+                    );
+                }
                 if device == long.as_str() || realistic_overflow {
                     assert_eq!(shown.chars().count(), 243, "{shown}");
                     assert!(shown.ends_with("..."), "{shown}");

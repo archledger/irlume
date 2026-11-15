@@ -14582,11 +14582,21 @@ mod tests {
     /// Device digits glued to `video` are identifiers, so `strip_measurements`
     /// keeps them.
     fn unseen_holder_busy_message(device: &str) -> String {
-        format!(
-            "Close the other app, or wait for irlumed to finish, then retry; if irlumed keeps holding \
-             it, please report it (`irlume support-report` says where). camera busy; \
-             `sudo fuser -v {device}` names the holder."
-        )
+        let resolved =
+            std::fs::canonicalize(device).unwrap_or_else(|_| std::path::PathBuf::from(device));
+        let command = resolved.to_str().and_then(|fuser_device| {
+            let command = format!(
+                "camera busy; `sudo fuser -v {fuser_device}`. Close the other app or \
+                 let irlumed finish, then retry; if it stays held, please report it (`irlume support-report` says where)."
+            );
+            ("hardware: ".len() + command.chars().count() <= 240).then_some(command)
+        });
+        command.unwrap_or_else(|| {
+            format!(
+                "Close the other app or let irlumed finish, then retry; if it stays held, please \
+                 report it (`irlume support-report` says where). camera busy; {device}."
+            )
+        })
     }
 
     fn unseen_holder_busy_wire(device: &str) -> String {
@@ -14636,30 +14646,52 @@ mod tests {
     }
 
     #[test]
+    fn journal_prose_keeps_the_realistic_unseen_holder_fuser_argument_intact() {
+        let dir = std::env::temp_dir().join(format!("irlume-journal-fuser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let device = dir.join("usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0");
+        std::os::unix::fs::symlink("/dev/null", &device).unwrap();
+        let line = journal_prose(&unseen_holder_busy_wire(device.to_str().unwrap()));
+        assert_eq!(line, unseen_holder_busy_wire(device.to_str().unwrap()));
+        assert!(line.contains("`sudo fuser -v /dev/null`"), "{line}");
+        assert!(line.contains("`irlume support-report`"), "{line}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn journal_prose_keeps_busy_guidance_before_a_long_path() {
         let short = unseen_holder_busy_wire("/dev/video99");
         assert_eq!(journal_prose(&short), short);
 
-        let realistic = unseen_holder_busy_wire(
-            "/dev/v4l/by-id/usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0",
-        );
-        let line = journal_prose(&realistic);
+        let dir =
+            std::env::temp_dir().join(format!("irlume-journal-remedy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let pinned = dir.join("usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0");
+        std::os::unix::fs::symlink("/dev/null", &pinned).unwrap();
+        let realistic = unseen_holder_busy_wire(pinned.to_str().unwrap());
+        assert_eq!(journal_prose(&realistic), realistic);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let long = format!("/dev/{}", "x".repeat(4091));
+        let line = journal_prose(&unseen_holder_busy_wire(&long));
         assert_eq!(line.chars().count(), 243, "{line}");
         assert!(line.ends_with("..."), "{line}");
         assert!(!line.contains('\n'), "{line}");
         assert!(
-            line.starts_with("hardware: Close the other app, or wait"),
+            line.starts_with("hardware: Close the other app or let irlumed finish"),
             "{line}"
         );
         assert!(
-            line.contains("if irlumed keeps holding it, please report it"),
+            line.contains("if it stays held, please report it"),
             "{line}"
         );
         assert!(line.contains("`irlume support-report`"), "{line}");
         assert!(
             line.find("`irlume support-report`")
                 .expect("report pointer")
-                < line.find("/dev/v4l/").expect("path prefix")
+                < line.find("/dev/").expect("path prefix")
         );
     }
 
@@ -20105,12 +20137,27 @@ mod tests {
             format!("{PREFIX}{short}")
         );
 
-        let path = "/dev/v4l/by-id/usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0";
+        let dir =
+            std::env::temp_dir().join(format!("irlume-no-decision-fuser-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let pinned = dir.join("usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0");
+        std::os::unix::fs::symlink("/dev/null", &pinned).unwrap();
+        let path = pinned.to_str().unwrap();
         let line = no_decision_line(
             "alice",
             &irlume_common::Error::CameraBusy(unseen_holder_busy_message(path)),
         );
-        assert!(line.starts_with(PREFIX), "{line}");
+        assert_eq!(line, format!("{PREFIX}{}", unseen_holder_busy_wire(path)));
+        assert!(line.contains("`sudo fuser -v /dev/null`"), "{line}");
+        assert!(line.contains("`irlume support-report`"), "{line}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let long = format!("/dev/{}", "x".repeat(4091));
+        let line = no_decision_line(
+            "alice",
+            &irlume_common::Error::CameraBusy(unseen_holder_busy_message(&long)),
+        );
         assert_eq!(line.chars().count(), PREFIX.chars().count() + 243, "{line}");
         assert!(line.ends_with("..."), "{line}");
         assert!(!line.contains('\n'), "{line}");
@@ -20118,7 +20165,7 @@ mod tests {
         assert!(
             line.find("`irlume support-report`")
                 .expect("report pointer")
-                < line.find("/dev/v4l/").expect("path prefix")
+                < line.find("/dev/").expect("path prefix")
         );
     }
 

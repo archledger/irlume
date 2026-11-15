@@ -134,8 +134,45 @@ has_async_fetch=1
 # Lifecycle probes use the production functions, never an installer run. The
 # failed-query case owns a real active child; status cases use a completed
 # publication record before their direct child's first reap.
-sed '/^main "\$@"$/d' "$script" > "$work/lifecycle-probes.sh"
+# Harness-only shared-directory attacker: before the publication redirect,
+# point its .part file at a known target. The production script has no such
+# branch; its original redirect performs the actual vulnerable operation.
+# shellcheck disable=SC2016
+sed -e 's#^  printf .* > "$fetch_completion.part"$#  case "${TEST_ATTACK_PART:-}" in\n    outer) ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.fetch-complete.part" ;;\n    command) ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.command-complete.part" ;;\n  esac\n  &#' \
+  "$script" > "$work/lifecycle-bindings.sh"
+# Read each successful publication before the normal command cleanup. The
+# expected legacy paths above are independent of the new private assignments.
+# shellcheck disable=SC2016
+sed -e 's#^  mv "\$fetch_completion.part" "\$fetch_completion"$#  &\n  case "${TEST_ATTACK_PART:-}" in\n    outer|command) cat "\$fetch_completion" > "\$probe_dir/\${TEST_ATTACK_PART}-record" ;;\n  esac#' \
+  "$work/lifecycle-bindings.sh" > "$work/lifecycle-publication.sh"
+mv "$work/lifecycle-publication.sh" "$work/lifecycle-bindings.sh"
+sed 's/^fetch_wait() {$/fetch_wait_real() {/' \
+  "$work/lifecycle-bindings.sh" > "$work/lifecycle-waits.sh"
+mv "$work/lifecycle-waits.sh" "$work/lifecycle-bindings.sh"
+sed '/^main "\$@"$/d' "$work/lifecycle-bindings.sh" > "$work/lifecycle-probes.sh"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.fetch-complete.part"' "$work/lifecycle-probes.sh")" = 1 ] \
+  || { echo 'test-install-script: outer marker attack substitution failed' >&2; exit 1; }
+# shellcheck disable=SC2016
+[ "$(grep -cF 'ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.command-complete.part"' "$work/lifecycle-probes.sh")" = 1 ] \
+  || { echo 'test-install-script: command marker attack substitution failed' >&2; exit 1; }
 cat >> "$work/lifecycle-probes.sh" <<'EOF'
+fetch_wait() {
+  probe_dir="${TEST_PROBE_DIR:?}"
+  printf '%s\n%s\n' "$1" "$2" > "$probe_dir/fetch-wait-args"
+  fetch_wait_real "$@"
+}
+legacy_sentinels() {
+  for suffix in .command-complete .command-complete.part .command-jobs \
+    .command-child-jobs .fetch-complete .fetch-complete.part .fetch-jobs; do
+    # The designated attack path is created at write time. All other legacy
+    # paths are ordinary foreign files and must remain byte-identical.
+    case "${TEST_ATTACK_PART:-}:$suffix" in
+      outer:.fetch-complete.part|command:.command-complete.part) continue ;;
+    esac
+    printf 'outside\n' > "${1}${suffix}"
+  done
+}
 probe_dir="${TEST_PROBE_DIR:?}"
 case "$1" in
   query_failure)
@@ -158,6 +195,108 @@ case "$1" in
     fetch_keep=""
     trap on_exit EXIT
     exit 143
+    ;;
+  shared_tmp_markers)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    printf 'protected-content\n' > "$probe_dir/protected-target"
+    auto_tmp=0
+    fetch_keep=""
+    fetch_command_done=""
+    fetch_command_report=""
+    trap fetch_cleanup EXIT
+    exit 0
+    ;;
+  command_markers)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    printf 'protected-content\n' > "$probe_dir/protected-target"
+    auto_tmp=0
+    fetch_keep=""
+    fetch_run sleep 0
+    ;;
+  parent_failure)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    auto_tmp=0
+    fetch_keep="${2##* }"
+    trap fetch_cleanup EXIT
+    exit "${2%% *}"
+    ;;
+  package_report)
+    pkg_dir="$probe_dir/package"
+    mkdir "$pkg_dir"
+    printf 'verified\n' > "$pkg_dir/asset"
+    cat > "$probe_dir/package-child.sh" <<'CHILD'
+printf 'spawned-parent=%s arg=%s\n' "$PPID" "$1" > "$TEST_PROBE_DIR/package-child-progress"
+kill -s TERM "$PPID"
+n=0
+while kill -0 "$PPID" 2>/dev/null && [ "$n" -lt 100 ]; do
+  n=$((n + 1))
+  sleep 0.1
+done
+printf 'asset=%s\n' "$(cat "$1" 2>/dev/null)" >> "$TEST_PROBE_DIR/package-child-progress"
+[ "$(cat "$1")" != verified ] || : > "$TEST_PROBE_DIR/child-read"
+CHILD
+    jobs() {
+      printf '%s\n' "$job_path" > "$probe_dir/job-capture-path"
+      : > "$probe_dir/in-on-exit"
+      return 98
+    }
+    download_dir="$pkg_dir"
+    fetch_done=""
+    fetch_keep=""
+    SUDO=""
+    trap on_exit EXIT
+    trap 'exit 143' TERM
+    install_verified sh "$probe_dir/package-child.sh" "$pkg_dir/asset"
+    ;;
+  main_cleanup)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    download_dir="$tmp"
+    fetch_done="${download_dir}/.fetch-complete"
+    fetch_job_report="${download_dir}/.fetch-jobs"
+    printf '143 -\n' > "$fetch_done"
+    pkg_dir=""
+    job_report=""
+    trap on_exit EXIT
+    exit 143
+    ;;
+  fetch_private_paths)
+    # Observe directory creation in this probe, as a shared-directory client
+    # can, and place foreign fixtures before fetch_release starts its worker.
+    mktemp() {
+      observed_tmp="$(command mktemp "$@")"
+      printf '%s\n' "$observed_tmp" > "$probe_dir/tmp-path"
+      legacy_sentinels "$observed_tmp"
+      printf '%s\n' "$observed_tmp"
+    }
+    fetch_verified() {
+      sleep 0.1
+      tmp="$2"
+      auto_tmp=0
+      fetch_keep=""
+      trap fetch_cleanup EXIT
+      printf 'verified\n' > "$tmp/asset.deb"
+      printf '%s/asset.deb\n' "$tmp"
+    }
+    fetch_release _amd64.deb
+    printf '%s\n' "$download_dir" > "$probe_dir/tmp-path"
+    ;;
+  standalone_creation_failure)
+    # Observe any publication without allowing an out-of-scope path write. A
+    # missing guard calls this spy with tmp empty and a root-level path.
+    fetch_publish() {
+      printf 'tmp=%s completion=%s\n' "$tmp" "$fetch_completion" \
+        > "$probe_dir/publication-attempt"
+      exit "$1"
+    }
+    fetch_verified _amd64.deb
     ;;
   keep_status)
     printf '%s keep\n' "$2" > "$probe_dir/completion"
@@ -182,7 +321,7 @@ env --default-signal=HUP,INT,TERM true \
   || { echo "test-install-script: env --default-signal is missing (GNU coreutils 8.31 or newer)" >&2; exit 1; }
 
 mkdir "$work/bin"
-for tool in sh mktemp rm mv uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep; do
+for tool in sh mktemp rm mv uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep ln; do
   ln -s "$(command -v "$tool")" "$work/bin/$tool"
 done
 
@@ -1051,6 +1190,107 @@ for published in 42 143 0; do
     fail "$label: $(cat "$work/probe-stderr")"
   fi
 done
+
+check_legacy_sentinels() {
+  for suffix in .command-complete .command-complete.part .command-jobs \
+    .command-child-jobs .fetch-complete .fetch-complete.part .fetch-jobs; do
+    case "${2:-}:$suffix" in
+      outer:.fetch-complete.part|command:.command-complete.part) continue ;;
+    esac
+    [ "$(cat "${1}${suffix}" 2>/dev/null)" = outside ] \
+      || fail "$label: changed or removed foreign $1$suffix"
+  done
+}
+
+for marker_mode in outer command; do
+  label="shared-directory $marker_mode marker symlink cannot truncate another file"
+  probe_dir="$work/probe-markers-$marker_mode"
+  mkdir "$probe_dir"
+  marker_probe=shared_tmp_markers
+  [ "$marker_mode" = outer ] || marker_probe=command_markers
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    TEST_ATTACK_PART="$marker_mode" \
+    sh "$work/lifecycle-probes.sh" "$marker_probe" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  want_rc 0
+  [ "$(cat "$probe_dir/protected-target")" = protected-content ] \
+    || fail "$label: publication followed a legacy symlink"
+  [ "$(cat "$probe_dir/$marker_mode-record" 2>/dev/null)" = '0 -' ] \
+    || fail "$label: missing publication record"
+  private_tmp="$(cat "$probe_dir/tmp-path")"
+  check_legacy_sentinels "$private_tmp" "$marker_mode"
+done
+
+label="private parent-owned fetch completion record"
+for published in '42 -' '143 -' '42 keep' '143 keep'; do
+  probe_dir="$work/probe-parent-${published%% *}-${published##* }"
+  mkdir "$probe_dir"
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    sh "$work/lifecycle-probes.sh" parent_failure "$published" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  want_rc "${published%% *}"
+  private_tmp="$(cat "$probe_dir/tmp-path")"
+  [ "$(cat "$private_tmp/.fetch-complete" 2>/dev/null)" = "$published" ] \
+    || fail "$label: wanted $published after publication or recording failed"
+  check_legacy_sentinels "$private_tmp"
+done
+
+label="main exit removes no foreign legacy marker"
+probe_dir="$work/probe-main-cleanup"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" main_cleanup > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+check_legacy_sentinels "$(cat "$probe_dir/tmp-path")"
+
+label="fetch completion and job report stay private"
+probe_dir="$work/probe-fetch-paths"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" fetch_private_paths \
+  > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 0
+private_tmp="$(cat "$probe_dir/tmp-path")"
+[ "$(sed -n 1p "$probe_dir/fetch-wait-args")" = "$private_tmp/.fetch-complete" ] \
+  || fail "$label: completion path changed"
+[ "$(sed -n 2p "$probe_dir/fetch-wait-args")" = "$private_tmp/.fetch-jobs" ] \
+  || fail "$label: job-report path changed"
+check_legacy_sentinels "$private_tmp"
+
+label="package job reports stay in the private package directory"
+probe_dir="$work/probe-package-report"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" package_report > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+[ "$(cat "$probe_dir/job-capture-path" 2>/dev/null)" = "$probe_dir/package/.package-jobs" ] \
+  || fail "$label: job capture used $(cat "$probe_dir/job-capture-path" 2>/dev/null)"
+[ -f "$probe_dir/package/asset" ] || fail "$label: removed the asset after a failed query"
+n=0
+while [ ! -e "$probe_dir/child-read" ] && [ "$n" -lt 260 ]; do sleep 0.05; n=$((n + 1)); done
+[ -e "$probe_dir/child-read" ] || fail "$label: active package child did not finish reading the asset; $(cat "$probe_dir/package-child-progress" 2>/dev/null)"
+
+
+label="standalone temporary creation failure never publishes"
+probe_dir="$work/probe-standalone-creation"
+mkdir "$probe_dir"
+[ ! -e "$probe_dir/missing" ] || fail "$label: missing-directory fixture exists"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  TMPDIR="$probe_dir/missing" \
+  sh "$work/lifecycle-probes.sh" standalone_creation_failure \
+  > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 1
+grep -qF 'could not create a temporary directory for the download.' "$work/probe-stderr" \
+  || fail "$label: did not exercise the real one-argument creation failure"
+[ ! -e "$probe_dir/publication-attempt" ] \
+  || fail "$label: $(cat "$probe_dir/publication-attempt")"
+[ ! -e "$probe_dir/missing" ] || fail "$label: created the intentionally missing directory"
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

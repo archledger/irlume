@@ -238,7 +238,9 @@ All notable changes to irlume are documented here. This project adheres to
   the temporary directory is removed. Package execution preserves the
   caller's input for conffile prompts, remains interruptible without
   removing the package an outstanding job may read, and cleans up before
-  launch, after reaping or on ordinary failure (#1338).
+  launch, after reaping or on ordinary failure. Completion and job-report
+  files stay inside the private download directory, outside the reach of
+  other users of a shared temporary directory (#1338).
 
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself

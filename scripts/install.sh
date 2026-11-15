@@ -174,20 +174,20 @@ on_exit() {
     # a download may still be active even though the publisher itself exited.
     fetch_honor_disposition "$fetch_done"
     if [ "${fetch_keep:-}" = keep ] && [ "$fetch_cancel_waited" = 1 ] && \
-       [ -f "$fetch_done" ] && [ -f "${download_dir}.command-complete" ]; then
+       [ -f "$fetch_done" ] && [ -f "${download_dir}/.command-complete" ]; then
       # Both publishing shells were waited. A raw downloader may still need
       # the directory, but no shell remains to recreate these report files.
       rm -f "$fetch_done" "$fetch_done.part" "$fetch_job_report" \
-        "${download_dir}.command-complete" "${download_dir}.command-complete.part" \
-        "${download_dir}.command-jobs" "${download_dir}.command-child-jobs" || true
+        "${download_dir}/.command-complete" "${download_dir}/.command-complete.part" \
+        "${download_dir}/.command-jobs" "${download_dir}/.command-child-jobs" || true
     fi
     fetch_done=""
   fi
   if [ -n "${download_dir:-}" ] && [ "${fetch_keep:-}" != keep ]; then
-    rm -f "${download_dir}.fetch-complete" "${download_dir}.fetch-complete.part" \
-      "${download_dir}.fetch-jobs" "${download_dir}.command-complete" \
-      "${download_dir}.command-complete.part" "${download_dir}.command-jobs" \
-      "${download_dir}.command-child-jobs" || true
+    rm -f "${download_dir}/.fetch-complete" "${download_dir}/.fetch-complete.part" \
+      "${download_dir}/.fetch-jobs" "${download_dir}/.command-complete" \
+      "${download_dir}/.command-complete.part" "${download_dir}/.command-jobs" \
+      "${download_dir}/.command-child-jobs" || true
     rm -rf "$download_dir" || true
   elif [ -n "${pkg_dir:-}" ]; then
     if [ -z "${job_report:-}" ] || ! package_job_outstanding; then
@@ -253,14 +253,20 @@ fetch_sums() {
 }
 
 # Publish status and cleanup disposition in one atomic rename. Publication is
-# the last filesystem operation of this child. A normal parent waits for it
-# before the first reaping wait, so a numeric child PID cannot have been reused.
+# the last operation observable by another process. A normal parent waits
+# for it before the first reaping wait. A standalone failing download removes
+# its private directory only after saving the status it will actually return.
 fetch_publish() {
   rc="$1"
   trap - EXIT
   printf '%s %s\n' "$rc" "${fetch_keep:--}" > "$fetch_completion.part"
   mv "$fetch_completion.part" "$fetch_completion"
-  [ "${auto_tmp:-0}" -ne 1 ] || rm -f "$fetch_completion"
+  if [ "${auto_tmp:-0}" -eq 1 ]; then
+    rm -f "$fetch_completion"
+    if [ "$rc" -ne 0 ] && [ "${fetch_keep:-}" != keep ]; then
+      rm -rf "$tmp"
+    fi
+  fi
   exit "$rc"
 }
 
@@ -362,9 +368,9 @@ fetch_abort() {
   exit "$rc"
 }
 fetch_run() {
-  fetch_command_done="${tmp}.command-complete"
-  fetch_command_report="${tmp}.command-jobs"
-  fetch_command_child_report="${tmp}.command-child-jobs"
+  fetch_command_done="${tmp}/.command-complete"
+  fetch_command_report="${tmp}/.command-jobs"
+  fetch_command_child_report="${tmp}/.command-child-jobs"
   rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report" \
     "$fetch_command_child_report"
   (
@@ -394,20 +400,23 @@ fetch_run() {
   return "$command_rc"
 }
 
-# fetch_verified's EXIT trap. Failures remove their temporary directory unless
-# an unclear child state requires preservation. The completion record precedes
-# every normal parent reap and the read callback validates its fields.
+# fetch_verified's EXIT trap. A parent-owned directory survives publication
+# and reaping; its parent decides when to delete it. In standalone mode,
+# fetch_publish removes the directory after recording a failure. Unknown state
+# always preserves the directory. Every marker is inside that private directory.
 fetch_cleanup() {
   rc=$?
   trap - EXIT
+  # A failed mktemp leaves no private directory and no legitimate completion
+  # path. Never turn that empty directory into a file beside a shared tmp root.
+  if [ -z "$tmp" ]; then
+    exit "$rc"
+  fi
   if [ -n "$tmp" ] && [ "${fetch_keep:-}" != keep ]; then
-    rm -f "${tmp}.command-complete" "${tmp}.command-complete.part" \
-      "${tmp}.command-jobs" "${tmp}.command-child-jobs" || true
+    rm -f "${tmp}/.command-complete" "${tmp}/.command-complete.part" \
+      "${tmp}/.command-jobs" "${tmp}/.command-child-jobs" || true
   fi
-  if [ "$rc" -ne 0 ] && [ -n "$tmp" ] && [ "${fetch_keep:-}" != keep ]; then
-    rm -rf "$tmp" || true
-  fi
-  fetch_completion="${tmp}.fetch-complete"
+  fetch_completion="${tmp}/.fetch-complete"
   fetch_publish "$rc"
 }
 
@@ -478,8 +487,8 @@ fetch_release() {
     printf '\033[1;31m[irlume]\033[0m %s\n' "could not create a temporary directory for the download." >&2
     return 1
   }
-  fetch_done="${download_dir}.fetch-complete"
-  fetch_job_report="${download_dir}.fetch-jobs"
+  fetch_done="${download_dir}/.fetch-complete"
+  fetch_job_report="${download_dir}/.fetch-jobs"
   fetch_rc=0
   fetch_verified "$1" "$download_dir" > "$download_dir/.fetch-result" &
   fetch_wait "$fetch_done" "$fetch_job_report" || fetch_rc=$?
@@ -533,7 +542,7 @@ install_verified() {
   pkg_dir="$download_dir"
   download_dir=""
   pkg_rc=0
-  job_report="$(mktemp)"
+  job_report="$pkg_dir/.package-jobs"
   # A background shell substitutes /dev/null for stdin, but only fd 0.
   # Save the caller's input and duplicate it over stdin before exec, so sudo
   # sees the original stream without needing any extra descriptor preserved.

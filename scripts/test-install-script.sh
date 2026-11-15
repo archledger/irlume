@@ -332,6 +332,14 @@ echo 1000
 EOF
 cat > "$work/bin/dpkg-query" <<'EOF'
 #!/bin/sh
+case "${TEST_APT:-}" in
+  early_HUP|early_INT|early_TERM)
+    sig=${TEST_APT#early_}
+    # The command substitution owns our parent; its parent is the script's shell.
+    kill -s "$sig" "$(awk '{print $4}' "/proc/$PPID/stat")"
+    sleep 1
+    ;;
+esac
 exit 1
 EOF
 cat > "$work/bin/sudo" <<'EOF'
@@ -779,6 +787,23 @@ want_name_refused() {
 want_name_refused 'a/b' 'a/b'
 want_name_refused '..' '..'
 want_name_refused '.' '.'
+
+# These signals land after fetch_verified returns and before install_verified
+# clears download_dir, the top-level window the fetch subshell does not cover.
+for sig in HUP INT TERM; do
+  case "$sig" in
+    HUP) sig_rc=129 ;;
+    INT) sig_rc=130 ;;
+    TERM) sig_rc=143 ;;
+  esac
+  label="SIG$sig after the verified .deb and before apt-get"
+  install "$debian" lists good active "early_$sig"
+  want_rc "$sig_rc"
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+  if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+  want_block
+  want_no_download
+done
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

@@ -232,6 +232,13 @@ All notable changes to irlume are documented here. This project adheres to
   the pinned serial-bearing alias, and is included only when the complete
   command fits that line, never with a truncated argument (#1338).
 
+- `scripts/install.sh` routes a hangup, interrupt or termination signal
+  while the parent owns a verified release download directory before
+  package installation through the parent's existing cleanup, so dash
+  no longer leaves that directory behind in that pre-install window.
+  Package-manager execution keeps the previous immediate signal behavior,
+  and the verified package remains available to it (#1338).
+
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself
   fails, the way a checksum mismatch already did. Before, a curl

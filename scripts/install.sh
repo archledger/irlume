@@ -248,15 +248,19 @@ should_install_deb() {
 
 # Install the verified release package with the package command "$@", as
 # root, then remove its directory. download_dir is empty while the command
-# runs, as bash runs on_exit as soon as a hangup or termination signal
-# reaches the script, while the command may still be reading the package.
-# A command that fails ends the run with its own exit status; on_exit then
-# removes the package.
+# runs. Signals keep their default dispositions there, so dash cannot defer
+# a trap until after the package command: the shell still exits at once
+# while the command may be reading the package. Restore the traps afterward;
+# on_exit removes the package on an ordinary failure.
 install_verified() {
   pkg_dir="$download_dir"
   download_dir=""
   pkg_rc=0
+  trap - HUP INT TERM
   $SUDO "$@" || pkg_rc=$?
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   download_dir="$pkg_dir"
   [ "$pkg_rc" -eq 0 ] || exit "$pkg_rc"
   download_dir=""
@@ -376,8 +380,13 @@ main() {
   # The directory on_exit removes: empty, whatever the environment holds,
   # until the release lane has downloaded and verified a package.
   download_dir=""
-  # Next, so every later exit runs it. A $(...) subshell does not.
+  # Next, so every later ordinary exit runs it. A $(...) subshell does not.
   trap on_exit EXIT
+  # Route signals through it too, except while install_verified gives the
+  # package command the default dispositions described below.
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   # Privilege: run package commands as root, via sudo when not already root.
   SUDO=""

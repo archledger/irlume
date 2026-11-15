@@ -5,8 +5,9 @@
 # Tests the channel scripts/install.sh chooses and what it prints when an
 # install fails or succeeds, without the network or root. Stand-ins first on
 # PATH log what they are asked. A copy of the script reads a fixture for
-# /etc/os-release, its only difference; a second copy of that one calls
-# fetch_verified instead of main on its last line. Real gzip and grep judge
+# /etc/os-release and adds test-only self-signals at exact handoff boundaries;
+# a second copy of that one calls fetch_verified instead of main on its last
+# line. Real gzip and grep judge
 # a real gzipped index, so a check of the wrong thing still fails here.
 # Every run keeps its exit status, and its stdout stays empty: install.sh's
 # own lines go to stderr.
@@ -67,7 +68,8 @@
 #   - nothing in its temporary directory, which starts empty for every run:
 #     not after a release download that is refused, breaks off or is
 #     interrupted (SIGHUP, SIGINT, SIGTERM, each ending the run with 128 plus
-#     its number), a signature or checksum that does not verify, a release
+#     its number) before a package job starts or after wait has reaped it,
+#     a signature or checksum that does not verify, a release
 #     .deb whose name gives no version, or a package command that fails
 #     (apt-get on Debian, dnf on Fedora), and not after an install, where
 #     the caller removes the directory once the package manager has read the
@@ -94,6 +96,221 @@ trap 'rm -rf "$work"' EXIT
 sed "s#/etc/os-release#$work/os-release#g" "$script" > "$work/install.sh"
 [ "$(grep -c "$work/os-release" "$work/install.sh")" -ge 2 ] \
   || { echo "test-install-script: install.sh no longer reads /etc/os-release" >&2; exit 1; }
+# Harness-only boundary signals. pre_launch has no child; post_wait follows
+# reaping and precedes ownership restoration. post_launch is present once the
+# implementation has a direct asynchronous child and covers the launch/wait
+# boundary before wait starts. fetch_delay signals only the captured installer
+# PID while its download is active. Production has no signal-injection branch.
+# Single-quoted sed templates produce literal shell expansions in the copy.
+# shellcheck disable=SC2016
+sed -e 's/^main() {$/main() {\n  printf "%s\\n" "$$" > "${TEST_DIR:?}\/installer-pid"/' \
+    -e 's/^  pkg_rc=0$/  [ "${TEST_APT:-}" != pre_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"\n  pkg_rc=0/' \
+    -e 's/^  \$SUDO "\$@" || pkg_rc=$?$/  $SUDO "$@" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  wait "\$!" || pkg_rc=$?$/  wait "$!" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  fetch_wait "\$fetch_done" "\$fetch_job_report" || fetch_rc=$?$/  fetch_wait "$fetch_done" "$fetch_job_report" || fetch_rc=$?\n  [ "${TEST_RELEASE:-}" != fetch_after_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  exec 9<&-$/  exec 9<\&-\n  [ "${TEST_APT:-}" != post_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    "$work/install.sh" > "$work/install-boundaries.sh"
+mv "$work/install-boundaries.sh" "$work/install.sh"
+# Harness-only report failure: empty a job report by writing to /dev/full.
+# shellcheck disable=SC2016
+sed -e 's#^  job_capture "\$job_report" || return 0$#  job_capture "${TEST_REPORT_PATH:-$job_report}" || return 0#' \
+  "$work/install.sh" > "$work/install-report-failure.sh"
+mv "$work/install-report-failure.sh" "$work/install.sh"
+[ "$(grep -c 'TEST_REPORT_PATH:-' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: job report substitution failed" >&2; exit 1; }
+[ "$(grep -c 'TEST_APT:-.*pre_launch' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: pre-launch boundary substitution failed" >&2; exit 1; }
+[ "$(grep -c 'TEST_APT:-.*post_wait' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: post-wait boundary substitution failed" >&2; exit 1; }
+has_background_package=0
+if grep -q '^  exec 9<&-$' "$script"; then
+  has_background_package=1
+  [ "$(grep -c 'TEST_APT:-.*post_launch' "$work/install.sh")" = 1 ] \
+    || { echo "test-install-script: post-launch boundary substitution failed" >&2; exit 1; }
+fi
+has_async_fetch=1
+[ "$(grep -c 'TEST_RELEASE:-.*fetch_after_wait' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: fetch post-wait substitution or wait form changed" >&2; exit 1; }
+# Lifecycle probes use the production functions, never an installer run. The
+# failed-query case owns a real active child; status cases use a completed
+# publication record before their direct child's first reap.
+# Harness-only shared-directory attacker: before the publication redirect,
+# point its .part file at a known target. The production script has no such
+# branch; its original redirect performs the actual vulnerable operation.
+# shellcheck disable=SC2016
+sed -e 's#^  printf .* > "$fetch_completion.part"$#  case "${TEST_ATTACK_PART:-}" in\n    outer) ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.fetch-complete.part" ;;\n    command) ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.command-complete.part" ;;\n  esac\n  &#' \
+  "$script" > "$work/lifecycle-bindings.sh"
+# Read each successful publication before the normal command cleanup. The
+# expected legacy paths above are independent of the new private assignments.
+# shellcheck disable=SC2016
+sed -e 's#^  mv "\$fetch_completion.part" "\$fetch_completion"$#  &\n  case "${TEST_ATTACK_PART:-}" in\n    outer|command) cat "\$fetch_completion" > "\$probe_dir/\${TEST_ATTACK_PART}-record" ;;\n  esac#' \
+  "$work/lifecycle-bindings.sh" > "$work/lifecycle-publication.sh"
+mv "$work/lifecycle-publication.sh" "$work/lifecycle-bindings.sh"
+sed 's/^fetch_wait() {$/fetch_wait_real() {/' \
+  "$work/lifecycle-bindings.sh" > "$work/lifecycle-waits.sh"
+mv "$work/lifecycle-waits.sh" "$work/lifecycle-bindings.sh"
+sed '/^main "\$@"$/d' "$work/lifecycle-bindings.sh" > "$work/lifecycle-probes.sh"
+# shellcheck disable=SC2016
+[ "$(grep -cF 'ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.fetch-complete.part"' "$work/lifecycle-probes.sh")" = 1 ] \
+  || { echo 'test-install-script: outer marker attack substitution failed' >&2; exit 1; }
+# shellcheck disable=SC2016
+[ "$(grep -cF 'ln -s "$TEST_PROBE_DIR/protected-target" "${tmp}.command-complete.part"' "$work/lifecycle-probes.sh")" = 1 ] \
+  || { echo 'test-install-script: command marker attack substitution failed' >&2; exit 1; }
+cat >> "$work/lifecycle-probes.sh" <<'EOF'
+fetch_wait() {
+  probe_dir="${TEST_PROBE_DIR:?}"
+  printf '%s\n%s\n' "$1" "$2" > "$probe_dir/fetch-wait-args"
+  fetch_wait_real "$@"
+}
+legacy_sentinels() {
+  for suffix in .command-complete .command-complete.part .command-jobs \
+    .command-child-jobs .fetch-complete .fetch-complete.part .fetch-jobs; do
+    # The designated attack path is created at write time. All other legacy
+    # paths are ordinary foreign files and must remain byte-identical.
+    case "${TEST_ATTACK_PART:-}:$suffix" in
+      outer:.fetch-complete.part|command:.command-complete.part) continue ;;
+    esac
+    printf 'outside\n' > "${1}${suffix}"
+  done
+}
+probe_dir="${TEST_PROBE_DIR:?}"
+case "$1" in
+  query_failure)
+    mkdir "$probe_dir/package"
+    printf 'verified\n' > "$probe_dir/package/asset"
+    (
+      n=0
+      while [ ! -e "$probe_dir/finish" ]; do
+        n=$((n + 1))
+        [ "$n" -lt 200 ] || exit 98
+        sleep 0.05
+      done
+      : > "$probe_dir/child-finished"
+    ) &
+    jobs() { return 98; }
+    pkg_dir="$probe_dir/package"
+    download_dir=""
+    job_report="$probe_dir/jobs"
+    fetch_done=""
+    fetch_keep=""
+    trap on_exit EXIT
+    exit 143
+    ;;
+  shared_tmp_markers)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    printf 'protected-content\n' > "$probe_dir/protected-target"
+    auto_tmp=0
+    fetch_keep=""
+    fetch_command_done=""
+    fetch_command_report=""
+    trap fetch_cleanup EXIT
+    exit 0
+    ;;
+  command_markers)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    printf 'protected-content\n' > "$probe_dir/protected-target"
+    auto_tmp=0
+    fetch_keep=""
+    fetch_run sleep 0
+    ;;
+  parent_failure)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    auto_tmp=0
+    fetch_keep="${2##* }"
+    trap fetch_cleanup EXIT
+    exit "${2%% *}"
+    ;;
+  package_report)
+    pkg_dir="$probe_dir/package"
+    mkdir "$pkg_dir"
+    printf 'verified\n' > "$pkg_dir/asset"
+    cat > "$probe_dir/package-child.sh" <<'CHILD'
+printf 'spawned-parent=%s arg=%s\n' "$PPID" "$1" > "$TEST_PROBE_DIR/package-child-progress"
+kill -s TERM "$PPID"
+n=0
+while kill -0 "$PPID" 2>/dev/null && [ "$n" -lt 100 ]; do
+  n=$((n + 1))
+  sleep 0.1
+done
+printf 'asset=%s\n' "$(cat "$1" 2>/dev/null)" >> "$TEST_PROBE_DIR/package-child-progress"
+[ "$(cat "$1")" != verified ] || : > "$TEST_PROBE_DIR/child-read"
+CHILD
+    jobs() {
+      printf '%s\n' "$job_path" > "$probe_dir/job-capture-path"
+      : > "$probe_dir/in-on-exit"
+      return 98
+    }
+    download_dir="$pkg_dir"
+    fetch_done=""
+    fetch_keep=""
+    SUDO=""
+    trap on_exit EXIT
+    trap 'exit 143' TERM
+    install_verified sh "$probe_dir/package-child.sh" "$pkg_dir/asset"
+    ;;
+  main_cleanup)
+    tmp="$(mktemp -d "$probe_dir/tmp.XXXXXX")"
+    printf '%s\n' "$tmp" > "$probe_dir/tmp-path"
+    legacy_sentinels "$tmp"
+    download_dir="$tmp"
+    fetch_done="${download_dir}/.fetch-complete"
+    fetch_job_report="${download_dir}/.fetch-jobs"
+    printf '143 -\n' > "$fetch_done"
+    pkg_dir=""
+    job_report=""
+    trap on_exit EXIT
+    exit 143
+    ;;
+  fetch_private_paths)
+    # Observe directory creation in this probe, as a shared-directory client
+    # can, and place foreign fixtures before fetch_release starts its worker.
+    mktemp() {
+      observed_tmp="$(command mktemp "$@")"
+      printf '%s\n' "$observed_tmp" > "$probe_dir/tmp-path"
+      legacy_sentinels "$observed_tmp"
+      printf '%s\n' "$observed_tmp"
+    }
+    fetch_verified() {
+      sleep 0.1
+      tmp="$2"
+      auto_tmp=0
+      fetch_keep=""
+      trap fetch_cleanup EXIT
+      printf 'verified\n' > "$tmp/asset.deb"
+      printf '%s/asset.deb\n' "$tmp"
+    }
+    fetch_release _amd64.deb
+    printf '%s\n' "$download_dir" > "$probe_dir/tmp-path"
+    ;;
+  standalone_creation_failure)
+    # Observe any publication without allowing an out-of-scope path write. A
+    # missing guard calls this spy with tmp empty and a root-level path.
+    fetch_publish() {
+      printf 'tmp=%s completion=%s\n' "$tmp" "$fetch_completion" \
+        > "$probe_dir/publication-attempt"
+      exit "$1"
+    }
+    fetch_verified _amd64.deb
+    ;;
+  keep_status)
+    printf '%s keep\n' "$2" > "$probe_dir/completion"
+    ( exit "$2" ) &
+    probe_rc=0
+    fetch_wait "$probe_dir/completion" "$probe_dir/jobs" || probe_rc=$?
+    [ "$probe_rc" = "$3" ] && [ "$fetch_keep" = keep ] || {
+      printf 'published %s keep returned %s with %s, want %s with keep\n' \
+        "$2" "$probe_rc" "${fetch_keep:-unset}" "$3" >&2
+      exit 1
+    }
+    ;;
+esac
+EOF
 sed 's/^main "\$@"$/fetch_verified "$@"/' "$work/install.sh" > "$work/fetch-verified.sh"
 [ "$(grep -cxF 'fetch_verified "$@"' "$work/fetch-verified.sh")" = 1 ] \
   || { echo 'test-install-script: install.sh no longer has one main "$@" line' >&2; exit 1; }
@@ -104,7 +321,7 @@ env --default-signal=HUP,INT,TERM true \
   || { echo "test-install-script: env --default-signal is missing (GNU coreutils 8.31 or newer)" >&2; exit 1; }
 
 mkdir "$work/bin"
-for tool in sh mktemp rm uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep; do
+for tool in sh mktemp rm mv uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep ln; do
   ln -s "$(command -v "$tool")" "$work/bin/$tool"
 done
 
@@ -133,7 +350,9 @@ cat > "$work/bin/curl" <<'EOF'
 # no_version serves the release whose .deb names no version; listed serves
 # the SHA256SUMS a case wrote to $TEST_DIR/SHA256SUMS.listed; cut
 # breaks the asset off after a few bytes, as curl exits 18 on a partial
-# transfer; interrupt_HUP, interrupt_INT and interrupt_TERM write a few bytes
+# transfer; fetch_delay sends TEST_SIGNAL only to the captured installer PID
+# and keeps a completed asset's download process alive for ten seconds;
+# interrupt_HUP, interrupt_INT and interrupt_TERM write a few bytes
 # of the asset, then send that signal to the shell running the download and
 # die of it, as a closed terminal, a Ctrl-C or a kill ends a real download
 # (it logs that it outlived the signal if it does not die); every other mode
@@ -197,6 +416,11 @@ case "$url" in
     case "$TEST_RELEASE" in
       bad_sum) printf 'changed\n' > "$out" ;;
       cut) printf 'stand-in' > "$out"; exit 18 ;;
+      fetch_delay)
+        cat "$asset" > "$out"
+        kill -s "${TEST_SIGNAL:-TERM}" "$(cat "$TEST_DIR/installer-pid")"
+        exec sleep 10
+        ;;
       interrupt_*)
         sig="${TEST_RELEASE#interrupt_}"
         printf 'stand-in' > "$out"
@@ -224,7 +448,7 @@ case " $* " in
     ;;
   *" --verify "*)
     case "$TEST_RELEASE" in
-      good|bad_sum|no_version|listed|cut|interrupt_*) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
+      good|bad_sum|no_version|listed|cut|interrupt_*|fetch_delay|fetch_after_wait) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
       *) exit 1 ;;
     esac
     ;;
@@ -238,16 +462,28 @@ EOF
 # Stand-in apt-get: under TEST_APT=fail an install exits 100, as apt-get does
 # when an install fails. Under TEST_APT=signal_shell an install first sends
 # SIGTERM to the shell that started it, the run of the copy, and to nothing
-# else, then waits up to 10 seconds for that shell to end; it touches
-# $TEST_DIR/apt-done when it is finished. An install from a local .deb
-# records its path in $TEST_DIR/deb-path and logs "apt-get read the verified
-# <name>" when the file still held the verified release asset.
+# else. It and post_launch both wait up to 10 seconds for that shell to end;
+# child_int sends SIGINT to itself, proving the asynchronous child did not
+# inherit an ignored interrupt. Each applicable mode touches apt-done when
+# finished. An install records the local .deb path in deb-path and logs
+# "apt-get read the verified <name>" only when it holds the verified asset.
 cat > "$work/bin/apt-get" <<'EOF'
 #!/bin/sh
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$TEST_LOG"
 if [ "${1:-}" = install ]; then
-  if [ "$TEST_APT" = signal_shell ]; then
+  if [ "$TEST_APT" = signal_shell ] || [ "$TEST_APT" = report_io_failure ]; then
     kill -s TERM "$PPID"
+  fi
+  if [ "$TEST_APT" = child_int ]; then
+    kill -s INT "$$"
+    printf 'apt-get: SIGINT was ignored\n' >> "$TEST_LOG"
+  fi
+  if [ "$TEST_APT" = stdin_pkg ]; then
+    IFS= read -r answer || exit 98
+    printf 'apt-get stdin: %s\n' "$answer" >> "$TEST_LOG"
+    [ "$answer" = 'keep-local-conffile' ] || exit 97
+  fi
+  case "$TEST_APT" in signal_shell|report_io_failure|post_launch)
     n=0
     while kill -0 "$PPID" 2>/dev/null; do
       n=$((n + 1))
@@ -257,7 +493,8 @@ if [ "${1:-}" = install ]; then
       fi
       sleep 0.1
     done
-  fi
+    ;;
+  esac
   for arg in "$@"; do
     case "$arg" in
       /*.deb)
@@ -269,7 +506,7 @@ if [ "${1:-}" = install ]; then
         ;;
     esac
   done
-  [ "$TEST_APT" != signal_shell ] || : > "$TEST_DIR/apt-done"
+  case "$TEST_APT" in signal_shell|report_io_failure|post_launch|child_int) : > "$TEST_DIR/apt-done" ;; esac
   [ "$TEST_APT" != fail ] || exit 100
 fi
 EOF
@@ -332,6 +569,14 @@ echo 1000
 EOF
 cat > "$work/bin/dpkg-query" <<'EOF'
 #!/bin/sh
+case "${TEST_APT:-}" in
+  early_HUP|early_INT|early_TERM)
+    sig=${TEST_APT#early_}
+    # The command substitution owns our parent; its parent is the script's shell.
+    kill -s "$sig" "$(awk '{print $4}' "/proc/$PPID/stat")"
+    sleep 1
+    ;;
+esac
 exit 1
 EOF
 cat > "$work/bin/sudo" <<'EOF'
@@ -373,10 +618,20 @@ install() {
   rm -rf "$work/tmp"
   mkdir "$work/tmp"
   rc=0
-  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
+  started=$SECONDS
+  apt_mode=${5:-ok}
+  report_path=""
+  [ "$apt_mode" != report_io_failure ] || report_path=/dev/full
+  set -- env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
     TEST_LOG="$work/log" TEST_DIR="$work" \
     TEST_PPA="$2" TEST_RELEASE="${3:-none}" TEST_DAEMON="${4:-active}" TEST_APT="${5:-ok}" \
-    TEST_KEY_FP="$key_fp" sh "$work/install.sh" > "$work/stdout" 2> "$work/stderr" || rc=$?
+    TEST_SIGNAL="${sig:-}" TEST_REPORT_PATH="$report_path" TEST_KEY_FP="$key_fp" sh "$work/install.sh"
+  if [ "$apt_mode" = stdin_pkg ]; then
+    printf 'keep-local-conffile\n' | "$@" > "$work/stdout" 2> "$work/stderr" || rc=$?
+  else
+    "$@" > "$work/stdout" 2> "$work/stderr" || rc=$?
+  fi
+  elapsed=$((SECONDS - started))
   sed 's/\x1b\[[0-9;]*m//g' "$work/stderr" > "$work/plain"
   leftover="$(ls -A "$work/tmp")" || leftover="(the run removed TMPDIR itself)"
   [ ! -s "$work/stdout" ] || fail "$label: wrote to stdout; install.sh writes only to stderr"
@@ -675,10 +930,21 @@ if grep -q '^apt-get: the shell outlived SIGTERM$' "$work/log"; then
 fi
 want_rc 143
 # The file was still there when apt-get read it, after the shell had ended:
-# bash runs on_exit at once on SIGTERM, and on_exit removed nothing (dash
-# runs no EXIT trap for a signal it does not trap).
+# the parent's signal trap runs on_exit at once, and its job-state check
+# leaves a running or suspended package child's directory in place.
 want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
 want_no_err 'The machine side is ready.'
+
+label="SIGTERM during package installation with an unwritable job report"
+rm -f "$work/apt-done"
+install "$debian" lists good active report_io_failure
+n=0
+while [ ! -e "$work/apt-done" ] && [ "$n" -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
+[ -e "$work/apt-done" ] || fail "$label: the stand-in apt-get did not finish"
+want_rc 143
+want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+want_no_err 'The machine side is ready.'
+want_block
 
 label="a directory made at the download directory's path after the install"
 rm -f "$work/deb-path"
@@ -779,6 +1045,252 @@ want_name_refused() {
 want_name_refused 'a/b' 'a/b'
 want_name_refused '..' '..'
 want_name_refused '.' '.'
+
+# These signals land after fetch_verified returns and before install_verified
+# clears download_dir, the top-level window the fetch subshell does not cover.
+for sig in HUP INT TERM; do
+  case "$sig" in
+    HUP) sig_rc=129 ;;
+    INT) sig_rc=130 ;;
+    TERM) sig_rc=143 ;;
+  esac
+  label="SIG$sig after the verified .deb and before apt-get"
+  install "$debian" lists good active "early_$sig"
+  want_rc "$sig_rc"
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+  if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+  want_block
+  want_no_download
+done
+
+# Signals at the two sides of the package child. Before launch the parent's
+# cleanup still owns the download. After wait reaps the child it owns it
+# again, before download_dir is restored.
+for boundary in pre_launch post_wait; do
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig in the $boundary package boundary"
+    install "$debian" lists good active "$boundary"
+    want_rc "$sig_rc"
+    want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+    if [ "$boundary" = pre_launch ]; then
+      if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+    else
+      want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+    fi
+    want_no_err 'The machine side is ready.'
+    want_block
+    want_no_download
+  done
+done
+
+if [ "$has_background_package" = 1 ]; then
+  # This signal is after the child exists and before wait starts. apt-get
+  # waits for the installer to end, then must still find the verified file.
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig after launch and before wait"
+    rm -f "$work/apt-done"
+    install "$debian" lists good active post_launch
+    n=0
+    while [ ! -e "$work/apt-done" ] && [ "$n" -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
+    [ -e "$work/apt-done" ] || fail "$label: the stand-in apt-get did not finish"
+    want_rc "$sig_rc"
+    want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+    want_no_err 'The machine side is ready.'
+    want_block
+  done
+
+  # Without job control, an asynchronous child can inherit SIGINT ignored.
+  # Its local reset followed by exec must make this a normal status-130 exit.
+  label="SIGINT disposition in the package child"
+  install "$debian" lists good active child_int
+  want_rc 130
+  grep -q '^apt-get install -y .*/irlume_0.99.0_amd64.deb$' "$work/log" \
+    || fail "$label: apt-get did not start"
+  want_no_err 'The machine side is ready.'
+  want_no_err 'apt-get: SIGINT was ignored'
+  want_block
+  want_no_download
+fi
+
+label="a conffile response reaches the asynchronous package child"
+install "$debian" lists good active stdin_pkg
+want_ready
+want_called 'apt-get stdin: keep-local-conffile'
+want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+
+for sig in HUP INT TERM; do
+  case "$sig" in
+    HUP) sig_rc=129 ;;
+    INT) sig_rc=130 ;;
+    TERM) sig_rc=143 ;;
+  esac
+  label="SIG$sig only to the installer during an active fetch"
+  install "$debian" lists fetch_delay active
+  want_rc "$sig_rc"
+  [ "$elapsed" -lt 5 ] || fail "$label: the active download was not cancelled promptly (${elapsed}s)"
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+  if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+  want_block
+  want_no_download
+
+done
+
+if [ "$has_async_fetch" = 1 ]; then
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig after fetch wait and before the answer is read"
+    install "$debian" lists fetch_after_wait active
+    want_rc "$sig_rc"
+    want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+    if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+    want_block
+    want_no_download
+  done
+fi
+
+label="a failed jobs query preserves the package of an active child"
+probe_dir="$work/probe-query-failure"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" query_failure > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+[ -f "$probe_dir/package/asset" ] \
+  || fail "$label: removed the verified package after a failed job query"
+: > "$probe_dir/finish"
+n=0
+while [ ! -e "$probe_dir/child-finished" ] && [ "$n" -lt 200 ]; do sleep 0.05; n=$((n + 1)); done
+[ -e "$probe_dir/child-finished" ] || fail "$label: active child did not stop"
+
+for published in 42 143 0; do
+  expected="$published"
+  [ "$published" -ne 0 ] || expected=1
+  label="published $published keep status and cleanup disposition"
+  probe_dir="$work/probe-keep-$published"
+  mkdir "$probe_dir"
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    sh "$work/lifecycle-probes.sh" keep_status "$published" "$expected" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "$label: $(cat "$work/probe-stderr")"
+  fi
+done
+
+check_legacy_sentinels() {
+  for suffix in .command-complete .command-complete.part .command-jobs \
+    .command-child-jobs .fetch-complete .fetch-complete.part .fetch-jobs; do
+    case "${2:-}:$suffix" in
+      outer:.fetch-complete.part|command:.command-complete.part) continue ;;
+    esac
+    [ "$(cat "${1}${suffix}" 2>/dev/null)" = outside ] \
+      || fail "$label: changed or removed foreign $1$suffix"
+  done
+}
+
+for marker_mode in outer command; do
+  label="shared-directory $marker_mode marker symlink cannot truncate another file"
+  probe_dir="$work/probe-markers-$marker_mode"
+  mkdir "$probe_dir"
+  marker_probe=shared_tmp_markers
+  [ "$marker_mode" = outer ] || marker_probe=command_markers
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    TEST_ATTACK_PART="$marker_mode" \
+    sh "$work/lifecycle-probes.sh" "$marker_probe" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  want_rc 0
+  [ "$(cat "$probe_dir/protected-target")" = protected-content ] \
+    || fail "$label: publication followed a legacy symlink"
+  [ "$(cat "$probe_dir/$marker_mode-record" 2>/dev/null)" = '0 -' ] \
+    || fail "$label: missing publication record"
+  private_tmp="$(cat "$probe_dir/tmp-path")"
+  check_legacy_sentinels "$private_tmp" "$marker_mode"
+done
+
+label="private parent-owned fetch completion record"
+for published in '42 -' '143 -' '42 keep' '143 keep'; do
+  probe_dir="$work/probe-parent-${published%% *}-${published##* }"
+  mkdir "$probe_dir"
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    sh "$work/lifecycle-probes.sh" parent_failure "$published" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  want_rc "${published%% *}"
+  private_tmp="$(cat "$probe_dir/tmp-path")"
+  [ "$(cat "$private_tmp/.fetch-complete" 2>/dev/null)" = "$published" ] \
+    || fail "$label: wanted $published after publication or recording failed"
+  check_legacy_sentinels "$private_tmp"
+done
+
+label="main exit removes no foreign legacy marker"
+probe_dir="$work/probe-main-cleanup"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" main_cleanup > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+check_legacy_sentinels "$(cat "$probe_dir/tmp-path")"
+
+label="fetch completion and job report stay private"
+probe_dir="$work/probe-fetch-paths"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" fetch_private_paths \
+  > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 0
+private_tmp="$(cat "$probe_dir/tmp-path")"
+[ "$(sed -n 1p "$probe_dir/fetch-wait-args")" = "$private_tmp/.fetch-complete" ] \
+  || fail "$label: completion path changed"
+[ "$(sed -n 2p "$probe_dir/fetch-wait-args")" = "$private_tmp/.fetch-jobs" ] \
+  || fail "$label: job-report path changed"
+check_legacy_sentinels "$private_tmp"
+
+label="package job reports stay in the private package directory"
+probe_dir="$work/probe-package-report"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" package_report > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+[ "$(cat "$probe_dir/job-capture-path" 2>/dev/null)" = "$probe_dir/package/.package-jobs" ] \
+  || fail "$label: job capture used $(cat "$probe_dir/job-capture-path" 2>/dev/null)"
+[ -f "$probe_dir/package/asset" ] || fail "$label: removed the asset after a failed query"
+n=0
+while [ ! -e "$probe_dir/child-read" ] && [ "$n" -lt 260 ]; do sleep 0.05; n=$((n + 1)); done
+[ -e "$probe_dir/child-read" ] || fail "$label: active package child did not finish reading the asset; $(cat "$probe_dir/package-child-progress" 2>/dev/null)"
+
+
+label="standalone temporary creation failure never publishes"
+probe_dir="$work/probe-standalone-creation"
+mkdir "$probe_dir"
+[ ! -e "$probe_dir/missing" ] || fail "$label: missing-directory fixture exists"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  TMPDIR="$probe_dir/missing" \
+  sh "$work/lifecycle-probes.sh" standalone_creation_failure \
+  > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 1
+grep -qF 'could not create a temporary directory for the download.' "$work/probe-stderr" \
+  || fail "$label: did not exercise the real one-argument creation failure"
+[ ! -e "$probe_dir/publication-attempt" ] \
+  || fail "$label: $(cat "$probe_dir/publication-attempt")"
+[ ! -e "$probe_dir/missing" ] || fail "$label: created the intentionally missing directory"
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

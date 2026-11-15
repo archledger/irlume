@@ -89,7 +89,7 @@ report_block() {
 }
 
 # A failed verification. It names the private route itself: it runs inside
-# fetch_verified's $(...) subshell, where main()'s EXIT trap does not run.
+# fetch_verified's subshell, where main()'s EXIT trap does not run.
 die_verify() {
   printf '\033[1;31m[irlume]\033[0m %s\n' "$1" >&2
   printf '\033[1;31m[irlume]\033[0m %s\n' "Do not override verification or install the download by hand;" >&2
@@ -102,13 +102,99 @@ die_verify() {
 # under set -e, or a package command that fails, with its own status) ends
 # here and says where to report a problem; an exit 0 adds nothing. A release
 # package the release lane downloaded and did not install (its version did
-# not parse, or the package command failed) is removed first; download_dir
-# is empty while the package command runs and after the release lane has
-# removed the directory itself. The exit status is kept.
+# not parse, or the package command failed) is removed first: download_dir
+# when it is held, or pkg_dir when no package job is outstanding. A running
+# or suspended job keeps the verified package to read. After ordinary cleanup
+# pkg_dir is empty so a recreated directory at the old path is never removed.
+# The exit status is kept.
+# Capture the sole direct job in the current shell, then a completion marker.
+# Query and write failures are independently unknown: neither a failed query
+# nor Bash returning zero after a failed jobs write may become a no-job report.
+# Parent-shell redirection is required: a command-substitution subshell cannot
+# see Dash's job table.
+job_capture() {
+  job_path="$1"
+  : > "$job_path" 2>/dev/null || return 1
+  LC_ALL=C jobs -l >> "$job_path" 2>/dev/null || return 1
+  printf '%s\n' 'irlume-job-state-version-1' >> "$job_path" 2>/dev/null || return 1
+  [ -s "$job_path" ]
+}
+
+# A valid report is either the marker alone (no job) or one state line followed
+# by the marker. Empty output is never accepted as a report. Parse both Dash's
+# separated job marker and Bash's attached one; malformed layouts are unknown.
+job_report_state() {
+  awk -v marker='irlume-job-state-version-1' \
+    'NR == 1 {
+      if ($0 == marker) { no_job = 1; next }
+      seen_job = 1
+      if ($1 ~ /^\[[0-9]+\][+-]$/ && $2 ~ /^[0-9]+$/) state = $3
+      else if ($1 ~ /^\[[0-9]+\]$/ && $2 ~ /^[+-]$/ && $3 ~ /^[0-9]+$/) state = $4
+      else state = "unknown"
+      next
+    }
+    $0 == marker { markers++; next }
+    { invalid = 1 }
+    END {
+      if (no_job && NR == 1 && !markers && !invalid) printf ""
+      else if (seen_job && NR == 2 && markers == 1 && !invalid) print state
+      else print "unknown"
+    }' "$1" 2>/dev/null
+}
+
+package_job_outstanding() {
+  # Only the validated marker alone or Done proves no outstanding job. A failed
+  # or malformed report, including an I/O failure Bash does not return, keeps
+  # the package conservatively rather than deleting it under a live manager.
+  job_capture "$job_report" || return 0
+  job_state="$(job_report_state "$job_report")" || job_state="unknown"
+  case "$job_state" in
+    ''|Done*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 on_exit() {
   rc=$?
   trap - EXIT
-  if [ -n "${download_dir:-}" ]; then rm -rf "$download_dir" || true; fi
+  if [ -n "${fetch_done:-}" ]; then
+    # A completion record precedes the first normal reap. Before it exists,
+    # only a reported live/stopped current child can be signalled. Completed
+    # or unclear states never select a numeric PID for termination.
+    trap '' HUP INT TERM
+    fetch_keep="${fetch_keep:--}"
+    fetch_cancel_waited=0
+    if [ ! -f "$fetch_done" ] && ! fetch_cancel "$fetch_done" "$fetch_job_report"; then
+      fetch_keep="keep"
+    else
+      wait 2>/dev/null || true
+      fetch_cancel_waited=1
+    fi
+    # Cancellation can make the worker publish after this trap began. Honor
+    # the record's disposition too: keep means an inner state was unknown and
+    # a download may still be active even though the publisher itself exited.
+    fetch_honor_disposition "$fetch_done"
+    if [ "${fetch_keep:-}" = keep ] && [ "$fetch_cancel_waited" = 1 ] && \
+       [ -f "$fetch_done" ] && [ -f "${download_dir}/.command-complete" ]; then
+      # Both publishing shells were waited. A raw downloader may still need
+      # the directory, but no shell remains to recreate these report files.
+      rm -f "$fetch_done" "$fetch_done.part" "$fetch_job_report" \
+        "${download_dir}/.command-complete" "${download_dir}/.command-complete.part" \
+        "${download_dir}/.command-jobs" "${download_dir}/.command-child-jobs" || true
+    fi
+    fetch_done=""
+  fi
+  if [ -n "${download_dir:-}" ] && [ "${fetch_keep:-}" != keep ]; then
+    rm -f "${download_dir}/.fetch-complete" "${download_dir}/.fetch-complete.part" \
+      "${download_dir}/.fetch-jobs" "${download_dir}/.command-complete" \
+      "${download_dir}/.command-complete.part" "${download_dir}/.command-jobs" \
+      "${download_dir}/.command-child-jobs" || true
+    rm -rf "$download_dir" || true
+  elif [ -n "${pkg_dir:-}" ]; then
+    if [ -z "${job_report:-}" ] || ! package_job_outstanding; then
+      rm -rf "$pkg_dir" || true
+    fi
+  fi
+  if [ -n "${job_report:-}" ]; then rm -f "$job_report" || true; fi
   if [ "$rc" -ne 0 ]; then report_block || true; fi
   exit "$rc"
 }
@@ -139,7 +225,7 @@ install_channel() {
 # box with no gpg where the user accepts HTTPS+SHA256 only.
 fetch_sums() {
   d="$1"
-  curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "${d}/SHA256SUMS" \
+  fetch_run curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "${d}/SHA256SUMS" \
     || die "could not fetch SHA256SUMS from the latest release."
 
   if [ "${IRLUME_INSECURE_NO_SIG:-}" = "1" ]; then
@@ -149,7 +235,7 @@ fetch_sums() {
 
   command -v gpg >/dev/null 2>&1 \
     || die "gpg is required to verify the release signature. Install gnupg, or (not recommended) set IRLUME_INSECURE_NO_SIG=1 to trust HTTPS + SHA256 only."
-  curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null \
+  fetch_run curl -fsSL "${RELEASE_BASE}/SHA256SUMS.asc" -o "${d}/SHA256SUMS.asc" 2>/dev/null \
     || die_verify "SHA256SUMS.asc not found for this release. Every irlume release is signed; a missing signature may mean the download was tampered with. Refusing to install."
 
   # Throwaway keyring holding only the pinned key: nothing else can sign,
@@ -166,39 +252,197 @@ fetch_sums() {
   fi
 }
 
-# fetch_verified's EXIT trap. An exit that is not 0 (a die, a die_verify, a
-# command that fails under set -e, or one of the signals fetch_verified
-# traps) removes the download directory with whatever was downloaded into
-# it; an exit 0 keeps it for the release lane, which removes it once it is
-# done with the package. The exit status is kept.
-fetch_cleanup() {
-  rc=$?
+# Publish status and cleanup disposition in one atomic rename. Publication is
+# the last operation observable by another process. A normal parent waits
+# for it before the first reaping wait. A standalone failing download removes
+# its private directory only after saving the status it will actually return.
+fetch_publish() {
+  rc="$1"
   trap - EXIT
-  if [ "$rc" -ne 0 ] && [ -n "$tmp" ]; then rm -rf "$tmp" || true; fi
+  printf '%s %s\n' "$rc" "${fetch_keep:--}" > "$fetch_completion.part"
+  mv "$fetch_completion.part" "$fetch_completion"
+  if [ "${auto_tmp:-0}" -eq 1 ]; then
+    rm -f "$fetch_completion"
+    if [ "$rc" -ne 0 ] && [ "${fetch_keep:-}" != keep ]; then
+      rm -rf "$tmp"
+    fi
+  fi
   exit "$rc"
 }
 
-# Download the release asset whose SHA256SUMS line contains the fixed string $1,
-# verify its checksum, and echo the local path on stdout. Aborts on mismatch.
-# The body is a subshell, as is the $(...) each caller reads the path
-# through, so the traps below are its own: main()'s EXIT trap is neither run
-# nor replaced here.
-fetch_verified() (
+# Determine the current job, using a parent-shell redirection: a jobs command
+# substitution cannot see dash's own job table. Each shell owns only its direct
+# asynchronous job. Unknown output never authorizes a signal or removal, and
+# never fakes activity. A failed report/write is unknown; a successful empty
+# report means the job is gone.
+fetch_job_state() {
+  fetch_state=unknown
+  job_capture "$1" || return 0
+  state="$(job_report_state "$1")" || state=unknown
+  case "$state" in
+    Running|Stopped*|Suspended*) fetch_state=running ;;
+    ''|Done*|Terminated*|Killed*|Interrupt*|Hangup*|Exit*) fetch_state=finished ;;
+    *) fetch_state=unknown ;;
+  esac
+}
+
+# Cancel one direct child only when publication is absent and its job is
+# observably live or stopped. If the child exited between inspection and kill,
+# it has not been reaped yet, so its PID is still owned here. wait then reaps
+# that exact child before any directory cleanup.
+fetch_cancel() {
+  [ -n "${1:-}" ] || return 0
+  [ ! -f "$1" ] || return 0
+  [ -n "${!-}" ] || return 0
+  fetch_job_state "$2"
+  case "$fetch_state" in
+    running)
+      kill -s TERM "${!-}" 2>/dev/null || true
+      wait "${!-}" 2>/dev/null || true
+      return 0
+      ;;
+    finished) return 0 ;;
+    unknown) return 1 ;;
+  esac
+}
+
+# Wait for publication before the first normal reap. The initial state is
+# finished so an already-published worker can be reaped without jobs being
+# queried. A terminal jobs report may consume Dash's saved status, and a
+# missing completion is therefore unknown, not success. Once read, the record
+# is the status authority: wait is reap-only and cannot turn it into 127.
+fetch_wait() {
+  fetch_wait_rc=0
+  fetch_keep=""
+  fetch_state=finished
+  while [ ! -f "$1" ]; do
+    fetch_job_state "$2"
+    case "$fetch_state" in
+      running) sleep 0.1 ;;
+      finished) break ;;
+      unknown) fetch_keep="keep"; return 1 ;;
+    esac
+  done
+  if [ ! -f "$1" ]; then
+    fetch_keep="keep"
+    return 1
+  fi
+  IFS=' ' read -r fetch_wait_rc fetch_keep < "$1" || {
+    fetch_wait_rc=1
+    fetch_keep="keep"
+  }
+  case "$fetch_keep" in
+    keep) [ "$fetch_wait_rc" -ne 0 ] || fetch_wait_rc=1 ;;
+    -) ;;
+    *) fetch_keep="keep"; fetch_wait_rc=1 ;;
+  esac
+  wait "${!-}" 2>/dev/null || true
+  return "$fetch_wait_rc"
+}
+
+# Propagate cleanup disposition without replacing the cancellation status.
+# A missing record leaves the current disposition unchanged. A keep or an
+# unreadable/invalid record is always conservative, at every nested parent.
+fetch_honor_disposition() {
+  [ -f "$1" ] || return 0
+  if IFS=' ' read -r _ fetch_completion_keep < "$1"; then
+    case "$fetch_completion_keep" in
+      keep) fetch_keep="keep" ;;
+      -) ;;
+      *) fetch_keep="keep" ;;
+    esac
+  else
+    fetch_keep="keep"
+  fi
+}
+
+fetch_abort() {
+  rc="$1"
+  trap '' HUP INT TERM
+  if ! fetch_cancel "$fetch_command_done" "${fetch_abort_report:-$fetch_command_report}"; then
+    fetch_keep="keep"
+  else
+    wait 2>/dev/null || true
+  fi
+  fetch_honor_disposition "$fetch_command_done"
+  exit "$rc"
+}
+fetch_run() {
+  fetch_command_done="${tmp}/.command-complete"
+  fetch_command_report="${tmp}/.command-jobs"
+  fetch_command_child_report="${tmp}/.command-child-jobs"
+  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report" \
+    "$fetch_command_child_report"
+  (
+    auto_tmp=0
+    # Parent and child own different job tables. Their report writes must not
+    # truncate one another and make a live job look transiently empty.
+    fetch_abort_report="$fetch_command_child_report"
+    fetch_completion="$fetch_command_done"
+    trap 'fetch_publish "$?"' EXIT
+    trap 'fetch_abort 129' HUP
+    trap 'fetch_abort 130' INT
+    trap 'fetch_abort 143' TERM
+    # A foreground download could defer this publisher's own trap. Wait on it
+    # asynchronously so cancellation reaches the child, then publish.
+    env --default-signal=HUP,INT,TERM "$@" &
+    command_rc=0
+    wait "${!-}" || command_rc=$?
+    fetch_abort "$command_rc"
+  ) &
+  command_rc=0
+  fetch_wait "$fetch_command_done" "$fetch_command_report" || command_rc=$?
+  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report" \
+    "$fetch_command_child_report"
+  if [ "$command_rc" -gt 128 ]; then
+    fetch_abort "$command_rc"
+  fi
+  return "$command_rc"
+}
+
+# fetch_verified's EXIT trap. A parent-owned directory survives publication
+# and reaping; its parent decides when to delete it. In standalone mode,
+# fetch_publish removes the directory after recording a failure. Unknown state
+# always preserves the directory. Every marker is inside that private directory.
+fetch_cleanup() {
+  rc=$?
+  trap - EXIT
+  # A failed mktemp leaves no private directory and no legitimate completion
+  # path. Never turn that empty directory into a file beside a shared tmp root.
+  if [ -z "$tmp" ]; then
+    exit "$rc"
+  fi
+  if [ -n "$tmp" ] && [ "${fetch_keep:-}" != keep ]; then
+    rm -f "${tmp}/.command-complete" "${tmp}/.command-complete.part" \
+      "${tmp}/.command-jobs" "${tmp}/.command-child-jobs" || true
+  fi
+  fetch_completion="${tmp}/.fetch-complete"
+  fetch_publish "$rc"
+}
+
+# Download and verify the release asset whose SHA256SUMS line contains $1.
+# $2 is the already parent-owned temporary directory; a one-argument call for
+# the standalone test still creates its own. The result path is the only
+# stdout line. Fetch helpers make each command wait interruptible, so killing
+# this subshell also cancels its active network command before directory
+# cleanup, rather than only moving Bash's deferred trap down one level. The
+# body uses braces: & already supplies the worker subshell, and another pair
+# of parentheses would separate its PID from the shell that owns these traps.
+fetch_verified() {
   match="$1"
-  # The traps are set before mktemp runs. Until it answers, tmp is empty, so
-  # the EXIT trap removes only a directory mktemp has named.
-  tmp=""
+  tmp="${2:-}"
+  auto_tmp=0
+  fetch_keep=""
+  fetch_command_done=""
+  fetch_command_report=""
   trap fetch_cleanup EXIT
-  # A hangup, interrupt or termination signal that reaches this subshell (a
-  # closed terminal or Ctrl-C sends one to the whole process group) ends it
-  # through that trap too, with the status a shell reports for a command the
-  # signal ended (128 plus its number).
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  # Checked here, not left to set -e, which bash ignores inside this
-  # function when the caller adds `|| die`, as the release-RPM path does.
-  tmp="$(mktemp -d)" || die "could not create a temporary directory for the download."
+  trap 'fetch_abort 129' HUP
+  trap 'fetch_abort 130' INT
+  trap 'fetch_abort 143' TERM
+  if [ -z "$tmp" ]; then
+    auto_tmp=1
+    tmp="$(mktemp -d)" || die "could not create a temporary directory for the download."
+  fi
   fetch_sums "$tmp"
   # Anchored patterns: a future .sig/.sha256 sibling must never be selected
   # as "the package", and multiple matches are an error, not first-wins.
@@ -223,13 +467,52 @@ fetch_verified() (
     ''|.|..|*/*) die "the SHA256SUMS entry for '${match}' is not a plain file name; refusing to download it." ;;
   esac
   say "downloading ${name} ..."
-  curl -fSL --progress-bar "${RELEASE_BASE}/${name}" -o "${tmp}/${name}" \
+  fetch_run curl -fSL --progress-bar "${RELEASE_BASE}/${name}" -o "${tmp}/${name}" \
     || die "download of ${name} failed."
   say "verifying checksum ..."
   ( cd "$tmp" && printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1 ) \
     || die_verify "CHECKSUM MISMATCH on ${name}; refusing to install."
   printf '%s/%s\n' "$tmp" "$name"
-)
+}
+
+# Start one verified fetch in the background. download_dir is assigned before
+# the worker can receive a signal, so on_exit already owns its directory.
+# The worker and its current network command each have their own direct job;
+# waiting for both levels stops cancellation at a foreground command wait.
+# Answer reading and validation use shell builtins, not another deferred
+# command substitution. download_dir remains owned on every failure path.
+fetch_release() {
+  fetch_keep=""
+  download_dir="$(mktemp -d)" || {
+    printf '\033[1;31m[irlume]\033[0m %s\n' "could not create a temporary directory for the download." >&2
+    return 1
+  }
+  fetch_done="${download_dir}/.fetch-complete"
+  fetch_job_report="${download_dir}/.fetch-jobs"
+  fetch_rc=0
+  fetch_verified "$1" "$download_dir" > "$download_dir/.fetch-result" &
+  fetch_wait "$fetch_done" "$fetch_job_report" || fetch_rc=$?
+  # An unclear state or keep record deliberately preserves directory and
+  # report ownership. Otherwise publication allowed the reap-only wait.
+  if [ "$fetch_state" != unknown ] && [ "$fetch_keep" != keep ]; then
+    rm -f "$fetch_done" "$fetch_done.part" "$fetch_job_report"
+    fetch_done=""
+  fi
+  [ "$fetch_rc" -eq 0 ] || return "$fetch_rc"
+  result=""
+  IFS= read -r result < "$download_dir/.fetch-result" || return 1
+  case "$result" in
+    "$download_dir"/*) result_name=${result#"$download_dir"/} ;;
+    *) return 1 ;;
+  esac
+  case "$result_name" in
+    ''|.|..|*/*) return 1 ;;
+  esac
+  [ -f "$result" ] || return 1
+  rm -f "$download_dir/.fetch-result" || return 1
+  fetch_result="$result"
+  return 0
+}
 
 # --- Channel-resilience helpers ---------------------------------------------
 # The release lane is the fallback for every distro lane. Guards make the
@@ -247,20 +530,37 @@ should_install_deb() {
 }
 
 # Install the verified release package with the package command "$@", as
-# root, then remove its directory. download_dir is empty while the command
-# runs, as bash runs on_exit as soon as a hangup or termination signal
-# reaches the script, while the command may still be reading the package.
-# A command that fails ends the run with its own exit status; on_exit then
-# removes the package.
+# root, then remove its directory. The package is this shell's only
+# asynchronous job; exec keeps it a direct child. GNU env resets dispositions
+# in that child without a wrapper, including SIGINT inherited as ignored,
+# which POSIX shells cannot restore with trap. wait is
+# interruptible by a trapped signal, so on_exit runs while the child may still
+# read the verified file. Its job-state test preserves an outstanding child
+# and removes the download before launch, after reaping, or on ordinary
+# failure. No PID liveness or /proc permission check is involved.
 install_verified() {
   pkg_dir="$download_dir"
   download_dir=""
   pkg_rc=0
-  $SUDO "$@" || pkg_rc=$?
+  job_report="$pkg_dir/.package-jobs"
+  # A background shell substitutes /dev/null for stdin, but only fd 0.
+  # Save the caller's input and duplicate it over stdin before exec, so sudo
+  # sees the original stream without needing any extra descriptor preserved.
+  exec 9<&0
+  (
+    # Unlike trap here, env --default-signal also resets an inherited ignore.
+    # exec keeps env and then the package command in this same direct child.
+    exec env --default-signal=HUP,INT,TERM $SUDO "$@" <&9
+  ) &
+  exec 9<&-
+  wait "$!" || pkg_rc=$?
   download_dir="$pkg_dir"
   [ "$pkg_rc" -eq 0 ] || exit "$pkg_rc"
   download_dir=""
   rm -rf "$pkg_dir"
+  rm -f "$job_report"
+  pkg_dir=""
+  job_report=""
 }
 
 install_deb_release() {
@@ -270,8 +570,8 @@ install_deb_release() {
   # PPA - before anything else on this path. A failed refresh warns and
   # continues: the existing lists may already satisfy the dependencies.
   $SUDO apt-get update || warn "apt-get update failed; installing with the current package lists."
-  deb="$(fetch_verified '_amd64.deb')"
-  download_dir="$(dirname "$deb")"
+  fetch_release '_amd64.deb'
+  deb="$fetch_result"
   cand="$(basename "$deb" | sed -n 's/^irlume_\(.*\)_amd64.deb$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release .deb filename: $(basename "$deb")"
   have="$(deb_version_installed)"
@@ -295,9 +595,9 @@ install_rpm_release() {
   case "$ver" in
     *[!0123456789]*) die "Fedora family with a VERSION_ID that is not a Fedora release number; cannot pick a release RPM. Install from Copr when it is back." ;;
   esac
-  rpm_path="$(fetch_verified ".fc${ver}.x86_64.rpm")" || \
+  fetch_release ".fc${ver}.x86_64.rpm" || \
     die "no verified release RPM for fc${ver}; the lines above say why. Install from Copr when it is back."
-  download_dir="$(dirname "${rpm_path}")"
+  rpm_path="$fetch_result"
   # `dnf install <local.rpm>` handles both fresh install and upgrade, and is
   # a no-op ("Nothing to do") when the installed version is not older: exactly
   # the upgrade-only semantics the fallback needs (`dnf upgrade` alone cannot
@@ -307,8 +607,8 @@ install_rpm_release() {
 
 install_pkg_release() {
   need vercmp
-  pkg="$(fetch_verified '_x86_64.pkg.tar.zst')"
-  download_dir="$(dirname "$pkg")"
+  fetch_release '_x86_64.pkg.tar.zst'
+  pkg="$fetch_result"
   cand="$(basename "$pkg" | sed -n 's/^irlume-\(.*\)-x86_64.pkg.tar.zst$/\1/p')"
   [ -n "$cand" ] || die "could not parse the release package filename: $(basename "$pkg")"
   have="$(pacman -Qi irlume 2>/dev/null | awk '/^Version/ {print $3}')"
@@ -331,6 +631,8 @@ update_from_release() {
   family=" ${ID:-} ${ID_LIKE:-} "
   need curl
   need sha256sum
+  need env
+  need mv
   case "$family" in
     *" debian "*|*" ubuntu "*) install_deb_release ;;
     *" fedora "*|*" rhel "*|*" centos "*) install_rpm_release ;;
@@ -376,8 +678,18 @@ main() {
   # The directory on_exit removes: empty, whatever the environment holds,
   # until the release lane has downloaded and verified a package.
   download_dir=""
-  # Next, so every later exit runs it. A $(...) subshell does not.
+  pkg_dir=""
+  job_report=""
+  fetch_result=""
+  fetch_done=""
+  fetch_job_report=""
+  # Next, so every later ordinary exit runs it. A $(...) subshell does not.
   trap on_exit EXIT
+  # Route signals through it too. install_verified resets dispositions only
+  # in its asynchronous child with GNU env, never in this parent shell.
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   # Privilege: run package commands as root, via sudo when not already root.
   SUDO=""
@@ -408,6 +720,8 @@ main() {
 
   need curl
   need sha256sum
+  need env
+  need mv
 
   arch="$(uname -m)"
   [ "$arch" = "x86_64" ] || die "irlume ships x86-64 packages only; '$arch' is not supported yet."

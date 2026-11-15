@@ -232,6 +232,16 @@ All notable changes to irlume are documented here. This project adheres to
   the pinned serial-bearing alias, and is included only when the complete
   command fits that line, never with a truncated argument (#1338).
 
+- `scripts/install.sh` routes a hangup, interrupt or termination signal
+  through cleanup that owns a verified download before its worker starts.
+  An active fetch and its current download are cancelled and reaped before
+  the temporary directory is removed. Package execution preserves the
+  caller's input for conffile prompts, remains interruptible without
+  removing the package an outstanding job may read, and cleans up before
+  launch, after reaping or on ordinary failure. Completion and job-report
+  files stay inside the private download directory, outside the reach of
+  other users of a shared temporary directory (#1338).
+
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself
   fails, the way a checksum mismatch already did. Before, a curl

@@ -222,21 +222,13 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
-- Busy-camera advice no longer treats every observed non-self PID as an
-  app to close: when it may be irlumed, the text says to let it finish
-  and retry, otherwise close that app, and to report a persistent hold.
-  Holder messages put the close, wait and report steps before a long
-  device path, so irlumed's 240-character journal line keeps those steps
-  and the `irlume support-report` pointer even when the path is elided.
-  Unseen-holder `sudo fuser -v` advice uses the resolved camera node, not
-  the pinned serial-bearing alias, and is included only when the complete
-  command fits that line, never with a truncated argument (#1338).
-
 - `scripts/install.sh` routes a hangup, interrupt or termination signal
-  before a verified release package job starts and after `wait` reaps it
-  through the existing cleanup. While the package job is outstanding, the
-  installer remains interruptible without removing the package the job may
-  still read. Package failures keep their exit status and cleanup (#1338).
+  through cleanup that owns a verified download before its worker starts.
+  An active fetch and its current download are cancelled and reaped before
+  the temporary directory is removed. Package execution preserves the
+  caller's input for conffile prompts, remains interruptible without
+  removing the package an outstanding job may read, and cleans up before
+  launch, after reaping or on ordinary failure (#1338).
 
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself

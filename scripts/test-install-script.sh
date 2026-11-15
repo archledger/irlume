@@ -99,13 +99,16 @@ sed "s#/etc/os-release#$work/os-release#g" "$script" > "$work/install.sh"
 # Harness-only boundary signals. pre_launch has no child; post_wait follows
 # reaping and precedes ownership restoration. post_launch is present once the
 # implementation has a direct asynchronous child and covers the launch/wait
-# boundary before wait starts. Production has no signal-injection branch.
+# boundary before wait starts. fetch_delay signals only the captured installer
+# PID while its download is active. Production has no signal-injection branch.
 # Single-quoted sed templates produce literal shell expansions in the copy.
 # shellcheck disable=SC2016
-sed -e 's/^  pkg_rc=0$/  [ "${TEST_APT:-}" != pre_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"\n  pkg_rc=0/' \
+sed -e 's/^main() {$/main() {\n  printf "%s\\n" "$$" > "${TEST_DIR:?}\/installer-pid"/' \
+    -e 's/^  pkg_rc=0$/  [ "${TEST_APT:-}" != pre_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"\n  pkg_rc=0/' \
     -e 's/^  \$SUDO "\$@" || pkg_rc=$?$/  $SUDO "$@" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
     -e 's/^  wait "\$!" || pkg_rc=$?$/  wait "$!" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
-    -e 's/^  ) &$/  ) \&\n  [ "${TEST_APT:-}" != post_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  fetch_wait "\$fetch_done" "\$fetch_job_report" || fetch_rc=$?$/  fetch_wait "$fetch_done" "$fetch_job_report" || fetch_rc=$?\n  [ "${TEST_RELEASE:-}" != fetch_after_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  exec 9<&-$/  exec 9<\&-\n  [ "${TEST_APT:-}" != post_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
     "$work/install.sh" > "$work/install-boundaries.sh"
 mv "$work/install-boundaries.sh" "$work/install.sh"
 [ "$(grep -c 'TEST_APT:-.*pre_launch' "$work/install.sh")" = 1 ] \
@@ -113,11 +116,14 @@ mv "$work/install-boundaries.sh" "$work/install.sh"
 [ "$(grep -c 'TEST_APT:-.*post_wait' "$work/install.sh")" = 1 ] \
   || { echo "test-install-script: post-wait boundary substitution failed" >&2; exit 1; }
 has_background_package=0
-if grep -q '^  ) &$' "$script"; then
+if grep -q '^  exec 9<&-$' "$script"; then
   has_background_package=1
   [ "$(grep -c 'TEST_APT:-.*post_launch' "$work/install.sh")" = 1 ] \
     || { echo "test-install-script: post-launch boundary substitution failed" >&2; exit 1; }
 fi
+has_async_fetch=1
+[ "$(grep -c 'TEST_RELEASE:-.*fetch_after_wait' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: fetch post-wait substitution or wait form changed" >&2; exit 1; }
 sed 's/^main "\$@"$/fetch_verified "$@"/' "$work/install.sh" > "$work/fetch-verified.sh"
 [ "$(grep -cxF 'fetch_verified "$@"' "$work/fetch-verified.sh")" = 1 ] \
   || { echo 'test-install-script: install.sh no longer has one main "$@" line' >&2; exit 1; }
@@ -128,7 +134,7 @@ env --default-signal=HUP,INT,TERM true \
   || { echo "test-install-script: env --default-signal is missing (GNU coreutils 8.31 or newer)" >&2; exit 1; }
 
 mkdir "$work/bin"
-for tool in sh mktemp rm uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep; do
+for tool in sh mktemp rm mv uname grep gzip sed awk basename dirname cat mkdir chmod sha256sum env sleep; do
   ln -s "$(command -v "$tool")" "$work/bin/$tool"
 done
 
@@ -157,7 +163,9 @@ cat > "$work/bin/curl" <<'EOF'
 # no_version serves the release whose .deb names no version; listed serves
 # the SHA256SUMS a case wrote to $TEST_DIR/SHA256SUMS.listed; cut
 # breaks the asset off after a few bytes, as curl exits 18 on a partial
-# transfer; interrupt_HUP, interrupt_INT and interrupt_TERM write a few bytes
+# transfer; fetch_delay sends TEST_SIGNAL only to the captured installer PID
+# and keeps a completed asset's download process alive for ten seconds;
+# interrupt_HUP, interrupt_INT and interrupt_TERM write a few bytes
 # of the asset, then send that signal to the shell running the download and
 # die of it, as a closed terminal, a Ctrl-C or a kill ends a real download
 # (it logs that it outlived the signal if it does not die); every other mode
@@ -221,6 +229,11 @@ case "$url" in
     case "$TEST_RELEASE" in
       bad_sum) printf 'changed\n' > "$out" ;;
       cut) printf 'stand-in' > "$out"; exit 18 ;;
+      fetch_delay)
+        cat "$asset" > "$out"
+        kill -s "${TEST_SIGNAL:-TERM}" "$(cat "$TEST_DIR/installer-pid")"
+        exec sleep 10
+        ;;
       interrupt_*)
         sig="${TEST_RELEASE#interrupt_}"
         printf 'stand-in' > "$out"
@@ -248,7 +261,7 @@ case " $* " in
     ;;
   *" --verify "*)
     case "$TEST_RELEASE" in
-      good|bad_sum|no_version|listed|cut|interrupt_*) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
+      good|bad_sum|no_version|listed|cut|interrupt_*|fetch_delay|fetch_after_wait) printf '[GNUPG:] VALIDSIG %s\n' "$TEST_KEY_FP" ;;
       *) exit 1 ;;
     esac
     ;;
@@ -277,6 +290,11 @@ if [ "${1:-}" = install ]; then
   if [ "$TEST_APT" = child_int ]; then
     kill -s INT "$$"
     printf 'apt-get: SIGINT was ignored\n' >> "$TEST_LOG"
+  fi
+  if [ "$TEST_APT" = stdin_pkg ]; then
+    IFS= read -r answer || exit 98
+    printf 'apt-get stdin: %s\n' "$answer" >> "$TEST_LOG"
+    [ "$answer" = 'keep-local-conffile' ] || exit 97
   fi
   case "$TEST_APT" in signal_shell|post_launch)
     n=0
@@ -413,10 +431,18 @@ install() {
   rm -rf "$work/tmp"
   mkdir "$work/tmp"
   rc=0
-  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
+  started=$SECONDS
+  apt_mode=${5:-ok}
+  set -- env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
     TEST_LOG="$work/log" TEST_DIR="$work" \
     TEST_PPA="$2" TEST_RELEASE="${3:-none}" TEST_DAEMON="${4:-active}" TEST_APT="${5:-ok}" \
-    TEST_SIGNAL="${sig:-}" TEST_KEY_FP="$key_fp" sh "$work/install.sh" > "$work/stdout" 2> "$work/stderr" || rc=$?
+    TEST_SIGNAL="${sig:-}" TEST_KEY_FP="$key_fp" sh "$work/install.sh"
+  if [ "$apt_mode" = stdin_pkg ]; then
+    printf 'keep-local-conffile\n' | "$@" > "$work/stdout" 2> "$work/stderr" || rc=$?
+  else
+    "$@" > "$work/stdout" 2> "$work/stderr" || rc=$?
+  fi
+  elapsed=$((SECONDS - started))
   sed 's/\x1b\[[0-9;]*m//g' "$work/stderr" > "$work/plain"
   leftover="$(ls -A "$work/tmp")" || leftover="(the run removed TMPDIR itself)"
   [ ! -s "$work/stdout" ] || fail "$label: wrote to stdout; install.sh writes only to stderr"
@@ -894,6 +920,46 @@ if [ "$has_background_package" = 1 ]; then
   want_no_err 'apt-get: SIGINT was ignored'
   want_block
   want_no_download
+fi
+
+label="a conffile response reaches the asynchronous package child"
+install "$debian" lists good active stdin_pkg
+want_ready
+want_called 'apt-get stdin: keep-local-conffile'
+want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+
+for sig in HUP INT TERM; do
+  case "$sig" in
+    HUP) sig_rc=129 ;;
+    INT) sig_rc=130 ;;
+    TERM) sig_rc=143 ;;
+  esac
+  label="SIG$sig only to the installer during an active fetch"
+  install "$debian" lists fetch_delay active
+  want_rc "$sig_rc"
+  [ "$elapsed" -lt 5 ] || fail "$label: the active download was not cancelled promptly (${elapsed}s)"
+  want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+  if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+  want_block
+  want_no_download
+
+done
+
+if [ "$has_async_fetch" = 1 ]; then
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig after fetch wait and before the answer is read"
+    install "$debian" lists fetch_after_wait active
+    want_rc "$sig_rc"
+    want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+    if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+    want_block
+    want_no_download
+  done
 fi
 
 [ "$failed" = 0 ] || exit 1

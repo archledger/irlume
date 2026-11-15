@@ -1436,13 +1436,20 @@ mod tests {
         );
     }
 
-    /// A busy row whose holder is irlume itself, or could not be seen and so
-    /// may be irlumed, ends with the report pointer and never asks to close
-    /// it (#1338); its evidence names no device path, the node field being the
-    /// only one a census document may carry.
+    /// A busy row whose holder is this irlume process, a different-PID
+    /// irlumed, or could not be seen ends with the report pointer and never
+    /// gives an unconditional close instruction (#1338). Its evidence names no
+    /// device path, the node field being the only one a census document may
+    /// carry.
     #[test]
     fn a_busy_row_never_asks_to_close_irlume() {
-        for holder in [crate::Holders::SelfOnly, crate::Holders::UnknownBlind] {
+        for holder in [
+            crate::Holders::SelfOnly,
+            crate::Holders::UnknownBlind,
+            crate::Holders::Other("irlumed (pid 42)".into()),
+        ] {
+            let external_irlumed =
+                matches!(&holder, crate::Holders::Other(who) if who == "irlumed (pid 42)");
             let entry = unreadable_entry(&crate::Unreadable {
                 path: "/dev/video4".into(),
                 at: crate::FailedAt::Open,
@@ -1455,6 +1462,17 @@ mod tests {
                 "{line}"
             );
             assert!(!line.contains("Close that app and retry"), "{line}");
+            if external_irlumed {
+                assert!(line.contains("in use by irlumed (pid 42)"), "{line}");
+                assert!(
+                    line.contains("For irlumed, let it finish, then retry"),
+                    "{line}"
+                );
+                assert!(
+                    line.contains("otherwise close that app and retry"),
+                    "{line}"
+                );
+            }
             assert!(
                 entry.evidence.iter().all(|e| !e.contains("/dev/")),
                 "{:?}",

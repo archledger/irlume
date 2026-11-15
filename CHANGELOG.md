@@ -222,6 +222,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Busy-camera advice no longer treats every observed non-self PID as an
+  app to close: when it may be irlumed, the text says to let it finish
+  and retry, otherwise close that app, and to report a persistent hold.
+  Holder messages put the close, wait and report steps before a long
+  device path, so irlumed's 240-character journal line keeps those steps
+  and the `irlume support-report` pointer even when the path is elided.
+  Unseen-holder `sudo fuser -v` advice uses the resolved camera node, not
+  the pinned serial-bearing alias, and is included only when the complete
+  command fits that line, never with a truncated argument (#1338).
+
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself
   fails, the way a checksum mismatch already did. Before, a curl

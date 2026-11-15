@@ -233,11 +233,10 @@ All notable changes to irlume are documented here. This project adheres to
   command fits that line, never with a truncated argument (#1338).
 
 - `scripts/install.sh` routes a hangup, interrupt or termination signal
-  while the parent owns a verified release download directory before
-  package installation through the parent's existing cleanup, so dash
-  no longer leaves that directory behind in that pre-install window.
-  Package-manager execution keeps the previous immediate signal behavior,
-  and the verified package remains available to it (#1338).
+  before a verified release package job starts and after `wait` reaps it
+  through the existing cleanup. While the package job is outstanding, the
+  installer remains interruptible without removing the package the job may
+  still read. Package failures keep their exit status and cleanup (#1338).
 
 - `scripts/fetch-models.sh` removes the partial `<name>.tmp` it was
   writing and prints one message naming the model when curl itself

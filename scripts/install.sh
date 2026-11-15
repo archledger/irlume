@@ -102,13 +102,37 @@ die_verify() {
 # under set -e, or a package command that fails, with its own status) ends
 # here and says where to report a problem; an exit 0 adds nothing. A release
 # package the release lane downloaded and did not install (its version did
-# not parse, or the package command failed) is removed first; download_dir
-# is empty while the package command runs and after the release lane has
-# removed the directory itself. The exit status is kept.
+# not parse, or the package command failed) is removed first: download_dir
+# when it is held, or pkg_dir when no package job is outstanding. A running
+# or suspended job keeps the verified package to read. After ordinary cleanup
+# pkg_dir is empty so a recreated directory at the old path is never removed.
+# The exit status is kept.
+package_job_outstanding() {
+  # jobs is a regular shell builtin. Use redirection, not $(jobs ...): dash
+  # cannot see the parent's jobs in a command-substitution subshell. With no
+  # other asynchronous jobs, %% names the package job. LC_ALL=C gives the
+  # POSIX state names. Empty output means no such current job; Done means it
+  # has completed. Any other reported state, including one this script cannot
+  # parse, is kept conservatively.
+  LC_ALL=C jobs -l %% > "$job_report" 2>/dev/null || true
+  [ -s "$job_report" ] || return 1
+  job_state="$(awk 'NR == 1 { print $4 }' "$job_report" 2>/dev/null)" || job_state=""
+  case "$job_state" in
+    Done*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 on_exit() {
   rc=$?
   trap - EXIT
-  if [ -n "${download_dir:-}" ]; then rm -rf "$download_dir" || true; fi
+  if [ -n "${download_dir:-}" ]; then
+    rm -rf "$download_dir" || true
+  elif [ -n "${pkg_dir:-}" ]; then
+    if [ -z "${job_report:-}" ] || ! package_job_outstanding; then
+      rm -rf "$pkg_dir" || true
+    fi
+  fi
+  if [ -n "${job_report:-}" ]; then rm -f "$job_report" || true; fi
   if [ "$rc" -ne 0 ]; then report_block || true; fi
   exit "$rc"
 }
@@ -247,24 +271,32 @@ should_install_deb() {
 }
 
 # Install the verified release package with the package command "$@", as
-# root, then remove its directory. download_dir is empty while the command
-# runs. Signals keep their default dispositions there, so dash cannot defer
-# a trap until after the package command: the shell still exits at once
-# while the command may be reading the package. Restore the traps afterward;
-# on_exit removes the package on an ordinary failure.
+# root, then remove its directory. The package is this shell's only
+# asynchronous job; exec keeps it a direct child. GNU env resets dispositions
+# in that child without a wrapper, including SIGINT inherited as ignored,
+# which POSIX shells cannot restore with trap. wait is
+# interruptible by a trapped signal, so on_exit runs while the child may still
+# read the verified file. Its job-state test preserves an outstanding child
+# and removes the download before launch, after reaping, or on ordinary
+# failure. No PID liveness or /proc permission check is involved.
 install_verified() {
   pkg_dir="$download_dir"
   download_dir=""
   pkg_rc=0
-  trap - HUP INT TERM
-  $SUDO "$@" || pkg_rc=$?
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  job_report="$(mktemp)"
+  (
+    # Unlike trap here, env --default-signal also resets an inherited ignore.
+    # exec keeps env and then the package command in this same direct child.
+    exec env --default-signal=HUP,INT,TERM $SUDO "$@"
+  ) &
+  wait "$!" || pkg_rc=$?
   download_dir="$pkg_dir"
   [ "$pkg_rc" -eq 0 ] || exit "$pkg_rc"
   download_dir=""
   rm -rf "$pkg_dir"
+  rm -f "$job_report"
+  pkg_dir=""
+  job_report=""
 }
 
 install_deb_release() {
@@ -380,10 +412,12 @@ main() {
   # The directory on_exit removes: empty, whatever the environment holds,
   # until the release lane has downloaded and verified a package.
   download_dir=""
+  pkg_dir=""
+  job_report=""
   # Next, so every later ordinary exit runs it. A $(...) subshell does not.
   trap on_exit EXIT
-  # Route signals through it too, except while install_verified gives the
-  # package command the default dispositions described below.
+  # Route signals through it too. install_verified resets dispositions only
+  # in its asynchronous child with GNU env, never in this parent shell.
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -417,6 +451,7 @@ main() {
 
   need curl
   need sha256sum
+  need env
 
   arch="$(uname -m)"
   [ "$arch" = "x86_64" ] || die "irlume ships x86-64 packages only; '$arch' is not supported yet."

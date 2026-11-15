@@ -5,8 +5,9 @@
 # Tests the channel scripts/install.sh chooses and what it prints when an
 # install fails or succeeds, without the network or root. Stand-ins first on
 # PATH log what they are asked. A copy of the script reads a fixture for
-# /etc/os-release, its only difference; a second copy of that one calls
-# fetch_verified instead of main on its last line. Real gzip and grep judge
+# /etc/os-release and adds test-only self-signals at exact handoff boundaries;
+# a second copy of that one calls fetch_verified instead of main on its last
+# line. Real gzip and grep judge
 # a real gzipped index, so a check of the wrong thing still fails here.
 # Every run keeps its exit status, and its stdout stays empty: install.sh's
 # own lines go to stderr.
@@ -67,7 +68,8 @@
 #   - nothing in its temporary directory, which starts empty for every run:
 #     not after a release download that is refused, breaks off or is
 #     interrupted (SIGHUP, SIGINT, SIGTERM, each ending the run with 128 plus
-#     its number), a signature or checksum that does not verify, a release
+#     its number) before a package job starts or after wait has reaped it,
+#     a signature or checksum that does not verify, a release
 #     .deb whose name gives no version, or a package command that fails
 #     (apt-get on Debian, dnf on Fedora), and not after an install, where
 #     the caller removes the directory once the package manager has read the
@@ -94,6 +96,28 @@ trap 'rm -rf "$work"' EXIT
 sed "s#/etc/os-release#$work/os-release#g" "$script" > "$work/install.sh"
 [ "$(grep -c "$work/os-release" "$work/install.sh")" -ge 2 ] \
   || { echo "test-install-script: install.sh no longer reads /etc/os-release" >&2; exit 1; }
+# Harness-only boundary signals. pre_launch has no child; post_wait follows
+# reaping and precedes ownership restoration. post_launch is present once the
+# implementation has a direct asynchronous child and covers the launch/wait
+# boundary before wait starts. Production has no signal-injection branch.
+# Single-quoted sed templates produce literal shell expansions in the copy.
+# shellcheck disable=SC2016
+sed -e 's/^  pkg_rc=0$/  [ "${TEST_APT:-}" != pre_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"\n  pkg_rc=0/' \
+    -e 's/^  \$SUDO "\$@" || pkg_rc=$?$/  $SUDO "$@" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  wait "\$!" || pkg_rc=$?$/  wait "$!" || pkg_rc=$?\n  [ "${TEST_APT:-}" != post_wait ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    -e 's/^  ) &$/  ) \&\n  [ "${TEST_APT:-}" != post_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
+    "$work/install.sh" > "$work/install-boundaries.sh"
+mv "$work/install-boundaries.sh" "$work/install.sh"
+[ "$(grep -c 'TEST_APT:-.*pre_launch' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: pre-launch boundary substitution failed" >&2; exit 1; }
+[ "$(grep -c 'TEST_APT:-.*post_wait' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: post-wait boundary substitution failed" >&2; exit 1; }
+has_background_package=0
+if grep -q '^  ) &$' "$script"; then
+  has_background_package=1
+  [ "$(grep -c 'TEST_APT:-.*post_launch' "$work/install.sh")" = 1 ] \
+    || { echo "test-install-script: post-launch boundary substitution failed" >&2; exit 1; }
+fi
 sed 's/^main "\$@"$/fetch_verified "$@"/' "$work/install.sh" > "$work/fetch-verified.sh"
 [ "$(grep -cxF 'fetch_verified "$@"' "$work/fetch-verified.sh")" = 1 ] \
   || { echo 'test-install-script: install.sh no longer has one main "$@" line' >&2; exit 1; }
@@ -238,16 +262,23 @@ EOF
 # Stand-in apt-get: under TEST_APT=fail an install exits 100, as apt-get does
 # when an install fails. Under TEST_APT=signal_shell an install first sends
 # SIGTERM to the shell that started it, the run of the copy, and to nothing
-# else, then waits up to 10 seconds for that shell to end; it touches
-# $TEST_DIR/apt-done when it is finished. An install from a local .deb
-# records its path in $TEST_DIR/deb-path and logs "apt-get read the verified
-# <name>" when the file still held the verified release asset.
+# else. It and post_launch both wait up to 10 seconds for that shell to end;
+# child_int sends SIGINT to itself, proving the asynchronous child did not
+# inherit an ignored interrupt. Each applicable mode touches apt-done when
+# finished. An install records the local .deb path in deb-path and logs
+# "apt-get read the verified <name>" only when it holds the verified asset.
 cat > "$work/bin/apt-get" <<'EOF'
 #!/bin/sh
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$TEST_LOG"
 if [ "${1:-}" = install ]; then
   if [ "$TEST_APT" = signal_shell ]; then
     kill -s TERM "$PPID"
+  fi
+  if [ "$TEST_APT" = child_int ]; then
+    kill -s INT "$$"
+    printf 'apt-get: SIGINT was ignored\n' >> "$TEST_LOG"
+  fi
+  case "$TEST_APT" in signal_shell|post_launch)
     n=0
     while kill -0 "$PPID" 2>/dev/null; do
       n=$((n + 1))
@@ -257,7 +288,8 @@ if [ "${1:-}" = install ]; then
       fi
       sleep 0.1
     done
-  fi
+    ;;
+  esac
   for arg in "$@"; do
     case "$arg" in
       /*.deb)
@@ -269,7 +301,7 @@ if [ "${1:-}" = install ]; then
         ;;
     esac
   done
-  [ "$TEST_APT" != signal_shell ] || : > "$TEST_DIR/apt-done"
+  case "$TEST_APT" in signal_shell|post_launch|child_int) : > "$TEST_DIR/apt-done" ;; esac
   [ "$TEST_APT" != fail ] || exit 100
 fi
 EOF
@@ -384,7 +416,7 @@ install() {
   env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
     TEST_LOG="$work/log" TEST_DIR="$work" \
     TEST_PPA="$2" TEST_RELEASE="${3:-none}" TEST_DAEMON="${4:-active}" TEST_APT="${5:-ok}" \
-    TEST_KEY_FP="$key_fp" sh "$work/install.sh" > "$work/stdout" 2> "$work/stderr" || rc=$?
+    TEST_SIGNAL="${sig:-}" TEST_KEY_FP="$key_fp" sh "$work/install.sh" > "$work/stdout" 2> "$work/stderr" || rc=$?
   sed 's/\x1b\[[0-9;]*m//g' "$work/stderr" > "$work/plain"
   leftover="$(ls -A "$work/tmp")" || leftover="(the run removed TMPDIR itself)"
   [ ! -s "$work/stdout" ] || fail "$label: wrote to stdout; install.sh writes only to stderr"
@@ -683,8 +715,8 @@ if grep -q '^apt-get: the shell outlived SIGTERM$' "$work/log"; then
 fi
 want_rc 143
 # The file was still there when apt-get read it, after the shell had ended:
-# bash runs on_exit at once on SIGTERM, and on_exit removed nothing (dash
-# runs no EXIT trap for a signal it does not trap).
+# the parent's signal trap runs on_exit at once, and its job-state check
+# leaves a running or suspended package child's directory in place.
 want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
 want_no_err 'The machine side is ready.'
 
@@ -804,6 +836,65 @@ for sig in HUP INT TERM; do
   want_block
   want_no_download
 done
+
+# Signals at the two sides of the package child. Before launch the parent's
+# cleanup still owns the download. After wait reaps the child it owns it
+# again, before download_dir is restored.
+for boundary in pre_launch post_wait; do
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig in the $boundary package boundary"
+    install "$debian" lists good active "$boundary"
+    want_rc "$sig_rc"
+    want_called 'curl https://github.com/archledger/irlume/releases/latest/download/irlume_0.99.0_amd64.deb'
+    if [ "$boundary" = pre_launch ]; then
+      if grep -q '^apt-get install ' "$work/log"; then fail "$label: apt-get started"; fi
+    else
+      want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+    fi
+    want_no_err 'The machine side is ready.'
+    want_block
+    want_no_download
+  done
+done
+
+if [ "$has_background_package" = 1 ]; then
+  # This signal is after the child exists and before wait starts. apt-get
+  # waits for the installer to end, then must still find the verified file.
+  for sig in HUP INT TERM; do
+    case "$sig" in
+      HUP) sig_rc=129 ;;
+      INT) sig_rc=130 ;;
+      TERM) sig_rc=143 ;;
+    esac
+    label="SIG$sig after launch and before wait"
+    rm -f "$work/apt-done"
+    install "$debian" lists good active post_launch
+    n=0
+    while [ ! -e "$work/apt-done" ] && [ "$n" -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
+    [ -e "$work/apt-done" ] || fail "$label: the stand-in apt-get did not finish"
+    want_rc "$sig_rc"
+    want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+    want_no_err 'The machine side is ready.'
+    want_block
+  done
+
+  # Without job control, an asynchronous child can inherit SIGINT ignored.
+  # Its local reset followed by exec must make this a normal status-130 exit.
+  label="SIGINT disposition in the package child"
+  install "$debian" lists good active child_int
+  want_rc 130
+  grep -q '^apt-get install -y .*/irlume_0.99.0_amd64.deb$' "$work/log" \
+    || fail "$label: apt-get did not start"
+  want_no_err 'The machine side is ready.'
+  want_no_err 'apt-get: SIGINT was ignored'
+  want_block
+  want_no_download
+fi
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

@@ -4395,6 +4395,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::testenv::{file_at, names_in, scratch};
 
     /// A wiring ENABLE must refuse a capability reading nothing established,
     /// because enabling unwires whatever reads unsupported. Demonstrated on
@@ -4757,72 +4758,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Removes a test's scratch directory when the test ends, whether it
-    /// passed or failed.
-    struct CopyDir(PathBuf);
-
-    impl Drop for CopyDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// A new, empty scratch directory for one test, and the guard that
-    /// removes it. Bind the guard to a named variable so that it lives to the
-    /// end of the test. The name is random, not built from the process ID: a
-    /// later run in another PID namespace can get the same process ID and
-    /// would meet a directory an earlier run left. Creation is strict, so
-    /// such a directory fails the test instead of being adopted.
-    fn copy_dir(label: &str) -> (PathBuf, CopyDir) {
-        let path = std::env::temp_dir().join(format!(
-            "irlume-pamcopy-{label}-{:08x}",
-            rand::random::<u32>()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        (path.clone(), CopyDir(path))
-    }
-
-    #[test]
-    fn copy_dirs_are_distinct_and_removed_when_their_test_fails() {
-        let (first, guard) = copy_dir("unwind");
-        let (second, _second) = copy_dir("unwind");
-        assert_ne!(first, second);
-        std::fs::write(first.join(format!("sudo{BACKUP}")), b"x").unwrap();
-        let unwound = std::panic::catch_unwind(move || {
-            let _guard = guard;
-            panic!("fixture failure");
-        });
-        assert!(unwound.is_err());
-        assert!(!first.exists());
-        assert!(second.is_dir());
-    }
-
-    /// Every name in `dir`, sorted, so a test sees a scratch file or a stray
-    /// copy left beside the ones it expects.
-    fn names_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// A file holding `body` at exactly `mode`. The mode is part of each
-    /// test's precondition: a file system that does not keep a bit fails
-    /// here, not later as a copy that matches by accident.
-    fn file_at(path: &Path, body: &str, mode: u32) {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert_eq!(
-            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
-            mode,
-            "precondition: {} did not take mode {mode:o}",
-            path.display()
-        );
-    }
-
     /// A backup has the mode (set-ID and sticky bits included) and owner of
     /// the file it copies, read from the same open file as its bytes; through
     /// a symlink, that is the file the link names, the one PAM reads. A
@@ -4836,7 +4771,7 @@ mod tests {
     #[test]
     fn a_backup_has_the_mode_and_owner_of_the_file_it_reads() {
         use std::os::unix::fs::MetadataExt as _;
-        let (dir, _guard) = copy_dir("backup-mode");
+        let (dir, _guard) = scratch("backup-mode");
         let at = |name: &str, mode: u32| {
             let path = dir.join(name);
             file_at(&path, &format!("{name} stack\n"), mode);
@@ -4889,7 +4824,7 @@ mod tests {
     #[test]
     fn a_backup_takes_its_mode_and_bytes_from_the_file_it_opened() {
         use std::os::unix::fs::MetadataExt as _;
-        let (dir, _guard) = copy_dir("backup-one-open");
+        let (dir, _guard) = scratch("backup-one-open");
         let check = |name: &str, copy: fn(&Path) -> Result<(), String>| {
             let target = dir.join(name);
             file_at(&target, "the stack opened\n", 0o600);
@@ -4931,7 +4866,7 @@ mod tests {
     #[test]
     fn a_backup_never_replaces_a_name_that_appears_before_its_link() {
         use std::os::unix::fs::MetadataExt as _;
-        let (dir, _guard) = copy_dir("backup-appears");
+        let (dir, _guard) = scratch("backup-appears");
         let target = dir.join("sudo");
         file_at(&target, "the original stack\n", 0o644);
         let bak = dir.join(format!("sudo{BACKUP}"));
@@ -4984,7 +4919,7 @@ mod tests {
     /// was the only reason: once it is free, the same copy goes through.
     #[test]
     fn a_kept_copy_never_replaces_a_name_that_appears_before_its_link() {
-        let (dir, _guard) = copy_dir("keep-appears");
+        let (dir, _guard) = scratch("keep-appears");
         let target = dir.join("plasmalogin");
         file_at(&target, "the edited override\n", 0o644);
         let bak = dir.join(format!("plasmalogin{BACKUP}"));
@@ -5104,7 +5039,7 @@ mod tests {
     /// depend on the umask of the test run.
     #[test]
     fn a_backup_is_owner_only_until_it_takes_the_original_mode() {
-        let (dir, _guard) = copy_dir("backup-owner-only");
+        let (dir, _guard) = scratch("backup-owner-only");
         run_with_umask_000("backup_scratch_mode_child", &dir);
     }
 
@@ -5162,7 +5097,7 @@ mod tests {
     /// [`run_with_umask_000`]).
     #[test]
     fn a_write_with_known_attributes_starts_owner_only() {
-        let (dir, _guard) = copy_dir("write-owner-only");
+        let (dir, _guard) = scratch("write-owner-only");
         run_with_umask_000("write_scratch_mode_child", &dir);
     }
 
@@ -5207,7 +5142,7 @@ mod tests {
     /// name, the same enable wires it and keeps the copy.
     #[test]
     fn an_enable_makes_no_copy_of_a_file_it_refuses() {
-        let (dir, _guard) = copy_dir("refused-no-copy");
+        let (dir, _guard) = scratch("refused-no-copy");
         std::fs::write(
             dir.join("password-auth"),
             "auth required pam_unix.so\nsession required pam_unix.so\n",
@@ -5262,7 +5197,7 @@ mod tests {
     /// keeps the copy.
     #[test]
     fn a_forced_rebuild_makes_no_copy_of_a_file_it_refuses() {
-        let (root, _guard) = copy_dir("force-refused-no-copy");
+        let (root, _guard) = scratch("force-refused-no-copy");
         ship_vendor_only(&root, "plasmalogin", UPSTREAM_FEDORA);
         ship_fedora_stacks(&root.join("usr/lib/pam.d"));
         let svc = under_root(&root, greeter("/etc/pam.d/plasmalogin"));

@@ -1191,75 +1191,10 @@ fn run_cmd(cmd: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Removes a test's scratch directory when the test ends, whether it
-    /// passed or failed.
-    struct Scratch(std::path::PathBuf);
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// A new, empty scratch directory for one test, and the guard that
-    /// removes it. Bind the guard to a named variable so that it lives to the
-    /// end of the test. The name is random, not built from the process ID: a
-    /// later run in another PID namespace can get the same process ID and
-    /// would meet a directory an earlier run left. Creation is strict, so
-    /// such a directory fails the test instead of being adopted.
-    fn scratch(label: &str) -> (std::path::PathBuf, Scratch) {
-        let path = std::env::temp_dir().join(format!(
-            "irlume-pamedit-{label}-{:08x}",
-            rand::random::<u32>()
-        ));
-        std::fs::create_dir(&path).unwrap();
-        (path.clone(), Scratch(path))
-    }
-
-    /// A file holding `body` at exactly `mode`. The mode is part of each
-    /// test's precondition: a file system that does not keep a bit fails
-    /// here, not later as a backup that matches by accident.
-    fn file_at(path: &std::path::Path, body: &str, mode: u32) {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        std::fs::write(path, body).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert_eq!(
-            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
-            mode,
-            "precondition: {} did not take mode {mode:o}",
-            path.display()
-        );
-    }
+    use crate::testenv::{file_at, names_in, scratch};
 
     fn backup_of(path: &std::path::Path) -> std::path::PathBuf {
         std::path::PathBuf::from(format!("{}{}", path.display(), crate::pamwire::BACKUP))
-    }
-
-    /// Every name in `dir`, sorted, so a test sees a scratch file or a stray
-    /// copy left beside the ones it expects.
-    fn names_in(dir: &std::path::Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn scratch_dirs_are_distinct_and_removed_when_their_test_fails() {
-        let (first, guard) = scratch("unwind");
-        let (second, _second) = scratch("unwind");
-        assert_ne!(first, second);
-        std::fs::write(first.join("sudo.pre-irlume"), b"x").unwrap();
-        let unwound = std::panic::catch_unwind(move || {
-            let _guard = guard;
-            panic!("fixture failure");
-        });
-        assert!(unwound.is_err());
-        assert!(!first.exists());
-        assert!(second.is_dir());
     }
 
     #[test]

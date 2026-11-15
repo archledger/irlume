@@ -7521,7 +7521,15 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
     /// state. Call it before any TPM work, so that its failure leaves the
     /// TPM as it was.
     fn require_read_permission_to_bind(dir: &std::path::Path) {
-        drop(crate::testenv::WithoutReadPermission::set(dir));
+        let unreadable = crate::testenv::WithoutReadPermission::set(dir);
+        let opened = std::fs::File::open(dir).is_ok();
+        drop(unreadable);
+        assert!(
+            !opened,
+            "this process opens a directory without read permission (root, \
+             CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+             be made to fail here: run the tests as an unprivileged user"
+        );
     }
 
     /// ADR-0034, Phase 3 amendment, condition 1, on swtpm with fake later

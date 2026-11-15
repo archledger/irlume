@@ -3298,36 +3298,44 @@ const GREY16_FOURCCS: [&[u8; 4]; 3] = [b"Y16 ", b"Y10 ", b"Y12 "];
 /// sign-in, an enrollment, a preview or setup), which is normal, or irlumed
 /// holding the camera after its work ended, which is a bug; each step reads
 /// true for all of them (#1338). Shared by `camera_busy_error` and
-/// [`Unreadable::cause`]. With `hardware: ` the busy text is 224 characters
-/// at `/dev/video0`, 2 more per extra digit, within the 240 characters
-/// irlumed's journal keeps of a bare error.
-const UNSEEN_HOLDER_STEPS: &str = "Close that app, or wait for irlumed to finish, then retry; \
+/// [`Unreadable::cause`]. With `hardware: ` the busy text is 216 characters
+/// at `/dev/video0`, one more per extra digit, within the 240 characters
+/// irlumed's journal keeps of a bare error. The fixed steps lead the text, so
+/// they also survive truncation of a longer pinned path.
+const UNSEEN_HOLDER_STEPS: &str =
+    "Close the other app, or wait for irlumed to finish, then retry; \
      if irlumed keeps holding it, please report it (`irlume support-report` says where)";
+
+/// A named non-self PID can be an external irlumed. Its `comm` is display
+/// text, not proof of daemon identity, so the advice covers both possibilities
+/// and ends with the same report pointer as the unseen-holder steps.
+const NAMED_HOLDER_STEPS: &str = "For irlumed, let it finish, then retry; otherwise close \
+     that app and retry. If irlumed keeps holding it, please report it \
+     (`irlume support-report` says where)";
 
 // Only a driver EBUSY reaches this mapping. Preserve the observed-holder
 // distinction: an identified self-only conflict is an Irlume bug, not advice
 // to close another app. An incomplete scan does not identify an owner, so its
-// text gives the step for each holder it may be (#1338).
+// text gives the step for each holder it may be (#1338). Fixed guidance leads
+// every arm so journal truncation cannot hide it behind a device path.
 fn camera_busy_error(device: &str, holders: Holders) -> Error {
     let self_only = matches!(holders, Holders::SelfOnly);
     let message = match holders {
-        Holders::Other(who) => format!(
-            "{device}: camera busy, in use by {who}. \
-                     Close that app (e.g. a camera/video/conferencing app) and retry."
-        ),
+        Holders::Other(who) => {
+            format!("{NAMED_HOLDER_STEPS}. camera busy, in use by {who}. {device}.")
+        }
         Holders::SelfOnly => format!(
-            "{device}: camera busy, and the only process holding it is irlume itself \
-                     (pid {}). That is an irlume bug, not an app you can close; please report \
-                     it (`irlume support-report` says where).",
+            "An irlume self-hold is a bug, not an app you can close; please report it \
+             (`irlume support-report` says where). {device}: camera busy, and the only process \
+             holding it is irlume itself (pid {}).",
             std::process::id()
         ),
         Holders::UnknownBlind => format!(
-            "{device}: camera busy; `sudo fuser -v {device}` names the holder. \
-             {UNSEEN_HOLDER_STEPS}."
+            "{UNSEEN_HOLDER_STEPS}. camera busy; `sudo fuser -v {device}` names the holder."
         ),
         Holders::None => format!(
-            "{device}: camera busy, another app is using it. \
-                     Close that app (e.g. a camera/video/conferencing app) and retry."
+            "Close the other app (e.g. a camera/video/conferencing app) and retry. \
+             {device}: camera busy, another app is using it."
         ),
     };
     if self_only {
@@ -3419,10 +3427,11 @@ fn describe_camera_holder(holders: Holders) -> Option<String> {
 /// name, decides what its text tells the reader to do (#1338).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holders {
-    /// Some other process has it. The one the user has to close, named by
-    /// its process name as `holder_name` shows it, then its pid
-    /// (`kamoso (pid 2567)`), or by its pid alone (`pid 2567`) when no name
-    /// is left.
+    /// Some other process has it. This is an observed non-self PID, which can
+    /// be an external irlumed: its process name is display text, not daemon
+    /// identity. The holder is named as `holder_name` shows it, then its pid
+    /// (`kamoso (pid 2567)`), or by its pid alone (`pid 2567`) when no name is
+    /// left. Advice covers both waiting for irlumed and closing an ordinary app.
     Other(String),
     /// Our own handle, on a scan that could read every process. irlume
     /// competing with itself is a defect, not something the user can act on.
@@ -3692,7 +3701,7 @@ impl Unreadable {
                     // says to report it (#1338).
                     (Some(Holders::SelfOnly), Some(own)) => format!("camera busy, in use by {own}"),
                     (_, Some(who)) => {
-                        format!("camera busy, in use by {who}. Close that app and retry")
+                        format!("camera busy, in use by {who}. {NAMED_HOLDER_STEPS}")
                     }
                     (_, None) => {
                         "camera busy, another app is using it. Close that app and retry".to_string()
@@ -16016,13 +16025,13 @@ mod tests {
         assert!(none.contains("no OS error reported"), "{none}");
     }
 
-    /// The busy sentence for each kind the holder scan reports (#1338):
-    /// "Close that app and retry" only after another process, never after
-    /// irlume itself, which the sentence calls a bug to report, and the
-    /// unseen-holder steps `camera_busy_error` gives. No arm names a device
-    /// path: census evidence is this text, and a census document names a
-    /// node only in its `node` field; scripts/machine-api-conformance.py
-    /// rejects `/dev/video` anywhere else (docs/MACHINE-API.md).
+    /// The busy sentence for each kind the holder scan reports (#1338).
+    /// SelfOnly and UnknownBlind keep their report guidance. A named non-self
+    /// PID gets conditional close advice because it can be an external irlumed;
+    /// its `comm` is not daemon identity. No arm names a device path: census
+    /// evidence is this text, and a census document names a node only in its
+    /// `node` field; scripts/machine-api-conformance.py rejects `/dev/video`
+    /// anywhere else (docs/MACHINE-API.md).
     #[test]
     fn a_busy_node_cause_never_contradicts_its_holder() {
         let busy =
@@ -16034,7 +16043,11 @@ mod tests {
         );
         assert_eq!(
             busy(Some(Holders::Other("firefox (pid 42)".into()))),
-            format!("{code} camera busy, in use by firefox (pid 42). Close that app and retry")
+            format!(
+                "{code} camera busy, in use by firefox (pid 42). For irlumed, let it \
+                 finish, then retry; otherwise close that app and retry. If irlumed keeps holding \
+                 it, please report it (`irlume support-report` says where)"
+            )
         );
         assert_eq!(
             busy(Some(Holders::SelfOnly)),
@@ -16043,8 +16056,8 @@ mod tests {
         assert_eq!(
             busy(Some(Holders::UnknownBlind)),
             format!(
-                "{code} camera busy; `sudo fuser -v` on this node names the holder. Close that \
-                 app, or wait for irlumed to finish, then retry; if irlumed keeps holding it, \
+                "{code} camera busy; `sudo fuser -v` on this node names the holder. Close the \
+                 other app, or wait for irlumed to finish, then retry; if irlumed keeps holding it, \
                  please report it (`irlume support-report` says where)"
             )
         );
@@ -19230,9 +19243,9 @@ mod tests {
     /// `camera_busy_error` words it.
     fn self_held_busy_text(device: &str) -> String {
         format!(
-            "{device}: camera busy, and the only process holding it is irlume itself (pid {}). \
-             That is an irlume bug, not an app you can close; please report it \
-             (`irlume support-report` says where).",
+            "An irlume self-hold is a bug, not an app you can close; please report it \
+             (`irlume support-report` says where). {device}: camera busy, and the only process \
+             holding it is irlume itself (pid {}).",
             std::process::id()
         )
     }
@@ -19265,9 +19278,9 @@ mod tests {
     /// `camera_busy_error` words it.
     fn unseen_holder_busy_text(device: &str) -> String {
         format!(
-            "{device}: camera busy; `sudo fuser -v {device}` names the holder. Close that app, \
-             or wait for irlumed to finish, then retry; if irlumed keeps holding it, please \
-             report it (`irlume support-report` says where)."
+            "Close the other app, or wait for irlumed to finish, then retry; if irlumed keeps holding \
+             it, please report it (`irlume support-report` says where). camera busy; \
+             `sudo fuser -v {device}` names the holder."
         )
     }
 
@@ -19275,8 +19288,8 @@ mod tests {
     /// work, which is normal, or irlumed holding the camera after its work
     /// ended, which is a bug: the text gives the step for each and stays a
     /// retryable busy camera (#1338). irlumed's journal keeps 240 characters
-    /// of a bare error (`journal_prose` in irlume-daemon), and the pointer to
-    /// the report ends this one, so it must fit for a two-digit node.
+    /// of a bare error (`journal_prose` in irlume-daemon). The fixed steps lead
+    /// the text, so they survive truncation of a long pinned path.
     #[test]
     fn unseen_holder_busy_text_gives_the_step_for_every_holder() {
         match camera_busy_error("/dev/video99", Holders::UnknownBlind) {
@@ -19286,6 +19299,109 @@ mod tests {
                 assert_eq!(irlume_common::single_line(&shown, 240), shown, "{shown}");
             }
             other => panic!("an unseen holder is a busy camera: {other:?}"),
+        }
+    }
+
+    /// A different PID running irlumed is an observed other holder, not
+    /// SelfOnly. Its name is display text, so the advice covers both daemon
+    /// work and an ordinary app without treating `comm` as daemon identity.
+    #[test]
+    fn an_external_irlumed_holder_gets_conditional_close_advice() {
+        let device = "/dev/video99";
+        match camera_busy_error(device, Holders::Other("irlumed (pid 4194304)".into())) {
+            Error::CameraBusy(text) => {
+                assert_eq!(
+                    text,
+                    "For irlumed, let it finish, then retry; otherwise close that app and \
+                     retry. If irlumed keeps holding it, please report it \
+                     (`irlume support-report` says where). camera busy, in use by \
+                     irlumed (pid 4194304). /dev/video99."
+                );
+                assert!(!text.contains("in use by irlumed (pid 4194304). Close that app"));
+                let wire = Error::CameraBusy(text).to_string();
+                assert_eq!(irlume_common::single_line(&wire, 240), wire, "{wire}");
+                assert!(
+                    wire.find("`irlume support-report`")
+                        .expect("report pointer")
+                        < wire.find(device).expect("device path")
+                );
+            }
+            other => panic!("an external irlumed holder is still a busy camera: {other:?}"),
+        }
+    }
+
+    /// Every remedy precedes variable device text, so the daemon's 240-plus-
+    /// ellipsis journal budget cannot cut it off. The realistic path does not
+    /// make the short None arm overflow; the other three arms do overflow.
+    #[test]
+    fn busy_remedies_survive_path_lengths_and_journal_truncation() {
+        const REALISTIC: &str =
+            "/dev/v4l/by-id/usb-Logitech_BRIO_4K_Pro_Webcam_12345678-video-index0";
+        let long = format!("/dev/{}", "x".repeat(4091));
+        assert_eq!(long.len(), 4096);
+        let cases = [
+            (
+                Holders::Other("irlumed (pid 4194304)".into()),
+                "otherwise close that app and retry",
+                true,
+            ),
+            (Holders::SelfOnly, "not an app you can close", true),
+            (Holders::UnknownBlind, "Close the other app, or wait", true),
+            (Holders::None, "Close the other app (e.g.", false),
+        ];
+        for device in ["/dev/video0", "/dev/video99", REALISTIC, long.as_str()] {
+            for (holders, remedy, has_report) in &cases {
+                let error = camera_busy_error(device, holders.clone());
+                let text = match &error {
+                    Error::CameraBusy(text) | Error::Hardware(text) => text,
+                    other => panic!("unexpected busy error variant: {other:?}"),
+                };
+                assert_eq!(text.matches(device).count(), 1, "{text}");
+                let path_at = text.find(device).expect("device path");
+                if let Holders::Other(who) = holders {
+                    assert!(text.find(who).expect("named holder") < path_at, "{text}");
+                }
+                assert!(text.find(remedy).expect("remedy") < path_at, "{text}");
+                if *has_report {
+                    assert!(
+                        text.find("`irlume support-report`")
+                            .expect("report pointer")
+                            < path_at,
+                        "{text}"
+                    );
+                }
+                match holders {
+                    Holders::Other(_) => assert!(text.contains("close that app"), "{text}"),
+                    Holders::None => assert!(text.contains("Close the other app"), "{text}"),
+                    _ => {}
+                }
+                if device == "/dev/video99" && matches!(holders, Holders::None) {
+                    assert_eq!(
+                        text,
+                        "Close the other app (e.g. a camera/video/conferencing app) and retry. \
+                         /dev/video99: camera busy, another app is using it."
+                    );
+                }
+
+                let wire = error.to_string();
+                let shown = irlume_common::single_line(&wire, 240);
+                if device.len() <= "/dev/video99".len() {
+                    assert_eq!(shown, wire, "{shown}");
+                }
+                let realistic_overflow = device == REALISTIC && !matches!(holders, Holders::None);
+                if device == long.as_str() || realistic_overflow {
+                    assert_eq!(shown.chars().count(), 243, "{shown}");
+                    assert!(shown.ends_with("..."), "{shown}");
+                    assert!(!shown.contains('\n'), "{shown}");
+                    assert!(shown.contains(remedy), "{shown}");
+                    if matches!(holders, Holders::Other(_)) {
+                        assert!(shown.contains("in use by irlumed (pid"), "{shown}");
+                    }
+                    if *has_report {
+                        assert!(shown.contains("`irlume support-report`"), "{shown}");
+                    }
+                }
+            }
         }
     }
 
@@ -19600,18 +19716,40 @@ mod tests {
                 "webcam-\u{30D3}\u{30C7}\u{30AA}".as_bytes(),
                 "webcam-\u{30D3}\u{30C7}\u{FFFD}",
             ),
-            // An ordinary name.
+            // Ordinary names, including one that looks like the daemon.
             (b"kamoso", "kamoso"),
+            (b"irlumed", "irlumed"),
         ];
         for (index, &(name, shown)) in cases.iter().enumerate() {
             let stdin = std::fs::File::open(&held).unwrap();
             let holder = holder_named(&scratch.0.join(index.to_string()), name, stdin);
             let pid = holder.0.id();
-            assert_eq!(
-                camera_holders(held.to_str().unwrap()),
-                Holders::Other(format!("{shown} (pid {pid})")),
-                "{name:?}"
-            );
+            let who = format!("{shown} (pid {pid})");
+            let observed = camera_holders(held.to_str().unwrap());
+            assert_eq!(observed, Holders::Other(who.clone()), "{name:?}");
+            if shown == "irlumed" {
+                let busy = camera_busy_error(held.to_str().unwrap(), observed.clone());
+                let Error::CameraBusy(text) = busy else {
+                    panic!("a different-PID irlumed remains CameraBusy: {busy:?}")
+                };
+                assert!(text.contains("For irlumed, let it finish, then retry"));
+                assert!(text.contains("otherwise close that app and retry"));
+                assert!(text.contains("`irlume support-report`"));
+                assert!(!text.contains(&format!("{who}. Close that app")));
+
+                let cause = Unreadable {
+                    path: held.to_string_lossy().into_owned(),
+                    at: FailedAt::Open,
+                    errno: Some(libc::EBUSY),
+                    holder: Some(observed),
+                }
+                .cause();
+                assert!(cause.contains(&format!("in use by {who}")), "{cause}");
+                assert!(cause.contains("For irlumed, let it finish, then retry"));
+                assert!(cause.contains("otherwise close that app and retry"));
+                assert!(cause.contains("`irlume support-report`"));
+                assert!(!cause.contains(&format!("{who}. Close that app")));
+            }
         }
         // Nothing left once cleaned: the holder is named by its pid alone.
         let stdin = std::fs::File::open(&held).unwrap();
@@ -19690,15 +19828,17 @@ mod tests {
                 Error::CameraBusy(text) => assert_eq!(
                     text,
                     format!(
-                        "{node}: camera busy, in use by {who}. Close that app \
-                         (e.g. a camera/video/conferencing app) and retry."
+                        "For irlumed, let it finish, then retry; otherwise close that app \
+                         and retry. If irlumed keeps holding it, please report it \
+                         (`irlume support-report` says where). camera busy, in use by {who}. \
+                         {node}."
                     )
                 ),
                 other => panic!("another holder is a busy camera: {other:?}"),
             }
             assert!(
                 cause.ends_with(&format!(
-                    "camera busy, in use by {who}. Close that app and retry"
+                    "camera busy, in use by {who}. {NAMED_HOLDER_STEPS}"
                 )),
                 "{cause:?}"
             );

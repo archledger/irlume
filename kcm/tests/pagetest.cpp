@@ -552,7 +552,7 @@ void checkCameras(const Ctx &c)
         // characters included; checkPlainText checks that it is plain text.
         c.showsText(QStringLiteral("device-/dev/video5"),
                     QStringLiteral("could not be opened (errno 16: Device or resource busy (os error 16)). "
-                                   "camera busy, in use by cam & mic <2> (pid 4242). Close that app and retry"));
+                                   "camera busy, in use by cam & mic <2> (pid 4242). For irlumed, let it finish, then retry; otherwise close that app and retry. If irlumed keeps holding it, please report it (`irlume support-report` says where)"));
     } else if (c.set == QLatin1String("empty") || c.set == QLatin1String("short")) {
         c.visible(QStringLiteral("empty"));
     } else if (c.set == QLatin1String("refused")) {

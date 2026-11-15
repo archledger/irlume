@@ -3611,6 +3611,15 @@ mod tests {
         let boot = irlume_common::boot_id().expect("this boot's ID");
 
         let unreadable = WithoutReadPermission::set(&keyring_dir);
+        if std::fs::File::open(&keyring_dir).is_ok() {
+            drop(unreadable);
+            drop(sandbox);
+            panic!(
+                "this process opens a directory without read permission (root, \
+                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                 be made to fail here: run the tests as an unprivileged user"
+            );
+        }
         let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
         let after = entries();
         let unused_since = load_record().unused_since;
@@ -3675,6 +3684,15 @@ mod tests {
         let boot = irlume_common::boot_id().expect("this boot's ID");
 
         let unreadable = WithoutReadPermission::set(&state_dir);
+        if std::fs::File::open(&state_dir).is_ok() {
+            drop(unreadable);
+            drop(sandbox);
+            panic!(
+                "this process opens a directory without read permission (root, \
+                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                 be made to fail here: run the tests as an unprivileged user"
+            );
+        }
         let published = publish_envelope(&bob, EnvelopeKind::KeyringSecret, "bob", &envelope(true));
         let bob_unchanged = std::fs::read(&bob).unwrap() == before;
         let after = entries();

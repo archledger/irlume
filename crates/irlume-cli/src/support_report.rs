@@ -1989,16 +1989,6 @@ mod tests {
         assert!(matches!(key.apply_to_reply(Response::Pong), Response::Pong));
     }
 
-    /// Removes a test's scratch directory when the test ends, whether it
-    /// passed or failed.
-    struct ScratchDir(PathBuf);
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     /// `collect` twice in one process against a fake daemon, as the TUI
     /// collects one report after another: first without a probe, then with
     /// one. Each report carries its own keyed values, and neither carries
@@ -2008,18 +1998,13 @@ mod tests {
     /// probes, so no command output shows the probe result's own snapshot.
     #[test]
     fn collect_draws_one_key_per_report_and_keys_a_probe_copy_with_it() {
+        use crate::testenv::scratch;
         use std::io::{BufRead as _, Write as _};
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // A random name, not the process ID: a run in another PID namespace
-        // can get the same process ID. Short, as `sun_path` holds 108 bytes.
-        let dir = std::env::temp_dir().join(format!(
-            "irlume-support-report-{:08x}",
-            rand::random::<u32>()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let _scratch = ScratchDir(dir.clone());
+        // Keep the path short, as `sun_path` holds 108 bytes.
+        let (dir, _scratch) = scratch("support-report");
         let socket = dir.join("daemon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();

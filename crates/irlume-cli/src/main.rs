@@ -7098,6 +7098,72 @@ fn capture(args: &[String]) -> std::process::ExitCode {
 #[cfg(test)]
 pub(crate) mod testenv {
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Removes a test's scratch directory when the test ends, whether it
+    /// passed or failed.
+    pub(crate) struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new, empty scratch directory for one test, and the guard that
+    /// removes it. Bind the guard to a named variable so that it lives to the
+    /// end of the test. The name is random, not built from the process ID: a
+    /// later run in another PID namespace can get the same process ID and
+    /// would meet a directory an earlier run left. Creation is strict, so
+    /// such a directory fails the test instead of being adopted.
+    pub(crate) fn scratch(label: &str) -> (std::path::PathBuf, Scratch) {
+        let path = std::env::temp_dir().join(format!(
+            "irlume-pamedit-{label}-{:08x}",
+            rand::random::<u32>()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        (path.clone(), Scratch(path))
+    }
+
+    /// A file holding `body` at exactly `mode`. The mode is part of each
+    /// test's precondition: a file system that does not keep a bit fails
+    /// here, not later as a backup that matches by accident.
+    pub(crate) fn file_at(path: &std::path::Path, body: &str, mode: u32) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(path).unwrap().mode() & 0o7777,
+            mode,
+            "precondition: {} did not take mode {mode:o}",
+            path.display()
+        );
+    }
+
+    /// Every name in `dir`, sorted, so a test sees a scratch file or a stray
+    /// copy left beside the ones it expects.
+    pub(crate) fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn scratch_dirs_are_distinct_and_removed_when_their_test_fails() {
+        let (first, guard) = scratch("unwind");
+        let (second, _second) = scratch("unwind");
+        assert_ne!(first, second);
+        std::fs::write(first.join("sudo.pre-irlume"), b"x").unwrap();
+        let unwound = std::panic::catch_unwind(move || {
+            let _guard = guard;
+            panic!("fixture failure");
+        });
+        assert!(unwound.is_err());
+        assert!(!first.exists());
+        assert!(second.is_dir());
+    }
 }
 
 /// Phase-1 make-or-break: load the recognition model and embed the same chip

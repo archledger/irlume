@@ -111,6 +111,13 @@ sed -e 's/^main() {$/main() {\n  printf "%s\\n" "$$" > "${TEST_DIR:?}\/installer
     -e 's/^  exec 9<&-$/  exec 9<\&-\n  [ "${TEST_APT:-}" != post_launch ] || kill -s "${TEST_SIGNAL:-TERM}" "$$"/' \
     "$work/install.sh" > "$work/install-boundaries.sh"
 mv "$work/install-boundaries.sh" "$work/install.sh"
+# Harness-only report failure: empty a job report by writing to /dev/full.
+# shellcheck disable=SC2016
+sed -e 's#^  job_capture "\$job_report" || return 0$#  job_capture "${TEST_REPORT_PATH:-$job_report}" || return 0#' \
+  "$work/install.sh" > "$work/install-report-failure.sh"
+mv "$work/install-report-failure.sh" "$work/install.sh"
+[ "$(grep -c 'TEST_REPORT_PATH:-' "$work/install.sh")" = 1 ] \
+  || { echo "test-install-script: job report substitution failed" >&2; exit 1; }
 [ "$(grep -c 'TEST_APT:-.*pre_launch' "$work/install.sh")" = 1 ] \
   || { echo "test-install-script: pre-launch boundary substitution failed" >&2; exit 1; }
 [ "$(grep -c 'TEST_APT:-.*post_wait' "$work/install.sh")" = 1 ] \
@@ -124,6 +131,47 @@ fi
 has_async_fetch=1
 [ "$(grep -c 'TEST_RELEASE:-.*fetch_after_wait' "$work/install.sh")" = 1 ] \
   || { echo "test-install-script: fetch post-wait substitution or wait form changed" >&2; exit 1; }
+# Lifecycle probes use the production functions, never an installer run. The
+# failed-query case owns a real active child; status cases use a completed
+# publication record before their direct child's first reap.
+sed '/^main "\$@"$/d' "$script" > "$work/lifecycle-probes.sh"
+cat >> "$work/lifecycle-probes.sh" <<'EOF'
+probe_dir="${TEST_PROBE_DIR:?}"
+case "$1" in
+  query_failure)
+    mkdir "$probe_dir/package"
+    printf 'verified\n' > "$probe_dir/package/asset"
+    (
+      n=0
+      while [ ! -e "$probe_dir/finish" ]; do
+        n=$((n + 1))
+        [ "$n" -lt 200 ] || exit 98
+        sleep 0.05
+      done
+      : > "$probe_dir/child-finished"
+    ) &
+    jobs() { return 98; }
+    pkg_dir="$probe_dir/package"
+    download_dir=""
+    job_report="$probe_dir/jobs"
+    fetch_done=""
+    fetch_keep=""
+    trap on_exit EXIT
+    exit 143
+    ;;
+  keep_status)
+    printf '%s keep\n' "$2" > "$probe_dir/completion"
+    ( exit "$2" ) &
+    probe_rc=0
+    fetch_wait "$probe_dir/completion" "$probe_dir/jobs" || probe_rc=$?
+    [ "$probe_rc" = "$3" ] && [ "$fetch_keep" = keep ] || {
+      printf 'published %s keep returned %s with %s, want %s with keep\n' \
+        "$2" "$probe_rc" "${fetch_keep:-unset}" "$3" >&2
+      exit 1
+    }
+    ;;
+esac
+EOF
 sed 's/^main "\$@"$/fetch_verified "$@"/' "$work/install.sh" > "$work/fetch-verified.sh"
 [ "$(grep -cxF 'fetch_verified "$@"' "$work/fetch-verified.sh")" = 1 ] \
   || { echo 'test-install-script: install.sh no longer has one main "$@" line' >&2; exit 1; }
@@ -284,7 +332,7 @@ cat > "$work/bin/apt-get" <<'EOF'
 #!/bin/sh
 printf '%s %s\n' "$(basename "$0")" "$*" >> "$TEST_LOG"
 if [ "${1:-}" = install ]; then
-  if [ "$TEST_APT" = signal_shell ]; then
+  if [ "$TEST_APT" = signal_shell ] || [ "$TEST_APT" = report_io_failure ]; then
     kill -s TERM "$PPID"
   fi
   if [ "$TEST_APT" = child_int ]; then
@@ -296,7 +344,7 @@ if [ "${1:-}" = install ]; then
     printf 'apt-get stdin: %s\n' "$answer" >> "$TEST_LOG"
     [ "$answer" = 'keep-local-conffile' ] || exit 97
   fi
-  case "$TEST_APT" in signal_shell|post_launch)
+  case "$TEST_APT" in signal_shell|report_io_failure|post_launch)
     n=0
     while kill -0 "$PPID" 2>/dev/null; do
       n=$((n + 1))
@@ -319,7 +367,7 @@ if [ "${1:-}" = install ]; then
         ;;
     esac
   done
-  case "$TEST_APT" in signal_shell|post_launch|child_int) : > "$TEST_DIR/apt-done" ;; esac
+  case "$TEST_APT" in signal_shell|report_io_failure|post_launch|child_int) : > "$TEST_DIR/apt-done" ;; esac
   [ "$TEST_APT" != fail ] || exit 100
 fi
 EOF
@@ -433,10 +481,12 @@ install() {
   rc=0
   started=$SECONDS
   apt_mode=${5:-ok}
+  report_path=""
+  [ "$apt_mode" != report_io_failure ] || report_path=/dev/full
   set -- env --default-signal=HUP,INT,TERM -i PATH="$work/bin" HOME="$work" TMPDIR="${6:-$work/tmp}" TERM=dumb \
     TEST_LOG="$work/log" TEST_DIR="$work" \
     TEST_PPA="$2" TEST_RELEASE="${3:-none}" TEST_DAEMON="${4:-active}" TEST_APT="${5:-ok}" \
-    TEST_SIGNAL="${sig:-}" TEST_KEY_FP="$key_fp" sh "$work/install.sh"
+    TEST_SIGNAL="${sig:-}" TEST_REPORT_PATH="$report_path" TEST_KEY_FP="$key_fp" sh "$work/install.sh"
   if [ "$apt_mode" = stdin_pkg ]; then
     printf 'keep-local-conffile\n' | "$@" > "$work/stdout" 2> "$work/stderr" || rc=$?
   else
@@ -746,6 +796,17 @@ want_rc 143
 want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
 want_no_err 'The machine side is ready.'
 
+label="SIGTERM during package installation with an unwritable job report"
+rm -f "$work/apt-done"
+install "$debian" lists good active report_io_failure
+n=0
+while [ ! -e "$work/apt-done" ] && [ "$n" -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
+[ -e "$work/apt-done" ] || fail "$label: the stand-in apt-get did not finish"
+want_rc 143
+want_called 'apt-get read the verified irlume_0.99.0_amd64.deb'
+want_no_err 'The machine side is ready.'
+want_block
+
 label="a directory made at the download directory's path after the install"
 rm -f "$work/deb-path"
 install "$debian" lists good remake
@@ -961,6 +1022,35 @@ if [ "$has_async_fetch" = 1 ]; then
     want_no_download
   done
 fi
+
+label="a failed jobs query preserves the package of an active child"
+probe_dir="$work/probe-query-failure"
+mkdir "$probe_dir"
+rc=0
+env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+  sh "$work/lifecycle-probes.sh" query_failure > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+want_rc 143
+[ -f "$probe_dir/package/asset" ] \
+  || fail "$label: removed the verified package after a failed job query"
+: > "$probe_dir/finish"
+n=0
+while [ ! -e "$probe_dir/child-finished" ] && [ "$n" -lt 200 ]; do sleep 0.05; n=$((n + 1)); done
+[ -e "$probe_dir/child-finished" ] || fail "$label: active child did not stop"
+
+for published in 42 143 0; do
+  expected="$published"
+  [ "$published" -ne 0 ] || expected=1
+  label="published $published keep status and cleanup disposition"
+  probe_dir="$work/probe-keep-$published"
+  mkdir "$probe_dir"
+  rc=0
+  env --default-signal=HUP,INT,TERM -i PATH="$work/bin" TEST_PROBE_DIR="$probe_dir" \
+    sh "$work/lifecycle-probes.sh" keep_status "$published" "$expected" \
+    > "$work/probe-stdout" 2> "$work/probe-stderr" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "$label: $(cat "$work/probe-stderr")"
+  fi
+done
 
 [ "$failed" = 0 ] || exit 1
 echo "test-install-script: every channel choice and message held (sh is $(readlink -f "$work/bin/sh"))"

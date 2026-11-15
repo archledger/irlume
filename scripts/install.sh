@@ -107,28 +107,49 @@ die_verify() {
 # or suspended job keeps the verified package to read. After ordinary cleanup
 # pkg_dir is empty so a recreated directory at the old path is never removed.
 # The exit status is kept.
-# Extract the state from one jobs -l report. Dash separates the current-job
-# marker from its bracketed number ("[1] + PID Running"); Bash attaches it
-# ("[1]+ PID Running"). Any other shape is unknown, never evidence of life.
+# Capture the sole direct job in the current shell, then a completion marker.
+# Query and write failures are independently unknown: neither a failed query
+# nor Bash returning zero after a failed jobs write may become a no-job report.
+# Parent-shell redirection is required: a command-substitution subshell cannot
+# see Dash's job table.
+job_capture() {
+  job_path="$1"
+  : > "$job_path" 2>/dev/null || return 1
+  LC_ALL=C jobs -l >> "$job_path" 2>/dev/null || return 1
+  printf '%s\n' 'irlume-job-state-version-1' >> "$job_path" 2>/dev/null || return 1
+  [ -s "$job_path" ]
+}
+
+# A valid report is either the marker alone (no job) or one state line followed
+# by the marker. Empty output is never accepted as a report. Parse both Dash's
+# separated job marker and Bash's attached one; malformed layouts are unknown.
 job_report_state() {
-  awk 'NR == 1 {
-    if ($1 ~ /^\[[0-9]+\][+-]$/ && $2 ~ /^[0-9]+$/) print $3
-    else if ($1 ~ /^\[[0-9]+\]$/ && $2 ~ /^[+-]$/ && $3 ~ /^[0-9]+$/) print $4
-  }' "$1" 2>/dev/null
+  awk -v marker='irlume-job-state-version-1' \
+    'NR == 1 {
+      if ($0 == marker) { no_job = 1; next }
+      seen_job = 1
+      if ($1 ~ /^\[[0-9]+\][+-]$/ && $2 ~ /^[0-9]+$/) state = $3
+      else if ($1 ~ /^\[[0-9]+\]$/ && $2 ~ /^[+-]$/ && $3 ~ /^[0-9]+$/) state = $4
+      else state = "unknown"
+      next
+    }
+    $0 == marker { markers++; next }
+    { invalid = 1 }
+    END {
+      if (no_job && NR == 1 && !markers && !invalid) printf ""
+      else if (seen_job && NR == 2 && markers == 1 && !invalid) print state
+      else print "unknown"
+    }' "$1" 2>/dev/null
 }
 
 package_job_outstanding() {
-  # jobs is a regular shell builtin. Use redirection, not $(jobs ...): dash
-  # cannot see the parent's jobs in a command-substitution subshell. With no
-  # other asynchronous jobs, %% names the package job. LC_ALL=C gives the
-  # POSIX state names. Empty output means no such current job; Done means it
-  # has completed. Any other reported state, including one this script cannot
-  # parse, is kept conservatively.
-  LC_ALL=C jobs -l %% > "$job_report" 2>/dev/null || true
-  [ -s "$job_report" ] || return 1
-  job_state="$(job_report_state "$job_report")" || job_state=""
+  # Only the validated marker alone or Done proves no outstanding job. A failed
+  # or malformed report, including an I/O failure Bash does not return, keeps
+  # the package conservatively rather than deleting it under a live manager.
+  job_capture "$job_report" || return 0
+  job_state="$(job_report_state "$job_report")" || job_state="unknown"
   case "$job_state" in
-    Done*) return 1 ;;
+    ''|Done*) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -141,17 +162,32 @@ on_exit() {
     # or unclear states never select a numeric PID for termination.
     trap '' HUP INT TERM
     fetch_keep="${fetch_keep:--}"
+    fetch_cancel_waited=0
     if [ ! -f "$fetch_done" ] && ! fetch_cancel "$fetch_done" "$fetch_job_report"; then
       fetch_keep="keep"
     else
       wait 2>/dev/null || true
+      fetch_cancel_waited=1
+    fi
+    # Cancellation can make the worker publish after this trap began. Honor
+    # the record's disposition too: keep means an inner state was unknown and
+    # a download may still be active even though the publisher itself exited.
+    fetch_honor_disposition "$fetch_done"
+    if [ "${fetch_keep:-}" = keep ] && [ "$fetch_cancel_waited" = 1 ] && \
+       [ -f "$fetch_done" ] && [ -f "${download_dir}.command-complete" ]; then
+      # Both publishing shells were waited. A raw downloader may still need
+      # the directory, but no shell remains to recreate these report files.
+      rm -f "$fetch_done" "$fetch_done.part" "$fetch_job_report" \
+        "${download_dir}.command-complete" "${download_dir}.command-complete.part" \
+        "${download_dir}.command-jobs" "${download_dir}.command-child-jobs" || true
     fi
     fetch_done=""
   fi
   if [ -n "${download_dir:-}" ] && [ "${fetch_keep:-}" != keep ]; then
     rm -f "${download_dir}.fetch-complete" "${download_dir}.fetch-complete.part" \
       "${download_dir}.fetch-jobs" "${download_dir}.command-complete" \
-      "${download_dir}.command-complete.part" "${download_dir}.command-jobs" || true
+      "${download_dir}.command-complete.part" "${download_dir}.command-jobs" \
+      "${download_dir}.command-child-jobs" || true
     rm -rf "$download_dir" || true
   elif [ -n "${pkg_dir:-}" ]; then
     if [ -z "${job_report:-}" ] || ! package_job_outstanding; then
@@ -229,16 +265,13 @@ fetch_publish() {
 }
 
 # Determine the current job, using a parent-shell redirection: a jobs command
-# substitution cannot see dash's own job table. Unknown output never authorizes
-# a signal or removal, and never fakes activity.
+# substitution cannot see dash's own job table. Each shell owns only its direct
+# asynchronous job. Unknown output never authorizes a signal or removal, and
+# never fakes activity. A failed report/write is unknown; a successful empty
+# report means the job is gone.
 fetch_job_state() {
   fetch_state=unknown
-  : > "$1" 2>/dev/null || return 0
-  LC_ALL=C jobs -l %% > "$1" 2>/dev/null || true
-  if [ ! -s "$1" ]; then
-    fetch_state=finished
-    return 0
-  fi
+  job_capture "$1" || return 0
   state="$(job_report_state "$1")" || state=unknown
   case "$state" in
     Running|Stopped*|Suspended*) fetch_state=running ;;
@@ -267,12 +300,15 @@ fetch_cancel() {
   esac
 }
 
-# Wait for publication, or a terminal job state, before the first normal reap.
-# Bounded sleep intervals remain signal-interruptible. Unexpected states stop
-# without guessing, keeping the directory instead of risking a live download.
+# Wait for publication before the first normal reap. The initial state is
+# finished so an already-published worker can be reaped without jobs being
+# queried. A terminal jobs report may consume Dash's saved status, and a
+# missing completion is therefore unknown, not success. Once read, the record
+# is the status authority: wait is reap-only and cannot turn it into 127.
 fetch_wait() {
   fetch_wait_rc=0
   fetch_keep=""
+  fetch_state=finished
   while [ ! -f "$1" ]; do
     fetch_job_state "$2"
     case "$fetch_state" in
@@ -281,37 +317,61 @@ fetch_wait() {
       unknown) fetch_keep="keep"; return 1 ;;
     esac
   done
-  if [ -f "$1" ]; then
-    IFS=' ' read -r fetch_wait_rc fetch_keep < "$1" || {
-      fetch_wait_rc=1
-      fetch_keep="keep"
-    }
-    case "$fetch_keep" in
-      keep) return 1 ;;
-      -) ;;
-      *) fetch_keep="keep"; return 1 ;;
-    esac
+  if [ ! -f "$1" ]; then
+    fetch_keep="keep"
+    return 1
   fi
-  wait "${!-}" || fetch_wait_rc=$?
+  IFS=' ' read -r fetch_wait_rc fetch_keep < "$1" || {
+    fetch_wait_rc=1
+    fetch_keep="keep"
+  }
+  case "$fetch_keep" in
+    keep) [ "$fetch_wait_rc" -ne 0 ] || fetch_wait_rc=1 ;;
+    -) ;;
+    *) fetch_keep="keep"; fetch_wait_rc=1 ;;
+  esac
+  wait "${!-}" 2>/dev/null || true
   return "$fetch_wait_rc"
+}
+
+# Propagate cleanup disposition without replacing the cancellation status.
+# A missing record leaves the current disposition unchanged. A keep or an
+# unreadable/invalid record is always conservative, at every nested parent.
+fetch_honor_disposition() {
+  [ -f "$1" ] || return 0
+  if IFS=' ' read -r _ fetch_completion_keep < "$1"; then
+    case "$fetch_completion_keep" in
+      keep) fetch_keep="keep" ;;
+      -) ;;
+      *) fetch_keep="keep" ;;
+    esac
+  else
+    fetch_keep="keep"
+  fi
 }
 
 fetch_abort() {
   rc="$1"
   trap '' HUP INT TERM
-  if ! fetch_cancel "$fetch_command_done" "$fetch_command_report"; then
+  if ! fetch_cancel "$fetch_command_done" "${fetch_abort_report:-$fetch_command_report}"; then
     fetch_keep="keep"
   else
     wait 2>/dev/null || true
   fi
+  fetch_honor_disposition "$fetch_command_done"
   exit "$rc"
 }
 fetch_run() {
   fetch_command_done="${tmp}.command-complete"
   fetch_command_report="${tmp}.command-jobs"
-  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report"
+  fetch_command_child_report="${tmp}.command-child-jobs"
+  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report" \
+    "$fetch_command_child_report"
   (
     auto_tmp=0
+    # Parent and child own different job tables. Their report writes must not
+    # truncate one another and make a live job look transiently empty.
+    fetch_abort_report="$fetch_command_child_report"
     fetch_completion="$fetch_command_done"
     trap 'fetch_publish "$?"' EXIT
     trap 'fetch_abort 129' HUP
@@ -326,7 +386,8 @@ fetch_run() {
   ) &
   command_rc=0
   fetch_wait "$fetch_command_done" "$fetch_command_report" || command_rc=$?
-  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report"
+  rm -f "$fetch_command_done" "$fetch_command_done.part" "$fetch_command_report" \
+    "$fetch_command_child_report"
   if [ "$command_rc" -gt 128 ]; then
     fetch_abort "$command_rc"
   fi
@@ -340,7 +401,8 @@ fetch_cleanup() {
   rc=$?
   trap - EXIT
   if [ -n "$tmp" ] && [ "${fetch_keep:-}" != keep ]; then
-    rm -f "${tmp}.command-complete" "${tmp}.command-complete.part" "${tmp}.command-jobs" || true
+    rm -f "${tmp}.command-complete" "${tmp}.command-complete.part" \
+      "${tmp}.command-jobs" "${tmp}.command-child-jobs" || true
   fi
   if [ "$rc" -ne 0 ] && [ -n "$tmp" ] && [ "${fetch_keep:-}" != keep ]; then
     rm -rf "$tmp" || true
@@ -421,9 +483,9 @@ fetch_release() {
   fetch_rc=0
   fetch_verified "$1" "$download_dir" > "$download_dir/.fetch-result" &
   fetch_wait "$fetch_done" "$fetch_job_report" || fetch_rc=$?
-  # An unclear state deliberately preserves directory and report ownership.
-  # Otherwise publication or a terminal job state allowed the first reap.
-  if [ "$fetch_state" != unknown ]; then
+  # An unclear state or keep record deliberately preserves directory and
+  # report ownership. Otherwise publication allowed the reap-only wait.
+  if [ "$fetch_state" != unknown ] && [ "$fetch_keep" != keep ]; then
     rm -f "$fetch_done" "$fetch_done.part" "$fetch_job_report"
     fetch_done=""
   fi

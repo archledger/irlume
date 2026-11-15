@@ -3575,7 +3575,8 @@ mod tests {
 
     /// Holds a directory at mode 0300 (write and search, no read) and puts it
     /// back at 0700 when dropped, so neither a failed assertion nor an early
-    /// return leaves a scratch directory that cannot be listed or removed.
+    /// return leaves a scratch directory that cannot be listed or removed. The
+    /// probe fails the test where the process can open the directory anyway.
     #[cfg(unix)]
     struct WithoutReadPermission<'a>(&'a std::path::Path);
 
@@ -3585,7 +3586,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
                 .expect("chmod 0300");
-            Self(dir)
+            let unreadable = Self(dir);
+            if std::fs::File::open(dir).is_ok() {
+                drop(unreadable);
+                let _ = std::fs::remove_dir_all(dir);
+                panic!(
+                    "this process opens a directory without read permission (root, \
+                     CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                     be made to fail here: run the tests as an unprivileged user"
+                );
+            }
+            unreadable
         }
     }
 
@@ -3645,15 +3656,6 @@ mod tests {
         ));
 
         let unreadable = WithoutReadPermission::set(&dir);
-        if std::fs::File::open(&dir).is_ok() {
-            drop(unreadable);
-            let _ = std::fs::remove_dir_all(&dir);
-            panic!(
-                "this process opens a directory without read permission (root, \
-                 CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
-                 be made to fail here: run the tests as an unprivileged user"
-            );
-        }
         let error = match super::write_atomic_reporting(&path, b"new", 0o600).expect("published") {
             super::AtomicWrite::VisibleNotDurable(e) => e,
             super::AtomicWrite::Durable => {

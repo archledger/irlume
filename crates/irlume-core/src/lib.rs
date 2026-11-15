@@ -260,9 +260,9 @@ pub(crate) mod testenv {
 
     /// Holds a directory at mode 0300 (write and search, no read) and sets it
     /// to 0700 when dropped. Declare it after the guard that removes the
-    /// directory, so it drops first. Where read permission does not bind
-    /// (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH) the directory still
-    /// opens.
+    /// directory, so it drops first. The probe fails the test where read
+    /// permission does not bind (root, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH)
+    /// and the directory still opens.
     pub(crate) struct WithoutReadPermission<'a>(&'a std::path::Path);
 
     impl<'a> WithoutReadPermission<'a> {
@@ -270,7 +270,15 @@ pub(crate) mod testenv {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300))
                 .expect("chmod 0300");
-            Self(dir)
+            let unreadable = Self(dir);
+            if std::fs::File::open(dir).is_ok() {
+                panic!(
+                    "this process opens a directory without read permission (root, \
+                     CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH), so the directory sync step cannot \
+                     be made to fail here: run the tests as an unprivileged user"
+                );
+            }
+            unreadable
         }
     }
 

@@ -1820,7 +1820,7 @@ enum EarlyRefusal {
     Policy,
     /// The daemon's configuration could not be read or is invalid.
     Configuration,
-    /// Too many recent attempts, or the retry state is unavailable.
+    /// Too many recent attempts, or the retry state is busy or unavailable.
     RetryThrottled,
     /// The engine is still loading (answered before the worker exists).
     DaemonStarting,
@@ -8961,7 +8961,7 @@ fn journal_identify_failure(
 }
 
 /// Journal a face request its retry admission refused before it started: the
-/// account reached the retry ceiling, or its retry state could not be read
+/// account reached a retry limit, or its retry state is busy or unavailable
 /// (#1136). A refusal is not a decision about a face, so it is journaled on
 /// every tier at notice level, as the other policy refusals are, once a
 /// minute per request, peer and account; a lock screen in `wait` mode asks
@@ -13655,7 +13655,9 @@ mod tests {
                 concat!(
                     include_str!("retry_throttle.rs"),
                     "\n",
-                    include_str!("retry_throttle/tests.rs")
+                    include_str!("retry_throttle/tests.rs"),
+                    "\n",
+                    include_str!("retry_throttle/tests/contention.rs")
                 ),
             ),
             (

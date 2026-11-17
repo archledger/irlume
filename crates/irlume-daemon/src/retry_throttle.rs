@@ -22,6 +22,7 @@ const FACE_LIMIT: u32 = 50;
 pub(crate) const UNAVAILABLE: &str =
     "face retry state unavailable; use your password and ask an administrator to check /var/lib/irlume/retry";
 pub(crate) const LIMITED: &str = "too many recent face attempts; use your password";
+const BUSY: &str = "face retry state is busy; use your password or try again later";
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid face retry state")
@@ -536,6 +537,8 @@ impl FaceAttempt {
     /// the account the request acts for, resolved once when the daemon
     /// registered it; no second lookup of the name is made here. `None`, a
     /// name that did not resolve, is refused as unavailable.
+    /// Nonblocking contention is refused as busy; other state errors are
+    /// refused as unavailable.
     pub(crate) fn for_account(uid: Option<u32>) -> Result<Self, &'static str> {
         let result = uid.ok_or_else(invalid).and_then(account_of).and_then(|a| {
             Self::begin(
@@ -549,6 +552,7 @@ impl FaceAttempt {
         match result {
             Ok(Some(attempt)) => Ok(attempt),
             Ok(None) => Err(LIMITED),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(BUSY),
             Err(_) => Err(UNAVAILABLE),
         }
     }

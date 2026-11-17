@@ -473,6 +473,12 @@ the original window immediately before the first byte and bounds the write
 timeout to remaining time where possible; partially written bytes cannot be
 retracted if cancellation or expiry arrives during the write.
 
+For face requests, `face retry state is busy` reports temporary unavailability,
+not a diagnosis of damaged records or proof that another face scan is running.
+For example, an earlier face reply or a retry-status/reset operation may still
+own the account lock. Use your password or try again later; do not repair,
+delete or reset history solely because of this message.
+
 For repair, use password authentication and inspect `journalctl -u irlumed`.
 Stop `irlumed.socket` and `irlumed.service` while correcting the affected
 record's ownership, permissions,

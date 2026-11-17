@@ -6,6 +6,8 @@ use irlume_auth::OutcomeKind as Kind;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod contention;
+
 const BOOT: &str = "00000000-0000-4000-8000-000000000001";
 const NEXT_BOOT: &str = "00000000-0000-4000-8000-000000000002";
 const POLICY: Policy = Policy {

@@ -1750,8 +1750,10 @@ fn legacy_eye_policy(enrollment: &irlume_core::storage::Enrollment) -> Result<()
 /// in one spectrum), or because the required PAD vote is still incomplete.
 ///
 /// These are the ONLY outcomes the grace window may retry: they are
-/// FAR-neutral (no matcher ran) and give an attacker nothing. The daemon
-/// throttle must NOT count them as failed attempts either. A real rejection
+/// FAR-neutral (no matcher ran) and give an attacker nothing. When returned
+/// as final outcomes, they do not add short-cooldown strikes. Retry admission
+/// still reserves one durable charge per request, shared by its internal
+/// grace retries; a failed request retains that charge. A real rejection
 /// (wrong person, a caught spoof that produced a live face) is NOT
 /// presence-retryable, and a below-threshold MATCH is never retried (that
 /// would multiply FAR).

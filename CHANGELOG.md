@@ -222,6 +222,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Unreceived worker replies now file cancelled grants and emit their
+  withheld journal line once, even if the channel accepted the reply.
+  Other decisions retain their recorded result and retry accounting
+  stays unchanged (ADR-0030 §5).
+
 - Early face-reply handoff retains completion data for the ordinary
   fallback path. This internal hardening keeps final admission and retry
   delivery accounting attached to unsent replies; a failed production

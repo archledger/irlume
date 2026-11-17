@@ -1577,13 +1577,9 @@ fn main() {
                             if !delivery.delivered {
                                 if let Err(std::sync::mpsc::SendError(resp)) = reply.send(resp) {
                                     // The connection thread is gone: no reply
-                                    // reaches the client, so a grant is not one.
-                                    resp.journal_unreceived();
-                                    if let Some(filing) = resp.filing {
-                                        filing
-                                            .undelivered(irlume_common::OutcomeCause::Cancelled)
-                                            .commit();
-                                    }
+                                    // reaches it. The owner files and journals
+                                    // this undelivered reply when dropped.
+                                    drop(resp);
                                 }
                             }
                             // Back to waiting for work: idle is healthy, and leaving the
@@ -2340,6 +2336,7 @@ impl WithheldLine {
     }
 }
 
+/// An unconsumed reply defaults to undelivered filing and journaling on drop.
 struct WorkerReply {
     response: Response,
     completion: Option<FaceCompletion>,
@@ -2425,17 +2422,9 @@ impl<'a> Delivery<'a> {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
-                reply.journal_unreceived();
-                if let Some(filing) = reply.filing.take() {
-                    filing
-                        .undelivered(irlume_common::OutcomeCause::Cancelled)
-                        .commit();
-                }
-                if let Some(completion) = &mut reply.completion {
-                    // Journaled above. The ordinary send reuses this disconnected
-                    // sender and fails too; it must not journal the line again.
-                    completion.withheld_line = None;
-                }
+                // Consume the failure metadata before retaining completion.
+                // The ordinary send reuses this disconnected sender and fails too.
+                reply.discard_undelivered();
                 *unsent_completion = reply.completion.take();
                 false
             }
@@ -2540,33 +2529,43 @@ impl WorkerReply {
     /// For a reply the connection thread was gone to take: a grant in it
     /// was journaled as granted where its request journals decisions, so the
     /// journal says it was not delivered, as the last admission check does.
-    fn journal_unreceived(&self) {
+    fn journal_unreceived(&mut self) {
         if let Some(line) = self
             .completion
-            .as_ref()
-            .and_then(|completion| completion.withheld_line.as_ref())
+            .as_mut()
+            .and_then(|completion| completion.withheld_line.take())
         {
             line.journal(&std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
-                "the connection closed before the reply was handed over",
+                "the reply was discarded before delivery to the client",
             ));
         }
     }
 
-    fn respond(self, stream: UnixStream) -> std::io::Result<()> {
-        let WorkerReply {
-            response,
-            completion,
-            filing,
-        } = self;
-        let Some(completion) = completion.filter(|_| is_face_grant(&response)) else {
-            let result = respond(stream, &response);
-            if let Some(filing) = filing {
+    /// The default outcome of losing a reply owner is undelivered. Taking
+    /// metadata before using it also makes an explicit discard idempotent.
+    fn discard_undelivered(&mut self) {
+        self.journal_unreceived();
+        if let Some(filing) = self.filing.take() {
+            filing
+                .undelivered(irlume_common::OutcomeCause::Cancelled)
+                .commit();
+        }
+    }
+
+    fn respond(mut self, stream: UnixStream) -> std::io::Result<()> {
+        let Some(completion) = self
+            .completion
+            .take()
+            .filter(|_| is_face_grant(&self.response))
+        else {
+            let result = respond(stream, &self.response);
+            if let Some(filing) = self.filing.take() {
                 filing.commit();
             }
             return result;
         };
-        let result = respond_admitted(stream, &response, |stream| {
+        let result = respond_admitted(stream, &self.response, |stream| {
             let timeout = completion
                 .window
                 .remaining()
@@ -2606,13 +2605,19 @@ impl WorkerReply {
         }
         // The record says what the client got (ADR-0030 §5): a grant that
         // was not admitted or not written is a failure, not a grant.
-        if let Some(filing) = filing {
+        if let Some(filing) = self.filing.take() {
             match &result {
                 Ok(()) => filing.commit(),
                 Err(e) => filing.undelivered(undelivered_cause(e)).commit(),
             }
         }
         result
+    }
+}
+
+impl Drop for WorkerReply {
+    fn drop(&mut self) {
+        self.discard_undelivered();
     }
 }
 
@@ -8556,12 +8561,16 @@ fn dispatch_scoped(
 ) -> Response {
     // Returning a value is not delivery. An unacknowledged token is dropped
     // conservatively; reset tests exercise the production socket responder.
-    let reply = dispatch_scoped_session(req, peer, engine, scope, authorization, None, None);
+    let mut reply = dispatch_scoped_session(req, peer, engine, scope, authorization, None, None);
     // Tests deliver nothing: the returned reply is what the client got.
-    if let Some(filing) = reply.filing {
+    if let Some(filing) = reply.filing.take() {
         filing.commit();
     }
-    reply.response
+    // This test consumer received the value, but did not acknowledge a wire
+    // write. Preserve conservative token drop without default-discard reporting.
+    let response = reply.response.clone();
+    drop(reply.completion.take());
+    response
 }
 
 #[cfg(test)]
@@ -13628,7 +13637,14 @@ mod tests {
                 "split_liveness_tests.rs",
                 include_str!("split_liveness_tests.rs"),
             ),
-            ("attempt_record.rs", include_str!("attempt_record.rs")),
+            (
+                "attempt_record.rs",
+                concat!(
+                    include_str!("attempt_record.rs"),
+                    "\n",
+                    include_str!("attempt_record/reply_tests.rs")
+                ),
+            ),
             ("shared_unlock.rs", include_str!("shared_unlock.rs")),
             (
                 "shared_greeter_tests.rs",

@@ -870,6 +870,9 @@ pub(crate) fn annotate_connected(
 }
 
 #[cfg(test)]
+mod reply_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1631,7 +1634,7 @@ mod tests {
 
     /// A throwaway `IRLUME_STATE_DIR` (set; the caller holds the env write
     /// guard) and this process's own uid and account name.
-    fn own_state_dir(tag: &str) -> (std::path::PathBuf, u32, String) {
+    pub(super) fn own_state_dir(tag: &str) -> (std::path::PathBuf, u32, String) {
         let dir = std::env::temp_dir().join(format!(
             "irlume-attempts-{tag}-{}-{:x}",
             std::process::id(),

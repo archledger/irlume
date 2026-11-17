@@ -534,6 +534,39 @@ mod cumulative {
     }
 
     #[test]
+    fn peer_write_shutdown_with_pending_input_cancels_before_first_response_byte() {
+        use std::io::Write;
+
+        if crate::test_support::isolated(
+            "retry_throttle::tests::cumulative::peer_write_shutdown_with_pending_input_cancels_before_first_response_byte",
+        ) {
+            return;
+        }
+        let _env = crate::test_support::env_read();
+        let f = Fixture::new();
+        let reply = grant_reply(&f);
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.write_all(b"x").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let result = reply.respond(server);
+        let mut bytes = Vec::new();
+        // Closing with unread request input may reset instead of ending at EOF.
+        // Either way, cancellation must withhold every response byte.
+        if let Err(error) = client.read_to_end(&mut bytes) {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        let error = result.expect_err("a cancelled response must not be delivered");
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(
+            bytes.is_empty(),
+            "cancellation precedes every response byte"
+        );
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
     fn ordinary_ok_response_cannot_acknowledge_a_face_token() {
         let _env = crate::test_support::env_read();
         let f = Fixture::new();

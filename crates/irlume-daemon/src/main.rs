@@ -2698,14 +2698,23 @@ impl ClientLink {
 
 /// Has the peer closed its end?
 ///
-/// `MSG_PEEK` so a byte that IS there stays there, `MSG_DONTWAIT` so a waiting
-/// connection thread never blocks here. Only a clean `0` (orderly shutdown) and a
-/// reset connection count as gone; every other answer, including an unexpected
-/// error, reads as still-connected, because the cost of being wrong in that
-/// direction is a few wasted seconds of camera while being wrong the other way
-/// cancels a live authentication.
+/// Observe write shutdown before peeking: queued input can hide EOF, but must
+/// not hide cancellation. Neither check consumes protocol input or blocks.
+/// Unknown errors still read as connected: a false disconnect would cancel a
+/// live authentication, whereas a missed one only wastes the remaining budget.
 fn peer_gone(stream: &UnixStream) -> bool {
     use std::os::unix::io::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    // SAFETY: fd is one initialized pollfd held exclusively for this call;
+    // stream keeps its descriptor alive and a zero timeout cannot block.
+    let polled = unsafe { libc::poll(&mut fd, 1, 0) };
+    if polled > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP) != 0 {
+        return true;
+    }
     let mut byte = 0u8;
     // SAFETY: `stream` owns the fd for the whole call, and the buffer is one byte
     // of stack we hold exclusively. MSG_DONTWAIT means no blocking, MSG_PEEK means
@@ -2743,7 +2752,7 @@ const WORKER_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How often a waiting connection thread checks whether its client is still
 /// there. Short enough that a cancelled polkit dialog stops the camera while the
 /// user is still looking at the screen, long enough that a parked thread costs
-/// four wakeups a second. The check itself is one non-blocking `recv`.
+/// four wakeups a second. The readiness check and peek never block or drain input.
 const CLIENT_ALIVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// True the first time this uid is refused an unseal for not being root.
@@ -17554,10 +17563,10 @@ mod tests {
         ) {
             return;
         }
-        // The primitive the disconnect check rests on, against a real socket pair
-        // rather than an assumption about what `recv` returns. Being wrong in the
-        // "gone" direction cancels a live authentication, so both states are pinned.
+        // Pin both disconnect states on a real socket pair: a false "gone"
+        // answer would cancel a live authentication.
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
+        ours.set_nonblocking(true).expect("non-blocking reads");
         assert!(
             !peer_gone(&ours),
             "an open peer must never read as gone (that would cancel a live auth)"
@@ -17568,12 +17577,40 @@ mod tests {
             !peer_gone(&ours),
             "a peer that sent a byte is still connected"
         );
-        drop(theirs);
-        // The byte is still buffered, so the socket only reports EOF once it is
-        // drained; drain it, then the orderly shutdown must be visible.
         let mut buf = [0u8; 1];
-        let _ = (&ours).read(&mut buf);
+        (&ours).read_exact(&mut buf).expect("open input untouched");
+        assert_eq!(buf, *b"x");
+        (&theirs).write_all(b"y").expect("input before close");
+        drop(theirs);
+        // Closure is visible without draining the remaining protocol input.
+        assert!(peer_gone(&ours), "buffered input must not hide closure");
+        (&ours)
+            .read_exact(&mut buf)
+            .expect("closed input untouched");
+        assert_eq!(buf, *b"y");
         assert!(peer_gone(&ours), "a closed peer must be detected");
+    }
+
+    #[test]
+    fn peer_gone_detects_write_shutdown_with_pending_input() {
+        if crate::test_support::isolated(
+            "tests::peer_gone_detects_write_shutdown_with_pending_input",
+        ) {
+            return;
+        }
+        let (mut ours, mut theirs) = UnixStream::pair().expect("socketpair");
+        theirs.write_all(b"x").expect("pending input");
+        theirs
+            .shutdown(std::net::Shutdown::Write)
+            .expect("write shutdown");
+
+        assert!(
+            peer_gone(&ours),
+            "pending input must not hide a peer's write shutdown"
+        );
+        let mut byte = [0u8; 1];
+        ours.read_exact(&mut byte).expect("input left untouched");
+        assert_eq!(byte, *b"x");
     }
 
     #[test]

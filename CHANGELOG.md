@@ -222,6 +222,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Clarify warn-first model checksum checks, strict core-model startup
+  refusals and PAD cue rejection without daemon exit. Disabling required
+  PAD prevents affected face grants (ADR-0013, amendment 2026-11-17; ADR-0019).
+
 - Qualify concurrent-camera teardown documentation: cleanup attempts do not
   guarantee physical shutdown or emitter restoration. Unconfirmed stops
   retain owners and refuse further capture (ADR-0027, amendment 2026-11-17).

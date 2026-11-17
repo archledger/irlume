@@ -12,7 +12,8 @@ Shipped since this list was written: the consecutive-failure throttle (0.4.0;
 the NIST SP 800-63B-4 3.2.3 hard requirement), panic containment at the PAM
 entry points, the hardening passes (constant-time checks, zeroization), the
 sandboxed systemd unit (validated on real logins), and the anti-spoof
-decision: both PAD models ship default-on and bundled, verified at startup
+decision: both PAD models ship default-on and bundled, checksum-checked at
+startup when enabled and present
 ([ADR-0013](adr/0013-ship-pad-models-default-on.md)); the third-party model
 lane was later removed outright
 ([ADR-0015](adr/0015-remove-thirdparty-model-lane.md)).

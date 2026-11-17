@@ -7,10 +7,12 @@ required PAD availability fail closed while keeping the daemon available
 **Implementation:** Complete with this PR. `liveness_vit.onnx` (Adedev-W
 LivenessModels-ONNX, MIT, sha256 `c7f8a6f3…`) and `flir.onnx` (Alibaba DAMO
 ModelScope `cv_manual_face-liveness_flir`, MIT, sha256 `df80cea7…`) are
-shipped as release assets, installed by every distribution lane, verified
-against `models/SHA256SUMS` at startup, and consulted DENY-ONLY at their
-measured operating points. Kill switches: `IRLUME_PAD_VIT=0` /
-`pad_vit=0` and `IRLUME_PAD_IR=0` / `pad_ir=0`.
+shipped as release assets, installed by every distribution lane,
+checksum-checked against `models/SHA256SUMS` at startup when enabled and present
+([clarified below](#amendment-2026-11-17-startup-checks-and-required-pad)),
+and consulted DENY-ONLY at their measured operating points.
+Kill switches: `IRLUME_PAD_VIT=0` / `pad_vit=0` and
+`IRLUME_PAD_IR=0` / `pad_ir=0`.
 
 ## Context
 
@@ -47,13 +49,17 @@ records why that is sound and what it costs.
 
 1. **Both models ship in every package** as release assets on `models-v1`,
    installed to `/usr/share/irlume/models/`, pinned in
-   `models/SHA256SUMS`, verified at startup, fetched by
+   `models/SHA256SUMS`, checksum-checked at startup, fetched by
    `scripts/fetch-models.sh` for dev/CI trees. Verification follows the
    shipped-model house policy, not the opt-in lane's: `IRLUME_MODELS_STRICT=1`
    refuses a present-but-tampered cue; in the default non-strict mode a
    mismatched file warns and the cue still loads from the path (the same
    warn-first policy det/mesh/blaze follow — tampering a deny-only cue is
    capability-equivalent to its kill switch, which root can set anyway).
+
+   Clarified 2026-11-17: the kill-switch equivalence above no longer holds
+   under ADR-0019; see the
+   [startup amendment](#amendment-2026-11-17-startup-checks-and-required-pad).
 
 2. **DENY-ONLY wiring, unchanged from the opt-in lane's contract.** Each cue
    can downgrade a Live verdict to Spoof and NOTHING else. A false fire
@@ -95,7 +101,7 @@ records why that is sound and what it costs.
    `IRLUME_PAD_IR`) and settings.conf (`pad_vit` / `pad_ir`). A
    kill-switched cue skips startup verification entirely and its absence is
    named in the startup log. ADR-0019 changes their runtime consequence from
-   an uncovered face path to password-only face authentication.
+   an uncovered face path to password-only for face grants requiring that cue.
 
 ## Consequences
 
@@ -234,3 +240,22 @@ with a single image, and none of the 1,680 identities with two or more
 images; no count of identities by number of images gives 2,280. The
 dated evaluation keeps the figure with a pointer here; this decision
 does not rest on it.
+
+## Amendment 2026-11-17: startup checks and required PAD
+
+The startup checks in the Implementation summary and Decision 1 are
+warn-first by default. Unrecognized PAD weights can load if the loader
+accepts them. Strict mode rejects those weights as `load-failed` while
+keeping the daemon available, as ADR-0019 requires. Disabled cues skip
+checksum checking and loading; missing cues remain unavailable.
+
+Decision 1's equivalence between substituted weights and a kill switch
+predates ADR-0019. A kill switch now removes required evidence and prevents
+the affected face grants; a loaded substitute can still supply scores.
+The historical rationale is retained but no longer describes that
+consequence. ViT is required for RGB-only grants, both cues for RGB+IR
+grants, and FLIR for dark and experimental IR-only grants. Other identity,
+liveness and policy gates still apply.
+
+This clarifies existing startup and availability behavior. It changes no
+defaults, operating points, recorded measurements or runtime policy.

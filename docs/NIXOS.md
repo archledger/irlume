@@ -286,8 +286,10 @@ fetched by the flake from the `models-v1` GitHub
 release as hash-pinned `fetchurl` inputs, and the package installs them into
 `$out/share/irlume/models/`. Because they are fixed-output fetches keyed by
 sha256 (not Git LFS), `nix build github:archledger/irlume` gets the real weights
-with no smudge-filter caveat and no LFS bandwidth cost. The daemon still refuses
-to start on a truncated model when `IRLUME_MODELS_STRICT=1` is set.
+with no smudge-filter caveat and no LFS bandwidth cost. With
+`IRLUME_MODELS_STRICT=1`, a truncated core model prevents startup; a rejected
+PAD cue instead leaves the daemon available and blocks affected face grants
+([ADR-0019](adr/0019-fail-closed-pad-availability.md)).
 
 ## Native .tflite models need `IRLUME_TFLITE_LIB`
 

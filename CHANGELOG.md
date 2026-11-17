@@ -222,6 +222,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Request replies use a pre-sized zeroizing output buffer without growing
+  it during serialization. The complete JSON line still precedes final
+  admission and every socket write (ADR-0027 §2).
+
 - Unreceived worker replies now file cancelled grants and emit their
   withheld journal line once, even if the channel accepted the reply.
   Other decisions retain their recorded result and retry accounting

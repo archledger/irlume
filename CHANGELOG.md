@@ -222,6 +222,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlumed detects client write shutdown even when unread input remains.
+  Waiting connections stop only their own jobs, pending OS approvals are
+  cancelled, and the final face-grant check withholds the reply without
+  changing retry policy (ADR-0027 §2).
+
 - Busy-camera advice no longer treats every observed non-self PID as an
   app to close: when it may be irlumed, the text says to let it finish
   and retry, otherwise close that app, and to report a persistent hold.

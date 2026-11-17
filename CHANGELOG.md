@@ -222,6 +222,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Face requests report nonblocking retry-state contention as busy rather
+  than suggesting administrator repair. Password fallback, account locks
+  and retry accounting stay unchanged (ADR-0034 §1).
+
 - Request replies use a pre-sized zeroizing output buffer without growing
   it during serialization. The complete JSON line still precedes final
   admission and every socket write (ADR-0027 §2).

@@ -222,6 +222,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Qualify concurrent-camera teardown documentation: cleanup attempts do not
+  guarantee physical shutdown or emitter restoration. Unconfirmed stops
+  retain owners and refuse further capture (ADR-0027, amendment 2026-11-17).
+
 - Face requests report nonblocking retry-state contention as busy rather
   than suggesting administrator repair. Password fallback, account locks
   and retry accounting stay unchanged (ADR-0034 §1).

@@ -9,6 +9,10 @@ decision replaces for the final release of a request. Motivated by the
 experiment recorded in `artifacts/irlume/2026-09-22-pair-release-order/`
 on the shared ledger.
 
+Clarified 2026-11-17: the
+[teardown amendment](#amendment-2026-11-17-teardown-attempts-and-unconfirmed-shutdown)
+distinguishes ordinary release from unconfirmed shutdown and failed restoration.
+
 ## Context
 
 On the concurrent capture path the engine arms an RGB and an IR streaming
@@ -74,12 +78,14 @@ before delivery.
    point, off the client's clock. IR-first is rejected by the measurement
    above and must not be reintroduced without a new one.
 
-4. The pair is still released before the worker takes its next job, so
-   evidence cannot cross requests and the next request's camera open never
-   overlaps a live pair (the lease is held until the drop). A back-to-back
-   second request pays the teardown in `queue_wait` instead of the first
-   request paying it before its reply; the total is unchanged, the
-   user-visible latency of the first is not.
+4. The teardown sequence still runs before the worker takes its next job.
+   Confirmed shutdown releases the pair before another capture; an
+   unconfirmed stop instead retains its owners and faults further capture
+   admission, as the amendment below describes. Evidence is not reused
+   across requests. A back-to-back second request on the ordinary release
+   path pays the teardown in `queue_wait` instead of the first request
+   paying it before its reply; the total is unchanged, the user-visible
+   latency of the first is not.
 
 5. The hook is not invoked when the outcome is not final for the request:
    a `rgb_pad_pending` refusal that the retry loop will re-arm for, a
@@ -111,11 +117,11 @@ before delivery.
 - Expected: NexiGo warm grant ~7.3 s to ~6.3 s; the reply follows the
   identity decision by the daemon's own bookkeeping only. Sequential-path
   cameras (BRIO, the laptop's built-in) see no change.
-- The camera stays open for about a second after a grant or a refusal on
-  the concurrent path: the RGB capture LED and the IR emitter turn off that
-  much later than today. The emitter restore is still guaranteed by the
-  same drop; nothing is left streaming. This is a visible change and is
-  named in the CHANGELOG.
+- Concurrent sessions can remain open after the final outcome is handed
+  over. The measured teardown above adds about a second, not a universal
+  shutdown bound. The same drop path attempts shutdown and emitter
+  restoration; their failure handling is qualified by the amendment below.
+  The delayed ordinary teardown is a visible change named in the CHANGELOG.
 - A grant is delivered while the pair is still held by the engine's stack.
   No frame is dequeued after the decision, no evidence is consumed, and no
   other consumer can obtain the pair (it is owned, not shared), so the
@@ -144,3 +150,26 @@ before delivery.
   install, expecting elapsed ≈ identity decision + daemon bookkeeping
   (~6.3 s warm) with `stream_owner_release` still ~1.0 s in the trace, and
   no change on the BRIO.
+
+## Amendment 2026-11-17: teardown attempts and unconfirmed shutdown
+
+This clarifies Decision 4 and the teardown consequence. It does not change
+delivery order, RGB-then-IR teardown order, grant admission or failure
+containment.
+
+`IrSession::drop` attempts stream closure and reports an unconfirmed stop.
+When the bound producer is quiescent, `StreamMode::drop` attempts emitter
+restoration. A restoration error is reported and can leave the value
+irlume applied unrestored; running Drop is not proof of successful I/O.
+
+If producer shutdown is unconfirmed, the capture-shutdown domain retains
+kernel-facing owners for the process lifetime and refuses further capture
+in that process. The retained emitter backend includes its descriptor,
+restore record and exclusion lock. It is not restored or released on a
+timer or guessed descriptor-close evidence. This is intentional containment,
+not confirmation that the camera or emitter is off.
+
+Forced process termination and kernel faults are outside that containment
+guarantee. A teardown failure after a reply has been written cannot retract
+that reply. The measurements above describe the original attended series,
+not a bound or qualification of these failure paths.

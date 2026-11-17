@@ -222,6 +222,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Early face-reply handoff retains completion data for the ordinary
+  fallback path. This internal hardening keeps final admission and retry
+  delivery accounting attached to unsent replies; a failed production
+  handoff still has no receiver (ADR-0027 §2).
+
 - irlumed abandons ordinary requests when their reply wait expires, just
   as it does for interactive sessions. Expired queued work cannot start,
   and cancellation asks only that request's running job to stop. Live

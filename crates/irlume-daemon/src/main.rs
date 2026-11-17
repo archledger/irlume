@@ -2394,14 +2394,21 @@ impl<'a> Delivery<'a> {
         }
     }
 
-    /// Send the reply now. Returns false when there is no channel or the
-    /// connection thread is gone; the caller then returns the reply as
-    /// before and nothing is lost. Never sends twice.
-    fn send(&mut self, mut reply: WorkerReply) -> bool {
+    /// Send at most one reply. Returns true once this or an earlier reply has
+    /// been handed to the channel; an already-delivered call drops this reply.
+    /// Otherwise returns false and restores completion through `unsent_completion`
+    /// for the ordinary reply path. Closed-channel failures are journaled and
+    /// filed here.
+    fn send(
+        &mut self,
+        mut reply: WorkerReply,
+        unsent_completion: &mut Option<FaceCompletion>,
+    ) -> bool {
         if self.delivered {
             return true;
         }
         let Some(sender) = self.sender else {
+            *unsent_completion = reply.completion.take();
             return false;
         };
         // The reply takes the attempt with it: filed by the connection
@@ -2414,18 +2421,45 @@ impl<'a> Delivery<'a> {
                 self.delivered = true;
                 true
             }
-            Err(std::sync::mpsc::SendError(reply)) => {
+            Err(std::sync::mpsc::SendError(mut reply)) => {
                 jout_warn!(
                     "irlumed: decision ready before camera release, but the connection thread is gone"
                 );
                 reply.journal_unreceived();
-                if let Some(filing) = reply.filing {
+                if let Some(filing) = reply.filing.take() {
                     filing
                         .undelivered(irlume_common::OutcomeCause::Cancelled)
                         .commit();
                 }
+                if let Some(completion) = &mut reply.completion {
+                    // Journaled above. The ordinary send reuses this disconnected
+                    // sender and fails too; it must not journal the line again.
+                    completion.withheld_line = None;
+                }
+                *unsent_completion = reply.completion.take();
                 false
             }
+        }
+    }
+
+    /// Hand an early face reply to the channel, retaining unsent completion for
+    /// the ordinary reply path.
+    fn send_or_retain_completion(
+        &mut self,
+        response: &Response,
+        mut completed: Option<FaceCompletion>,
+        fallback: &mut Option<FaceCompletion>,
+    ) {
+        let sent = self.send(
+            WorkerReply {
+                response: response.clone(),
+                completion: completed.take().filter(|_| is_face_grant(response)),
+                filing: None,
+            },
+            &mut completed,
+        );
+        if !sent {
+            *fallback = completed;
         }
     }
 }
@@ -9762,16 +9796,7 @@ fn dispatch_after_authorization(
                     };
                     let mut completed = None;
                     let response = verify_reply(engine, outcome, &user, inputs, &mut completed);
-                    let sent = delivery.send(WorkerReply {
-                        response: response.clone(),
-                        completion: completed.take().filter(|_| is_face_grant(&response)),
-                        filing: None,
-                    });
-                    if !sent {
-                        // No channel (or the connection thread is gone): the
-                        // reply is returned below exactly as before.
-                        *completion = completed;
-                    }
+                    delivery.send_or_retain_completion(&response, completed, completion);
                     early = Some(response);
                 };
                 let mut admission = |selected: &irlume_auth::Engine, final_window| {
@@ -11530,14 +11555,7 @@ fn do_unseal_password_scoped(
                 t,
                 &mut completed,
             );
-            let sent = delivery.send(WorkerReply {
-                response: response.clone(),
-                completion: completed.take().filter(|_| is_face_grant(&response)),
-                filing: None,
-            });
-            if !sent {
-                *completion = completed;
-            }
+            delivery.send_or_retain_completion(&response, completed, completion);
             early = Some(response);
         };
         let mut admission = |selected: &irlume_auth::Engine, selected_window| {
@@ -11821,11 +11839,11 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut delivery = Delivery::attached(&tx, std::time::Instant::now());
         assert!(!delivery.delivered);
-        assert!(delivery.send(plain_reply("first")));
+        assert!(delivery.send(plain_reply("first"), &mut None));
         assert!(delivery.delivered);
         // A second send is swallowed: the connection thread must never see
         // two replies for one request.
-        assert!(delivery.send(plain_reply("second")));
+        assert!(delivery.send(plain_reply("second"), &mut None));
         let received: Vec<WorkerReply> = rx.try_iter().collect();
         assert_eq!(received.len(), 1);
         assert!(
@@ -11833,7 +11851,7 @@ mod tests {
         );
 
         let mut none = Delivery::none();
-        assert!(!none.send(plain_reply("unsent")));
+        assert!(!none.send(plain_reply("unsent"), &mut None));
         assert!(!none.delivered);
     }
 
@@ -11845,7 +11863,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel::<WorkerReply>();
         drop(rx);
         let mut delivery = Delivery::attached(&tx, std::time::Instant::now());
-        assert!(!delivery.send(plain_reply("orphaned")));
+        assert!(!delivery.send(plain_reply("orphaned"), &mut None));
         assert!(!delivery.delivered);
     }
 

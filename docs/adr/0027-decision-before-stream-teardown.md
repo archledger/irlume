@@ -119,8 +119,9 @@ before delivery.
   cameras (BRIO, the laptop's built-in) see no change.
 - Concurrent sessions can remain open after the final outcome is handed
   over. The measured teardown above adds about a second, not a universal
-  shutdown bound. The same drop path attempts shutdown and emitter
-  restoration; their failure handling is qualified by the amendment below.
+  shutdown bound. The same drop path attempts shutdown; emitter restoration
+  is attempted only when the bound producer is quiescent. Failure handling
+  is qualified by the amendment below.
   The delayed ordinary teardown is a visible change named in the CHANGELOG.
 - A grant is delivered while the pair is still held by the engine's stack.
   No frame is dequeued after the decision, no evidence is consumed, and no

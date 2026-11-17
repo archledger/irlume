@@ -19,7 +19,9 @@
 use irlume_common::pam_service::ServiceKind;
 use irlume_common::{jout_debug, jout_err, jout_info, jout_notice, jout_warn};
 use irlume_common::{IntentAttestation, Request, Response, SOCKET_PATH};
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::Write;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use trace_stream::serve_trace;
 use zeroize::Zeroize;
@@ -117,6 +119,7 @@ mod listener_tests;
 mod live;
 mod operation_authorization;
 mod position_session;
+mod reply_encoding;
 mod retry_recovery;
 mod retry_throttle;
 mod role_classification;
@@ -127,6 +130,8 @@ mod trace_lifecycle_tests;
 mod trace_stream;
 mod users;
 mod worker_wait;
+
+use reply_encoding::respond_admitted;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
 /// to the weights and embedded at build time).
@@ -11771,18 +11776,6 @@ fn respond(stream: UnixStream, resp: &Response) -> std::io::Result<()> {
     respond_admitted(stream, resp, |_| Ok(()))
 }
 
-fn respond_admitted(
-    mut stream: UnixStream,
-    resp: &Response,
-    admit: impl FnOnce(&UnixStream) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let mut json = zeroize::Zeroizing::new(serde_json::to_vec(resp)?);
-    json.push(b'\n');
-    admit(&stream)?;
-    stream.write_all(&json)?;
-    stream.flush()
-}
-
 /// Mode for the control socket. Every local uid may connect; `SO_PEERCRED`
 /// decides what each one may then do. See the note at the bind site for why a
 /// group-restricted mode was removed rather than repaired.
@@ -13590,7 +13583,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 32] = [
+        let sources: [(&str, &str); 33] = [
             ("main.rs", include_str!("main.rs")),
             ("listener_tests.rs", include_str!("listener_tests.rs")),
             (
@@ -13695,6 +13688,7 @@ mod tests {
             ),
             ("trace_stream.rs", include_str!("trace_stream.rs")),
             ("worker_wait.rs", include_str!("worker_wait.rs")),
+            ("reply_encoding.rs", include_str!("reply_encoding.rs")),
             (
                 "operation_authorization.rs",
                 include_str!("operation_authorization.rs"),

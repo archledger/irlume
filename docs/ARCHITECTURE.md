@@ -176,9 +176,13 @@ or prove physical camera/emitter shutdown.
 ## Model stack
 
 Seven model files ship with every package (five recognizers/landmarkers plus
-the two PAD models below), loaded once by `irlumed` at startup
-and checksum-verified against a built-in manifest (a mismatch warns;
-`IRLUME_MODELS_STRICT=1` refuses to start instead). Six of the seven are
+the two PAD models below). `irlumed` loads the selected models at startup
+and checks their digests against a built-in manifest. Unknown digests warn
+by default. `IRLUME_MODELS_STRICT=1` makes core verification failures
+startup-fatal; a rejected PAD cue instead stays unavailable without stopping
+the daemon, and affected face grants fall back to the password
+([ADR-0019](adr/0019-fail-closed-pad-availability.md)).
+Disabled PAD cues skip checksum checking and loading. Six of the seven are
 ONNX (all five recognizers/landmarkers except the mesh, plus both PAD
 models); the
 landmark mesh is Google's published `.tflite`, run on the TFLite C runtime the

@@ -47,13 +47,26 @@ Full detail in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Primary concerns:
   `models/SHA256SUMS`; `scripts/fetch-models.sh` verifies each release-hosted
   weight against its hash before use) and ship inside the distro packages,
   whose own integrity checking covers them; only the permissive, audited BOM is
-  shipped. At startup the daemon re-hashes each configured model against the
-  release manifest (`models/SHA256SUMS`, embedded at build time) and logs a
-  loud warning on any mismatch; `IRLUME_MODELS_STRICT=1` turns both a
-  mismatch and an unreadable/deleted model into a startup refusal. Warn-first
-  is the default so a recoverable mis-packaging (or a deliberately overridden
-  model path via the unit's `IRLUME_*_MODEL` variables) degrades to a loud
-  warning instead of bricking face login; strict is the hardened choice.
+  shipped. At startup the daemon compares model digests with the release
+  manifest (`models/SHA256SUMS`, embedded at build time). Unknown digests warn
+  and proceed to the loader by default; this manifest policy does not enforce
+  release weights. Individual loaders can still reject them.
+  `IRLUME_MODELS_STRICT=1` makes missing, unreadable or unrecognized detection,
+  recognition, mesh or Blaze weights startup-fatal. A present optional IR
+  adapter follows the same verification policy; an absent adapter is excluded.
+  Warn-first is the default to allow deliberate custom model paths and
+  self-trained adapters. Strict is the hardened choice; it refuses to start
+  with a present adapter whose digest is not in the release manifest.
+  PAD cues are handled separately: disabled cues skip checksum checking and
+  loading; missing cues are unavailable; read errors, strict checksum rejection
+  and load errors leave the cue unavailable without terminating the daemon.
+  Face grants requiring that cue fall back to the password
+  ([ADR-0019](docs/adr/0019-fail-closed-pad-availability.md)).
+  Loader errors are separate from checksum policy: load failures of the
+  detector, recognizer, or a present Blaze model or IR adapter are
+  startup-fatal.
+  Outside strict mode, a missing or failed mesh disables rescue alignment
+  while the daemon continues.
 
 ## Reporting a vulnerability
 

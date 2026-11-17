@@ -266,7 +266,8 @@ were still fully rejected. This is a demonstrated instance of the accepted
 IR-approximating-spoof residual risk.
 
 The mitigation is automatic. The **shipped FLIR PAD cue** (default-on since
-ADR-0013, verified against `models/SHA256SUMS` at daemon startup) has
+ADR-0013, checksum-checked at startup when enabled and present; unknown
+weights warn by default and are rejected in strict mode) has
 refused this print in every measured session, including one enhanced with an
 infrared-absorbing patch that carries the centre/edge ratio into the genuine
 range while the built-in gate still returns `Live`. The passive-blink gate that
@@ -283,7 +284,8 @@ or a failed inference, produces a nonretryable password-fallback denial rather
 than continuing with the algorithmic gate alone. The daemon remains available
 for password fallback, diagnostics, and repair, and its health response reports
 each model as loaded, disabled, missing, or load-failed. Kill switches therefore
-mean password-only face authentication; they do not accept this documented gap.
+mean password-only for affected face grants; they do not accept this documented
+gap.
 Full write-up: [`pad-results/2026-06-30-ir-liveness-selftest.md`](pad-results/2026-06-30-ir-liveness-selftest.md).
 
 ## Storage

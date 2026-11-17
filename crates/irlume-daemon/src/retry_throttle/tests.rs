@@ -481,6 +481,180 @@ mod cumulative {
         }
     }
 
+    fn early_reply(f: &Fixture, credential: bool) -> crate::WorkerReply {
+        let mut reply = grant_reply(f);
+        if credential {
+            reply.response = crate::Response::PasswordUnsealed {
+                secret: irlume_common::SecretBytes::new(b"synthetic early reply".to_vec()),
+                kind: irlume_common::KeyringSecretKind::LoginPassword,
+            };
+        }
+        reply
+    }
+
+    fn assert_unsent_early_reply_keeps_admission(
+        f: &Fixture,
+        delivery: &mut crate::Delivery<'_>,
+        credential: bool,
+    ) {
+        let mut prepared = early_reply(f, credential);
+        let completed = prepared.completion.take();
+        let mut fallback = None;
+        delivery.send_or_retain_completion(&prepared.response, completed, &mut fallback);
+        assert!(!delivery.delivered);
+        let reply = crate::WorkerReply {
+            response: prepared.response.clone(),
+            completion: fallback,
+            filing: None,
+        };
+        drop(prepared);
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let error = reply
+            .respond(server)
+            .expect_err("an unsent early reply must retain final peer admission");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        assert!(
+            bytes.is_empty(),
+            "no grant or credential byte may be written"
+        );
+        assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+        assert!(f.store.operation(&account_one()).is_ok());
+    }
+
+    #[test]
+    fn early_reply_without_channel_retains_admission_and_charge() {
+        if crate::test_support::isolated(
+            "retry_throttle::tests::cumulative::early_reply_without_channel_retains_admission_and_charge",
+        ) {
+            return;
+        }
+        let _env = crate::test_support::env_read();
+        for credential in [false, true] {
+            let f = Fixture::new();
+            let mut delivery = crate::Delivery::none();
+            assert_unsent_early_reply_keeps_admission(&f, &mut delivery, credential);
+        }
+    }
+
+    #[test]
+    fn early_reply_on_closed_channel_retains_admission_and_charge() {
+        if crate::test_support::isolated(
+            "retry_throttle::tests::cumulative::early_reply_on_closed_channel_retains_admission_and_charge",
+        ) {
+            return;
+        }
+        let _env = crate::test_support::env_read();
+        for credential in [true, false] {
+            let f = Fixture::new();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            drop(receiver);
+            let mut delivery = crate::Delivery::attached(&sender, std::time::Instant::now());
+            assert_unsent_early_reply_keeps_admission(&f, &mut delivery, credential);
+        }
+    }
+
+    #[test]
+    fn early_reply_channel_transfers_completion_until_successful_write() {
+        if crate::test_support::isolated(
+            "retry_throttle::tests::cumulative::early_reply_channel_transfers_completion_until_successful_write",
+        ) {
+            return;
+        }
+        let _env = crate::test_support::env_read();
+        for credential in [false, true] {
+            let f = Fixture::new();
+            let mut prepared = early_reply(&f, credential);
+            let completed = prepared.completion.take();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut delivery = crate::Delivery::attached(&sender, std::time::Instant::now());
+            let mut fallback = None;
+            delivery.send_or_retain_completion(&prepared.response, completed, &mut fallback);
+            assert!(delivery.delivered);
+            assert!(fallback.is_none());
+            assert!(f.store.operation(&account_one()).is_err());
+            assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+            let reply = receiver.try_recv().expect("one early reply");
+            assert!(receiver.try_recv().is_err(), "only one reply is queued");
+            let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+
+            reply.respond(server).unwrap();
+
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).unwrap();
+            let response: crate::Response = serde_json::from_slice(&bytes).unwrap();
+            assert!(crate::is_face_grant(&response));
+            assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 0);
+            assert!(f.store.operation(&account_one()).is_ok());
+        }
+    }
+
+    #[test]
+    fn failed_early_handoff_journals_a_withheld_grant_only_once() {
+        if crate::test_support::isolated(
+            "retry_throttle::tests::cumulative::failed_early_handoff_journals_a_withheld_grant_only_once",
+        ) {
+            return;
+        }
+        let _env = crate::test_support::env_read();
+        for credential in [false, true] {
+            let f = Fixture::new();
+            let mut prepared = early_reply(&f, credential);
+            let mut completed = prepared.completion.take();
+            completed.as_mut().unwrap().withheld_line = Some(crate::WithheldLine {
+                prefix: "irlumed: synthetic: ".into(),
+                notice: false,
+            });
+            let (sender, receiver) = std::sync::mpsc::channel();
+            drop(receiver);
+            let mut delivery = crate::Delivery::attached(&sender, std::time::Instant::now());
+            let mut fallback = None;
+            let before = irlume_common::journal_out::emitted_lines();
+
+            delivery.send_or_retain_completion(&prepared.response, completed, &mut fallback);
+
+            assert!(!delivery.delivered);
+            let completion = fallback.expect("an unsent reply retains its completion");
+            assert!(
+                completion.withheld_line.is_none(),
+                "the already-journaled line must be consumed"
+            );
+            assert_eq!(
+                irlume_common::journal_out::emitted_lines() - before,
+                2,
+                "one channel warning and one withheld-grant line"
+            );
+            let ordinary = crate::WorkerReply {
+                response: prepared.response.clone(),
+                completion: Some(completion),
+                filing: None,
+            };
+            // Replay the worker's ordinary failed send on the same channel.
+            let std::sync::mpsc::SendError(ordinary) = sender
+                .send(ordinary)
+                .expect_err("the receiver is still gone");
+            ordinary.journal_unreceived();
+            drop(ordinary);
+            assert_eq!(
+                irlume_common::journal_out::emitted_lines() - before,
+                2,
+                "the ordinary failed send must not duplicate the grant line"
+            );
+            assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
+            assert!(f.store.operation(&account_one()).is_ok());
+        }
+    }
+
     #[test]
     fn delivery_success_alone_resets_and_synchronous_return_does_not() {
         let _env = crate::test_support::env_read();

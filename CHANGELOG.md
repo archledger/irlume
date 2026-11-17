@@ -222,6 +222,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- irlumed abandons ordinary requests when their reply wait expires, just
+  as it does for interactive sessions. Expired queued work cannot start,
+  and cancellation asks only that request's running job to stop. Live
+  status reports the stop request, not proof that work has stopped
+  (ADR-0030 §5).
+
 - irlumed detects client write shutdown even when unread input remains.
   Waiting connections stop only their own jobs, pending OS approvals are
   cancelled, and the final face-grant check withholds the reply without

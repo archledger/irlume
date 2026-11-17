@@ -126,6 +126,7 @@ mod token_delivery;
 mod trace_lifecycle_tests;
 mod trace_stream;
 mod users;
+mod worker_wait;
 
 /// Release checksums of the bundled models (models/SHA256SUMS, committed next
 /// to the weights and embedded at build time).
@@ -4330,20 +4331,20 @@ fn serve_peer_until(
                     return respond(stream, &resp);
                 }
             }
-            let (session, mut session_connection) =
-                if matches!(req, Request::EnrollmentSession { .. }) {
-                    let (worker, connection) = enrollment_session::channel(arbiter.cancel_token());
-                    (Some(worker), Some(connection))
-                } else {
-                    (None, None)
-                };
-            let (position, mut position_connection) =
-                if matches!(req, Request::PositionSession { .. }) {
-                    let (worker, connection) = position_session::channel(arbiter.cancel_token());
-                    (Some(worker), Some(connection))
-                } else {
-                    (None, None)
-                };
+            let (session, session_connection) = if matches!(req, Request::EnrollmentSession { .. })
+            {
+                let (worker, connection) = enrollment_session::channel(arbiter.cancel_token());
+                (Some(worker), Some(connection))
+            } else {
+                (None, None)
+            };
+            let (position, position_connection) = if matches!(req, Request::PositionSession { .. })
+            {
+                let (worker, connection) = position_session::channel(arbiter.cancel_token());
+                (Some(worker), Some(connection))
+            } else {
+                (None, None)
+            };
             let scope = diagnostic_state.begin_for(
                 diagnostic_operation_class(&req),
                 diagnostic_owner(&req, &peer),
@@ -4434,65 +4435,16 @@ fn serve_peer_until(
                 }
                 return respond(stream, &Response::Error(refusal.message().into()));
             }
-            // Wait for the worker, checking between slices whether the client is
-            // still there. A polkit dialog the user dismissed (or that closed on a
-            // head-shake) takes its helper process with it, and nothing else tells
-            // the worker to stop: it would hold the camera and the IR emitter for
-            // the rest of the budget for an answer nobody will read.
             let deadline = std::time::Instant::now() + WORKER_REPLY_TIMEOUT;
-            let resp = loop {
-                if let Some(connection) = &mut session_connection {
-                    if let Err(error) = connection.pump(&stream) {
-                        link.abandon(&arbiter.cancel_token());
-                        return Err(error);
-                    }
-                }
-                if let Some(connection) = &mut position_connection {
-                    if let Err(error) = connection.pump(&stream) {
-                        link.abandon(&arbiter.cancel_token());
-                        return Err(error);
-                    }
-                }
-                match answer.recv_timeout(CLIENT_ALIVE_POLL) {
-                    Ok(resp) => {
-                        if let Some(connection) = &mut session_connection {
-                            connection.pump(&stream)?;
-                        }
-                        if let Some(connection) = &mut position_connection {
-                            connection.pump(&stream)?;
-                        }
-                        break resp;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if std::time::Instant::now() >= deadline {
-                            if session_connection.is_some() || position_connection.is_some() {
-                                link.abandon(&arbiter.cancel_token());
-                            }
-                            break Response::Error("request did not complete".into()).into();
-                        }
-                        if peer_gone(&stream) {
-                            // Cancel ONLY if this connection's own job holds the
-                            // camera; a job still queued is dropped by `claim`
-                            // instead, so another user's authentication is never
-                            // cancelled by someone else hanging up.
-                            if link.abandon(&arbiter.cancel_token()) {
-                                irlume_common::dlog!(
-                                    "client disconnected mid-request; asked the capture to stop"
-                                );
-                            }
-                            // Nothing to answer: the socket is gone.
-                            return Ok(());
-                        }
-                    }
-                    // The worker dropped the sender (it panicked and the reply never
-                    // came). This request has no answer, and a client that gets an
-                    // error falls back to the password.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        break Response::Error("request did not complete".into()).into()
-                    }
-                }
-            };
-            resp.respond(stream)
+            worker_wait::wait_and_respond(
+                stream,
+                answer,
+                &link,
+                &arbiter.cancel_token(),
+                session_connection,
+                position_connection,
+                deadline,
+            )
         }
     }
 }
@@ -13611,7 +13563,7 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 31] = [
+        let sources: [(&str, &str); 32] = [
             ("main.rs", include_str!("main.rs")),
             ("listener_tests.rs", include_str!("listener_tests.rs")),
             (
@@ -13708,6 +13660,7 @@ mod tests {
                 include_str!("trace_lifecycle_tests.rs"),
             ),
             ("trace_stream.rs", include_str!("trace_stream.rs")),
+            ("worker_wait.rs", include_str!("worker_wait.rs")),
             (
                 "operation_authorization.rs",
                 include_str!("operation_authorization.rs"),

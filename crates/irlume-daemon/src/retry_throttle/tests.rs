@@ -640,9 +640,10 @@ mod cumulative {
                 filing: None,
             };
             // Replay the worker's ordinary failed send on the same channel.
-            let std::sync::mpsc::SendError(ordinary) = sender
+            let std::sync::mpsc::SendError(mut ordinary) = sender
                 .send(ordinary)
                 .expect_err("the receiver is still gone");
+            // Production relies on Drop; this explicit call also pins idempotence.
             ordinary.journal_unreceived();
             drop(ordinary);
             assert_eq!(
@@ -661,8 +662,8 @@ mod cumulative {
         let f = Fixture::new();
         let reply = grant_reply(&f);
         assert!(f.store.operation(&account_one()).is_err());
-        let _response = reply.response;
-        drop(reply.completion);
+        let _response = reply.response.clone();
+        drop(reply);
         assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 1);
         let reply = grant_reply(&f);
         let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();

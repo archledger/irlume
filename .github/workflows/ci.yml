@@ -346,6 +346,9 @@ jobs:
             --require tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key \
             -- cargo test -p irlume-core --lib --locked -- --ignored \
             tpm_lockout_the_endorsement_check_runs_only_under_the_da_exempt_key --test-threads=1
+          # Name the existing daemon tests so an unchanged count cannot
+          # hide a missing keyring, enrollment or credential check. Keep
+          # the guarded names in sync with the hosted coverage lane.
           ./scripts/run-tests-guarded.sh --min 1 \
             --require tpm_split_whole_unseal_releases_once_at_each_skew_and_resets_only_after_delivery \
             --require tpm_split_whole_unwritten_credential_keeps_the_charge_after_one_real_release \
@@ -353,6 +356,20 @@ jobs:
             --require tpm_split_whole_centroid_identity_releases_once_at_each_skew \
             --require tpm_split_whole_reset_preserves_template_key_and_next_authenticate_routes \
             --require tpm_endorsement_report_keeps_its_deadline_and_notes_progress \
+            --require tpm_readiness_report_carries_the_lockout_state \
+            --require tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved \
+            --require tpm_seal_and_unseal_keyring_release_the_secret_to_root_only \
+            --require tpm_owner_reseal_leaves_the_token_envelope_unchanged \
+            --require tpm_unverified_owner_seal_leaves_the_token_envelope_unchanged \
+            --require tpm_unverified_root_seal_leaves_the_token_envelope_unchanged \
+            --require tpm_reseal_with_a_wrong_login_password_leaves_the_envelope_unchanged \
+            --require tpm_unverified_reseal_rewraps_the_token_under_the_new_password \
+            --require tpm_a_checked_new_password_rewraps_the_token \
+            --require tpm_a_checked_arm_never_replaces_a_token_with_another_kind \
+            --require tpm_a_checked_token_arm_never_mints_over_an_unreadable_envelope \
+            --require tpm_a_checked_arm_never_seals_over_an_unreadable_envelope \
+            --require tpm_a_first_arm_on_an_oo7_home_seals_the_login_password \
+            --require tpm_an_arm_on_an_oo7_home_keeps_an_armed_token \
             -- cargo test -p irlume-daemon --locked -- --ignored tpm_ --test-threads=1
 
       # The two emitter-lock tests need a lock file another uid owns (#392),

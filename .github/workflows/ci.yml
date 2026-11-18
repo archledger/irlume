@@ -741,6 +741,10 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || { sudo apt-get -qq update && sudo apt-get -qq install -y --no-install-recommends python3-yaml; }
           python3 scripts/ci/test-github-hygiene.py
 
+      # Uses PyYAML from the previous step. No KDE install or ONNX Runtime.
+      - name: KCM smoke exit-status contract (fixtures only)
+        run: python3 -B scripts/ci/test-kcm-workflow-contract.py
+
       - name: systemd boot-order contract (no host service changes)
         run: python3 scripts/test-systemd-boot-order.py
 

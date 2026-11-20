@@ -1,0 +1,47 @@
+name: LiteRT runtime unsigned trial
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: litert-runtime-provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    name: Rebuild on minihost
+    if: >-
+      github.repository == 'archledger/irlume' &&
+      github.repository_id == '1286828818' &&
+      github.ref == 'refs/heads/main' && github.ref_protected
+    runs-on: [self-hosted, Linux, X64, n100]
+    timeout-minutes: 70
+    steps:
+      - name: Require minihost and the protected official branch
+        shell: bash
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          [[ $GITHUB_REPOSITORY == archledger/irlume && $GITHUB_REPOSITORY_ID == 1286828818 ]]
+          [[ $GITHUB_REF == refs/heads/main && $REF_PROTECTED == true ]]
+          [[ $GITHUB_EVENT_NAME == workflow_dispatch ]]
+          [[ $RUNNER_NAME == minihost && $RUNNER_ENVIRONMENT == self-hosted ]]
+          [[ $RUNNER_OS == Linux && $RUNNER_ARCH == X64 ]]
+      - name: Check out the immutable triggering commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Rebuild offline and verify the local unsigned handoff
+        timeout-minutes: 68
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ $(git rev-parse HEAD) == "$GITHUB_SHA" ]]
+          tools="$GITHUB_WORKSPACE/scripts/ci/litert-provenance"
+          bash "$tools/run-minihost-workflow.sh" \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"

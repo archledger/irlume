@@ -1,0 +1,77 @@
+# Private draft: do not register without an approved source revision and permit.
+name: LiteRT Debian preview build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: litert-preview-build
+  cancel-in-progress: false
+
+jobs:
+  runtime:
+    name: Rebuild LiteRT runtime
+    if: >-
+      github.repository == 'archledger/irlume' &&
+      github.repository_id == '1286828818' &&
+      github.repository_owner_id == '276915572' &&
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      github.event_name == 'workflow_dispatch' && github.run_attempt == 1
+    runs-on: [self-hosted, Linux, X64, n100]
+    timeout-minutes: 70
+    steps:
+      - name: Rebuild and verify the frozen runtime
+        shell: bash
+        timeout-minutes: 68
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin LC_ALL=C
+          bridge=/home/test/.local-tasks/irlume-litert-preview-build-20261120/code/run-job.sh
+          [[ -f $bridge && ! -L $bridge && -O $bridge && $(realpath -e -- "$bridge") == "$bridge" ]]
+          printf '%s  %s\n' 138cc2fa81dc2a7356587a90f1ca146e466b7e0a496ffd9f925415d039451fd6 "$bridge" |
+            sha256sum --check --strict --quiet
+          pass=(PATH=/usr/bin:/bin LC_ALL=C)
+          for name in GITHUB_REPOSITORY GITHUB_REPOSITORY_ID GITHUB_REPOSITORY_OWNER_ID \
+                      GITHUB_EVENT_NAME GITHUB_REF GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA \
+                      GITHUB_RUN_ID GITHUB_RUN_ATTEMPT REF_PROTECTED \
+                      RUNNER_NAME RUNNER_ENVIRONMENT RUNNER_OS RUNNER_ARCH; do
+            pass+=("$name=${!name}")
+          done
+          exec /usr/bin/env -i "${pass[@]}" /usr/bin/bash "$bridge" runtime "$GITHUB_SHA" "$GITHUB_RUN_ID"
+
+  assembly:
+    name: Assemble Debian preview
+    needs: runtime
+    if: >-
+      github.repository == 'archledger/irlume' &&
+      github.repository_id == '1286828818' &&
+      github.repository_owner_id == '276915572' &&
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      github.event_name == 'workflow_dispatch' && github.run_attempt == 1
+    runs-on: [self-hosted, Linux, X64, n100]
+    timeout-minutes: 10
+    steps:
+      - name: Assemble and verify the exact Debian package
+        shell: bash
+        timeout-minutes: 7
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -euo pipefail
+          export PATH=/usr/bin:/bin LC_ALL=C
+          bridge=/home/test/.local-tasks/irlume-litert-preview-build-20261120/code/run-job.sh
+          [[ -f $bridge && ! -L $bridge && -O $bridge && $(realpath -e -- "$bridge") == "$bridge" ]]
+          printf '%s  %s\n' 138cc2fa81dc2a7356587a90f1ca146e466b7e0a496ffd9f925415d039451fd6 "$bridge" |
+            sha256sum --check --strict --quiet
+          pass=(PATH=/usr/bin:/bin LC_ALL=C)
+          for name in GITHUB_REPOSITORY GITHUB_REPOSITORY_ID GITHUB_REPOSITORY_OWNER_ID \
+                      GITHUB_EVENT_NAME GITHUB_REF GITHUB_SHA GITHUB_WORKFLOW_REF GITHUB_WORKFLOW_SHA \
+                      GITHUB_RUN_ID GITHUB_RUN_ATTEMPT REF_PROTECTED \
+                      RUNNER_NAME RUNNER_ENVIRONMENT RUNNER_OS RUNNER_ARCH; do
+            pass+=("$name=${!name}")
+          done
+          exec /usr/bin/env -i "${pass[@]}" /usr/bin/bash "$bridge" assembly "$GITHUB_SHA" "$GITHUB_RUN_ID"

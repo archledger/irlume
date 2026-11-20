@@ -1,0 +1,124 @@
+# Private draft: do not register without an approved source revision and permit.
+name: LiteRT Debian preview build
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  PREVIEW_BRIDGE_SHA256: 634862bcadaa38eaf43f74b9bd65097a601b43c8793797e609e2351ffc879efa
+
+concurrency:
+  group: litert-preview-build
+  cancel-in-progress: false
+
+jobs:
+  runtime:
+    name: Rebuild LiteRT runtime
+    if: >-
+      github.repository == 'archledger/irlume' &&
+      github.repository_id == '1286828818' &&
+      github.repository_owner_id == '276915572' &&
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      github.event_name == 'workflow_dispatch' && github.run_attempt == 1
+    runs-on: [self-hosted, Linux, X64, n100]
+    timeout-minutes: 70
+    steps:
+      - name: Rebuild and verify the frozen runtime
+        shell: bash
+        timeout-minutes: 68
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+          PREVIEW_ROLE: runtime
+        run: &preview_entrypoint |
+          set -euo pipefail
+          exec /usr/bin/python3 -I -S -B - <<'PY'
+          import fcntl
+          import hashlib
+          import os
+          import stat
+
+          PASSTHROUGH = (
+              "GITHUB_REPOSITORY", "GITHUB_REPOSITORY_ID", "GITHUB_REPOSITORY_OWNER_ID",
+              "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_SHA", "GITHUB_WORKFLOW_REF",
+              "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "REF_PROTECTED",
+              "RUNNER_NAME", "RUNNER_ENVIRONMENT", "RUNNER_OS", "RUNNER_ARCH",
+          )
+          MAX_BRIDGE_BYTES = 65536
+
+          def verified_bridge(path, expected):
+              # Inspect the inode without opening a symlink, device or FIFO for I/O.
+              source = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+              try:
+                  info = os.fstat(source)
+                  if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+                      raise ValueError("preview bridge requires an owned regular file")
+                  if not 0 < info.st_size <= MAX_BRIDGE_BYTES:
+                      raise ValueError("unexpected preview bridge size")
+                  with open(f"/proc/self/fd/{source}", "rb") as stream:
+                      data = stream.read(MAX_BRIDGE_BYTES + 1)
+              finally:
+                  os.close(source)
+              if len(data) != info.st_size:
+                  raise ValueError("preview bridge size changed")
+              if hashlib.sha256(data).hexdigest() != expected:
+                  raise ValueError("preview bridge digest mismatch")
+
+              # Seal the verified byte copy, not the mutable source inode.
+              fd = os.memfd_create("preview-bridge", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+              try:
+                  if os.write(fd, data) != len(data):
+                      raise OSError("incomplete preview bridge copy")
+                  os.lseek(fd, 0, os.SEEK_SET)
+                  fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SEAL | fcntl.F_SEAL_WRITE |
+                              fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK)
+              except OSError:
+                  os.close(fd)
+                  raise
+              return fd
+
+          def main():
+              required = {"RUNNER_NAME": "minihost", "RUNNER_ENVIRONMENT": "self-hosted",
+                          "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64"}
+              if (any(os.environ.get(name) != value for name, value in required.items())
+                      or os.uname().nodename != "minihost" or os.geteuid() == 0):
+                  raise SystemExit("preview requires the Minihost runner")
+              role = os.environ["PREVIEW_ROLE"]
+              if role not in ("runtime", "assembly"):
+                  raise SystemExit("unapproved preview job role")
+              env = {name: os.environ[name] for name in PASSTHROUGH}
+              env.update(PATH="/usr/bin:/bin", LC_ALL="C")
+              path = "/home/test/.local-tasks/irlume-litert-preview-build-20261120/code/run-job.sh"
+              try:
+                  fd = verified_bridge(path, os.environ["PREVIEW_BRIDGE_SHA256"])
+              except (OSError, ValueError) as error:
+                  raise SystemExit(f"preview bridge refused: {error}") from None
+              env["PREVIEW_BRIDGE_FD"] = str(fd)
+              os.set_inheritable(fd, True)
+              os.execve("/usr/bin/bash", ["/usr/bin/bash", f"/proc/self/fd/{fd}", role,
+                                        env["GITHUB_SHA"], env["GITHUB_RUN_ID"]], env)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+  assembly:
+    name: Assemble Debian preview
+    needs: runtime
+    if: >-
+      github.repository == 'archledger/irlume' &&
+      github.repository_id == '1286828818' &&
+      github.repository_owner_id == '276915572' &&
+      github.ref == 'refs/heads/main' && github.ref_protected &&
+      github.event_name == 'workflow_dispatch' && github.run_attempt == 1
+    runs-on: [self-hosted, Linux, X64, n100]
+    timeout-minutes: 10
+    steps:
+      - name: Assemble and verify the exact Debian package
+        shell: bash
+        timeout-minutes: 7
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+          PREVIEW_ROLE: assembly
+        run: *preview_entrypoint

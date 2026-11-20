@@ -331,6 +331,8 @@ declare -A ORT_PIN_COUNT=(
   [scripts/fetch-ort.sh]=1
 )
 
+ORT_ASSET_REPO='archledger/irlume-ci-assets/releases/download'
+ORT_ASSET_BASE="https://github.com/$ORT_ASSET_REPO"
 ort_ref=""
 for f in "${ORT_PINNED_BY[@]}"; do
   want="${ORT_PIN_COUNT[$f]:-}"
@@ -383,7 +385,7 @@ else
   # library.
   doc_needs=(
     "onnxruntime **$ort_ref** (\`ORT_DYLIB_PATH\`)"
-    "releases/download/v$ort_ref/onnxruntime-linux-x64-$ort_ref.tgz"
+    "$ORT_ASSET_BASE/onnxruntime-$ort_ref-linux-x64/onnxruntime-linux-x64-$ort_ref.tgz"
     "tar xzf onnxruntime-linux-x64-$ort_ref.tgz"
     "ORT_DYLIB_PATH=\"\$PWD/onnxruntime-linux-x64-$ort_ref/lib/libonnxruntime.so\""
     "libonnxruntime.so.$ort_ref"
@@ -509,7 +511,7 @@ fi
 # way (curl, a mirror, `gh release download`) fails here until it calls
 # scripts/fetch-ort.sh. This script and the fetcher's test name the tarball but
 # download nothing.
-ORT_URL='microsoft/onnxruntime/releases/download'
+ORT_UPSTREAM='microsoft/onnxruntime/releases/download'
 ORT_DOWNLOADERS=(
   "$ORT_FETCHER"
   flake.nix
@@ -519,6 +521,22 @@ ORT_DOWNLOADERS=(
   scripts/build-ppa-source.sh
   "$ORT_DEV_GUIDE"
 )
+for f in "${ORT_DOWNLOADERS[@]}"; do
+  if ! grep -Fq -- "$ORT_ASSET_BASE/onnxruntime-" "$f"; then
+    printf '  MISS  %-42s must download from the pinned CI dependency mirror\n' "$f"
+    fail=1
+  fi
+  case "$f" in
+    # These two builders keep the upstream lookup for explicit version overrides.
+    packaging/debian/build-deb.sh|scripts/build-ppa-source.sh) ;;
+    *)
+      if grep -Fq -- "$ORT_UPSTREAM" "$f"; then
+        printf '  MISS  %-42s still names the unavailable upstream download\n' "$f"
+        fail=1
+      fi
+      ;;
+  esac
+done
 while IFS= read -r f; do
   case "$f" in scripts/check-packaging-parity.sh|scripts/test-fetch-ort.sh) continue ;; esac
   allowed=0
@@ -532,7 +550,7 @@ while IFS= read -r f; do
       "$f" "$ORT_FETCHER"
     fail=1
   fi
-done < <(grep -rlE -- "$ORT_URL|onnxruntime-linux-x64-[^/[:space:]]*\\.tgz" \
+done < <(grep -rlE -- "$ORT_UPSTREAM|$ORT_ASSET_REPO|onnxruntime-linux-x64-[^/[:space:]]*\\.tgz" \
   .github scripts packaging nix flake.nix "$ORT_DEV_GUIDE" | sort)
 
 echo

@@ -115,7 +115,7 @@ let
     pname = "onnxruntime-linux-x64";
     version = ortVersion;
     src = pkgs.fetchurl {
-      url = "https://github.com/microsoft/onnxruntime/releases/download/v${ortVersion}/onnxruntime-linux-x64-${ortVersion}.tgz";
+      url = "https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-${ortVersion}-linux-x64/onnxruntime-linux-x64-${ortVersion}.tgz";
       hash = "sha256-JSmu+WjQrQYDNlBUvEbr76fw/jvBLyjF9ynJnd/+KoE=";
     };
     nativeBuildInputs = [ pkgs.autoPatchelfHook ];

@@ -131,8 +131,8 @@ printf 'left by an earlier run\n' > "$work/case-verified/$name/stale"
 run verified "$work/fetch-ort-fixture.sh" "$ver"
 check "verified: exit status" "$rc" 0
 check "verified: downloads" "$calls" 1
-check "verified: requests the pinned release" \
-  "$(grep -cF "https://github.com/microsoft/onnxruntime/releases/download/v$ver/$name.tgz" "$FETCH_ORT_TEST_LOG" || true)" 1
+check "verified: requests the pinned dependency mirror" \
+  "$(grep -cF "https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-$ver-linux-x64/$name.tgz" "$FETCH_ORT_TEST_LOG" || true)" 1
 check "verified: files left" "$(left)" "$name $name.tgz"
 check "verified: tarball is the downloaded one" "$(sha256sum < "$dir/$name.tgz" | cut -d' ' -f1)" "$fixture_sha"
 check "verified: library unpacked" "$([ -f "$dir/$name/lib/libonnxruntime.so" ] && echo yes || echo no)" yes

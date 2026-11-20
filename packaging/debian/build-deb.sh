@@ -37,8 +37,13 @@ echo "glibc floor ok: binaries need $actual, package declares >= $declared"
 
 rm -rf "$STAGE"; mkdir -p "$STAGE"
 # Bundle onnxruntime.
-curl -fsSL -o "$STAGE/ort.tgz" \
-  "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+if [ "$ORT_VER" = 1.28.1 ]; then
+  ort_url="https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-${ORT_VER}-linux-x64/onnxruntime-linux-x64-${ORT_VER}.tgz"
+else
+  # Other versions selected with ORT_VER/ORT_SHA256 are not mirrored.
+  ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+fi
+curl -fsSL -o "$STAGE/ort.tgz" "$ort_url"
 echo "${ORT_SHA256}  $STAGE/ort.tgz" | sha256sum -c - \
   || { echo "onnxruntime tarball failed sha256 check; refusing to bundle."; exit 1; }
 mkdir -p "$STAGE/onnxruntime"

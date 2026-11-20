@@ -79,6 +79,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('check-handoff "$root/handoff" "$1" "$2" "$3"', bridge)
         self.assertNotIn("runner_temp", bridge)
 
+    def test_verifier_fixtures_are_run_in_the_hosted_ci_check(self):
+        ci = yaml.load(WORKFLOW.with_name("ci.yml").read_text(), Loader=yaml.BaseLoader)
+        check = ci["jobs"]["check"]
+        self.assertEqual(check["runs-on"], "ubuntu-24.04")
+        command = "python3 -E -B -m unittest discover -s scripts/ci/litert-provenance -p 'test_*.py' -v"
+        self.assertTrue(any(step.get("run") == command and "if" not in step
+                            for step in check["steps"]), "missing hosted LiteRT contract check")
+
+    def test_scope_guard_accepts_nested_systemd_user_manager_path(self):
+        lines = (TOOLS / "run-minihost-workflow.sh").read_text().splitlines()
+        stop = lines.index('        || fail "controlled build scope missing"')
+        guard = "\n".join(lines[stop - 1:stop + 1])
+        check = ('fail() { exit 78; }\nscope=$1\n' + guard
+                 + '\nprintf "%s" "${BASH_REMATCH[1]}"')
+        path = "/user.slice/user-1000.slice/user@1000.service/app.slice/" \
+               "irlume-litert-unsigned-bounded-build-247.scope"
+        argv = ["/bin/bash", "-ec", check, "test"]
+        valid = subprocess.run(argv + ["0::" + path], capture_output=True, text=True, timeout=5)
+        self.assertEqual(valid.returncode, 0, valid.stderr)
+        self.assertEqual(valid.stdout, path)
+        for wrong in (path.replace("/user.slice/", "/system.slice/", 1),
+                      path.replace("bounded-build-247", "unrelated-247"), path + "/child"):
+            with self.subTest(path=wrong):
+                result = subprocess.run(argv + ["0::" + wrong], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 78, result.stderr)
+
     def test_scope_collection_waits_for_removal_but_refuses_an_error_or_stuck_unit(self):
         bridge = (TOOLS / "run-minihost-workflow.sh").read_text()
         fail = re.search(r"^fail\(\) .+$", bridge, re.M)

@@ -26,7 +26,9 @@ confirms the reported runner registration, not a physical machine
 identity or a signed build. No local synthetic handoff is admissible as
 evidence of this workflow.
 
-Local checks:
+The hosted CI check runs the fixture suite without minihost, Podman
+or the private input bundle. Run it and the workflow linters locally
+with:
 
 ```sh
 python3 -E -B -m unittest discover -s scripts/ci/litert-provenance -p 'test_*.py' -v

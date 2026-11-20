@@ -68,8 +68,13 @@ rsync -a --exclude .git --exclude /target --exclude /.deb-staging \
 
 echo "==> bundling onnxruntime $ORT_VER"
 ORT_TGZ="$BUILDROOT/onnxruntime-linux-x64-${ORT_VER}.tgz"
-[ -f "$ORT_TGZ" ] || curl -fsSL -o "$ORT_TGZ" \
-    "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+if [ "$ORT_VER" = 1.28.1 ]; then
+    ort_url="https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-${ORT_VER}-linux-x64/onnxruntime-linux-x64-${ORT_VER}.tgz"
+else
+    # Other versions selected with ORT_VER/ORT_SHA256 are not mirrored.
+    ort_url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VER}/onnxruntime-linux-x64-${ORT_VER}.tgz"
+fi
+[ -f "$ORT_TGZ" ] || curl -fsSL -o "$ORT_TGZ" "$ort_url"
 # Verify every time (also re-checks a reused cached tarball).
 echo "${ORT_SHA256}  ${ORT_TGZ}" | sha256sum -c - \
     || { echo "onnxruntime tarball failed sha256 check; refusing to bundle."; exit 1; }

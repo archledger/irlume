@@ -25,8 +25,8 @@ Source9:        %{url}/releases/download/models-v1/flir.onnx
 # (verified 2026-07-16: f43 1.20.1, f44 1.22.2; rawhide's 1.26 is the first
 # to clear the floor), so we vendor the upstream Linux build. Revisit
 # unbundling when the floor is met across our chroots. Packit/Copr fetch
-# remote sources (net-on).
-Source1:        https://github.com/microsoft/onnxruntime/releases/download/v%{ort_ver}/onnxruntime-linux-x64-%{ort_ver}.tgz
+# remote sources (net-on); the dependency mirror keeps the original bytes.
+Source1:        https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-%{ort_ver}-linux-x64/onnxruntime-linux-x64-%{ort_ver}.tgz
 # Bundled TFLite C runtime (Apache-2.0), for native .tflite models (#295).
 # Google publishes no prebuilt Linux C-API artifact at stable URLs, so irlume
 # builds its own from the pinned tensorflow tag (scripts/build-tflite-runtime.sh)

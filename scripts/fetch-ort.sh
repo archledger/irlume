@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
 #
-# Download the ONNX Runtime release tarball, check it against the sha256 pinned
-# below, and only then unpack it into the current directory. CI runs it in the
+# Download the mirrored ONNX Runtime release tarball, verify the pinned sha256,
+# and only then unpack it into the current directory. CI runs it in the
 # checkout; locally, run it outside, because git does not ignore the tarball:
 #
 #   cd "$(mktemp -d)" && bash /path/to/irlume/scripts/fetch-ort.sh 1.28.1
@@ -20,8 +20,8 @@
 # and then every site that check names.
 set -euo pipefail
 
-# sha256 of onnxruntime-linux-x64-${PINNED_VER}.tgz from the upstream GitHub
-# release; the release API reports the same digest for the asset.
+# sha256 of the original upstream GitHub release asset. The dependency
+# mirror preserves the archive byte for byte.
 PINNED_VER=1.28.1
 PINNED_SHA256=2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81
 
@@ -41,7 +41,7 @@ part="${tgz}.part"
 trap 'rm -f "$part"' EXIT
 
 curl -fsSL --retry 3 --retry-delay 2 -o "$part" \
-  "https://github.com/microsoft/onnxruntime/releases/download/v${ver}/${tgz}"
+  "https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-${ver}-linux-x64/${tgz}"
 got="$(sha256sum "$part" | cut -d' ' -f1)"
 if [ "$got" != "$PINNED_SHA256" ]; then
   echo "fetch-ort.sh: $tgz has sha256 $got, expected $PINNED_SHA256; not unpacking it." >&2

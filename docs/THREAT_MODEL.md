@@ -279,10 +279,15 @@ steps, not the anti-spoof boundary. Measurements:
 
 PAD availability is fail closed for face grants. RGB-only grants require a ViT
 RGB score, RGB+IR grants require both ViT RGB and FLIR IR scores, and dark
-IR-only grants require a FLIR IR score. A missing or disabled required model,
-or a failed inference, produces a nonretryable password-fallback denial rather
-than continuing with the algorithmic gate alone. The daemon remains available
-for password fallback, diagnostics, and repair, and its health response reports
+IR-only grants require a FLIR IR score. When an assessment reaches final
+admission, a recorded unavailable required cue (including missing, disabled
+or load-failed) or failed inference replaces an otherwise presence-retryable
+result with an unavailable/password-fallback denial. Existing terminal
+refusals retain their diagnostic order. NoFace/NotApplicable is not an
+execution failure and does not bypass final required-evidence checks
+([ADR-0019, amendment 2026-11-17](adr/0019-fail-closed-pad-availability.md#amendment-2026-11-17-execution-failures-before-retries)).
+The daemon remains available for password fallback, diagnostics, and repair,
+and its health response reports
 each model as loaded, disabled, missing, or load-failed. Kill switches therefore
 mean password-only for affected face grants; they do not accept this documented
 gap.

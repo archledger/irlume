@@ -55,6 +55,10 @@ scope, retain eager identity materialization before PAD qualification. They
 keep their existing identity-error precedence and retry-cost behavior. The
 earlier experiment that deferred ordinary attempts is not part of this scope.
 
+Amended 2026-11-17: the
+[required-failure retry exception](#amendment-2026-11-17-required-execution-failure-stops-retry)
+qualifies ordinary outcome precedence without moving identity preparation.
+
 Every analyzed pair must satisfy the existing runtime contract and concurrent
 pairing rules. Successive acquisition windows must advance without overlap or
 replay; intervening validated discarded frames need not become PAD samples.
@@ -117,3 +121,29 @@ longer reservation is spent only after the person at the prompt chose face.
 Nothing downstream moves: the rate window, the five-sample bound, PAD
 operating points, the skew limit and identity thresholds are the lock
 screen's, and every other rule of this ADR applies unchanged.
+
+## Amendment 2026-11-17: required execution failure stops retry
+
+Ordinary eager identity materialization and its error precedence remain.
+Managed non-Live/dark preparation also stays eager. The managed collector's
+visible-Live optimization, pending-evidence collection and stopping rules
+do not change.
+
+Final shared admission first selects the existing decision, including
+authority checks and terminal refusals. Only an otherwise-presence-retryable
+denial is replaced by a recorded required execution failure, as clarified
+in [ADR-0019](0019-fail-closed-pad-availability.md#amendment-2026-11-17-execution-failures-before-retries).
+The outer grace loop therefore does not capture again for that failure.
+The full PAD policy is not moved ahead of liveness, and normal absence or
+inapplicability is not converted into an execution failure.
+
+Existing terminal ordinary diagnostics keep their order. A dark template
+refusal remains prior where reached; a lit-scene retry can be replaced
+before that later check. Grouped terminal diagnostic priority remains
+separate, rather than becoming the ordinary policy wholesale.
+
+Transport/tail-drain validity, stale-pair qualification, request windows,
+modality requirements, identity thresholds, PAD operating points, finite
+score settlement and teardown ordering remain unchanged. The request keeps
+its reserved durable charge and uses the existing `RuntimeUnavailable`
+short-strike policy.

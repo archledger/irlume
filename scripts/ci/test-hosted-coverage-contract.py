@@ -13,6 +13,7 @@ Rust build, no hardware.
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -25,9 +26,35 @@ WORKFLOW = ROOT / '.github/workflows/coverage.yml'
 # A lane deleted from the workflow must fail here, not vanish quietly.
 EXPECTED_INSTRUMENTED_LANES = 11
 
+# Independently pin the existing daemon swtpm suite, not the contents of
+# either workflow or libtest's current --list output. Losing a name in both
+# workflows at once must still fail this contract.
+DAEMON_SWTPM_TESTS = (
+    'tpm_a_checked_arm_never_replaces_a_token_with_another_kind',
+    'tpm_a_checked_arm_never_seals_over_an_unreadable_envelope',
+    'tpm_a_checked_new_password_rewraps_the_token',
+    'tpm_a_checked_token_arm_never_mints_over_an_unreadable_envelope',
+    'tpm_a_first_arm_on_an_oo7_home_seals_the_login_password',
+    'tpm_an_arm_on_an_oo7_home_keeps_an_armed_token',
+    'tpm_endorsement_report_keeps_its_deadline_and_notes_progress',
+    'tpm_owner_reseal_leaves_the_token_envelope_unchanged',
+    'tpm_readiness_report_carries_the_lockout_state',
+    'tpm_refused_eyes_open_off_keeps_the_enrollment_and_key_unmoved',
+    'tpm_reseal_with_a_wrong_login_password_leaves_the_envelope_unchanged',
+    'tpm_seal_and_unseal_keyring_release_the_secret_to_root_only',
+    'tpm_split_whole_broken_credential_envelope_refuses_release_and_keeps_charge',
+    'tpm_split_whole_centroid_identity_releases_once_at_each_skew',
+    'tpm_split_whole_reset_preserves_template_key_and_next_authenticate_routes',
+    'tpm_split_whole_unseal_releases_once_at_each_skew_and_resets_only_after_delivery',
+    'tpm_split_whole_unwritten_credential_keeps_the_charge_after_one_real_release',
+    'tpm_unverified_owner_seal_leaves_the_token_envelope_unchanged',
+    'tpm_unverified_reseal_rewraps_the_token_under_the_new_password',
+    'tpm_unverified_root_seal_leaves_the_token_envelope_unchanged',
+)
 
-def workflow_text():
-    text = WORKFLOW.read_text()
+
+def workflow_text(workflow=WORKFLOW):
+    text = workflow.read_text()
     # Join shell continuations so one lane spanning several lines is checked
     # as the single command the guard actually sees.
     return text.replace('\\\n', ' ')
@@ -262,6 +289,50 @@ sys.exit(int(os.environ['FIXTURE_EXIT']))
 
     def test_failed_command_cannot_pass_from_success_output(self):
         self.assertEqual(self.run_lane(2720, exit_code=23).returncode, 23)
+
+
+class DaemonSwtpmGuardTests(unittest.TestCase):
+    def guard_args(self, workflow, command):
+        lines = [line.strip() for line in workflow_text(workflow).splitlines()
+                 if '-p irlume-daemon ' in line and '--ignored tpm_' in line]
+        self.assertEqual(len(lines), 1, workflow.name)
+        args = shlex.split(lines[0])
+        self.assertEqual(args[0], './scripts/run-tests-guarded.sh')
+        separator = args.index('--')
+        self.assertEqual(
+            args[separator + 1:],
+            command + ['-p', 'irlume-daemon', '--locked', '--',
+                       '--ignored', 'tpm_', '--test-threads=1'],
+        )
+        return args[1:separator]
+
+    def test_both_daemon_lanes_guard_every_named_result(self):
+        def run_guard(args, names):
+            # These are libtest's normal result lines. This test runs only
+            # the guard, never Cargo or any software or physical TPM.
+            transcript = ''.join(f'test tests::{name} ... ok\n' for name in names)
+            transcript += f'test result: ok. {len(names)} passed; 0 failed; 0 ignored;\n'
+            return subprocess.run(
+                ['bash', './scripts/run-tests-guarded.sh', *args, '--', 'printf', '%s',
+                 transcript],
+                cwd=ROOT, capture_output=True, text=True, timeout=10,
+            )
+
+        for workflow, command in (
+            (WORKFLOW.with_name('ci.yml'), ['cargo', 'test']),
+            (WORKFLOW, ['$IRLUME_COVERAGE_BIN', 'llvm-cov', '--no-report']),
+        ):
+            args = self.guard_args(workflow, command)
+            result = run_guard(args, DAEMON_SWTPM_TESTS)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for missing in DAEMON_SWTPM_TESTS:
+                with self.subTest(workflow=workflow.name, missing=missing):
+                    # A different passing case keeps the count unchanged.
+                    names = tuple('tpm_unrelated_passing_fixture' if name == missing else name
+                                  for name in DAEMON_SWTPM_TESTS)
+                    result = run_guard(args, names)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f'did not run and pass: {missing}', result.stderr)
 
 
 if __name__ == '__main__':

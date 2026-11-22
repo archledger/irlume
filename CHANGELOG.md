@@ -235,6 +235,12 @@ All notable changes to irlume are documented here. This project adheres to
   expose their IR sensors. Camera admission and loopback refusal stay
   unchanged (ADR-0041 §1, #1379).
 
+- The fixed IR startup path for the measured NexiGo N930W (`3443:c803`)
+  profile can advance a below-floor startup window once before delivering
+  a frame. It still requires 30 intervals at the same delivered-rate
+  floor. Healthy sessions, other profiles, continuity probes and paired
+  startup keep their existing behavior.
+
 - Clarify warn-first model checksum checks, strict core-model startup
   refusals and PAD cue rejection without daemon exit. Disabling required
   PAD prevents affected face grants (ADR-0013, amendment 2026-11-17; ADR-0019).

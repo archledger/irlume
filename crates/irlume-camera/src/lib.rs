@@ -1996,6 +1996,11 @@ const MAX_RATE_FILL_ATTEMPTS: usize = 64;
 /// seed plus five deltas; 16 gives generous headroom for corrupt frames.
 const MAX_PROBE_FILL_ATTEMPTS: usize = 16;
 
+// On the measured NexiGo IR profile, three additional discards make the
+// first deliverable frame judge a full window starting at frame 10 instead
+// of 7. The first delivery still runs the normal per-frame check.
+const NEXIGO_IR_RECHECK_DISCARDS: usize = 3;
+
 struct TrackedStream<S> {
     stream: Option<S>,
     control: CaptureControl,
@@ -2424,10 +2429,24 @@ impl<S: ValidatedStream> TrackedStream<S> {
     }
 
     fn fill_rate_evidence_with_startup(&mut self, adaptive_ir: bool) -> std::io::Result<()> {
+        self.fill_rate_evidence_with_recheck(adaptive_ir, || false)
+    }
+
+    fn fill_rate_evidence_with_recheck(
+        &mut self,
+        adaptive_ir: bool,
+        measured_profile: impl FnOnce() -> bool,
+    ) -> std::io::Result<()> {
         self.control.check_io()?;
         if self.rate_window.ready() || self.health_admitted {
             return Ok(());
         }
+        // A fixed IR session starts with one successful warm-up dequeue.
+        // Never recheck a recovered stream or a later fill in this session.
+        let fixed_ir_start = !adaptive_ir
+            && self.rate_config.role() == contracts::StreamRole::Ir
+            && self.observations == 1
+            && !self.recovery_epoch_pending;
         // A probe-eligible stream always measures post-flush, so it takes the
         // fixed-flush path even when the caller asked for adaptive startup:
         // the probe cannot distinguish a STREAMON transient from degradation.
@@ -2554,6 +2573,27 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 rate_amortization::record_completion(key.clone());
             }
         }
+        let policy = self.rate_config.policy();
+        if fixed_ir_start
+            && !probe_eligible
+            && attempts == policy.window() + 1
+            && attempts + NEXIGO_IR_RECHECK_DISCARDS <= MAX_RATE_FILL_ATTEMPTS
+            && self.sequence_span_sum == self.observations - 1
+            && !self.rate_window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            )
+            && measured_profile()
+        {
+            // Keep the existing continuity trackers and sliding window.
+            // Advance it once by a fixed amount, not until a window passes.
+            // next() still enforces the full window before handing out a
+            // frame. Healthy fills never pay this cost or read the profile.
+            for _ in 0..NEXIGO_IR_RECHECK_DISCARDS {
+                self.next_discarded()?;
+            }
+        }
         if adaptive_ir {
             // One-shot IR may settle before the fixed exclusion is needed.
             // A retained seed shifts the initial window back one frame. Give
@@ -2561,7 +2601,6 @@ impl<S: ValidatedStream> TrackedStream<S> {
             // reachable window and total work cap match the original path.
             // Delivery still checks the next frame's
             // updated window, including a typed BelowFloor refusal if needed.
-            let policy = self.rate_config.policy();
             for _ in 0..flush + retained_seed {
                 if self.rate_window.meets_floor(
                     policy.floor_num(),
@@ -2722,12 +2761,21 @@ impl IrSessionStartup {
         }
     }
 
+    #[cfg(test)]
     fn fill<S: ValidatedStream>(self, stream: &mut TrackedStream<S>) -> std::io::Result<()> {
+        self.fill_with_recheck(stream, || false)
+    }
+
+    fn fill_with_recheck<S: ValidatedStream>(
+        self,
+        stream: &mut TrackedStream<S>,
+        measured_profile: impl FnOnce() -> bool,
+    ) -> std::io::Result<()> {
         let result = match self {
             // The joint fill resets both windows and measures simultaneous
             // delivery. A solo IR window would only be thrown away there.
             Self::Paired => Ok(()),
-            Self::Fixed => stream.fill_rate_evidence(),
+            Self::Fixed => stream.fill_rate_evidence_with_recheck(false, measured_profile),
             Self::Adaptive => stream.fill_rate_evidence_with_startup(true),
         };
         // Preserve the typed cause before map_io converts it to production prose.
@@ -7108,6 +7156,30 @@ pub struct IrCamera {
     card: String,
 }
 
+fn nexigo_ir_recheck_contract(
+    format: &v4l::Format,
+    requested: frame_interval::FrameInterval,
+    accepted: frame_interval::FrameInterval,
+) -> bool {
+    (format.fourcc.repr, format.width, format.height) == (*b"GREY", 640, 360)
+        && requested.parts() == (1, 30)
+        && accepted.parts() == (1, 30)
+}
+
+fn nexigo_ir_recheck_endpoint(context: &uvc_descriptor::FdCameraContext) -> bool {
+    let identity = &context.identity;
+    (
+        identity.vid,
+        identity.pid,
+        identity.active_configuration,
+        identity.interface_number,
+    ) == (0x3443, 0xc803, 1, 2)
+        && context.connection.driver == "uvcvideo"
+        && context.connection.speed_millimbps == 480_000
+        && identity.descriptors.as_slice()
+            == include_bytes!("../tests/fixtures/nexigo-3443-c803.descriptors")
+}
+
 impl IrCamera {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
@@ -7451,7 +7523,16 @@ impl IrCamera {
         let fill_result = {
             let _timing = control.stage(Stage::RateFill);
             fill_rate_then_drain_metadata(
-                || startup.fill(&mut session.stream),
+                || {
+                    startup.fill_with_recheck(&mut session.stream, || {
+                        nexigo_ir_recheck_contract(
+                            &self.negotiated,
+                            self.requested_interval,
+                            self.accepted_interval,
+                        ) && uvc_descriptor::identity_and_connection_from_fd(self.dev.handle().fd())
+                            .is_ok_and(|context| nexigo_ir_recheck_endpoint(&context))
+                    })
+                },
                 || {
                     if let Some(log) = session.meta.as_mut() {
                         log.drain();
@@ -11918,6 +11999,7 @@ where
 mod tests {
     include!("native_validator_accounting_tests.rs");
     include!("probe_bounds_tests.rs");
+    include!("first_session_settle_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");
     }

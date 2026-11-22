@@ -197,6 +197,13 @@ can ignore the optional request field and continue emitting schema 1.
 5; omission still selects schema 1. The lifetime correction below preserves
 that negotiation and introduces no wire field or variant.
 
+**Amended 2026-11-22:** current daemons and readers support schemas 1 through
+6. Schema 6 adds one event, `rate_evidence`, reported per stream after a
+pair's rate establishment with how that stream's delivered-rate window was
+established (ADR-0021): closed enum values, counts and durations, no score
+and no frame. Subscribers of schema 5 and older omit it before queue,
+sequence and drop accounting, as for every earlier addition.
+
 Exact match and liveness measurements are permitted only in the root-owned
 trace because they can provide iterative feedback to an attacker. The trace
 header warns about that oracle. Frames, crops, landmarks, embeddings,

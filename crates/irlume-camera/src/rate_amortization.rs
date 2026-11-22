@@ -7,7 +7,8 @@
 //! completed a full window recently in this process and nothing invalidating
 //! happened since, a 5-delta continuity probe through the same exact
 //! `meets_floor` arithmetic may admit the session instead. The per-frame
-//! sliding judgment keeps running for the whole burst either way.
+//! sliding judgment keeps running for the whole burst either way. Every
+//! fill records which of the two happened and why ([`rate_evidence`]).
 
 use crate::contracts::StreamRole;
 use std::collections::HashMap;
@@ -70,17 +71,49 @@ fn cache() -> &'static Mutex<HashMap<Key, Instant>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Whether a session for this key may try the continuity probe, and when
+/// not, why. [`amortizable`] asks whether it is `Recent`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Reuse {
+    /// Reuse is switched off by `IRLUME_RATE_AMORTIZATION=0`.
+    Disabled,
+    /// No completion is recorded for this key: the first session for this
+    /// node and role in the process, a changed node, or an earlier
+    /// invalidating event removed it.
+    Unrecorded,
+    /// A completion is recorded but older than [`MAX_STALENESS`].
+    Stale,
+    /// A completion within the staleness bound.
+    Recent,
+}
+
+impl Reuse {
+    /// Why a session for `key` may or may not try the continuity probe. A
+    /// session created without an amortization key has nothing recorded.
+    pub(crate) fn for_key(key: Option<&Key>) -> Self {
+        let Some(key) = key else {
+            return Self::Unrecorded;
+        };
+        if !enabled() {
+            return Self::Disabled;
+        }
+        match cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+        {
+            Some(completed_at) if completed_at.elapsed() <= MAX_STALENESS => Self::Recent,
+            Some(_) => Self::Stale,
+            None => Self::Unrecorded,
+        }
+    }
+}
+
 /// Whether a session for this key may admit on a continuity probe: enabled,
 /// and a full window completed within the staleness bound.
 pub(crate) fn amortizable(key: &Key) -> bool {
-    if !enabled() {
-        return false;
-    }
-    cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(key)
-        .is_some_and(|completed_at| completed_at.elapsed() <= MAX_STALENESS)
+    Reuse::for_key(Some(key)) == Reuse::Recent
 }
 
 /// Record that a full 30-delta window completed for this key now.
@@ -98,6 +131,50 @@ pub(crate) fn invalidate(key: &Key) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(key);
+}
+
+/// The decision under which a session paid its full window, given what its
+/// probe could have reused and whether a probe missed first.
+pub(crate) fn full_window_decision(
+    reuse: Reuse,
+    probe_missed: bool,
+) -> irlume_common::diagnostics::RateEvidenceDecision {
+    use irlume_common::diagnostics::RateEvidenceDecision as Decision;
+    if probe_missed {
+        return Decision::ProbeMissed;
+    }
+    match reuse {
+        Reuse::Disabled => Decision::DisabledFullWindow,
+        Reuse::Stale => Decision::StaleFullWindow,
+        // A recent completion without an admission: the paired fill skipped
+        // the probe for a stream that parked a startup buffer (which revoked
+        // the entry as well), or the entry lapsed between a fill's two
+        // checks. Either way a full window established the session.
+        Reuse::Unrecorded | Reuse::Recent => Decision::FullWindow,
+    }
+}
+
+/// The schema 6 trace record for one stream's established rate window.
+pub(crate) fn rate_evidence(
+    role: StreamRole,
+    decision: irlume_common::diagnostics::RateEvidenceDecision,
+    deltas: usize,
+    probe_deltas: Option<usize>,
+    offset: Duration,
+    elapsed: Duration,
+) -> irlume_common::diagnostics::TraceEventKind {
+    let micros = |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+    irlume_common::diagnostics::TraceEventKind::RateEvidence {
+        role: match role {
+            StreamRole::Rgb => irlume_common::diagnostics::CameraRoleLabel::Rgb,
+            StreamRole::Ir => irlume_common::diagnostics::CameraRoleLabel::Ir,
+        },
+        decision,
+        deltas: u32::try_from(deltas).unwrap_or(u32::MAX),
+        probe_deltas: probe_deltas.map(|deltas| u32::try_from(deltas).unwrap_or(u32::MAX)),
+        offset_us: micros(offset),
+        elapsed_us: micros(elapsed),
+    }
 }
 
 #[cfg(test)]

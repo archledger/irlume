@@ -20,6 +20,23 @@ All notable changes to irlume are documented here. This project adheres to
   a published two-host one), and how a third party rebuilds each
   channel and what to compare (ADR-0040 §1, #1366).
 
+- Diagnostic trace schema 6 reports how each stream's delivered-rate
+  window was established after a concurrent pair's `rate_establishment`:
+  one `rate_evidence` record per stream with the decision (`full_window`,
+  `stale_full_window`, `disabled_full_window`, `probe_admitted` or
+  `probe_missed`), the deltas the window held, the deltas a missed probe
+  had collected, and when the stream's own collection began and how long
+  it took relative to the pair fill (ADR-0021). `irlume trace explain`
+  prints the records, so one trace shows whether a slow first attempt paid
+  the full window because the daemon had just started, because the last
+  completion was over 24 hours old or because the continuity probe
+  missed, and whether both windows were collected at once (#1399).
+  Schema 5 and older subscribers omit the records; the recorder now
+  requests schema 6, which a daemon started before the upgrade refuses as
+  an unsupported schema until it restarts. `irlume trace analyze` still
+  reads schema 5 traces. Capture, decisions and the sequential routes'
+  records are unchanged.
+
 ### Changed
 
 - Paired face-authentication requests stop grace retries on a recorded

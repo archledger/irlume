@@ -11,8 +11,29 @@
 # for the organization in CodeRabbit still apply below this file. A file
 # without it is the only configuration layer, and every setting the file
 # leaves out falls back to the schema defaults.
+#
+# A repository file is also read with the V2 schema, and some V2 defaults
+# differ from the V3 defaults that applied before this file: sequence
+# diagrams, the estimated review effort, the linked issue assessment, the
+# in-progress fortune, chat art, and the built-in title, description and
+# issue assessment checks are on in V2 and off in V3. They are pinned here
+# to off, the value each had before this file. Every key below is in the
+# documented configuration reference.
 inheritance: true
+chat:
+  art: false
 reviews:
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: false
+  in_progress_fortune: false
+  pre_merge_checks:
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
   finishing_touches:
     unit_tests:
       enabled: false

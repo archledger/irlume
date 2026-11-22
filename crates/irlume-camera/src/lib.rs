@@ -205,6 +205,7 @@ mod paired_processing;
 pub mod profiles;
 pub use paired_processing::process_pair_while_draining;
 mod rate_amortization;
+mod rate_evidence_store;
 mod rate_gate;
 mod sequential_batch;
 mod split_capture;
@@ -2021,6 +2022,16 @@ struct TrackedStream<S> {
     /// `RateEvidence` record), from the fill that established it until the
     /// window is revoked; see [`Self::record_rate_evidence`].
     rate_evidence: Option<irlume_common::diagnostics::TraceEventKind>,
+    /// Ordinals, from zero among the frames this session dequeued, of the
+    /// seed and of the last frame of the rate window as it stands. Written
+    /// as the window is observed and read when a fill records it.
+    rate_seed_frame: Option<u64>,
+    rate_end_frame: Option<u64>,
+    /// Whether this session's rate evidence was restored from the on-disk
+    /// record at session start (ADR-0021 amendment 2026-11-22), which the
+    /// trace's `persisted` field reports. Captured once, before any probe
+    /// can invalidate what it rested on.
+    rate_persisted: bool,
 }
 
 impl<S> TrackedStream<S> {
@@ -2040,12 +2051,31 @@ impl<S> TrackedStream<S> {
             health_admitted: false,
             pair_fill_started: None,
             rate_evidence: None,
+            rate_seed_frame: None,
+            rate_end_frame: None,
+            rate_persisted: false,
         }
     }
 
     /// Enable ADR-0021 rate-evidence amortization for this stream session.
     fn with_rate_amortization(mut self, node: &str) -> Self {
         self.amort_key = Some(rate_amortization::Key::new(node, self.rate_config.role()));
+        self
+    }
+
+    /// Bind this session's rate evidence to the persistent stream identity
+    /// its completion record lives under, and consult that record at session
+    /// start exactly as the in-memory cache is consulted after it (ADR-0021
+    /// amendment 2026-11-22). A session without an identity keeps
+    /// process-local evidence: nothing is read from or written to disk for
+    /// it, which is what the diagnostic readers want.
+    fn with_rate_identity(mut self, identity: Option<rate_amortization::Identity>) -> Self {
+        if let Some(key) = self.amort_key.take() {
+            let bound = key.with_identity(identity);
+            rate_amortization::restore(&bound);
+            self.rate_persisted = rate_amortization::restored(&bound);
+            self.amort_key = Some(bound);
+        }
         self
     }
 
@@ -2061,8 +2091,14 @@ impl<S> TrackedStream<S> {
         self.rate_evidence = Some(rate_amortization::rate_evidence(
             self.rate_config.role(),
             decision,
-            self.rate_window.count(),
+            rate_amortization::Window {
+                deltas: self.rate_window.count(),
+                seed_frame: self.rate_seed_frame.unwrap_or_default(),
+                end_frame: self.rate_end_frame.unwrap_or_default(),
+                span_us: self.rate_window.span_us(),
+            },
             probe_deltas,
+            self.rate_persisted,
             self.pair_fill_started
                 .map_or(std::time::Duration::ZERO, |started| {
                     collected_since.saturating_duration_since(started)
@@ -2416,6 +2452,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
             discarded_observations,
             sequence_span_sum,
             recovery_epoch_pending,
+            rate_seed_frame,
+            rate_end_frame,
             ..
         } = self;
         let dequeued = stream
@@ -2451,9 +2489,16 @@ impl<S: ValidatedStream> TrackedStream<S> {
             true,
         )?;
         if delivered {
+            // This frame's ordinal: the count already includes it.
+            let frame = observations.saturating_sub(1);
+            let seeds = rate_window.count() == 0 && !rate_window.has_only_seed();
             rate_window
                 .observe_success(facts.timestamp_micros())
                 .map_err(std::io::Error::other)?;
+            if seeds {
+                *rate_seed_frame = Some(frame);
+            }
+            *rate_end_frame = Some(frame);
         }
         Ok(())
     }
@@ -2661,6 +2706,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
             sequence_span_sum,
             recovery_epoch_pending,
             amort_key,
+            rate_seed_frame,
+            rate_end_frame,
             ..
         } = self;
         let dequeued = stream
@@ -2712,6 +2759,8 @@ impl<S: ValidatedStream> TrackedStream<S> {
         )
         .map_err(DeliveryError::Io)?;
 
+        let frame = observations.saturating_sub(1);
+        let seeds = rate_window.count() == 0 && !rate_window.has_only_seed();
         rate_window
             .observe_success(facts.timestamp_micros())
             .inspect_err(|_| {
@@ -2720,6 +2769,10 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 }
             })
             .map_err(|error| DeliveryError::Io(std::io::Error::other(error)))?;
+        if seeds {
+            *rate_seed_frame = Some(frame);
+        }
+        *rate_end_frame = Some(frame);
 
         let policy = rate_config.policy();
         let meets_floor = rate_window.meets_floor(
@@ -5669,6 +5722,16 @@ impl RgbCamera {
         self.session_with_control(&CaptureControl::with_progress(progress.clone()))
     }
 
+    /// The persistent rate-evidence identity of this camera's stream: a
+    /// digest of the facts collected from its own open descriptor and of the
+    /// negotiated stream contract (ADR-0021 amendment 2026-11-22). `None`
+    /// when those facts cannot be collected, in which case the session keeps
+    /// process-local evidence and no completion record is read or written.
+    fn rate_evidence_identity(&self) -> Option<rate_amortization::Identity> {
+        let (endpoint, stream) = self.qualification_facts().ok()?;
+        rate_amortization::Identity::for_stream(&endpoint, &stream)
+    }
+
     /// Start an RGB session with cooperative request cancellation.
     ///
     /// # Errors
@@ -5677,6 +5740,7 @@ impl RgbCamera {
         &self,
         control: &CaptureControl,
     ) -> irlume_common::Result<RgbSession<'_>> {
+        let rate_identity = self.rate_evidence_identity();
         control.check()?;
         self.lease
             .require_endpoint(&self.device)
@@ -5726,6 +5790,7 @@ impl RgbCamera {
                 ),
             )
             .with_rate_amortization(&self.device)
+            .with_rate_identity(rate_identity)
             .with_control(control),
             warmed: false,
             progress: control.progress.clone(),
@@ -7413,12 +7478,23 @@ impl IrCamera {
         )
     }
 
+    /// The persistent rate-evidence identity of this camera's stream: a
+    /// digest of the facts collected from its own open descriptor and of the
+    /// negotiated stream contract (ADR-0021 amendment 2026-11-22). `None`
+    /// when those facts cannot be collected, in which case the session keeps
+    /// process-local evidence and no completion record is read or written.
+    fn rate_evidence_identity(&self) -> Option<rate_amortization::Identity> {
+        let (endpoint, stream) = self.qualification_facts().ok()?;
+        rate_amortization::Identity::for_stream(&endpoint, &stream)
+    }
+
     fn session_with_control_startup_metadata<'a>(
         &'a self,
         control: &CaptureControl,
         startup: IrSessionStartup,
         metadata: ir_metadata::MetadataSelection<'_>,
     ) -> irlume_common::Result<IrSession<'a>> {
+        let rate_identity = self.rate_evidence_identity();
         let _setup_timing = control.stage(Stage::SessionSetup);
         control.check()?;
         self.lease
@@ -7458,6 +7534,7 @@ impl IrCamera {
                 ),
             )
             .with_rate_amortization(&self.device)
+            .with_rate_identity(rate_identity)
         };
         stream.control = control.clone();
         if let Some(inner) = stream.stream.as_mut() {
@@ -12027,6 +12104,7 @@ mod tests {
     include!("native_validator_accounting_tests.rs");
     include!("probe_bounds_tests.rs");
     include!("rate_evidence_tests.rs");
+    include!("rate_evidence_persistence_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");
     }

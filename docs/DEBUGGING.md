@@ -214,13 +214,23 @@ session after a daemon start, a changed node, or an earlier fault),
 session) or `probe_missed` (the probe missed, the completion was revoked and
 the full window followed). `deltas` is the width of the window that
 established the session and `probe_deltas` the deltas a missed probe had
-collected. `offset_us` is the time from the start of the pair fill to the
-start of this stream's own window collection, after its startup flush, and
-`elapsed_us` how long that collection took: two small offsets with
-overlapping durations mean both windows were collected at once, and a second
-offset about equal to the first duration means one followed the other.
-`deltas` over `elapsed_us` is the rate the stream delivered while its window
-was collected. The records are telemetry: no capture, admission or fallback
+collected. `seed_frame` and `end_frame` name the frames that window
+covered, counted from zero among the frames the session dequeued, warm-up
+and flush discards included; on the pair route a stream primed with one
+frame and then reset seeds at frame 1, and IR's five-frame flush puts its
+seed at frame 5. `span_us` is what the window's deltas sum to on the
+driver's clock, so `deltas` over `span_us` is the rate the window was
+judged at (30 deltas may span at most 2,061,855 us on IR and 4,123,711 us
+on RGB). A first window that is refused while a window seeded a few frames
+later would pass is the camera's start-up cadence, late frames after
+power-on or a re-plug, and not a slow link; a stream that is slow shows a
+large `span_us` wherever its window began. `offset_us` is the time from the
+start of the pair fill to the start of this stream's own window collection,
+after its startup flush, and `elapsed_us` how long that collection took in
+wall time: two small offsets with overlapping durations mean both windows
+were collected at once, and a second offset about equal to the first
+duration means one followed the other. The records are telemetry: no
+capture, admission or fallback
 decision reads them, and the sequential routes, whose fills sit inside their
 own capture stages, emit none. Schema 5 and older subscribers omit the
 records the same way. `irlume trace analyze` reads schema 5 and 6 traces; the

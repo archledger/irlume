@@ -159,3 +159,96 @@ remain out of scope here: a fill-time hard fault returned from
 `next_discarded` and a fill-time `observe_success` failure (also
 `next_discarded`) do not invalidate the amortization entry. Neither was
 introduced by this change.
+
+## Amendment 2026-11-22: completions outlive the daemon, keyed on USB identity
+
+Measured on the HP EliteBook 830 G8 of #1399: a concurrent attempt spends
+8.417 s of a 15.08 s lock-screen window in rate establishment, and 9.3 s
+pass before the first face sample. A cold session pays the 30-delta window
+per stream, and its wall time scales with the inverse of the delivered
+rate (30 deltas are 4.02 s on that machine's RGB stream at 7.456 fps).
+Every daemon start, whether boot, package upgrade or watchdog restart,
+began with an empty cache, so the first attempt after each of them was
+cold, and the trace could not say so.
+
+1. A full window's completion is kept on disk as well as in memory: one
+   small file per stream identity under `state_dir()/rate-evidence/`,
+   holding the record schema and the completion's unix time in
+   milliseconds. Nothing else is stored: no secret, no biometric data,
+   no device path and no serial.
+
+2. The identity is a SHA-256 digest of the stream's USB endpoint as
+   `CameraEndpoint` collects it from the open descriptor (vendor and
+   product id, serial where present, interface, bus and port,
+   configuration-bound descriptor digest, controller and link speed),
+   of its negotiated stream contract and of the rate policy its window
+   is judged by (role floor, tolerance, window width, startup flush).
+   A renumbered video node keeps its identity. A camera moved to another
+   port, a link-speed change, a new descriptor, stream or policy gives
+   another, for which no record exists (ADR-0023, section 5). A camera
+   that publishes no serial is known by its port, as it is by the
+   emitter journal and the qualifications: an identical unit later
+   plugged into the same port inherits the record, and item 5 is all
+   that costs.
+
+3. At session start the record is consulted once, exactly as the
+   in-memory cache is consulted after it. A completion within the
+   staleness bound becomes the cache entry for this session's key, with
+   the age the record states, and the cache then behaves as before:
+   decision item 5's probe (5 deltas, escalating to 15) on the current
+   session is THE evidence that admits it, every later frame is judged
+   by the sliding ring, and a full window that completes records its
+   completion in memory and on disk. The bound stays at 24 hours and now
+   spans restarts. A restored entry never replaces what this process
+   already observed itself.
+
+4. Every invalidating event of decision item 3 (stream recovery, a
+   dequeue I/O error, a failed probe, a parked startup buffer, a
+   held-side fault) removes the memory entry and the record with it:
+   an invalidated stream re-proves itself with a full window, which is
+   the conservative direction.
+   `IRLUME_RATE_AMORTIZATION=0` restores nothing, records nothing and
+   removes nothing.
+
+5. The record only decides whether the probe is tried. It is never rate
+   evidence. A forged, stale or corrupt record can cause a probe attempt
+   and nothing else; a stream below its floor fails that probe, pays the
+   full window and is refused exactly as before.
+
+The security and correctness argument above does not change. The probe
+and the sliding ring are the admitting evidence on every path; the
+record only removes the need for a full window before a probe may be
+tried, and a failed probe still revokes what it contradicted. On top of
+that:
+
+- The record is not trusted input. The daemon writes it 0600, at file
+  creation, by atomic replace into a 0700 directory. A read accepts
+  only a regular file owned by the effective user with no access for
+  group or other, opened without following links, within a small size
+  bound, in the known schema, with a completion neither in the future
+  nor past the staleness bound. Each refusal is the same as an absent
+  record, as are a missing, unreadable or unwritable state directory.
+  Only root can write it, inside the stated trust boundary.
+- The per-frame sliding floor judgment, the exact-integer `meets_floor`
+  arithmetic and the watchdog bound are untouched. The only new work on
+  the capture path is one bounded file read at session start, and one
+  small atomic write when a full window completes.
+- The directory holds at most 32 records; when a new one would exceed
+  that, a file that is no sound record goes first and then the oldest
+  completions. A record past the bound or in the future is removed when
+  it is read.
+
+Consequences:
+
+- The first attempt after a daemon start tries the probe when the same
+  stream completed a full window in the previous 24 hours. On #1399-class
+  hardware the per-stream machinery of that attempt drops from the full
+  window (about 4 s on its RGB stream) to the probe.
+- A probe that now misses where a cold fill would have been paid costs
+  up to 15 deltas before the full window: on that RGB stream about 2 s.
+  The trace's `rate_evidence` record (schema 6) reports that outcome as
+  `probe_missed`, and its `persisted` field says when the decision
+  rested on a completion from before this daemon start.
+- A test or tool that opens a real USB camera as root without
+  `IRLUME_STATE_DIR` set keeps its records under the production state
+  directory, as the emitter journal already does.

@@ -2663,19 +2663,24 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A `RateEvidence` record; `window` is `(deltas, probe_deltas,
+    /// seed_frame, end_frame, span_us)`.
     fn rate_evidence(
         role: irlume_common::diagnostics::CameraRoleLabel,
         decision: irlume_common::diagnostics::RateEvidenceDecision,
-        deltas: u32,
-        probe_deltas: Option<u32>,
+        window: (u32, Option<u32>, u64, u64, u64),
         offset_us: u64,
         elapsed_us: u64,
     ) -> TraceEventKind {
         TraceEventKind::RateEvidence {
             role,
             decision,
-            deltas,
-            probe_deltas,
+            deltas: window.0,
+            probe_deltas: window.1,
+            seed_frame: window.2,
+            end_frame: window.3,
+            span_us: window.4,
+            persisted: false,
             offset_us,
             elapsed_us,
         }
@@ -2719,8 +2724,7 @@ mod tests {
                 rate_evidence(
                     CameraRoleLabel::Rgb,
                     RateEvidenceDecision::FullWindow,
-                    30,
-                    None,
+                    (30, None, 1, 31, 4_020_000),
                     95,
                     8_390_000,
                 ),
@@ -2731,8 +2735,7 @@ mod tests {
                 rate_evidence(
                     CameraRoleLabel::Ir,
                     RateEvidenceDecision::FullWindow,
-                    30,
-                    None,
+                    (30, None, 5, 35, 2_104_090),
                     333_000,
                     2_010_000,
                 ),
@@ -2743,8 +2746,7 @@ mod tests {
                 rate_evidence(
                     CameraRoleLabel::Rgb,
                     RateEvidenceDecision::ProbeMissed,
-                    30,
-                    Some(15),
+                    (30, Some(15), 17, 47, 4_020_000),
                     0,
                     8_390_000,
                 ),
@@ -2755,8 +2757,7 @@ mod tests {
                 rate_evidence(
                     CameraRoleLabel::Ir,
                     RateEvidenceDecision::ProbeAdmitted,
-                    5,
-                    None,
+                    (5, None, 5, 10, 340_000),
                     333_000,
                     340_000,
                 ),
@@ -2787,22 +2788,22 @@ mod tests {
         )));
         let evidence_lines = [
             format!(
-                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, offset_us: 95, elapsed_us: 8390000 }}",
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, seed_frame: 1, end_frame: 31, span_us: 4020000, persisted: false, offset_us: 95, elapsed_us: 8390000 }}",
                 CameraRoleLabel::Rgb,
                 RateEvidenceDecision::FullWindow
             ),
             format!(
-                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, offset_us: 333000, elapsed_us: 2010000 }}",
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, seed_frame: 5, end_frame: 35, span_us: 2104090, persisted: false, offset_us: 333000, elapsed_us: 2010000 }}",
                 CameraRoleLabel::Ir,
                 RateEvidenceDecision::FullWindow
             ),
             format!(
-                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: Some(15), offset_us: 0, elapsed_us: 8390000 }}",
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: Some(15), seed_frame: 17, end_frame: 47, span_us: 4020000, persisted: false, offset_us: 0, elapsed_us: 8390000 }}",
                 CameraRoleLabel::Rgb,
                 RateEvidenceDecision::ProbeMissed
             ),
             format!(
-                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 5, probe_deltas: None, offset_us: 333000, elapsed_us: 340000 }}",
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 5, probe_deltas: None, seed_frame: 5, end_frame: 10, span_us: 340000, persisted: false, offset_us: 333000, elapsed_us: 340000 }}",
                 CameraRoleLabel::Ir,
                 RateEvidenceDecision::ProbeAdmitted
             ),
@@ -2886,8 +2887,7 @@ mod tests {
                     rate_evidence(
                         CameraRoleLabel::Rgb,
                         RateEvidenceDecision::ProbeAdmitted,
-                        5,
-                        None,
+                        (5, None, 1, 6, 670_000),
                         0,
                         670_000,
                     ),

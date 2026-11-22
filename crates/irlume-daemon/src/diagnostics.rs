@@ -1907,6 +1907,10 @@ mod tests {
                 decision,
                 deltas: 30,
                 probe_deltas: None,
+                seed_frame: 5,
+                end_frame: 35,
+                span_us: 2_000_010,
+                persisted: false,
                 offset_us: 0,
                 elapsed_us: 7,
             };

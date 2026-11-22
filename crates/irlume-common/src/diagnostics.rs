@@ -818,9 +818,10 @@ diagnostic_enum!(EmitterTraceOutcome {
 });
 // Schema 6 adds `RateEvidence`, one record per stream after a pair's
 // rate establishment: whether the stream paid its full delivered-rate
-// window or was admitted on the continuity probe, why, how many deltas it
-// collected, and when its own window collection began and ended relative
-// to the pair fill (ADR-0021). No record carries a score or a frame.
+// window or was admitted on the continuity probe, why, the window that
+// did it (its deltas and the frames it covered, on the driver's clock) and
+// when its collection began and ended relative to the pair fill (ADR-0021).
+// No record carries a score or a frame.
 /// How one stream's delivered-rate window was established for a capture
 /// session (ADR-0021). A completion is a full window that met its floor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -921,16 +922,40 @@ pub enum TraceEventKind {
         role: CameraRoleLabel,
         count: u32,
     },
-    /// How one stream's delivered-rate window was established (schema 6).
+    /// How one stream's delivered-rate window was established (schema 6):
+    /// the decision, the window that established the session, and where
+    /// its collection fell inside the pair fill.
     RateEvidence {
         role: CameraRoleLabel,
         decision: RateEvidenceDecision,
         /// Deltas held by the window that established the session: 5
         /// through 15 after `ProbeAdmitted`, the full width otherwise.
         deltas: u32,
-        /// Deltas the missed probe had collected (`ProbeMissed` only).
+        /// Deltas the missed probe had collected (`ProbeMissed` only). The
+        /// missed probe's own window began one seed and `probe_deltas`
+        /// frames before `seed_frame`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probe_deltas: Option<u32>,
+        /// Ordinal, from zero, of the frame that seeded the window among
+        /// the frames this session dequeued, warm-up and flush discards
+        /// included. With `deltas` it names the frames the first judged
+        /// window covered, so a window that began on a camera's first
+        /// frames after power-on is told from one taken later.
+        seed_frame: u64,
+        /// Ordinal of the window's last frame, which is `seed_frame` plus
+        /// `deltas` unless a dequeued frame in between carried no sound
+        /// timestamp.
+        end_frame: u64,
+        /// Microseconds the window's deltas sum to: `deltas` over
+        /// `span_us` is the delivered rate the window was judged at, on
+        /// the driver's clock and not in wall time.
+        span_us: u64,
+        /// Whether the decision rested on a completion restored from the
+        /// on-disk record at session start, one from before this daemon
+        /// run (ADR-0021 amendment 2026-11-22). Absent from older records
+        /// reads as `false`: evidence this process measured itself.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        persisted: bool,
         /// Microseconds from the start of the pair fill to the start of
         /// this stream's own window collection.
         offset_us: u64,
@@ -1895,23 +1920,28 @@ mod tests {
         let events = [
             serde_json::json!({
                 "event":"rate_evidence", "role":"rgb", "decision":"full_window",
-                "deltas":30, "offset_us":95, "elapsed_us":8_390_000
+                "deltas":30, "seed_frame":1, "end_frame":31, "span_us":4_020_000,
+                "offset_us":95, "elapsed_us":8_390_000
             }),
             serde_json::json!({
                 "event":"rate_evidence", "role":"ir", "decision":"stale_full_window",
-                "deltas":30, "offset_us":333_000, "elapsed_us":2_010_000
+                "deltas":30, "seed_frame":5, "end_frame":35, "span_us":2_104_090,
+                "offset_us":333_000, "elapsed_us":2_010_000
             }),
             serde_json::json!({
                 "event":"rate_evidence", "role":"rgb", "decision":"disabled_full_window",
-                "deltas":30, "offset_us":0, "elapsed_us":1_000
+                "deltas":30, "seed_frame":1, "end_frame":31, "span_us":4_020_000,
+                "offset_us":0, "elapsed_us":1_000
             }),
             serde_json::json!({
                 "event":"rate_evidence", "role":"ir", "decision":"probe_admitted",
-                "deltas":5, "offset_us":333_000, "elapsed_us":340_000
+                "deltas":5, "seed_frame":5, "end_frame":10, "span_us":340_000,
+                "offset_us":333_000, "elapsed_us":340_000
             }),
             serde_json::json!({
                 "event":"rate_evidence", "role":"rgb", "decision":"probe_missed",
-                "deltas":30, "probe_deltas":15, "offset_us":0, "elapsed_us":8_390_000
+                "deltas":30, "probe_deltas":15, "seed_frame":17, "end_frame":47,
+                "span_us":4_020_000, "offset_us":0, "elapsed_us":8_390_000
             }),
         ];
         for event in events {
@@ -1960,6 +1990,28 @@ mod tests {
             }),
             serde_json::json!({
                 "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "offset_us":0, "elapsed_us":1
+            }),
+            // The window's frames and span are part of the record, never
+            // defaulted: a line without them is not one.
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "deltas":5, "end_frame":10, "span_us":340_000,
+                "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "deltas":5, "seed_frame":5, "span_us":340_000,
+                "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "deltas":5, "seed_frame":5, "end_frame":10,
+                "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "deltas":5, "seed_frame":-1, "end_frame":10, "span_us":340_000,
                 "offset_us":0, "elapsed_us":1
             }),
         ] {

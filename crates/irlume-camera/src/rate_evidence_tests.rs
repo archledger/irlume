@@ -23,6 +23,53 @@ fn recorded_evidence<S>(stream: &TrackedStream<S>) -> (RateEvidenceDecision, u32
     }
 }
 
+/// The window the record names: `(deltas, seed_frame, end_frame, span_us)`.
+fn window_of<S>(stream: &TrackedStream<S>) -> (u32, u64, u64, u64) {
+    match stream.rate_evidence.clone() {
+        Some(TraceEventKind::RateEvidence {
+            deltas,
+            seed_frame,
+            end_frame,
+            span_us,
+            ..
+        }) => (deltas, seed_frame, end_frame, span_us),
+        other => panic!("no rate evidence recorded: {other:?}"),
+    }
+}
+
+/// The stream role a trace record's role label names.
+fn role_of(role: CameraRoleLabel) -> contracts::StreamRole {
+    match role {
+        CameraRoleLabel::Rgb => contracts::StreamRole::Rgb,
+        CameraRoleLabel::Ir => contracts::StreamRole::Ir,
+    }
+}
+
+/// A frame queue delivering frames with exactly the given driver
+/// timestamps, in microseconds.
+fn timed_queue(timestamps_us: &[i64]) -> QueuedContinuityFixture {
+    let metadata = timestamps_us
+        .iter()
+        .enumerate()
+        .map(|(index, micros)| {
+            let mut frame = continuity_metadata(
+                u32::try_from(index).unwrap() + 1,
+                micros.div_euclid(1_000_000),
+                v4l::buffer::Flags::TIMESTAMP_MONOTONIC,
+            );
+            frame.timestamp = v4l::timestamp::Timestamp::new(
+                micros.div_euclid(1_000_000),
+                micros.rem_euclid(1_000_000),
+            );
+            frame
+        })
+        .collect();
+    QueuedContinuityFixture {
+        payload: [1],
+        metadata,
+    }
+}
+
 /// A frame queue whose first frame seeds and whose later frames arrive
 /// after the given deltas, in microseconds.
 fn delta_queue(deltas_us: &[i64]) -> QueuedContinuityFixture {
@@ -110,6 +157,8 @@ fn rate_evidence_a_cold_single_stream_reports_its_full_window() {
     assert!(stream.rate_evidence.is_none(), "nothing is established yet");
     stream.fill_rate_evidence().expect("full fill");
     let recorded = stream.rate_evidence.clone();
+    // RGB has no flush and keeps every delta: the window is the session's
+    // first 31 frames, 30 deltas of 66,667 us.
     assert!(matches!(
         recorded,
         Some(TraceEventKind::RateEvidence {
@@ -117,10 +166,15 @@ fn rate_evidence_a_cold_single_stream_reports_its_full_window() {
             decision: RateEvidenceDecision::FullWindow,
             deltas: 30,
             probe_deltas: None,
+            seed_frame: 0,
+            end_frame: 30,
+            span_us: 2_000_010,
+            persisted: false,
             offset_us: 0,
             elapsed_us: 0..=1_000_000,
         })
     ));
+    assert_eq!(window_of(&stream), (30, 0, 30, 2_000_010));
     // A ready window is not established again, so its record stays as it was.
     stream.fill_rate_evidence().expect("ready window");
     assert_eq!(stream.rate_evidence, recorded);
@@ -139,6 +193,8 @@ fn rate_evidence_a_cold_single_stream_reports_its_full_window() {
             ..
         })
     ));
+    // IR's five-frame flush precedes the window: frames 5 through 35.
+    assert_eq!(window_of(&unkeyed), (30, 5, 35, 2_000_010));
     rate_amortization::test_support::force_completion(key, None);
 }
 
@@ -207,6 +263,8 @@ fn rate_evidence_a_probe_admission_reports_the_deltas_it_admitted_on() {
         (RateEvidenceDecision::ProbeAdmitted, 5, None, 0)
     );
     assert!(elapsed_us < 1_000_000, "{elapsed_us} us");
+    // The probe's window follows the five-frame flush: frames 5 through 10.
+    assert_eq!(window_of(&first), (5, 5, 10, 333_335));
     assert!(first.health_admitted);
 
     // The measured N930W RGB startup shape: one ~616 ms queue-refill stall
@@ -224,6 +282,12 @@ fn rate_evidence_a_probe_admission_reports_the_deltas_it_admitted_on() {
         "only the widened window admitted: {deltas} deltas"
     );
     assert_eq!(probe_deltas, None, "an admission is not a miss");
+    // RGB keeps every frame: the stall is the first delta after a seed at
+    // frame 0, and the window runs to the frame that cleared the floor.
+    assert_eq!(
+        window_of(&widened),
+        (deltas, 0, u64::from(deltas), 616_000 + 7 * 66_667)
+    );
     assert!(widened.health_admitted);
 
     for key in [first_key, wide_key] {
@@ -258,6 +322,9 @@ fn rate_evidence_a_missed_probe_reports_the_miss_and_the_full_window() {
     );
     assert!(elapsed_us < 1_000_000, "{elapsed_us} us");
     assert!(!slow.health_admitted);
+    // The probe took frames 5 through 20 (15 deltas); the full window that
+    // followed was seeded on the next frame and ran to frame 51.
+    assert_eq!(window_of(&slow), (30, 21, 51, 3_000_000));
     assert!(
         !rate_amortization::amortizable(&slow_key),
         "the missed probe revoked the completion"
@@ -333,6 +400,10 @@ fn rate_evidence_a_cold_pair_reports_each_streams_full_window_then_its_probes() 
             stream.rate_evidence,
             Some(TraceEventKind::RateEvidence { role: recorded, .. }) if recorded == role
         ));
+        // Each window begins right after its own flush: frame 0 for RGB,
+        // frame 5 for IR.
+        let seed = rate_gate::startup_flush(role_of(role)) as u64;
+        assert_eq!(window_of(stream), (30, seed, seed + 30, 2_000_010), "{role:?}");
         assert!(!stream.health_admitted);
     }
 
@@ -340,10 +411,12 @@ fn rate_evidence_a_cold_pair_reports_each_streams_full_window_then_its_probes() 
     // probe, so the record says so with the five deltas it admitted on.
     let (mut warm_rgb, mut warm_ir) = (rgb(), ir());
     establish_concurrent_rate(&mut warm_rgb, &mut warm_ir).expect("warm pair fill");
-    for stream in [&warm_rgb, &warm_ir] {
+    for (stream, role) in [(&warm_rgb, CameraRoleLabel::Rgb), (&warm_ir, CameraRoleLabel::Ir)] {
         let (decision, deltas, probe_deltas, offset_us, _) = recorded_evidence(stream);
         assert_eq!((decision, deltas, probe_deltas), (RateEvidenceDecision::ProbeAdmitted, 5, None));
         assert!(offset_us < 1_000_000, "offset {offset_us} us");
+        let seed = rate_gate::startup_flush(role_of(role)) as u64;
+        assert_eq!(window_of(stream), (5, seed, seed + 5, 333_335), "{role:?}");
         assert!(stream.health_admitted);
     }
 
@@ -468,6 +541,143 @@ fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
     );
 }
 
+/// A window that began on a camera's first frames after power-on is told
+/// from a slow stream by the frames the record names. The profile here is
+/// measured: the driver timestamps of the IR stream of a NexiGo N930W
+/// (3443:c803) on 2026-11-22, metadata only. In the first session after the
+/// camera was plugged in the intervals arriving at frame 1 and at frames 5
+/// to 9 run long (432 ms, then 80, 84, 88, 96 and 80 ms against 68 ms) and
+/// the cadence is normal from frame 10. The floor is 15 fps at 97 percent,
+/// so 30 deltas may span at most 2,061,855 us. Neither path nor floor is
+/// changed; the record shows where the first window began and how long it
+/// ran, which is what tells this case from a stream that is slow throughout.
+#[test]
+fn rate_evidence_names_the_frames_of_a_first_window_on_a_measured_startup_profile() {
+    let _lock = crate::testenv::env_lock();
+    let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+    // Driver timestamps in microseconds of frames 0 through 40.
+    const AFTER_POWER_ON: &[i64] = &[
+        414152152796, 414152584806, 414152652809, 414152720796,
+        414152788816, 414152868826, 414152952816, 414153040879,
+        414153136824, 414153216827, 414153280849, 414153348723,
+        414153416672, 414153484831, 414153552861, 414153620847,
+        414153688843, 414153752868, 414153820870, 414153888868,
+        414153956878, 414154024884, 414154092882, 414154164880,
+        414154228891, 414154296882, 414154364891, 414154432778,
+        414154500893, 414154568899, 414154636895, 414154700909,
+        414154768908, 414154836919, 414154904917, 414154972916,
+        414155040929, 414155109000, 414155172994, 414155240894,
+        414155308935,
+    ];
+    const FIVE_SECONDS_LATER: &[i64] = &[
+        414166109777, 414166273806, 414166341613, 414166409834,
+        414166481801, 414166553889, 414166625698, 414166693816,
+        414166761824, 414166829816, 414166897801, 414166965801,
+        414167029846, 414167097839, 414167165828, 414167233824,
+        414167301856, 414167369833, 414167437808, 414167501860,
+        414167569853, 414167637751, 414167709866, 414167777854,
+        414167845756, 414167913783, 414167977877, 414168045881,
+        414168113751, 414168181892, 414168249888, 414168317959,
+        414168385847, 414168449893, 414168517899, 414168585911,
+        414168653793, 414168721914, 414168789904, 414168857811,
+        414168921822,
+    ];
+    const FLOOR_LIMIT_US: u64 = 2_061_855;
+    let late_frames = |timestamps: &[i64]| {
+        (1..timestamps.len())
+            .filter(|&index| timestamps[index] - timestamps[index - 1] > 72_500)
+            .map(|index| index as u64)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(late_frames(AFTER_POWER_ON), [1, 5, 6, 7, 8, 9]);
+    assert_eq!(late_frames(FIVE_SECONDS_LATER), [1]);
+
+    for (label, timestamps, fill, first_judged, refused) in [
+        // Fixed startup: one warm-up frame, the flush of frames 1 to 5,
+        // then a window seeded at frame 6. It holds the late intervals that
+        // arrive at frames 7 to 9; the frame after it is refused.
+        (
+            "fixed startup, first session after power-on",
+            AFTER_POWER_ON,
+            (6, 36, 2_088_113_u64),
+            2_068_121_u64,
+            true,
+        ),
+        (
+            "fixed startup, five seconds later",
+            FIVE_SECONDS_LATER,
+            (6, 36, 2_028_095),
+            2_028_098,
+            false,
+        ),
+        // Paired startup: the flush of frames 0 to 4, then a window seeded
+        // at frame 5, which holds the late intervals of frames 6 to 9.
+        (
+            "paired startup, first session after power-on",
+            AFTER_POWER_ON,
+            (5, 35, 2_104_090),
+            2_088_113,
+            true,
+        ),
+        (
+            "paired startup, five seconds later",
+            FIVE_SECONDS_LATER,
+            (5, 35, 2_032_022),
+            2_028_095,
+            false,
+        ),
+    ] {
+        let mut stream =
+            TrackedStream::new(timed_queue(timestamps), role_config(contracts::StreamRole::Ir));
+        if label.starts_with("fixed") {
+            IrSessionStartup::Fixed
+                .warm_up("measured", &mut stream, &no_progress())
+                .expect("one warm-up frame");
+            IrSessionStartup::Fixed.fill(&mut stream).expect("the window fills on readiness");
+        } else {
+            drain_until_both_ready(
+                &mut stream,
+                &std::sync::atomic::AtomicUsize::new(1),
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut 0,
+            )
+            .expect("the window fills on readiness");
+        }
+        assert_eq!(window_of(&stream), (30, fill.0, fill.1, fill.2), "{label}");
+        assert!(
+            matches!(
+                stream.rate_evidence,
+                Some(TraceEventKind::RateEvidence {
+                    role: CameraRoleLabel::Ir,
+                    decision: RateEvidenceDecision::FullWindow,
+                    deltas: 30,
+                    probe_deltas: None,
+                    seed_frame,
+                    end_frame,
+                    span_us,
+                    ..
+                }) if (seed_frame, end_frame, span_us) == fill
+            ),
+            "{label}"
+        );
+        // The first frame the session delivers is judged on the window as
+        // it stands then, seeded one frame later than the fill's own.
+        let judged = stream.next().map_err(|error| match error {
+            DeliveryError::BelowFloor(evidence) => *evidence,
+            other => panic!("{label}: unexpected refusal: {other}"),
+        });
+        if refused {
+            let evidence = judged.expect_err("{label}: below the floor");
+            assert_eq!(evidence.window_count, 30);
+            assert_eq!(evidence.window_span_us, first_judged, "{label}");
+            assert!(evidence.window_span_us > FLOOR_LIMIT_US, "{label}");
+            assert!(!evidence.meets_floor);
+        } else {
+            judged.unwrap_or_else(|error| panic!("{label}: at the floor: {error:?}"));
+        }
+    }
+}
+
 /// A stream that a standalone fill established keeps no record of that
 /// window once the paired fill resets it: a paired fill that then fails at
 /// its next dequeue reports nothing, not how a window that no longer
@@ -563,8 +773,14 @@ fn rate_evidence_full_window_decisions_and_the_record_are_typed() {
         rate_amortization::rate_evidence(
             contracts::StreamRole::Ir,
             RateEvidenceDecision::ProbeMissed,
-            30,
+            rate_amortization::Window {
+                deltas: 30,
+                seed_frame: 21,
+                end_frame: 51,
+                span_us: 2_088_113,
+            },
             Some(15),
+            false,
             std::time::Duration::from_micros(333_555),
             std::time::Duration::from_micros(2_010_000),
         ),
@@ -573,18 +789,28 @@ fn rate_evidence_full_window_decisions_and_the_record_are_typed() {
             decision: RateEvidenceDecision::ProbeMissed,
             deltas: 30,
             probe_deltas: Some(15),
+            seed_frame: 21,
+            end_frame: 51,
+            span_us: 2_088_113,
+            persisted: false,
             offset_us: 333_555,
             elapsed_us: 2_010_000,
         }
     );
-    // A count or duration that does not fit saturates; it never panics on
-    // the capture path.
+    // A count, an ordinal or a duration that does not fit saturates; it
+    // never panics on the capture path.
     assert_eq!(
         rate_amortization::rate_evidence(
             contracts::StreamRole::Rgb,
             RateEvidenceDecision::ProbeAdmitted,
-            usize::MAX,
+            rate_amortization::Window {
+                deltas: usize::MAX,
+                seed_frame: u64::MAX,
+                end_frame: u64::MAX,
+                span_us: u64::MAX,
+            },
             Some(usize::MAX),
+            false,
             std::time::Duration::MAX,
             std::time::Duration::MAX,
         ),
@@ -593,6 +819,10 @@ fn rate_evidence_full_window_decisions_and_the_record_are_typed() {
             decision: RateEvidenceDecision::ProbeAdmitted,
             deltas: u32::MAX,
             probe_deltas: Some(u32::MAX),
+            seed_frame: u64::MAX,
+            end_frame: u64::MAX,
+            span_us: u64::MAX,
+            persisted: false,
             offset_us: u64::MAX,
             elapsed_us: u64::MAX,
         }

@@ -25,12 +25,15 @@ All notable changes to irlume are documented here. This project adheres to
   one `rate_evidence` record per stream with the decision (`full_window`,
   `stale_full_window`, `disabled_full_window`, `probe_admitted` or
   `probe_missed`), the deltas the window held, the deltas a missed probe
-  had collected, and when the stream's own collection began and how long
+  had collected, the frames the window covered and its span on the
+  driver's clock, and when the stream's own collection began and how long
   it took relative to the pair fill (ADR-0021). `irlume trace explain`
   prints the records, so one trace shows whether a slow first attempt paid
   the full window because the daemon had just started, because the last
   completion was over 24 hours old or because the continuity probe
-  missed, and whether both windows were collected at once (#1399).
+  missed, whether both windows were collected at once, and whether a
+  refused first window began on the camera's first frames after power-on
+  or the stream is slow throughout (#1399).
   Schema 5 and older subscribers omit the records; the recorder now
   requests schema 6, which a daemon started before the upgrade refuses as
   an unsupported schema until it restarts. `irlume trace analyze` still
@@ -38,6 +41,20 @@ All notable changes to irlume are documented here. This project adheres to
   records are unchanged.
 
 ### Changed
+
+- Rate evidence survives daemon restarts (ADR-0021, amendment
+  2026-11-22): a full window's completion is kept as a small root-only
+  record per stream identity under the state directory, keyed by a
+  digest of the USB endpoint facts, the negotiated stream contract and
+  the rate policy. The first session after a boot, package upgrade or
+  watchdog restart consults it exactly as the in-memory cache is
+  consulted, so it may admit on the continuity probe instead of
+  re-paying the full 30-delta window. The probe on the current session
+  remains the evidence that admits a session; a forged, stale or corrupt
+  record can cause a probe attempt and nothing else. The trace's
+  `rate_evidence` record gains `persisted`, which says when the decision
+  rested on a completion from before this daemon start.
+
 
 - Paired face-authentication requests stop grace retries on a recorded
   required IR PAD execution failure, with earlier password fallback and an

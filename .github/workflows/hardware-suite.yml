@@ -362,17 +362,15 @@ jobs:
       - name: Set up pinned coverage tools (system Rust)
         run: bash scripts/ci/setup-coverage-tools.sh
 
-      # `--no-report` runs keep earlier build artifacts, and the report reads
-      # every instrumented binary under the runner's persistent target
-      # directory. A binary left from an earlier night's tree counts each file
-      # changed since then twice: on 2026-09-28 the 57 files changed since
-      # 2026-09-26 counted 1.96 times their lines, the 83 unchanged files
-      # matched, and the total fell from 85.26% to 54.73% (#906). Remove the
-      # workspace's instrumented builds and profiles first; dependencies stay
-      # built.
-      - name: Remove earlier coverage builds and profiles
+      # The report scans both Cargo artifact layouts. After a toolchain
+      # upgrade, partial cleaning can leave old instrumented binaries in the
+      # shared tree (#906, #1396). Share fresh paths within this job only.
+      - name: Allocate job-local coverage artifacts
         run: |
-          "$IRLUME_COVERAGE_BIN" llvm-cov clean --workspace
+          set -euo pipefail
+          coverage_dir="$(mktemp -d "${RUNNER_TEMP%/}/irlume-nightly-coverage.XXXXXXXX")"
+          printf 'CARGO_LLVM_COV_TARGET_DIR=%s\nCARGO_LLVM_COV_BUILD_DIR=%s\n' \
+            "$coverage_dir" "$coverage_dir" >> "$GITHUB_ENV"
 
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -159,19 +160,53 @@ p=Path(a[a.index('--root')+1])/'bin';p.mkdir()
         self.assertLess(coverage.index('bash scripts/ci/setup-coverage-tools.sh'),
                         coverage.index('ffmpeg -loglevel'))
         self.assertNotIn('-- cargo llvm-cov', coverage)
-        self.assertEqual(coverage.count('"$IRLUME_COVERAGE_BIN" llvm-cov'), 10)
+        self.assertEqual(coverage.count('"$IRLUME_COVERAGE_BIN" llvm-cov'), 9)
         self.assertIn('--fail-under-lines 75', coverage)
 
-    def test_workflow_cleans_earlier_builds_before_the_first_measurement(self):
-        # `--no-report` keeps old artifacts and the report reads every
-        # instrumented binary in the persistent target directory (#906).
+    def run_nightly_allocation(self, **env):
         workflow = (ROOT / '.github/workflows/hardware-suite.yml').read_text()
         coverage = workflow.split('\n  coverage:', 1)[1]
-        clean = coverage.index('\n          "$IRLUME_COVERAGE_BIN" llvm-cov clean --workspace\n')
-        self.assertEqual(coverage.count('llvm-cov clean'), 1)
-        self.assertLess(coverage.index('bash scripts/ci/setup-coverage-tools.sh'), clean)
-        self.assertLess(clean, coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov --no-report'))
-        self.assertLess(clean, coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov report'))
+        step = '      - name: Allocate job-local coverage artifacts\n        run: |\n'
+        self.assertEqual(coverage.count(step), 1)
+        body = coverage.split(step, 1)[1].split('\n      - name:', 1)[0]
+        self.assertLess(coverage.index('bash scripts/ci/setup-coverage-tools.sh'),
+                        coverage.index(step))
+        self.assertLess(coverage.index(step),
+                        coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov --no-report'))
+        self.assertLess(coverage.index(step),
+                        coverage.index('"$IRLUME_COVERAGE_BIN" llvm-cov report'))
+        return subprocess.run(['/bin/bash', '-e', '-c', textwrap.dedent(body)],
+                              env=dict(self.env, **env), capture_output=True,
+                              text=True, timeout=10)
+
+    def test_nightly_artifacts_are_fresh_even_with_inherited_coverage_paths(self):
+        old_target, old_build = self.root / 'old target', self.root / 'old build'
+        for directory in (old_target, old_build):
+            directory.mkdir()
+            (directory / 'stale-object').touch()
+        seen = set()
+        for _ in range(2):
+            self.env_file.write_text('IRLUME_COVERAGE_BIN=/fixture/tool\n')
+            p = self.run_nightly_allocation(CARGO_LLVM_COV_TARGET_DIR=str(old_target),
+                                            CARGO_LLVM_COV_BUILD_DIR=str(old_build))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            exported = dict(line.split('=', 1) for line in
+                            self.env_file.read_text().splitlines())
+            self.assertEqual(exported['IRLUME_COVERAGE_BIN'], '/fixture/tool')
+            target = Path(exported['CARGO_LLVM_COV_TARGET_DIR'])
+            self.assertEqual(target, Path(exported['CARGO_LLVM_COV_BUILD_DIR']))
+            self.assertEqual(target.parent, self.root)
+            self.assertNotIn(target, {old_target, old_build, *seen})
+            self.assertTrue(target.is_dir())
+            self.assertEqual(list(target.iterdir()), [])
+            seen.add(target)
+        for directory in (old_target, old_build):
+            self.assertTrue((directory / 'stale-object').is_file())
+
+    def test_nightly_allocation_failure_does_not_export_a_fallback(self):
+        p = self.run_nightly_allocation(RUNNER_TEMP=str(self.root / 'absent'))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.env_file.read_text(), '')
 
 
 if __name__ == '__main__':

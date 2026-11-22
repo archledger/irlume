@@ -164,12 +164,13 @@ on every instrumented invocation, the report floor, the artifact upload) is
 pinned by `test-hosted-coverage-contract.py`, which runs in ci.yml's
 required `units` job beside the nightly contract.
 
-The next step runs `cargo llvm-cov clean --workspace`. The lanes pass
-`--no-report`, which keeps earlier build artifacts, and the report reads every
-instrumented binary under the runner's persistent target directory, so a binary
-built from an earlier night's tree would count each file changed since then
-twice (#906). The clean removes the workspace crates' instrumented builds and
-profiles; dependency builds stay.
+The nightly uses an empty directory under `RUNNER_TEMP` for both
+`CARGO_LLVM_COV_TARGET_DIR` and `CARGO_LLVM_COV_BUILD_DIR`. All `--no-report`
+lanes and the final report share it within that job. The report scans both
+Cargo artifact layouts; `clean --workspace` left instrumented binaries from
+the previous layout after the runner's Rust upgrade (#1396). A fresh directory
+keeps old profiles and binaries out of the measurement without deleting the
+runner's shared build cache. Instrumented dependencies rebuild each night.
 
 The eligible runner uses distribution Rust: its runner `.env` and `.path` list
 `/usr/bin` before `~/.cargo/bin`, so a rustup default toolchain cannot shadow

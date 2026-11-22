@@ -2189,6 +2189,29 @@ fn pad_policy_refusal(
     }
 }
 
+/// Only a recorded execution failure replaces an otherwise-retryable result.
+/// Producers already normalize nonfinite model answers to InferenceFailed;
+/// Pending, NotApplicable and raw scores are not new execution failures here.
+fn required_pad_execution_refusal(
+    requirements: PadRequirements,
+    rgb: PadEvidence,
+    ir: PadEvidence,
+) -> Option<Outcome> {
+    let failed = |modality, evidence| match evidence {
+        PadEvidence::Unavailable | PadEvidence::InferenceFailed => {
+            pad_evidence_refusal(modality, evidence)
+        }
+        _ => None,
+    };
+    match requirements {
+        PadRequirements::RgbOnly => failed(PadModality::Rgb, rgb),
+        PadRequirements::RgbAndIr => {
+            failed(PadModality::Rgb, rgb).or_else(|| failed(PadModality::Ir, ir))
+        }
+        PadRequirements::IrOnly => failed(PadModality::Ir, ir),
+    }
+}
+
 /// Deny-only rule for the shipped PAD cues: fires (downgrades to
 /// Spoof) ONLY when the built-in gate already said Live AND the cue's P(fake)
 /// clears the threshold. A non-Live verdict is never touched, and an absent
@@ -7992,8 +8015,9 @@ impl Engine {
         }
         let mut assessment = materialize(self, evidence)?;
         self.check_request_active()?;
-        // Dark and non-Live paths retain eager materialization and the existing
-        // outcome precedence. Pending Live evidence keeps its accumulated vote.
+        // Dark and non-Live paths retain eager materialization. Final admission
+        // keeps terminal precedence and applies the required-failure retry
+        // exception. Pending Live evidence keeps its accumulated vote.
         if !qualified_before_identity {
             self.qualify_rgb_pad_evidence(&mut assessment);
         }
@@ -8053,6 +8077,38 @@ impl Engine {
     }
 
     fn authenticate_qualified_assessment(
+        &mut self,
+        enr: &irlume_core::storage::Enrollment,
+        purpose: AuthenticationPurpose,
+        service: Option<&str>,
+        a: Assessment,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    ) -> irlume_common::Result<Outcome> {
+        // Save route/evidence metadata only, before the decision consumes the
+        // embeddings. Do not move PAD ahead of authority, identity or existing
+        // terminal diagnostics (ADR-0019/0020, amendment 2026-11-17).
+        let has_rgb = a.embedding.is_some();
+        let has_ir = a.ir_embedding.is_some();
+        let (rgb_pad, ir_pad) = (a.rgb_pad, a.ir_pad);
+        let outcome =
+            self.authenticate_qualified_assessment_inner(enr, purpose, service, a, diagnostics)?;
+        if outcome.granted || !presence_retryable(&outcome) {
+            return Ok(outcome);
+        }
+        // Mirror the inner method's RGB pad_policy_refusal and dark IrOnly
+        // sites. Grouped pre-identity admission deliberately uses detections
+        // instead of embeddings and also normalizes raw nonfinite scores.
+        let requirements = match (has_rgb, has_ir, self.ir_available) {
+            (true, _, true) => PadRequirements::RgbAndIr,
+            (true, _, false) => PadRequirements::RgbOnly,
+            (false, true, _) => PadRequirements::IrOnly,
+            // No new model-availability preflight on a missing-face sample.
+            (false, false, _) => return Ok(outcome),
+        };
+        Ok(required_pad_execution_refusal(requirements, rgb_pad, ir_pad).unwrap_or(outcome))
+    }
+
+    fn authenticate_qualified_assessment_inner(
         &mut self,
         enr: &irlume_core::storage::Enrollment,
         _purpose: AuthenticationPurpose,
@@ -14264,6 +14320,7 @@ mod engine_tests {
     mod identity_characterization_tests;
     mod managed_pad_tests;
     mod managed_timing_tests;
+    mod pad_failure_precedence_tests;
     mod pair_identity_tests;
     mod request_preparation_tests;
     mod secondary_camera_tests;

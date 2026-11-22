@@ -163,6 +163,35 @@ fn cumulative_reservation_survives_abandoned_requests() {
     assert_eq!(f.saved().budget.unwrap().unsuccessful_requests, 50);
 }
 
+#[test]
+fn runtime_unavailable_finishes_reserved_request_with_one_charge_and_strike() {
+    let fixture = Fixture::new();
+    cumulative::TIME.set(100);
+    let attempt = cumulative::start_attempt(&fixture)
+        .unwrap()
+        .expect("within the durable budget");
+    attempt.denied(&outcome(Kind::RuntimeUnavailable)).unwrap();
+
+    let recorded = fixture.saved();
+    let budget = recorded.budget.unwrap();
+    assert_eq!(budget.unsuccessful_requests, 1);
+    assert!(!budget.pending);
+    assert_eq!(recorded.strikes, 1);
+    assert!(recorded.cooldown.is_none());
+    assert!(fixture.store.operation(&account_one()).is_ok());
+
+    let presence = cumulative::start_attempt(&fixture)
+        .unwrap()
+        .expect("a second reserved request");
+    presence.denied(&outcome(Kind::NoFace)).unwrap();
+    let recorded = fixture.saved();
+    assert_eq!(recorded.budget.unwrap().unsuccessful_requests, 2);
+    assert_eq!(
+        recorded.strikes, 1,
+        "presence neither adds nor clears strikes"
+    );
+}
+
 // Migrated original consent-throttle regressions: the real persistent store now
 // replaces direct inspection/deletion of a process-local map.
 #[test]

@@ -22,6 +22,14 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Paired face-authentication requests stop grace retries on a recorded
+  required IR PAD execution failure, with earlier password fallback and an
+  unavailable situation instead of framing or no-IR-face retry advice.
+  These failures add the existing short strike and keep their reserved
+  request charge; existing terminal refusals retain precedence (ADR-0019
+  and ADR-0020, amendment
+  2026-11-17).
+
 - The PPA container route builds with a pinned Rust toolchain: instead
   of the Ubuntu archive's `cargo`/`rustc`, the container installs
   rustup-pinned `RUST_VER` (1.88.0, the same pin the universal `.deb`

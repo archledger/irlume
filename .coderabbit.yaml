@@ -6,6 +6,12 @@
 # branch has to be reset before the pull request can merge (as on #1403).
 # The touch is off here. The other finishing touches are not changed by
 # this file.
+#
+# inheritance is on so the review settings saved for this repository and
+# for the organization in CodeRabbit still apply below this file. A file
+# without it is the only configuration layer, and every setting the file
+# leaves out falls back to the schema defaults.
+inheritance: true
 reviews:
   finishing_touches:
     unit_tests:

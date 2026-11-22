@@ -383,44 +383,33 @@ fn recovery_owner_unwind_releases_lock_but_keeps_durable_charge_with_duplicate()
     drop(duplicate);
 }
 
+// What a forked child holds of an operation: a duplicate descriptor for the
+// same open file description, and a guard acquired by its parent, so an owner
+// pid that is not its own. No process is forked: the tests of this binary run
+// on several threads, and a forked child keeps a copy of every descriptor they
+// have open until it exits, which left a sibling test's peer open and failed
+// its read (#1396).
 #[test]
-fn forked_child_dropping_operation_cannot_unlock_active_parent() {
+fn operation_copy_dropped_with_another_owner_pid_cannot_unlock_active_owner() {
     let f = Fixture::new();
     let operation = f.store().operation(&f.identity()).unwrap();
     let contender = File::open(f.0.join("retry/1234.operation")).unwrap();
-    // SAFETY: after fork the child only drops the File/PID lock guard and calls
-    // leaf libc syscalls; it never allocates, locks Rust state or unwinds, and
-    // _exit skips inherited test/fixture destructors. The parent always reaps it.
-    let child = unsafe { libc::fork() };
-    assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
-    if child == 0 {
-        drop(operation);
-        // SAFETY: inherited contender is live; flock is a nonblocking Linux
-        // syscall and errno is thread-local. _exit does not run Rust destructors.
-        unsafe {
-            let result = libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
-            let blocked = result == -1 && *libc::__errno_location() == libc::EWOULDBLOCK;
-            libc::_exit(if blocked { 0 } else { 1 });
-        }
-    }
-    let mut status = 0;
-    loop {
-        // SAFETY: status is writable, and child is the pid returned above.
-        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
-        if waited == child {
-            break;
-        }
-        assert_eq!(
-            io::Error::last_os_error().kind(),
-            io::ErrorKind::Interrupted
-        );
-    }
-    assert!(libc::WIFEXITED(status));
+    // SAFETY: getppid has no preconditions and never returns this process's pid.
+    let owner_pid = unsafe { libc::getppid() };
+    let child_copy = RetryLock {
+        file: operation.try_clone().unwrap(),
+        owner_pid,
+    };
+    drop(child_copy);
+    // SAFETY: contender is a live descriptor of this test, and flock with
+    // LOCK_NB is a nonblocking Linux syscall, so a regression fails here
+    // instead of blocking.
+    let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(
-        libc::WEXITSTATUS(status),
-        0,
-        "child released the parent's live lock"
+        result, -1,
+        "the dropped copy unlocked the active owner's lock"
     );
+    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
     assert_eq!(
         f.store().operation(&f.identity()).err().unwrap().kind(),
         io::ErrorKind::WouldBlock

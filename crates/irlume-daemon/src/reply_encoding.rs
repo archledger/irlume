@@ -92,7 +92,35 @@ pub(super) fn respond_admitted(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::ffi::OsStr;
     use std::io::Read;
+
+    fn run_socket_case_in_child(case: &str, assertions: impl FnOnce()) {
+        const CHILD: &str = "IRLUME_TEST_REPLY_ENCODING_CHILD";
+        const CHECKED: &str = "reply-encoding-socket-assertions-complete";
+        if std::env::var_os(CHILD).as_deref() == Some(OsStr::new(case)) {
+            assertions();
+            println!("{CHECKED}");
+            return;
+        }
+
+        // Even a close-on-exec socket can be inherited while a sibling
+        // test's child is between fork and exec. Open this pair only after
+        // re-exec, with no other tests running in the child.
+        let test = format!("reply_encoding::tests::{case}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", "--test-threads=1", &test])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains(CHECKED),
+            "{test} child failed or did not run the assertions: {}\nstdout: {stdout}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 
     #[test]
     fn prepared_reply_is_exact_compact_json_with_one_newline() {
@@ -103,6 +131,13 @@ mod tests {
 
     #[test]
     fn admission_refusal_observes_no_response_bytes() {
+        run_socket_case_in_child(
+            "admission_refusal_observes_no_response_bytes",
+            assert_refused_socket,
+        );
+    }
+
+    fn assert_refused_socket() {
         let response = Response::Ok("not delivered".into());
         let (server, mut client) = UnixStream::pair().unwrap();
         client.set_nonblocking(true).unwrap();
@@ -220,6 +255,13 @@ mod tests {
 
     #[test]
     fn successful_admission_observes_no_bytes_then_writes_exact_line() {
+        run_socket_case_in_child(
+            "successful_admission_observes_no_bytes_then_writes_exact_line",
+            assert_admitted_socket,
+        );
+    }
+
+    fn assert_admitted_socket() {
         let response = Response::TokenSealed {
             token: irlume_common::SecretBytes::new((0u8..=u8::MAX).collect()),
             minted: false,

@@ -1,0 +1,12 @@
+# CodeRabbit review configuration for this repository.
+#
+# reviews.finishing_touches.unit_tests controls the "Generate unit tests"
+# finishing touch. When it commits onto the pull request branch, the commit
+# is unsigned and carries no DCO trailer, so the DCO check fails and the
+# branch has to be reset before the pull request can merge (as on #1403).
+# The touch is off here. The other finishing touches are not changed by
+# this file.
+reviews:
+  finishing_touches:
+    unit_tests:
+      enabled: false

@@ -400,7 +400,10 @@ fn rate_evidence_a_pair_reports_a_probe_miss_on_the_stream_that_missed() {
 
 /// The record carries enough to tell a pair fill that collects both windows
 /// at once from one that fills them one after the other: each stream's
-/// collection start relative to the pair fill, and its own duration.
+/// collection start relative to the pair fill, and its own duration. A
+/// sleep never returns early, so every lower bound holds on any host; no
+/// assertion depends on how soon the scheduler runs a thread, and the
+/// overlap is judged with a margin left for it.
 #[test]
 fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
     let _lock = crate::testenv::env_lock();
@@ -424,25 +427,16 @@ fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
         )
     };
 
-    // Concurrent: both collections begin with the pair fill, and the faster
-    // stream has its window long before the slower one has its.
+    // Concurrent: the faster stream has its window long before the slower
+    // one has its, which cannot happen when the two are filled in turn.
     let (mut rgb, mut ir) = pair();
     establish_concurrent_rate(&mut rgb, &mut ir).expect("concurrent pair fill");
     let (_, _, _, rgb_offset, rgb_elapsed) = recorded_evidence(&rgb);
     let (_, _, _, ir_offset, ir_elapsed) = recorded_evidence(&ir);
-    assert!(rgb_offset < 20_000, "rgb offset {rgb_offset} us");
-    assert!(
-        (1_200_000..2_500_000).contains(&rgb_elapsed),
-        "rgb elapsed {rgb_elapsed} us"
-    );
-    assert!(
-        (45_000..200_000).contains(&ir_offset),
-        "ir offset {ir_offset} us"
-    );
-    assert!(
-        (290_000..700_000).contains(&ir_elapsed),
-        "ir elapsed {ir_elapsed} us"
-    );
+    assert!(rgb_elapsed >= 30 * 40_000, "rgb elapsed {rgb_elapsed} us");
+    assert!(ir_elapsed >= 30 * 10_000, "ir elapsed {ir_elapsed} us");
+    // IR's collection starts after its flush, five frames of 10 ms.
+    assert!(ir_offset >= 5 * 10_000, "ir offset {ir_offset} us");
     assert!(
         ir_offset + ir_elapsed + 300_000 < rgb_offset + rgb_elapsed,
         "the collections overlapped: ir was done {} us into the fill, rgb took {} us",
@@ -452,7 +446,7 @@ fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
 
     // Serial, for contrast: the same two streams filled one after the other
     // from one pair start read as the second collection beginning only
-    // once the first is complete.
+    // once the first is complete, so the inequality above cannot hold.
     let (mut rgb, mut ir) = pair();
     let started = std::time::Instant::now();
     rgb.pair_fill_started = Some(started);
@@ -464,12 +458,53 @@ fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
     drain_until_both_ready(&mut ir, &alone(), &cancelled, &mut 0).expect("second fill");
     let (_, _, _, rgb_offset, rgb_elapsed) = recorded_evidence(&rgb);
     let (_, _, _, ir_offset, ir_elapsed) = recorded_evidence(&ir);
-    assert!(rgb_offset < 20_000, "rgb offset {rgb_offset} us");
+    assert!(rgb_elapsed >= 30 * 40_000, "rgb elapsed {rgb_elapsed} us");
+    assert!(ir_elapsed >= 30 * 10_000, "ir elapsed {ir_elapsed} us");
     assert!(
-        ir_offset + 20_000 >= rgb_elapsed,
-        "a serial fill starts the second window after the first: ir offset {ir_offset} us, rgb elapsed {rgb_elapsed} us"
+        ir_offset > rgb_offset + rgb_elapsed,
+        "a serial fill starts the second window after the first: ir offset {} us, rgb done {} us",
+        ir_offset,
+        rgb_offset + rgb_elapsed
     );
-    assert!(ir_elapsed > 290_000, "ir elapsed {ir_elapsed} us");
+}
+
+/// A stream that a standalone fill established keeps no record of that
+/// window once the paired fill resets it: a paired fill that then fails at
+/// its next dequeue reports nothing, not how a window that no longer
+/// stands was established.
+#[test]
+fn rate_evidence_a_failed_paired_fill_leaves_no_record_of_an_earlier_window() {
+    let _lock = crate::testenv::env_lock();
+    let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
+    for (role, flush) in [
+        (contracts::StreamRole::Rgb, 0_usize),
+        (
+            contracts::StreamRole::Ir,
+            rate_gate::startup_flush(contracts::StreamRole::Ir),
+        ),
+    ] {
+        // One seed, then enough frames for the standalone fill and after
+        // it for the paired fill's own flush alone.
+        let frames = flush + rate_gate::RATE_WINDOW_CAPACITY + flush;
+        let mut stream = stream_with_deltas(role, &floor_deltas(frames));
+        stream.fill_rate_evidence().expect("standalone full fill");
+        assert_eq!(recorded_evidence(&stream).0, RateEvidenceDecision::FullWindow);
+
+        // A fill that fails sets its own cancel flag, so each stream gets
+        // a fresh one: the second is not refused for the first's failure.
+        let failed = drain_until_both_ready(
+            &mut stream,
+            &std::sync::atomic::AtomicUsize::new(1),
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut 0,
+        );
+        assert!(failed.is_err(), "the paired fill runs out of frames");
+        assert!(
+            stream.rate_evidence.is_none(),
+            "{role:?}: the record of the reset window is gone"
+        );
+        assert!(!stream.rate_window.ready() && !stream.health_admitted);
+    }
 }
 
 #[test]

@@ -3121,6 +3121,11 @@ fn drain_until_both_ready<S: ValidatedStream>(
         }
     }
     stream.rate_window.reset();
+    // Whatever window this stream held is gone: a stream that a standalone
+    // fill established before the pair fill leaves no record of it behind,
+    // so a fill that fails at its next dequeue reports nothing rather than
+    // how a window that no longer stands was established.
+    stream.clear_rate_evidence();
     // When this stream began collecting the window that will establish it,
     // after its flush; each stream's rate evidence measures from here.
     let mut collected_since = std::time::Instant::now();

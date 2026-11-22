@@ -7,7 +7,7 @@ use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
     parse_trace, CaptureSchedule, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord,
     TraceStage, TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS,
-    MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES,
+    MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES, V5_TRACE_SCHEMA_VERSION,
 };
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
@@ -895,11 +895,13 @@ fn analyze(input: &Path) -> Result<String, String> {
     // The envelope projection is only defined for the schema that carries
     // the sequential capture stages; an older trace without them would
     // report a sequential envelope of zero that is indistinguishable from
-    // an operation that never used sequential capture.
+    // an operation that never used sequential capture. Schema 6 only adds
+    // the rate evidence records, which take no part in the envelope, so a
+    // schema 5 trace still analyzes.
     if let Some(first) = records.first() {
-        if first.trace_schema < CURRENT_TRACE_SCHEMA_VERSION {
+        if first.trace_schema < V5_TRACE_SCHEMA_VERSION {
             return Err(format!(
-                "trace analyze requires schema {CURRENT_TRACE_SCHEMA_VERSION}; this trace is schema {}",
+                "trace analyze requires schema {V5_TRACE_SCHEMA_VERSION} or newer; this trace is schema {}",
                 first.trace_schema
             ));
         }
@@ -2658,6 +2660,281 @@ mod tests {
         assert!(explain(&older)
             .unwrap_err()
             .contains("unsupported trace schema"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn rate_evidence(
+        role: irlume_common::diagnostics::CameraRoleLabel,
+        decision: irlume_common::diagnostics::RateEvidenceDecision,
+        deltas: u32,
+        probe_deltas: Option<u32>,
+        offset_us: u64,
+        elapsed_us: u64,
+    ) -> TraceEventKind {
+        TraceEventKind::RateEvidence {
+            role,
+            decision,
+            deltas,
+            probe_deltas,
+            offset_us,
+            elapsed_us,
+        }
+    }
+
+    /// `irlume trace explain` prints each stream's rate evidence under the
+    /// pair fill it belongs to, with the decision, the delta counts and the
+    /// stream's own timing, and refuses the same records in a file labeled
+    /// with a schema that does not define them.
+    #[test]
+    fn explain_prints_each_streams_rate_evidence_and_refuses_it_below_schema_6() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateEvidenceDecision};
+        let limits = TraceLimits::bounded(1_000);
+        let records = vec![
+            fixture_record(
+                0,
+                TraceEventKind::TraceStarted {
+                    limits,
+                    warning: TraceWarning::PrivilegedDiagnosticOracle,
+                },
+                false,
+            ),
+            fixture_record(
+                1,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::StreamArm,
+                    elapsed_us: 30_000,
+                },
+                false,
+            ),
+            fixture_record(
+                2,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RateEstablishment,
+                    elapsed_us: 8_417_000,
+                },
+                false,
+            ),
+            fixture_record(
+                3,
+                rate_evidence(
+                    CameraRoleLabel::Rgb,
+                    RateEvidenceDecision::FullWindow,
+                    30,
+                    None,
+                    95,
+                    8_390_000,
+                ),
+                false,
+            ),
+            fixture_record(
+                4,
+                rate_evidence(
+                    CameraRoleLabel::Ir,
+                    RateEvidenceDecision::FullWindow,
+                    30,
+                    None,
+                    333_000,
+                    2_010_000,
+                ),
+                false,
+            ),
+            fixture_record(
+                5,
+                rate_evidence(
+                    CameraRoleLabel::Rgb,
+                    RateEvidenceDecision::ProbeMissed,
+                    30,
+                    Some(15),
+                    0,
+                    8_390_000,
+                ),
+                false,
+            ),
+            fixture_record(
+                6,
+                rate_evidence(
+                    CameraRoleLabel::Ir,
+                    RateEvidenceDecision::ProbeAdmitted,
+                    5,
+                    None,
+                    333_000,
+                    340_000,
+                ),
+                false,
+            ),
+            fixture_record(
+                7,
+                TraceEventKind::Finished {
+                    outcome: CategoricalOutcome::Denied,
+                },
+                true,
+            ),
+        ];
+        let write = |path: &Path, records: &[TraceRecord]| {
+            let mut bytes = Vec::new();
+            for record in records {
+                serde_json::to_writer(&mut bytes, record).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
+        let (dir, _sandbox) = sandbox("explain-v6");
+        let current = dir.join("current.jsonl");
+        write(&current, &records);
+        let rendered = explain(&current).unwrap();
+        assert!(rendered.starts_with(&format!(
+            "Irlume diagnostic trace schema {CURRENT_TRACE_SCHEMA_VERSION}\n"
+        )));
+        let evidence_lines = [
+            format!(
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, offset_us: 95, elapsed_us: 8390000 }}",
+                CameraRoleLabel::Rgb,
+                RateEvidenceDecision::FullWindow
+            ),
+            format!(
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: None, offset_us: 333000, elapsed_us: 2010000 }}",
+                CameraRoleLabel::Ir,
+                RateEvidenceDecision::FullWindow
+            ),
+            format!(
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 30, probe_deltas: Some(15), offset_us: 0, elapsed_us: 8390000 }}",
+                CameraRoleLabel::Rgb,
+                RateEvidenceDecision::ProbeMissed
+            ),
+            format!(
+                "RateEvidence {{ role: {:?}, decision: {:?}, deltas: 5, probe_deltas: None, offset_us: 333000, elapsed_us: 340000 }}",
+                CameraRoleLabel::Ir,
+                RateEvidenceDecision::ProbeAdmitted
+            ),
+        ];
+        let block = rendered
+            .find("  +      2000 us  #2  StageTiming { stage: RateEstablishment, elapsed_us: 8417000 }")
+            .expect("the pair fill keeps its own block line");
+        // Each record prints once, in file order, right after the block it
+        // decomposes; nothing else in the timeline changes.
+        let mut previous = block;
+        for (record, line) in (3..7).zip(&evidence_lines) {
+            let whole = format!("  +{:>10} us  #{record}  {line}", record * 1_000);
+            let positions: Vec<_> = rendered
+                .match_indices(&whole)
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(positions.len(), 1, "{rendered}");
+            assert!(positions[0] > previous, "{rendered}");
+            previous = positions[0];
+        }
+        assert_eq!(rendered.matches("RateEvidence {").count(), 4, "{rendered}");
+
+        for schema in [
+            V5_TRACE_SCHEMA_VERSION,
+            irlume_common::diagnostics::V4_TRACE_SCHEMA_VERSION,
+        ] {
+            let mut older_records = records.clone();
+            for record in &mut older_records {
+                record.trace_schema = schema;
+            }
+            let older = dir.join(format!("older-{schema}.jsonl"));
+            write(&older, &older_records);
+            assert!(explain(&older)
+                .unwrap_err()
+                .contains("unsupported trace schema"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Schema 6 only adds records that are not stage timings, so the timing
+    /// envelope still analyzes a schema 5 trace and takes no notice of the
+    /// rate evidence in a schema 6 one.
+    #[test]
+    fn analyze_keeps_accepting_schema_5_and_ignores_rate_evidence_in_schema_6() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateEvidenceDecision};
+        let write = |path: &Path, records: &mut Vec<TraceRecord>| {
+            records.last_mut().unwrap().operation_id =
+                irlume_common::diagnostics::OperationId::from_bytes([9; 16]);
+            let mut bytes = Vec::new();
+            for record in records.iter() {
+                serde_json::to_writer(&mut bytes, record).unwrap();
+                bytes.push(b'\n');
+            }
+            std::fs::write(path, bytes).unwrap();
+        };
+        let (dir, _sandbox) = sandbox("analyze-v6");
+        for schema in [V5_TRACE_SCHEMA_VERSION, CURRENT_TRACE_SCHEMA_VERSION] {
+            // Stream arm 30 ms after its start, the pair fill 8.417 s later.
+            let mut records = vec![
+                fixture_record(
+                    0,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::StreamArm,
+                        elapsed_us: 30_000,
+                    },
+                    false,
+                ),
+                fixture_record(
+                    0,
+                    TraceEventKind::StageTiming {
+                        stage: TraceStage::RateEstablishment,
+                        elapsed_us: 8_417_000,
+                    },
+                    false,
+                ),
+            ];
+            // Only schema 6 may carry the rate evidence.
+            if schema == CURRENT_TRACE_SCHEMA_VERSION {
+                records.push(fixture_record(
+                    0,
+                    rate_evidence(
+                        CameraRoleLabel::Rgb,
+                        RateEvidenceDecision::ProbeAdmitted,
+                        5,
+                        None,
+                        0,
+                        670_000,
+                    ),
+                    false,
+                ));
+            }
+            records.extend([
+                fixture_record(
+                    0,
+                    TraceEventKind::Shared {
+                        transition: ShareSafeEventKind::OperationFinished {
+                            outcome: CategoricalOutcome::Completed,
+                        },
+                    },
+                    false,
+                ),
+                fixture_record(
+                    0,
+                    TraceEventKind::Finished {
+                        outcome: CategoricalOutcome::Completed,
+                    },
+                    true,
+                ),
+            ]);
+            // The sequence is each record's place in the stream and the
+            // monotonic time its end on the daemon's clock.
+            let ends_us = [1_030_000_u64, 9_447_000, 9_447_010, 9_447_020, 9_447_030];
+            for (index, record) in records.iter_mut().enumerate() {
+                record.sequence = index as u64;
+                record.monotonic_us = ends_us[index];
+                record.trace_schema = schema;
+            }
+            // The stream's control group holds the terminal record.
+            let path = dir.join(format!("trace-{schema}.jsonl"));
+            write(&path, &mut records);
+            let rendered = analyze(&path).unwrap();
+            assert!(
+                rendered.contains("  stage_union_us=8447000\n"),
+                "schema {schema}: {rendered}"
+            );
+            assert!(!rendered.contains("RateEvidence"), "{rendered}");
+            // The two stages touch, so they form one block.
+            assert!(
+                rendered.contains("StreamArm..RateEstablishment"),
+                "{rendered}"
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

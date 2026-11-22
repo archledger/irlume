@@ -135,8 +135,8 @@ may be read later. Full disconnect releases the collector; closing only the
 client's write side does not cancel its read side (ADR-0008 lifetime amendment
 2026-10-20).
 
-The recorder requests trace schema 5. A current daemon honors explicit schema
-1 through 5; a request without `trace_schema` retains schema 1 for older
+The recorder requests trace schema 6. A current daemon honors explicit schema
+1 through 6; a request without `trace_schema` retains schema 1 for older
 recorders. An older daemon ignores the optional request field and continues
 producing schema 1, which the current reader also accepts. Each stream uses one
 schema throughout; unsupported versions, version changes within a stream and
@@ -202,6 +202,29 @@ release. The eager sequential route still reports one `rgb_capture` and one
 `ir_capture` per pair, and the concurrent routes report none of these stages.
 Schema 4 and older subscribers omit all seven records before queue, sequence
 and drop accounting.
+
+Schema 6 adds `rate_evidence`, one record per stream after the concurrent
+routes' `rate_establishment`, which times a pair's delivered-rate fill as one
+block (ADR-0021). `decision` says how the stream's window was established:
+`full_window` (no earlier completion for this node and role: the first
+session after a daemon start, a changed node, or an earlier fault),
+`stale_full_window` (the last completion is over 24 hours old),
+`disabled_full_window` (`IRLUME_RATE_AMORTIZATION=0`), `probe_admitted` (the
+5-delta continuity probe, widened to at most 15 deltas, admitted the
+session) or `probe_missed` (the probe missed, the completion was revoked and
+the full window followed). `deltas` is the width of the window that
+established the session and `probe_deltas` the deltas a missed probe had
+collected. `offset_us` is the time from the start of the pair fill to the
+start of this stream's own window collection, after its startup flush, and
+`elapsed_us` how long that collection took: two small offsets with
+overlapping durations mean both windows were collected at once, and a second
+offset about equal to the first duration means one followed the other.
+`deltas` over `elapsed_us` is the rate the stream delivered while its window
+was collected. The records are telemetry: no capture, admission or fallback
+decision reads them, and the sequential routes, whose fills sit inside their
+own capture stages, emit none. Schema 5 and older subscribers omit the
+records the same way. `irlume trace analyze` reads schema 5 and 6 traces; the
+records are not stage timings and take no part in the envelope.
 
 For a public issue, start with `irlume support-report`. Its default action is
 read-only and camera-free, and its `.txt` output is structurally share-safe and

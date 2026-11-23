@@ -239,7 +239,7 @@ All notable changes to irlume are documented here. This project adheres to
   profile can advance a below-floor startup window once before delivering
   a frame. It still requires 30 intervals at the same delivered-rate
   floor. Healthy sessions, other profiles, continuity probes and paired
-  startup keep their existing behavior.
+  startup keep their existing behavior (ADR-0021 Decision, #1396).
 
 - Clarify warn-first model checksum checks, strict core-model startup
   refusals and PAD cue rejection without daemon exit. Disabling required

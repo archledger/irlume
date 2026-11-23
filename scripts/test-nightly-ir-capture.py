@@ -53,6 +53,9 @@ fi
 export FIXTURE_PRIVILEGED=1
 exec "$@"
 ''')
+        self.write(self.bin / 'sleep', '''#!/bin/bash
+printf '%s\\n' "$@" >> "$SLEEPS"
+''')
         self.write(self.target / 'debug/irlume', '''#!/bin/bash
 if [ "${NO_NODES:-0}" = 1 ]; then
   printf '%s\\n' '[doctor] camera nodes (classified by pixel format):' '  (no /dev/video* nodes on this machine)'
@@ -67,6 +70,11 @@ set -eu
 printf '%s\\n' "${FIXTURE_PRIVILEGED:-0}" >> "$CALLS"
 [ "$2" = /dev/video2 ] && [ "$3" = 6 ] || exit 91
 [ "${IRLUME_LOG_EMITTER_WRITES:-0}" = 1 ] || exit 92
+if [ "${REFUSE_RATE_ONCE:-0}" = 1 ] && [ ! -e "$RATE_REFUSED" ]; then
+  : > "$RATE_REFUSED"
+  echo 'irlume: burst rate refused: role=ir window_count=30 window_span_us=2088113 sequence_gap=0 cumulative_drops=0' >&2
+  exit 3
+fi
 if [ "${FAIL_CAPTURE:-0}" = 1 ]; then
   echo 'fixture: capture failed' >&2
   exit 23
@@ -91,10 +99,11 @@ fi
 ''')
         self.env = dict(os.environ, PATH=f'{self.bin}:/usr/bin:/bin',
                         CARGO_TARGET_DIR=str(self.target), TMPDIR=str(self.root),
-                        CALLS=str(self.root / 'calls'))
+                        CALLS=str(self.root / 'calls'), SLEEPS=str(self.root / 'sleeps'),
+                        RATE_REFUSED=str(self.root / 'rate-refused'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
                     'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR',
-                    'NO_NODES']:
+                    'NO_NODES', 'REFUSE_RATE_ONCE']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -130,10 +139,29 @@ if [ "${REJECT_BUILD:-0}" = 1 ]; then
 fi
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-"$CARGO_TARGET_DIR/debug/examples/burst_dump" "$out" "$2" 6 >/dev/null
+"$CARGO_TARGET_DIR/debug/examples/burst_dump" "$out" "$2" 6 >/dev/null || exit 1
 tar -C "$out" -cf - .
 exit "${HELPER_EXIT:-0}"
 ''')
+
+    def assert_first_rate_refusal_fails(self):
+        # The fake capture would succeed on a second call. The first refusal
+        # must stay visible to the workflow's failure-only forensics.
+        result = self.run_step(REFUSE_RATE_ONCE='1')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('privileged IR burst failed', result.stdout, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+        self.assertFalse((self.root / 'sleeps').exists())
+        self.assertIn('irlume: burst rate refused: role=ir', result.stdout)
+        self.assertIn('window_span_us=2088113', result.stdout)
+        self.assertNotIn('captured 6 frames', result.stdout)
+
+    def test_direct_rate_refusal_remains_a_failure(self):
+        self.assert_first_rate_refusal_fails()
+
+    def test_helper_rate_refusal_remains_a_failure(self):
+        self.install_helper()
+        self.assert_first_rate_refusal_fails()
 
     def test_installed_helper_preserves_all_capture_gates(self):
         self.install_helper()

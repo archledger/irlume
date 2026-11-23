@@ -11979,6 +11979,58 @@ mod tests {
     }
 
     #[test]
+    fn a_d2_only_device_default_is_refused_without_measurement_or_write() {
+        let _lock = crate::testenv::env_lock();
+        // A dedicated fake interface supports, defaults to and already holds D2.
+        let d2 = vec![1, 3, 0b100, 0, 0, 0, 0, 0, 0];
+        let camera = fake_camera::Camera {
+            current: d2.clone(),
+            def: d2.clone(),
+            max: d2.clone(),
+            len: d2.len(),
+            info: 0b11,
+            ..Default::default()
+        };
+        let mut measurements = 0;
+        let mut guard_calls = 0;
+        let (outcome, log, current, dir) = run_discovery_guarded(
+            camera,
+            "d2-only-default",
+            || {
+                measurements += 1;
+                Some(50.0)
+            },
+            || {
+                guard_calls += 1;
+                Ok(())
+            },
+        );
+
+        assert!(
+            matches!(&outcome, Ok(Attempt::NotUsable(why))
+                if why.contains("offers only background subtraction (D2)")
+                    && why.contains("alternating-illumination stream (D1)")),
+            "{outcome:?}"
+        );
+        assert_eq!(measurements, 0);
+        assert_eq!(guard_calls, 0);
+        assert_eq!(current, d2);
+        assert!(log.iter().any(|r| matches!(
+            r,
+            fake_camera::Request::Get {
+                query: UVC_GET_MAX,
+                ..
+            }
+        )));
+        assert!(
+            log.iter()
+                .all(|r| matches!(r, fake_camera::Request::Get { .. })),
+            "{log:?}"
+        );
+        assert!(!dir.exists(), "refusal must not create an undo journal");
+    }
+
+    #[test]
     fn several_interfaces_advertising_alternating_illumination_are_all_selected() {
         // Microsoft UVC extensions 1.5, Face Authentication payload table:
         // count at 0; interfaces at 1 and 9; seven-byte flags at 2 and 10.

@@ -43,9 +43,11 @@
 use irlume_common::{IntentAttestation, Request, Response};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[path = "pamwrap/cosmic.rs"]
 mod cosmic;
@@ -228,6 +230,39 @@ impl Harness {
         authtok_env: Option<&str>,
         env: &[(&str, &str)],
     ) -> (bool, String) {
+        let mut cmd = self.pamtester(service, ops, authtok_env, env);
+        let mut child = cmd.spawn().expect("spawn pamtester");
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).ok();
+        let out = child.wait_with_output().expect("wait for pamtester");
+        combined_output(&out)
+    }
+
+    /// [`Self::run`] under an outer deadline, for a fixture that must not be
+    /// trusted to return: a wait loop that lost its budget would otherwise
+    /// hold this serial lane until the job timed out. The command is the one
+    /// [`Self::run_with_env`] builds with no extra environment, and a run
+    /// that ends in time reports exactly what that one reports.
+    fn run_bounded(
+        &self,
+        service: &str,
+        ops: &[&str],
+        stdin: &str,
+        limit: Duration,
+    ) -> Result<(bool, String), TimedOut> {
+        let command = self.pamtester(service, ops, None, &[]);
+        run_bounded(command, stdin.as_bytes(), limit).map(|out| combined_output(&out))
+    }
+
+    /// The pamtester run every fixture here starts: `pamtester <service>
+    /// tester <ops>` under the wrapper, with the module's directories and the
+    /// remote markers set as [`Harness::run_with_env`] describes.
+    fn pamtester(
+        &self,
+        service: &str,
+        ops: &[&str],
+        authtok_env: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Command {
         let mut cmd = Command::new("pamtester");
         cmd.arg(service).arg("tester").args(ops);
         cmd.env("LD_PRELOAD", &self.wrapper)
@@ -263,12 +298,7 @@ impl Harness {
             None => cmd.env_remove("PAM_AUTHTOK"),
         };
         cmd.envs(env.iter().copied());
-        let mut child = cmd.spawn().expect("spawn pamtester");
-        child.stdin.take().unwrap().write_all(stdin.as_bytes()).ok();
-        let out = child.wait_with_output().expect("wait for pamtester");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        (out.status.success(), text)
+        cmd
     }
 
     /// `auth <control> <pam_irlume.so> <args>` line for this build's module.
@@ -298,6 +328,64 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A finished process as the tests read it: whether it succeeded, and its
+/// text, stdout then stderr with undecodable bytes replaced.
+fn combined_output(output: &std::process::Output) -> (bool, String) {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
+// --------------------------------------------------------- bounded child run
+
+/// A run under [`run_bounded`] whose process was still running when its
+/// deadline passed. Carries that deadline.
+#[derive(Debug)]
+struct TimedOut(Duration);
+
+/// Run a command whose three standard streams are piped, under an outer
+/// deadline; `stdin` is written and then closed.
+///
+/// `Ok` carries the output once the process has exited. `Err` means it was
+/// still running at the deadline: by then its process group has been killed,
+/// the process itself killed and reaped, and its pipes dropped. The poll is
+/// the one `pamwrap/cosmic.rs` uses for its conversation driver. The group
+/// is what the camera crate's lock-holder fixture uses: the fixture starts a
+/// process group of its own, so a `pam_exec` command or a helper it forked
+/// ends with it, where killing the process alone leaves that child running.
+/// A descendant that moved to its own session or group is out of reach.
+/// Output is read after the exit, so a fixture that fills its pipes counts
+/// as one that does not exit. `stdin` is written before the poll starts, so
+/// it has to fit the pipe on its own, as the one line each fixture here sends
+/// does.
+fn run_bounded(
+    mut command: Command,
+    stdin: &[u8],
+    limit: Duration,
+) -> Result<std::process::Output, TimedOut> {
+    command.process_group(0);
+    let mut child = command.spawn().expect("spawn the fixture");
+    child.stdin.take().unwrap().write_all(stdin).ok();
+    let deadline = Instant::now() + limit;
+    loop {
+        if child.try_wait().expect("poll the fixture").is_some() {
+            return Ok(child
+                .wait_with_output()
+                .expect("collect the fixture output"));
+        }
+        if Instant::now() >= deadline {
+            // The group first, then the process, then reap it: the order the
+            // lock holder in the camera crate is ended in.
+            // SAFETY: kill(2) on this test's own fixture process group.
+            let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TimedOut(limit));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -5122,7 +5210,9 @@ fn pamwrap_camera_contention_never_grants_and_keeps_the_password_fallback() {
 /// the password, not in a hang or a grant. The three replies take turns, so
 /// each is retried rather than ending the loop or the stack. The lower bound
 /// on the elapsed time is exact, since the loop cannot leave before its
-/// budget; the upper bound only catches a budget that grew.
+/// budget; the upper bound only catches a budget that grew. The pamtester run
+/// itself sits under an outer deadline, so a wait that never ends fails here
+/// in bounded time instead of holding the lane.
 #[test]
 #[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
 fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
@@ -5156,13 +5246,23 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
         replies[index].clone()
     });
 
-    let started = std::time::Instant::now();
-    let (ok, out) = h.run(
+    // An outer bound on the whole run, above the 30 s allowed below: a wait
+    // that grew but still ends fails there, on its measured time, and only a
+    // wait that never ends ends here.
+    let outer = WAIT_BUDGET + Duration::from_secs(20);
+    let started = Instant::now();
+    let (ok, out) = match h.run_bounded(
         "irlume-lock",
         &["authenticate"],
         &format!("{FIXED_TEST_TOKEN}\n"),
-        None,
-    );
+        outer,
+    ) {
+        Ok(run) => run,
+        Err(TimedOut(after)) => panic!(
+            "pamtester was still running after {after:?}: the wait never ended. \
+             Its process group was killed and reaped"
+        ),
+    };
     let took = started.elapsed();
     assert!(ok, "the wait must end in the password prompt: {out}");
     assert!(!out.contains(FIXED_TEST_TOKEN), "{out}");
@@ -5190,4 +5290,151 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
     used.sort_unstable();
     used.dedup();
     assert_eq!(used, (0..reply_count).collect::<Vec<_>>());
+}
+
+// ------------------------------------------------- the bounded run's own proof
+
+/// The state letter of a process in `/proc/<pid>/stat`, or `None` when there
+/// is no such process: one that was reaped, or never ran. `Z` is a process
+/// that died and waits for its parent to reap it.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.trim_start().chars().next()
+}
+
+/// A fixture that never exits and has a child of its own: the shape of
+/// pamtester with a `pam_exec` command or a helper still running. The leader
+/// writes its own id and the child's to `ids`, then both sleep. `sleep` is
+/// checked first, so a host without it fails here instead of passing on
+/// processes that never were.
+fn hanging_fixture(ids: &Path) -> Command {
+    let sleep = Command::new("sleep")
+        .arg("0")
+        .status()
+        .expect("spawn sleep");
+    assert!(sleep.success(), "this check needs a working sleep(1)");
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "sleep 600 & echo \"$$ $!\" > \"$1\"; exec sleep 600",
+            "sh",
+        ])
+        .arg(ids)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// What the bounded run returns for a fixture that exits in time: its exit
+/// status, both output streams and the input it read, as `Harness::run`
+/// reports them. `sh` stands in for pamtester; no PAM stack takes part.
+#[test]
+fn pamwrap_bounded_run_keeps_the_output_of_a_fixture_that_exits() {
+    let mut command = Command::new("sh");
+    command
+        .args([
+            "-c",
+            "IFS= read -r line; printf 'out:%s\\n' \"$line\"; printf 'err\\n' >&2; exit 3",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_bounded(command, b"fixed-input\n", Duration::from_secs(5))
+        .expect("the fixture exits long before the bound");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "out:fixed-input\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+    assert_eq!(
+        combined_output(&output),
+        (false, "out:fixed-input\nerr\n".to_owned())
+    );
+}
+
+/// The outer bound is real, and its cleanup reaches the fixture's children.
+/// `sh` and `sleep` stand in for pamtester and a `pam_exec` command or a
+/// helper it left running; no PAM stack takes part. The control comes first:
+/// the leader killed on its own, which is all `Child::kill` does, leaves that
+/// child alive. Then the bounded run meets the same fixture.
+#[test]
+fn pamwrap_bounded_run_ends_a_fixture_that_never_exits_with_its_child() {
+    let root = std::env::temp_dir().join(format!("irlume-pamwrap-bounded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let ids = root.join("ids");
+    let read_ids = || -> (u32, u32) {
+        let text = std::fs::read_to_string(&ids).expect("the fixture reports its ids");
+        let (leader, child) = text.trim().split_once(' ').expect("leader then child");
+        (leader.parse().unwrap(), child.parse().unwrap())
+    };
+
+    let mut leader = hanging_fixture(&ids)
+        .spawn()
+        .expect("spawn the control fixture");
+    drop(leader.stdin.take().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ids.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the control fixture never reported its ids"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (control, child) = read_ids();
+    leader.kill().expect("kill the control leader");
+    leader.wait().expect("reap the control leader");
+    assert_eq!(
+        process_state(control),
+        None,
+        "the control leader was reaped"
+    );
+    let state = process_state(child);
+    assert!(
+        matches!(state, Some('S') | Some('R')),
+        "killing the leader alone must leave its child running, found {state:?}"
+    );
+    // SAFETY: signals a process this test's own fixture started.
+    unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+    std::fs::remove_file(&ids).unwrap();
+
+    let limit = Duration::from_millis(500);
+    let started = Instant::now();
+    let outcome = run_bounded(hanging_fixture(&ids), b"", limit);
+    let took = started.elapsed();
+    let (leader, child) = read_ids();
+    match outcome {
+        Err(TimedOut(after)) => assert_eq!(after, limit),
+        Ok(output) => panic!("a fixture that never exits was reported as exited: {output:?}"),
+    }
+    assert!(
+        took >= limit,
+        "the bound ended before its deadline: {took:?}"
+    );
+    assert!(
+        took < limit + Duration::from_secs(5),
+        "the bound took too long to end the fixture: {took:?}"
+    );
+    assert_eq!(
+        process_state(leader),
+        None,
+        "the bounded run reaped the leader"
+    );
+    // kill(2) is asynchronous, so the child may take a moment to die. It is
+    // then init's to reap, so a zombie is as gone as this process can make it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match process_state(child) {
+            None | Some('Z') => break,
+            state => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the fixture's child is still running: {state:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

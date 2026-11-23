@@ -30,8 +30,12 @@ mod camera_lease_contention {
     /// A generous ceiling on the same wait, and under the window this request
     /// gets. A longer cap that still ends inside the window answers with the
     /// same refusal, so the time is what tells it apart. The margin is wide on
-    /// purpose, because a loaded machine may wake the waiter late; the lower
-    /// bound above is the exact one.
+    /// purpose, because a loaded machine may wake the waiter late.
+    ///
+    /// Read together, the two bounds catch a default that became very short
+    /// (under two seconds) or left the window's scale (a wait that ran to the
+    /// window, or lost its bound). They do not measure the cap to the
+    /// second: a default of, say, five seconds would pass both.
     const ACQUISITION_CEILING: Duration = Duration::from_secs(10);
 
     /// Clears the device and IR overrides the shared engine sets, the grace

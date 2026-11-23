@@ -3072,6 +3072,7 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
         let a = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(cancelled);
+            let primary = &mut *primary;
             let parked = &mut primary_parked;
             scope.spawn(hostfs::inherit(move || {
                 drain_until_both_ready(primary, &count, &cancelled, parked)
@@ -3080,6 +3081,7 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
         let b = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(cancelled);
+            let secondary = &mut *secondary;
             let parked = &mut secondary_parked;
             scope.spawn(hostfs::inherit(move || {
                 drain_until_both_ready(secondary, &count, &cancelled, parked)
@@ -3101,6 +3103,9 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
             (_, Err(b)) => Err(b),
         }
     });
+    // Keep the completed records, but not the clock origin for a later fill.
+    primary.pair_fill_started = None;
+    secondary.pair_fill_started = None;
     // Preserve the handled-Parked evidence even when preparation failed.
     (result, primary_parked != 0 || secondary_parked != 0)
 }

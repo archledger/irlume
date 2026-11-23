@@ -7,6 +7,7 @@
 // is software-only; no camera is opened.
 
 use irlume_common::diagnostics::{CameraRoleLabel, RateEvidenceDecision, TraceEventKind};
+use std::{sync::mpsc, time::Duration};
 
 /// The recorded `(decision, deltas, probe_deltas, offset_us, elapsed_us)`.
 fn recorded_evidence<S>(stream: &TrackedStream<S>) -> (RateEvidenceDecision, u32, Option<u32>, u64, u64) {
@@ -67,16 +68,32 @@ fn floor_deltas(count: usize) -> Vec<i64> {
 }
 
 /// A queue that delivers each frame after a real pause, so a test can read
-/// the wall time a window's collection took.
+/// the wall time a window's collection took. In a pair, rendezvous on the
+/// first dequeue after the startup flush.
 struct PacedQueue {
     inner: QueuedContinuityFixture,
-    interval: std::time::Duration,
+    interval: Duration,
+    startup_left: usize,
+    rendezvous: Option<FillRendezvous>,
 }
+
+type FillRendezvous = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
 impl ValidatedStream for PacedQueue {
     fn next_validated(
         &mut self,
     ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+        if self.startup_left == 0 {
+            if let Some((entered, peer_entered)) = self.rendezvous.take() {
+                entered.send(()).expect("peer still connected");
+                // A hang guard, not a bound on the recorded timing.
+                peer_entered
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("peer entered its collection");
+            }
+        } else {
+            self.startup_left -= 1;
+        }
         std::thread::sleep(self.interval);
         self.inner.next_validated()
     }
@@ -84,15 +101,16 @@ impl ValidatedStream for PacedQueue {
 
 fn paced_stream(
     role: contracts::StreamRole,
-    frames: usize,
-    interval: std::time::Duration,
+    interval: Duration,
+    rendezvous: Option<FillRendezvous>,
 ) -> TrackedStream<PacedQueue> {
-    let interval_us = i64::try_from(interval.as_micros()).unwrap();
-    let deltas = vec![interval_us; frames];
     TrackedStream::new(
         PacedQueue {
-            inner: delta_queue(&deltas),
+            // Either stream may drain up to its bounded attempt budget.
+            inner: delta_queue(&floor_deltas(200)),
             interval,
+            startup_left: rate_gate::startup_flush(role),
+            rendezvous,
         },
         role_config(role),
     )
@@ -400,54 +418,43 @@ fn rate_evidence_a_pair_reports_a_probe_miss_on_the_stream_that_missed() {
 
 /// The record carries enough to tell a pair fill that collects both windows
 /// at once from one that fills them one after the other: each stream's
-/// collection start relative to the pair fill, and its own duration. A
-/// sleep never returns early, so every lower bound holds on any host; no
-/// assertion depends on how soon the scheduler runs a thread, and the
-/// overlap is judged with a margin left for it.
+/// collection start relative to the pair fill, and its own duration.
 #[test]
 fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
-    let _lock = crate::testenv::env_lock();
-    let _env = crate::testenv::EnvGuard::unset("IRLUME_RATE_AMORTIZATION");
-    // RGB: seed + 30 deltas at 40 ms, about 1.24 s. IR: a five-frame flush
-    // then seed + 30 deltas at 10 ms, about 0.36 s in all. Once IR is ready
-    // it keeps dequeuing while RGB finishes, so its queue carries enough
-    // frames for the whole pair fill.
-    let pair = || {
+    use contracts::StreamRole::{Ir, Rgb};
+    let interval = Duration::from_millis(1);
+    let interval_us = u64::try_from(interval.as_micros()).unwrap();
+    let window_min = (rate_gate::RATE_WINDOW_CAPACITY as u64 + 1) * interval_us;
+    let ir_flush_min = rate_gate::startup_flush(Ir) as u64 * interval_us;
+    let pair = |rgb, ir| {
         (
-            paced_stream(
-                contracts::StreamRole::Rgb,
-                34,
-                std::time::Duration::from_millis(40),
-            ),
-            paced_stream(
-                contracts::StreamRole::Ir,
-                132,
-                std::time::Duration::from_millis(10),
-            ),
+            paced_stream(Rgb, interval, rgb),
+            paced_stream(Ir, interval, ir),
         )
     };
 
-    // Concurrent: the faster stream has its window long before the slower
-    // one has its, which cannot happen when the two are filled in turn.
-    let (mut rgb, mut ir) = pair();
+    // Both timings have started before either first collection dequeue can
+    // finish. The pause in that dequeue leaves overlap even after rounding
+    // to microseconds, regardless of which worker starts or finishes first.
+    let (rgb_entered, ir_peer) = mpsc::channel();
+    let (ir_entered, rgb_peer) = mpsc::channel();
+    let (mut rgb, mut ir) = pair(Some((rgb_entered, rgb_peer)), Some((ir_entered, ir_peer)));
     establish_concurrent_rate(&mut rgb, &mut ir).expect("concurrent pair fill");
     let (_, _, _, rgb_offset, rgb_elapsed) = recorded_evidence(&rgb);
     let (_, _, _, ir_offset, ir_elapsed) = recorded_evidence(&ir);
-    assert!(rgb_elapsed >= 30 * 40_000, "rgb elapsed {rgb_elapsed} us");
-    assert!(ir_elapsed >= 30 * 10_000, "ir elapsed {ir_elapsed} us");
-    // IR's collection starts after its flush, five frames of 10 ms.
-    assert!(ir_offset >= 5 * 10_000, "ir offset {ir_offset} us");
+    assert!(rgb_elapsed >= window_min, "rgb elapsed {rgb_elapsed} us");
+    assert!(ir_elapsed >= window_min, "ir elapsed {ir_elapsed} us");
+    assert!(ir_offset >= ir_flush_min, "ir offset {ir_offset} us");
+    let overlap_start = rgb_offset.max(ir_offset);
+    let overlap_end = (rgb_offset + rgb_elapsed).min(ir_offset + ir_elapsed);
     assert!(
-        ir_offset + ir_elapsed + 300_000 < rgb_offset + rgb_elapsed,
-        "the collections overlapped: ir was done {} us into the fill, rgb took {} us",
-        ir_offset + ir_elapsed,
-        rgb_elapsed
+        overlap_start < overlap_end,
+        "collections do not overlap: rgb ({rgb_offset}, {rgb_elapsed}), ir ({ir_offset}, {ir_elapsed})"
     );
 
-    // Serial, for contrast: the same two streams filled one after the other
-    // from one pair start read as the second collection beginning only
-    // once the first is complete, so the inequality above cannot hold.
-    let (mut rgb, mut ir) = pair();
+    // Serial control: the same streams without a rendezvous, filled in
+    // turn from one origin. IR starts after RGB finishes and its own flush.
+    let (mut rgb, mut ir) = pair(None, None);
     let started = std::time::Instant::now();
     rgb.pair_fill_started = Some(started);
     ir.pair_fill_started = Some(started);
@@ -458,12 +465,11 @@ fn rate_evidence_shows_whether_a_pair_fill_collects_both_windows_at_once() {
     drain_until_both_ready(&mut ir, &alone(), &cancelled, &mut 0).expect("second fill");
     let (_, _, _, rgb_offset, rgb_elapsed) = recorded_evidence(&rgb);
     let (_, _, _, ir_offset, ir_elapsed) = recorded_evidence(&ir);
-    assert!(rgb_elapsed >= 30 * 40_000, "rgb elapsed {rgb_elapsed} us");
-    assert!(ir_elapsed >= 30 * 10_000, "ir elapsed {ir_elapsed} us");
+    assert!(rgb_elapsed >= window_min, "rgb elapsed {rgb_elapsed} us");
+    assert!(ir_elapsed >= window_min, "ir elapsed {ir_elapsed} us");
     assert!(
-        ir_offset > rgb_offset + rgb_elapsed,
-        "a serial fill starts the second window after the first: ir offset {} us, rgb done {} us",
-        ir_offset,
+        ir_offset >= rgb_offset + rgb_elapsed + ir_flush_min,
+        "ir collection starts before rgb finished and ir flushed: ir starts {ir_offset} us, rgb done {} us",
         rgb_offset + rgb_elapsed
     );
 }
@@ -505,6 +511,47 @@ fn rate_evidence_a_failed_paired_fill_leaves_no_record_of_an_earlier_window() {
         );
         assert!(!stream.rate_window.ready() && !stream.health_admitted);
     }
+}
+
+#[test]
+fn rate_evidence_a_standalone_fill_uses_no_offset_after_a_failed_pair() {
+    let mut rgb = stream_with_deltas(contracts::StreamRole::Rgb, &[]);
+    let mut ir = stream_with_deltas(contracts::StreamRole::Ir, &[]);
+    rgb.stream_mut().unwrap().metadata.clear();
+    ir.stream_mut().unwrap().metadata.clear();
+    assert!(establish_concurrent_rate(&mut rgb, &mut ir).is_err());
+    assert!(rgb.rate_evidence.is_none());
+    assert!(ir.rate_evidence.is_none());
+
+    // The next dequeues succeed on the same synthetic streams. Make the
+    // previous pair's start distinguishable at microsecond precision.
+    std::thread::sleep(Duration::from_millis(2));
+    for stream in [&mut rgb, &mut ir] {
+        stream.stream_mut().unwrap().metadata = delta_queue(&floor_deltas(40)).metadata;
+        stream.fill_rate_evidence().expect("standalone retry");
+        let (decision, deltas, probe_deltas, offset_us, _) = recorded_evidence(stream);
+        assert_eq!(
+            (decision, deltas, probe_deltas, offset_us),
+            (RateEvidenceDecision::FullWindow, 30, None, 0)
+        );
+    }
+}
+
+#[test]
+fn rate_evidence_a_window_established_before_a_trailing_error_keeps_its_record() {
+    let mut stream = stream_with_deltas(
+        contracts::StreamRole::Rgb,
+        &floor_deltas(rate_gate::RATE_WINDOW_CAPACITY),
+    );
+    let ready = std::sync::atomic::AtomicUsize::new(0);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    assert!(drain_until_both_ready(&mut stream, &ready, &cancelled, &mut 0).is_err());
+    assert!(stream.rate_window.ready());
+    let (decision, deltas, probe_deltas, _, _) = recorded_evidence(&stream);
+    assert_eq!(
+        (decision, deltas, probe_deltas),
+        (RateEvidenceDecision::FullWindow, 30, None)
+    );
 }
 
 #[test]

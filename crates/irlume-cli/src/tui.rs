@@ -10240,7 +10240,7 @@ impl App {
                 &mut page_actions,
                 "b",
                 "Set up Bitwarden",
-                "installs its polkit action so your face unlocks the vault",
+                "installs its polkit action for system authentication",
             );
         }
         push_page_action(
@@ -10261,14 +10261,16 @@ impl App {
         // action is present or snapd owns it. Set apart by a blank line.
         match &self.heavy {
             Some(crate::bitwarden::TuiState::Ready) => {
+                let hint = if secure_face {
+                    "  (turn on \"unlock with system authentication\"; if prompted, type yes for one face attempt)"
+                } else {
+                    "  (turn on \"unlock with system authentication\")"
+                };
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
                     Span::raw("  Bitwarden   "),
                     Span::styled("● polkit action installed", Style::new().fg(th().ok)),
-                    Span::styled(
-                        "  (turn on \"unlock with system authentication\"; type yes for one face attempt)",
-                        Style::new().dim(),
-                    ),
+                    Span::styled(hint, Style::new().dim()),
                 ]));
             }
             Some(crate::bitwarden::TuiState::SnapMissing) => {

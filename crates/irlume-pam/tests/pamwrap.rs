@@ -41,11 +41,13 @@
 //! (authenticate in every module mode, open_session, close_session) is covered.
 
 use irlume_common::{IntentAttestation, Request, Response};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd as _;
+use std::os::fd::{AsRawFd as _, BorrowedFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -341,52 +343,153 @@ fn combined_output(output: &std::process::Output) -> (bool, String) {
 
 // --------------------------------------------------------- bounded child run
 
-/// A run under [`run_bounded`] whose process was still running when its
-/// deadline passed. Carries that deadline.
+/// A run that did not finish both execution and output capture by its deadline.
 #[derive(Debug)]
 struct TimedOut(Duration);
 
-/// Run a command whose three standard streams are piped, under an outer
-/// deadline; `stdin` is written and then closed.
+const FIXTURE_POLL: Duration = Duration::from_millis(5);
+
+fn nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: fd is borrowed from an open pipe end owned by this runner.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: same descriptor; F_SETFL takes the integer status flags.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn read_fixture_output(pipe: &mut Option<impl Read>, output: &mut Vec<u8>) -> io::Result<()> {
+    let Some(reader) = pipe else { return Ok(()) };
+    // One nonblocking read per stream per poll, even with a continuous writer.
+    let mut chunk = [0; 8192];
+    match reader.read(&mut chunk) {
+        Ok(0) => *pipe = None,
+        Ok(n) => {
+            if output.len() + n > 1024 * 1024 {
+                return Err(io::Error::other("fixture output exceeded 1 MiB per stream"));
+            }
+            output.extend_from_slice(&chunk[..n]);
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Observe the leader without reaping it. Only the runner waits for this
+/// child, so holding it unreaped prevents its PID/PGID from being recycled.
+fn fixture_exited(child: &Child) -> io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: info is writable and waitid only observes this runner's child.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid succeeded; si_pid is zero if no child was waitable.
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+/// Signal only the owned group, before any operation that can reap its leader.
+fn stop_fixture(child: &mut Child) -> ExitStatus {
+    fixture_exited(child).expect("the fixture leader must still be ours");
+    // SAFETY: process_group(0) made the unreaped child's PID its group ID.
+    let rc = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    if rc == -1 {
+        let error = io::Error::last_os_error();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ESRCH),
+            "kill fixture group: {error}"
+        );
+        child.kill().expect("kill the fixture leader");
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(status) = child.try_wait().expect("reap the fixture leader") {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture leader did not exit after SIGKILL"
+        );
+        std::thread::sleep(FIXTURE_POLL);
+    }
+}
+
+/// Bound both exit and pipe EOF. A descendant can keep the pipe open after the
+/// leader exits. On either outcome, signal the fixture group before reaping
+/// the leader, with a separate one-second allowance to reap after SIGKILL.
 ///
-/// `Ok` carries the output once the process has exited. `Err` means it was
-/// still running at the deadline: by then its process group has been killed,
-/// the process itself killed and reaped, and its pipes dropped. The poll is
-/// the one `pamwrap/cosmic.rs` uses for its conversation driver. The group
-/// is what the camera crate's lock-holder fixture uses: the fixture starts a
-/// process group of its own, so a `pam_exec` command or a helper it forked
-/// ends with it, where killing the process alone leaves that child running.
-/// A descendant that moved to its own session or group is out of reach.
-/// Output is read after the exit, so a fixture that fills its pipes counts
-/// as one that does not exit. `stdin` is written before the poll starts, so
-/// it has to fit the pipe on its own, as the one line each fixture here sends
-/// does.
+/// This is for small test input and output. A descendant that moves to
+/// another group is outside cleanup, but cannot block nonblocking capture.
 fn run_bounded(
     mut command: Command,
     stdin: &[u8],
     limit: Duration,
 ) -> Result<std::process::Output, TimedOut> {
-    command.process_group(0);
-    let mut child = command.spawn().expect("spawn the fixture");
-    child.stdin.take().unwrap().write_all(stdin).ok();
+    assert!(stdin.len() <= libc::PIPE_BUF);
     let deadline = Instant::now() + limit;
-    loop {
-        if child.try_wait().expect("poll the fixture").is_some() {
-            return Ok(child
-                .wait_with_output()
-                .expect("collect the fixture output"));
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the fixture");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let finished = (|| -> io::Result<bool> {
+        let mut input = child.stdin.take().unwrap();
+        nonblocking(input.as_fd())?;
+        // One atomic write to our empty pipe; the fixture can also exit
+        // without reading any input. Close it before collecting output.
+        match input.write(stdin) {
+            Ok(n) if n == stdin.len() => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(e),
+            Ok(_) => return Err(io::ErrorKind::WriteZero.into()),
         }
-        if Instant::now() >= deadline {
-            // The group first, then the process, then reap it: the order the
-            // lock holder in the camera crate is ended in.
-            // SAFETY: kill(2) on this test's own fixture process group.
-            let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TimedOut(limit));
+        drop(input);
+        let mut out_pipe = child.stdout.take();
+        let mut err_pipe = child.stderr.take();
+        nonblocking(out_pipe.as_ref().unwrap().as_fd())?;
+        nonblocking(err_pipe.as_ref().unwrap().as_fd())?;
+        while Instant::now() < deadline {
+            read_fixture_output(&mut out_pipe, &mut stdout)?;
+            read_fixture_output(&mut err_pipe, &mut stderr)?;
+            if out_pipe.is_none() && err_pipe.is_none() && fixture_exited(&child)? {
+                return Ok(true);
+            }
+            std::thread::sleep(
+                FIXTURE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-        std::thread::sleep(Duration::from_millis(5));
+        Ok(false)
+    })();
+    let status = stop_fixture(&mut child);
+    if !finished.expect("collect the fixture output") {
+        return Err(TimedOut(limit));
     }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// The environment variables `is_remote_session` (src/lib.rs) reads as a
@@ -5259,8 +5362,8 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
     ) {
         Ok(run) => run,
         Err(TimedOut(after)) => panic!(
-            "pamtester was still running after {after:?}: the wait never ended. \
-             Its process group was killed and reaped"
+            "pamtester did not exit and close its output within {after:?}. \
+             Its process group was signaled and its leader reaped"
         ),
     };
     let took = started.elapsed();
@@ -5303,29 +5406,55 @@ fn process_state(pid: u32) -> Option<char> {
     after.trim_start().chars().next()
 }
 
-/// A fixture that never exits and has a child of its own: the shape of
-/// pamtester with a `pam_exec` command or a helper still running. The leader
-/// writes its own id and the child's to `ids`, then both sleep. `sleep` is
-/// checked first, so a host without it fails here instead of passing on
-/// processes that never were.
+/// Both processes outlive the test deadline even if only one is killed.
+/// Finite sleeps limit their lifetimes if the runner's cleanup regresses.
 fn hanging_fixture(ids: &Path) -> Command {
-    let sleep = Command::new("sleep")
-        .arg("0")
-        .status()
-        .expect("spawn sleep");
-    assert!(sleep.success(), "this check needs a working sleep(1)");
     let mut command = Command::new("sh");
     command
         .args([
             "-c",
-            "sleep 600 & echo \"$$ $!\" > \"$1\"; exec sleep 600",
+            "sleep 15 & echo \"$$ $!\" > \"$1\"; exec sleep 15",
             "sh",
         ])
         .arg(ids)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .process_group(0);
     command
+}
+
+fn fixture_pid_file(name: &str) -> PathBuf {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let path = std::env::temp_dir().join(format!("irlume-pamwrap-{name}-{}", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("create a private fixture pid file");
+    path
+}
+
+fn fixture_pids(path: &Path) -> Option<(u32, u32)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (leader, child) = text.trim().split_once(' ')?;
+    Some((leader.parse().ok()?, child.parse().ok()?))
+}
+
+fn assert_fixture_stopped(leader: u32, child: u32) {
+    assert_eq!(process_state(leader), None, "fixture leader was not reaped");
+    // SIGKILL delivery is asynchronous; only init can reap the orphan.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let state = process_state(child);
+        if matches!(state, None | Some('Z')) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture child is still running: {state:?}"
+        );
+        std::thread::sleep(FIXTURE_POLL);
+    }
 }
 
 /// What the bounded run returns for a fixture that exits in time: its exit
@@ -5334,14 +5463,10 @@ fn hanging_fixture(ids: &Path) -> Command {
 #[test]
 fn pamwrap_bounded_run_keeps_the_output_of_a_fixture_that_exits() {
     let mut command = Command::new("sh");
-    command
-        .args([
-            "-c",
-            "IFS= read -r line; printf 'out:%s\\n' \"$line\"; printf 'err\\n' >&2; exit 3",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args([
+        "-c",
+        "IFS= read -r line; printf 'out:%s\\n' \"$line\"; printf 'err\\n' >&2; exit 3",
+    ]);
     let output = run_bounded(command, b"fixed-input\n", Duration::from_secs(5))
         .expect("the fixture exits long before the bound");
     assert_eq!(output.status.code(), Some(3));
@@ -5353,6 +5478,31 @@ fn pamwrap_bounded_run_keeps_the_output_of_a_fixture_that_exits() {
     );
 }
 
+#[test]
+fn pamwrap_bounded_run_times_out_when_a_descendant_keeps_output_open() {
+    let ids = fixture_pid_file("output-holder");
+    let mut command = Command::new("sh");
+    // The shell exits immediately, but sleep inherits both writers. Its
+    // finite lifetime also bounds this test if the runner regresses.
+    command
+        .args(["-c", "sleep 8 & echo \"$$ $!\" > \"$1\"; exit 3", "sh"])
+        .arg(&ids);
+    let limit = Duration::from_secs(1);
+    let started = Instant::now();
+    let outcome = run_bounded(command, b"", limit);
+    let took = started.elapsed();
+    let pids = fixture_pids(&ids);
+    std::fs::remove_file(&ids).expect("remove the private fixture pid file");
+
+    assert!(
+        matches!(outcome, Err(TimedOut(after)) if after == limit),
+        "the open pipes must time out even though the leader exited: {outcome:?} after {took:?}"
+    );
+    assert!(took >= limit && took < Duration::from_secs(4), "{took:?}");
+    let (leader, descendant) = pids.expect("the fixture reports its ids");
+    assert_fixture_stopped(leader, descendant);
+}
+
 /// The outer bound is real, and its cleanup reaches the fixture's children.
 /// `sh` and `sleep` stand in for pamtester and a `pam_exec` command or a
 /// helper it left running; no PAM stack takes part. The control comes first:
@@ -5360,50 +5510,48 @@ fn pamwrap_bounded_run_keeps_the_output_of_a_fixture_that_exits() {
 /// child alive. Then the bounded run meets the same fixture.
 #[test]
 fn pamwrap_bounded_run_ends_a_fixture_that_never_exits_with_its_child() {
-    let root = std::env::temp_dir().join(format!("irlume-pamwrap-bounded-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
-    let ids = root.join("ids");
-    let read_ids = || -> (u32, u32) {
-        let text = std::fs::read_to_string(&ids).expect("the fixture reports its ids");
-        let (leader, child) = text.trim().split_once(' ').expect("leader then child");
-        (leader.parse().unwrap(), child.parse().unwrap())
-    };
-
-    let mut leader = hanging_fixture(&ids)
+    let control_ids = fixture_pid_file("leader-only-kill");
+    let mut leader = hanging_fixture(&control_ids)
         .spawn()
         .expect("spawn the control fixture");
-    drop(leader.stdin.take().unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !ids.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the control fixture never reported its ids"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let (control, child) = read_ids();
-    leader.kill().expect("kill the control leader");
-    leader.wait().expect("reap the control leader");
-    assert_eq!(
-        process_state(control),
-        None,
-        "the control leader was reaped"
-    );
-    let state = process_state(child);
+    let control = (|| {
+        let (control, child) = loop {
+            if let Some(pids) = fixture_pids(&control_ids) {
+                break pids;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(FIXTURE_POLL);
+        };
+        leader.kill().ok()?;
+        while !fixture_exited(&leader).ok()? {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(FIXTURE_POLL);
+        }
+        Some((control, child, process_state(child)))
+    })();
+    // Check the leader-only result after cleanup, even on control failure.
+    stop_fixture(&mut leader);
+    std::fs::remove_file(&control_ids).unwrap();
+    let (control, child, state) = control.expect("control reports both pids and leader exits");
     assert!(
         matches!(state, Some('S') | Some('R')),
         "killing the leader alone must leave its child running, found {state:?}"
     );
-    // SAFETY: signals a process this test's own fixture started.
-    unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
-    std::fs::remove_file(&ids).unwrap();
+    assert_fixture_stopped(control, child);
 
+    let ids = fixture_pid_file("bounded-kill");
     let limit = Duration::from_millis(500);
     let started = Instant::now();
     let outcome = run_bounded(hanging_fixture(&ids), b"", limit);
     let took = started.elapsed();
-    let (leader, child) = read_ids();
+    let pids = fixture_pids(&ids);
+    std::fs::remove_file(&ids).unwrap();
+    let (leader, child) = pids.expect("the fixture reports its ids");
     match outcome {
         Err(TimedOut(after)) => assert_eq!(after, limit),
         Ok(output) => panic!("a fixture that never exits was reported as exited: {output:?}"),
@@ -5416,25 +5564,5 @@ fn pamwrap_bounded_run_ends_a_fixture_that_never_exits_with_its_child() {
         took < limit + Duration::from_secs(5),
         "the bound took too long to end the fixture: {took:?}"
     );
-    assert_eq!(
-        process_state(leader),
-        None,
-        "the bounded run reaped the leader"
-    );
-    // kill(2) is asynchronous, so the child may take a moment to die. It is
-    // then init's to reap, so a zombie is as gone as this process can make it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match process_state(child) {
-            None | Some('Z') => break,
-            state => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the fixture's child is still running: {state:?}"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
-    let _ = std::fs::remove_dir_all(&root);
+    assert_fixture_stopped(leader, child);
 }

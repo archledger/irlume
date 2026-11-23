@@ -1817,6 +1817,18 @@ fn emit_trace_stage_ms(
     });
 }
 
+/// Report how each stream's delivered-rate window was established (the
+/// schema 6 `RateEvidence` records), RGB then IR, for every stream whose
+/// fill established one. Telemetry only: it changes no decision.
+fn emit_rate_evidence(
+    diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+    evidence: [Option<irlume_common::diagnostics::TraceEventKind>; 2],
+) {
+    for evidence in evidence.into_iter().flatten() {
+        diagnostics.emit_trace(evidence);
+    }
+}
+
 /// Measure work through early returns and unwinding without recording its data
 /// or error text. The scope chooses the exact work included in this interval.
 struct TraceStageTimer<'a> {
@@ -5511,6 +5523,13 @@ impl Engine {
                 stage: irlume_common::diagnostics::TraceStage::RateEstablishment,
                 elapsed_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             });
+            emit_rate_evidence(
+                diagnostics,
+                [
+                    rgb.diagnostic_rate_evidence(),
+                    ir.diagnostic_rate_evidence(),
+                ],
+            );
             rate.map_err(|error| {
                 setup_error(RuntimeDegradation::PairRateEstablishmentFailure, error)
             })?;

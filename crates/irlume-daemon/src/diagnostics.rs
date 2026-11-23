@@ -9,7 +9,7 @@ use irlume_common::diagnostics::{
     SupportUnavailable, TraceEventKind, TraceLimits, TraceRecord, TraceWarning, UnavailableReason,
     CURRENT_TRACE_SCHEMA_VERSION, LEGACY_TRACE_SCHEMA_VERSION, MAX_HISTORY_MS,
     MAX_SHARE_SAFE_EVENTS, MAX_TRACE_LINE_BYTES, V2_TRACE_SCHEMA_VERSION, V3_TRACE_SCHEMA_VERSION,
-    V4_TRACE_SCHEMA_VERSION,
+    V4_TRACE_SCHEMA_VERSION, V5_TRACE_SCHEMA_VERSION,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, VecDeque};
@@ -332,6 +332,7 @@ impl DiagnosticState {
                 | V2_TRACE_SCHEMA_VERSION
                 | V3_TRACE_SCHEMA_VERSION
                 | V4_TRACE_SCHEMA_VERSION
+                | V5_TRACE_SCHEMA_VERSION
                 | CURRENT_TRACE_SCHEMA_VERSION
         ) {
             return Err(TraceSubscribeError::UnsupportedSchema);
@@ -1646,7 +1647,7 @@ mod tests {
     #[test]
     fn trace_negotiation_defaults_to_legacy_and_rejects_unknown_versions_without_ownership() {
         let state = DiagnosticState::default();
-        for unsupported in [0, 6, u32::MAX] {
+        for unsupported in [0, 7, u32::MAX] {
             assert!(matches!(
                 state.subscribe_trace(0, 60_000, Some(unsupported)),
                 Err(TraceSubscribeError::UnsupportedSchema)
@@ -1659,6 +1660,7 @@ mod tests {
             (Some(3), 3),
             (Some(4), 4),
             (Some(5), 5),
+            (Some(6), 6),
         ] {
             let subscription = state.subscribe_trace(0, 60_000, requested).unwrap();
             let mut records: Vec<_> = subscription.receiver.try_iter().collect();
@@ -1871,8 +1873,10 @@ mod tests {
         drop(operation);
         drop(older);
 
-        let current = state
-            .subscribe_trace_with_capacity(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION), 16)
+        // Named by tier, not as "current": schema 6 is current now and this
+        // subscriber is the one that negotiated the tier under test.
+        let schema_5 = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(V5_TRACE_SCHEMA_VERSION), 16)
             .unwrap();
         let operation = state.begin(OperationClass::Authentication);
         for stage in SCHEMA_5 {
@@ -1881,9 +1885,113 @@ mod tests {
                 elapsed_us: 7,
             });
         }
-        let records: Vec<_> = current.receiver.try_iter().collect();
+        let records: Vec<_> = schema_5.receiver.try_iter().collect();
         assert_eq!(stages_of(&records), SCHEMA_5);
         assert!(records.iter().all(|record| record.trace_schema == 5));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+    }
+
+    /// A schema 5 subscriber (the previous current tier) keeps working and
+    /// never receives the schema 6 rate evidence, before queue, sequence
+    /// and drop accounting; a schema 6 subscriber receives it in emission
+    /// order and every earlier event with it.
+    #[test]
+    fn schema_5_subscriber_omits_rate_evidence() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateEvidenceDecision, TraceStage};
+        let rate_evidence =
+            |role: CameraRoleLabel, decision: RateEvidenceDecision| TraceEventKind::RateEvidence {
+                role,
+                decision,
+                deltas: 30,
+                probe_deltas: None,
+                offset_us: 0,
+                elapsed_us: 7,
+            };
+        let evidence_of = |records: &[TraceRecord]| -> Vec<CameraRoleLabel> {
+            records
+                .iter()
+                .filter_map(|record| match record.event {
+                    TraceEventKind::RateEvidence { role, .. } => Some(role),
+                    _ => None,
+                })
+                .collect()
+        };
+        let state = DiagnosticState::default();
+        // The initial record and the one real stage fill this queue: the
+        // omitted records must neither take capacity nor count as drops.
+        let older = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(V5_TRACE_SCHEMA_VERSION), 2)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        operation.emit_trace(TraceEventKind::StageTiming {
+            stage: TraceStage::RateEstablishment,
+            elapsed_us: 7,
+        });
+        for _ in 0..10 {
+            for role in [CameraRoleLabel::Rgb, CameraRoleLabel::Ir] {
+                operation.emit_trace(rate_evidence(role, RateEvidenceDecision::FullWindow));
+            }
+        }
+        let mut records: Vec<_> = older.receiver.try_iter().collect();
+        records.extend(older.finish(CategoricalOutcome::Completed));
+        assert!(records.iter().all(|record| record.trace_schema == 5));
+        assert_eq!(evidence_of(&records), Vec::new(), "{records:?}");
+        assert!(
+            records.iter().any(|record| matches!(
+                record.event,
+                TraceEventKind::StageTiming {
+                    stage: TraceStage::RateEstablishment,
+                    ..
+                }
+            )),
+            "{records:?}"
+        );
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record.event, TraceEventKind::EventsDropped { .. })));
+        assert!(records
+            .iter()
+            .enumerate()
+            .all(|(index, record)| record.sequence == index as u64));
+        assert!(records.last().unwrap().terminal);
+        drop(operation);
+        drop(older);
+
+        let current = state
+            .subscribe_trace_with_capacity(0, 60_000, Some(CURRENT_TRACE_SCHEMA_VERSION), 16)
+            .unwrap();
+        let operation = state.begin(OperationClass::Authentication);
+        operation.emit_trace(TraceEventKind::StageTiming {
+            stage: TraceStage::RateEstablishment,
+            elapsed_us: 7,
+        });
+        operation.emit_trace(rate_evidence(
+            CameraRoleLabel::Rgb,
+            RateEvidenceDecision::FullWindow,
+        ));
+        operation.emit_trace(rate_evidence(
+            CameraRoleLabel::Ir,
+            RateEvidenceDecision::ProbeMissed,
+        ));
+        let records: Vec<_> = current.receiver.try_iter().collect();
+        assert_eq!(
+            evidence_of(&records),
+            [CameraRoleLabel::Rgb, CameraRoleLabel::Ir]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, TraceEventKind::StageTiming { .. }))
+                .count(),
+            1,
+            "the earlier stage still reaches a schema 6 subscriber"
+        );
+        assert!(records
+            .iter()
+            .all(|record| record.trace_schema == CURRENT_TRACE_SCHEMA_VERSION));
         assert!(records
             .iter()
             .enumerate()

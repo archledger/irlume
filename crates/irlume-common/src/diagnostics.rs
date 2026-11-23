@@ -26,11 +26,15 @@ pub const V2_TRACE_SCHEMA_VERSION: u32 = 2;
 /// client that negotiated it keeps working.
 pub const V3_TRACE_SCHEMA_VERSION: u32 = 3;
 /// The tier that added the capture-setup and finalization stages but not
-/// the sequential capture phases and grouped evaluation of the current tier.
+/// the sequential capture phases and grouped evaluation of the next tier.
 /// Kept addressable so an older client that negotiated it keeps working.
 pub const V4_TRACE_SCHEMA_VERSION: u32 = 4;
+/// The tier that added the sequential capture phases and the grouped
+/// evaluation but not the per-stream rate evidence of the current tier.
+/// Kept addressable so an older client that negotiated it keeps working.
+pub const V5_TRACE_SCHEMA_VERSION: u32 = 5;
 /// Latest trace vocabulary, requested explicitly by current clients.
-pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_TRACE_SCHEMA_VERSION: u32 = 6;
 /// Current schema for callers constructing new records, not a subscription default.
 pub const TRACE_SCHEMA_VERSION: u32 = CURRENT_TRACE_SCHEMA_VERSION;
 pub const DEFAULT_TRACE_DURATION_MS: u64 = 60_000;
@@ -812,6 +816,30 @@ diagnostic_enum!(EmitterTraceOutcome {
     RestoreFailed,
     Unavailable,
 });
+// Schema 6 adds `RateEvidence`, one record per stream after a pair's
+// rate establishment: whether the stream paid its full delivered-rate
+// window or was admitted on the continuity probe, why, how many deltas it
+// collected, and when its own window collection began and ended relative
+// to the pair fill (ADR-0021). No record carries a score or a frame.
+/// How one stream's delivered-rate window was established for a capture
+/// session (ADR-0021). A completion is a full window that met its floor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateEvidenceDecision {
+    /// No completion to reuse, so the session paid the full window: its
+    /// first session for this node and role in the process, a changed
+    /// node, or an earlier invalidating event.
+    FullWindow,
+    /// A completion is recorded but older than the 24-hour bound.
+    StaleFullWindow,
+    /// Reuse is switched off by `IRLUME_RATE_AMORTIZATION=0`.
+    DisabledFullWindow,
+    /// A completion admitted the session on its own continuity probe.
+    ProbeAdmitted,
+    /// The probe missed: the completion was revoked and the session paid
+    /// the full window.
+    ProbeMissed,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct TraceMeasurement {
@@ -893,6 +921,23 @@ pub enum TraceEventKind {
         role: CameraRoleLabel,
         count: u32,
     },
+    /// How one stream's delivered-rate window was established (schema 6).
+    RateEvidence {
+        role: CameraRoleLabel,
+        decision: RateEvidenceDecision,
+        /// Deltas held by the window that established the session: 5
+        /// through 15 after `ProbeAdmitted`, the full width otherwise.
+        deltas: u32,
+        /// Deltas the missed probe had collected, from 0 through 15.
+        /// Present only for `ProbeMissed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe_deltas: Option<u32>,
+        /// Microseconds from the start of the pair fill to the start of
+        /// this stream's own window collection.
+        offset_us: u64,
+        /// Microseconds this stream's own window collection took.
+        elapsed_us: u64,
+    },
     Decision {
         verdict: TraceVerdict,
         measurements: Vec<TraceMeasurement>,
@@ -940,6 +985,11 @@ impl TraceEventKind {
                     | TraceStage::GroupedEvaluation
             };
         }
+        if matches!(self, Self::RateEvidence { .. }) {
+            // Schema 6 is the first tier that defines the per-stream rate
+            // evidence, and an unknown newer tier is refused as before.
+            return schema == CURRENT_TRACE_SCHEMA_VERSION;
+        }
         match schema {
             LEGACY_TRACE_SCHEMA_VERSION => !matches!(
                 self,
@@ -976,6 +1026,7 @@ impl TraceEventKind {
                     ..
                 }
             ),
+            V5_TRACE_SCHEMA_VERSION => true,
             CURRENT_TRACE_SCHEMA_VERSION => true,
             _ => false,
         }
@@ -1162,6 +1213,22 @@ fn validate_trace_event(event: &TraceEventKind) -> Result<(), TraceParseError> {
             Err(TraceParseError::InvalidEvent)
         }
         TraceEventKind::EventsDropped { count: 0 } => Err(TraceParseError::InvalidEvent),
+        TraceEventKind::RateEvidence {
+            decision,
+            deltas,
+            probe_deltas,
+            ..
+        } => {
+            use RateEvidenceDecision::{
+                DisabledFullWindow, FullWindow, ProbeAdmitted, ProbeMissed, StaleFullWindow,
+            };
+            match (*decision, *deltas, *probe_deltas) {
+                (ProbeAdmitted, 5..=15, None)
+                | (ProbeMissed, 30, Some(0..=15))
+                | (FullWindow | StaleFullWindow | DisabledFullWindow, 30, None) => Ok(()),
+                _ => Err(TraceParseError::InvalidEvent),
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -1618,7 +1685,7 @@ mod tests {
                 true,
             ),
         ];
-        for schema in [1, 2, 3, 4, 5] {
+        for schema in [1, 2, 3, 4, 5, 6] {
             for record in &mut records {
                 record.trace_schema = schema;
             }
@@ -1632,7 +1699,7 @@ mod tests {
                 Err(TraceParseError::Schema)
             ));
         }
-        for schema in [0, 6, u32::MAX] {
+        for schema in [0, 7, u32::MAX] {
             records[0].trace_schema = schema;
             assert!(matches!(
                 parse_trace(std::io::Cursor::new(trace_jsonl(&records)), limits),
@@ -1833,6 +1900,158 @@ mod tests {
             .unwrap();
             assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
             assert!(typed.supports_schema(V4_TRACE_SCHEMA_VERSION));
+        }
+    }
+
+    /// Schema 6 adds the per-stream rate evidence; every older tier's
+    /// parser would fail on the unknown event, so no schema 1 to 5 record
+    /// may carry one.
+    #[test]
+    fn trace_v6_rate_evidence_is_not_valid_below_v6() {
+        let limits = TraceLimits::bounded(1000);
+        let events = [
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"full_window",
+                "deltas":30, "offset_us":95, "elapsed_us":8_390_000
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"ir", "decision":"stale_full_window",
+                "deltas":30, "offset_us":333_000, "elapsed_us":2_010_000
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"disabled_full_window",
+                "deltas":30, "offset_us":0, "elapsed_us":1_000
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"ir", "decision":"probe_admitted",
+                "deltas":5, "offset_us":333_000, "elapsed_us":340_000
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_missed",
+                "deltas":30, "probe_deltas":15, "offset_us":0, "elapsed_us":8_390_000
+            }),
+        ];
+        for event in events {
+            let typed = serde_json::from_value::<TraceEventKind>(event.clone())
+                .expect("schema 6 closed event vocabulary must deserialize");
+            assert_eq!(serde_json::to_value(&typed).unwrap(), event);
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            let mut record = trace_record(0, typed.clone(), false);
+            record.trace_schema = CURRENT_TRACE_SCHEMA_VERSION;
+            let mut validator = TraceValidator::new(limits).unwrap();
+            assert!(validator
+                .push_line(&serde_json::to_vec(&record).unwrap())
+                .is_ok());
+            for schema in [
+                V5_TRACE_SCHEMA_VERSION,
+                V4_TRACE_SCHEMA_VERSION,
+                V3_TRACE_SCHEMA_VERSION,
+                V2_TRACE_SCHEMA_VERSION,
+                LEGACY_TRACE_SCHEMA_VERSION,
+            ] {
+                assert!(!typed.supports_schema(schema), "{event} under {schema}");
+                record.trace_schema = schema;
+                let mut validator = TraceValidator::new(limits).unwrap();
+                assert!(
+                    matches!(
+                        validator.push_line(&serde_json::to_vec(&record).unwrap()),
+                        Err(TraceParseError::Schema)
+                    ),
+                    "{event} under schema {schema}"
+                );
+            }
+        }
+        // The closed vocabulary refuses any other decision, role or prose.
+        for event in [
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"admitted",
+                "deltas":5, "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"thermal", "decision":"probe_admitted",
+                "deltas":5, "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"fast enough",
+                "deltas":5, "offset_us":0, "elapsed_us":1
+            }),
+            serde_json::json!({
+                "event":"rate_evidence", "role":"rgb", "decision":"probe_admitted",
+                "offset_us":0, "elapsed_us":1
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<TraceEventKind>(event.clone()).is_err(),
+                "{event}"
+            );
+        }
+        // Every earlier event remains valid at the new tier and at schema 5.
+        for event in [
+            serde_json::json!({"event":"stage_timing", "stage":"rate_establishment", "elapsed_us":1}),
+            serde_json::json!({"event":"stage_timing", "stage":"sequential_ir_start", "elapsed_us":1}),
+        ] {
+            let typed = serde_json::from_value::<TraceEventKind>(event).unwrap();
+            assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+            assert!(typed.supports_schema(V5_TRACE_SCHEMA_VERSION));
+        }
+    }
+
+    #[test]
+    fn trace_v6_rate_evidence_enforces_decision_delta_counts() {
+        use RateEvidenceDecision::{
+            DisabledFullWindow, FullWindow, ProbeAdmitted, ProbeMissed, StaleFullWindow,
+        };
+
+        let validate = |decision, deltas, probe_deltas| {
+            let event = TraceEventKind::RateEvidence {
+                role: CameraRoleLabel::Rgb,
+                decision,
+                deltas,
+                probe_deltas,
+                offset_us: 0,
+                elapsed_us: 1_000,
+            };
+            let mut record = trace_record(0, event, false);
+            record.trace_schema = CURRENT_TRACE_SCHEMA_VERSION;
+            TraceValidator::new(TraceLimits::bounded(1000))
+                .unwrap()
+                .push_line(&serde_json::to_vec(&record).unwrap())
+        };
+        for decision in [FullWindow, StaleFullWindow, DisabledFullWindow] {
+            assert!(validate(decision, 30, None).is_ok(), "{decision:?}");
+            for (deltas, probe_deltas) in [(30, Some(5)), (29, None), (31, None)] {
+                assert!(
+                    matches!(
+                        validate(decision, deltas, probe_deltas),
+                        Err(TraceParseError::InvalidEvent)
+                    ),
+                    "{decision:?}, {deltas}, {probe_deltas:?}"
+                );
+            }
+        }
+        for deltas in [5, 11, 15] {
+            assert!(validate(ProbeAdmitted, deltas, None).is_ok());
+        }
+        for (decision, deltas, probe_deltas) in [
+            (ProbeAdmitted, 4, None),
+            (ProbeAdmitted, 16, None),
+            (ProbeAdmitted, 5, Some(5)),
+            (ProbeAdmitted, 5, Some(30)),
+            (ProbeMissed, 29, Some(0)),
+            (ProbeMissed, 31, Some(15)),
+            (ProbeMissed, 30, None),
+            (ProbeMissed, 30, Some(16)),
+        ] {
+            assert!(
+                matches!(
+                    validate(decision, deltas, probe_deltas),
+                    Err(TraceParseError::InvalidEvent)
+                ),
+                "{decision:?}, {deltas}, {probe_deltas:?}"
+            );
+        }
+        for probe_deltas in [0, 5, 15] {
+            assert!(validate(ProbeMissed, 30, Some(probe_deltas)).is_ok());
         }
     }
 

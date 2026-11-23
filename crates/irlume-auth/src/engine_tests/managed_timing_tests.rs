@@ -2,7 +2,9 @@
 // Copyright the irlume contributors.
 
 use crate::managed_pad::capture_with_timing;
-use irlume_common::diagnostics::{DiagnosticSink, TraceEventKind, TraceStage};
+use irlume_common::diagnostics::{
+    DiagnosticSink, TraceEventKind, TraceStage, CURRENT_TRACE_SCHEMA_VERSION,
+};
 use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
@@ -261,4 +263,114 @@ fn managed_timing_elapsed_includes_the_capture_callback_work() {
         [TraceEventKind::StageTiming { elapsed_us, .. }]
             if u128::from(*elapsed_us) >= minimum.as_micros()
     ));
+}
+
+fn rate_evidence(
+    role: irlume_common::diagnostics::CameraRoleLabel,
+    decision: irlume_common::diagnostics::RateEvidenceDecision,
+) -> TraceEventKind {
+    TraceEventKind::RateEvidence {
+        role,
+        decision,
+        deltas: 30,
+        probe_deltas: None,
+        offset_us: 0,
+        elapsed_us: 7,
+    }
+}
+
+/// Each stream's rate evidence reaches the trace once, RGB before IR, and
+/// only for a stream whose fill established a window (ADR-0021). It is not
+/// a stage timing, so it takes no part in a capture round or the envelope.
+#[test]
+fn rate_evidence_is_reported_once_per_established_stream_rgb_before_ir() {
+    use irlume_common::diagnostics::{
+        CameraRoleLabel, RateEvidenceDecision, V5_TRACE_SCHEMA_VERSION,
+    };
+    let rgb = rate_evidence(CameraRoleLabel::Rgb, RateEvidenceDecision::FullWindow);
+    let ir = rate_evidence(CameraRoleLabel::Ir, RateEvidenceDecision::ProbeAdmitted);
+    for (given, expected) in [
+        (
+            [Some(rgb.clone()), Some(ir.clone())],
+            vec![rgb.clone(), ir.clone()],
+        ),
+        ([Some(rgb.clone()), None], vec![rgb.clone()]),
+        ([None, Some(ir.clone())], vec![ir.clone()]),
+        ([None, None], vec![]),
+    ] {
+        let sink = TimingSink::default();
+        crate::emit_rate_evidence(&sink, given);
+        assert_eq!(sink.events(), expected);
+    }
+    for event in [rgb, ir] {
+        assert!(event.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
+        assert!(!event.supports_schema(V5_TRACE_SCHEMA_VERSION));
+        assert!(!matches!(event, TraceEventKind::StageTiming { .. }));
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.starts_with("{\"event\":\"rate_evidence\""), "{json}");
+        assert!(!json.contains("/dev"), "{json}");
+    }
+}
+
+fn assert_rate_evidence_report(text: &str) {
+    let emit = text
+        .find("emit_rate_evidence(")
+        .expect("the records are emitted");
+    let rgb = text
+        .find("rgb.diagnostic_rate_evidence()")
+        .expect("the RGB record is read");
+    let ir = text
+        .find("ir.diagnostic_rate_evidence()")
+        .expect("the IR record is read");
+    assert!(
+        emit < rgb && rgb < ir,
+        "both records are read, RGB before IR, into one report: {text}"
+    );
+}
+
+/// Native sessions exist only with a camera, so the two sites that time a
+/// pair's rate establishment are pinned by shape: each reads both streams'
+/// records right after the fill and before the fill's error handling, so a
+/// stream whose window was established before its twin failed still reports.
+#[test]
+fn both_pair_fills_report_each_streams_rate_evidence_after_the_fill() {
+    let lib = include_str!("../lib.rs");
+    let eager = lib
+        .split("\n    fn assess_with_fresh_pair_finish<T>(")
+        .nth(1)
+        .expect("the eager pair assessment");
+    let after = eager
+        .split_once("let rate = irlume_camera::establish_pair_rate(rgb, ir);")
+        .expect("the eager pair fill")
+        .1;
+    let reported = after
+        .split_once("rate.map_err(|error|")
+        .expect("the fill's error handling")
+        .0;
+    // This route times the block itself, first, then decomposes it.
+    assert!(
+        reported
+            .find("TraceStage::RateEstablishment")
+            .zip(reported.find("emit_rate_evidence("))
+            .is_some_and(|(block, evidence)| block < evidence),
+        "the block's own timing is reported first: {reported}"
+    );
+    assert_rate_evidence_report(reported);
+
+    let managed = include_str!("../managed_pad.rs");
+    let (before, after) = managed
+        .split_once("let established = irlume_camera::establish_pair_rate(rgb, ir);")
+        .expect("the managed pair fill");
+    let reported = after
+        .split_once("established.map_err(|error|")
+        .expect("the fill's error handling")
+        .0;
+    assert!(before.contains("with_managed_pair("));
+    // Here the block's timer wraps this whole closure, so the records
+    // precede the block's own timing record on this route.
+    assert!(
+        !reported.contains("TraceStage::"),
+        "the managed block's timer closes after this closure: {reported}"
+    );
+    assert_rate_evidence_report(reported);
 }

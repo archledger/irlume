@@ -355,7 +355,18 @@ impl Engine {
                     })
                 },
                 |rgb, ir| {
-                    irlume_camera::establish_pair_rate(rgb, ir).map_err(|error| {
+                    // Each stream's rate evidence follows its own outcome, so
+                    // a stream whose window was established before its twin
+                    // failed still reports how (ADR-0021 telemetry).
+                    let established = irlume_camera::establish_pair_rate(rgb, ir);
+                    emit_rate_evidence(
+                        diagnostics,
+                        [
+                            rgb.diagnostic_rate_evidence(),
+                            ir.diagnostic_rate_evidence(),
+                        ],
+                    );
+                    established.map_err(|error| {
                         concurrent_setup_error(
                             Some(mode),
                             diagnostics,

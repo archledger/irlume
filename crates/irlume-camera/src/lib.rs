@@ -2018,6 +2018,14 @@ struct TrackedStream<S> {
     /// Set when a continuity probe admitted this session; the per-frame
     /// sliding judgment keeps running either way.
     health_admitted: bool,
+    /// The start of the pair fill this stream is part of, set by the paired
+    /// fill so the stream's rate evidence can say when its own window
+    /// collection began relative to it.
+    pair_fill_started: Option<std::time::Instant>,
+    /// How this session's rate window was last established (the schema 6
+    /// `RateEvidence` record), from the fill that established it until the
+    /// window is revoked; see [`Self::record_rate_evidence`].
+    rate_evidence: Option<irlume_common::diagnostics::TraceEventKind>,
 }
 
 impl<S> TrackedStream<S> {
@@ -2035,6 +2043,8 @@ impl<S> TrackedStream<S> {
             recovery_epoch_pending: false,
             amort_key: None,
             health_admitted: false,
+            pair_fill_started: None,
+            rate_evidence: None,
         }
     }
 
@@ -2042,6 +2052,35 @@ impl<S> TrackedStream<S> {
     fn with_rate_amortization(mut self, node: &str) -> Self {
         self.amort_key = Some(rate_amortization::Key::new(node, self.rate_config.role()));
         self
+    }
+
+    /// Record how the window just established was established. `collected_since`
+    /// is when this stream's collection of that window began, after its
+    /// startup flush; the count is read from the window as it stands.
+    fn record_rate_evidence(
+        &mut self,
+        decision: irlume_common::diagnostics::RateEvidenceDecision,
+        probe_deltas: Option<usize>,
+        collected_since: std::time::Instant,
+    ) {
+        self.rate_evidence = Some(rate_amortization::rate_evidence(
+            self.rate_config.role(),
+            decision,
+            self.rate_window.count(),
+            probe_deltas,
+            self.pair_fill_started
+                .map_or(std::time::Duration::ZERO, |started| {
+                    collected_since.saturating_duration_since(started)
+                }),
+            collected_since.elapsed(),
+        ));
+    }
+
+    /// The stream's window is no longer established (a recovery epoch, a
+    /// revoked paired admission or a parked startup buffer): the record of
+    /// the window it replaced no longer describes this session.
+    fn clear_rate_evidence(&mut self) {
+        self.rate_evidence = None;
     }
 
     /// Revoke this stream's ADR-0021 rate-amortization entry. Shared by the
@@ -2108,6 +2147,7 @@ impl<S> TrackedStream<S> {
         // fill to re-run, which is where `begin_recovered_continuity_epoch`
         // then re-seeds the baseline in the new epoch.
         self.rate_window.reset();
+        self.clear_rate_evidence();
         // A recovery epoch also revokes a probe admission (ADR-0021, decision
         // item 3), as `invalidate_paired_rate_admission` does.
         self.health_admitted = false;
@@ -2450,10 +2490,10 @@ impl<S: ValidatedStream> TrackedStream<S> {
         // A probe-eligible stream always measures post-flush, so it takes the
         // fixed-flush path even when the caller asked for adaptive startup:
         // the probe cannot distinguish a STREAMON transient from degradation.
-        let probe_eligible = self
-            .amort_key
-            .as_ref()
-            .is_some_and(rate_amortization::amortizable);
+        // The basis is also what the rate evidence later names when the
+        // session pays the full window.
+        let reuse = rate_amortization::Reuse::for_key(self.amort_key.as_ref());
+        let probe_eligible = reuse == rate_amortization::Reuse::Recent;
         let adaptive_ir = adaptive_ir && !probe_eligible;
         // Exclude a role's measured STREAMON transient. With no exclusion
         // (RGB), retain successful timing observations from AE warm-up: they
@@ -2475,6 +2515,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 self.rate_window.reset();
             }
         }
+        // When this stream began collecting the window that will establish
+        // it. RGB keeps its warm-up deltas here, so for RGB the duration
+        // covers only the part of the window the fill itself collects.
+        let mut collected_since = std::time::Instant::now();
+        let mut probe_missed: Option<usize> = None;
         // ADR-0021 continuity probe: when this node and role completed a full
         // floor-passing window recently in this process and nothing
         // invalidating happened since, seed + a handful of deltas through the
@@ -2527,6 +2572,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
                     )
                 {
                     self.health_admitted = true;
+                    self.record_rate_evidence(
+                        irlume_common::diagnostics::RateEvidenceDecision::ProbeAdmitted,
+                        None,
+                        collected_since,
+                    );
                     return Ok(());
                 }
                 // The escalated probe missed: the current session is not
@@ -2547,7 +2597,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
                     self.rate_window.max_delta_us()
                 );
                 rate_amortization::invalidate(&key);
+                probe_missed = Some(self.rate_window.count());
                 self.rate_window.reset();
+                self.clear_rate_evidence();
+                // The full window that follows is a new collection.
+                collected_since = std::time::Instant::now();
             }
         }
         let mut attempts = 0;
@@ -2612,6 +2666,11 @@ impl<S: ValidatedStream> TrackedStream<S> {
                 self.next_discarded()?;
             }
         }
+        self.record_rate_evidence(
+            rate_amortization::full_window_decision(reuse, probe_missed.is_some()),
+            probe_missed,
+            collected_since,
+        );
         Ok(())
     }
 
@@ -2962,7 +3021,10 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
     secondary: &mut TrackedStream<B>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
-    let (preparation, parked) = establish_paired_rate_pass(primary, secondary, &cancelled);
+    // Report collection offsets from the start of the entire paired fill,
+    // including preparation that is revoked after a Parked buffer.
+    let started = std::time::Instant::now();
+    let (preparation, parked) = establish_paired_rate_pass(primary, secondary, &cancelled, started);
     if parked {
         // Neither worker's preparation readiness survives a paired Parked.
         // Both workers have joined. Revoke both contributions even if that
@@ -2973,7 +3035,7 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
     }
     preparation?;
     if parked {
-        let (fresh, pending) = establish_paired_rate_pass(primary, secondary, &cancelled);
+        let (fresh, pending) = establish_paired_rate_pass(primary, secondary, &cancelled, started);
         if fresh.is_err() || pending {
             invalidate_paired_rate_admission(primary);
             invalidate_paired_rate_admission(secondary);
@@ -2991,6 +3053,7 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
 fn invalidate_paired_rate_admission<S: ValidatedStream>(stream: &mut TrackedStream<S>) {
     stream.health_admitted = false;
     stream.rate_window.reset();
+    stream.clear_rate_evidence();
     if let Some(key) = &stream.amort_key {
         rate_amortization::invalidate(key);
     }
@@ -3000,14 +3063,18 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
     primary: &mut TrackedStream<A>,
     secondary: &mut TrackedStream<B>,
     cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pair_fill_started: std::time::Instant,
 ) -> (std::io::Result<()>, bool) {
     let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut primary_parked = 0;
     let mut secondary_parked = 0;
+    primary.pair_fill_started = Some(pair_fill_started);
+    secondary.pair_fill_started = Some(pair_fill_started);
     let result = std::thread::scope(|scope| {
         let a = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(cancelled);
+            let primary = &mut *primary;
             let parked = &mut primary_parked;
             scope.spawn(hostfs::inherit(move || {
                 drain_until_both_ready(primary, &count, &cancelled, parked)
@@ -3016,6 +3083,7 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
         let b = {
             let count = std::sync::Arc::clone(&ready_count);
             let cancelled = std::sync::Arc::clone(cancelled);
+            let secondary = &mut *secondary;
             let parked = &mut secondary_parked;
             scope.spawn(hostfs::inherit(move || {
                 drain_until_both_ready(secondary, &count, &cancelled, parked)
@@ -3037,6 +3105,9 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
             (_, Err(b)) => Err(b),
         }
     });
+    // Keep the completed records, but not the clock origin for a later fill.
+    primary.pair_fill_started = None;
+    secondary.pair_fill_started = None;
     // Preserve the handled-Parked evidence even when preparation failed.
     (result, primary_parked != 0 || secondary_parked != 0)
 }
@@ -3066,6 +3137,7 @@ fn next_paired_startup_discard<S: ValidatedStream>(
                 // Only a new pre-admission stream may consume this exact return.
                 *parked += 1;
                 stream.rate_window.reset();
+                stream.clear_rate_evidence();
                 if let Some(key) = &stream.amort_key {
                     rate_amortization::invalidate(key);
                 }
@@ -3104,6 +3176,14 @@ fn drain_until_both_ready<S: ValidatedStream>(
         }
     }
     stream.rate_window.reset();
+    // Whatever window this stream held is gone: a stream that a standalone
+    // fill established before the pair fill leaves no record of it behind,
+    // so a fill that fails at its next dequeue reports nothing rather than
+    // how a window that no longer stands was established.
+    stream.clear_rate_evidence();
+    // When this stream began collecting the window that will establish it,
+    // after its flush; each stream's rate evidence measures from here.
+    let mut collected_since = std::time::Instant::now();
     // ADR-0021 continuity probe for the CONCURRENT path, in parity with the
     // single-stream fill: a full floor-passing window completed recently on
     // this node and role may admit the session after seed + a handful of
@@ -3115,10 +3195,14 @@ fn drain_until_both_ready<S: ValidatedStream>(
     // pair from paying the cold fill on every attempt (measured ~4.4s per
     // concurrent attempt before this).
     let mut reported = false;
+    // What the probe could reuse, as it stands now; a full window below is
+    // paid under the decision this implies.
+    let reuse = rate_amortization::Reuse::for_key(stream.amort_key.as_ref());
+    let mut probe_missed: Option<usize> = None;
     if let Some(key) = stream
         .amort_key
         .clone()
-        .filter(|key| *parked_startup == 0 && rate_amortization::amortizable(key))
+        .filter(|_| *parked_startup == 0 && reuse == rate_amortization::Reuse::Recent)
     {
         let mut attempts = 0;
         while stream.rate_window.count() < rate_amortization::CONTINUITY_PROBE_DELTAS
@@ -3176,6 +3260,11 @@ fn drain_until_both_ready<S: ValidatedStream>(
                 "[rate-fill] concurrent probe admitted after {} deltas",
                 stream.rate_window.count()
             );
+            stream.record_rate_evidence(
+                irlume_common::diagnostics::RateEvidenceDecision::ProbeAdmitted,
+                None,
+                collected_since,
+            );
         } else {
             // The escalated probe missed: this session is not delivering at
             // floor, so the cached evidence is stale in the harmful
@@ -3194,7 +3283,11 @@ fn drain_until_both_ready<S: ValidatedStream>(
                 stream.rate_window.max_delta_us()
             );
             rate_amortization::invalidate(&key);
+            probe_missed = Some(stream.rate_window.count());
             stream.rate_window.reset();
+            stream.clear_rate_evidence();
+            // The full window that follows is a new collection.
+            collected_since = std::time::Instant::now();
         }
     }
     let mut attempts = 0usize;
@@ -3212,6 +3305,11 @@ fn drain_until_both_ready<S: ValidatedStream>(
         if !reported && stream.rate_window.ready() {
             ready_count.fetch_add(1, Ordering::AcqRel);
             reported = true;
+            stream.record_rate_evidence(
+                rate_amortization::full_window_decision(reuse, probe_missed.is_some()),
+                probe_missed,
+                collected_since,
+            );
         }
         attempts += 1;
     }
@@ -6007,6 +6105,14 @@ impl<'a> RgbSession<'a> {
         self.stream.invalidate_rate_evidence();
     }
 
+    /// How this session's delivered-rate window was established (ADR-0021),
+    /// as the schema 6 `RateEvidence` trace record: `None` until a fill has
+    /// established the window, and again once the window is revoked.
+    #[must_use]
+    pub fn diagnostic_rate_evidence(&self) -> Option<irlume_common::diagnostics::TraceEventKind> {
+        self.stream.rate_evidence.clone()
+    }
+
     /// Discard frames until auto-exposure has settled, once per session. A
     /// second capture on the same stream is already settled, and re-running the
     /// warm-up would throw away good frames to no purpose.
@@ -8276,6 +8382,14 @@ impl IrSession<'_> {
     /// items 3-5).
     pub fn invalidate_rate_evidence(&mut self) {
         self.stream.invalidate_rate_evidence();
+    }
+
+    /// How this session's delivered-rate window was established (ADR-0021),
+    /// as the schema 6 `RateEvidence` trace record: `None` until a fill has
+    /// established the window, and again once the window is revoked.
+    #[must_use]
+    pub fn diagnostic_rate_evidence(&self) -> Option<irlume_common::diagnostics::TraceEventKind> {
+        self.stream.rate_evidence.clone()
     }
 }
 
@@ -12000,6 +12114,7 @@ mod tests {
     include!("native_validator_accounting_tests.rs");
     include!("probe_bounds_tests.rs");
     include!("first_session_settle_tests.rs");
+    include!("rate_evidence_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");
     }

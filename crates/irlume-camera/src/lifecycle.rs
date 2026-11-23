@@ -1440,6 +1440,63 @@ mod tests {
         assert_eq!(*waits.lock().unwrap(), [COALESCE_QUIET, Duration::ZERO]);
     }
 
+    /// A poll of the kernel monitor that returns no relevant event or hint
+    /// is not evidence of anything: the coordinator takes no snapshot,
+    /// publishes nothing and keeps the published identity, so a reference
+    /// taken before it stays valid. Only a hint starts a rescan, and
+    /// `classify_kernel_event` makes a hint from a video4linux change or a
+    /// USB event for a camera whether or not it re-enumerated. A wake may
+    /// leave the monitor with no hint, and this is the state then; the test
+    /// does not say which wakes do. Nothing in this process observes resume.
+    #[test]
+    fn a_silent_poll_rescans_nothing_and_keeps_the_published_identity() {
+        use irlume_common::live_camera::CameraInventoryState;
+        let inventory = TestInventory::new();
+        let camera = "/devices/pci/usb1/camera";
+        // Exhausted by the startup scan, so a later scan fails the test.
+        let mut coordinator = LifecycleCoordinator::new(
+            FakeSnapshots(VecDeque::from([Ok(vec![
+                CameraObservation::with_lifecycle_evidence_and_endpoints(
+                    BackendKind::UvcV4l2,
+                    PhysicalCameraId::new(camera, None).unwrap(),
+                    CameraCapabilities::default(),
+                    vec!["stable".into()],
+                    vec!["/dev/video0".into(), "/dev/video2".into()],
+                ),
+            ])])),
+            FakeEvents(VecDeque::new()),
+        );
+        let published = coordinator.initialize(&inventory).unwrap();
+        assert_eq!(published.len(), 1);
+        let descriptor = published[0].descriptor().clone();
+        let before = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(before.state, CameraInventoryState::Current);
+
+        let events = coordinator.process_next(&inventory, MONITOR_WAIT).unwrap();
+
+        assert!(events.is_empty());
+        assert!(
+            coordinator.snapshots.0.is_empty(),
+            "a silent poll must not scan sysfs"
+        );
+        let after = inventory.0.lock().unwrap().snapshot();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.supervisor_id, before.supervisor_id);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.reason, before.reason);
+        assert_eq!(after.candidates, before.candidates);
+        assert_eq!(inventory.validate(&descriptor), Ok(()));
+        assert_eq!(
+            inventory
+                .0
+                .lock()
+                .unwrap()
+                .reference_for_endpoints(&["/dev/video0", "/dev/video2"])
+                .map(|reference| reference.descriptor().clone()),
+            Ok(descriptor)
+        );
+    }
+
     #[test]
     fn monitor_is_bound_before_initial_snapshot() {
         struct RecordingSnapshot(std::sync::Arc<Mutex<Vec<&'static str>>>);

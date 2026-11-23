@@ -257,6 +257,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- IR liveness refusals suggest moving away from strong infrared light only
+  when the camera observed a lit/dark pair for the selected frame. An
+  unconfirmed bright reading suggests using the password without diagnosing
+  the lighting. Authentication decisions are unchanged.
+
 - Camera diagnostics say irlume cannot use Intel MIPI pipelines and
   media-controller or multi-planar-only nodes without claiming Linux does not
   expose their IR sensors. Camera admission and loopback refusal stay

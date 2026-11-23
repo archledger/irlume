@@ -77,6 +77,12 @@ fn setting_badge(state: Option<bool>) -> Span<'static> {
 const MIN_WINDOW_COLS: u16 = 80;
 const MIN_WINDOW_ROWS: u16 = 24;
 
+const WEBCAM_ONLY_NOTICE: &str = "\
+Webcam-only face unlock is easier to fool than infrared face unlock.\n\
+It works only on supported lock screens after you sign in.\n\
+It cannot sign you in, approve sudo or app prompts, or open the password wallet.\n\
+You can still use your password.";
+
 fn window_fits(area: Rect) -> bool {
     area.width >= MIN_WINDOW_COLS && area.height >= MIN_WINDOW_ROWS
 }
@@ -1567,6 +1573,30 @@ impl App {
         }
     }
 
+    /// Display only. An unconfirmed IR endpoint does not establish an RGB-only tier.
+    fn observed_webcam_only(&self) -> bool {
+        self.daemon_up
+            && self
+                .health
+                .as_ref()
+                .is_some_and(|h| h.tier == "convenience" && h.ir_dev.is_none())
+            && self.face_camera_presence() == Some(true)
+            && matches!(
+                self.preference_state().face_sensor_policy.resolve(),
+                Ok(irlume_common::config::FaceSensorPolicy::Dual)
+            )
+    }
+
+    // Read the observations at render time, not when a review opens. Losing
+    // evidence changes only the copy; the existing action and keys stay put.
+    fn webcam_setup_copy<'a>(&self, applies: bool, body: &'a str) -> std::borrow::Cow<'a, str> {
+        if applies && self.observed_webcam_only() {
+            format!("{WEBCAM_ONLY_NOTICE}\n\n{body}").into()
+        } else {
+            body.into()
+        }
+    }
+
     fn update_camera_availability(&mut self) {
         let rgb = self.face_camera_presence() == Some(true);
         let ir_pair = rgb
@@ -2547,14 +2577,16 @@ impl App {
         }
         match (
             self.caps.ir_pair,
-            self.caps.rgb,
+            self.observed_webcam_only(),
             self.fp_present && self.source_usable(Source::FingerprintReader),
         ) {
             // "in the dark", never "dark mode": IR needs no visible light,
             // but "dark mode" reads as a UI theme.
             (true, _, _) => "Face (IR) · secure: login, sudo, lock screen, in the dark",
-            (false, true, true) => "Fingerprint (secure), or Face (RGB) for lock-screen only",
-            (false, true, false) => "Face (RGB) · convenience: lock-screen unlock only",
+            (false, true, true) => {
+                "Fingerprint (secure), or Face (RGB) for supported lock screens only"
+            }
+            (false, true, false) => "Face (RGB) · convenience: supported lock screens only",
             (false, false, true) => "Fingerprint",
             (false, false, false) => {
                 "Password remains available; biometric availability unconfirmed"
@@ -6109,11 +6141,11 @@ impl App {
             (SC_WELCOME, KeyCode::Char('w'))
             | (SC_PAM, KeyCode::Char('w'))
             | (SC_DONE, KeyCode::Char('w')) => {
-                self.log('→', "sudo irlume login enable --apply: wires the greeter + lock screen for your method");
-                self.log('·', "leave the password empty and press Enter to use your face (login needs the IR/secure tier; an RGB-only camera unlocks the lock screen only)");
-                self.log('·', "face-sudo is opt-in; add it later with: sudo irlume login enable --with-sudo --apply");
+                self.log('→', "sudo irlume login enable --apply: updates wiring for the current method");
                 self.confirm = Some((
-                    "Wire face authentication into login and the lock screen? This changes system PAM configuration for the current method, retaining password fallback.".into(),
+                    "Connect the current authentication method where supported?\n\
+                     This changes system authentication settings.\n\
+                     Administrator approval is required. Password fallback remains available.".into(),
                     "Wire login", ConfirmAct::Sus(Suspend::LoginEnable),
                 ));
             }
@@ -6122,16 +6154,18 @@ impl App {
             // Opt-in wiring extras; each logs the exact command then suspends,
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
-                self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt (password still works)");
+                self.log('→', "sudo irlume login enable --with-sudo --apply: updates sudo wiring for the current method");
                 self.confirm = Some((
-                    "Wire face authentication into sudo? This changes system PAM configuration; the password remains available.".into(),
+                    "Connect authentication for sudo where supported?\n\
+                     This changes system PAM configuration. Password fallback remains available.".into(),
                     "Wire sudo", ConfirmAct::Sus(Suspend::LoginEnableSudo),
                 ));
             }
             (SC_PAM, KeyCode::Char('p')) => {
-                self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts (password still works)");
+                self.log('→', "sudo irlume login enable --with-polkit --apply: updates app approval wiring for the current method");
                 self.confirm = Some((
-                    "Wire face authentication into app approval prompts? This changes system polkit PAM configuration; the password remains available.".into(),
+                    "Connect authentication for app approvals where supported?\n\
+                     This changes system polkit PAM configuration. Password fallback remains available.".into(),
                     "Wire prompts", ConfirmAct::Sus(Suspend::LoginEnablePolkit),
                 ));
             }
@@ -6968,6 +7002,7 @@ impl App {
             };
             // Prompt in the wrapping body (a long name/prompt would truncate as a
             // border title); the typed field on its own line below it.
+            let prompt = self.webcam_setup_copy(matches!(pending, Pending::EnrollName), prompt);
             self.modal(
                 f,
                 "Input",
@@ -6977,14 +7012,26 @@ impl App {
                     ("[Enter] Continue", KeyCode::Enter),
                 ],
             );
-        } else if let Some((what, _, _)) = &self.confirm {
+        } else if let Some((what, verb, act)) = &self.confirm {
             // Question in the body so a long target name isn't clipped by the
             // single-line border title.
-            let verb = self.confirm.as_ref().map(|c| c.1).unwrap_or("Confirm");
+            let face_setup = match act {
+                ConfirmAct::Sus(
+                    Suspend::LoginEnable | Suspend::LoginEnableSudo | Suspend::LoginEnablePolkit,
+                ) => true,
+                ConfirmAct::Sus(Suspend::MoreAction(invocation)) => matches!(
+                    invocation.action.args,
+                    ["enroll"]
+                        | ["enroll", "--reset"]
+                        | ["login", "enable", "--with-sudo", "--with-polkit", "--apply"]
+                ),
+                _ => false,
+            };
+            let what = self.webcam_setup_copy(face_setup, what);
             self.modal(
                 f,
                 "Confirm",
-                what,
+                &what,
                 &[
                     ("[Esc] Cancel", KeyCode::Esc),
                     (&format!("[y] {verb}"), KeyCode::Char('y')),
@@ -7095,22 +7142,29 @@ impl App {
         } else {
             "Private, local enrollment with your RGB camera."
         };
-        self.draw_action_paragraph(
-            f,
-            guidance,
-            vec![
-                Line::raw(camera),
-                Line::raw("Your password remains available during and after setup."),
-                Line::raw(""),
-                Line::raw("1  Look at the camera"),
-                Line::raw("2  Follow the cues"),
-                Line::raw("3  Finish login setup"),
-                Line::raw(""),
-                Line::raw("F3 chooses a section; Tab goes to the next section."),
-                Line::raw("v shows or hides technical tools."),
-            ],
-            &[],
-        );
+        let webcam_only = self.observed_webcam_only();
+        let mut lines = vec![Line::raw(camera)];
+        if webcam_only {
+            lines.extend(WEBCAM_ONLY_NOTICE.lines().map(Line::raw));
+        } else {
+            lines.push(Line::raw(
+                "Your password remains available during and after setup.",
+            ));
+        }
+        lines.extend([
+            Line::raw(""),
+            Line::raw("1  Look at the camera"),
+            Line::raw("2  Follow the cues"),
+            Line::raw(if webcam_only {
+                "3  Finish setup"
+            } else {
+                "3  Finish login setup"
+            }),
+            Line::raw(""),
+            Line::raw("F3 chooses a section; Tab goes to the next section."),
+            Line::raw("v shows or hides technical tools."),
+        ]);
+        self.draw_action_paragraph(f, guidance, lines, &[]);
     }
 
     /// The left navigation rail: the visible screens grouped Setup / System /
@@ -10097,13 +10151,13 @@ impl App {
         // at the greeter. On a convenience (RGB-only) box face is lock-screen
         // only; describing keyring-unseal there would be a false promise.
         match self.health.as_ref().map(|h| h.tier.as_str()) {
-            Some("convenience") => {
+            Some("convenience") if self.observed_webcam_only() => {
                 lines.push(Line::from(Span::styled(
-                    "  greeter (RGB-only): face is NOT accepted for login; password only",
+                    "  greeter (RGB-only): face is not accepted for login",
                     Style::new().dim(),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "  lock screen: face unlocks the screen (no credential release)",
+                    "  face is only for supported lock screens after you sign in",
                     Style::new().dim(),
                 )));
             }
@@ -10138,21 +10192,36 @@ impl App {
             &mut page_actions,
             "w",
             "Wire login + lock",
-            "the core action; leave the password empty then Enter to use your face",
+            "connect the current authentication method where supported",
         );
+        let secure_face = self.daemon_up
+            && self.source_usable(Source::Health)
+            && self
+                .health
+                .as_ref()
+                .is_some_and(|health| health.tier == "secure" && health.ir_dev.is_some())
+            && matches!(
+                self.preference_state().face_sensor_policy.resolve(),
+                Ok(irlume_common::config::FaceSensorPolicy::Dual)
+            );
+        let extra_wiring_hint = if secure_face {
+            "optional; if prompted, type yes for one face attempt"
+        } else {
+            "optional; connects the current method where supported"
+        };
         push_page_action(
             &mut lines,
             &mut page_actions,
             "u",
             "Wire face-sudo",
-            "opt-in; type yes for one face attempt at sudo prompts",
+            extra_wiring_hint,
         );
         push_page_action(
             &mut lines,
             &mut page_actions,
             "p",
             "Wire app prompts",
-            "opt-in; type yes for one face attempt at app prompts",
+            extra_wiring_hint,
         );
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -12243,6 +12312,7 @@ mod tests {
     include!("tui/bitwarden_action_tests.rs");
     include!("tui/camera_layout_tests.rs");
     include!("tui/enrollment_cancel_tests.rs");
+    include!("tui/webcam_disclosure_tests.rs");
     /// Serializes tests that mutate process-global environment (IRLUME_SOCKET,
     /// PATH) so they can't race each other under the parallel test runner.
     /// One binary-wide lock: main.rs and commands.rs tests use the same one,
@@ -15560,7 +15630,6 @@ mod tests {
 
     #[test]
     fn recommended_covers_every_hardware_tier() {
-        let mut app = test_app();
         let cases = [
             (true, true, true, "Face (IR)"),
             (false, true, true, "Fingerprint (secure), or Face (RGB)"),
@@ -15569,7 +15638,16 @@ mod tests {
             (false, false, false, "Password remains available"),
         ];
         for (ir_pair, rgb, fp, want) in cases {
-            app.caps = irlume_camera::Caps { ir_pair, rgb };
+            let mut app = if ir_pair {
+                live_test_app()
+            } else {
+                webcam_setup_app()
+            };
+            if !rgb {
+                let mut snapshot = live_test_snapshot();
+                snapshot.cameras.candidates.clear();
+                app.apply_live_snapshot(snapshot, app.now());
+            }
             app.fp_present = fp;
             let got = app.recommended();
             assert!(
@@ -21849,7 +21927,7 @@ mod tests {
         assert!(text.contains("[p]") && text.contains("Wire app prompts"));
         assert!(text.contains("[s]") && text.contains("Show full status"));
         assert!(text.contains("[x]") && text.contains("Un-wire everything"));
-        assert!(text.contains("type yes for one face attempt"), "{text}");
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
         for retired in [
             "Calibrate gesture",
             "Calibrate Gesture",
@@ -21874,26 +21952,25 @@ mod tests {
                 "retired PAM help remains: {retired}"
             );
         }
-        app.health = Some(HealthInfo {
-            tier: "convenience".into(),
-            rgb_dev: Some("/dev/video0".into()),
-            ir_dev: None,
-            mesh: false,
-            adapter: false,
-            rgb_pad: None,
-            ir_pad: None,
-            version: "1.0".into(),
-            apparmor: None,
-        });
+        let mut app = webcam_setup_app();
+        app.screen = SC_PAM;
         let text = draw_text(&app);
         assert!(
-            text.contains("face is NOT accepted for login"),
+            text.contains("face is not accepted for login"),
             "RGB-only must not promise greeter login"
         );
-        app.health.as_mut().unwrap().tier = "secure".into();
+        assert!(text.contains("supported lock screens after you sign in"));
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
+        let mut app = live_test_app();
+        app.screen = SC_PAM;
+        app.preferences = Some(preference_fixture(false));
         let text = draw_text(&app);
         assert!(text.contains("TPM-unseal password"));
         assert!(text.contains("always fail-safe to the password"));
+        assert!(text.contains("type yes for one face attempt"), "{text}");
+        app.freshness.observation_mut(Source::Health).invalidate();
+        let text = draw_text(&app);
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
     }
 
     #[test]

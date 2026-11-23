@@ -1587,6 +1587,24 @@ impl App {
             )
     }
 
+    /// Display only. A cached tier or capability bit is not a live pair.
+    fn observed_ir_pair(&self) -> bool {
+        self.daemon_up
+            && self.source_usable(Source::Health)
+            && self.health.as_ref().is_some_and(|health| {
+                health.tier == "secure"
+                    && health
+                        .rgb_dev
+                        .as_deref()
+                        .zip(health.ir_dev.as_deref())
+                        .is_some_and(|(rgb, ir)| rgb != ir && self.camera_choice(rgb, ir).is_some())
+            })
+            && matches!(
+                self.preference_state().face_sensor_policy.resolve(),
+                Ok(irlume_common::config::FaceSensorPolicy::Dual)
+            )
+    }
+
     // Read the observations at render time, not when a review opens. Losing
     // evidence changes only the copy; the existing action and keys stay put.
     fn webcam_setup_copy<'a>(&self, applies: bool, body: &'a str) -> std::borrow::Cow<'a, str> {
@@ -10147,35 +10165,30 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(section("What each does"));
-        // Tier-accurate: only the Secure (IR) tier releases the login credential
-        // at the greeter. On a convenience (RGB-only) box face is lock-screen
-        // only; describing keyring-unseal there would be a false promise.
-        match self.health.as_ref().map(|h| h.tier.as_str()) {
-            Some("convenience") if self.observed_webcam_only() => {
-                lines.push(Line::from(Span::styled(
-                    "  greeter (RGB-only): face is not accepted for login",
-                    Style::new().dim(),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  face is only for supported lock screens after you sign in",
-                    Style::new().dim(),
-                )));
-            }
-            Some("secure") => {
-                lines.push(Line::from(Span::styled(
-                    "  greeter: face → TPM-unseal password → wallet opens at login",
-                    Style::new().dim(),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  lock screen: face verify-only (wallet already open)",
-                    Style::new().dim(),
-                )));
-            }
-            // Daemon unreachable/older, or no camera; don't promise credential release.
-            _ => lines.push(Line::from(Span::styled(
+        let secure_face = self.observed_ir_pair();
+        if secure_face {
+            lines.push(Line::from(Span::styled(
+                "  supported greeter: face can TPM-unseal password for a configured wallet",
+                Style::new().dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  lock screen: face verification only, no wallet release",
+                Style::new().dim(),
+            )));
+        } else if self.observed_webcam_only() {
+            lines.push(Line::from(Span::styled(
+                "  greeter (RGB-only): face is not accepted for login",
+                Style::new().dim(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  face is only for supported lock screens after you sign in",
+                Style::new().dim(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
                 "  tier unknown (observation unavailable); password remains the fallback",
                 Style::new().dim(),
-            ))),
+            )));
         }
         lines.push(Line::from(Span::styled(
             "  always fail-safe to the password: no lockout.",
@@ -10194,16 +10207,6 @@ impl App {
             "Wire login + lock",
             "connect the current authentication method where supported",
         );
-        let secure_face = self.daemon_up
-            && self.source_usable(Source::Health)
-            && self
-                .health
-                .as_ref()
-                .is_some_and(|health| health.tier == "secure" && health.ir_dev.is_some())
-            && matches!(
-                self.preference_state().face_sensor_policy.resolve(),
-                Ok(irlume_common::config::FaceSensorPolicy::Dual)
-            );
         let extra_wiring_hint = if secure_face {
             "optional; if prompted, type yes for one face attempt"
         } else {

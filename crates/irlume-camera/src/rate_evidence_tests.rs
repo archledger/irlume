@@ -538,6 +538,61 @@ fn rate_evidence_a_standalone_fill_uses_no_offset_after_a_failed_pair() {
 }
 
 #[test]
+fn rate_evidence_offsets_include_parked_pair_preparation() {
+    struct ParkOnce {
+        inner: PacedQueue,
+        delay: Option<Duration>,
+    }
+
+    impl ValidatedStream for ParkOnce {
+        fn next_validated(
+            &mut self,
+        ) -> Result<(&[u8], frame_provenance::DequeuedBufferFacts), ValidatedDequeueError> {
+            if let Some(delay) = self.delay.take() {
+                std::thread::sleep(delay);
+                return Err(ValidatedDequeueError::Io(
+                    mmap_capture::parked_error_for_test(),
+                ));
+            }
+            self.inner.next_validated()
+        }
+    }
+
+    let interval = Duration::from_millis(2);
+    let preparation = Duration::from_millis(100);
+    let mut rgb = paced_stream(contracts::StreamRole::Rgb, interval, None);
+    let mut ir = TrackedStream::new(
+        ParkOnce {
+            inner: PacedQueue {
+                inner: delta_queue(&floor_deltas(200)),
+                interval,
+                startup_left: 0,
+                rendezvous: None,
+            },
+            delay: Some(preparation),
+        },
+        role_config(contracts::StreamRole::Ir),
+    );
+
+    establish_concurrent_rate(&mut rgb, &mut ir).expect("fresh fill after Parked");
+    assert!(ir.stream_mut().unwrap().delay.is_none());
+    let minimum = preparation.as_micros() as u64;
+    for (role, evidence) in [
+        ("RGB", recorded_evidence(&rgb)),
+        ("IR", recorded_evidence(&ir)),
+    ] {
+        let (_, deltas, _, offset_us, _) = evidence;
+        assert_eq!(deltas, 30);
+        assert!(
+            offset_us >= minimum,
+            "{role} offset {offset_us} us must include at least {minimum} us of preparation"
+        );
+    }
+    assert!(rgb.pair_fill_started.is_none());
+    assert!(ir.pair_fill_started.is_none());
+}
+
+#[test]
 fn rate_evidence_a_window_established_before_a_trailing_error_keeps_its_record() {
     let mut stream = stream_with_deltas(
         contracts::StreamRole::Rgb,

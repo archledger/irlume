@@ -3021,7 +3021,10 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
     secondary: &mut TrackedStream<B>,
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
-    let (preparation, parked) = establish_paired_rate_pass(primary, secondary, &cancelled);
+    // Report collection offsets from the start of the entire paired fill,
+    // including preparation that is revoked after a Parked buffer.
+    let started = std::time::Instant::now();
+    let (preparation, parked) = establish_paired_rate_pass(primary, secondary, &cancelled, started);
     if parked {
         // Neither worker's preparation readiness survives a paired Parked.
         // Both workers have joined. Revoke both contributions even if that
@@ -3032,7 +3035,7 @@ fn establish_concurrent_rate_with_cancel<A: ValidatedStream + Send, B: Validated
     }
     preparation?;
     if parked {
-        let (fresh, pending) = establish_paired_rate_pass(primary, secondary, &cancelled);
+        let (fresh, pending) = establish_paired_rate_pass(primary, secondary, &cancelled, started);
         if fresh.is_err() || pending {
             invalidate_paired_rate_admission(primary);
             invalidate_paired_rate_admission(secondary);
@@ -3060,12 +3063,11 @@ fn establish_paired_rate_pass<A: ValidatedStream + Send, B: ValidatedStream + Se
     primary: &mut TrackedStream<A>,
     secondary: &mut TrackedStream<B>,
     cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pair_fill_started: std::time::Instant,
 ) -> (std::io::Result<()>, bool) {
     let ready_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut primary_parked = 0;
     let mut secondary_parked = 0;
-    // Both fills measure their own window collection from this instant.
-    let pair_fill_started = std::time::Instant::now();
     primary.pair_fill_started = Some(pair_fill_started);
     secondary.pair_fill_started = Some(pair_fill_started);
     let result = std::thread::scope(|scope| {

@@ -42,6 +42,7 @@ All notable changes to irlume are documented here. This project adheres to
 - Face setup and login-wiring reviews explain the lower assurance of an
   observed webcam-only configuration and limit it to supported lock screens
   after sign-in. Password fallback and authentication policy are unchanged.
+  (ADR-0030 §1, #967)
 
 - Paired face-authentication requests stop grace retries on a recorded
   required IR PAD execution failure, with earlier password fallback and an

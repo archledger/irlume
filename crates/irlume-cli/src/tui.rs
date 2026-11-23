@@ -6154,16 +6154,18 @@ impl App {
             // Opt-in wiring extras; each logs the exact command then suspends,
             // so nothing needs to be copied out of the TUI to be run.
             (SC_PAM, KeyCode::Char('u')) => {
-                self.log('→', "sudo irlume login enable --with-sudo --apply: type yes for one face attempt (password still works)");
+                self.log('→', "sudo irlume login enable --with-sudo --apply: updates sudo wiring for the current method");
                 self.confirm = Some((
-                    "Wire face authentication into sudo? This changes system PAM configuration; the password remains available.".into(),
+                    "Connect authentication for sudo where supported?\n\
+                     This changes system PAM configuration. Password fallback remains available.".into(),
                     "Wire sudo", ConfirmAct::Sus(Suspend::LoginEnableSudo),
                 ));
             }
             (SC_PAM, KeyCode::Char('p')) => {
-                self.log('→', "sudo irlume login enable --with-polkit --apply: type yes for one face attempt at app prompts (password still works)");
+                self.log('→', "sudo irlume login enable --with-polkit --apply: updates app approval wiring for the current method");
                 self.confirm = Some((
-                    "Wire face authentication into app approval prompts? This changes system polkit PAM configuration; the password remains available.".into(),
+                    "Connect authentication for app approvals where supported?\n\
+                     This changes system polkit PAM configuration. Password fallback remains available.".into(),
                     "Wire prompts", ConfirmAct::Sus(Suspend::LoginEnablePolkit),
                 ));
             }
@@ -7014,7 +7016,9 @@ impl App {
             // Question in the body so a long target name isn't clipped by the
             // single-line border title.
             let face_setup = match act {
-                ConfirmAct::Sus(Suspend::LoginEnable) => true,
+                ConfirmAct::Sus(
+                    Suspend::LoginEnable | Suspend::LoginEnableSudo | Suspend::LoginEnablePolkit,
+                ) => true,
                 ConfirmAct::Sus(Suspend::MoreAction(invocation)) => matches!(
                     invocation.action.args,
                     ["enroll"]
@@ -10190,19 +10194,34 @@ impl App {
             "Wire login + lock",
             "connect the current authentication method where supported",
         );
+        let secure_face = self.daemon_up
+            && self.source_usable(Source::Health)
+            && self
+                .health
+                .as_ref()
+                .is_some_and(|health| health.tier == "secure" && health.ir_dev.is_some())
+            && matches!(
+                self.preference_state().face_sensor_policy.resolve(),
+                Ok(irlume_common::config::FaceSensorPolicy::Dual)
+            );
+        let extra_wiring_hint = if secure_face {
+            "optional; if prompted, type yes for one face attempt"
+        } else {
+            "optional; connects the current method where supported"
+        };
         push_page_action(
             &mut lines,
             &mut page_actions,
             "u",
             "Wire face-sudo",
-            "opt-in; type yes for one face attempt at sudo prompts",
+            extra_wiring_hint,
         );
         push_page_action(
             &mut lines,
             &mut page_actions,
             "p",
             "Wire app prompts",
-            "opt-in; type yes for one face attempt at app prompts",
+            extra_wiring_hint,
         );
         // [b] is an ACTION only when Bitwarden is installed without its polkit
         // action; otherwise its state shows as a status line below.
@@ -21908,7 +21927,7 @@ mod tests {
         assert!(text.contains("[p]") && text.contains("Wire app prompts"));
         assert!(text.contains("[s]") && text.contains("Show full status"));
         assert!(text.contains("[x]") && text.contains("Un-wire everything"));
-        assert!(text.contains("type yes for one face attempt"), "{text}");
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
         for retired in [
             "Calibrate gesture",
             "Calibrate Gesture",
@@ -21941,11 +21960,17 @@ mod tests {
             "RGB-only must not promise greeter login"
         );
         assert!(text.contains("supported lock screens after you sign in"));
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
         let mut app = live_test_app();
         app.screen = SC_PAM;
+        app.preferences = Some(preference_fixture(false));
         let text = draw_text(&app);
         assert!(text.contains("TPM-unseal password"));
         assert!(text.contains("always fail-safe to the password"));
+        assert!(text.contains("type yes for one face attempt"), "{text}");
+        app.freshness.observation_mut(Source::Health).invalidate();
+        let text = draw_text(&app);
+        assert!(!text.contains("type yes for one face attempt"), "{text}");
     }
 
     #[test]

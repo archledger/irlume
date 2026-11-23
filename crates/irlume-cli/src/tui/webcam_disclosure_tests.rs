@@ -122,6 +122,35 @@ fn webcam_setup_disclosure_preserves_login_confirmation_and_cancels() {
 }
 
 #[test]
+fn webcam_setup_disclosure_covers_dedicated_sudo_and_app_reviews() {
+    for key in ['u', 'p'] {
+        let mut app = webcam_setup_app();
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char(key));
+        let text = draw_text_at(&app, 80, 24);
+        assert_webcam_setup_copy(&text);
+        assert!(text.contains("where supported"), "{text}");
+        assert!(app.confirm.is_some() && app.suspend.is_none() && app.op.is_none());
+
+        app.freshness.observation_mut(Source::Health).invalidate();
+        assert!(!draw_text_at(&app, 80, 24).contains("easier to fool"));
+        assert!(app.confirm.is_some() && app.suspend.is_none());
+        app.on_key(KeyCode::Esc);
+        assert!(app.confirm.is_none() && app.suspend.is_none() && app.op.is_none());
+
+        let mut app = webcam_setup_app();
+        app.screen = SC_PAM;
+        app.on_key(KeyCode::Char(key));
+        app.on_key(KeyCode::Char('y'));
+        assert!(matches!(
+            (key, app.suspend),
+            ('u', Some(Suspend::LoginEnableSudo)) | ('p', Some(Suspend::LoginEnablePolkit))
+        ));
+        assert!(app.confirm.is_none() && app.op.is_none());
+    }
+}
+
+#[test]
 fn webcam_setup_disclosure_ignores_missing_or_stale_tier_evidence() {
     for case in [
         "secure",

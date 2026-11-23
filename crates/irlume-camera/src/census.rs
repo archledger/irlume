@@ -638,9 +638,8 @@ fn mipi_ipu_entry(generation: &'static str) -> CensusEntry {
         node: None,
         class: CensusClass::MipiIpu { generation },
         verdict: CensusVerdict::Unsupported(
-            "MIPI camera pipeline irlume cannot use: the sensor emits raw Bayer behind an \
-             ISP Linux drives through libcamera, and its IR sensor is not exposed at all. \
-             An external USB IR camera is the supported path on this machine",
+            "irlume does not support capture through this Intel MIPI pipeline. \
+             Use a supported USB IR camera for IR authentication",
         ),
         privacy_engaged: None,
         evidence: vec![format!(
@@ -1409,6 +1408,20 @@ mod tests {
             evidence.contains("05a3:9331") && evidence.contains("2-1"),
             "identity and sysfs location are the evidence: {evidence}"
         );
+    }
+
+    #[test]
+    fn embedded_capture_refusal_reports_irlume_support_not_sensor_presence() {
+        let ipu = mipi_ipu_entry("IPU3");
+        let CensusVerdict::Unsupported(note) = ipu.verdict else {
+            panic!("expected unsupported IPU3 pipeline, got {:?}", ipu.verdict);
+        };
+        assert!(
+            note.contains("irlume does not support capture through this Intel MIPI pipeline"),
+            "{note}"
+        );
+        assert!(note.contains("supported USB IR camera"), "{note}");
+        assert!(!note.contains("not exposed"), "{note}");
     }
 
     #[test]

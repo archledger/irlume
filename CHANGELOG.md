@@ -230,6 +230,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Camera diagnostics say irlume cannot use Intel MIPI pipelines and
+  media-controller or multi-planar-only nodes without claiming Linux does not
+  expose their IR sensors. Camera admission and loopback refusal stay
+  unchanged (ADR-0041 §1, #1379).
+
 - Clarify warn-first model checksum checks, strict core-model startup
   refusals and PAD cue rejection without daemon exit. Disabling required
   PAD prevents affected face grants (ADR-0013, amendment 2026-11-17; ADR-0019).

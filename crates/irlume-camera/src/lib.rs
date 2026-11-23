@@ -3628,9 +3628,8 @@ impl McCentric {
             }
         };
         format!(
-            "driver '{}', {stack}. irlume needs a UVC camera; the RGB side of \
-             this device may work through libcamera/PipeWire, and its IR side \
-             has no Linux support",
+            "driver '{}', {stack}. irlume cannot use this node for camera capture; \
+             use a supported UVC camera",
             self.driver
         )
     }
@@ -16380,6 +16379,22 @@ mod tests {
             "{}",
             mplane.cause()
         );
+    }
+
+    #[test]
+    fn embedded_capture_refusal_names_irlume_limitation_for_mplane_node() {
+        let cio2 = McCentric {
+            driver: "ipu3-cio2".into(),
+            io_mc: false,
+            mplane_only: true,
+        };
+        let cause = cio2.cause();
+        assert!(
+            cause.contains("irlume cannot use this node for camera capture"),
+            "{cause}"
+        );
+        assert!(cause.contains("supported UVC camera"), "{cause}");
+        assert!(!cause.contains("no Linux support"), "{cause}");
     }
 
     /// EINVAL at index 0 is the kernel's "no format here", which every UVC

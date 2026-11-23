@@ -4975,3 +4975,219 @@ fn pamwrap_authentication_deadline_keeps_fresh_password_fallback() {
         }
     }
 }
+
+// -------------------------------------------------------- camera contention
+
+/// The guidance for a node whose holder the camera's scan could see. The same
+/// text `camera_busy_error` builds in `crates/irlume-camera/src/lib.rs` and
+/// the daemon's `named_holder_busy_wire` test helper carries: this crate
+/// does not link the camera crate, so it cannot ask it.
+const NAMED_HOLDER_STEPS: &str = concat!(
+    "For irlumed, let it finish, then retry; otherwise close that app and retry. ",
+    "If irlumed keeps holding it, please report it (`irlume support-report` says where)"
+);
+
+/// The guidance for a node whose holder the scan could not see, as in the
+/// packaged unit (#207).
+const UNSEEN_HOLDER_STEPS: &str = concat!(
+    "Close the other app or let irlumed finish, then retry; ",
+    "if it stays held, please report it (`irlume support-report` says where)"
+);
+
+/// What irlumed answers a PAM module, which asks for prose and not for
+/// structured errors, when another Irlume operation still holds the camera
+/// at the request's lease-acquisition deadline. It names the kind of
+/// operation that holds the camera, and no process, path or account.
+fn camera_lease_reply() -> Response {
+    Response::Error(
+        irlume_common::Error::CameraUnavailable(
+            "camera lease deadline expired; current owner: Enrollment".into(),
+        )
+        .to_string(),
+    )
+}
+
+/// What it answers when the driver reports EBUSY and the holder scan saw the
+/// process holding the node.
+fn visible_holder_reply() -> Response {
+    Response::Error(
+        irlume_common::Error::CameraBusy(format!(
+            "{NAMED_HOLDER_STEPS}. camera busy, in use by kamoso (pid 2567). /dev/video0."
+        ))
+        .to_string(),
+    )
+}
+
+/// What it answers when the driver reports EBUSY and no holder is visible:
+/// the packaged daemon cannot read another user's descriptors (#207).
+fn unseen_holder_reply() -> Response {
+    Response::Error(
+        irlume_common::Error::CameraBusy(format!(
+            "camera busy; `sudo fuser -v /dev/video0`. {UNSEEN_HOLDER_STEPS}."
+        ))
+        .to_string(),
+    )
+}
+
+/// The three ways the camera can be taken from an attempt: another Irlume
+/// operation still holds the lease, another application holds the node and is
+/// named, or holds it unseen. Each must cost the person this one face attempt
+/// and nothing else: no grant, no second face request, and the typed
+/// password still authenticates, on the desktop and the privileged path.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_camera_contention_never_grants_and_keeps_the_password_fallback() {
+    for (index, (held_by, reply)) in [
+        ("held by another irlume operation", camera_lease_reply()),
+        ("held by a named application", visible_holder_reply()),
+        ("held by an unseen application", unseen_holder_reply()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (service, flags, consent, desktop) in [
+            ("kde", "unseal ondemand", "\n", true),
+            ("sudo", "", "yes\n", false),
+        ] {
+            let Some(h) = Harness::try_new(&format!("camera-contention-{index}-{service}")) else {
+                return;
+            };
+            let reply = reply.clone();
+            let checker = h.token_checker("camera-contention", FIXED_TEST_TOKEN);
+            h.write_service(
+                service,
+                &[
+                    h.auth_line("sufficient", flags),
+                    format!(
+                        "auth required pam_exec.so expose_authtok {}",
+                        checker.display()
+                    ),
+                ],
+            );
+            let log = serve(&h.socket, move |_| reply.clone());
+
+            let (ok, out) = h.run(
+                service,
+                &["authenticate"],
+                &format!("{consent}{FIXED_TEST_TOKEN}\n"),
+                None,
+            );
+            assert!(
+                ok,
+                "a camera {held_by} must reach a fresh password prompt: {service}: {out}"
+            );
+            assert!(!out.contains(FIXED_TEST_TOKEN), "{out}");
+
+            // The same run with a wrong password must fail: the success above
+            // was the password's, not a grant riding on the reply.
+            let (ok, out) = h.run(
+                service,
+                &["authenticate"],
+                &format!("{consent}{WRONG_TEST_TOKEN}\n"),
+                None,
+            );
+            assert!(
+                !ok,
+                "a camera {held_by} granted without the password: {service}: {out}"
+            );
+
+            // One face request per run and no other: in particular a refused
+            // release never buys the identity-only verify.
+            let requests = log.lock().unwrap();
+            if desktop {
+                assert!(matches!(
+                    requests.as_slice(),
+                    [
+                        Request::UnsealPassword { .. },
+                        Request::UnsealPassword { .. }
+                    ]
+                ));
+            } else {
+                assert!(matches!(
+                    requests.as_slice(),
+                    [
+                        Request::Health,
+                        Request::Authenticate { .. },
+                        Request::Health,
+                        Request::Authenticate { .. }
+                    ]
+                ));
+            }
+        }
+    }
+}
+
+/// The lock screen's `wait` mode asks again after anything but a grant, and
+/// stops at its budget: a camera that stays taken for the whole wait ends in
+/// the password, not in a hang or a grant. The three replies take turns, so
+/// each is retried rather than ending the loop or the stack. The lower bound
+/// on the elapsed time is exact, since the loop cannot leave before its
+/// budget; the upper bound only catches a budget that grew.
+#[test]
+#[ignore = "needs pam_wrapper + pamtester (CI installs them; see this file's header)"]
+fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
+    const WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+    let Some(h) = Harness::try_new("camera-contention-wait") else {
+        return;
+    };
+    let checker = h.token_checker("camera-contention-wait", FIXED_TEST_TOKEN);
+    h.write_service(
+        "irlume-lock",
+        &[
+            h.auth_line("required", "wait"),
+            format!(
+                "auth required pam_exec.so expose_authtok {}",
+                checker.display()
+            ),
+        ],
+    );
+    let replies = [
+        camera_lease_reply(),
+        visible_holder_reply(),
+        unseen_holder_reply(),
+    ];
+    let reply_count = replies.len();
+    let answered = Arc::new(Mutex::new(Vec::new()));
+    let turns = Arc::clone(&answered);
+    let log = serve(&h.socket, move |_| {
+        let mut answered = turns.lock().unwrap();
+        let index = answered.len() % reply_count;
+        answered.push(index);
+        replies[index].clone()
+    });
+
+    let started = std::time::Instant::now();
+    let (ok, out) = h.run(
+        "irlume-lock",
+        &["authenticate"],
+        &format!("{FIXED_TEST_TOKEN}\n"),
+        None,
+    );
+    let took = started.elapsed();
+    assert!(ok, "the wait must end in the password prompt: {out}");
+    assert!(!out.contains(FIXED_TEST_TOKEN), "{out}");
+    assert!(
+        took >= WAIT_BUDGET,
+        "the wait ended before its budget: {took:?}"
+    );
+    assert!(
+        took < WAIT_BUDGET + std::time::Duration::from_secs(10),
+        "the wait outran its budget: {took:?}"
+    );
+
+    // Every request was the same face request, each retry a whole one, and
+    // all three replies were retried.
+    let requests = log.lock().unwrap();
+    assert!(
+        requests.len() >= reply_count,
+        "the wait must keep asking: {} requests",
+        requests.len()
+    );
+    assert!(requests
+        .iter()
+        .all(|request| matches!(request, Request::Authenticate { .. })));
+    let mut used = answered.lock().unwrap().clone();
+    used.sort_unstable();
+    used.dedup();
+    assert_eq!(used, (0..reply_count).collect::<Vec<_>>());
+}

@@ -13583,12 +13583,16 @@ mod tests {
         //
         // `include_str!` and not a runtime read: a renamed or deleted module
         // is then a compile error rather than a silently smaller scan.
-        let sources: [(&str, &str); 33] = [
+        let sources: [(&str, &str); 34] = [
             ("main.rs", include_str!("main.rs")),
             ("listener_tests.rs", include_str!("listener_tests.rs")),
             (
                 "request_preparation_tests.rs",
                 include_str!("request_preparation_tests.rs"),
+            ),
+            (
+                "camera_lease_contention_tests.rs",
+                include_str!("camera_lease_contention_tests.rs"),
             ),
             (
                 "split_runtime_tests.rs",
@@ -20241,6 +20245,7 @@ mod tests {
     include!("split_closed_matrix_tests.rs");
     include!("split_diagnostics_tests.rs");
     include!("split_liveness_tests.rs");
+    include!("camera_lease_contention_tests.rs");
 
     /// A waiver is a claim about the machine's policy, not about the caller, so
     /// the daemon has to agree with it independently. A root PAM client saying

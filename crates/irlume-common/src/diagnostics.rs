@@ -928,7 +928,8 @@ pub enum TraceEventKind {
         /// Deltas held by the window that established the session: 5
         /// through 15 after `ProbeAdmitted`, the full width otherwise.
         deltas: u32,
-        /// Deltas the missed probe had collected (`ProbeMissed` only).
+        /// Deltas the missed probe had collected, from 0 through 15.
+        /// Present only for `ProbeMissed`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probe_deltas: Option<u32>,
         /// Microseconds from the start of the pair fill to the start of
@@ -1212,6 +1213,22 @@ fn validate_trace_event(event: &TraceEventKind) -> Result<(), TraceParseError> {
             Err(TraceParseError::InvalidEvent)
         }
         TraceEventKind::EventsDropped { count: 0 } => Err(TraceParseError::InvalidEvent),
+        TraceEventKind::RateEvidence {
+            decision,
+            deltas,
+            probe_deltas,
+            ..
+        } => {
+            use RateEvidenceDecision::{
+                DisabledFullWindow, FullWindow, ProbeAdmitted, ProbeMissed, StaleFullWindow,
+            };
+            match (*decision, *deltas, *probe_deltas) {
+                (ProbeAdmitted, 5..=15, None)
+                | (ProbeMissed, 30, Some(0..=15))
+                | (FullWindow | StaleFullWindow | DisabledFullWindow, 30, None) => Ok(()),
+                _ => Err(TraceParseError::InvalidEvent),
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -1976,6 +1993,65 @@ mod tests {
             let typed = serde_json::from_value::<TraceEventKind>(event).unwrap();
             assert!(typed.supports_schema(CURRENT_TRACE_SCHEMA_VERSION));
             assert!(typed.supports_schema(V5_TRACE_SCHEMA_VERSION));
+        }
+    }
+
+    #[test]
+    fn trace_v6_rate_evidence_enforces_decision_delta_counts() {
+        use RateEvidenceDecision::{
+            DisabledFullWindow, FullWindow, ProbeAdmitted, ProbeMissed, StaleFullWindow,
+        };
+
+        let validate = |decision, deltas, probe_deltas| {
+            let event = TraceEventKind::RateEvidence {
+                role: CameraRoleLabel::Rgb,
+                decision,
+                deltas,
+                probe_deltas,
+                offset_us: 0,
+                elapsed_us: 1_000,
+            };
+            let mut record = trace_record(0, event, false);
+            record.trace_schema = CURRENT_TRACE_SCHEMA_VERSION;
+            TraceValidator::new(TraceLimits::bounded(1000))
+                .unwrap()
+                .push_line(&serde_json::to_vec(&record).unwrap())
+        };
+        for decision in [FullWindow, StaleFullWindow, DisabledFullWindow] {
+            assert!(validate(decision, 30, None).is_ok(), "{decision:?}");
+            for (deltas, probe_deltas) in [(30, Some(5)), (29, None), (31, None)] {
+                assert!(
+                    matches!(
+                        validate(decision, deltas, probe_deltas),
+                        Err(TraceParseError::InvalidEvent)
+                    ),
+                    "{decision:?}, {deltas}, {probe_deltas:?}"
+                );
+            }
+        }
+        for deltas in [5, 11, 15] {
+            assert!(validate(ProbeAdmitted, deltas, None).is_ok());
+        }
+        for (decision, deltas, probe_deltas) in [
+            (ProbeAdmitted, 4, None),
+            (ProbeAdmitted, 16, None),
+            (ProbeAdmitted, 5, Some(5)),
+            (ProbeAdmitted, 5, Some(30)),
+            (ProbeMissed, 29, Some(0)),
+            (ProbeMissed, 31, Some(15)),
+            (ProbeMissed, 30, None),
+            (ProbeMissed, 30, Some(16)),
+        ] {
+            assert!(
+                matches!(
+                    validate(decision, deltas, probe_deltas),
+                    Err(TraceParseError::InvalidEvent)
+                ),
+                "{decision:?}, {deltas}, {probe_deltas:?}"
+            );
+        }
+        for probe_deltas in [0, 5, 15] {
+            assert!(validate(ProbeMissed, 30, Some(probe_deltas)).is_ok());
         }
     }
 

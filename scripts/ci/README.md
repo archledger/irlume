@@ -38,6 +38,18 @@ brightness range;
 they do not establish that a host write caused an optical change. In particular,
 BRIO may operate in D1 by default while NexiGo requires an actual transition.
 
+## Raw IR rate refusals
+
+`burst_dump` reports a delivered-rate refusal on stderr with the rejected
+window, rate floor and continuity counters, then exits 3. The nightly
+preserves that first failure and collects its failure diagnostics. It
+does not retry: a refusal in a later window does not identify the measured
+startup case. The raw burst does not use the product's fixed-IR recheck.
+
+The restricted route forwards the diagnostic when its approved capture
+binary includes it. The helper's nonzero exit still fails the step
+regardless of which diagnostic it relays.
+
 The control contract is [Microsoft UVC Face Authentication](https://learn.microsoft.com/en-us/windows-hardware/drivers/stream/uvc-extensions-1-5#2226-face-authentication-control).
 Do not infer default readiness from VID:PID, successful face unlock, absence of
 errors, an already-held non-default value, or brightness alone.

@@ -8,9 +8,8 @@ frames, embeddings, passwords, or anything reusable.
 
 ## Reading the journal with `irlume logs`
 
-All auth decisions land in the system journal. `irlume logs` shows the whole
-story in one stream: daemon lines, the PAM audit records that say what the
-greeter actually granted, and the keyring modules a face login feeds:
+`irlume logs` filters the system journal for matching daemon, PAM audit and
+keyring messages. A plain `pam_unix` failure need not appear in this view.
 
 ```sh
 irlume logs                     # this boot (sudo if the system journal is hidden)
@@ -32,7 +31,7 @@ How to read the key lines:
 | `irlumed: Identify failed: <error>` (or `IdentifyFor`) | an identification failed before a decision: the camera or the engine. It names no account and no score; at most one per peer a minute, repeats under `IRLUME_LOG=debug` |
 | `irlumed: <Request> for 'x' failed: <error>` | a request the camera worker ran (an enrollment, a scan, a profile change, a split pair, `ir-setup`, a self-test, recovery, keyring sealing) ended in an error; each such request ends with this line, after any line its handler wrote; at most one per request and account a minute, repeats under `IRLUME_LOG=debug`. Refusals answered before a request reaches the worker are not journaled: daemon busy, still starting, not authorized, a dismissed polkit prompt, the status requests and `irlume retry` |
 | `audit … grantors=pam_irlume` | PAM's own record that the grant came from face, not password fallthrough |
-| `pam_unix(<svc>:auth): authentication failure` with **no** irlumed line before it | a typed (wrong) password; correct on-demand behavior: typing never fires the camera |
+| `pam_unix(<svc>:auth): authentication failure` in the system journal | the password check failed. A missing matching daemon line does not establish which route or policy applied, or whether the PAM worker reached the daemon |
 | `plasma-kwallet-pam` / `pam_gnome_keyring` lines | the unsealed secret reaching your wallet/keyring |
 | `irlume-gkr-unlock[pid]: …` | a GNOME keyring token on its way to gnome-keyring. Most of these lines do not contain the word irlume, so `irlume logs` leaves them out; read them with `journalctl -t irlume-gkr-unlock` (below) |
 | `pam_irlume(<svc>:session): GNOME keyring token hand-off failed: …` | the session line could not hand the GNOME keyring token to `irlume-gkr-unlock`, or the helper reported a failure, so a token-armed login keyring stays locked; the end of the line says how, for example `exited with code 1`, and for a failure the waiter saw, its own `irlume-gkr-unlock` line (below) gives the reason |
@@ -349,33 +348,63 @@ irlume diag            # both TPM seals + PCR drift (sudo for detail)
 irlume status          # daemon + enrollment state
 ```
 
+For a face attempt that falls back to the password, distinguish two paths:
+
+1. The process running `pam_irlume.so` must connect to the daemon's Unix
+   socket (normally `/run/irlume.sock`). Check which process runs PAM and
+   whether it can see and access that socket in its own mount namespace.
+2. After the daemon admits a capture request, its worker must be able to open
+   the selected camera using the daemon's own view of `/dev`, device access
+   rules and security context. A greeter does not need permission to open
+   the camera.
+
+`irlume doctor` classifies and probes camera nodes in the CLI's own context.
+Its separate capture-mode check asks the daemon. A successful result for
+a pair means the daemon opened its selected RGB and IR nodes for diagnostics,
+without streaming. The daemon's `Health` reply is passive and does not open
+a camera. None of these checks proves that the greeter can connect to the
+daemon or that a live login works.
+
 ## Exercising PAM without logging out
 
-`pamtester` drives the exact PAM stack a greeter uses:
+Use this example only for an already-wired local desktop login or lock
+service in on-demand mode. Check the wiring and mode with `irlume login status`
+and replace `SERVICE` with that service name. This is live authentication:
+it can open the camera and spend a face attempt. Other stacks, such as
+face-first, can request face without typed input.
+
+Even under `sudo`, the shell does not reproduce the greeter's prompt,
+credentials, security label or mount namespace. Do not use this example for
+LightDM: the shell cannot reproduce
+[LightDM's private PAM view and remote-seat policy](THREAT_MODEL.md#remote-sessions).
+See [desktop face selection](DESKTOP-AUTH.md#existing-desktop-flow) for COSMIC
+and other prompt differences.
 
 ```sh
-sudo pamtester <service> $USER authenticate
+sudo pamtester SERVICE "$USER" authenticate
 ```
 
-`<service>` is your greeter's PAM service: `plasmalogin`, `sddm`, `lightdm`,
-`greetd`, `gdm-password`, `cosmic-greeter`, `ly`, or `polkit-1` for app prompts.
-`irlume login status` prints the active ones. On an on-demand wiring, press **Enter on the empty password
-prompt** to trigger face; type the password to confirm the no-camera path.
-Watch `irlume logs -f` in a second terminal.
-
-Expected on-demand matrix (all live-validated):
+Expected for an on-demand stack configured for empty-Enter face selection:
 
 | You do | Expect |
 |---|---|
-| wait, touch nothing | **no** camera fire, ever (no ambient scanning) |
-| empty password + Enter | camera fires → `UnsealPassword OK` → grant |
-| type correct password | no camera; password grants |
-| type wrong password | no camera; normal failure prompt |
+| wait at the prompt | the PAM call does not request face |
+| submit an empty password | requests face; a refusal goes on to the password |
+| type a password | uses the password path rather than requesting face |
 
 ## Platform checks
 
-- **SELinux (Fedora):** `sudo ausearch -m avc -ts recent | grep irlume` must
-  come back empty; the shipped policy covers the confined greeter → daemon socket.
+- **SELinux (Fedora):** `irlume selinux status` can report `loaded` from the
+  visible `irlume_runtime_t` socket label alone. The label describes the
+  socket file in the observer's namespace. Neither the label nor a module
+  listing proves SELinux is enforcing or that the PAM worker can connect
+  to the listening socket. In existing audit records, match an
+  enforced denial to the failed attempt, the process and the object involved:
+  a PAM worker denied access to the socket is different from `irlumed`
+  denied access to a camera node. If evidence is missing, unreadable or
+  cannot be matched to the attempt, access is unknown. An empty search does
+  not prove access. Keep confinement and the password fallback in place;
+  do not widen socket or camera permissions based on a shell check.
 - **KWallet false alarm:** `busctl call org.kde.kwalletd6 … isOpen` can report
   `false` even when your wallet is open; it activates an empty legacy
   `kwalletd6`, the wrong daemon. Query the real one instead:

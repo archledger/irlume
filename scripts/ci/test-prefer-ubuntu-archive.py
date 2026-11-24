@@ -20,6 +20,7 @@ MIRRORS = (
     "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
     "https://security.ubuntu.com/ubuntu/\tpriority:3\n"
 )
+EC2_MIRROR = "http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:1\n"
 
 
 class MirrorSelectionTests(unittest.TestCase):
@@ -28,7 +29,7 @@ class MirrorSelectionTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("prefer_ubuntu_archive", SCRIPT)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return module.without_azure_mirror(text)
+        return module.without_known_slow_mirrors(text)
 
     def run_cli(self, path):
         return subprocess.run(
@@ -46,6 +47,25 @@ class MirrorSelectionTests(unittest.TestCase):
             "azure.archive.ubuntu.com/ubuntu/", "azure.archive.ubuntu.com/ubuntu"
         )
         self.assertEqual(self.policy(text), self.policy(MIRRORS))
+
+    def test_removes_the_exact_ec2_entry_with_either_scheme_and_optional_slash(self):
+        fallbacks = "".join(MIRRORS.splitlines(keepends=True)[1:])
+        for scheme in ("http", "https"):
+            for slash in ("", "/"):
+                entry = f"{scheme}://us-east-2.ec2.archive.ubuntu.com/ubuntu{slash}\tpriority:1\n"
+                with self.subTest(entry=entry):
+                    self.assertEqual(self.policy(entry + fallbacks), fallbacks)
+
+    def test_ec2_lookalikes_and_commented_entry_are_preserved(self):
+        extra = (
+            f"# {EC2_MIRROR}\n"
+            "http://us-east-2.ec2.archive.ubuntu.com.example/ubuntu/\tpriority:4\n"
+            "http://us-west-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:5\n"
+            "http://us-east-2.ec2.archive.ubuntu.com:80/ubuntu/\tpriority:6\n"
+            "http://us-east-2.ec2.archive.ubuntu.com/ubuntu-extra/\tpriority:7\n"
+            "http://us-east-2.ec2.archive.ubuntu.com/ubuntu//\tpriority:8\n"
+        )
+        self.assertEqual(self.policy(MIRRORS + extra), self.policy(MIRRORS) + extra)
 
     def test_comments_blank_lines_and_other_entries_are_preserved(self):
         extra = "# original image list\n\nhttps://mirror.example/ubuntu/\tpriority:4\n"
@@ -72,22 +92,29 @@ class MirrorSelectionTests(unittest.TestCase):
     def test_cli_preserves_mode_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "mirrors.txt"
-            path.write_text(MIRRORS)
+            path.write_text(EC2_MIRROR + "".join(MIRRORS.splitlines(keepends=True)[1:]))
             path.chmod(0o640)
             self.assertEqual(self.run_cli(path).returncode, 0)
-            self.assertEqual(path.read_text(), self.policy(MIRRORS))
+            self.assertEqual(path.read_text(), (
+                "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+                "https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+            ))
             self.assertEqual(path.stat().st_mode & 0o777, 0o640)
             before = path.stat().st_mtime_ns
             self.assertEqual(self.run_cli(path).returncode, 0)
             self.assertEqual(path.stat().st_mtime_ns, before)
 
     def test_invalid_list_is_not_rewritten(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "mirrors.txt"
-            text = MIRRORS.splitlines()[0] + "\n"
-            path.write_text(text)
-            self.assertNotEqual(self.run_cli(path).returncode, 0)
-            self.assertEqual(path.read_text(), text)
+        for fallback in ("", "# https://archive.ubuntu.com/ubuntu/\n",
+                         "http://archive.ubuntu.com/ubuntu/\n"):
+            with self.subTest(fallback=fallback), tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / "mirrors.txt"
+                text = MIRRORS.splitlines(keepends=True)[0] + EC2_MIRROR + fallback
+                path.write_text(text)
+                before = path.stat().st_mtime_ns
+                self.assertNotEqual(self.run_cli(path).returncode, 0)
+                self.assertEqual(path.read_text(), text)
+                self.assertEqual(path.stat().st_mtime_ns, before)
 
     def test_links_and_missing_files_are_refused(self):
         with tempfile.TemporaryDirectory() as temp:

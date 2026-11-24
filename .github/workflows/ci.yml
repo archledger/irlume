@@ -78,11 +78,10 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-24.04
-    # A cold hosted runner may spend about 17 minutes installing the matching
-    # kernel modules and building v4l2loopback before the guarded camera/PAM
-    # suites start. Keep every integration gate, but leave enough wall-clock
-    # budget for that measured cold path.
-    timeout-minutes: 45
+    # Two #1418 runs hit the 45-minute limit during or just after virtual-camera
+    # setup. Nearby runs needed another 6-7 minutes for the integration lanes,
+    # so leave headroom for a cold runner without dropping any gates.
+    timeout-minutes: 60
     steps:
       # Actions are pinned to a commit SHA (the tag in the comment is what it
       # was) so a moved tag cannot change what runs. Dependabot bumps these.

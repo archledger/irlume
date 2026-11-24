@@ -150,6 +150,67 @@ fn webcam_setup_disclosure_covers_dedicated_sudo_and_app_reviews() {
     }
 }
 
+fn observed_ir_wiring_app() -> App {
+    let mut app = live_test_app();
+    app.screen = SC_PAM;
+    app.preferences = Some(preference_fixture(false));
+    let text = draw_text(&app);
+    assert!(text.contains("TPM-unseal password"), "{text}");
+    assert!(text.contains("type yes for one face attempt"), "{text}");
+    app
+}
+
+fn assert_no_ir_wiring_guidance(app: &App) {
+    let text = draw_text(app);
+    assert!(!text.contains("type yes for one face attempt"), "{text}");
+    assert!(!text.contains("TPM-unseal password"), "{text}");
+    assert!(
+        text.contains("tier unknown (observation unavailable)"),
+        "{text}"
+    );
+    assert!(text.contains("password remains the fallback"), "{text}");
+}
+
+#[test]
+fn pam_screen_withholds_ir_guidance_when_health_is_stale() {
+    let mut app = observed_ir_wiring_app();
+    let now = app.now();
+    app.freshness
+        .observation_mut(Source::Health)
+        .record(true, now - Duration::from_secs(21));
+    assert!(
+        app.health.is_some(),
+        "the previous secure reply stays cached"
+    );
+    assert_no_ir_wiring_guidance(&app);
+}
+
+#[test]
+fn pam_screen_withholds_ir_guidance_without_the_observed_pair() {
+    let mut app = observed_ir_wiring_app();
+    assert!(app.caps.ir_pair);
+    app.freshness.observation_mut(Source::Live).invalidate();
+    assert!(app.caps.ir_pair, "cached capability bits are not evidence");
+    assert_no_ir_wiring_guidance(&app);
+
+    for other_ir in [None, Some("/dev/video44")] {
+        let mut app = observed_ir_wiring_app();
+        let mut snapshot = live_test_snapshot();
+        snapshot.cameras.revision += 1;
+        let endpoints = &mut snapshot.cameras.candidates[0].endpoint_paths;
+        endpoints.truncate(1);
+        endpoints.extend(other_ir.map(str::to_owned));
+        app.apply_live_snapshot(snapshot, app.now());
+        assert!(app.source_usable(Source::Health));
+        assert_eq!(app.face_camera_presence(), Some(true));
+        assert_no_ir_wiring_guidance(&app);
+    }
+
+    let mut app = observed_ir_wiring_app();
+    app.health.as_mut().unwrap().ir_dev = Some("/dev/video40".into());
+    assert_no_ir_wiring_guidance(&app);
+}
+
 #[test]
 fn webcam_setup_disclosure_ignores_missing_or_stale_tier_evidence() {
     for case in [

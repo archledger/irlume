@@ -39,6 +39,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- Login & Apps shows IR-backed face and consent guidance only when fresh
+  daemon and camera observations confirm the configured RGB+IR pair.
+  Missing or stale observations keep the password fallback guidance
+  without changing wiring or authentication (ADR-0030 §1, #1413).
+
 - Face setup and login-wiring reviews explain the lower assurance of an
   observed webcam-only configuration and limit it to supported lock screens
   after sign-in. Password fallback and authentication policy are unchanged.

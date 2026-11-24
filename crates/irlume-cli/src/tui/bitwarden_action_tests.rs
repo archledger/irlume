@@ -88,3 +88,34 @@ fn bitwarden_setup_focus_reveals_the_matching_body_action() {
     // Do not activate: the real handler rechecks the host before confirming.
     assert!(app.suspend.is_none() && app.confirm.is_none() && app.op.is_none());
 }
+
+#[test]
+fn bitwarden_wiring_copy_respects_current_ir_evidence() {
+    use crate::bitwarden::TuiState;
+
+    let mut app = observed_ir_wiring_app();
+    app.heavy = Some(TuiState::Ready);
+    app.heavy_known = true;
+    // Keep the whole status row visible, including the trailing prompt hint.
+    let text = draw_text_at(&app, 180, 40);
+    let row = row_with(&text, "polkit action installed");
+    assert!(row.contains("type yes for one face attempt"), "{row}");
+
+    app.freshness.observation_mut(Source::Live).invalidate();
+    let text = draw_text_at(&app, 180, 40);
+    let row = row_with(&text, "polkit action installed");
+    assert!(
+        row.contains("unlock with system authentication")
+            && !row.contains("type yes for one face attempt"),
+        "stale IR must not advertise face consent: {row}"
+    );
+    assert!(!bitwarden_body_has_setup(&app));
+
+    app.heavy = Some(TuiState::NeedsSetup);
+    let text = draw_text_at(&app, 180, 40);
+    let row = row_with(&text, "Set up Bitwarden");
+    assert!(row.contains("installs its polkit action"), "{row}");
+    assert!(!row.contains("your face unlocks the vault"), "{row}");
+    assert!(bitwarden_body_has_setup(&app));
+    assert!(app.suspend.is_none() && app.confirm.is_none() && app.op.is_none());
+}

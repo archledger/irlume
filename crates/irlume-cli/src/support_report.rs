@@ -2120,4 +2120,43 @@ mod tests {
         .is_err());
         assert!(parse_human_args(&["support-report".into(), "--json".into()]).is_err());
     }
+
+    #[test]
+    fn human_args_parse_inline_output_and_since() {
+        // Include a non-default duration so ignoring --since cannot pass.
+        for (since, seconds) in [("--since=10m", 600), ("--since=12m", 720)] {
+            let parsed = parse_human_args(&[
+                "support-report".into(),
+                "--output=report.txt".into(),
+                since.into(),
+            ])
+            .unwrap();
+            assert_eq!(parsed.output, Some(PathBuf::from("report.txt")));
+            assert_eq!(parsed.since, Duration::from_secs(seconds));
+        }
+    }
+
+    #[test]
+    fn human_args_reject_a_flag_in_place_of_an_output_path() {
+        assert_eq!(
+            parse_human_args(&["support-report".into(), "--output".into(), "--probe".into()]).err(),
+            Some("--output requires a path")
+        );
+    }
+
+    #[test]
+    fn human_args_reject_an_empty_inline_output_path() {
+        assert_eq!(
+            parse_human_args(&["support-report".into(), "--output=".into()]).err(),
+            Some("--output requires a path")
+        );
+    }
+
+    #[test]
+    fn human_args_reject_an_unknown_option_with_usage() {
+        assert_eq!(
+            parse_human_args(&["support-report".into(), "--unknown".into()]).err(),
+            Some("usage: irlume support-report [--output FILE.txt] [--since 10m] [--probe]")
+        );
+    }
 }

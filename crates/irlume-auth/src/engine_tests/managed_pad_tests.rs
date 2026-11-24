@@ -62,6 +62,117 @@ fn managed_pending_collects_five_fresh_samples_and_materializes_only_the_last() 
 }
 
 #[test]
+fn managed_slow_rgb_replay_needs_the_fifth_sample_inside_the_original_budget() {
+    // Timing-only fixture from #1399, comment 7066259376, relative to the
+    // start of EngineAuthenticate (trace offset 4_558_348 us). The concurrent
+    // RGB sample stream delivered about 7.46 fps.
+    // These times drive the real collector's clock, not the camera driver.
+    const RATE_READY_US: u64 = 9_102_247;
+    const PENDING_US: [u64; 4] = [11_178_768, 12_386_845, 13_594_730, 14_802_693];
+    const FIFTH_CAPTURE_CUTOFF_US: u64 = 15_070_632;
+    // There was no fifth liveness result. The positive control models that
+    // round at the observed fourth-round cost and saves startup time only.
+    const FIFTH_COMPLETE_US: u64 = PENDING_US[3] + (PENDING_US[3] - PENDING_US[2]);
+
+    struct RestoreIrAvailability<'a> {
+        engine: &'a mut Engine,
+        previous: bool,
+    }
+
+    impl Drop for RestoreIrAvailability<'_> {
+        fn drop(&mut self) {
+            self.engine.ir_available = self.previous;
+        }
+    }
+
+    let _guard = env_guard();
+    let mut state = shared();
+    let restore = RestoreIrAvailability {
+        previous: state.engine.ir_available,
+        engine: &mut state.engine,
+    };
+    let engine = &mut *restore.engine;
+    engine.ir_available = true;
+    for saved_startup_us in [0, 1_500_000] {
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(GRACE_WINDOW_MS);
+        let at = |elapsed| start + Duration::from_micros(elapsed - saved_startup_us);
+        let clock = Cell::new(at(RATE_READY_US));
+        let mut capture_calls = 0;
+        let mut completed_samples = 0;
+        let mut materialized = Vec::new();
+
+        let prepared = engine.collect_concurrent_pending_with(
+            deadline,
+            |engine| {
+                assert!(clock.get() < deadline, "no capture starts after expiry");
+                let sample = capture_calls;
+                capture_calls += 1;
+                match PENDING_US.get(usize::from(sample)) {
+                    Some(&elapsed) => clock.set(at(elapsed)),
+                    None if saved_startup_us == 0 => {
+                        // Replay the capture callback's terminal expiry:
+                        // no fifth sample was delivered to liveness or PAD.
+                        clock.set(at(FIFTH_CAPTURE_CUTOFF_US));
+                        assert!(clock.get() >= deadline);
+                        return Err(irlume_common::Error::DeadlineExpired.into());
+                    }
+                    None => clock.set(at(FIFTH_COMPLETE_US)),
+                }
+                assert!(clock.get() < deadline);
+                completed_samples += 1;
+                let evidence = visible_pair_sample(engine, sample, 0.2, false);
+                engine
+                    .prepare_pair_authentication_with(evidence, |_, evidence| {
+                        materialized.push(sample);
+                        Ok(materialize_synthetic_pair(evidence))
+                    })
+                    .map_err(CapturePathError::from)
+            },
+            || clock.get(),
+        );
+        assert_eq!(capture_calls, 5);
+        assert!(engine.vit_scores.is_empty(), "the vote is request-local");
+        if saved_startup_us == 0 {
+            assert_eq!(completed_samples, 4);
+            assert!(
+                materialized.is_empty(),
+                "partial PAD must not reach identity"
+            );
+            assert!(matches!(
+                &prepared,
+                Err(CapturePathError::Other(
+                    irlume_common::Error::DeadlineExpired
+                ))
+            ));
+            assert_eq!(engine.last_attempt_facts.rgb_face, None);
+        } else {
+            assert_eq!(completed_samples, 5);
+            assert_eq!(materialized, [4]);
+        }
+        let outcome = engine.finish_pair_authentication(
+            &paired_enrollment(),
+            AuthenticationPurpose::Verify,
+            Some("kde"),
+            prepared,
+            None,
+            &(),
+        );
+        if saved_startup_us == 0 {
+            assert!(matches!(
+                outcome,
+                Err(irlume_common::Error::DeadlineExpired)
+            ));
+        } else {
+            assert!(
+                outcome.unwrap().granted,
+                "the complete, in-budget control must grant"
+            );
+        }
+    }
+}
+
+#[test]
 fn managed_pending_hard_ir_failure_stops_without_identity_or_a_sixth_sample() {
     let _guard = env_guard();
     let mut state = shared();

@@ -1729,6 +1729,12 @@ mod tests {
         drop(holder);
     }
 
+    /// Three distinct positive PIDs that `earlier_irlumes` will not skip as self.
+    fn foreign_pids() -> [u32; 3] {
+        let me = std::process::id();
+        [1, 2, 3].map(|pid| if pid < me { pid } else { pid + 1 })
+    }
+
     /// At the limit, a holder of the legacy lock, or a process waiting for it,
     /// is passed over only when `/proc` shows it is not an earlier irlume. When
     /// the holders cannot be read, none is listed, as for one outside this PID
@@ -1736,6 +1742,7 @@ mod tests {
     /// read, the operation stops.
     #[test]
     fn stops_when_proc_cannot_rule_out_an_earlier_irlume_holding_the_legacy_lock() {
+        let [other, peer, waiter] = foreign_pids();
         let users = |holders: &[u32], waiters: &[u32]| {
             Some(LockUsers {
                 holders: holders.to_vec(),
@@ -1745,36 +1752,33 @@ mod tests {
         let refused = earlier_irlumes(None, |_| Some(false))
             .expect_err("unreadable holders were passed over");
         assert!(refused.contains("cannot be read"), "{refused}");
-        let refused = earlier_irlumes(users(&[], &[4242]), |_| Some(false))
+        let refused = earlier_irlumes(users(&[], &[other]), |_| Some(false))
             .expect_err("a holder /proc/locks does not list was passed over");
         assert!(refused.contains("does not list"), "{refused}");
-        let refused = earlier_irlumes(users(&[4242, 4343], &[]), |pid| {
-            (pid == 4242).then_some(false)
-        })
-        .expect_err("a holder /proc cannot show was passed over");
-        assert!(refused.contains("process 4343"), "{refused}");
-        let refused = earlier_irlumes(users(&[4242], &[4343]), |pid| {
-            (pid == 4242).then_some(false)
-        })
-        .expect_err("a waiter /proc cannot show was passed over");
-        assert!(refused.contains("process 4343"), "{refused}");
+        let unreadable_peer = |pid| (pid == other).then_some(false);
+        let refused = earlier_irlumes(users(&[other, peer], &[]), unreadable_peer)
+            .expect_err("a holder /proc cannot show was passed over");
+        assert!(refused.contains(&format!("process {peer} ")), "{refused}");
+        let refused = earlier_irlumes(users(&[other], &[peer]), unreadable_peer)
+            .expect_err("a waiter /proc cannot show was passed over");
+        assert!(refused.contains(&format!("process {peer} ")), "{refused}");
 
         assert_eq!(
-            earlier_irlumes(users(&[4242, 4343], &[4444]), |pid| Some(pid == 4343)),
+            earlier_irlumes(users(&[other, peer], &[waiter]), |pid| Some(pid == peer)),
             Ok(LockUsers {
-                holders: vec![4343],
+                holders: vec![peer],
                 waiters: Vec::new(),
             })
         );
         assert_eq!(
-            earlier_irlumes(users(&[4242], &[4343, 4444]), |pid| Some(pid == 4444)),
+            earlier_irlumes(users(&[other], &[peer, waiter]), |pid| Some(pid == waiter)),
             Ok(LockUsers {
                 holders: Vec::new(),
-                waiters: vec![4444],
+                waiters: vec![waiter],
             })
         );
         assert_eq!(
-            earlier_irlumes(users(&[4242], &[4343]), |_| Some(false)),
+            earlier_irlumes(users(&[other], &[peer]), |_| Some(false)),
             Ok(LockUsers::default())
         );
         // This process, which has the file open, is never an earlier irlume.
@@ -2575,46 +2579,47 @@ mod tests {
     /// The verdict at the limit reads `/proc/locks` until two consecutive
     /// readings list the same holders and waiters of the file, since one
     /// reading can leave out a line when other locks change meanwhile. Here
-    /// the first reading leaves out process 4343, which runs as the caller's
-    /// uid with the file open, beside process 4242, which does not: that
-    /// reading alone lets the operation go on, and the two after it, which
-    /// agree, stop it. Two readings listing the same processes in another
-    /// order agree. A reading that fails leaves the holders unread, which
-    /// stops the operation ([`earlier_irlumes`]).
+    /// the first reading lists an unrelated holder but leaves out the one
+    /// that runs as the caller's uid with the file open: that reading alone
+    /// lets the operation go on, and the two after it, which agree, stop it.
+    /// Two readings listing the same processes in another order agree.
+    /// A reading that fails leaves the holders unread, which stops the
+    /// operation ([`earlier_irlumes`]).
     #[test]
     fn decides_at_the_limit_on_the_first_two_proc_locks_readings_that_agree() {
-        let earlier = |pid| Some(pid == 4343);
-        let left_out = locks_reading(&[4242], &[]);
-        let full = locks_reading(&[4242, 4343], &[]);
+        let [other, holder, _] = foreign_pids();
+        let earlier = |pid| Some(pid == holder);
+        let left_out = locks_reading(&[other], &[]);
+        let full = locks_reading(&[other, holder], &[]);
         assert_eq!(
             earlier_irlumes(Some(flock_users(&left_out, (0, 0x1a), 777)), earlier),
             Ok(LockUsers::default()),
-            "the reading without process 4343 must let the operation go on alone"
+            "the reading without the earlier irlume must let the operation go on alone"
         );
         let (users, taken) = agreed(&[Some(left_out), Some(full.clone()), Some(full.clone())]);
         assert_eq!(taken, 3);
         assert_eq!(
             users,
             Some(LockUsers {
-                holders: vec![4242, 4343],
+                holders: vec![other, holder],
                 waiters: Vec::new(),
             })
         );
         assert_eq!(
             earlier_irlumes(users, earlier),
             Ok(LockUsers {
-                holders: vec![4343],
+                holders: vec![holder],
                 waiters: Vec::new(),
             })
         );
 
-        let reordered = locks_reading(&[4343, 4242], &[]);
+        let reordered = locks_reading(&[holder, other], &[]);
         let (users, taken) = agreed(&[Some(full.clone()), Some(reordered)]);
         assert_eq!(taken, 2, "the same processes in another order disagreed");
         assert_eq!(
             users,
             Some(LockUsers {
-                holders: vec![4343, 4242],
+                holders: vec![holder, other],
                 waiters: Vec::new(),
             })
         );
@@ -2624,33 +2629,33 @@ mod tests {
 
     /// When no two consecutive readings of `/proc/locks` agree, the verdict
     /// at the limit judges every holder and waiter any of them lists, after
-    /// [`LOCKS_READINGS`] readings. Here readings that list process 4242
-    /// holding the lock and process 4444 waiting for it, neither of which runs
-    /// as the caller's uid with the file open, alternate with readings that
-    /// list process 4343, which does, holding it beside 4242: the first kind
-    /// alone lets the operation go on, and all of them together stop it.
+    /// [`LOCKS_READINGS`] readings. Here readings listing an unrelated holder
+    /// and waiter alternate with readings listing a second holder that runs
+    /// as the caller's uid with the file open: the first kind alone lets the
+    /// operation go on, and all of them together stop it.
     #[test]
     fn decides_at_the_limit_on_every_process_proc_locks_readings_list_when_none_agree() {
-        let earlier = |pid| Some(pid == 4343);
-        let left_out = locks_reading(&[4242], &[4444]);
+        let [other, holder, waiter] = foreign_pids();
+        let earlier = |pid| Some(pid == holder);
+        let left_out = locks_reading(&[other], &[waiter]);
         assert_eq!(
             earlier_irlumes(Some(flock_users(&left_out, (0, 0x1a), 777)), earlier),
             Ok(LockUsers::default()),
-            "the reading without process 4343 must let the operation go on alone"
+            "the reading without the earlier irlume must let the operation go on alone"
         );
-        let (users, taken) = agreed(&[Some(left_out), Some(locks_reading(&[4242, 4343], &[]))]);
+        let (users, taken) = agreed(&[Some(left_out), Some(locks_reading(&[other, holder], &[]))]);
         assert_eq!(taken, LOCKS_READINGS);
         assert_eq!(
             users,
             Some(LockUsers {
-                holders: vec![4242, 4343],
-                waiters: vec![4444],
+                holders: vec![other, holder],
+                waiters: vec![waiter],
             })
         );
         assert_eq!(
             earlier_irlumes(users, earlier),
             Ok(LockUsers {
-                holders: vec![4343],
+                holders: vec![holder],
                 waiters: Vec::new(),
             })
         );

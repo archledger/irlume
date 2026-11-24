@@ -49,8 +49,9 @@ summary lives on the [README](../README.md); this is the detail.
 - **Bright infrared behind you rejects a genuine face.** The gate infers shape
   from how the emitter's light falls, and open sky or a hot lamp floods it. In a
   430-sample field session it was reliable below ambient ~120 on the 0-255 IR
-  scale and rejected 129 of 129 genuine samples above ~170. The rejection names
-  the condition and the fix.
+  scale and rejected 129 of 129 genuine samples above ~170. When the camera
+  confirms a lit/dark pair for the selected frame, applicable refusals suggest
+  moving away from the light or using the password.
 - **A dim room can make the shipped RGB PAD cue refuse a genuine face.** The
   ViT RGB cue (ADR-0013) is deny-only and denies when the median of the last
   five scores reaches 0.55. Single genuine frames already reach that line (on

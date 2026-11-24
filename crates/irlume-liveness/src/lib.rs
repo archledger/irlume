@@ -75,10 +75,10 @@ pub struct Signals {
     /// High-frequency spectral peakiness of the RGB face region (2D-FFT moiré /
     /// pixel-grid cue); RGB-only screen-replay deterrent. Unused on the IR path.
     pub rgb_moire_score: f32,
-    /// Ambient IR level (0–255): mean of the darkest (unlit) frame in the IR
-    /// capture burst, i.e. the scene's own infrared with the emitter off. 0.0 =
-    /// not measured (RGB-only path, older callers); the flood rewording below
-    /// then never triggers. See [`IR_AMBIENT_FLOOD`].
+    /// Raw IR burst ambient estimate (0–255): the darkest frame the camera
+    /// marked emitter-off, or the burst minimum without such a frame. Some
+    /// callers use zero when there is no IR burst. This scalar alone does not
+    /// establish an emitter-off observation. See [`IR_AMBIENT_FLOOD`].
     pub ir_ambient: f32,
     /// Whether the negotiated IR format defines where its sensor ceiling is,
     /// i.e. whether [`Self::ir_saturated_frac`] could be measured at all.
@@ -489,18 +489,15 @@ impl Signals {
     }
 }
 
-/// Ambient IR (see [`Signals::ir_ambient`]) above which the brightness and
-/// center/edge cues are physically starved rather than measuring a spoof: the scene's
-/// own infrared swamps the emitter, so the strobe adds almost nothing to read
-/// shape or skin reflectance from. Measured 2026-07-16 (430-sample field
+/// At or above this observed ambient IR level the scene's own infrared can
+/// swamp the emitter, starving the brightness and center/edge cues. Measured
+/// 2026-07-16 (430-sample field
 /// session, ~/irlume-suncal/SESSION-2026-07-16.md): genuine faces clear the ratio
 /// reliably below ambient ~120, marginally to ~170, and 0/129 samples passed
 /// above ~170 (emitter-over-ambient gap collapsed to 4–9, IR frame 46–82%
 /// saturated). The verdict stays Spoof (fail closed); only the REASON changes,
-/// from "looks 2D" (which reads as an accusation) to what is actually wrong
-/// and what to do about it. The sensor cannot tell WHAT the source is (open
-/// sky, sun, and strong lamps look identical in IR), so the message names
-/// examples, not a diagnosis.
+/// from "looks 2D" to password guidance. Only paired evidence supports the
+/// ambient advisory, and it does not identify a source or direction.
 pub const IR_AMBIENT_FLOOD: f32 = 170.0;
 
 /// The actionable rejection for a dark or flat reading explained by a
@@ -510,12 +507,20 @@ fn persistent_ir_source_reason() -> String {
         .into()
 }
 
-/// The actionable rejection for ambient-flooded IR scenes.
-fn flood_reason(ambient: f32) -> String {
-    format!(
-        "too much IR light behind you (ambient {ambient:.0}: open sky, sun, or bright \
-         lamps wash out the emitter); turn away from the light or use your password"
-    )
+/// Wording for an already dark or flat refusal, never a verdict.
+fn ambient_flood_reason(s: &Signals) -> Option<&'static str> {
+    (s.ir_ambient >= IR_AMBIENT_FLOOD).then(|| {
+        // Capture supplies this fraction only for the selected camera-marked
+        // lit frame and an adjacent camera-marked dark frame in the same burst.
+        // Presence (even zero), not clipping magnitude, proves the ambient mean
+        // was not a fallback burst minimum. A missing pair is inconclusive.
+        if s.ir_persistent_saturated_frac.is_some() {
+            "strong infrared light may be interfering with the camera; \
+             move away from the light or use your password"
+        } else {
+            "IR liveness check did not pass; use your password"
+        }
+    })
 }
 
 /// Whether the corneal glint says the eyes are off the lens while the head
@@ -632,8 +637,8 @@ impl LivenessGate {
         if !cues.ir_reflectance_ok {
             let reason = if s.persistent_ir_source_overwhelms() {
                 persistent_ir_source_reason()
-            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
-                flood_reason(s.ir_ambient)
+            } else if let Some(reason) = ambient_flood_reason(s) {
+                reason.into()
             } else {
                 format!(
                     "IR face too dark ({:.0}); not reflecting IR like skin",
@@ -648,8 +653,8 @@ impl LivenessGate {
         if !cues.center_edge_ratio_ok {
             let reason = if s.persistent_ir_source_overwhelms() {
                 persistent_ir_source_reason()
-            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
-                flood_reason(s.ir_ambient)
+            } else if let Some(reason) = ambient_flood_reason(s) {
+                reason.into()
             } else if eyes_off_lens(s.ir_eye_glint) {
                 off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
             } else {
@@ -750,8 +755,8 @@ impl LivenessGate {
         if !cues.ir_reflectance_ok {
             let reason = if s.persistent_ir_source_overwhelms() {
                 persistent_ir_source_reason()
-            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
-                flood_reason(s.ir_ambient)
+            } else if let Some(reason) = ambient_flood_reason(s) {
+                reason.into()
             } else {
                 format!("IR face too dark ({:.0})", s.ir_face_brightness)
             };
@@ -761,8 +766,8 @@ impl LivenessGate {
         if !cues.center_edge_ratio_ok {
             let reason = if s.persistent_ir_source_overwhelms() {
                 persistent_ir_source_reason()
-            } else if s.ir_ambient >= IR_AMBIENT_FLOOD {
-                flood_reason(s.ir_ambient)
+            } else if let Some(reason) = ambient_flood_reason(s) {
+                reason.into()
             } else if eyes_off_lens(s.ir_eye_glint) {
                 off_axis_reason(s.ir_center_edge_ratio, s.ir_eye_glint)
             } else {
@@ -1635,38 +1640,74 @@ mod tests {
 
     #[test]
     fn ambient_flood_rewords_but_still_denies() {
-        // Flat under flood ambient: still Spoof (fail closed), but the reason
-        // says what is wrong (too much IR behind the user) instead of accusing
-        // a genuine face of being a photo. Both starved cues get the wording.
-        let mut s = live_signals();
-        s.ir_center_edge_ratio = 0.85; // outdoor-flat (2026-07-16 field data)
-        s.ir_ambient = 190.0;
-        let (v, _, reason) = LivenessGate::new().evaluate(&s);
-        assert_eq!(v, Verdict::Spoof);
-        assert!(reason.contains("too much IR light behind you"), "{reason}");
+        for ir_only in [false, true] {
+            let evaluate = |s: &Signals| {
+                if ir_only {
+                    LivenessGate.evaluate_ir_only(s)
+                } else {
+                    LivenessGate.evaluate(s)
+                }
+            };
+            let mut good = live_signals();
+            if ir_only {
+                good.rgb_face = None;
+            }
+            good.ir_ambient = 190.0;
+            // An explicit lit/dark pair can be measured even at zero overlap.
+            good.ir_persistent_saturated_frac = Some(0.0);
+            assert_eq!(evaluate(&good).0, Verdict::Live);
 
-        let mut s = live_signals();
-        s.ir_face_brightness = 20.0; // starved by subtraction/backlight
-        s.ir_ambient = 190.0;
-        let (v, _, reason) = LivenessGate::new().evaluate(&s);
-        assert_eq!(v, Verdict::Spoof);
-        assert!(reason.contains("too much IR light behind you"), "{reason}");
+            for dark in [false, true] {
+                let mut sample = good.clone();
+                let ordinary_reason = if dark {
+                    sample.ir_face_brightness = 20.0;
+                    "IR face too dark"
+                } else {
+                    sample.ir_center_edge_ratio = 0.85;
+                    "IR too flat"
+                };
 
-        // Same cues indoors (low ambient): the specific accusations remain,
-        // and the ir-only/dark path rewords the same way under flood.
-        let mut s = live_signals();
-        s.ir_center_edge_ratio = 0.85;
-        s.ir_ambient = 60.0;
-        let (_, _, reason) = LivenessGate::new().evaluate(&s);
-        assert!(reason.contains("IR too flat"), "{reason}");
+                // The same raw high value could be a fallback burst minimum.
+                sample.ir_persistent_saturated_frac = None;
+                let (unknown, unknown_cues, unknown_reason) = evaluate(&sample);
+                assert_eq!(unknown, Verdict::Spoof);
+                assert_eq!(unknown_cues.deny_cause, DenyCause::Other);
+                assert_eq!(
+                    unknown_reason,
+                    "IR liveness check did not pass; use your password"
+                );
 
-        let mut s = live_signals();
-        s.rgb_face = None;
-        s.ir_center_edge_ratio = 0.85;
-        s.ir_ambient = 200.0;
-        let (v, _, reason) = LivenessGate::new().evaluate_ir_only(&s);
-        assert_eq!(v, Verdict::Spoof);
-        assert!(reason.contains("too much IR light behind you"), "{reason}");
+                sample.ir_persistent_saturated_frac = Some(0.0);
+                let (confirmed, confirmed_cues, confirmed_reason) = evaluate(&sample);
+                assert_eq!(confirmed, unknown);
+                assert_eq!(confirmed_cues.deny_cause, unknown_cues.deny_cause);
+                assert_eq!(
+                    confirmed_reason,
+                    "strong infrared light may be interfering with the camera; \
+                     move away from the light or use your password"
+                );
+
+                sample.ir_ambient = 60.0;
+                let (low, low_cues, low_reason) = evaluate(&sample);
+                assert_eq!(low, unknown);
+                assert_eq!(low_cues.deny_cause, unknown_cues.deny_cause);
+                assert!(low_reason.starts_with(ordinary_reason), "{low_reason}");
+            }
+
+            // An observed ambient value does not explain an earlier no-face refusal.
+            good.ir_face = None;
+            let (verdict, cues, reason) = evaluate(&good);
+            assert_eq!(
+                verdict,
+                if ir_only {
+                    Verdict::Uncertain
+                } else {
+                    Verdict::Spoof
+                }
+            );
+            assert_eq!(cues.deny_cause, DenyCause::NoIrFace);
+            assert!(reason.starts_with("no face in IR"), "{reason}");
+        }
     }
 
     #[test]

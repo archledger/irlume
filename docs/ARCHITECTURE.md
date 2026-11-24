@@ -279,10 +279,11 @@ behind (`crates/irlume-camera/src/lib.rs`):
   raw lit frame is kept, so subtracting a bright pedestal can never hand a
   blank image downstream.
 
-Above `IR_AMBIENT_FLOOD = 170` mean ambient (8-bit, `irlume-liveness`) the
-sensor saturates and no capture strategy recovers the signal; the liveness gate
-still denies, with a message telling the user to turn away from the light or
-use their password.
+If the gate has refused an IR reading as too dark or flat, an ambient mean at
+or above `IR_AMBIENT_FLOOD` can explain the refusal. The advisory requires the
+camera to have marked both the selected lit frame and an adjacent dark frame
+in the same burst. A bright reading without that pair gets neutral password
+guidance, not a claim about the light. The advisory does not change the verdict.
 
 ## Face login → keyring unlock
 

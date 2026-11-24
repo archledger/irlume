@@ -59,7 +59,11 @@ stops receiving security updates at that moment, and the release notes plus
 ## No professional support
 
 There is no SLA, no dedicated support channel and no paid tier. If irlume
-breaks your login, your password still works: irlume never blocks it, and a
-failed face sign-in falls back to it. That is a design invariant, not a best
-effort. The operating system's own lockout after repeated failed logins
-(`pam_faillock`) is separate; `irlume doctor` reports it and how to clear it.
+breaks face sign-in, your password path still opens: on a supported PAM stack a
+refused face sign-in returns control to the password provider, and irlume never
+blocks that path. That is a design invariant about the handoff, not a guarantee
+that the operating system will accept your password. The frontend and OS account
+policy still apply (see the
+[frontend boundary](docs/DESKTOP-AUTH.md#frontend-boundary)); in particular the
+OS lockout after repeated failed logins (`pam_faillock`) can reject a password
+independently of irlume, and `irlume doctor` reports it and how to clear it.

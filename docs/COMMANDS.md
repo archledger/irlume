@@ -92,12 +92,16 @@ Conventions that apply everywhere:
 | `irlume uninstall [--keep-data] [--yes]` | yes | un-wire PAM first (lockout-safe order), stop the daemon, sweep the stale socket, the `/etc/systemd/system` unit copies and enabled timer, the kernel-loaded AppArmor profile, and per-user XDG state; wipe enrolled data unless `--keep-data`, evict the persisted TPM storage root key, and irlume's DA-exempt storage key (ADR-0034 §3) at any owner handle, after a fully completed wipe (kept with `--keep-data` or an incomplete wipe; a key that irlume's template does not derive is never touched), through the TPM transport and original-key handle irlumed's unit sets (`IRLUME_TCTI`, `IRLUME_SRK_HANDLE`), which it reports, then report each storage key irlumed's record keeps (its original key, its DA-exempt key, a key that one superseded) that is still persisted, with its handle, TPM name and the manual `tpm2_evictcontrol` command, passing irlumed's `IRLUME_TCTI` with `-T` (ADR-0034, Phase 3 amendment), name the Bitwarden polkit leave-behind if present, then print the package-removal command |
 
 `trace explain` summarizes IR face-region washout by comparing recorded
-clipping fractions with their own recorded limits. "Measured but not
-observed above the recorded limit" refers only to usable records, not all
-frames. Rate and illumination metadata alone are insufficient. The
-summary is omitted when the operation ID spans classes or records follow
+clipping fractions with their own recorded limits. "Recorded clipping values
+did not exceed their recorded limits" refers only to usable comparisons, not
+all frames. A recorded zero does not prove the region was sampled. Rate and
+illumination metadata alone are insufficient. The summary is omitted
+when the operation ID spans classes or records follow
 its completion; the timeline is unchanged. The summary does not identify
 a light source, diagnose camera health, or test exposure response.
+With `--output`, if the explanation would exceed the 16 MiB file limit,
+the command omits the summaries and saves the unchanged timeline if it
+fits. If the timeline itself is too large, no output file is created.
 
 `camera-tune --verify-record` compares the reference and fresh records per
 capture arm and role. The drift report keeps stored refusals as `false`,

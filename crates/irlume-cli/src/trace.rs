@@ -346,32 +346,14 @@ fn run_explain(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let rendered = match explain(&input) {
-        Ok(rendered) => rendered,
-        Err(message) => {
-            eprintln!("irlume trace explain: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let Some(output) = output else {
-        print!("{rendered}");
-        return ExitCode::SUCCESS;
-    };
-    let result = (|| {
-        let mut artifact = SecureArtifact::create(&output, MAX_TRACE_BYTES)?;
-        artifact.write_chunk(rendered.as_bytes())?;
-        artifact.commit()
-    })();
-    match result {
-        Ok(published) => {
-            println!(
-                "Trace explanation created: {}",
-                published.final_path.display()
-            );
+    let export = output.as_deref().map(|path| (path, MAX_TRACE_BYTES));
+    match explain(&input, export) {
+        Ok(rendered) => {
+            print!("{rendered}");
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!("irlume trace explain: {}: {error}", output.display());
+        Err(message) => {
+            eprintln!("irlume trace explain: {message}");
             ExitCode::FAILURE
         }
     }
@@ -410,15 +392,46 @@ fn parse_explain_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), &'s
     Ok((PathBuf::from(input), output))
 }
 
-fn explain(input: &Path) -> Result<String, String> {
+fn explain(input: &Path, export: Option<(&Path, u64)>) -> Result<String, String> {
     let file =
         std::fs::File::open(input).map_err(|error| format!("{}: {error}", input.display()))?;
     let limits = TraceLimits::bounded(MAX_TRACE_DURATION_MS);
     let parsed = parse_trace(BufReader::new(file), limits).map_err(|error| error.to_string())?;
-    Ok(render_timeline(parsed.records()))
+    let mut rendered = render_timeline(parsed.records(), true);
+    let Some((output, limit)) = export else {
+        return Ok(rendered);
+    };
+
+    let fits = |len| u64::try_from(len).is_ok_and(|bytes| bytes <= limit);
+    if !fits(rendered.len()) {
+        // Summaries are optional. Render the same parsed trace without them
+        // rather than refusing an export the timeline alone could fit.
+        drop(rendered);
+        rendered = render_timeline(parsed.records(), false);
+    }
+    if !fits(rendered.len()) {
+        return Err(format!(
+            "{}: artifact byte limit exceeded",
+            output.display()
+        ));
+    }
+
+    let result = (|| {
+        let mut artifact = SecureArtifact::create(output, limit)?;
+        artifact.write_chunk(rendered.as_bytes())?;
+        artifact.commit()
+    })();
+    result
+        .map(|published| {
+            format!(
+                "Trace explanation created: {}\n",
+                published.final_path.display()
+            )
+        })
+        .map_err(|error: std::io::Error| format!("{}: {error}", output.display()))
 }
 
-fn render_timeline(records: &[TraceRecord]) -> String {
+fn render_timeline(records: &[TraceRecord], include_summaries: bool) -> String {
     use std::fmt::Write as _;
     let mut by_operation: BTreeMap<String, Vec<&TraceRecord>> = BTreeMap::new();
     let mut dropped = 0_u64;
@@ -454,12 +467,14 @@ fn render_timeline(records: &[TraceRecord]) -> String {
             operation_records[0].operation
         )
         .unwrap();
-        if let Some(status) = ir_washout_summary(&operation_records) {
-            writeln!(
-                output,
-                "  IR face-region washout: {status}; exposure response not tested"
-            )
-            .unwrap();
+        if include_summaries {
+            if let Some(status) = ir_washout_summary(&operation_records) {
+                writeln!(
+                    output,
+                    "  IR face-region washout: {status}; exposure response not tested"
+                )
+                .unwrap();
+            }
         }
         for record in operation_records {
             writeln!(
@@ -503,10 +518,11 @@ fn ir_washout_summary(records: &[&TraceRecord]) -> Option<&'static str> {
         );
         above_limit = above_limit.max(recorded_ir_clipping(&record.event));
     }
-    // Above-limit evidence takes precedence over other recorded samples.
+    // Above-limit evidence takes precedence over other recorded comparisons.
+    // A zero value does not establish that the producer sampled any pixels.
     Some(match above_limit {
         Some(true) => "saturation observed above the recorded limit",
-        Some(false) => "measured but not observed above the recorded limit",
+        Some(false) => "recorded clipping values did not exceed their recorded limits",
         None => "insufficient evidence (no usable recorded clipping measurement)",
     })
 }
@@ -1190,7 +1206,7 @@ mod tests {
                 true,
             ),
         ];
-        let rendered = render_timeline(&records);
+        let rendered = render_timeline(&records, true);
         assert!(rendered.contains("Operation 07070707070707070707070707070707"));
         assert!(rendered.contains("Events dropped before recording: 4"));
         assert!(rendered.contains("[terminal]"));
@@ -1212,19 +1228,19 @@ mod tests {
         };
         for (label, events, status) in [
             (
-                "measured zero without illumination metadata",
+                "recorded zero without proof of sampling",
                 vec![stream(None), clipping_decision(&[(0.0, Some(0.1))])],
-                "measured but not observed above the recorded limit",
+                "recorded clipping values did not exceed their recorded limits",
             ),
             (
                 "equal to the recorded limit",
                 vec![clipping_decision(&[(0.1, Some(0.1))])],
-                "measured but not observed above the recorded limit",
+                "recorded clipping values did not exceed their recorded limits",
             ),
             (
                 "use the recorded limit, not the current policy",
                 vec![clipping_decision(&[(0.2, Some(0.25))])],
-                "measured but not observed above the recorded limit",
+                "recorded clipping values did not exceed their recorded limits",
             ),
             (
                 "active IR alone, without a decision",
@@ -1344,7 +1360,7 @@ mod tests {
                     "Operation 01010101010101010101010101010101 (Authentication)",
                     "  IR face-region washout: saturation observed above the recorded limit; exposure response not tested",
                     "Operation 02020202020202020202020202020202 (Enrollment)",
-                    "  IR face-region washout: measured but not observed above the recorded limit; exposure response not tested",
+                    "  IR face-region washout: recorded clipping values did not exceed their recorded limits; exposure response not tested",
                     "Operation 03030303030303030303030303030303 (Identification)",
                     "  IR face-region washout: insufficient evidence (no usable recorded clipping measurement); exposure response not tested",
                     "Operation 09090909090909090909090909090909 (Lifecycle)",
@@ -1407,7 +1423,7 @@ mod tests {
                 .filter(|line| line.contains("IR face-region washout:"))
                 .collect();
             let mut expected = vec![
-                "  IR face-region washout: measured but not observed above the recorded limit; exposure response not tested",
+                "  IR face-region washout: recorded clipping values did not exceed their recorded limits; exposure response not tested",
             ];
             if control {
                 expected.insert(0, "  IR face-region washout: saturation observed above the recorded limit; exposure response not tested");
@@ -1452,6 +1468,15 @@ mod tests {
     ) -> String {
         let (dir, _sandbox) = sandbox("ir-washout");
         let path = dir.join("trace.jsonl");
+        write_clipping_fixture(&path, schema, records);
+        explain(&path, None).unwrap()
+    }
+
+    fn write_clipping_fixture(
+        path: &Path,
+        schema: u32,
+        records: Vec<(u8, OperationClass, TraceEventKind)>,
+    ) {
         let finished = TraceEventKind::Finished {
             outcome: CategoricalOutcome::Completed,
         };
@@ -1469,8 +1494,61 @@ mod tests {
             serde_json::to_writer(&mut bytes, &record).unwrap();
             bytes.push(b'\n');
         }
-        std::fs::write(&path, bytes).unwrap();
-        explain(&path).unwrap()
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn explanation_export_omits_only_summaries_to_fit_and_preflights_the_timeline() {
+        let (dir, _sandbox) = sandbox("explain-export-limit");
+        let path = dir.join("trace.jsonl");
+        write_clipping_fixture(
+            &path,
+            CURRENT_TRACE_SCHEMA_VERSION,
+            vec![(
+                1,
+                OperationClass::Authentication,
+                clipping_decision(&[(0.2, Some(0.1))]),
+            )],
+        );
+        let full = explain(&path, None).unwrap();
+        let timeline = full.replace(
+            "  IR face-region washout: saturation observed above the recorded limit; exposure response not tested\n",
+            "",
+        );
+        assert!(timeline.len() < full.len());
+
+        for (name, cap, expected) in [
+            ("full.txt", full.len(), &full),
+            ("one-over.txt", full.len() - 1, &timeline),
+            ("timeline.txt", timeline.len(), &timeline),
+        ] {
+            let output = dir.join(name);
+            let cap = u64::try_from(cap).unwrap();
+            assert_eq!(
+                explain(&path, Some((&output, cap))).unwrap(),
+                format!("Trace explanation created: {}\n", output.display())
+            );
+            assert_eq!(std::fs::read_to_string(&output).unwrap(), *expected);
+            assert_eq!(
+                output.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let files = || -> std::collections::BTreeSet<_> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect()
+        };
+        let before = files();
+        let refused = dir.join("refused.txt");
+        let cap = u64::try_from(timeline.len() - 1).unwrap();
+        assert_eq!(
+            explain(&path, Some((&refused, cap))).unwrap_err(),
+            format!("{}: artifact byte limit exceeded", refused.display())
+        );
+        assert_eq!(files(), before);
     }
 
     #[test]
@@ -1890,7 +1968,7 @@ mod tests {
                 .records()
                 .iter()
                 .all(|record| record.trace_schema == schema));
-            assert!(render_timeline(parsed.records())
+            assert!(render_timeline(parsed.records(), true)
                 .starts_with(&format!("Irlume diagnostic trace schema {schema}\n")));
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -1990,7 +2068,7 @@ mod tests {
                 false,
             ),
         ];
-        let rendered = render_timeline(&records);
+        let rendered = render_timeline(&records, true);
         assert!(rendered.starts_with(&format!(
             "Irlume diagnostic trace schema {TRACE_SCHEMA_VERSION}\n"
         )));
@@ -2978,7 +3056,7 @@ mod tests {
         let (dir, _sandbox) = sandbox("explain-v5");
         let current = dir.join("current.jsonl");
         write(&current, &records);
-        let rendered = explain(&current).unwrap();
+        let rendered = explain(&current, None).unwrap();
         assert!(rendered.starts_with(&format!(
             "Irlume diagnostic trace schema {CURRENT_TRACE_SCHEMA_VERSION}\n"
         )));
@@ -2997,7 +3075,7 @@ mod tests {
         }
         let older = dir.join("older.jsonl");
         write(&older, &records);
-        assert!(explain(&older)
+        assert!(explain(&older, None)
             .unwrap_err()
             .contains("unsupported trace schema"));
         std::fs::remove_dir_all(dir).unwrap();
@@ -3121,7 +3199,7 @@ mod tests {
         let (dir, _sandbox) = sandbox("explain-v6");
         let current = dir.join("current.jsonl");
         write(&current, &records);
-        let rendered = explain(&current).unwrap();
+        let rendered = explain(&current, None).unwrap();
         assert!(rendered.starts_with(&format!(
             "Irlume diagnostic trace schema {CURRENT_TRACE_SCHEMA_VERSION}\n"
         )));
@@ -3175,7 +3253,7 @@ mod tests {
             }
             let older = dir.join(format!("older-{schema}.jsonl"));
             write(&older, &older_records);
-            assert!(explain(&older)
+            assert!(explain(&older, None)
                 .unwrap_err()
                 .contains("unsupported trace schema"));
         }

@@ -27,6 +27,7 @@ digests below is [`RELEASING.md`](RELEASING.md).
 | ONNX Runtime | 1.28.1 tarball sha256 (`scripts/fetch-ort.sh`) |
 | TensorFlow Lite runtime | v2.19.0 asset sha256 (`build-ppa-source.sh`) |
 | Container base images | digest-pinned `ubuntu:26.04`, `debian:12`; the PPA container's build toolchain is rustup-pinned `RUST_VER` (1.88.0, the same pin the universal `.deb` lane uses; the archive's `cargo`/`rustc` stay installed only to satisfy the source package's Build-Depends gate) |
+| Universal `.deb` build packages | Debian Bookworm, updates and security from the same dated [Debian snapshot](https://snapshot.debian.org/), verified using the Debian archive keyring |
 
 The model digests are recorded in `scripts/fetch-models.sh`,
 `models/SHA256SUMS` and `nix/package.nix`, and the two bundled runtimes'
@@ -56,8 +57,11 @@ lockfile cannot be re-resolved before its `--frozen` build accepts it.
 The ONNX Runtime version and sha256 are written in several places (the PPA
 and `.deb` scripts, the Fedora spec, the Nix files); CI's packaging parity
 step (`scripts/check-packaging-parity.sh`) fails if any copy drifts. The
-`.deb` lane also pins `nfpm` by version and verifies it against goreleaser's
-published checksums before it packs anything.
+`.deb` lane also pins the `nfpm` version and amd64 package SHA-256 in the
+recipe. When updating the Debian build packages, update the snapshot timestamp
+deliberately and recheck the Debian and Ubuntu install matrix. The snapshot
+sources disable only the expiry check for historical metadata; APT still
+verifies the Debian archive signatures and package hashes.
 
 ## The PPA orig tarball is packed deterministically
 
@@ -166,16 +170,22 @@ machine and compare those digests.
    release may need the verifier's conditional options: `--require deb`
    when it has no Arch asset, and `--allow-no-metadata` when it predates
    the SBOM/VEX policy (the script's `--help` states the defaults). Check out the
-   release tag you are comparing first: the next step builds the source
-   tree that is currently checked out, so running it on another
-   revision compares against a different artifact. Rebuild the
-   universal `.deb` with
-   `packaging/debian/build-deb-container.sh` (digest-pinned `debian:12`,
-   rustup 1.88.0; the host needs podman or Docker, rootless is fine)
-   and compare its sha256 against the release's `SHA256SUMS`
-   line. A mismatch is a data point, not proof of tampering: this lane is
-   not certified byte-reproducible, so report it rather than conclude from
-   it.
+   release tag you are comparing first: another revision represents a
+   different artifact. For tags with the snapshot-based recipe, run
+   `bash packaging/debian/build-deb-container.sh` from a clean committed
+   checkout without local `info/attributes` overrides. The host needs Git,
+   podman or Docker, and a PEM CA bundle
+   (`CA_BUNDLE` defaults to `/etc/ssl/certs/ca-certificates.crt`).
+   The recipe exports the committed tree, verifies any reused model files,
+   and builds at `/build` in a fresh amd64 container. By default, it uses the
+   commit's Unix timestamp as `SOURCE_DATE_EPOCH`; record the value if you
+   override it. Set `OUT` to an existing output directory if needed.
+   To compare two builders, use the same commit, recipe pins and epoch and
+   compare the resulting `.deb` hashes. To verify reproduction of a published
+   binary, compare against the signed `SHA256SUMS` as well. A match between
+   two new builds does not establish a match to an older release. In
+   particular, v0.16.0 did not use this snapshot and timestamp policy, so
+   these settings do not recover its original build environment.
 2. **PPA orig tarball.** Build from a clean disposable checkout of tag
    `vX.Y.Z` (a fresh `git clone --depth 1 --branch vX.Y.Z`, or
    `git worktree add` on the tag): `build-ppa-source.sh` stages the

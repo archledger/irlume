@@ -16,10 +16,12 @@
 # 2.27 / GLIBCXX 3.4.22, so it never binds first. If BASE ever moves, update
 # the libc6 floor in nfpm.yaml; build-deb.sh asserts the two stay in sync.
 #
-# Requires: podman (or docker; rootless is fine) and real LFS model weights in models/.
+# Requires: podman (or docker; rootless is fine), Git and a host CA bundle.
 #   bash packaging/debian/build-deb-container.sh
-# Output: ./irlume_<version>_amd64.deb (copied out of the container).
+# Output: irlume_<version>_amd64.deb in OUT (default: checkout root).
 set -euo pipefail
+# Cold model downloads must have the same modes as verified cached models.
+umask 022
 # Digest-pinned so the glibc floor and toolchain are reproducible: the plain
 # `debian:12` tag tracks every point release. Bump the digest deliberately when
 # moving the base (the tag is `debian:12` as of this digest).
@@ -30,47 +32,86 @@ RUST_VER="${RUST_VER:-1.88.0}"   # >= ort's MSRV (edition 2024)
 # PPA container lane; keep the two in step).
 RUSTUP_VER="${RUSTUP_VER:-1.29.3}"
 RUSTUP_SHA256="${RUSTUP_SHA256:-b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55}"
-# nfpm builds the .deb; pin it and verify its published checksum rather than
-# fetching a floating "latest" (a compromised/behavior-changed nfpm would
-# otherwise silently alter every universal .deb).
+# Pin the actual nFPM bytes rather than trusting a checksum fetched alongside
+# the executable. Update the version and checksum together.
 NFPM_VER="${NFPM_VER:-2.47.0}"
+NFPM_SHA256="${NFPM_SHA256:-3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${OUT:-$REPO}"
+CA_BUNDLE="${CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
 
+commit="$(git -C "$REPO" rev-parse --verify HEAD)"
+epoch="${SOURCE_DATE_EPOCH-$(git -C "$REPO" show -s --format=%ct "$commit")}"
+# The Unix timestamp also has to fit in the 12-character Debian ar field.
+if [[ ! "$epoch" =~ ^[0-9]{1,12}$ ]]; then
+    echo "invalid SOURCE_DATE_EPOCH: expected 1 to 12 decimal digits" >&2
+    exit 1
+fi
+if [[ ! "$RUSTUP_SHA256" =~ ^[[:xdigit:]]{64}$ || ! "$NFPM_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "RUSTUP_SHA256 and NFPM_SHA256 must be 64 hex digits" >&2
+    exit 1
+fi
+if ! git -C "$REPO" diff --quiet -- || ! git -C "$REPO" diff --cached --quiet "$commit" --; then
+    echo "tracked changes found; build from a clean committed checkout" >&2
+    exit 1
+fi
+if [[ -s "$(git -C "$REPO" rev-parse --path-format=absolute --git-path info/attributes)" ]]; then
+    echo "local Git attributes can change the source archive; build from a fresh clone" >&2
+    exit 1
+fi
 CONTAINER_RUN="$(command -v podman || command -v docker)" || {
     echo "need podman (or docker)"
     exit 1
 }
-# Models are hosted as release assets (not Git LFS); fetch + verify them so a
-# fresh checkout (CI, a clean clone) has real weights to bundle into the .deb.
-bash "$REPO/scripts/fetch-models.sh"
+if [[ ! -r "$CA_BUNDLE" || ! -s "$CA_BUNDLE" ]]; then
+    echo "no readable CA bundle at $CA_BUNDLE; set CA_BUNDLE to a PEM bundle" >&2
+    exit 1
+fi
+OUT="$(cd "$OUT" && pwd)"
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+install -m 0444 -- "$CA_BUNDLE" "$work/ca.pem"
+mkdir "$work/source" "$work/out"
+GIT_ATTR_NOSYSTEM=1 git -C "$REPO" -c core.attributesFile=/dev/null -c tar.umask=0022 archive --format=tar "$commit" \
+    > "$work/source.tar"
+tar --no-same-owner -xf "$work/source.tar" -C "$work/source"
+
+# Seed only manifest-listed model files from the local cache.
+models=()
+while read -r _ model; do
+    if [[ ! "$model" =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]]; then
+        echo "invalid model path in models/SHA256SUMS" >&2
+        exit 1
+    fi
+    models+=("$model")
+    if [[ ! -e "$work/source/models/$model" && -f "$REPO/models/$model" ]]; then
+        install -m 0644 -- "$REPO/models/$model" "$work/source/models/$model"
+    fi
+done < "$work/source/models/SHA256SUMS"
+bash "$work/source/scripts/fetch-models.sh"
+(
+    cd "$work/source/models"
+    sha256sum --quiet --strict -c SHA256SUMS
+    # A staging filesystem's default ACL can override the umask.
+    chmod 0644 -- "${models[@]}"
+)
 
 echo "==> building universal .deb in $BASE (rustup $RUST_VER)"
-"$CONTAINER_RUN" run --rm \
-  -v "$REPO:/src:ro,z" \
-  -v "$OUT:/out:z" \
-  "docker.io/library/$BASE" bash -euc '
-    export DEBIAN_FRONTEND=noninteractive
-    NFPM_VER='"$NFPM_VER"'
-    apt-get update -qq
-    # clang/libclang-dev: bindgen (v4l2-sys-mit) needs libclang at build time.
-    apt-get install -y -qq curl ca-certificates build-essential pkg-config \
-        libtss2-dev libpam0g-dev libudev-dev libdbus-1-dev dbus-daemon clang libclang-dev git xz-utils >/dev/null
-    curl -fsSL "https://static.rust-lang.org/rustup/archive/'"$RUSTUP_VER"'/x86_64-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init \
-      || { echo "rustup-init download failed"; exit 1; }
-    echo '"$RUSTUP_SHA256"'  /tmp/rustup-init | sha256sum -c - \
-      || { echo "rustup-init failed sha256 check; refusing."; exit 1; }
-    chmod +x /tmp/rustup-init
-    /tmp/rustup-init -y --default-toolchain '"$RUST_VER"' --profile minimal --no-modify-path >/dev/null
-    . "$HOME/.cargo/env"    # Pinned nfpm, verified against its published (goreleaser-signed) checksums.
-    curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_amd64.deb" -o /tmp/nfpm.deb
-    curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/checksums.txt" -o /tmp/nfpm.sums
-    ( cd /tmp && want=$(grep "nfpm_${NFPM_VER}_amd64.deb\$" nfpm.sums | awk "{print \$1}"); \
-      got=$(sha256sum nfpm.deb | awk "{print \$1}"); \
-      [ -n "$want" ] && [ "$want" = "$got" ] || { echo "nfpm checksum mismatch"; exit 1; } )
-    apt-get install -y -qq /tmp/nfpm.deb >/dev/null
-    cp -r /src /build && cd /build
-    bash packaging/debian/build-deb.sh
-    cp -v *.deb /out/
-  '
+"$CONTAINER_RUN" run --rm --platform linux/amd64 \
+  -v "$work/source:/src:ro,z" \
+  -v "$work/source.tar:/tmp/irlume-source.tar:ro,z" \
+  -v "$work/ca.pem:/tmp/irlume-ca.pem:ro,z" \
+  -v "$work/out:/out:z" \
+  -e "SOURCE_DATE_EPOCH=$epoch" \
+  -e "RUST_VER=$RUST_VER" -e "RUSTUP_VER=$RUSTUP_VER" -e "RUSTUP_SHA256=$RUSTUP_SHA256" \
+  -e "NFPM_VER=$NFPM_VER" -e "NFPM_SHA256=$NFPM_SHA256" \
+  "docker.io/library/$BASE" bash /src/packaging/debian/container-build.sh
+
+shopt -s nullglob
+packages=("$work"/out/irlume_*_amd64.deb)
+if [[ "${#packages[@]}" != 1 || ! -f "${packages[0]}" || -L "${packages[0]}" ]]; then
+    echo "expected exactly one universal Debian package" >&2
+    exit 1
+fi
+install -m 0644 -- "${packages[0]}" "$OUT/"
 echo "==> universal .deb in $OUT/"

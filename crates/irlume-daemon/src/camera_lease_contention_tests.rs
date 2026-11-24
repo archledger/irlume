@@ -38,8 +38,8 @@ mod camera_lease_contention {
     /// second: a default of, say, five seconds would pass both.
     const ACQUISITION_CEILING: Duration = Duration::from_secs(10);
 
-    /// Clears the device and IR overrides the shared engine sets, the grace
-    /// override and the TPM transport, and restores every value on drop.
+    /// Clears device, IR, retry and grace overrides, uses a nonexistent TPM
+    /// path, then restores every value on drop.
     struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
     impl Environment {
         fn clear() -> Self {
@@ -50,6 +50,8 @@ mod camera_lease_contention {
                 "IRLUME_CAMERA_REQUIRE_FIXED",
                 "IRLUME_FORBID_EXTERNAL_CAMERAS",
                 "IRLUME_GRACE_MS",
+                "IRLUME_RATE_LIMIT",
+                "IRLUME_RATE_COOLDOWN_SECS",
                 "IRLUME_TCTI",
             ];
             let saved = keys
@@ -74,6 +76,23 @@ mod camera_lease_contention {
                     None => std::env::remove_var(key),
                 }
             }
+        }
+    }
+
+    /// Restore the shared engine's fixture defaults even if an assertion
+    /// unwinds while it is using the contention camera pair.
+    struct FixtureDevices<'a>(&'a mut irlume_auth::Engine);
+
+    impl<'a> FixtureDevices<'a> {
+        fn new(engine: &'a mut irlume_auth::Engine) -> Self {
+            engine.set_devices(RGB, IR);
+            Self(engine)
+        }
+    }
+
+    impl Drop for FixtureDevices<'_> {
+        fn drop(&mut self) {
+            self.0.set_devices(NO_RGB, NO_IR);
         }
     }
 
@@ -157,7 +176,7 @@ mod camera_lease_contention {
 
             let recorder = fixture();
             let counts = recorder.lease_counts_observer();
-            engine.set_devices(RGB, IR);
+            let camera = FixtureDevices::new(&mut engine);
             // Taken through the public entry on the request's own thread, so
             // it is the lease authority the request then contends on.
             let held =
@@ -173,7 +192,7 @@ mod camera_lease_contention {
 
             for structured_errors in [false, true] {
                 let seen = recorder.calls().len();
-                let (response, took) = timed(authenticate(structured_errors), &mut engine);
+                let (response, took) = timed(authenticate(structured_errors), camera.0);
                 assert!(
                     !is_face_grant(&response),
                     "a camera another operation holds grants nothing: {response:?}"
@@ -229,7 +248,7 @@ mod camera_lease_contention {
             // Control: with the lease free, the same request takes it and
             // reaches the camera, where the fixture's refused open ends it.
             let calls = recorder.calls().len();
-            let (response, _) = timed(authenticate(false), &mut engine);
+            let (response, _) = timed(authenticate(false), camera.0);
             assert!(!is_face_grant(&response), "{response:?}");
             let reached = &recorder.calls()[calls..];
             assert!(
@@ -239,7 +258,6 @@ mod camera_lease_contention {
             assert_eq!(counts(), (0, 0));
             charged += 1;
             assert_eq!(charges(&sb, 0), charged);
-            engine.set_devices(NO_RGB, NO_IR);
         }
     }
 }

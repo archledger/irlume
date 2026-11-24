@@ -312,13 +312,25 @@ impl Harness {
     /// token from stdin. Test tokens are restricted to shell-safe bytes so the
     /// helper never needs quoting logic that could obscure what it validates.
     fn token_checker(&self, name: &str, expected: &str) -> PathBuf {
+        self.write_token_checker(name, expected, false)
+    }
+
+    /// Optionally create a private `.passed` marker only after a token match.
+    fn write_token_checker(&self, name: &str, expected: &str, mark_success: bool) -> PathBuf {
         assert!(expected
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
         let path = self.root.join(format!("check-{name}.sh"));
+        let record = if mark_success {
+            ": > \"${0%.sh}.passed\"\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &path,
-            format!("#!/bin/sh\nIFS= read -r value || :\n[ \"$value\" = '{expected}' ]\n"),
+            format!(
+                "#!/bin/sh\nIFS= read -r value || :\n[ \"$value\" = '{expected}' ] || exit 1\n{record}"
+            ),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt as _;
@@ -5255,7 +5267,24 @@ fn pamwrap_camera_contention_never_grants_and_keeps_the_password_fallback() {
                     ),
                 ],
             );
+            // The busy error also answers sudo's preliminary Health, so
+            // this exercises unknown health before the Authenticate reply.
             let log = serve(&h.socket, move |_| reply.clone());
+            let assert_one_face_request = || {
+                let mut requests = log.lock().unwrap();
+                // For each transaction, a refused release never buys an
+                // identity-only verify. Health is not a face request.
+                let expected = if desktop {
+                    matches!(requests.as_slice(), [Request::UnsealPassword { .. }])
+                } else {
+                    matches!(
+                        requests.as_slice(),
+                        [Request::Health, Request::Authenticate { .. }]
+                    )
+                };
+                assert!(expected, "{service}: expected exactly one face request");
+                requests.clear();
+            };
 
             let (ok, out) = h.run(
                 service,
@@ -5268,6 +5297,7 @@ fn pamwrap_camera_contention_never_grants_and_keeps_the_password_fallback() {
                 "a camera {held_by} must reach a fresh password prompt: {service}: {out}"
             );
             assert!(!out.contains(FIXED_TEST_TOKEN), "{out}");
+            assert_one_face_request();
 
             // The same run with a wrong password must fail: the success above
             // was the password's, not a grant riding on the reply.
@@ -5281,29 +5311,7 @@ fn pamwrap_camera_contention_never_grants_and_keeps_the_password_fallback() {
                 !ok,
                 "a camera {held_by} granted without the password: {service}: {out}"
             );
-
-            // One face request per run and no other: in particular a refused
-            // release never buys the identity-only verify.
-            let requests = log.lock().unwrap();
-            if desktop {
-                assert!(matches!(
-                    requests.as_slice(),
-                    [
-                        Request::UnsealPassword { .. },
-                        Request::UnsealPassword { .. }
-                    ]
-                ));
-            } else {
-                assert!(matches!(
-                    requests.as_slice(),
-                    [
-                        Request::Health,
-                        Request::Authenticate { .. },
-                        Request::Health,
-                        Request::Authenticate { .. }
-                    ]
-                ));
-            }
+            assert_one_face_request();
         }
     }
 }
@@ -5323,11 +5331,13 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
     let Some(h) = Harness::try_new("camera-contention-wait") else {
         return;
     };
-    let checker = h.token_checker("camera-contention-wait", FIXED_TEST_TOKEN);
+    let checker = h.write_token_checker("camera-contention-wait", FIXED_TEST_TOKEN, true);
+    let checked = checker.with_extension("passed");
+    assert!(!checked.try_exists().unwrap());
     h.write_service(
         "irlume-lock",
         &[
-            h.auth_line("required", "wait"),
+            h.auth_line("sufficient", "wait"),
             format!(
                 "auth required pam_exec.so expose_authtok {}",
                 checker.display()
@@ -5340,12 +5350,10 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
         unseen_holder_reply(),
     ];
     let reply_count = replies.len();
-    let answered = Arc::new(Mutex::new(Vec::new()));
-    let turns = Arc::clone(&answered);
+    let turn = std::cell::Cell::new(0);
     let log = serve(&h.socket, move |_| {
-        let mut answered = turns.lock().unwrap();
-        let index = answered.len() % reply_count;
-        answered.push(index);
+        let index = turn.get();
+        turn.set((index + 1) % reply_count);
         replies[index].clone()
     });
 
@@ -5368,6 +5376,12 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
     };
     let took = started.elapsed();
     assert!(ok, "the wait must end in the password prompt: {out}");
+    // A sufficient face grant skips the password checker and still makes
+    // PAM succeed. Require the marker that proves the checker accepted it.
+    assert!(
+        checked.try_exists().unwrap(),
+        "the password checker was bypassed"
+    );
     assert!(!out.contains(FIXED_TEST_TOKEN), "{out}");
     assert!(
         took >= WAIT_BUDGET,
@@ -5382,17 +5396,13 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
     // all three replies were retried.
     let requests = log.lock().unwrap();
     assert!(
-        requests.len() >= reply_count,
+        requests.len() > reply_count,
         "the wait must keep asking: {} requests",
         requests.len()
     );
     assert!(requests
         .iter()
         .all(|request| matches!(request, Request::Authenticate { .. })));
-    let mut used = answered.lock().unwrap().clone();
-    used.sort_unstable();
-    used.dedup();
-    assert_eq!(used, (0..reply_count).collect::<Vec<_>>());
 }
 
 // ------------------------------------------------- the bounded run's own proof
@@ -5400,10 +5410,16 @@ fn pamwrap_lock_screen_wait_ends_at_its_budget_while_the_camera_is_taken() {
 /// The state letter of a process in `/proc/<pid>/stat`, or `None` when there
 /// is no such process: one that was reaped, or never ran. `Z` is a process
 /// that died and waits for its parent to reap it.
-fn process_state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit_once(')')?.1;
-    after.trim_start().chars().next()
+fn process_state(pid: u32) -> io::Result<Option<char>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, after)| after.trim_start().chars().next())
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing fixture process state"))
 }
 
 /// Both processes outlive the test deadline even if only one is killed.
@@ -5441,11 +5457,15 @@ fn fixture_pids(path: &Path) -> Option<(u32, u32)> {
 }
 
 fn assert_fixture_stopped(leader: u32, child: u32) {
-    assert_eq!(process_state(leader), None, "fixture leader was not reaped");
+    assert_eq!(
+        process_state(leader).expect("read fixture leader state"),
+        None,
+        "fixture leader was not reaped"
+    );
     // SIGKILL delivery is asynchronous; only init can reap the orphan.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        let state = process_state(child);
+        let state = process_state(child).expect("read fixture child state");
         if matches!(state, None | Some('Z')) {
             break;
         }
@@ -5538,6 +5558,7 @@ fn pamwrap_bounded_run_ends_a_fixture_that_never_exits_with_its_child() {
     stop_fixture(&mut leader);
     std::fs::remove_file(&control_ids).unwrap();
     let (control, child, state) = control.expect("control reports both pids and leader exits");
+    let state = state.expect("read control child state");
     assert!(
         matches!(state, Some('S') | Some('R')),
         "killing the leader alone must leave its child running, found {state:?}"

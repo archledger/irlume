@@ -411,17 +411,18 @@ sudo irlume fingerprint disable
   attempt counts or physical camera-off guarantees. See [bounded attempts and
   cleanup](DESKTOP-AUTH.md#bounded-attempts-and-cleanup).
 
-Face verification and face-gated credential release share a durable limit of
-50 consecutive unsuccessful requests per account. Each request reserves one
-charge before engine work; its internal presence retries, grouped capture and
-fallbacks share that reservation. At 50, face stands down until independently
-verified password recovery or an explicit administrator reset. Ordinary password
-login remains available. A successfully admitted and completely written face
-grant resets the count, so successful everyday unlocks do not exhaust it.
+Face verification and face-gated credential release share a durable per-account
+budget. Before engine work, the daemon reserves one charge for the request;
+internal presence retries, grouped capture and fallbacks share it. The 50th
+charged request can still succeed. If 50 charges remain recorded when another
+face request arrives, the daemon refuses it until a password-verified retry
+reset or an administrator reset clears the count. Irlume's retry limits do not
+block ordinary password login. When the daemon admits a face grant and writes it
+in full, it attempts to reset the count.
 
-Cancellation, errors, interrupted requests and completed no-face/setup outcomes
-retain their cumulative charge. No cumulative neutral refund is made. Separately,
-the short throttle defaults to five strikes followed by a 30-second camera rest.
+Once a request is reserved, cancellation, errors, interruption and completed
+no-face/setup outcomes retain its cumulative charge. Separately, the short
+throttle defaults to a 30-second cooldown after five qualifying strikes.
 No-face and uncertain-evidence outcomes do not consume short strikes; hard spoof
 and below-threshold rejections do. An abandoned reservation conservatively adds
 one short strike when it is next observed.
@@ -432,10 +433,16 @@ settings does not erase earlier face rejections or cancel an active cooldown.
 Camera-binding refusals, PAD failures and grouped
 capture timeouts retain their existing strike behavior.
 
-A cooldown expiry clears only the short throttle, never the cumulative budget.
-Both survive daemon restarts; profiles, modes and PAM services for one Linux
-account share them. Ordinary password login does not send a reset event; use
-`irlume retry reset` when face is blocked.
+When the cooldown ends, short strikes start counting from zero; the cumulative
+request count stays in place. This is not a rolling rate limit or a delay before
+every later face request. Both controls survive daemon restarts; profiles,
+modes and PAM services for one Linux account share them. Ordinary password
+login does not reset the count; see
+[password-verified retry reset](#password-verified-retry-reset).
+
+These controls protect local authentication.
+[NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b/introduction/)
+addresses authentication over a network.
 
 ### Persistent retry records
 
@@ -465,9 +472,10 @@ unreadable, wrongly owned or unsafe records refuse the face path with a password
 fallback message. UID/name mismatches also refuse: a reused UID or renamed
 account must be reconciled by an administrator. No engine work starts until its
 reservation is durably committed. The daemon holds the account lock through
-response delivery and clears a successful request only after final admission and
-successful write/flush. A crash after delivery but before reset can conservatively
-retain a charge. A failed reset after delivery cannot retract the grant; the next
+response delivery. For a face grant, the daemon attempts to reset the count
+only after final admission and a successful write and flush.
+A crash after delivery but before reset can conservatively retain a charge.
+A failed reset after delivery cannot retract the grant; the next
 operation re-reads and synchronizes authoritative disk state. Admission checks
 the original window immediately before the first byte and bounds the write
 timeout to remaining time where possible; partially written bytes cannot be
@@ -534,15 +542,15 @@ release. Keep normal password login available and ask an administrator when
 status reports reset unavailable. An older daemon is refused before prompting;
 updating the client alone does not add recovery support.
 
-Reset-password guessing has its own persistent record at
+Password verification for a retry reset has a separate budget stored in
 `/var/lib/irlume/retry/<uid>.reset.json`, with the same private ownership and
 permissions as face records. After five failed checks, each further check needs
 a 30-second wait; the wait never erases failures. At 50 failed checks, an
 administrator must reset the budget. A verification attempt is charged durably
 before the helper runs, so interruption or unknown completion also consumes an
 attempt. This budget survives daemon restarts; reboot can restart its recorded
-cooldown. None of these limits block ordinary password login or introduce a
-cumulative ceiling for face authentication.
+cooldown. These checks do not spend the separate face-request budget or limit
+ordinary password login.
 
 `irlume recovery restore` is separate: it uses the recovery passphrase to restore
 the template key and never clears retry counters. A desktop/polkit approval or

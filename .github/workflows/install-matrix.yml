@@ -26,14 +26,19 @@ jobs:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
 
-      # Same model cache as ci.yml (shared key): the ~614 MB weights
-      # (incl. both PAD models) are
-      # fetched from the models-v1 release, cached so warm runs skip the pull.
+      # Cache only downloaded weights. Restoring tracked files from another
+      # commit would leave a dirty checkout, which the Debian builder rejects.
       - name: Cache model weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: models
-          key: models-${{ hashFiles('models/SHA256SUMS') }}
+          path: |
+            models/glintr100.onnx
+            models/face_detection_yunet_2023mar.onnx
+            models/face_landmark.onnx
+            models/blaze_face_short_range.onnx
+            models/liveness_vit.onnx
+            models/flir.onnx
+          key: deb-downloaded-models-v1-${{ hashFiles('models/SHA256SUMS') }}
 
       - name: Fetch model weights (models-v1 release, sha256-verified)
         run: bash scripts/fetch-models.sh

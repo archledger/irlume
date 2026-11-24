@@ -293,6 +293,9 @@ jobs:
           python3 scripts/test-package-upgrade-harness.py
           python3 scripts/test-check-upgrade-auth.py
 
+      - name: Universal Debian source and timestamp regressions
+        run: bash scripts/test-deb-container-build.sh
+
       - name: Package service hook and state preservation regressions
         run: |
           # Ubuntu ships vercmp in makepkg, a recommendation of pacman-package-manager.

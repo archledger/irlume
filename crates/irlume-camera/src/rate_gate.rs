@@ -608,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn reported_slow_rgb_pair_still_clears_both_delivered_rate_floors() {
+        // #1399, comment 7066259376: first concurrent StreamEvidence.
+        // Reconstruct evenly spaced windows with the exact aggregate rates.
+        // This does not reconstruct the camera's individual frame timing.
+        let nominal = FrameInterval::new(1, 30).unwrap();
+        for (role, span_us, rate, floor) in [
+            (
+                StreamRole::Rgb,
+                4_023_788_i64,
+                (7_500_000, 1_005_947),
+                (15, 2),
+            ),
+            (StreamRole::Ir, 2_007_955_i64, (6_000_000, 401_591), (15, 1)),
+        ] {
+            let policy = StreamRateConfig::new(role, nominal, nominal).policy();
+            assert_eq!((policy.floor_num(), policy.floor_den()), floor);
+            assert_eq!(policy.window(), 30);
+            assert_eq!(policy.tolerance_percent(), 97);
+            let mut window = RateWindow::new();
+            for frame in 0..=30 {
+                window.observe_success(frame * span_us / 30).unwrap();
+            }
+            assert!(window.ready());
+            assert_eq!(window.delivered_rate(), rate);
+            assert!(window.meets_floor(
+                policy.floor_num(),
+                policy.floor_den(),
+                policy.tolerance_percent(),
+            ));
+        }
+    }
+
+    #[test]
     fn max_delta_reports_the_largest_held_gap_not_the_average() {
         let mut window = RateWindow::with_capacity(4);
         window.observe_success(1_000).unwrap();

@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- `irlume trace explain` summarizes recorded IR face-region clipping,
+  distinguishing above-limit saturation, measurements within the limit,
+  and insufficient evidence. It does not test exposure controls
+  (ADR-0008, diagnostic trace contract; #1399).
+
 - The reproducibility claim has a recorded scope,
   [ADR-0040](docs/adr/0040-reproducibility-scope.md): every input of a
   lane the repository controls is pinned and digest-verified, the PPA

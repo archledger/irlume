@@ -5,9 +5,10 @@
 
 use irlume_common::artifact::SecureArtifact;
 use irlume_common::diagnostics::{
-    parse_trace, CaptureSchedule, ShareSafeEventKind, TraceEventKind, TraceLimits, TraceRecord,
-    TraceStage, TraceValidator, CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS,
-    MAX_TRACE_BYTES, MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES, V5_TRACE_SCHEMA_VERSION,
+    parse_trace, CaptureSchedule, OperationClass, ShareSafeEventKind, TraceEventKind, TraceLimits,
+    TraceMetric, TraceRecord, TraceStage, TraceValidator, TraceVerdict,
+    CURRENT_TRACE_SCHEMA_VERSION, DEFAULT_TRACE_DURATION_MS, MAX_TRACE_BYTES,
+    MAX_TRACE_DURATION_MS, MAX_TRACE_LINE_BYTES, V5_TRACE_SCHEMA_VERSION,
 };
 use irlume_common::{Request, Response};
 use std::collections::BTreeMap;
@@ -453,6 +454,13 @@ fn render_timeline(records: &[TraceRecord]) -> String {
             operation_records[0].operation
         )
         .unwrap();
+        if let Some(status) = ir_washout_summary(&operation_records) {
+            writeln!(
+                output,
+                "  IR face-region washout: {status}; exposure response not tested"
+            )
+            .unwrap();
+        }
         for record in operation_records {
             writeln!(
                 output,
@@ -466,6 +474,61 @@ fn render_timeline(records: &[TraceRecord]) -> String {
         }
     }
     output
+}
+
+fn ir_washout_summary(records: &[&TraceRecord]) -> Option<&'static str> {
+    let operation = records.first()?.operation;
+    if !matches!(
+        operation,
+        OperationClass::Authentication
+            | OperationClass::Enrollment
+            | OperationClass::Identification
+    ) {
+        return None;
+    }
+
+    let mut completed = false;
+    let mut above_limit = None;
+    for record in records {
+        // A reused ID cannot support a common finding. Suppress the summary
+        // only; the timeline still shows the validated records.
+        if record.operation != operation || completed {
+            return None;
+        }
+        completed = matches!(
+            record.event,
+            TraceEventKind::Shared {
+                transition: ShareSafeEventKind::OperationFinished { .. },
+            }
+        );
+        above_limit = above_limit.max(recorded_ir_clipping(&record.event));
+    }
+    // Above-limit evidence takes precedence over other recorded samples.
+    Some(match above_limit {
+        Some(true) => "saturation observed above the recorded limit",
+        Some(false) => "measured but not observed above the recorded limit",
+        None => "insufficient evidence (no usable recorded clipping measurement)",
+    })
+}
+
+fn recorded_ir_clipping(event: &TraceEventKind) -> Option<bool> {
+    let TraceEventKind::Decision {
+        verdict: TraceVerdict::Live | TraceVerdict::Spoof | TraceVerdict::Uncertain,
+        measurements,
+    } = event
+    else {
+        return None;
+    };
+    let mut clipping = measurements
+        .iter()
+        .filter(|measurement| measurement.metric == TraceMetric::IrSaturatedFraction);
+    let reading = clipping.next()?;
+    let limit = reading.threshold?;
+    // Neither illumination flags nor rate evidence measure clipping. Compare
+    // the recorded fraction with its own limit, not today's policy.
+    let fraction = 0.0..=1.0;
+    (clipping.next().is_none() && fraction.contains(&reading.value) && fraction.contains(&limit))
+        .then_some(reading.value > limit)
 }
 
 fn render_event(event: &TraceEventKind) -> String {
@@ -1131,6 +1194,283 @@ mod tests {
         assert!(rendered.contains("Operation 07070707070707070707070707070707"));
         assert!(rendered.contains("Events dropped before recording: 4"));
         assert!(rendered.contains("[terminal]"));
+    }
+
+    #[test]
+    fn explanation_classifies_legacy_clipping_without_guessing() {
+        use irlume_common::diagnostics::{
+            CameraRoleLabel, ExactFraction, LEGACY_TRACE_SCHEMA_VERSION,
+        };
+
+        let stream = |active_ir| TraceEventKind::StreamEvidence {
+            role: CameraRoleLabel::Ir,
+            delivered: ExactFraction::new(15, 1).unwrap(),
+            minimum: ExactFraction::new(15, 1).unwrap(),
+            dropped_frames: 0,
+            continuity_epoch: 0,
+            active_ir,
+        };
+        for (label, events, status) in [
+            (
+                "measured zero without illumination metadata",
+                vec![stream(None), clipping_decision(&[(0.0, Some(0.1))])],
+                "measured but not observed above the recorded limit",
+            ),
+            (
+                "equal to the recorded limit",
+                vec![clipping_decision(&[(0.1, Some(0.1))])],
+                "measured but not observed above the recorded limit",
+            ),
+            (
+                "use the recorded limit, not the current policy",
+                vec![clipping_decision(&[(0.2, Some(0.25))])],
+                "measured but not observed above the recorded limit",
+            ),
+            (
+                "active IR alone, without a decision",
+                vec![stream(Some(true))],
+                "insufficient evidence (no usable recorded clipping measurement)",
+            ),
+            (
+                "missing limit or invalid fraction",
+                vec![
+                    clipping_decision(&[(0.0, None)]),
+                    clipping_decision(&[(1.1, Some(0.1))]),
+                    clipping_decision(&[(0.0, Some(-0.1))]),
+                ],
+                "insufficient evidence (no usable recorded clipping measurement)",
+            ),
+            (
+                "ambiguous duplicate measurements",
+                vec![clipping_decision(&[(0.2, Some(0.1)), (0.0, Some(0.1))])],
+                "insufficient evidence (no usable recorded clipping measurement)",
+            ),
+        ] {
+            let records = events
+                .into_iter()
+                .map(|event| (7, OperationClass::Authentication, event))
+                .collect();
+            let output = explain_clipping_fixture(LEGACY_TRACE_SCHEMA_VERSION, records);
+            let lines: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains("IR face-region washout:"))
+                .collect();
+            assert_eq!(
+                lines,
+                [format!(
+                    "  IR face-region washout: {status}; exposure response not tested"
+                )],
+                "{label}:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn explanation_groups_clipping_by_operation_without_hiding_rate_evidence() {
+        use irlume_common::diagnostics::{CameraRoleLabel, RateEvidenceDecision, TraceVerdict};
+
+        for schema in [V5_TRACE_SCHEMA_VERSION, CURRENT_TRACE_SCHEMA_VERSION] {
+            use OperationClass::{Authentication, Enrollment, Identification};
+            let mut records = vec![
+                (
+                    1,
+                    Authentication,
+                    clipping_decision_with_verdict(TraceVerdict::Spoof, &[(0.2, Some(0.1))]),
+                ),
+                (
+                    2,
+                    Enrollment,
+                    clipping_decision_with_verdict(TraceVerdict::Live, &[(0.2, Some(0.25))]),
+                ),
+                (1, Authentication, clipping_decision(&[(0.0, Some(0.1))])),
+                (1, Authentication, clipping_decision(&[])),
+                (3, Identification, clipping_decision(&[])),
+                (
+                    1,
+                    Authentication,
+                    TraceEventKind::EventsDropped { count: 1 },
+                ),
+                (
+                    3,
+                    Identification,
+                    clipping_decision_with_verdict(TraceVerdict::Match, &[(0.9, Some(0.1))]),
+                ),
+                (
+                    3,
+                    Identification,
+                    clipping_decision_with_verdict(TraceVerdict::NoMatch, &[(0.9, Some(0.1))]),
+                ),
+            ];
+            if schema == CURRENT_TRACE_SCHEMA_VERSION {
+                records.insert(
+                    0,
+                    (
+                        1,
+                        Authentication,
+                        rate_evidence(
+                            CameraRoleLabel::Ir,
+                            RateEvidenceDecision::ProbeAdmitted,
+                            5,
+                            None,
+                            30,
+                            40,
+                        ),
+                    ),
+                );
+                records.push((
+                    3,
+                    Identification,
+                    rate_evidence(
+                        CameraRoleLabel::Ir,
+                        RateEvidenceDecision::FullWindow,
+                        30,
+                        None,
+                        30,
+                        140,
+                    ),
+                ));
+            }
+            let output = explain_clipping_fixture(schema, records);
+            assert!(output.starts_with(&format!("Irlume diagnostic trace schema {schema}\n")));
+            let summaries: Vec<_> = output
+                .lines()
+                .filter(|line| {
+                    line.starts_with("Operation ") || line.contains("IR face-region washout:")
+                })
+                .collect();
+            assert_eq!(
+                summaries,
+                [
+                    "Operation 01010101010101010101010101010101 (Authentication)",
+                    "  IR face-region washout: saturation observed above the recorded limit; exposure response not tested",
+                    "Operation 02020202020202020202020202020202 (Enrollment)",
+                    "  IR face-region washout: measured but not observed above the recorded limit; exposure response not tested",
+                    "Operation 03030303030303030303030303030303 (Identification)",
+                    "  IR face-region washout: insufficient evidence (no usable recorded clipping measurement); exposure response not tested",
+                    "Operation 09090909090909090909090909090909 (Lifecycle)",
+                ],
+                "{output}"
+            );
+            let rate_line = "  +         0 us  #0  RateEvidence { role: Ir, decision: ProbeAdmitted, deltas: 5, probe_deltas: None, offset_us: 30, elapsed_us: 40 }";
+            assert_eq!(
+                output.lines().filter(|line| *line == rate_line).count(),
+                usize::from(schema == CURRENT_TRACE_SCHEMA_VERSION),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn explanation_suppresses_clipping_for_ambiguous_operation_groups() {
+        use OperationClass::{Authentication, Status};
+
+        let complete = || TraceEventKind::Shared {
+            transition: ShareSafeEventKind::OperationFinished {
+                outcome: CategoricalOutcome::Completed,
+            },
+        };
+        let late_record = || TraceEventKind::StageTiming {
+            stage: TraceStage::CameraOpen,
+            elapsed_us: 1,
+        };
+        for (label, extras) in [
+            ("mixed operation classes", vec![(1, Status, late_record())]),
+            (
+                "record after completion",
+                vec![
+                    (1, Authentication, complete()),
+                    (1, Authentication, late_record()),
+                ],
+            ),
+            (
+                "repeated completion",
+                vec![
+                    (1, Authentication, complete()),
+                    (1, Authentication, complete()),
+                ],
+            ),
+            (
+                "one completion at the end",
+                vec![(2, Authentication, complete())],
+            ),
+        ] {
+            let mut records = vec![
+                (1, Authentication, clipping_decision(&[(0.2, Some(0.1))])),
+                (2, Authentication, clipping_decision(&[(0.1, Some(0.1))])),
+                (3, Status, clipping_decision(&[(0.9, Some(0.1))])),
+            ];
+            let control = label == "one completion at the end";
+            records.extend(extras);
+            let output = explain_clipping_fixture(CURRENT_TRACE_SCHEMA_VERSION, records);
+            let summaries: Vec<_> = output
+                .lines()
+                .filter(|line| line.contains("IR face-region washout:"))
+                .collect();
+            let mut expected = vec![
+                "  IR face-region washout: measured but not observed above the recorded limit; exposure response not tested",
+            ];
+            if control {
+                expected.insert(0, "  IR face-region washout: saturation observed above the recorded limit; exposure response not tested");
+            }
+            assert_eq!(summaries, expected, "{label}:\n{output}");
+            assert!(output.contains("Operation 03030303030303030303030303030303 (Status)"));
+            assert_eq!(
+                output.matches("Decision {").count(),
+                3,
+                "{label}:\n{output}"
+            );
+            assert!(output.contains("[terminal]"), "{label}:\n{output}");
+        }
+    }
+
+    fn clipping_decision(fractions: &[(f64, Option<f64>)]) -> TraceEventKind {
+        clipping_decision_with_verdict(
+            irlume_common::diagnostics::TraceVerdict::Uncertain,
+            fractions,
+        )
+    }
+
+    fn clipping_decision_with_verdict(
+        verdict: irlume_common::diagnostics::TraceVerdict,
+        fractions: &[(f64, Option<f64>)],
+    ) -> TraceEventKind {
+        use irlume_common::diagnostics::{TraceMeasurement, TraceMetric};
+        TraceEventKind::Decision {
+            verdict,
+            measurements: fractions
+                .iter()
+                .map(|&(value, limit)| {
+                    TraceMeasurement::new(TraceMetric::IrSaturatedFraction, value, limit).unwrap()
+                })
+                .collect(),
+        }
+    }
+
+    fn explain_clipping_fixture(
+        schema: u32,
+        records: Vec<(u8, OperationClass, TraceEventKind)>,
+    ) -> String {
+        let (dir, _sandbox) = sandbox("ir-washout");
+        let path = dir.join("trace.jsonl");
+        let finished = TraceEventKind::Finished {
+            outcome: CategoricalOutcome::Completed,
+        };
+        let mut bytes = Vec::new();
+        for (sequence, (id, operation, event)) in records
+            .into_iter()
+            .chain([(9, OperationClass::Lifecycle, finished)])
+            .enumerate()
+        {
+            let terminal = matches!(event, TraceEventKind::Finished { .. });
+            let mut record = fixture_record(sequence as u64, event, terminal);
+            record.trace_schema = schema;
+            record.operation_id = OperationId::from_bytes([id; 16]);
+            record.operation = operation;
+            serde_json::to_writer(&mut bytes, &record).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&path, bytes).unwrap();
+        explain(&path).unwrap()
     }
 
     #[test]

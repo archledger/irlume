@@ -754,22 +754,35 @@ with none of these checks ([#179]).
 
 ## Anti-spoofing (PAD) models: shipped default-on
 
-The shipped PAD pair refuses a life-size print.
-The algorithmic gate alone does not stop one. Measured twice on the same
-hardware, on 2026-06-30 and again on 2026-08-02, an angled vinyl print of the
-enrolled user's face produces the same centre-to-edge infrared falloff a real
-face does, so no threshold separates them and the gate accepts the print. The
-measured defence is the SHIPPED PAD pair (ADR-0013): the FLIR IR cue denied
-that print at `p_fake` 0.999 and above, and the ViT RGB cue catches the
-print/banner species at login distance. Both ship default-on and verified
-against `models/SHA256SUMS` at daemon startup; kill switches if a cue misfires
-on your hardware: `IRLUME_PAD_IR=0` (settings.conf key `pad_ir=0`) and
-`IRLUME_PAD_VIT=0` (`pad_vit=0`), then `sudo systemctl restart irlumed`.
-These switches are password-only controls: the daemon, diagnostics, and
-password fallback remain available, but no face grant that requires the
-disabled cue is permitted. A missing model or inference failure has the same
-fail-closed authentication result. Model availability is reported by the daemon
-health check; a runtime inference failure is reported on the failed attempt.
+Irlume ships two presentation-attack detection (PAD) models, ViT for RGB and
+FLIR for infrared (IR). Both are enabled by default. A face grant requires
+usable PAD evidence for the route taken:
+
+| Face authentication route | Required PAD evidence |
+|---|---|
+| Paired RGB+IR with a visible RGB face | ViT RGB and FLIR IR, even if the identity match uses IR |
+| RGB-only convenience (screen unlock only) | ViT RGB |
+| Automatic dark authentication (paired capture, no RGB face in a dark scene) | FLIR IR |
+| [Experimental IR-only sensor policy](#optional-experimental-ir-only-policy) (explicit opt-in, no RGB capture) | FLIR IR |
+
+`loaded` in the daemon health check means the model is available, not that
+it evaluated this attempt or produced the required evidence. A completed PAD
+evaluation can veto an otherwise live result, but cannot authorize a face
+grant. The other liveness, identity, and authorization checks still apply.
+
+At startup the daemon checks enabled models that are present against
+`models/SHA256SUMS`. Unknown weights warn by default and are rejected in
+strict mode. See [ADR-0013](adr/0013-ship-pad-models-default-on.md#amendment-2026-11-17-startup-checks-and-required-pad).
+
+The diagnostic switches are `IRLUME_PAD_IR=0` (`pad_ir=0` in `settings.conf`)
+and `IRLUME_PAD_VIT=0` (`pad_vit=0`). Restart `irlumed` after changing them.
+Disabling a cue does not waive its requirement. If a required model is
+disabled, missing, fails to load, or fails to produce usable evidence for
+the attempt, that route cannot grant face authentication. The failure is
+not itself a spoof verdict. The daemon stays available for diagnostics
+and repair, and the password remains the fallback on supported PAM stacks
+with a password provider. See
+[ADR-0019](adr/0019-fail-closed-pad-availability.md#decision).
 
 Third-party / bring-your-own model support was removed (ADR-0015): irlume
 ships and supports exactly the models-v1 set it was validated with, and there

@@ -568,6 +568,40 @@ fn split_native_open_refuses_a_foreign_fd_before_format_negotiation() {
 }
 
 #[test]
+fn rgb_backlight_write_rechecks_the_lease_after_the_capability_query() {
+    let (guard, expected) = fixture();
+    let operation = acquire(&expected);
+    let restore = crate::apply_blc_with(
+        operation.lease(),
+        RGB,
+        -1,
+        || {
+            Ok(v4l::control::Control {
+                id: crate::V4L2_CID_BACKLIGHT_COMPENSATION,
+                value: v4l::control::Value::Integer(0),
+            })
+        },
+        || {
+            guard.endpoint_invalidation_observer(IR)();
+            Ok(backlight_capability(crate::BLC_WANTED))
+        },
+        |_| panic!("peer loss after querying capability must not write"),
+    );
+    assert!(restore.is_none());
+    assert!(operation.lease().validate().is_err());
+}
+
+fn backlight_capability(maximum: i64) -> v4l::v4l_sys::v4l2_query_ext_ctrl {
+    // SAFETY: this V4L2 query consists only of integer scalars and arrays.
+    let mut query: v4l::v4l_sys::v4l2_query_ext_ctrl = unsafe { std::mem::zeroed() };
+    query.id = crate::V4L2_CID_BACKLIGHT_COMPENSATION;
+    query.type_ = v4l::v4l_sys::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER;
+    query.maximum = maximum;
+    query.step = 1;
+    query
+}
+
+#[test]
 fn split_rgb_restore_admission_survives_peer_loss_without_reopening_capture() {
     use std::os::unix::fs::symlink;
     let roots = crate::hostfs::test::fixture_with(|_, sys| {
@@ -626,9 +660,51 @@ fn split_rgb_restore_admission_survives_peer_loss_without_reopening_capture() {
     };
     let operation = acquire(&expected);
     let dev = v4l::Device::with_path("/dev/null").unwrap();
+    for advertised in [
+        Ok(backlight_capability(1)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+    ] {
+        let restore = crate::apply_blc_with(
+            operation.lease(),
+            "/dev/null",
+            dev.handle().fd(),
+            || {
+                Ok(v4l::control::Control {
+                    id: crate::V4L2_CID_BACKLIGHT_COMPENSATION,
+                    value: v4l::control::Value::Integer(0),
+                })
+            },
+            || advertised,
+            |_| panic!("an unsupported or unknown value must not enter the setter"),
+        );
+        assert!(restore.is_none());
+    }
     let current = Cell::new(0_i64);
-    let reads = Cell::new(0);
     let writes = std::cell::RefCell::new(Vec::new());
+    let unchanged_guard = crate::apply_blc_with(
+        operation.lease(),
+        "/dev/null",
+        dev.handle().fd(),
+        || {
+            Ok(v4l::control::Control {
+                id: crate::V4L2_CID_BACKLIGHT_COMPENSATION,
+                value: v4l::control::Value::Integer(current.get()),
+            })
+        },
+        || Ok(backlight_capability(2)),
+        |value| {
+            writes.borrow_mut().push(value);
+            current.set(value);
+            Ok(())
+        },
+    );
+    assert_eq!(unchanged_guard, Some(0));
+    assert_eq!(*writes.borrow(), [crate::BLC_WANTED]);
+
+    // New mock session for the existing clamp and peer-loss rollback.
+    current.set(0);
+    let reads = Cell::new(0);
+    writes.borrow_mut().clear();
     let restore = crate::apply_blc_with(
         operation.lease(),
         "/dev/null",
@@ -643,6 +719,7 @@ fn split_rgb_restore_admission_survives_peer_loss_without_reopening_capture() {
                 value: v4l::control::Value::Integer(current.get()),
             })
         },
+        || Ok(backlight_capability(2)),
         |value| {
             writes.borrow_mut().push(value);
             current.set(if value == crate::BLC_WANTED { 1 } else { value });

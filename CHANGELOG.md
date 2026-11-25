@@ -262,6 +262,9 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Fixed
 
+- Leave RGB backlight compensation unchanged when the camera does not
+  advertise Irlume's optional tuning value.
+
 - IR liveness refusals suggest moving away from strong infrared light only
   when the camera observed a lit/dark pair for the selected frame. An
   unconfirmed bright reading suggests using the password without diagnosing

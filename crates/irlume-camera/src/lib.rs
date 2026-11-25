@@ -675,6 +675,39 @@ fn blc_write_decision(read: std::io::Result<v4l::control::Control>) -> Option<i6
     }
 }
 
+fn blc_capability_accepts_tuning(query: &v4l::v4l_sys::v4l2_query_ext_ctrl) -> bool {
+    use v4l::v4l_sys as raw;
+
+    query.id == V4L2_CID_BACKLIGHT_COMPENSATION
+        && query.type_ == raw::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER
+        && query.flags
+            & (raw::V4L2_CTRL_FLAG_DISABLED
+                | raw::V4L2_CTRL_FLAG_READ_ONLY
+                | raw::V4L2_CTRL_FLAG_HAS_PAYLOAD)
+            == 0
+        && (query.minimum..=query.maximum).contains(&BLC_WANTED)
+        && BLC_WANTED.abs_diff(query.minimum).checked_rem(query.step) == Some(0)
+}
+
+fn query_backlight_capability(
+    dev: &v4l::Device,
+) -> std::io::Result<v4l::v4l_sys::v4l2_query_ext_ctrl> {
+    // SAFETY: the query has only integer scalars and arrays; the kernel API
+    // requires the reserved fields to be zero.
+    let mut query: v4l::v4l_sys::v4l2_query_ext_ctrl = unsafe { std::mem::zeroed() };
+    query.id = V4L2_CID_BACKLIGHT_COMPENSATION;
+    // SAFETY: `dev` owns this fd through the call, and this pointer is to the
+    // exact initialized struct the read-only VIDIOC_QUERY_EXT_CTRL fills.
+    unsafe {
+        v4l::v4l2::ioctl(
+            dev.handle().fd(),
+            v4l::v4l2::vidioc::VIDIOC_QUERY_EXT_CTRL,
+            std::ptr::from_mut(&mut query).cast(),
+        )?;
+    }
+    Ok(query)
+}
+
 /// What a restore should write back: the displaced value, but only while the
 /// control reads as holding what irlume applied. A control that moved (as of
 /// that read; V4L2 has no compare-and-set, so a write racing between the
@@ -764,6 +797,7 @@ fn apply_blc(cam: &RgbCamera) -> Option<BlcRestore<'_>> {
         &cam.device,
         cam.dev.handle().fd(),
         || cam.dev.control(V4L2_CID_BACKLIGHT_COMPENSATION),
+        || query_backlight_capability(&cam.dev),
         |value| {
             cam.dev.set_control(v4l::control::Control {
                 id: V4L2_CID_BACKLIGHT_COMPENSATION,
@@ -785,9 +819,17 @@ fn apply_blc_with(
     endpoint: &str,
     fd: std::os::fd::RawFd,
     mut read: impl FnMut() -> std::io::Result<v4l::control::Control>,
+    query: impl FnOnce() -> std::io::Result<v4l::v4l_sys::v4l2_query_ext_ctrl>,
     mut write: impl FnMut(i64) -> std::io::Result<()>,
 ) -> Option<i64> {
     let displaced = blc_write_decision(read())?;
+    lease.require_endpoint(endpoint).ok()?;
+    // A UVC setter can clamp an out-of-range request rather than reject it.
+    // Optional tuning must not substitute a different value (or guess when
+    // the exact control's advertised capability cannot be read).
+    if !blc_capability_accepts_tuning(&query().ok()?) {
+        return None;
+    }
     lease.require_endpoint(endpoint).ok()?;
     write(BLC_WANTED).ok()?;
     let confirm = read();
@@ -21500,6 +21542,46 @@ mod tests {
             None,
             "an unreadable control authorises nothing"
         );
+    }
+
+    #[test]
+    fn backlight_tuning_requires_the_exact_advertised_integer_value() {
+        use v4l::v4l_sys as raw;
+
+        // SAFETY: v4l2_query_ext_ctrl contains only integer scalars and arrays.
+        let mut query: raw::v4l2_query_ext_ctrl = unsafe { std::mem::zeroed() };
+        query.id = V4L2_CID_BACKLIGHT_COMPENSATION;
+        query.type_ = raw::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER;
+        query.step = 1;
+        query.maximum = 1;
+        assert!(!blc_capability_accepts_tuning(&query));
+
+        query.maximum = 2;
+        assert!(blc_capability_accepts_tuning(&query));
+        query.minimum = 1;
+        query.maximum = 5;
+        query.step = 2;
+        assert!(!blc_capability_accepts_tuning(&query));
+        query.minimum = 0;
+        assert!(blc_capability_accepts_tuning(&query));
+        query.step = 0;
+        assert!(!blc_capability_accepts_tuning(&query));
+
+        query.step = 1;
+        for flag in [
+            raw::V4L2_CTRL_FLAG_DISABLED,
+            raw::V4L2_CTRL_FLAG_READ_ONLY,
+            raw::V4L2_CTRL_FLAG_HAS_PAYLOAD,
+        ] {
+            query.flags = flag;
+            assert!(!blc_capability_accepts_tuning(&query));
+        }
+        query.flags = 0;
+        query.type_ = raw::v4l2_ctrl_type_V4L2_CTRL_TYPE_BOOLEAN;
+        assert!(!blc_capability_accepts_tuning(&query));
+        query.type_ = raw::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER;
+        query.id = V4L2_CID_PRIVACY;
+        assert!(!blc_capability_accepts_tuning(&query));
     }
 
     /// Only the errnos the V4L2 specification assigns to "this control does

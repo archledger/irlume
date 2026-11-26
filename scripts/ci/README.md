@@ -56,9 +56,10 @@ then the window that admitted the first frame after the recheck, as
 right after the first line means the window after the recheck missed too;
 a refusal after both lines means a later window missed. Either is a refusal
 like any other: exit 3. The floor, the window and the single attempt are
-unchanged, and the nightly adds a warning, not a retry, when the recheck
-ran. The first session after the camera enumerates is the measured case; a
-stream that stays below its floor still fails.
+unchanged, and the nightly adds a warning, not a retry, whenever the recheck
+ran, whether the capture then passed or failed. The first session after the
+camera enumerates is the measured case; a stream that stays below its floor
+still fails.
 
 The restricted route forwards the diagnostic when its approved capture
 binary includes it. The helper's nonzero exit still fails the step

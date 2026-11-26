@@ -14,6 +14,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TREE = 'a' * 40
+RECHECK_WARNING = '::warning::IR burst: the first rate window of the session was below the floor'
 
 
 def camera_step():
@@ -77,6 +78,11 @@ if [ "${RECHECK_REFUSED:-0}" = 1 ]; then
   echo 'irlume: burst rate refused: role=ir window_count=30 window_span_us=2090000 sequence_gap=0 cumulative_drops=0' >&2
   exit 3
 fi
+if [ "${RECHECK_STALLED:-0}" = 1 ]; then
+  echo "thread 'main' panicked at crates/irlume-camera/examples/burst_dump.rs:47:23:" >&2
+  echo 'capture: CameraUnavailable("/dev/video2: dequeue timed out")' >&2
+  exit 101
+fi
 # Written at the first frame after the recheck, before any later window.
 if [ "${FIRST_WINDOW_REFUSED:-0}" = 1 ]; then
   echo 'irlume: burst rate accepted after one startup recheck: requested=1/30 accepted=1/30 floor=15/1 tolerance_percent=97 window_count=30 window_span_us=2028086 delivered=15000000/1014043 max_inter_frame_gap_us=71998 meets_floor=true' >&2
@@ -119,7 +125,7 @@ fi
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
                     'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR',
                     'NO_NODES', 'REFUSE_RATE_ONCE', 'FIRST_WINDOW_REFUSED', 'RECHECK_REFUSED',
-                    'LATER_REFUSED']:
+                    'LATER_REFUSED', 'RECHECK_STALLED']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -171,6 +177,8 @@ exit "${HELPER_EXIT:-0}"
         self.assertIn('irlume: burst rate refused: role=ir', result.stdout)
         self.assertIn('window_span_us=2088113', result.stdout)
         self.assertNotIn('captured 6 frames', result.stdout)
+        # No first window was refused, so no recheck ran to warn about.
+        self.assertNotIn('::warning::IR burst:', result.stdout)
 
     def test_direct_rate_refusal_remains_a_failure(self):
         self.assert_first_rate_refusal_fails()
@@ -188,21 +196,31 @@ exit "${HELPER_EXIT:-0}"
         self.assertFalse((self.root / 'sleeps').exists())
         self.assertIn('irlume: burst first window refused: requested=1/30', result.stdout)
         self.assertIn('irlume: burst rate accepted after one startup recheck:', result.stdout)
-        self.assertIn(
-            '::warning::IR burst: the first rate window of the session was below the floor', result.stdout)
+        self.assertIn(RECHECK_WARNING, result.stdout)
         self.assertIn('captured 6 frames', result.stdout)
+
+    def assert_failed_capture_after_a_recheck_warns(self, result, *lines):
+        # A failed capture still names the recheck, after the burst's own
+        # lines and before the step's error.
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+        self.assertFalse((self.root / 'sleeps').exists())
+        expected = [*lines, RECHECK_WARNING, 'privileged IR burst failed']
+        for line in expected:
+            self.assertIn(line, result.stdout)
+        positions = [result.stdout.index(line) for line in expected]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(result.stdout.count(RECHECK_WARNING), 1)
+        self.assertNotIn('captured 6 frames', result.stdout)
 
     def assert_refused_recheck_fails(self):
         # The window after the recheck missed too: both windows stay visible
         # and the step fails on its first capture.
         result = self.run_step(FIRST_WINDOW_REFUSED='1', RECHECK_REFUSED='1')
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('privileged IR burst failed', result.stdout)
-        self.assertEqual((self.root / 'calls').read_text(), '1\n')
-        self.assertFalse((self.root / 'sleeps').exists())
-        self.assertIn('irlume: burst first window refused:', result.stdout)
-        self.assertIn('irlume: burst rate refused: role=ir window_count=30 window_span_us=2090000', result.stdout)
-        self.assertNotIn('captured 6 frames', result.stdout)
+        self.assert_failed_capture_after_a_recheck_warns(
+            result, 'irlume: burst first window refused:',
+            'irlume: burst rate refused: role=ir window_count=30 window_span_us=2090000')
+        self.assertNotIn('irlume: burst rate accepted after one startup recheck:', result.stdout)
 
     def test_direct_first_window_refusal_with_a_passing_recheck_passes(self):
         self.assert_rechecked_capture_passes()
@@ -222,16 +240,10 @@ exit "${HELPER_EXIT:-0}"
         # The recheck window passed and a later window missed: the step fails
         # on its first capture, and the log keeps all three lines in order.
         result = self.run_step(FIRST_WINDOW_REFUSED='1', LATER_REFUSED='1')
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('privileged IR burst failed', result.stdout)
-        self.assertEqual((self.root / 'calls').read_text(), '1\n')
-        self.assertFalse((self.root / 'sleeps').exists())
-        positions = [result.stdout.index(line) for line in [
-            'irlume: burst first window refused:',
+        self.assert_failed_capture_after_a_recheck_warns(
+            result, 'irlume: burst first window refused:',
             'irlume: burst rate accepted after one startup recheck:',
-            'irlume: burst rate refused: role=ir window_count=30 window_span_us=2100212']]
-        self.assertEqual(positions, sorted(positions))
-        self.assertNotIn('captured 6 frames', result.stdout)
+            'irlume: burst rate refused: role=ir window_count=30 window_span_us=2100212')
 
     def test_direct_later_refusal_after_acceptance_fails_with_all_three_lines(self):
         self.assert_later_refusal_after_acceptance_fails()
@@ -239,6 +251,23 @@ exit "${HELPER_EXIT:-0}"
     def test_helper_later_refusal_after_acceptance_fails_with_all_three_lines(self):
         self.install_helper()
         self.assert_later_refusal_after_acceptance_fails()
+
+    def assert_failed_recheck_dequeue_warns(self):
+        # A recheck dequeue failed: only the first window was judged, and the
+        # capture failed without a rate refusal.
+        result = self.run_step(FIRST_WINDOW_REFUSED='1', RECHECK_STALLED='1')
+        self.assert_failed_capture_after_a_recheck_warns(
+            result, 'irlume: burst first window refused:',
+            'capture: CameraUnavailable("/dev/video2: dequeue timed out")')
+        self.assertNotIn('irlume: burst rate accepted after one startup recheck:', result.stdout)
+        self.assertNotIn('irlume: burst rate refused:', result.stdout)
+
+    def test_direct_failed_recheck_dequeue_still_warns(self):
+        self.assert_failed_recheck_dequeue_warns()
+
+    def test_helper_failed_recheck_dequeue_still_warns(self):
+        self.install_helper()
+        self.assert_failed_recheck_dequeue_warns()
 
     def test_a_capture_without_a_recheck_prints_no_warning(self):
         for helper in [False, True]:

@@ -52,10 +52,10 @@ All notable changes to irlume are documented here. This project adheres to
   accepted after one startup recheck:` when the first frame after the
   recheck is delivered), so a later window's refusal is told apart from
   the recheck window's; either still exits 3. The floor, the window and
-  the single attempt are unchanged; the nightly adds a warning when the
-  recheck ran and still does not retry a failed capture (#1430). The
-  `burst_dump` summary's delivered rate now spans the delivered frames;
-  it counted the startup dequeues.
+  the single attempt are unchanged; the nightly adds a warning whenever
+  the recheck ran, also when the capture then fails, and still does not
+  retry a failed capture (#1430). The `burst_dump` summary's delivered
+  rate now spans the delivered frames; it counted the startup dequeues.
 
 - Login & Apps shows IR-backed face and consent guidance only when fresh
   daemon and camera observations confirm the configured RGB+IR pair.

@@ -223,19 +223,18 @@ jobs:
           elif sudo -n env IRLUME_LOG_EMITTER_WRITES=1 "$burst" "$out" "$ir" 6 2>"$err"; then
             captured=1
           fi
-          if [ "$captured" -eq 0 ]; then
-            cat "$err"
-            echo "::error::privileged IR burst failed; inspect the capture or sudo diagnostic above. The trusted hardware runner needs noninteractive sudo for burst_dump (or its installed fixed capture helper)."
-            exit 1
-          fi
           cat "$err"
           # The product's fixed IR startup gives the measured camera one
           # recheck when the first rate window of a session misses its floor
-          # (#1409). The burst starts the same way, so a first-session night
-          # gets that recheck and reports both windows. A window after the
-          # recheck that misses too has already failed the capture above.
+          # (#1409). The burst starts the same way and writes each window as
+          # it is judged, so a recheck is named whether the capture then
+          # passed or failed, before the failure below.
           if grep -Fq 'irlume: burst first window refused:' "$err"; then
-            echo "::warning::IR burst: the first rate window of the session was below the floor; one startup recheck followed. Both windows are in the burst lines above."
+            echo "::warning::IR burst: the first rate window of the session was below the floor and one startup recheck followed; the burst lines above show what came after it."
+          fi
+          if [ "$captured" -eq 0 ]; then
+            echo "::error::privileged IR burst failed; inspect the capture or sudo diagnostic above. The trusted hardware runner needs noninteractive sudo for burst_dump (or its installed fixed capture helper)."
+            exit 1
           fi
           # Two distinct positive proofs from the capture's own open camera:
           # a completed write, or a validated active device default. The latter

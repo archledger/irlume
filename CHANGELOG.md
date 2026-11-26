@@ -53,6 +53,8 @@ All notable changes to irlume are documented here. This project adheres to
   misses too still exits 3, with both windows in the log. The floor, the
   window and the single attempt are unchanged; the nightly adds a warning
   when the recheck ran and still does not retry a failed capture (#1430).
+  The `burst_dump` summary's delivered rate now spans the delivered
+  frames; it counted the startup dequeues.
 
 - Login & Apps shows IR-backed face and consent guidance only when fresh
   daemon and camera observations confirm the configured RGB+IR pair.

@@ -2935,20 +2935,23 @@ impl IrSessionStartup {
 
 /// Start a raw IR burst the way the product's fixed IR session starts: one
 /// warm-up dequeue, then the rate fill with its single startup recheck. The
-/// raw route keeps one attempt for each. The result is the window the recheck
-/// replaced, for the caller to report; `None` when no recheck ran.
+/// raw route keeps one attempt for each. A window the recheck replaced goes
+/// to `on_refused` before a failed recheck dequeue can return.
 fn start_raw_ir_burst<S: ValidatedStream>(
     device: &str,
     stream: &mut TrackedStream<S>,
     measured_profile: impl FnOnce() -> bool,
-) -> irlume_common::Result<Option<RefusedStartupWindow>> {
+    on_refused: impl FnOnce(RefusedStartupWindow),
+) -> irlume_common::Result<()> {
     stream
         .next_discarded()
         .map_err(|error| map_io(device, error))?;
-    IrSessionStartup::Fixed
-        .fill_with_recheck(stream, measured_profile)
-        .map_err(|error| map_io(device, error))?;
-    Ok(stream.take_startup_window_refused())
+    let filled = IrSessionStartup::Fixed.fill_with_recheck(stream, measured_profile);
+    // Recorded when the recheck is decided, before its three dequeues.
+    if let Some(window) = stream.take_startup_window_refused() {
+        on_refused(window);
+    }
+    filled.map_err(|error| map_io(device, error))
 }
 
 // Prime a fresh pair without claiming delivered-rate readiness. Observation
@@ -8729,12 +8732,12 @@ pub mod ir_probe {
     /// [`capture_raw_burst_timed`], on a stream that starts the way the
     /// product's fixed IR session starts: its first rate window gets the one
     /// startup recheck the product gives the measured camera (#1409), and
-    /// `on_refused` receives the window that recheck replaced, as soon as it
-    /// is replaced, so a caller can report it even when the window after it
-    /// misses too. A window after the recheck that misses the floor is refused
-    /// like any other. The floor, the window and the single attempt are the
-    /// product's. With `n == 0` nothing is dequeued and `on_refused` is not
-    /// called.
+    /// `on_refused` receives the window that recheck replaced as soon as the
+    /// recheck is decided, so a caller can report it even when a recheck
+    /// dequeue then fails or the window after it misses too. A window after
+    /// the recheck that misses the floor is refused like any other. The
+    /// floor, the window and the single attempt are the product's. With
+    /// `n == 0` nothing is dequeued and `on_refused` is not called.
     ///
     /// # Errors
     ///
@@ -8812,12 +8815,19 @@ pub mod ir_probe {
         // A burst that delivers frames starts like a product session. With
         // nothing to deliver the stream is only opened and armed.
         if n > 0 {
-            let refused = super::start_raw_ir_burst(device, &mut stream, || {
-                super::nexigo_ir_recheck_applies(&fmt, interval.requested, interval.accepted, &dev)
-            })?;
-            if let Some(window) = refused {
-                on_refused(window);
-            }
+            super::start_raw_ir_burst(
+                device,
+                &mut stream,
+                || {
+                    super::nexigo_ir_recheck_applies(
+                        &fmt,
+                        interval.requested,
+                        interval.accepted,
+                        &dev,
+                    )
+                },
+                &mut on_refused,
+            )?;
         }
         for _ in 0..n {
             let (buf, facts, sequence, timestamp, rate_evidence) =

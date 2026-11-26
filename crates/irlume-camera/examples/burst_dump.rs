@@ -67,11 +67,7 @@ fn main() -> ExitCode {
         pgm.write_all(&f.data).unwrap();
     }
     let span_ms = frames.last().map(|(_, ms)| *ms).unwrap_or(0.0);
-    let fps = if span_ms > 0.0 {
-        (frames.len().saturating_sub(1)) as f64 / (span_ms / 1000.0)
-    } else {
-        0.0
-    };
+    let fps = delivered_fps(&frames.iter().map(|(_, ms)| *ms).collect::<Vec<_>>());
     println!(
         "{}: wrote {} frames ({}x{}) in {:.0} ms ({:.1} fps delivered)",
         out,
@@ -82,6 +78,17 @@ fn main() -> ExitCode {
         fps
     );
     ExitCode::SUCCESS
+}
+
+/// Frames per second over the delivered frames: the gaps between them, not
+/// the startup dequeues that ran before the first. Zero without a span.
+fn delivered_fps(ms: &[f64]) -> f64 {
+    match (ms.first(), ms.last()) {
+        (Some(&first), Some(&last)) if last > first => {
+            (ms.len() - 1) as f64 / ((last - first) / 1000.0)
+        }
+        _ => 0.0,
+    }
 }
 
 /// The numbers of one judged rate window, as the two startup lines report
@@ -284,5 +291,16 @@ mod tests {
              window_span_us=2028086 delivered=15000000/1014043 \
              max_inter_frame_gap_us=71998 meets_floor=true\n"
         );
+    }
+
+    #[test]
+    fn the_delivered_rate_spans_the_delivered_frames_not_the_startup() {
+        // Six frames after a 2.5 s startup: five gaps of 68 ms. Over the
+        // startup as well the same frames would read as 1.8 fps.
+        let stamps = [2_500.0, 2_568.0, 2_636.0, 2_704.0, 2_772.0, 2_840.0];
+        assert!((delivered_fps(&stamps) - 5.0 / 0.340).abs() < 1e-9);
+        assert_eq!(delivered_fps(&[2_500.0]), 0.0);
+        assert_eq!(delivered_fps(&[]), 0.0);
+        assert_eq!(delivered_fps(&[2_500.0, 2_500.0]), 0.0);
     }
 }

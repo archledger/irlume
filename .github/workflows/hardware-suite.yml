@@ -229,6 +229,14 @@ jobs:
             exit 1
           fi
           cat "$err"
+          # The product's fixed IR startup gives the measured camera one
+          # recheck when the first rate window of a session misses its floor
+          # (#1409). The burst starts the same way, so a first-session night
+          # gets that recheck and reports both windows. A window after the
+          # recheck that misses too has already failed the capture above.
+          if grep -Fq 'irlume: burst first window refused:' "$err"; then
+            echo "::warning::IR burst: the first rate window of the session was below the floor; one startup recheck followed. Both windows are in the burst lines above."
+          fi
           # Two distinct positive proofs from the capture's own open camera:
           # a completed write, or a validated active device default. The latter
           # is read-only and cannot be emitted after a failed/configured write.

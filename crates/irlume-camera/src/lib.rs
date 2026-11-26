@@ -2043,6 +2043,32 @@ const MAX_PROBE_FILL_ATTEMPTS: usize = 16;
 // of 7. The first delivery still runs the normal per-frame check.
 const NEXIGO_IR_RECHECK_DISCARDS: usize = 3;
 
+/// The first rate window that the fixed-IR startup recheck (#1409) replaced:
+/// the numbers of the window that missed its floor, for a caller that reports
+/// both windows. Numbers only; no timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusedStartupWindow {
+    /// The frame interval the stream asked for, `numerator / denominator`
+    /// frames per second.
+    pub requested: (u32, u32),
+    /// The frame interval the device granted, in the same form.
+    pub accepted: (u32, u32),
+    /// Inter-frame deltas the window judged.
+    pub window_count: u32,
+    /// Sum of those deltas, in microseconds.
+    pub window_span_us: u64,
+    /// Delivered rate as a reduced fraction, `numerator / denominator` frames
+    /// per second.
+    pub delivered: (u64, u64),
+    /// The largest single gap in the window, in microseconds.
+    pub max_inter_frame_gap_us: u64,
+    /// The floor the window missed, `numerator / denominator` frames per
+    /// second, before its tolerance.
+    pub floor: (u32, u32),
+    /// The share of the floor the window had to reach.
+    pub tolerance_percent: u32,
+}
+
 struct TrackedStream<S> {
     stream: Option<S>,
     control: CaptureControl,
@@ -2068,6 +2094,9 @@ struct TrackedStream<S> {
     /// `RateEvidence` record), from the fill that established it until the
     /// window is revoked; see [`Self::record_rate_evidence`].
     rate_evidence: Option<irlume_common::diagnostics::TraceEventKind>,
+    /// The first window the startup recheck replaced in this session, from
+    /// that fill until a caller takes it to report it.
+    startup_window_refused: Option<RefusedStartupWindow>,
 }
 
 impl<S> TrackedStream<S> {
@@ -2087,7 +2116,13 @@ impl<S> TrackedStream<S> {
             health_admitted: false,
             pair_fill_started: None,
             rate_evidence: None,
+            startup_window_refused: None,
         }
+    }
+
+    /// Take the window the startup recheck replaced, if this session had one.
+    fn take_startup_window_refused(&mut self) -> Option<RefusedStartupWindow> {
+        self.startup_window_refused.take()
     }
 
     /// Enable ADR-0021 rate-evidence amortization for this stream session.
@@ -2686,6 +2721,16 @@ impl<S: ValidatedStream> TrackedStream<S> {
             // Advance it once by a fixed amount, not until a window passes.
             // next() still enforces the full window before handing out a
             // frame. Healthy fills never pay this cost or read the profile.
+            self.startup_window_refused = Some(RefusedStartupWindow {
+                requested: self.rate_config.requested().parts(),
+                accepted: self.rate_config.accepted().parts(),
+                window_count: self.rate_window.count() as u32,
+                window_span_us: self.rate_window.span_us(),
+                delivered: self.rate_window.delivered_rate(),
+                max_inter_frame_gap_us: self.rate_window.max_delta_us(),
+                floor: (policy.floor_num(), policy.floor_den()),
+                tolerance_percent: policy.tolerance_percent(),
+            });
             for _ in 0..NEXIGO_IR_RECHECK_DISCARDS {
                 self.next_discarded()?;
             }
@@ -2886,6 +2931,24 @@ impl IrSessionStartup {
         }
         result
     }
+}
+
+/// Start a raw IR burst the way the product's fixed IR session starts: one
+/// warm-up dequeue, then the rate fill with its single startup recheck. The
+/// raw route keeps one attempt for each. The result is the window the recheck
+/// replaced, for the caller to report; `None` when no recheck ran.
+fn start_raw_ir_burst<S: ValidatedStream>(
+    device: &str,
+    stream: &mut TrackedStream<S>,
+    measured_profile: impl FnOnce() -> bool,
+) -> irlume_common::Result<Option<RefusedStartupWindow>> {
+    stream
+        .next_discarded()
+        .map_err(|error| map_io(device, error))?;
+    IrSessionStartup::Fixed
+        .fill_with_recheck(stream, measured_profile)
+        .map_err(|error| map_io(device, error))?;
+    Ok(stream.take_startup_window_refused())
 }
 
 // Prime a fresh pair without claiming delivered-rate readiness. Observation
@@ -7328,6 +7391,20 @@ fn nexigo_ir_recheck_endpoint(context: &uvc_descriptor::FdCameraContext) -> bool
             == include_bytes!("../tests/fixtures/nexigo-3443-c803.descriptors")
 }
 
+/// Whether the startup recheck applies to an open IR stream: the negotiated
+/// contract is the measured one, and so is the USB endpoint and link behind
+/// its descriptor. Evaluated only after a first window missed its floor.
+fn nexigo_ir_recheck_applies(
+    negotiated: &v4l::Format,
+    requested: frame_interval::FrameInterval,
+    accepted: frame_interval::FrameInterval,
+    dev: &Device,
+) -> bool {
+    nexigo_ir_recheck_contract(negotiated, requested, accepted)
+        && uvc_descriptor::identity_and_connection_from_fd(dev.handle().fd())
+            .is_ok_and(|context| nexigo_ir_recheck_endpoint(&context))
+}
+
 impl IrCamera {
     #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
     pub fn open(device: &str) -> irlume_common::Result<Self> {
@@ -7673,12 +7750,12 @@ impl IrCamera {
             fill_rate_then_drain_metadata(
                 || {
                     startup.fill_with_recheck(&mut session.stream, || {
-                        nexigo_ir_recheck_contract(
+                        nexigo_ir_recheck_applies(
                             &self.negotiated,
                             self.requested_interval,
                             self.accepted_interval,
-                        ) && uvc_descriptor::identity_and_connection_from_fd(self.dev.handle().fd())
-                            .is_ok_and(|context| nexigo_ir_recheck_endpoint(&context))
+                            &self.dev,
+                        )
                     })
                 },
                 || {
@@ -8523,6 +8600,7 @@ pub fn capture_pair_with<R: Send, I: Send>(
 /// example and the capture path share one implementation.
 pub mod ir_probe {
     use super::negotiate_ir_format_and_interval;
+    pub use super::RefusedStartupWindow;
     use super::{map_delivery, map_io, verify_pinned, Error, Frame, Spectrum};
 
     /// Mean brightness of an 8-bit greyscale buffer.
@@ -8645,6 +8723,29 @@ pub mod ir_probe {
         device: &str,
         n: usize,
     ) -> irlume_common::Result<Vec<(Frame, f64)>> {
+        capture_raw_burst_with_startup(device, n, |_| {})
+    }
+
+    /// [`capture_raw_burst_timed`], on a stream that starts the way the
+    /// product's fixed IR session starts: its first rate window gets the one
+    /// startup recheck the product gives the measured camera (#1409), and
+    /// `on_refused` receives the window that recheck replaced, as soon as it
+    /// is replaced, so a caller can report it even when the window after it
+    /// misses too. A window after the recheck that misses the floor is refused
+    /// like any other. The floor, the window and the single attempt are the
+    /// product's. With `n == 0` nothing is dequeued and `on_refused` is not
+    /// called.
+    ///
+    /// # Errors
+    ///
+    /// When the device cannot be pinned, opened, negotiated or streamed, when
+    /// the emitter cannot be enabled, when a startup dequeue fails, or with a
+    /// `DeliveredRate` error when a delivered frame's window misses its floor.
+    pub fn capture_raw_burst_with_startup(
+        device: &str,
+        n: usize,
+        mut on_refused: impl FnMut(RefusedStartupWindow),
+    ) -> irlume_common::Result<Vec<(Frame, f64)>> {
         verify_pinned(device)?;
         let permit = super::lease::permit_for_endpoint(
             device,
@@ -8708,6 +8809,16 @@ pub mod ir_probe {
         let _ = &mode;
         let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
+        // A burst that delivers frames starts like a product session. With
+        // nothing to deliver the stream is only opened and armed.
+        if n > 0 {
+            let refused = super::start_raw_ir_burst(device, &mut stream, || {
+                super::nexigo_ir_recheck_applies(&fmt, interval.requested, interval.accepted, &dev)
+            })?;
+            if let Some(window) = refused {
+                on_refused(window);
+            }
+        }
         for _ in 0..n {
             let (buf, facts, sequence, timestamp, rate_evidence) =
                 stream.next().map_err(|error| map_delivery(device, error))?;
@@ -12156,6 +12267,7 @@ mod tests {
     include!("native_validator_accounting_tests.rs");
     include!("probe_bounds_tests.rs");
     include!("first_session_settle_tests.rs");
+    include!("raw_burst_startup_tests.rs");
     include!("rate_evidence_tests.rs");
     mod paired_processing_tests {
         include!("paired_processing_tests.rs");

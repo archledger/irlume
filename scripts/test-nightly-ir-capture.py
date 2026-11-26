@@ -70,6 +70,13 @@ set -eu
 printf '%s\\n' "${FIXTURE_PRIVILEGED:-0}" >> "$CALLS"
 [ "$2" = /dev/video2 ] && [ "$3" = 6 ] || exit 91
 [ "${IRLUME_LOG_EMITTER_WRITES:-0}" = 1 ] || exit 92
+if [ "${FIRST_WINDOW_REFUSED:-0}" = 1 ]; then
+  echo 'irlume: burst first window refused: requested=1/30 accepted=1/30 floor=15/1 tolerance_percent=97 window_count=30 window_span_us=2104076 delivered=7500000/526019 max_inter_frame_gap_us=95945 meets_floor=false' >&2
+fi
+if [ "${RECHECK_REFUSED:-0}" = 1 ]; then
+  echo 'irlume: burst rate refused: role=ir window_count=30 window_span_us=2090000 sequence_gap=0 cumulative_drops=0' >&2
+  exit 3
+fi
 if [ "${REFUSE_RATE_ONCE:-0}" = 1 ] && [ ! -e "$RATE_REFUSED" ]; then
   : > "$RATE_REFUSED"
   echo 'irlume: burst rate refused: role=ir window_count=30 window_span_us=2088113 sequence_gap=0 cumulative_drops=0' >&2
@@ -78,6 +85,9 @@ fi
 if [ "${FAIL_CAPTURE:-0}" = 1 ]; then
   echo 'fixture: capture failed' >&2
   exit 23
+fi
+if [ "${FIRST_WINDOW_REFUSED:-0}" = 1 ]; then
+  echo 'irlume: burst rate accepted after one startup recheck: role=ir requested=1/30 accepted=1/30 floor=15/1 tolerance_percent=97 window_count=30 window_span_us=2028086 delivered=15000000/1014043 max_inter_frame_gap_us=71998 meets_floor=true' >&2
 fi
 mkdir -p "$1"
 for ((i=0; i<${FRAMES:-6}; i++)); do
@@ -103,7 +113,7 @@ fi
                         RATE_REFUSED=str(self.root / 'rate-refused'))
         for key in ['FIXTURE_PRIVILEGED', 'DENY_SUDO', 'FAIL_CAPTURE', 'FRAMES',
                     'SPREAD', 'NO_MARKER', 'PROOF', 'HELPER_EXIT', 'REJECT_BUILD', 'TWO_IR',
-                    'NO_NODES', 'REFUSE_RATE_ONCE']:
+                    'NO_NODES', 'REFUSE_RATE_ONCE', 'FIRST_WINDOW_REFUSED', 'RECHECK_REFUSED']:
             self.env.pop(key, None)
 
     def write(self, path, source):
@@ -162,6 +172,56 @@ exit "${HELPER_EXIT:-0}"
     def test_helper_rate_refusal_remains_a_failure(self):
         self.install_helper()
         self.assert_first_rate_refusal_fails()
+
+    def assert_rechecked_capture_passes(self):
+        # The first rate window missed; the one startup recheck passed. The
+        # step stays green and says so, with both windows in the log.
+        result = self.run_step(FIRST_WINDOW_REFUSED='1')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+        self.assertFalse((self.root / 'sleeps').exists())
+        self.assertIn('irlume: burst first window refused: requested=1/30', result.stdout)
+        self.assertIn('irlume: burst rate accepted after one startup recheck:', result.stdout)
+        self.assertIn(
+            '::warning::IR burst: the first rate window of the session was below the floor', result.stdout)
+        self.assertIn('captured 6 frames', result.stdout)
+
+    def assert_refused_recheck_fails(self):
+        # The window after the recheck missed too: both windows stay visible
+        # and the step fails on its first capture.
+        result = self.run_step(FIRST_WINDOW_REFUSED='1', RECHECK_REFUSED='1')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('privileged IR burst failed', result.stdout)
+        self.assertEqual((self.root / 'calls').read_text(), '1\n')
+        self.assertFalse((self.root / 'sleeps').exists())
+        self.assertIn('irlume: burst first window refused:', result.stdout)
+        self.assertIn('irlume: burst rate refused: role=ir window_count=30 window_span_us=2090000', result.stdout)
+        self.assertNotIn('captured 6 frames', result.stdout)
+
+    def test_direct_first_window_refusal_with_a_passing_recheck_passes(self):
+        self.assert_rechecked_capture_passes()
+
+    def test_helper_first_window_refusal_with_a_passing_recheck_passes(self):
+        self.install_helper()
+        self.assert_rechecked_capture_passes()
+
+    def test_direct_refused_recheck_window_fails_with_both_windows(self):
+        self.assert_refused_recheck_fails()
+
+    def test_helper_refused_recheck_window_fails_with_both_windows(self):
+        self.install_helper()
+        self.assert_refused_recheck_fails()
+
+    def test_a_capture_without_a_recheck_prints_no_warning(self):
+        for helper in [False, True]:
+            if helper:
+                self.install_helper()
+            with self.subTest(helper=helper):
+                result = self.run_step()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn('burst first window refused', result.stdout)
+                self.assertNotIn('burst rate accepted after one startup recheck', result.stdout)
+                self.assertNotIn('::warning::IR burst:', result.stdout)
 
     def test_installed_helper_preserves_all_capture_gates(self):
         self.install_helper()

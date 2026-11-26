@@ -43,8 +43,20 @@ BRIO may operate in D1 by default while NexiGo requires an actual transition.
 `burst_dump` reports a delivered-rate refusal on stderr with the rejected
 window, rate floor and continuity counters, then exits 3. The nightly
 preserves that first failure and collects its failure diagnostics. It
-does not retry: a refusal in a later window does not identify the measured
-startup case. The raw burst does not use the product's fixed-IR recheck.
+does not retry a failed capture.
+
+The burst's stream starts the way the product's fixed IR session starts.
+On the measured NexiGo profile (GREY 640x360 at 1/30 on its recorded USB
+endpoint), a first rate window that misses the floor gets the product's one
+startup recheck (#1409): three further frames, then the next full window is
+judged as usual. `burst_dump` reports the replaced window at once, as
+`irlume: burst first window refused:`, and the window that passed, as
+`irlume: burst rate accepted after one startup recheck:`. A window after the
+recheck that misses too is a refusal like any other: exit 3, with both
+windows in the log. The floor, the window and the single attempt are
+unchanged, and the nightly adds a warning, not a retry, when the recheck
+ran. The first session after the camera enumerates is the measured case; a
+stream that stays below its floor still fails.
 
 The restricted route forwards the diagnostic when its approved capture
 binary includes it. The helper's nonzero exit still fails the step

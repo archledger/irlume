@@ -44,6 +44,16 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Changed
 
+- The raw IR burst (`burst_dump`, the nightly's camera stage) starts the
+  way the product's fixed IR session starts: on the measured NexiGo
+  profile, a first rate window that misses its floor gets the product's
+  one startup recheck (#1409), and both windows are reported
+  (`irlume: burst first window refused:`, then `irlume: burst rate
+  accepted after one startup recheck:`). A window after the recheck that
+  misses too still exits 3, with both windows in the log. The floor, the
+  window and the single attempt are unchanged; the nightly adds a warning
+  when the recheck ran and still does not retry a failed capture (#1430).
+
 - Login & Apps shows IR-backed face and consent guidance only when fresh
   daemon and camera observations confirm the configured RGB+IR pair.
   Missing or stale observations keep the password fallback guidance

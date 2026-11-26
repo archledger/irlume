@@ -7,10 +7,16 @@
 //!
 //! Usage: cargo run --release -p irlume-camera --example burst_dump -- <out_dir> [ir_dev] [frames]
 //!
-//! A delivered-rate refusal exits 3 and reports the rejected rate window on
-//! stderr. It leaves the burst failed; the nightly does not retry it.
+//! The stream starts the way the product's fixed IR session starts. When the
+//! first rate window of the session misses its floor on the measured camera,
+//! the capture makes the product's one startup recheck and this program
+//! reports each window on stderr as soon as it is judged: the refused one,
+//! then the one that admitted the first frame. A delivered-rate refusal exits
+//! 3 and reports the rejected rate window. It leaves the burst failed; the
+//! nightly does not retry it.
 
-use irlume_camera::ir_probe;
+use irlume_camera::frame_provenance::DeliveredRateEvidence;
+use irlume_camera::ir_probe::{self, RefusedStartupWindow, StartupRecheckReport};
 use irlume_common::{CameraStreamRateEvidence, Error};
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -26,7 +32,10 @@ fn main() -> ExitCode {
     let n: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(36);
 
     std::fs::create_dir_all(&out).expect("create out dir");
-    let frames = match ir_probe::capture_raw_burst_timed(&dev, n) {
+    let frames = match ir_probe::capture_raw_burst_with_startup(&dev, n, |report| {
+        // Written as soon as each window is judged: a later one may still miss.
+        let _ = write_recheck_report(io::stderr().lock(), report);
+    }) {
         Ok(frames) => frames,
         Err(Error::DeliveredRate(evidence)) => {
             // A broken stderr still leaves the refused burst failed.
@@ -47,11 +56,7 @@ fn main() -> ExitCode {
         pgm.write_all(&f.data).unwrap();
     }
     let span_ms = frames.last().map(|(_, ms)| *ms).unwrap_or(0.0);
-    let fps = if span_ms > 0.0 {
-        (frames.len().saturating_sub(1)) as f64 / (span_ms / 1000.0)
-    } else {
-        0.0
-    };
+    let fps = delivered_fps(&frames.iter().map(|(_, ms)| *ms).collect::<Vec<_>>());
     println!(
         "{}: wrote {} frames ({}x{}) in {:.0} ms ({:.1} fps delivered)",
         out,
@@ -62,6 +67,101 @@ fn main() -> ExitCode {
         fps
     );
     ExitCode::SUCCESS
+}
+
+/// Frames per second over the delivered frames: the gaps between them, not
+/// the startup dequeues that ran before the first. Zero without a span.
+fn delivered_fps(ms: &[f64]) -> f64 {
+    match (ms.first(), ms.last()) {
+        (Some(&first), Some(&last)) if last > first => {
+            (ms.len() - 1) as f64 / ((last - first) / 1000.0)
+        }
+        _ => 0.0,
+    }
+}
+
+/// One startup line on stderr: the refused first window, or the window that
+/// admitted the first frame after the recheck.
+fn write_recheck_report(out: impl Write, report: StartupRecheckReport) -> io::Result<()> {
+    match report {
+        StartupRecheckReport::FirstWindowRefused(window) => {
+            write_window(out, "first window refused", &window.into())
+        }
+        StartupRecheckReport::AcceptedAfterRecheck(evidence) => write_window(
+            out,
+            "rate accepted after one startup recheck",
+            &evidence.into(),
+        ),
+    }
+}
+
+/// The numbers of one judged rate window, as the two startup lines report
+/// them. No timestamps.
+#[derive(Clone, Copy)]
+struct WindowLine {
+    requested: (u32, u32),
+    accepted: (u32, u32),
+    floor: (u32, u32),
+    tolerance_percent: u32,
+    window_count: u32,
+    window_span_us: u64,
+    delivered: (u64, u64),
+    max_inter_frame_gap_us: u64,
+    meets_floor: bool,
+}
+
+impl From<RefusedStartupWindow> for WindowLine {
+    fn from(window: RefusedStartupWindow) -> Self {
+        Self {
+            requested: window.requested,
+            accepted: window.accepted,
+            floor: window.floor,
+            tolerance_percent: window.tolerance_percent,
+            window_count: window.window_count,
+            window_span_us: window.window_span_us,
+            delivered: window.delivered,
+            max_inter_frame_gap_us: window.max_inter_frame_gap_us,
+            meets_floor: false,
+        }
+    }
+}
+
+impl From<DeliveredRateEvidence> for WindowLine {
+    fn from(evidence: DeliveredRateEvidence) -> Self {
+        Self {
+            requested: evidence.requested(),
+            accepted: evidence.accepted(),
+            floor: evidence.floor(),
+            tolerance_percent: evidence.tolerance_percent(),
+            window_count: evidence.window_count(),
+            window_span_us: evidence.window_span_us(),
+            delivered: evidence.delivered(),
+            max_inter_frame_gap_us: evidence.max_inter_frame_gap_us(),
+            meets_floor: evidence.meets_floor(),
+        }
+    }
+}
+
+fn write_window(mut out: impl Write, label: &str, window: &WindowLine) -> io::Result<()> {
+    writeln!(
+        out,
+        "irlume: burst {label}: requested={}/{} accepted={}/{} floor={}/{} \
+         tolerance_percent={} window_count={} window_span_us={} delivered={}/{} \
+         max_inter_frame_gap_us={} meets_floor={}",
+        window.requested.0,
+        window.requested.1,
+        window.accepted.0,
+        window.accepted.1,
+        window.floor.0,
+        window.floor.1,
+        window.tolerance_percent,
+        window.window_count,
+        window.window_span_us,
+        window.delivered.0,
+        window.delivered.1,
+        window.max_inter_frame_gap_us,
+        window.meets_floor,
+    )
 }
 
 fn write_rate_refusal(mut out: impl Write, evidence: &CameraStreamRateEvidence) -> io::Result<()> {
@@ -129,5 +229,86 @@ mod tests {
              delivered=30000000/2088113 meets_floor=false sequence_gap=0 \
              cumulative_drops=0 clock=monotonic source=end_of_frame\n"
         );
+    }
+
+    #[test]
+    fn the_refused_first_window_is_reported_as_numbers_only() {
+        let window = RefusedStartupWindow {
+            requested: (1, 30),
+            accepted: (1, 30),
+            window_count: 30,
+            window_span_us: 2_104_076,
+            delivered: (7_500_000, 526_019),
+            max_inter_frame_gap_us: 95_945,
+            floor: (15, 1),
+            tolerance_percent: 97,
+        };
+        let mut output = Vec::new();
+
+        write_recheck_report(
+            &mut output,
+            StartupRecheckReport::FirstWindowRefused(window),
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "irlume: burst first window refused: requested=1/30 accepted=1/30 \
+             floor=15/1 tolerance_percent=97 window_count=30 window_span_us=2104076 \
+             delivered=7500000/526019 max_inter_frame_gap_us=95945 meets_floor=false\n"
+        );
+    }
+
+    #[test]
+    fn both_startup_lines_report_the_same_fields() {
+        let first = WindowLine {
+            requested: (1, 30),
+            accepted: (1, 30),
+            floor: (15, 1),
+            tolerance_percent: 97,
+            window_count: 30,
+            window_span_us: 2_104_076,
+            delivered: (7_500_000, 526_019),
+            max_inter_frame_gap_us: 95_945,
+            meets_floor: false,
+        };
+        let accepted = WindowLine {
+            window_span_us: 2_028_086,
+            delivered: (15_000_000, 1_014_043),
+            max_inter_frame_gap_us: 71_998,
+            meets_floor: true,
+            ..first
+        };
+        let mut output = Vec::new();
+
+        write_window(&mut output, "first window refused", &first).unwrap();
+        write_window(
+            &mut output,
+            "rate accepted after one startup recheck",
+            &accepted,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "irlume: burst first window refused: requested=1/30 accepted=1/30 \
+             floor=15/1 tolerance_percent=97 window_count=30 window_span_us=2104076 \
+             delivered=7500000/526019 max_inter_frame_gap_us=95945 meets_floor=false\n\
+             irlume: burst rate accepted after one startup recheck: requested=1/30 \
+             accepted=1/30 floor=15/1 tolerance_percent=97 window_count=30 \
+             window_span_us=2028086 delivered=15000000/1014043 \
+             max_inter_frame_gap_us=71998 meets_floor=true\n"
+        );
+    }
+
+    #[test]
+    fn the_delivered_rate_spans_the_delivered_frames_not_the_startup() {
+        // Six frames after a 2.5 s startup: five gaps of 68 ms. Over the
+        // startup as well the same frames would read as 1.8 fps.
+        let stamps = [2_500.0, 2_568.0, 2_636.0, 2_704.0, 2_772.0, 2_840.0];
+        assert!((delivered_fps(&stamps) - 5.0 / 0.340).abs() < 1e-9);
+        assert_eq!(delivered_fps(&[2_500.0]), 0.0);
+        assert_eq!(delivered_fps(&[]), 0.0);
+        assert_eq!(delivered_fps(&[2_500.0, 2_500.0]), 0.0);
     }
 }

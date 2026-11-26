@@ -10,12 +10,13 @@
 //! The stream starts the way the product's fixed IR session starts. When the
 //! first rate window of the session misses its floor on the measured camera,
 //! the capture makes the product's one startup recheck and this program
-//! reports both windows on stderr. A delivered-rate refusal exits 3 and
-//! reports the rejected rate window. It leaves the burst failed; the nightly
-//! does not retry it.
+//! reports each window on stderr as soon as it is judged: the refused one,
+//! then the one that admitted the first frame. A delivered-rate refusal exits
+//! 3 and reports the rejected rate window. It leaves the burst failed; the
+//! nightly does not retry it.
 
 use irlume_camera::frame_provenance::DeliveredRateEvidence;
-use irlume_camera::ir_probe::{self, RefusedStartupWindow};
+use irlume_camera::ir_probe::{self, RefusedStartupWindow, StartupRecheckReport};
 use irlume_common::{CameraStreamRateEvidence, Error};
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -31,11 +32,9 @@ fn main() -> ExitCode {
     let n: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(36);
 
     std::fs::create_dir_all(&out).expect("create out dir");
-    let mut rechecked = false;
-    let frames = match ir_probe::capture_raw_burst_with_startup(&dev, n, |window| {
-        rechecked = true;
-        // Reported as soon as it is known: the window after it may miss too.
-        let _ = write_window(io::stderr().lock(), "first window refused", &window.into());
+    let frames = match ir_probe::capture_raw_burst_with_startup(&dev, n, |report| {
+        // Written as soon as each window is judged: a later one may still miss.
+        let _ = write_recheck_report(io::stderr().lock(), report);
     }) {
         Ok(frames) => frames,
         Err(Error::DeliveredRate(evidence)) => {
@@ -45,16 +44,6 @@ fn main() -> ExitCode {
         }
         Err(error) => panic!("capture: {error:?}"),
     };
-    if rechecked {
-        if let Some((frame, _)) = frames.first() {
-            // The first delivered frame carries the window that passed.
-            let _ = write_window(
-                io::stderr().lock(),
-                "rate accepted after one startup recheck",
-                &frame.provenance().rate_evidence().into(),
-            );
-        }
-    }
     // means.txt columns: index, frame mean, ms since first dequeue. The third
     // column is capture-time-only data (real delivered fps, strobe cadence);
     // everything else about a frame can be recomputed offline from the PGM.
@@ -88,6 +77,21 @@ fn delivered_fps(ms: &[f64]) -> f64 {
             (ms.len() - 1) as f64 / ((last - first) / 1000.0)
         }
         _ => 0.0,
+    }
+}
+
+/// One startup line on stderr: the refused first window, or the window that
+/// admitted the first frame after the recheck.
+fn write_recheck_report(out: impl Write, report: StartupRecheckReport) -> io::Result<()> {
+    match report {
+        StartupRecheckReport::FirstWindowRefused(window) => {
+            write_window(out, "first window refused", &window.into())
+        }
+        StartupRecheckReport::AcceptedAfterRecheck(evidence) => write_window(
+            out,
+            "rate accepted after one startup recheck",
+            &evidence.into(),
+        ),
     }
 }
 
@@ -241,7 +245,11 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        write_window(&mut output, "first window refused", &window.into()).unwrap();
+        write_recheck_report(
+            &mut output,
+            StartupRecheckReport::FirstWindowRefused(window),
+        )
+        .unwrap();
 
         assert_eq!(
             String::from_utf8(output).unwrap(),

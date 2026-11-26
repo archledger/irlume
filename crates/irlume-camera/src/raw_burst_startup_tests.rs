@@ -126,3 +126,123 @@ fn raw_burst_startup_reports_the_replaced_window_when_a_recheck_dequeue_fails() 
     let refused = reported.expect("the replaced window is reported before the failure");
     assert_eq!(refused.window_span_us, 2_088_113);
 }
+
+// The whole raw burst, startup and deliveries, the way
+// `capture_raw_burst_with_startup` drives it: what it reports and delivers,
+// in order.
+#[derive(Debug, PartialEq, Eq)]
+enum RawBurstEvent {
+    FirstWindowRefused(u64),
+    AcceptedAfterRecheck(u64, bool),
+    Delivered(u32),
+}
+
+fn record_raw_burst(
+    stream: &mut TrackedStream<QueuedContinuityFixture>,
+    frames: usize,
+    measured_profile: impl FnOnce() -> bool,
+) -> (irlume_common::Result<Vec<u32>>, Vec<RawBurstEvent>) {
+    let events = std::cell::RefCell::new(Vec::new());
+    let result = run_raw_ir_burst(
+        "fixture",
+        stream,
+        frames,
+        measured_profile,
+        |report| {
+            events.borrow_mut().push(match report {
+                StartupRecheckReport::FirstWindowRefused(window) => {
+                    RawBurstEvent::FirstWindowRefused(window.window_span_us)
+                }
+                StartupRecheckReport::AcceptedAfterRecheck(evidence) => {
+                    RawBurstEvent::AcceptedAfterRecheck(
+                        evidence.window_span_us(),
+                        evidence.meets_floor(),
+                    )
+                }
+            });
+        },
+        |_, facts, _, _, _| {
+            events
+                .borrow_mut()
+                .push(RawBurstEvent::Delivered(facts.sequence_raw()));
+            Ok(facts.sequence_raw())
+        },
+    );
+    (result, events.into_inner())
+}
+
+#[test]
+fn raw_burst_reports_the_accepted_window_before_the_first_frame_is_used() {
+    let mut stream = ir_startup_timing_fixture(&FIRST_IR_SESSION_US);
+    let (result, events) = record_raw_burst(&mut stream, 3, || true);
+    assert_eq!(result.unwrap(), [41, 42, 43]);
+    assert_eq!(
+        events,
+        [
+            RawBurstEvent::FirstWindowRefused(2_088_113),
+            RawBurstEvent::AcceptedAfterRecheck(2_028_086, true),
+            RawBurstEvent::Delivered(41),
+            RawBurstEvent::Delivered(42),
+            RawBurstEvent::Delivered(43),
+        ]
+    );
+}
+
+#[test]
+fn raw_burst_reports_the_accepted_window_before_a_later_window_misses() {
+    // A 140 ms stall after frame 41: the window that admitted frame 41
+    // passes, the one at frame 42 does not.
+    let mut deltas = FIRST_IR_SESSION_US;
+    deltas[40] = 140_000;
+    let mut stream = ir_startup_timing_fixture(&deltas);
+    let (result, events) = record_raw_burst(&mut stream, 3, || true);
+    let Err(Error::DeliveredRate(evidence)) = result else {
+        panic!("the window at frame 42 must get a typed rate refusal");
+    };
+    assert_eq!(evidence.window_span_us, 2_028_086 - 67_874 + 140_000);
+    assert_eq!(
+        events,
+        [
+            RawBurstEvent::FirstWindowRefused(2_088_113),
+            RawBurstEvent::AcceptedAfterRecheck(2_028_086, true),
+            RawBurstEvent::Delivered(41),
+        ]
+    );
+}
+
+#[test]
+fn raw_burst_refused_at_the_recheck_window_reports_no_accepted_window() {
+    let mut stream = ir_startup_timing_fixture(&[71_429; 42]);
+    let (result, events) = record_raw_burst(&mut stream, 3, || true);
+    let Err(Error::DeliveredRate(evidence)) = result else {
+        panic!("a stream that stays below its floor must get a typed rate refusal");
+    };
+    assert_eq!(evidence.window_span_us, 30 * 71_429);
+    assert_eq!(events, [RawBurstEvent::FirstWindowRefused(30 * 71_429)]);
+}
+
+#[test]
+fn raw_burst_without_a_recheck_delivers_without_reports() {
+    let mut stream = ir_startup_timing_fixture(&SECOND_IR_SESSION_US);
+    let (result, events) = record_raw_burst(&mut stream, 3, || {
+        panic!("healthy startup must not check the profile")
+    });
+    assert_eq!(result.unwrap(), [38, 39, 40]);
+    assert_eq!(
+        events,
+        [
+            RawBurstEvent::Delivered(38),
+            RawBurstEvent::Delivered(39),
+            RawBurstEvent::Delivered(40),
+        ]
+    );
+}
+
+#[test]
+fn raw_burst_of_zero_frames_dequeues_nothing() {
+    let mut stream = ir_startup_timing_fixture(&FIRST_IR_SESSION_US);
+    let (result, events) = record_raw_burst(&mut stream, 0, || panic!("nothing to deliver"));
+    assert!(result.unwrap().is_empty());
+    assert!(events.is_empty());
+    assert_eq!(stream.accounting().0, 0);
+}

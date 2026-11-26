@@ -49,11 +49,13 @@ The burst's stream starts the way the product's fixed IR session starts.
 On the measured NexiGo profile (GREY 640x360 at 1/30 on its recorded USB
 endpoint), a first rate window that misses the floor gets the product's one
 startup recheck (#1409): three further frames, then the next full window is
-judged as usual. `burst_dump` reports the replaced window at once, as
-`irlume: burst first window refused:`, and the window that passed, as
-`irlume: burst rate accepted after one startup recheck:`. A window after the
-recheck that misses too is a refusal like any other: exit 3, with both
-windows in the log. The floor, the window and the single attempt are
+judged as usual. `burst_dump` reports each window on stderr as soon as it
+is judged: the replaced window, as `irlume: burst first window refused:`,
+then the window that admitted the first frame after the recheck, as
+`irlume: burst rate accepted after one startup recheck:`. A rate refusal
+right after the first line means the window after the recheck missed too;
+a refusal after both lines means a later window missed. Either is a refusal
+like any other: exit 3. The floor, the window and the single attempt are
 unchanged, and the nightly adds a warning, not a retry, when the recheck
 ran. The first session after the camera enumerates is the measured case; a
 stream that stays below its floor still fails.

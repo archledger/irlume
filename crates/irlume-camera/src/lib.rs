@@ -2069,6 +2069,18 @@ pub struct RefusedStartupWindow {
     pub tolerance_percent: u32,
 }
 
+/// What a raw burst reports about its startup recheck, each as soon as it is
+/// known, so a later failure cannot hide it. Neither is reported when the
+/// first window met its floor or no recheck applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupRecheckReport {
+    /// The first window missed its floor and the recheck replaced it.
+    FirstWindowRefused(RefusedStartupWindow),
+    /// The window that admitted the first frame after the recheck, before
+    /// that frame is used. A window after it can still miss.
+    AcceptedAfterRecheck(frame_provenance::DeliveredRateEvidence),
+}
+
 struct TrackedStream<S> {
     stream: Option<S>,
     control: CaptureControl,
@@ -2952,6 +2964,45 @@ fn start_raw_ir_burst<S: ValidatedStream>(
         on_refused(window);
     }
     filled.map_err(|error| map_io(device, error))
+}
+
+/// Run a raw IR burst of `n` frames: the startup of [`start_raw_ir_burst`],
+/// then one delivery per frame through `deliver`, stopping at the first
+/// error. After a recheck the window that admitted the first frame goes to
+/// `on_recheck` before `deliver` sees that frame. With `n == 0` nothing is
+/// dequeued.
+fn run_raw_ir_burst<S: ValidatedStream, T>(
+    device: &str,
+    stream: &mut TrackedStream<S>,
+    n: usize,
+    measured_profile: impl FnOnce() -> bool,
+    mut on_recheck: impl FnMut(StartupRecheckReport),
+    mut deliver: impl FnMut(
+        &[u8],
+        frame_provenance::DequeuedBufferFacts,
+        frame_provenance::SequenceObservation,
+        frame_provenance::TimestampObservation,
+        frame_provenance::DeliveredRateEvidence,
+    ) -> irlume_common::Result<T>,
+) -> irlume_common::Result<Vec<T>> {
+    let mut out = Vec::with_capacity(n);
+    if n == 0 {
+        return Ok(out);
+    }
+    let mut rechecked = false;
+    start_raw_ir_burst(device, stream, measured_profile, |window| {
+        rechecked = true;
+        on_recheck(StartupRecheckReport::FirstWindowRefused(window));
+    })?;
+    for _ in 0..n {
+        let (payload, facts, sequence, timestamp, rate_evidence) =
+            stream.next().map_err(|error| map_delivery(device, error))?;
+        if std::mem::take(&mut rechecked) {
+            on_recheck(StartupRecheckReport::AcceptedAfterRecheck(rate_evidence));
+        }
+        out.push(deliver(payload, facts, sequence, timestamp, rate_evidence)?);
+    }
+    Ok(out)
 }
 
 // Prime a fresh pair without claiming delivered-rate readiness. Observation
@@ -8604,7 +8655,8 @@ pub fn capture_pair_with<R: Send, I: Send>(
 pub mod ir_probe {
     use super::negotiate_ir_format_and_interval;
     pub use super::RefusedStartupWindow;
-    use super::{map_delivery, map_io, verify_pinned, Error, Frame, Spectrum};
+    pub use super::StartupRecheckReport;
+    use super::{map_io, verify_pinned, Error, Frame, Spectrum};
 
     /// Mean brightness of an 8-bit greyscale buffer.
     pub fn mean(data: &[u8]) -> f64 {
@@ -8731,13 +8783,14 @@ pub mod ir_probe {
 
     /// [`capture_raw_burst_timed`], on a stream that starts the way the
     /// product's fixed IR session starts: its first rate window gets the one
-    /// startup recheck the product gives the measured camera (#1409), and
-    /// `on_refused` receives the window that recheck replaced as soon as the
-    /// recheck is decided, so a caller can report it even when a recheck
-    /// dequeue then fails or the window after it misses too. A window after
-    /// the recheck that misses the floor is refused like any other. The
+    /// startup recheck the product gives the measured camera (#1409). After a
+    /// recheck `on_recheck` receives the window it replaced as soon as the
+    /// recheck is decided, then the window that admitted the first frame as
+    /// soon as that frame is delivered, so a caller can report each even when
+    /// a later dequeue fails or a later window misses its floor. A window
+    /// after the recheck that misses the floor is refused like any other. The
     /// floor, the window and the single attempt are the product's. With
-    /// `n == 0` nothing is dequeued and `on_refused` is not called.
+    /// `n == 0` nothing is dequeued and `on_recheck` is not called.
     ///
     /// # Errors
     ///
@@ -8747,7 +8800,7 @@ pub mod ir_probe {
     pub fn capture_raw_burst_with_startup(
         device: &str,
         n: usize,
-        mut on_refused: impl FnMut(RefusedStartupWindow),
+        on_recheck: impl FnMut(StartupRecheckReport),
     ) -> irlume_common::Result<Vec<(Frame, f64)>> {
         verify_pinned(device)?;
         let permit = super::lease::permit_for_endpoint(
@@ -8810,45 +8863,39 @@ pub mod ir_probe {
         .with_producer(stream.producer());
         // Bound, never read: held for its `Drop`, which restores the control.
         let _ = &mode;
-        let mut out = Vec::with_capacity(n);
         let t0 = std::time::Instant::now();
         // A burst that delivers frames starts like a product session. With
         // nothing to deliver the stream is only opened and armed.
-        if n > 0 {
-            super::start_raw_ir_burst(
-                device,
-                &mut stream,
-                || {
-                    super::nexigo_ir_recheck_applies(
-                        &fmt,
-                        interval.requested,
-                        interval.accepted,
-                        &dev,
-                    )
-                },
-                &mut on_refused,
-            )?;
-        }
-        for _ in 0..n {
-            let (buf, facts, sequence, timestamp, rate_evidence) =
-                stream.next().map_err(|error| map_delivery(device, error))?;
-            let taken = std::time::Instant::now();
-            let provenance = super::checked_single_provenance(
-                binding.clone(),
-                format.clone(),
-                facts,
-                sequence,
-                timestamp,
-                taken,
-                super::contracts::IlluminationProvenance::Unknown,
-                rate_evidence,
-            )?;
-            out.push((
-                Frame::from_provenance(w, h, Spectrum::Ir, dec.decode(buf, w, h), provenance)?,
-                t0.elapsed().as_secs_f64() * 1000.0,
-            ));
-        }
-        Ok(out)
+        super::run_raw_ir_burst(
+            device,
+            &mut stream,
+            n,
+            || super::nexigo_ir_recheck_applies(&fmt, interval.requested, interval.accepted, &dev),
+            on_recheck,
+            |payload, facts, sequence, timestamp, rate_evidence| {
+                let taken = std::time::Instant::now();
+                let provenance = super::checked_single_provenance(
+                    binding.clone(),
+                    format.clone(),
+                    facts,
+                    sequence,
+                    timestamp,
+                    taken,
+                    super::contracts::IlluminationProvenance::Unknown,
+                    rate_evidence,
+                )?;
+                Ok((
+                    Frame::from_provenance(
+                        w,
+                        h,
+                        Spectrum::Ir,
+                        dec.decode(payload, w, h),
+                        provenance,
+                    )?,
+                    t0.elapsed().as_secs_f64() * 1000.0,
+                ))
+            },
+        )
     }
 }
 

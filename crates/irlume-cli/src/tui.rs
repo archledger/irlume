@@ -5149,9 +5149,9 @@ impl App {
     fn on_key(&mut self, code: KeyCode) {
         // A key between two clicks ends a double click.
         self.repair_click = None;
-        if self.enrollment_result_is_exposed()
+        if matches!(code, KeyCode::Enter | KeyCode::Esc)
+            && self.enrollment_result_is_exposed()
             && self.enrollment_result.take().is_some()
-            && matches!(code, KeyCode::Enter | KeyCode::Esc)
         {
             return;
         }
@@ -19743,6 +19743,27 @@ mod tests {
         app.on_key(KeyCode::Esc);
         assert!(!app.activity_history_open);
         assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_survives_opening_history() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+
+        app.on_key(KeyCode::Char('L'));
+        assert!(app.activity_history_open);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+        app.on_key(KeyCode::Enter);
+        assert!(app.enrollment_result.is_none());
         drain_loads(&mut app);
         wait_live_done(&mut app);
     }

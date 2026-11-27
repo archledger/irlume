@@ -347,10 +347,11 @@ fn enrollment_session_with_connect(
     let mut reader = std::io::BufReader::new(reader);
     // The scan cap is 30, with one probe/merge and occasional target updates.
     // The daemon's optional 250 ms pump can send many more observations over
-    // the 380 s deadline. Do not spend mandatory capacity on that feedback.
+    // the 380 s deadline. Once advisory delivery is capped, keep reading
+    // under the existing deadline and line-size bound for progress or result.
     let mut mandatory_left = 128_u16;
     let mut advisory_left = 2048_u16;
-    while mandatory_left != 0 && advisory_left != 0 {
+    while mandatory_left != 0 {
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -376,6 +377,9 @@ fn enrollment_session_with_connect(
         match response {
             Response::EnrollmentSession(progress) => {
                 if matches!(progress, crate::EnrollmentEvent::Framing { .. }) {
+                    if advisory_left == 0 {
+                        continue;
+                    }
                     advisory_left -= 1;
                 } else {
                     mandatory_left -= 1;
@@ -939,6 +943,7 @@ mod tests {
 
     #[test]
     fn enrollment_framing_does_not_consume_the_progress_budget() {
+        const ADVISORIES: usize = 2_100;
         let (device, peer) = UnixStream::pair().unwrap();
         let server = std::thread::spawn(move || -> io::Result<()> {
             let mut stream = BufReader::new(peer);
@@ -946,7 +951,7 @@ mod tests {
             stream.read_line(&mut line)?;
             let mut peer = stream.into_inner();
             peer.write_all(b"{\"EnrollmentSession\":\"Started\"}\n")?;
-            for _ in 0..160 {
+            for _ in 0..ADVISORIES {
                 peer.write_all(b"{\"EnrollmentSession\":{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n")?;
             }
             peer.write_all(b"{\"EnrollmentSession\":{\"Progress\":{\"captured\":3,\"target\":3}}}\n{\"Ok\":\"finished\"}\n")
@@ -979,7 +984,7 @@ mod tests {
             "{result:?}"
         );
         server_result.unwrap();
-        assert_eq!((framing, progress), (160, 3));
+        assert_eq!((framing, progress), (2048, 3));
     }
 
     #[test]

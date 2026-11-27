@@ -147,11 +147,22 @@ impl Connection {
     }
 
     fn pump_inner(&mut self, stream: &UnixStream, allow_optional: bool) -> io::Result<()> {
-        if !allow_optional {
+        if allow_optional {
+            if !self.optional_tail.is_empty() {
+                let sent = try_write_optional(stream, &self.optional_tail);
+                self.optional_tail.drain(..sent);
+                if !self.optional_tail.is_empty() {
+                    // Do not dequeue control events or block on optional
+                    // bytes. A later pump resumes this line before any other.
+                    return Ok(());
+                }
+            }
+        } else {
+            // The final reply already uses the socket's write timeout. Finish
+            // any line already started so the final reply stays decodable.
             self.complete_optional_line(stream)?;
         }
         while let Ok(event) = self.events.try_recv() {
-            self.complete_optional_line(stream)?;
             if matches!(event, EnrollmentEvent::Merge { .. }) {
                 if self.waiting {
                     return Err(io::Error::other("duplicate merge prompt"));
@@ -217,11 +228,6 @@ impl Connection {
     }
 
     fn pump_optional(&mut self, stream: &UnixStream) {
-        if !self.optional_tail.is_empty() {
-            let sent = try_write_optional(stream, &self.optional_tail);
-            self.optional_tail.drain(..sent);
-            return;
-        }
         let sample = self
             .framing
             .as_ref()
@@ -332,6 +338,58 @@ mod tests {
             })
         ));
         assert!(connection.optional_tail.is_empty());
+    }
+
+    #[test]
+    fn enrollment_framing_partial_line_yields_while_the_reader_is_slow() {
+        use std::io::{BufRead, BufReader, Read};
+
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut filled = 0;
+        loop {
+            match server.write(&[0_u8; 4096]) {
+                Ok(n) if n != 0 => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected fixture write: {other:?}"),
+            }
+            assert!(filled < 1_000_000);
+        }
+        // Simulate the remaining bytes after a short write. The prefix is
+        // already reader-owned; recover it below when checking line integrity.
+        let prefix = b"{\"EnrollmentSession\":";
+        let tail = b"{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n";
+        connection.optional_tail = tail.to_vec();
+        worker.progress(1, 3).unwrap();
+        connection
+            .pump(&server)
+            .expect("backpressure on an optional tail is not an error");
+        assert_eq!(connection.optional_tail, tail);
+
+        client.read_exact(&mut vec![0; filled]).unwrap();
+        connection.pump(&server).unwrap();
+        assert!(connection.optional_tail.is_empty());
+        let mut reader = BufReader::new(client);
+        let mut line = prefix.to_vec();
+        reader.read_until(b'\n', &mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(&line).unwrap(),
+            Response::EnrollmentSession(EnrollmentEvent::Framing { position: None, .. })
+        ));
+        line.clear();
+        reader.read_until(b'\n', &mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(&line).unwrap(),
+            Response::EnrollmentSession(EnrollmentEvent::Progress {
+                captured: 1,
+                target: 3
+            })
+        ));
     }
 
     #[test]

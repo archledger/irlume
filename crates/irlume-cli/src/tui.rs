@@ -16,6 +16,7 @@ mod attempts;
 pub(crate) mod dates;
 mod freshness;
 mod launch;
+mod polling;
 use attempts::AttemptsReply;
 use freshness::{Freshness, Source, Worker};
 
@@ -4084,87 +4085,7 @@ impl App {
 
     fn poll(&mut self) {
         let now = self.now();
-        if let Some(result) = receive_finished(&self.live_load) {
-            self.live_load = None;
-            if self.freshness.cycle_mut(Worker::Live).finish(now) {
-                match result {
-                    Ok(Ok(snapshot)) => self.apply_live_snapshot(snapshot, now),
-                    _ => {
-                        self.freshness
-                            .observation_mut(Source::Live)
-                            .record(false, now);
-                        self.clear_source(Source::Live);
-                    }
-                }
-            }
-        }
-        if let Some(result) = receive_finished(&self.heavy_load) {
-            self.heavy_load = None;
-            self.heavy_at = now;
-            if self.freshness.cycle_mut(Worker::Apps).finish(now) {
-                let success = matches!(&result, Ok(Ok(_)));
-                self.freshness
-                    .observation_mut(Source::Apps)
-                    .record(success, now);
-                match result {
-                    Ok(Ok(state)) => {
-                        self.heavy = state;
-                        self.heavy_known = true;
-                    }
-                    Err(()) => {
-                        self.clear_source(Source::Apps);
-                        self.log('!', "app status refresh ended without a result; current app state is unavailable. Refresh to retry.");
-                    }
-                    Ok(Err(_)) => self.clear_source(Source::Apps),
-                }
-            }
-        }
-        if let Some(result) = receive_finished(&self.camera_load) {
-            self.camera_load = None;
-            if self.freshness.cycle_mut(Worker::Cameras).finish(now) {
-                let pairs = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|listing| listing.pairs.as_ref());
-                self.freshness
-                    .observation_mut(Source::Cameras)
-                    .record(pairs.is_some(), now);
-                self.freshness
-                    .observation_mut(Source::CameraPrivacy)
-                    .record(pairs.is_some(), now);
-                if let Some(pairs) = pairs {
-                    let selected = self.selected_camera_choice.take().or_else(|| {
-                        (self.pairs_known || !self.pairs.is_empty()).then(|| {
-                            self.pairs
-                                .get(self.cam_sel)
-                                .and_then(|pair| self.camera_choice(&pair.rgb, &pair.ir))
-                        })
-                    });
-                    self.pairs = pairs
-                        .iter()
-                        .filter(|pair| self.camera_choice(&pair.rgb, &pair.ir).is_some())
-                        .cloned()
-                        .collect();
-                    self.pairs_known = true;
-                    self.cam_sel = match selected {
-                        None => 0,
-                        Some(Some(choice)) if self.camera_choice_current(&choice) => self
-                            .pairs
-                            .iter()
-                            .position(|pair| pair.rgb == choice.rgb && pair.ir == choice.ir)
-                            .unwrap_or(self.pairs.len()),
-                        Some(_) => self.pairs.len(),
-                    };
-                } else {
-                    self.clear_source(Source::Cameras);
-                    if result.is_err() {
-                        self.log('!', "camera refresh ended without a result; current camera classification is unavailable. Refresh to retry.");
-                    }
-                }
-                self.run_checks();
-                self.recompute_visible();
-            }
-        }
+        self.poll_live_apps_and_cameras(now);
         if let Some(result) = receive_finished(&self.qualification_load) {
             self.qualification_load = None;
             if self.freshness.cycle_mut(Worker::Qualification).finish(now) {
@@ -15051,21 +14972,25 @@ mod tests {
         // outside tests. An instrumented run is the empirical half (strace
         // counted 12 node opens before this change, 0 after); this catches
         // a reintroduction at review time instead.
-        let src = include_str!("tui.rs");
-        let body = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
-        for banned in [
-            "irlume_camera::discover_nodes",
-            "irlume_camera::list_pairs",
-            "irlume_camera::capabilities",
-            "irlume_camera::privacy_engaged",
-            // Falls through to discovery when no pair is configured, and it
-            // sat in a per-frame draw path (#187 review).
-            "irlume_camera::select_pair",
+        for (path, src) in [
+            ("tui.rs", include_str!("tui.rs")),
+            ("tui/polling.rs", include_str!("tui/polling.rs")),
         ] {
-            assert!(
-                !body.contains(banned),
-                "{banned} opens video nodes; the TUI must ask the daemon (#187)"
-            );
+            let body = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+            for banned in [
+                "irlume_camera::discover_nodes",
+                "irlume_camera::list_pairs",
+                "irlume_camera::capabilities",
+                "irlume_camera::privacy_engaged",
+                // Falls through to discovery when no pair is configured, and it
+                // sat in a per-frame draw path (#187 review).
+                "irlume_camera::select_pair",
+            ] {
+                assert!(
+                    !body.contains(banned),
+                    "{path}: {banned} opens video nodes; the TUI must ask the daemon (#187)"
+                );
+            }
         }
     }
 

@@ -11,8 +11,14 @@ use std::time::{Duration, Instant};
 
 use irlume_auth::EnrollmentObserver;
 use irlume_common::{EnrollmentDecision, EnrollmentEvent, FramingPosition, Response};
+use irlume_core::storage::MAX_SCANS_PER_PROFILE;
 
 type FramingSlot = Arc<Mutex<Option<EnrollmentEvent>>>;
+
+// A partially written framing line must finish before the next wire line.
+// Keep room for all required events while it yields to a slow reader: each
+// capture stage can restart once, plus Started and at most two merge prompts.
+const GUIDED_EVENT_CAPACITY: usize = 2 * MAX_SCANS_PER_PROFILE + 3;
 
 pub(super) struct Worker {
     events: SyncSender<EnrollmentEvent>,
@@ -40,7 +46,7 @@ pub(super) fn channel_with_framing(
     stop: super::arbiter::CancelToken,
     framing: bool,
 ) -> (Worker, Connection) {
-    let (events, read_events) = mpsc::sync_channel(8);
+    let (events, read_events) = mpsc::sync_channel(if framing { GUIDED_EVENT_CAPACITY } else { 8 });
     let (decisions, read_decisions) = mpsc::sync_channel(1);
     let framing = framing.then(|| Arc::new(Mutex::new(None)));
     (
@@ -349,9 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_framing_partial_line_yields_while_the_reader_is_slow() {
+    fn enrollment_framing_partial_line_retains_all_progress_under_backpressure() {
         use std::io::{BufRead, BufReader, Read};
 
+        let target = MAX_SCANS_PER_PROFILE;
         let (worker, mut connection) =
             channel_with_framing(super::super::arbiter::CancelToken::new(), true);
         let (mut server, mut client) = UnixStream::pair().unwrap();
@@ -359,6 +366,12 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
+        let prefix = b"{\"EnrollmentSession\":";
+        server.write_all(prefix).unwrap();
+        let mut line = vec![0; prefix.len()];
+        client.read_exact(&mut line).unwrap();
+        assert_eq!(line, prefix);
+
         let mut filled = 0;
         loop {
             match server.write(&[0_u8; 4096]) {
@@ -368,35 +381,53 @@ mod tests {
             }
             assert!(filled < 1_000_000);
         }
-        // Simulate the remaining bytes after a short write. The prefix is
-        // already reader-owned; recover it below when checking line integrity.
-        let prefix = b"{\"EnrollmentSession\":";
+        // The prefix is already with the reader; inject a short write's suffix.
         let tail = b"{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n";
         connection.optional_tail = tail.to_vec();
-        worker.progress(1, 3).unwrap();
-        connection
-            .pump(&server)
-            .expect("backpressure on an optional tail is not an error");
+        // Capture can report progress again after a concurrent pair failure.
+        let progress = (1..target).chain(1..=target);
+        for captured in progress.clone() {
+            worker
+                .progress(captured, target)
+                .unwrap_or_else(|error| panic!("lost progress {captured} of {target}: {error}"));
+            connection
+                .pump(&server)
+                .expect("backpressure on an optional tail is not an error");
+        }
+        worker
+            .send(EnrollmentEvent::Merge {
+                profile: "fixture".into(),
+                remaining: 0,
+            })
+            .unwrap();
         assert_eq!(connection.optional_tail, tail);
 
         client.read_exact(&mut vec![0; filled]).unwrap();
         connection.pump(&server).unwrap();
         assert!(connection.optional_tail.is_empty());
         let mut reader = BufReader::new(client);
-        let mut line = prefix.to_vec();
         reader.read_until(b'\n', &mut line).unwrap();
         assert!(matches!(
             serde_json::from_slice::<Response>(&line).unwrap(),
             Response::EnrollmentSession(EnrollmentEvent::Framing { position: None, .. })
         ));
+        for expected in progress {
+            line.clear();
+            reader.read_until(b'\n', &mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Response>(&line).unwrap(),
+                Response::EnrollmentSession(EnrollmentEvent::Progress {
+                    captured,
+                    target: reported_target
+                }) if captured == expected && reported_target == target
+            ));
+        }
         line.clear();
         reader.read_until(b'\n', &mut line).unwrap();
         assert!(matches!(
             serde_json::from_slice::<Response>(&line).unwrap(),
-            Response::EnrollmentSession(EnrollmentEvent::Progress {
-                captured: 1,
-                target: 3
-            })
+            Response::EnrollmentSession(EnrollmentEvent::Merge { profile, remaining: 0 })
+            if profile == "fixture"
         ));
     }
 

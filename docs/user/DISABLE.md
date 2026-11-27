@@ -49,9 +49,13 @@ enable` shows how the two differ, and `sudo irlume login enable --apply
 --force` rebuilds it, keeping the previous file as `<file>.pre-irlume` (add
 `--with-sudo` or `--with-polkit` for those two services). It does not when
 irlume's lines would move a numeric jump the vendor file has (a `[success=1
-default=ignore]` just above its password line, say): it says why, and deleting
-the file and running `sudo irlume login enable --apply` creates it again from
-the vendor file, after which you check that jump. irlume's lines keep their
+default=ignore]` just above its password line, say): it says why and keeps
+the override. Do not delete it to force a rebuild: the vendor file would
+take over without your local rules. Before any manual repair, save a
+root-only copy of the override. Compare it with the vendor file, preserve
+local rules and their ordering, and check where each jump lands. Preview the
+wiring and test password fallback in a separate session before relying on
+the repaired stack. irlume's lines keep their
 side of each of your lines: a faillock or group gate you put above irlume's
 line stays above it. A comment you add to a vendor line, or a blank or comment
 line, does not count as a line of yours; a copy of a vendor line does, and so

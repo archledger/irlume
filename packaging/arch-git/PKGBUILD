@@ -162,8 +162,13 @@ package_irlume-git() {
     # The machine-API contract, beside the engine that implements it: a consumer
     # validating our JSON should never have to guess which schema this build speaks.
     install -Dm0644 schemas/machine-api-v1.schema.json "$pkgdir/usr/share/irlume/schemas/machine-api-v1.schema.json"
-    install -Dm0644 docs/reference/MACHINE-API.md "$pkgdir/usr/share/doc/$pkgname/MACHINE-API.md"
-    install -Dm0644 docs/reference/INTEGRATION.md "$pkgdir/usr/share/doc/$pkgname/INTEGRATION.md"
+    local docdir=docs/reference
+    # Released tags from before the docs move still use the flat layout.
+    if [[ ! -d $docdir ]]; then
+        docdir=docs
+    fi
+    install -Dm0644 "$docdir/MACHINE-API.md" "$pkgdir/usr/share/doc/$pkgname/MACHINE-API.md"
+    install -Dm0644 "$docdir/INTEGRATION.md" "$pkgdir/usr/share/doc/$pkgname/INTEGRATION.md"
 }
 
 package_irlume-kcm-git() {

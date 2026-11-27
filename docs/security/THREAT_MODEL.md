@@ -425,6 +425,11 @@ installs and loads by hand.
   process memory, dropped after use but not explicitly wiped, inside the
   same root daemon that holds the decrypted templates anyway. Nothing
   biometric is logged.
+- **Enrollment viewfinder data.** An admitted non-root framing connection
+  that names its own account and opts in can receive coarse face position
+  and size for that session's TUI guide. This does not send pixels or facial
+  landmarks. The viewfinder is not part of capture, login, or unlock, and
+  Irlume does not store or log its geometry.
 
 ## Intent, throttling, and privilege elevation
 

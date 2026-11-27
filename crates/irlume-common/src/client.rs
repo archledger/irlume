@@ -1010,6 +1010,36 @@ mod tests {
     }
 
     #[test]
+    fn position_viewfinder_connect_uses_the_existing_handshake() {
+        let _g = testenv::lock();
+        let path = sock("viewfinder");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(b"\"PositionSessionStarted\"\n").unwrap();
+            line
+        });
+        let connected = PositionSession::connect_with_viewfinder(
+            "alice",
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let received = server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert!(connected.unwrap().is_some());
+        assert_eq!(
+            received,
+            "{\"PositionSession\":{\"user\":\"alice\",\"viewfinder\":true}}\n"
+        );
+    }
+
+    #[test]
     fn socket_path_honours_the_env_override() {
         let _g = testenv::lock();
         std::env::remove_var("IRLUME_SOCKET");

@@ -770,7 +770,10 @@ mod tests {
             Class::Camera
         );
         assert_eq!(
-            classify(&Request::PositionSession { user: None }),
+            classify(&Request::PositionSession {
+                user: None,
+                viewfinder: false,
+            }),
             Class::Camera
         );
         // Both recognition tests capture: never a connection-thread status.

@@ -2042,6 +2042,10 @@ fn authorized_for(peer: &Peer, target_user: &str) -> bool {
     peer.uid == 0 || uid_of(target_user).is_some_and(|u| u == peer.uid)
 }
 
+fn framing_viewfinder_allowed(peer: &Peer, target_user: Option<&str>, requested: bool) -> bool {
+    requested && peer.uid != 0 && target_user.is_some_and(|user| authorized_for(peer, user))
+}
+
 /// Whether a refusal at the door belongs in the named account's history
 /// (ADR-0030 §5): only a peer that may act for that account leaves a
 /// trace there — root, or the account itself for a verification; the
@@ -4951,9 +4955,9 @@ fn posture(req: &Request) -> RequestPosture<'_> {
             enrollment: Reads,
             camera: if *dry_run { NoCapture } else { Captures },
         },
-        // Framing guide: the optional user only tunes the pitch band, but it is
-        // still interpolated into a state path, so it is screened like the rest.
-        PositionSample { user } | PositionSession { user } => RequestPosture {
+        // The account hint is screened before the guide uses it for pitch
+        // calibration or checks whether to return optional geometry.
+        PositionSample { user } | PositionSession { user, .. } => RequestPosture {
             privilege: AnyPeer,
             user: user.as_deref(),
             enrollment: Reads,
@@ -5933,9 +5937,9 @@ fn adds_to_enrollment(req: &Request) -> bool {
 fn enrollment_capture_user<'a>(req: &'a Request, peer: &Peer) -> Option<&'a str> {
     match req {
         Request::PositionSample { user: Some(user) }
-        | Request::PositionSession { user: Some(user) } => {
-            authorized_for(peer, user).then_some(user.as_str())
-        }
+        | Request::PositionSession {
+            user: Some(user), ..
+        } => authorized_for(peer, user).then_some(user.as_str()),
         _ if captures_enrollment(req) => enrollment_mutating_user(req),
         _ => None,
     }
@@ -9650,17 +9654,16 @@ fn dispatch_after_authorization(
                 ),
             }
         }
-        Request::PositionSession { user } => {
+        Request::PositionSession { user, viewfinder } => {
             let Some(observer) = position else {
                 return Response::Error("framing requires its live connection".into());
             };
             if let Err(error) = observer.started() {
                 return Response::Error(error.to_string());
             }
-            match engine.position_session(
-                user.as_deref().filter(|u| authorized_for(peer, u)),
-                observer,
-            ) {
+            let user = user.as_deref().filter(|u| authorized_for(peer, u));
+            let viewfinder = framing_viewfinder_allowed(peer, user, viewfinder);
+            match engine.position_session(user, viewfinder, observer) {
                 Ok(()) => Response::PositionSessionEnded,
                 Err(error) => Response::Error(error.to_string()),
             }
@@ -14270,7 +14273,7 @@ mod tests {
         TraceSubscribe => Request::TraceSubscribe { duration_ms: 60_000, trace_schema: None },
         // The user-bearing form, so the traversal walk covers it.
         PositionSample => Request::PositionSample { user: Some(u()) },
-        PositionSession => Request::PositionSession { user: Some(u()) },
+        PositionSession => Request::PositionSession { user: Some(u()), viewfinder: false },
         SealPassword => Request::SealPassword {
             user: u(),
             password: secret(),
@@ -15174,21 +15177,30 @@ mod tests {
         let _passwd = passwd_lock();
         let user = || Some(SAMPLE_USER.to_owned());
         for guide in [
-            Request::PositionSession { user: user() },
+            Request::PositionSession {
+                user: user(),
+                viewfinder: true,
+            },
             Request::PositionSample { user: user() },
         ] {
             assert_eq!(enrollment_capture_user(&guide, &peer(0)), Some(SAMPLE_USER));
             assert_eq!(enrollment_capture_user(&guide, &peer(4_000_000)), None);
         }
         assert_eq!(
-            enrollment_capture_user(&Request::PositionSession { user: None }, &peer(0)),
+            enrollment_capture_user(
+                &Request::PositionSession {
+                    user: None,
+                    viewfinder: false,
+                },
+                &peer(0)
+            ),
             None
         );
         for req in &request_samples() {
             let checked = enrollment_capture_user(req, &peer(0)).is_some();
             let guide = matches!(
                 req,
-                Request::PositionSession { user: Some(_) }
+                Request::PositionSession { user: Some(_), .. }
                     | Request::PositionSample { user: Some(_) }
             );
             assert_eq!(
@@ -15706,6 +15718,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn framing_viewfinder_requires_non_root_account_owner() {
+        let _g = env_lock();
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("the test host has a nobody account"));
+        assert_ne!(owner.uid, 0);
+        assert!(framing_viewfinder_allowed(&owner, Some(user), true));
+        assert!(!framing_viewfinder_allowed(&owner, Some(user), false));
+        assert!(!framing_viewfinder_allowed(&owner, None, true));
+        assert!(!framing_viewfinder_allowed(
+            &owner,
+            Some("no/such/viewfinder/account"),
+            true
+        ));
+        assert!(!framing_viewfinder_allowed(
+            &peer(owner.uid + 1),
+            Some(user),
+            true
+        ));
+        assert!(!framing_viewfinder_allowed(&peer(0), Some(user), true));
+    }
+
     /// irlumed turns a camera on for a non-root account only while that
     /// account holds the active local session on a seat, the rule udev's
     /// `uaccess` applies to the camera nodes. Every request the account's
@@ -15942,7 +15976,14 @@ mod tests {
             refused.close();
             for request in [
                 Request::Identify,
-                Request::PositionSession { user: None },
+                Request::PositionSession {
+                    user: None,
+                    viewfinder: false,
+                },
+                Request::PositionSession {
+                    user: Some(user.into()),
+                    viewfinder: true,
+                },
                 Request::CameraDiagnostics,
                 Request::Enroll {
                     user: user.into(),

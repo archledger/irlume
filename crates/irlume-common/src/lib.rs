@@ -903,7 +903,13 @@ pub enum Request {
     /// `PositionSessionControl::Sample` receives one fresh `Position` report.
     /// Finish receives `PositionSessionEnded` after camera release. Closing
     /// the connection cancels. No enrollment or auth.
-    PositionSession { user: Option<String> },
+    PositionSession {
+        user: Option<String>,
+        /// Ask for coarse geometry. Only the acting non-root account's
+        /// admitted session can receive it; older daemons ignore the flag.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewfinder: bool,
+    },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -1488,9 +1494,39 @@ pub struct ProfileIrSummary {
     pub calibration_withheld: bool,
 }
 
-/// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
-/// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
-/// implies a capture will succeed.
+/// Coarse display position for the enrollment viewfinder, not a face image
+/// or a readiness decision. No facial landmarks or identity data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FramingPosition {
+    /// Horizontal bucket from the camera frame's left (0) to right (10).
+    pub x: u8,
+    /// Vertical bucket from the camera frame's top (0) to bottom (10).
+    pub y: u8,
+    /// Relative face size, from small (0) through large (2).
+    pub size: u8,
+}
+
+impl FramingPosition {
+    /// Whether the sample fits the viewfinder's coarse grid.
+    pub const fn in_bounds(self) -> bool {
+        self.x <= 10 && self.y <= 10 && self.size <= 2
+    }
+}
+
+fn deserialize_framing_position<'de, D>(
+    de: D,
+) -> std::result::Result<Option<FramingPosition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let position = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value::<FramingPosition>(position)
+        .ok()
+        .filter(|position| position.in_bounds()))
+}
+
+/// Framing-guide sample for guided enrollment; no raw image.
+/// `well_framed` is the cue to start a fresh capture, not its verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PositionReport {
     pub face: bool,
@@ -1510,6 +1546,14 @@ pub struct PositionReport {
     pub well_framed: bool,
     /// One plain-language cue for the user ("Move closer", "Hold still", …).
     pub guidance: String,
+    /// Optional display-only position. Older peers omit it. Bad geometry
+    /// drops only the marker so it cannot stop the text guide.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_framing_position"
+    )]
+    pub viewfinder: Option<FramingPosition>,
 }
 
 /// Camera-free prerequisites; never qualification or login permission.

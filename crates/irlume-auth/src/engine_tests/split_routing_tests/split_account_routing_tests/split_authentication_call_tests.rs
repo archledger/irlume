@@ -129,7 +129,7 @@ fn a_pending_pin_closes_every_nested_and_ordinary_entry_before_any_lease() {
             ("support probe", reply(request.support_probe(&()))),
             (
                 "position session",
-                reply(request.position_session(Some(USER), &Finish)),
+                reply(request.position_session(Some(USER), false, &Finish)),
             ),
             (
                 "position sample",
@@ -234,7 +234,7 @@ fn a_routed_split_keeps_nested_and_ordinary_entries_closed_inside_the_call() {
                 ("support probe", reply(call.support_probe(&()))),
                 (
                     "position session",
-                    reply(call.position_session(Some(USER), &Finish)),
+                    reply(call.position_session(Some(USER), false, &Finish)),
                 ),
                 ("position sample", reply(call.position_sample(Some(USER)))),
                 ("identify", reply(call.identify_with_diagnostics(&()))),

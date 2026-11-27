@@ -146,7 +146,10 @@ mod request_preparation_gates {
             Request::Identify,
             Request::IdentifyFor { user: user.clone() },
             Request::PositionSample { user: None },
-            Request::PositionSession { user: None },
+            Request::PositionSession {
+                user: None,
+                viewfinder: false,
+            },
             Request::SupportProbe { since_ms: 0 },
         ];
         for request in requests {
@@ -251,7 +254,10 @@ mod request_preparation_gates {
             );
         }
         let (worker, mut connection) = position_session::channel(arbiter::CancelToken::new());
-        let request = Request::PositionSession { user: None };
+        let request = Request::PositionSession {
+            user: None,
+            viewfinder: false,
+        };
         let state = diagnostics::DiagnosticState::default();
         let scope = state.begin_for(
             diagnostic_operation_class(&request),

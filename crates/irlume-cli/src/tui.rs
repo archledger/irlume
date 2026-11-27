@@ -12443,7 +12443,7 @@ mod tests {
 
     /// Opening the framing session.
     fn framing_start(request: &Request) -> bool {
-        matches!(request, Request::PositionSession { user: Some(user) } if user == "test-user")
+        matches!(request, Request::PositionSession { user: Some(user), .. } if user == "test-user")
     }
 
     /// One framing sample on the fallback path.
@@ -13988,6 +13988,7 @@ mod tests {
             quality: 85,
             well_framed: true,
             guidance: guidance.into(),
+            viewfinder: None,
         }
     }
 

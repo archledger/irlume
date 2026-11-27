@@ -142,7 +142,7 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
                 let request: Request = serde_json::from_str(&line).unwrap();
                 let cancelled = stop.load(Ordering::Relaxed);
                 let response = match &request {
-                    Request::PositionSession { user } => {
+                    Request::PositionSession { user, .. } => {
                         assert_eq!(user.as_deref(), Some("test-user"));
                         Response::Error("bad request".into())
                     }

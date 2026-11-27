@@ -98,7 +98,7 @@ cargo clippy --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-
 cargo test --locked -p irlume-auth --features ir-only-evaluation --lib --examples
 cargo test --locked -p irlume-camera --features capture-timing --lib
 RUSTDOCFLAGS="-D warnings" cargo doc --locked -p irlume-auth -p irlume-camera --features irlume-auth/ir-only-evaluation --no-deps
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items
 cargo build --release --locked
 ./scripts/run-tests-guarded.sh --min 2720 -- cargo test --workspace --locked
 ```

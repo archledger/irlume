@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Wisbendji Fimerlus <archledger236@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Client-side wording for machine-API values (docs/MACHINE-API.md). The
+// Client-side wording for machine-API values (docs/reference/MACHINE-API.md). The
 // contract publishes stable identifiers and leaves titles to consumers.
 // Every lookup falls back to the raw value, so a doctor check added later
 // (that list may grow) and a malformed or newer-contract document still
@@ -102,7 +102,7 @@ function list(value) {
     return out;
 }
 
-// ---- Error codes (MACHINE-API.md "Error codes") ----
+// Error codes (MACHINE-API.md "Error codes").
 
 var errorMeanings = {
     "usage-error": "The irlume command line was not one this module expected. Updating irlume or this module may help.",
@@ -132,7 +132,7 @@ function errorText(error) {
     return error.code ? ("irlume refused the request (" + error.code + ").") : "irlume refused the request.";
 }
 
-// ---- Doctor checks (MACHINE-API.md "irlume doctor --json") ----
+// Doctor checks (MACHINE-API.md "irlume doctor --json").
 
 var checkTitles = {
     "platform": "Distribution family",
@@ -221,7 +221,7 @@ function checkLevel(state) {
     return index < checkGroups.length ? checkGroups[index].level : UNKNOWN;
 }
 
-// ---- Camera census (MACHINE-API.md "irlume camera census --json") ----
+// Camera census (MACHINE-API.md "irlume camera census --json").
 
 // Mirrors render_class in crates/irlume-camera/src/census.rs.
 function censusClass(entry) {
@@ -292,7 +292,7 @@ function censusIsAside(entry) {
     return entry.verdict === "informational" || entry.verdict === "not_hardware";
 }
 
-// ---- Login wiring (MACHINE-API.md "irlume login status --json") ----
+// Login wiring (MACHINE-API.md "irlume login status --json").
 
 function loginRole(role) {
     switch (role) {

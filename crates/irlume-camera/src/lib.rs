@@ -10994,7 +10994,7 @@ impl ContinuityFact {
 }
 
 impl PairContinuityState {
-    /// Like [`Self::observe`], naming WHICH fact failed (`None` = continuous).
+    /// Advance both cursors and return the first failed continuity check, if any.
     fn observe_fact(
         &mut self,
         rgb: &frame_provenance::RuntimeFrameProvenance,

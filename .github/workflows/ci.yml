@@ -259,8 +259,8 @@ jobs:
       - name: irlume-vision with every feature compiles
         run: cargo check -p irlume-vision --all-features --locked
 
-      - name: doc (broken intra-doc links are errors)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+      - name: doc (public and private intra-doc links)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items
 
       - name: build
         run: cargo build --release --locked

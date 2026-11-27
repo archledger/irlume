@@ -2003,7 +2003,7 @@ struct Peer {
     uid: u32,
     // SO_PEERCRED delivers all three fields in the same getsockopt call.
     // PID binds OS approval and shared-greeter requests to the caller process;
-    // GID is retained for diagnostics but does not confer authority.
+    // Tests check GID alongside UID and PID; live authorization does not use it.
     #[allow(dead_code)]
     gid: u32,
     pid: i32,

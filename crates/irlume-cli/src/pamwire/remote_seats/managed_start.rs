@@ -12,7 +12,7 @@
 //! reader of timestamps and file metadata can close either gap: the missing
 //! fact is the remote-server policy the running invocation actually loaded.
 //!
-//! This module is the consumer half of that contract. A qualified producer
+//! The managed-start producer and consumer implement that contract. The producer
 //! (wrapper-owned exec path with an immutable configuration view, per the
 //! contract in artifacts/irlume/2026-10-03-lightdm-managed-start) publishes a
 //! receipt tied to one systemd invocation, and the verdict machine here
@@ -22,15 +22,14 @@
 //! invocation, never by ordering wall times, so a clock step cannot forge or
 //! erase a verdict, and the observation does not read `/proc`.
 //!
-//! Until the producer ships, every real source yields no receipt and the
-//! verdict is `Unknown`; the timestamp rule keeps its current role. Nothing
-//! here upgrades a missing record or an inactive unit into proof that no
+//! An active unit without a valid receipt produces `Unknown` and the timestamp
+//! fallback still applies. Neither a missing record nor an inactive unit proves that no
 //! remote-serving LightDM exists: `Absent` requires the source's explicit
 //! qualified-absence authority, and root and unprivileged callers must feed
 //! the same source the same facts.
 
-// The restart gate reads `Running`; the qualified-absence authority and parts
-// of the receipt are defined for producers that do not exist yet.
+// The restart gate uses `Running`; not every variant of the evidence contract
+// is produced by the system source.
 #![allow(dead_code)]
 
 mod loader;

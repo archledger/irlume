@@ -160,6 +160,7 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
                         profile,
                         scans,
                         improve: requested,
+                        ..
                     } => {
                         assert_eq!(user, "test-user");
                         assert_eq!(profile.as_deref(), Some("test-profile"));

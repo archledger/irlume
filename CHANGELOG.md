@@ -8,8 +8,10 @@ All notable changes to irlume are documented here. This project adheres to
 ### Added
 
 - The TUI centers the enrollment cue and countdown above a live framing
-  guide and scan progress. The guide shows a mirrored position and
-  distance marker without sending webcam images or facial landmarks.
+  guide and scan progress. The guide stays through approval, capture,
+  and the result. A fresh mirrored position and distance marker comes
+  from frames the daemon already assesses, without sending webcam
+  images or facial landmarks.
 
 - `irlume trace explain` summarizes recorded IR face-region clipping,
   distinguishing above-limit saturation, measurements within the limit,

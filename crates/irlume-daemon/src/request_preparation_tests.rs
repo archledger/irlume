@@ -222,6 +222,7 @@ mod request_preparation_gates {
                 profile: improve.then(|| "fixture".into()),
                 scans: 1,
                 improve,
+                viewfinder: false,
             };
             let state = diagnostics::DiagnosticState::default();
             let scope = state.begin_for(

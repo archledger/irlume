@@ -2046,6 +2046,10 @@ fn framing_viewfinder_allowed(peer: &Peer, target_user: Option<&str>, requested:
     requested && peer.uid != 0 && target_user.is_some_and(|user| authorized_for(peer, user))
 }
 
+fn enrollment_framing_allowed(peer: &Peer, user: &str, requested: bool, approved: bool) -> bool {
+    approved && framing_viewfinder_allowed(peer, Some(user), requested)
+}
+
 /// Whether a refusal at the door belongs in the named account's history
 /// (ADR-0030 §5): only a peer that may act for that account leaves a
 /// trace there — root, or the account itself for a verification; the
@@ -4379,9 +4383,16 @@ fn serve_peer_until(
                     return respond(stream, &resp);
                 }
             }
-            let (session, session_connection) = if matches!(req, Request::EnrollmentSession { .. })
+            let (session, session_connection) = if let Request::EnrollmentSession {
+                user,
+                viewfinder,
+                ..
+            } = &req
             {
-                let (worker, connection) = enrollment_session::channel(arbiter.cancel_token());
+                let (worker, connection) = enrollment_session::channel_with_framing(
+                    arbiter.cancel_token(),
+                    enrollment_framing_allowed(&peer, user, *viewfinder, authorization.is_some()),
+                );
                 (Some(worker), Some(connection))
             } else {
                 (None, None)
@@ -9463,6 +9474,7 @@ fn dispatch_after_authorization(
             profile,
             scans,
             improve,
+            ..
         } => {
             let Some(observer) = session else {
                 return Response::Error("guided enrollment requires its live connection".into());
@@ -14154,7 +14166,7 @@ mod tests {
             service: Some("kde".into()),
             intent_confirmation: None,
         },
-        EnrollmentSession => Request::EnrollmentSession { user: u(), profile: None, scans: 10, improve: false },
+        EnrollmentSession => Request::EnrollmentSession { user: u(), profile: None, scans: 10, improve: false, viewfinder: false },
         Enroll => Request::Enroll {
             user: u(),
             profile: None,
@@ -15136,6 +15148,7 @@ mod tests {
             profile: Some("Face".into()),
             scans: 3,
             improve,
+            viewfinder: false,
         };
         assert!(adds_to_enrollment(&improve(true)));
         assert!(!adds_to_enrollment(&improve(false)));
@@ -15286,6 +15299,7 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: true,
+                viewfinder: false,
             },
         ];
         let mut trust_adding = 0;
@@ -15716,6 +15730,19 @@ mod tests {
             posture(&Request::PositionSample { user: None }).camera,
             CameraUse::Captures
         );
+    }
+
+    #[test]
+    fn enrollment_framing_obeys_authorization() {
+        let _g = env_lock();
+        let user = "nobody";
+        let owner = peer(uid_of(user).expect("fixture has a nobody account"));
+        assert_ne!(owner.uid, 0);
+        assert!(enrollment_framing_allowed(&owner, user, true, true));
+        assert!(!enrollment_framing_allowed(&owner, user, true, false));
+        assert!(!enrollment_framing_allowed(&owner, user, false, true));
+        assert!(!enrollment_framing_allowed(&owner, "root", true, true));
+        assert!(!enrollment_framing_allowed(&peer(0), user, true, true));
     }
 
     #[test]
@@ -18048,12 +18075,14 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: false,
+                viewfinder: false,
             },
             Request::EnrollmentSession {
                 user: user.into(),
                 profile: Some("primary".into()),
                 scans: 5,
                 improve: true,
+                viewfinder: false,
             },
             Request::RecoverySetup {
                 user: user.into(),
@@ -18400,6 +18429,7 @@ mod tests {
                 scans,
                 profile,
                 improve,
+                viewfinder: false,
             };
             assert!(matches!(pregate(&request, &root), Some(Response::Error(_))));
         }
@@ -18408,6 +18438,7 @@ mod tests {
             scans: 10,
             profile: None,
             improve: false,
+            viewfinder: false,
         };
         assert!(pregate(&request, &root).is_none());
         let mut engine = engine();

@@ -575,8 +575,20 @@ pub enum IntentAttestation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnrollmentEvent {
     Started,
-    Progress { captured: usize, target: usize },
-    Merge { profile: String, remaining: usize },
+    Progress {
+        captured: usize,
+        target: usize,
+    },
+    Merge {
+        profile: String,
+        remaining: usize,
+    },
+    /// Optional display-only position from an opt-in enrollment connection.
+    Framing {
+        #[serde(default, deserialize_with = "deserialize_framing_position")]
+        position: Option<FramingPosition>,
+        sampled_mono_ms: u64,
+    },
 }
 
 /// The sole continuation accepted on an enrollment session's own socket.
@@ -661,6 +673,8 @@ pub enum Request {
         profile: Option<String>,
         scans: usize,
         improve: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewfinder: bool,
     },
     /// 1:N identify ("who is this?"): one live capture, no claimed identity.
     /// Unprivileged (no credential release), but NOT unscoped: a root peer is
@@ -1511,6 +1525,32 @@ impl FramingPosition {
     pub const fn in_bounds(self) -> bool {
         self.x <= 10 && self.y <= 10 && self.size <= 2
     }
+}
+
+/// Current Linux monotonic clock in milliseconds. This clock is shared by
+/// the local daemon and client under their normal time namespace.
+#[must_use]
+pub fn enrollment_monotonic_ms() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is valid writable storage for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return None;
+    }
+    u64::try_from(value.tv_sec)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()? / 1_000_000)
+}
+
+/// Whether an enrollment observation is neither stale nor from the future.
+#[must_use]
+pub fn enrollment_framing_is_fresh(sampled_mono_ms: u64, now_mono_ms: u64) -> bool {
+    now_mono_ms
+        .checked_sub(sampled_mono_ms)
+        .is_some_and(|age| age < 2000)
 }
 
 fn deserialize_framing_position<'de, D>(
@@ -3233,6 +3273,49 @@ mod tests {
         }
         assert!(serde_json::from_str::<OldRequest>(&wire).is_err());
         assert!(serde_json::from_str::<OldRequest>(r#""Identify""#).is_ok());
+    }
+
+    #[test]
+    fn enrollment_framing_is_opt_in_and_additive() {
+        assert!(enrollment_framing_is_fresh(1_000, 2_999));
+        assert!(!enrollment_framing_is_fresh(1_000, 3_000));
+        assert!(!enrollment_framing_is_fresh(1_000, 999));
+        #[derive(Deserialize)]
+        enum OldRequest {
+            EnrollmentSession {
+                user: String,
+                profile: Option<String>,
+                scans: usize,
+                improve: bool,
+            },
+        }
+        let json =
+            r#"{"EnrollmentSession":{"user":"alice","profile":null,"scans":3,"improve":false}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&req).unwrap(), json);
+        let opted_in = json.replace(r#""improve":false"#, r#""improve":false,"viewfinder":true"#);
+        let req: Request = serde_json::from_str(&opted_in).unwrap();
+        assert_eq!(serde_json::to_string(&req).unwrap(), opted_in);
+        let OldRequest::EnrollmentSession {
+            user,
+            profile,
+            scans,
+            improve,
+        } = serde_json::from_str(&opted_in).unwrap();
+        assert_eq!(
+            (user.as_str(), profile, scans, improve),
+            ("alice", None, 3, false)
+        );
+
+        let encoded = r#"{"EnrollmentSession":{"Framing":{"position":{"x":5,"y":4,"size":2},"sampled_mono_ms":1000}}}"#;
+        let reply: Response = serde_json::from_str(encoded).unwrap();
+        assert_eq!(serde_json::to_string(&reply).unwrap(), encoded);
+        let malformed = encoded.replace(r#""size":2"#, r#""size":100"#);
+        let reply: Response = serde_json::from_str(&malformed).unwrap();
+        assert_eq!(
+            serde_json::to_string(&reply).unwrap(),
+            r#"{"EnrollmentSession":{"Framing":{"position":null,"sampled_mono_ms":1000}}}"#
+        );
     }
 
     #[test]

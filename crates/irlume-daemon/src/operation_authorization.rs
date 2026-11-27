@@ -739,6 +739,7 @@ mod tests {
                 profile: Some("Primary".into()),
                 scans: 10,
                 improve,
+                viewfinder: false,
             };
             let subject = Subject::capture(&peer).unwrap();
             let message = approval_message(&subject, &req).unwrap();
@@ -772,24 +773,28 @@ mod tests {
                     profile: Some("Primary".into()),
                     scans: 11,
                     improve,
+                    viewfinder: false,
                 },
                 Request::EnrollmentSession {
                     user: user.clone(),
                     profile: Some("Other".into()),
                     scans: 10,
                     improve,
+                    viewfinder: false,
                 },
                 Request::EnrollmentSession {
                     user: user.clone(),
                     profile: Some("Primary".into()),
                     scans: 10,
                     improve: !improve,
+                    viewfinder: false,
                 },
                 Request::EnrollmentSession {
                     user: "different-account".into(),
                     profile: Some("Primary".into()),
                     scans: 10,
                     improve,
+                    viewfinder: false,
                 },
             ] {
                 assert!(grant().consume(&changed, &peer).is_err());

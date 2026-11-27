@@ -428,8 +428,11 @@ installs and loads by hand.
 - **Enrollment viewfinder data.** An admitted non-root framing connection
   that names its own account and opts in can receive coarse face position
   and size for that session's TUI guide. This does not send pixels or facial
-  landmarks. The viewfinder is not part of capture, login, or unlock, and
-  Irlume does not store or log its geometry.
+  landmarks. The existing guided enrollment connection may also opt in to
+  display-only position from its already assessed RGB capture after the
+  same-account, active-seat and OS approval checks. Observations can be
+  dropped, do not affect which scans are accepted, and are not available
+  during login or unlock. Irlume does not store or log the geometry.
 
 ## Intent, throttling, and privilege elevation
 

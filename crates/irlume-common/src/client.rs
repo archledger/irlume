@@ -821,6 +821,7 @@ mod tests {
                 profile: Some("main".into()),
                 scans: 1,
                 improve: false,
+                viewfinder: false,
             },
             &cancelled,
             |_| panic!("cancelled request emitted an event"),
@@ -863,6 +864,7 @@ mod tests {
                 profile: Some("main".into()),
                 scans: 1,
                 improve: false,
+                viewfinder: false,
             },
         ];
         let results: Vec<_> = requests
@@ -910,6 +912,7 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: false,
+                viewfinder: false,
             },
             &stop,
             |_| {
@@ -981,11 +984,12 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: false,
+                viewfinder: false,
             },
             &stop,
             |event| {
                 match event {
-                    crate::EnrollmentEvent::Started => {}
+                    crate::EnrollmentEvent::Started | crate::EnrollmentEvent::Framing { .. } => {}
                     crate::EnrollmentEvent::Progress { captured, target } => {
                         progress.push((captured, target))
                     }

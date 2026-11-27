@@ -525,7 +525,7 @@ pub struct IdentifyOutcome {
     pub cause: Option<OutcomeCause>,
 }
 
-/// One live enrollment scan, as captured by [`Engine::capture_scans`].
+/// One live enrollment scan, as captured by [`Engine::capture_scans_observed`].
 struct CapturedScan {
     /// RGB-face embedding, the primary identity template.
     rgb: Vec<f32>,
@@ -10884,7 +10884,7 @@ fn pitch_band(pitch_neutral: Option<f32>) -> (f32, f32) {
 }
 
 /// True when a head pose is squarely-frontal enough to enroll: the capture-time
-/// gate (in [`Engine::capture_scans`]) and the guide's `well_framed` share these
+/// gate (in [`Engine::capture_scan_loop`]) and the guide's `well_framed` share these
 /// bounds (and the same `pitch_neutral`), so what the guide coaches to is exactly
 /// what gets saved.
 fn frontal_signals(s: &Signals, pitch_neutral: Option<f32>) -> bool {

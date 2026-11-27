@@ -11,7 +11,7 @@ Every change to `main` arrives as a pull request and is reviewed before merge.
    dependencies require an audit note.
 3. **Tests**: the full workspace suite, clippy `-D warnings`, `rustfmt`, the
    warnings-denied documentation build
-   (`RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked`),
+   (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked --document-private-items`),
    and the relevant hardware lanes must pass on the final head before merge.
    Pending Packit builds are recorded honestly, never claimed as passed.
 4. **Docs**: behavior changes update `CHANGELOG.md`; interface changes update

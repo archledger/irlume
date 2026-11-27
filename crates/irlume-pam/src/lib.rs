@@ -1315,10 +1315,13 @@ fn read_stdout_bounded(
         return kill_and_fail(child);
     };
     let fd = stdout.as_raw_fd();
-    // SAFETY: fcntl on an fd this process owns; F_GETFL/F_SETFL touch no memory.
+    // SAFETY: stdout owns this fd, and F_GETFL takes no pointer argument.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    #[expect(clippy::undocumented_unsafe_blocks, reason = "doc backlog")]
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    // A blocking read could outlive the helper's deadline.
+    if flags < 0
+        // SAFETY: stdout still owns the fd; F_SETFL takes an integer flag set.
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
         return kill_and_fail(child);
     }
 

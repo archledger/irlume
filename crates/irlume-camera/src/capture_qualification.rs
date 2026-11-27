@@ -3,6 +3,7 @@
 
 //! Durable evidence that one exact RGB+IR stream pair may capture concurrently.
 
+use crate::frame_interval::gcd;
 use serde::{Deserialize, Serialize};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -153,15 +154,6 @@ impl ExactRate {
         }
         Ok(())
     }
-}
-
-const fn gcd(mut left: u32, mut right: u32) -> u32 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
 }
 
 /// USB and backend facts whose change invalidates a measurement.

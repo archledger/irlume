@@ -16,11 +16,13 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 irlume-common.workspace = true
-serde_json.workspace = true
 # `std` adds `Zeroize` for `CString`, the type `set_authtok` takes.
 zeroize = { workspace = true, features = ["std"] }
 pamsm = { version = "0.5", features = ["libpam"] }
 libc.workspace = true   # O_NONBLOCK on the kwallet helper's stdout, so the read can carry a deadline
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

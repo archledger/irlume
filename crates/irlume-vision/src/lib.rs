@@ -839,7 +839,12 @@ mod onnx {
     }
 
     impl Embedder {
-        #[expect(clippy::missing_errors_doc, reason = "doc backlog")]
+        /// Each embedder session owns its thread pool and defaults to the
+        /// shared settings for heavy models.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the runtime cannot initialize or load the model.
         pub fn load_from_memory(model: &[u8]) -> irlume_common::Result<Self> {
             Ok(Self {
                 session: build(model, &heavy_pool())?,
@@ -1430,7 +1435,7 @@ mod onnx {
     /// generation (468 legacy or 478), returning landmarks in the input space
     /// plus a face-probability flag. RGB-trained; IR-grey performance is
     /// validated empirically (that's the open question the diagnostic answers).
-    /// The mesh's inference backend. Both eat the same NHWC [0,1] tensor and
+    /// Both mesh backends accept the same NHWC `[0, 1]` tensor and
     /// return the same landmark layout, proven equivalent by the mesh_parity
     /// gate (mean NME 6.9e-7 over all 478 points, iris tail included).
     enum MeshBackend {

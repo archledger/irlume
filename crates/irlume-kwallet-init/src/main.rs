@@ -478,11 +478,8 @@ fn read_salt_at(path: &std::path::Path) -> Result<irlume_common::SecretBytes, Sa
     Ok(irlume_common::SecretBytes::new(raw))
 }
 
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "libc credential queries have no Rust wrapper"
-)]
 fn enter_user(pw: &User) -> Result<(), String> {
+    // SAFETY: these calls take no arguments and only return the process's IDs.
     let (ruid, euid, rgid, egid) = unsafe {
         (
             libc::getuid(),
@@ -597,28 +594,28 @@ struct CapData {
     inheritable: u32,
 }
 
-#[expect(
-    clippy::undocumented_unsafe_blocks,
-    reason = "libc group-list queries have no Rust wrapper"
-)]
 fn verify_groups(pw: &User) -> Result<(), String> {
     let mut count = 0;
+    // SAFETY: name is NUL-terminated; zero capacity asks for the count without writing groups.
     unsafe { libc::getgrouplist(pw.name.as_ptr(), pw.gid, std::ptr::null_mut(), &mut count) };
     if count <= 0 {
         return Err("account groups unavailable".into());
     }
     let mut expected = vec![0; count as usize];
+    // SAFETY: expected has room for count gids and remains live throughout the call.
     if unsafe { libc::getgrouplist(pw.name.as_ptr(), pw.gid, expected.as_mut_ptr(), &mut count) }
         < 0
     {
         return Err("account groups changed".into());
     }
     expected.truncate(count as usize);
+    // SAFETY: a zero size queries the count and does not write through the null pointer.
     let actual_count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
     if actual_count < 0 {
         return Err("process groups unavailable".into());
     }
     let mut actual = vec![0; actual_count as usize];
+    // SAFETY: actual has room for actual_count gids and stays live throughout the call.
     if unsafe { libc::getgroups(actual_count, actual.as_mut_ptr()) } < 0 {
         return Err("process groups unavailable".into());
     }

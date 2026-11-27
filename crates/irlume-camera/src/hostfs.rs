@@ -6,8 +6,8 @@
 //! Production resolves the real roots (`/dev`, `/sys`). Under `cfg(test)`
 //! the same readers resolve whatever roots the running test installed and
 //! REFUSE the real ones until a test says which it wants:
-//! [`test::fixture_with`] (or [`test::empty_fixture`]) points every reader
-//! at a temporary tree, and [`test::host`] is the explicit opt-in to the
+//! `test::fixture_with` (or `test::empty_fixture`) points every reader
+//! at a temporary tree, and `test::host` is the explicit opt-in to the
 //! real machine, reserved for the `#[ignore]`d hardware and v4l2loopback
 //! lanes (plus this module's own self-test of the opt-in). A unit test that
 //! reaches for the host's `/dev/video*`, `/dev/media*` or

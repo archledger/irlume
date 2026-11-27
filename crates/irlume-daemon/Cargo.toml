@@ -12,7 +12,6 @@ path = "src/main.rs"
 irlume-common.workspace = true
 irlume-auth.workspace = true
 irlume-core.workspace = true
-irlume-liveness.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
@@ -24,6 +23,7 @@ dbus.workspace = true
 default = []
 
 [dev-dependencies]
+irlume-liveness.workspace = true
 irlume-auth = { workspace = true, features = ["test-support"] }
 irlume-camera = { workspace = true, features = ["test-support"] }
 # The TPM-presence pin for tests that write account stores

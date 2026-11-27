@@ -24,7 +24,6 @@ required-features = ["ir-only-evaluation"]
 
 [dependencies]
 libc = { workspace = true, optional = true }
-sha2.workspace = true
 irlume-common.workspace = true
 irlume-camera.workspace = true
 irlume-vision.workspace = true
@@ -33,6 +32,7 @@ irlume-core.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 irlume-camera = { workspace = true, features = ["test-support"] }
 # The TPM-presence pin in the request fixtures (template_key::test_support).
 # A dev-dependency feature: resolver 2 keeps it out of release builds.

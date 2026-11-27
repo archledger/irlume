@@ -34,7 +34,6 @@ flowchart TD
     auth --> common
     daemon --> auth
     daemon --> core
-    daemon --> liveness
     daemon --> common
     cli --> auth
     cli --> camera
@@ -80,6 +79,9 @@ Rust symbols or unlisted commands.
 
 ## What the graph does and does not promise
 
+- The graph shows normal Cargo dependencies. Daemon fixtures use
+  **irlume-liveness** directly, but the daemon relies on **irlume-auth** for
+  liveness in production.
 - **irlume-auth** is the only crate that composes the pipeline into an
   AUTHENTICATION: a grant decision is born nowhere else. The CLI also
   Cargo-depends on the pipeline crates directly, for its diagnostics,

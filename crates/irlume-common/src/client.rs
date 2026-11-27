@@ -346,8 +346,11 @@ fn enrollment_session_with_connect(
     };
     let mut reader = std::io::BufReader::new(reader);
     // The scan cap is 30, with one probe/merge and occasional target updates.
-    // A fake endpoint cannot send an unbounded event stream.
-    for _ in 0..128 {
+    // The daemon's optional 250 ms pump can send many more observations over
+    // the 380 s deadline. Do not spend mandatory capacity on that feedback.
+    let mut mandatory_left = 128_u16;
+    let mut advisory_left = 2048_u16;
+    while mandatory_left != 0 && advisory_left != 0 {
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -372,6 +375,11 @@ fn enrollment_session_with_connect(
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         match response {
             Response::EnrollmentSession(progress) => {
+                if matches!(progress, crate::EnrollmentEvent::Framing { .. }) {
+                    advisory_left -= 1;
+                } else {
+                    mandatory_left -= 1;
+                }
                 let merge = matches!(progress, crate::EnrollmentEvent::Merge { .. });
                 let answer = event(progress)?;
                 if merge {
@@ -927,6 +935,51 @@ mod tests {
             matches!(result,Err(ref e) if e.kind()==io::ErrorKind::ConnectionAborted),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn enrollment_framing_does_not_consume_the_progress_budget() {
+        let (device, peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || -> io::Result<()> {
+            let mut stream = BufReader::new(peer);
+            let mut line = String::new();
+            stream.read_line(&mut line)?;
+            let mut peer = stream.into_inner();
+            peer.write_all(b"{\"EnrollmentSession\":\"Started\"}\n")?;
+            for _ in 0..160 {
+                peer.write_all(b"{\"EnrollmentSession\":{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n")?;
+            }
+            peer.write_all(b"{\"EnrollmentSession\":{\"Progress\":{\"captured\":3,\"target\":3}}}\n{\"Ok\":\"finished\"}\n")
+        });
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut framing = 0;
+        let mut progress = 0;
+        let result = enrollment_session_with_connect(
+            &Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: None,
+                scans: 3,
+                improve: false,
+                viewfinder: true,
+            },
+            &stop,
+            |event| {
+                match event {
+                    crate::EnrollmentEvent::Framing { .. } => framing += 1,
+                    crate::EnrollmentEvent::Progress { captured, .. } => progress = captured,
+                    _ => {}
+                }
+                Ok(None)
+            },
+            || Ok(device),
+        );
+        let server_result = server.join().unwrap();
+        assert!(
+            matches!(result, Ok(Response::Ok(ref message)) if message == "finished"),
+            "{result:?}"
+        );
+        server_result.unwrap();
+        assert_eq!((framing, progress), (160, 3));
     }
 
     #[test]

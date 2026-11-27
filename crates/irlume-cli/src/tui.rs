@@ -552,6 +552,7 @@ enum WMsg {
         sampled_at: Instant,
     },
     CaptureStarted,
+    LegacyScanRequested,
     CaptureFraming {
         position: Option<FramingPosition>,
         sampled_mono_ms: u64,
@@ -618,6 +619,7 @@ enum EnrollmentPhase {
     Framing,
     Authorizing,
     Capturing,
+    LegacyScan,
 }
 
 struct EnrollmentResultView {
@@ -4409,6 +4411,15 @@ impl App {
                             e.capture_framing = None;
                         }
                     }
+                    WMsg::LegacyScanRequested => {
+                        if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::LegacyScan;
+                            e.last = None;
+                            e.count = None;
+                            e.viewfinder = None;
+                            e.capture_framing = None;
+                        }
+                    }
                     WMsg::CaptureFraming {
                         position,
                         sampled_mono_ms,
@@ -5138,8 +5149,7 @@ impl App {
     fn on_key(&mut self, code: KeyCode) {
         // A key between two clicks ends a double click.
         self.repair_click = None;
-        if self.enroll.is_none()
-            && !self.dialog_open()
+        if self.enrollment_result_is_exposed()
             && self.enrollment_result.take().is_some()
             && matches!(code, KeyCode::Enter | KeyCode::Esc)
         {
@@ -7408,6 +7418,14 @@ impl App {
                 .is_some_and(|e| e.session_merge.is_some())
     }
 
+    fn enrollment_result_is_exposed(&self) -> bool {
+        self.enroll.is_none()
+            && !self.dialog_open()
+            && !self.activity_history_open
+            && self.more_actions.is_none()
+            && self.sections.is_none()
+    }
+
     fn on_scroll(&mut self, col: u16, row: u16, area: Rect, direction: i32) {
         if self.activity_history_open && !self.dialog_open() {
             self.activity.scroll(if direction < 0 {
@@ -7507,7 +7525,7 @@ impl App {
     /// first-run button replays its key. Clicks while a modal/flow owns the
     /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
-        if self.enroll.is_none() && !self.dialog_open() {
+        if self.enrollment_result_is_exposed() {
             self.enrollment_result = None;
         }
         let last_click = self.repair_click.take();
@@ -7926,6 +7944,8 @@ impl App {
             ))
         } else if e.phase == EnrollmentPhase::Authorizing {
             Line::from(Span::styled("Waiting for approval", Style::new().bold()))
+        } else if e.phase == EnrollmentPhase::LegacyScan {
+            Line::from(Span::styled("Working on scan", Style::new().bold()))
         } else if e.phase == EnrollmentPhase::Capturing {
             let status = if captured >= total {
                 "Finishing enrollment"
@@ -7993,7 +8013,8 @@ impl App {
                     }
                     EnrollmentPhase::Framing
                     | EnrollmentPhase::Authorizing
-                    | EnrollmentPhase::Capturing => None,
+                    | EnrollmentPhase::Capturing
+                    | EnrollmentPhase::LegacyScan => None,
                 };
                 Guide::Frame(marker)
             };
@@ -8074,10 +8095,12 @@ impl App {
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
             return;
         }
-        lines.extend(checks.map(|mut check| {
-            check.spans.insert(0, Span::raw("  "));
-            check
-        }));
+        if e.phase == EnrollmentPhase::Framing {
+            lines.extend(checks.map(|mut check| {
+                check.spans.insert(0, Span::raw("  "));
+                check
+            }));
+        }
         lines.push(Line::raw(""));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
@@ -12491,7 +12514,7 @@ fn legacy_enroll_worker(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            if !send(WMsg::Authorizing) {
+            if !send(WMsg::LegacyScanRequested) {
                 return;
             }
             match irlume_common::client::request_cancellable(
@@ -19694,7 +19717,32 @@ mod tests {
             assert!(!text.contains("Framing guide"));
             assert!(text.contains("Capturing scans"));
             assert!(text.contains("1/4") && text.contains("cancel enrollment"));
+            assert!(!text.contains("Face detected"), "{width}x{height}: {text}");
         }
+        tx.send(WMsg::LegacyScanRequested).unwrap();
+        app.poll();
+        let legacy = draw_text_at(&app, 80, 24);
+        assert!(legacy.contains("Working on scan"));
+        assert!(!legacy.contains("Waiting for approval"));
+        assert!(!legacy.contains("Face detected"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_does_not_steal_history_keys() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        app.activity_history_open = true;
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        assert!(app.enrollment_result.is_some());
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
         drain_loads(&mut app);
         wait_live_done(&mut app);
     }

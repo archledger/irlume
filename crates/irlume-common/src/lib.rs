@@ -673,6 +673,7 @@ pub enum Request {
         profile: Option<String>,
         scans: usize,
         improve: bool,
+        /// Ask for bounded capture framing feedback after authorization.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         viewfinder: bool,
     },

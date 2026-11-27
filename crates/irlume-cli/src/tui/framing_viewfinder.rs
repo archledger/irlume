@@ -20,9 +20,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
     let middle = inside.y + inside.height / 2;
     let buffer = frame.buffer_mut();
     let style = Style::default();
-    buffer.set_string(center - 4, middle, "[", style);
-    buffer.set_string(center + 4, middle, "]", style);
-
     if let Some(p) = position.filter(|p| p.in_bounds()) {
         let marker = ["o", "(o)", "((o))"][usize::from(p.size)];
         // Leave room for the largest mark at either edge and mirror like a selfie.
@@ -30,4 +27,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
         let y = inside.y + (u16::from(p.y) * (inside.height - 1) + 5) / 10;
         buffer.set_string(x - u16::from(p.size), y, marker, style);
     }
+    // Keep the target visible when a marker edge crosses it. Neither bracket
+    // column coincides with a marker center.
+    buffer.set_string(center - 4, middle, "[", style);
+    buffer.set_string(center + 4, middle, "]", style);
 }

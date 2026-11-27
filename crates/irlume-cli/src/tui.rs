@@ -12643,15 +12643,28 @@ mod tests {
 
     #[test]
     fn guided_enrollment_reuses_framing_connection_and_releases_it_before_authorization() {
-        let messages = exercise_guided_session(false);
+        let messages = exercise_guided_session(false, false);
         assert!(!messages
             .iter()
             .any(|message| matches!(message, WMsg::Viewfinder { .. })));
     }
 
     #[test]
+    fn enrollment_viewfinder_opt_in_works_with_a_daemon_without_geometry() {
+        let messages = exercise_guided_session(true, false);
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, WMsg::Viewfinder { .. })));
+        let cues = messages
+            .iter()
+            .filter(|message| matches!(message, WMsg::Cue(report) if report.guidance == "Ready"))
+            .count();
+        assert_eq!(cues, 3);
+    }
+
+    #[test]
     fn enrollment_viewfinder_updates_without_touching_countdown() {
-        let messages = exercise_guided_session(true);
+        let messages = exercise_guided_session(true, true);
         let beats: Vec<_> = messages
             .windows(2)
             .filter_map(|pair| match pair {
@@ -12673,11 +12686,15 @@ mod tests {
         );
     }
 
-    fn exercise_guided_session(viewfinder: bool) -> Vec<WMsg> {
+    fn exercise_guided_session(viewfinder: bool, send_geometry: bool) -> Vec<WMsg> {
         use std::io::{BufRead, Write};
         let _guard = dead_socket();
-        let path =
-            std::env::temp_dir().join(format!("irlume-guided-framing-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "irlume-guide-{}-{}-{}.sock",
+            std::process::id(),
+            u8::from(viewfinder),
+            u8::from(send_geometry)
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
@@ -12700,7 +12717,7 @@ mod tests {
                     "Sample"
                 );
                 let mut report = good_report("Ready");
-                if viewfinder {
+                if send_geometry {
                     report.viewfinder = Some(irlume_common::FramingPosition { x, y: 5, size: 1 });
                 }
                 writeln!(
@@ -12770,10 +12787,10 @@ mod tests {
             tx,
         );
         let messages: Vec<_> = rx.try_iter().collect();
-        let batch = server.join().unwrap();
+        let batch = server.join();
         std::fs::remove_file(path).unwrap();
         assert!(
-            batch,
+            batch.unwrap(),
             "guided enrollment must authorize and capture one bounded batch"
         );
         assert_eq!(
@@ -19337,6 +19354,45 @@ mod tests {
         assert_eq!(large_center, center);
         assert!(medium.lines().any(|row| row.contains("[  (o)  ]")));
         assert!(large.lines().any(|row| row.contains("[ ((o)) ]")));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_keeps_the_target_visible_at_every_position() {
+        let mut terminal = Terminal::new(TestBackend::new(23, 7)).unwrap();
+        for x in 0..=10 {
+            for y in 0..=10 {
+                for size in 0..=2 {
+                    let position = FramingPosition { x, y, size };
+                    terminal
+                        .draw(|frame| {
+                            let area = frame.area();
+                            framing_viewfinder::draw(frame, area, Some(position));
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_eq!(buffer[(7, 3)].symbol(), "[", "{position:?}");
+                    assert_eq!(buffer[(15, 3)].symbol(), "]", "{position:?}");
+                    for (corner, symbol) in
+                        [((0, 0), "┌"), ((22, 0), "┐"), ((0, 6), "└"), ((22, 6), "┘")]
+                    {
+                        assert_eq!(buffer[corner].symbol(), symbol, "{position:?}");
+                    }
+                    assert_eq!(
+                        buffer
+                            .content
+                            .iter()
+                            .filter(|cell| cell.symbol() == "o")
+                            .count(),
+                        1,
+                        "{position:?}"
+                    );
+                    for row in 1..6 {
+                        assert_eq!(buffer[(0, row)].symbol(), "│", "{position:?}");
+                        assert_eq!(buffer[(22, row)].symbol(), "│", "{position:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

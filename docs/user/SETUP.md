@@ -65,7 +65,8 @@ and the existing-person versus new-person enrollment flow.
    needed.
 
 Set `IRLUME_REDUCE_MOTION=1` before launching to replace indeterminate spinners
-with static activity marks. Determinate enrollment progress remains visible.
+with static activity marks and hide the moving enrollment marker. Text cues
+and enrollment progress remain visible.
 
 That's it. Skip to [Verify](#verify) to confirm, or read on for the manual
 equivalents.

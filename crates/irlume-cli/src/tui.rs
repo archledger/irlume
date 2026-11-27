@@ -7769,35 +7769,30 @@ impl App {
     }
 
     fn draw_enroll(&self, f: &mut Frame, area: Rect) {
+        const APPROVAL: &str = "Approve the system dialog when prompted to continue.";
         let e = self.enroll.as_ref().unwrap();
         let r = e.last.as_ref();
         let captured = e.captured + e.base;
         let total = e.target + e.base;
         let current = captured.saturating_add(1).min(total.max(1));
-        let filled = captured.saturating_mul(20) / total.max(1);
-        let progress = format!(
-            "[{}{}] {captured}/{total}",
-            "█".repeat(filled.min(20)),
-            "░".repeat(20usize.saturating_sub(filled.min(20)))
-        );
-        let chk = |ok: bool, label: &str| {
+        let progress_bar = |width: usize| {
+            let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
+            format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+        };
+        let chk = |ok: bool, label: &'static str| {
             Line::from(vec![
                 Span::styled(
-                    if ok { "  ● " } else { "  ○ " },
+                    if ok { "● " } else { "○ " },
                     if ok {
                         Style::new().fg(th().ok)
                     } else {
                         Style::new().dim()
                     },
                 ),
-                Span::styled(
-                    label.to_string(),
-                    if ok { Style::new() } else { Style::new().dim() },
-                ),
+                Span::styled(label, if ok { Style::new() } else { Style::new().dim() }),
             ])
         };
-        let face = r.map(|x| x.face).unwrap_or(false);
-        let cue = if e.stalled.is_some() {
+        let mut cue = if e.stalled.is_some() {
             Line::from(Span::styled(
                 "Camera guide not answering; this is not about your face or lighting.",
                 Style::new().fg(th().err).bold(),
@@ -7816,29 +7811,91 @@ impl App {
                 };
                 format!("{spinner} Starting camera…")
             });
-            Line::from(vec![
-                Span::styled("→ ", Style::new().fg(th().accent)),
-                Span::styled(guidance, Style::new().bold()),
-            ])
+            Line::from(Span::styled(guidance, Style::new().bold()))
         };
+        let profile = Line::from(Span::styled(
+            format!("Enrolling '{}'", e.profile),
+            Style::new().bold(),
+        ));
+        let scan = format!("Scan {current} of {total}");
+        let checks = [
+            chk(r.is_some_and(|x| x.face), "Face detected"),
+            chk(r.is_some_and(|x| x.centered), "Centered in frame"),
+            chk(
+                r.is_some_and(|x| {
+                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
+                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
+                }),
+                "Facing the camera",
+            ),
+            chk(
+                r.is_some_and(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness)),
+                "Well lit",
+            ),
+        ];
+        if e.stalled.is_none() && f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68 {
+            use framing_viewfinder::Guide;
+
+            let guide = if let Some(sample) = e.viewfinder.as_ref().filter(|_| !self.reduce_motion)
+            {
+                let fresh = self
+                    .now()
+                    .checked_duration_since(sample.sampled_at)
+                    .is_some_and(|age| age < Duration::from_secs(2));
+                Guide::Frame(sample.position.filter(|_| fresh))
+            } else {
+                Guide::TextOnly
+            };
+            let [face, centered, facing, lit] = checks.clone();
+            let pair = |mut first: Line<'static>, second: Line<'static>| {
+                let padding = 24usize.saturating_sub(first.width());
+                let trailing = 21usize.saturating_sub(second.width());
+                first.spans.push(Span::raw(" ".repeat(padding)));
+                first.spans.extend(second.spans);
+                first.spans.push(Span::raw(" ".repeat(trailing)));
+                first
+            };
+            if framing_viewfinder::draw_stack(
+                f,
+                area,
+                cue.clone(),
+                vec![
+                    profile.clone(),
+                    Line::raw(scan.clone()),
+                    Line::from(Span::styled(progress_bar(24), Style::new().fg(th().accent))),
+                    Line::raw(format!("{captured}/{total} captured")),
+                ],
+                vec![
+                    pair(face, centered),
+                    pair(facing, lit),
+                    Line::raw(APPROVAL),
+                    Line::from(Span::styled("[esc] cancel", Style::new().dim())),
+                ],
+                guide,
+            ) {
+                return;
+            }
+        }
+        if e.stalled.is_none() && e.count.is_none() {
+            cue.spans
+                .insert(0, Span::styled("→ ", Style::new().fg(th().accent)));
+        }
         let mut lines = vec![
             cue,
-            Line::from(Span::styled(
-                format!("Enrolling '{}'", e.profile),
-                Style::new().add_modifier(Modifier::BOLD),
-            )),
+            profile,
             Line::from(vec![
                 Span::styled(
-                    format!("  Scan {current} of {total}  "),
+                    format!("  {scan}  "),
                     Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(progress, Style::new().fg(th().ok)),
+                Span::styled(
+                    format!("{} {captured}/{total}", progress_bar(20)),
+                    Style::new().fg(th().ok),
+                ),
             ]),
             Line::raw(""),
         ];
-        lines.push(Line::raw(
-            "  Approve the system dialog when prompted to continue.",
-        ));
+        lines.push(Line::raw(format!("  {APPROVAL}")));
         if let Some(err) = &e.stalled {
             // Not a biometric verdict: the guide stopped answering, so EVERY
             // live reading (quality bar, checklist, guidance) is stale and
@@ -7856,59 +7913,16 @@ impl App {
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
             return;
         }
-        lines.extend([
-            chk(face, "Face detected"),
-            chk(r.map(|x| x.centered).unwrap_or(false), "Centered in frame"),
-            chk(
-                r.map(|x| {
-                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
-                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
-                })
-                .unwrap_or(false),
-                "Facing the camera",
-            ),
-            chk(
-                r.map(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness))
-                    .unwrap_or(false),
-                "Well lit",
-            ),
-            Line::raw(""),
-        ]);
+        lines.extend(checks.map(|mut check| {
+            check.spans.insert(0, Span::raw("  "));
+            check
+        }));
+        lines.push(Line::raw(""));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  [esc] cancel",
             Style::new().dim(),
         )));
-        let area = if let Some(sample) = e.viewfinder.as_ref().filter(|_| {
-            !self.reduce_motion
-                && f.area().width >= SIDEBAR_MIN_COLS
-                && area.width >= 68
-                && area.height >= 12
-        }) {
-            let [text, _, guide] = Layout::horizontal([
-                Constraint::Min(43),
-                Constraint::Length(2),
-                Constraint::Length(framing_viewfinder::WIDTH),
-            ])
-            .areas(area);
-            let fresh = self
-                .now()
-                .checked_duration_since(sample.sampled_at)
-                .is_some_and(|age| age < Duration::from_secs(2));
-            framing_viewfinder::draw(
-                f,
-                Rect::new(
-                    guide.x,
-                    guide.y + 1,
-                    guide.width,
-                    framing_viewfinder::HEIGHT,
-                ),
-                sample.position.filter(|_| fresh),
-            );
-            text
-        } else {
-            area
-        };
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
@@ -19299,11 +19313,98 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_viewfinder_centers_cue_guide_and_progress_in_the_pane() {
+        fn locate(text: &str, label: &str) -> (usize, usize) {
+            text.lines()
+                .enumerate()
+                .find_map(|(y, row)| {
+                    row.find(label)
+                        .map(|x| (y, row[..x].chars().count() * 2 + label.chars().count()))
+                })
+                .unwrap_or_else(|| panic!("missing {label}: {text}"))
+        }
+
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(2, 8);
+        enrollment.captured = 1;
+        enrollment.last = Some(good_report("Center your face in the frame"));
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.viewfinder = Some(ViewfinderSample {
+            position: Some(FramingPosition {
+                x: 2,
+                y: 5,
+                size: 1,
+            }),
+            sampled_at: now,
+        });
+        app.enroll = Some(enrollment);
+
+        for (w, h) in [(128, 48), (100, 30)] {
+            let viewport = Rect::new(0, 0, w, h);
+            let (_, pane) = app.body_split(app.frame_rows(viewport)[2]);
+            let axis = usize::from(pane.x * 2 + pane.width);
+            let framing = draw_text_at(&app, w, h);
+            let old_cue = locate(&framing, "Center your face in the frame");
+            let guide = locate(&framing, "Framing guide");
+            let progress = locate(&framing, "[███████░░░░░░░░░░░░░░░░░]");
+            let captured = locate(&framing, "3/10 captured");
+            assert!(old_cue.0 < guide.0 && guide.0 < progress.0 && progress.0 < captured.0);
+            for (_, center) in [old_cue, guide, progress, captured] {
+                assert!(axis.abs_diff(center) <= 1, "{w}x{h}: {framing}");
+            }
+            assert!(framing.contains("Scan 4 of 10"));
+            assert!(framing.contains("cancel enrollment"));
+
+            app.enroll.as_mut().unwrap().count = Some(3);
+            let countdown = draw_text_at(&app, w, h);
+            assert_eq!(locate(&countdown, "capturing in 3").0, old_cue.0);
+            assert_eq!(locate(&countdown, "Framing guide"), guide);
+            assert_eq!(locate(&countdown, "[███████░░░░░░░░░░░░░░░░░]"), progress);
+            app.enroll.as_mut().unwrap().count = None;
+        }
+    }
+
+    #[test]
+    fn enrollment_viewfinder_short_panes_keep_no_face_and_cancel_visible() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(0, 4);
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.viewfinder = Some(ViewfinderSample {
+            position: None,
+            sampled_at: now,
+        });
+        enrollment.last = Some(PositionReport {
+            guidance: "No face detected; look straight at the camera and center yourself".into(),
+            ..PositionReport::default()
+        });
+        app.enroll = Some(enrollment);
+
+        for (width, height, activity) in [
+            (80, 24, false),
+            (96, 24, false),
+            (106, 24, false),
+            (120, 27, true),
+        ] {
+            app.activity_open = activity;
+            let text = draw_text_at(&app, width, height);
+            assert!(!text.contains("Framing guide"), "{width}x{height}: {text}");
+            assert!(text.contains("No face detected"));
+            assert!(text.contains("Scan 1 of 4"));
+            assert!(text.contains("[esc] cancel"));
+            assert!(text.contains("cancel enrollment"));
+        }
+    }
+
+    #[test]
     fn enrollment_viewfinder_mirrors_and_scales_without_color() {
         use irlume_common::FramingPosition;
 
         let draw = |position| {
-            let mut terminal = Terminal::new(TestBackend::new(23, 7)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(33, 9)).unwrap();
             terminal
                 .draw(|frame| {
                     let area = frame.area();
@@ -19338,7 +19439,7 @@ mod tests {
         }));
         assert!(lower.x < center.x && center.x < upper.x);
         assert!(upper.y < center.y && center.y < lower.y);
-        assert!(small.lines().any(|row| row.contains("[   o   ]")));
+        assert!(small.lines().any(|row| row.contains("[     o     ]")));
 
         let (medium_center, medium) = draw(Some(FramingPosition {
             x: 5,
@@ -19352,13 +19453,13 @@ mod tests {
         }));
         assert_eq!(medium_center, center);
         assert_eq!(large_center, center);
-        assert!(medium.lines().any(|row| row.contains("[  (o)  ]")));
-        assert!(large.lines().any(|row| row.contains("[ ((o)) ]")));
+        assert!(medium.lines().any(|row| row.contains("[    (o)    ]")));
+        assert!(large.lines().any(|row| row.contains("[   ((o))   ]")));
     }
 
     #[test]
     fn enrollment_viewfinder_keeps_the_target_visible_at_every_position() {
-        let mut terminal = Terminal::new(TestBackend::new(23, 7)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(33, 9)).unwrap();
         for x in 0..=10 {
             for y in 0..=10 {
                 for size in 0..=2 {
@@ -19370,10 +19471,10 @@ mod tests {
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
-                    assert_eq!(buffer[(7, 3)].symbol(), "[", "{position:?}");
-                    assert_eq!(buffer[(15, 3)].symbol(), "]", "{position:?}");
+                    assert_eq!(buffer[(10, 4)].symbol(), "[", "{position:?}");
+                    assert_eq!(buffer[(22, 4)].symbol(), "]", "{position:?}");
                     for (corner, symbol) in
-                        [((0, 0), "┌"), ((22, 0), "┐"), ((0, 6), "└"), ((22, 6), "┘")]
+                        [((0, 0), "┌"), ((32, 0), "┐"), ((0, 8), "└"), ((32, 8), "┘")]
                     {
                         assert_eq!(buffer[corner].symbol(), symbol, "{position:?}");
                     }
@@ -19386,9 +19487,9 @@ mod tests {
                         1,
                         "{position:?}"
                     );
-                    for row in 1..6 {
+                    for row in 1..8 {
                         assert_eq!(buffer[(0, row)].symbol(), "│", "{position:?}");
-                        assert_eq!(buffer[(22, row)].symbol(), "│", "{position:?}");
+                        assert_eq!(buffer[(32, row)].symbol(), "│", "{position:?}");
                     }
                 }
             }

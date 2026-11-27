@@ -2,10 +2,75 @@
 // Copyright the irlume contributors.
 
 use irlume_common::FramingPosition;
-use ratatui::{layout::Rect, style::Style, widgets::Block, Frame};
+use ratatui::{
+    layout::{Alignment, Rect},
+    style::Style,
+    text::Line,
+    widgets::{Block, Paragraph, Wrap},
+    Frame,
+};
 
-pub(super) const WIDTH: u16 = 23;
-pub(super) const HEIGHT: u16 = 7;
+const WIDTH: u16 = 33;
+const HEIGHT: u16 = 9;
+
+pub(super) enum Guide {
+    TextOnly,
+    Frame(Option<FramingPosition>),
+}
+
+pub(super) fn draw_stack(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cue: Line<'_>,
+    progress: Vec<Line<'_>>,
+    details: Vec<Line<'_>>,
+    guide: Guide,
+) -> bool {
+    let panels = [
+        Paragraph::new(cue),
+        Paragraph::new(progress),
+        Paragraph::new(details),
+    ]
+    .map(|panel| {
+        panel
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+    });
+    let [Ok(cue_rows), Ok(progress_rows), Ok(detail_rows)] = panels
+        .each_ref()
+        .map(|panel| u16::try_from(panel.line_count(area.width)))
+    else {
+        return false;
+    };
+    let (guide_rows, intervals) = match guide {
+        Guide::TextOnly => (0, 2),
+        Guide::Frame(_) if area.width >= WIDTH => (HEIGHT, 3),
+        Guide::Frame(_) => return false,
+    };
+    let Some(slack) = [cue_rows, guide_rows, progress_rows, detail_rows]
+        .into_iter()
+        .try_fold(area.height, u16::checked_sub)
+    else {
+        return false;
+    };
+    let gap = (slack / intervals).min(2);
+    let top = area.y + (slack - gap * intervals) / 2;
+    let [cue, progress, details] = panels;
+    let row_area = |y, height| Rect::new(area.x, y, area.width, height);
+    frame.render_widget(cue, row_area(top, cue_rows));
+    let mut y = top + cue_rows + gap;
+    if let Guide::Frame(marker) = guide {
+        draw(
+            frame,
+            Rect::new(area.x + (area.width - WIDTH) / 2, y, WIDTH, HEIGHT),
+            marker,
+        );
+        y += guide_rows + gap;
+    }
+    frame.render_widget(progress, row_area(y, progress_rows));
+    frame.render_widget(details, row_area(y + progress_rows + gap, detail_rows));
+    true
+}
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPosition>) {
     let area = area.intersection(frame.area());
@@ -13,7 +78,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
         return;
     }
 
-    let border = Block::bordered().title(" Framing guide ");
+    let border = Block::bordered()
+        .title(" Framing guide ")
+        .title_alignment(Alignment::Center);
     let inside = border.inner(area);
     frame.render_widget(border, area);
     let center = inside.x + inside.width / 2;
@@ -29,6 +96,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
     }
     // Keep the target visible when a marker edge crosses it. Neither bracket
     // column coincides with a marker center.
-    buffer.set_string(center - 4, middle, "[", style);
-    buffer.set_string(center + 4, middle, "]", style);
+    buffer.set_string(center - 6, middle, "[", style);
+    buffer.set_string(center + 6, middle, "]", style);
 }

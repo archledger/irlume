@@ -243,24 +243,28 @@ Inspection failure is shown separately from an empty device list. Selection
 follows device identity, and a connection change invalidates an open camera
 switch confirmation rather than silently choosing a replacement.
 
-### Enrollment framing guide
+## Enrollment framing guide
 
-During enrollment, the text cue tells you what to adjust. On a wide
-terminal, the framing guide also shows a generic marker inside a box.
-The brackets mark the center. Move to your right and the marker moves
-right; move closer and it grows. A centered marker does not tell you
-whether your angle or lighting is right. Follow the text cue for those.
+When the terminal has room, the enrollment screen stacks the text cue or
+countdown, the framing guide, and scan progress in the center. The guide
+appears after the first detected position. Move to your right and the
+marker moves right; move closer and it grows. The brackets are a visual
+reference, not a readiness check. Follow the text cue for position,
+angle, and lighting.
 
 The marker clears if Irlume loses track of your face or stops receiving
 fresh position data. The guide closes before authorization and scan
 capture. It uses coarse position and size, not webcam video or facial
-landmarks. Compact terminals, older daemons, and
-`IRLUME_REDUCE_MOTION=1` keep the text-only guide.
+landmarks. Compact terminals, older daemons, root or other-account
+sessions, and `IRLUME_REDUCE_MOTION=1` keep the text-only guide.
 
 During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
 The guide checks cancellation after waiting or sampling, and the client checks
 again before sending a new capture request, including the older-daemon fallback.
 Cancellation does not undo work the daemon has already received.
+
+## Leaving an action in progress
+
 For a general daemon task, the **quit** control exits the TUI and explicitly says
 the task keeps running. Other page controls stay inactive during these operations.
 
@@ -281,8 +285,9 @@ setting off is not inherently an error. Selection and keyboard focus remain
 visible independently of color. The palette follows the terminal's colors
 without assuming that truecolor means a dark background.
 
-Set `NO_COLOR=1` to disable color, or `IRLUME_REDUCE_MOTION=1` to use static
-activity marks. Keyboard shortcuts remain available with mouse capture released.
+Set `NO_COLOR=1` to disable color. `IRLUME_REDUCE_MOTION=1` uses static
+activity marks and hides the moving enrollment marker. Keyboard shortcuts
+remain available with mouse capture released.
 
 ## Preferences
 

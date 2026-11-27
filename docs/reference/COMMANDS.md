@@ -7,6 +7,10 @@ Conventions that apply everywhere:
 
 - Commands act on the current user by default. `--user U` overrides that
   (managing another account needs root).
+- `-h` is short for `--help`. For `update`, `-n` is short for `--check`.
+  For `uninstall`, `-y` is short for `--yes`.
+- `irlume doctor --check` returns 1 for warnings or 2 for failures.
+- `irlume fingerprint reset --yes` skips the reset confirmation.
 - Commands that change system state (PAM wiring, SELinux, camera config,
   the daemon) need `sudo`; the tables below mark them. Everything else runs
   as your own user.
@@ -339,7 +343,135 @@ the daemon; the TUI ships it as Diagnostics -> Test Infrared Camera) and the
 - Reading scores, gate reasons, and PAM decisions: [DEBUGGING.md](../user/DEBUGGING.md)
 - NixOS module instead of imperative wiring: [NIXOS.md](../user/NIXOS.md)
 
-### Authorization before enrollment
+## Terminal help
+
+This section uses the same synopsis as `irlume help`. The sections above cover
+command-specific details that do not fit in terminal help.
+
+<!-- cli-help:start -->
+<!-- parser option inventory sha256: 6353064b35cd25bddf9b78a00f35836beee34e5a667f43709c792bc8397fcbe7 -->
+
+```text
+irlume - local face authentication
+
+USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
+
+SETUP & STATUS
+  tui [--user U] [--page P] [--new]
+                        guided setup + live dashboard (enroll & configure here);
+                        --page starts on a named screen (overview, diagnostics,
+                        cameras, faces, wallet, recovery, fingerprint, login,
+                        settings); --new skips the single-instance guard
+  setup                 scripted onboarding (enroll, keyring, recovery, wiring)
+  status                health dashboard (daemon, enrollment, keyring, cameras)
+  detect                script probe; exit 0=ready / 10=partial / 20=absent
+  doctor                platform / TPM / Secure Boot / camera / model checks
+  support-report [--output FILE.txt] [--since 10m] [--probe]
+                        create a private 0600 report; default is read-only and
+                        camera-free, while --probe is explicit and root-only
+  trace [record] [--duration 60s] [--output FILE.jsonl]
+  trace explain FILE.jsonl [--output FILE.txt]
+  trace analyze FILE.jsonl [--output FILE.txt]
+  deps                  verify runtime dependencies (onnxruntime, models, TPM)
+  split <list|status|add|remove|select>
+                        split camera authorizations; split --help gives JSON
+                        guard/side syntax. Status and changes require root.
+
+ENROLLMENT & AUTH
+  enroll [--name N] [--scans K] [--reset] [--add-camera]
+         [--camera-choice JSON] [--split-camera-choice JSON]
+                        capture a face profile (or a second camera group:
+                        ADR-0024); a choice flag names a guarded ordinary
+                        or authorized split pair for this operation only
+                        (split stays refused until activation)
+  profiles [list|add-scan|remove-camera|rename|delete|forget-model|eyes-open off]   manage profiles
+                        (one-release migration only: clears the retired gate;
+                        it cannot be turned on, see issue #386)
+  identify              1:N "who is this?" (all users as root; else scoped to you)
+KEYRING / TPM
+  keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
+                        (GNOME token disarm is unavailable; --force does not erase tokens)
+  reseal                re-bind the sealed secret to current PCRs (after a
+                        firmware/kernel update); safe, re-enters the password
+  recovery <status|setup|restore|forget>   recovery passphrase + encryption
+  retry <status|reset> [--user U]         inspect/reset face retry state
+                        reset verifies your local password; root is an admin override
+  diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
+
+SYSTEM INTEGRATION
+  login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply] [--force]
+        [--adjust-jumps]
+                        PAM wiring: greeters, lock screen, sudo, and app prompts
+                        (--with-polkit lets your face approve Bitwarden/pkexec);
+                        reconcile re-applies it after a distro PAM regeneration and
+                        applies immediately (no --apply; the self-heal unit runs it);
+                        enable --force rebuilds irlume's /etc copies of vendor PAM
+                        files that have lines of yours, keeping each as .pre-irlume;
+                        --adjust-jumps changes the value of a numeric jump of yours
+                        in such a copy that irlume's lines would move, so it skips
+                        the same lines of yours and lands on the same line (a
+                        fingerprint's success: on irlume's pam_permit.so landing;
+                        where irlume's lines come out and it landed on one: the
+                        first line after them)
+  logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
+  logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
+  fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]
+                        fprintd companion; enable = face OR fingerprint (both),
+                        --fingerprint-only replaces face with fingerprint
+  bitwarden <status|setup> [--apply]
+                        install Bitwarden's biometric-unlock polkit action
+                        (flatpak/native; snap is handled by snapd already)
+  selinux <status|load>           SELinux module for the login greeter
+  ir-setup [--dry-run]            configure the IR emitter (sudo; rarely needed,
+                        and only ever run when you ask; it writes to the
+                        camera, so --dry-run first)
+  set-cameras <rgb> <ir>          persist the RGB+IR camera pair (sudo; the TUI
+                        camera picker runs this for you)
+  camera-tune [--rounds N]        measure whether this camera can stream RGB and
+                        IR at once without dimming, and store the answer (sudo)
+  camera-mode                     report the capture mode in force for the
+                        auto-selected pair, and where that verdict came from
+  camera census [--json]          classify every camera-like device on the
+                        machine, printing the evidence each classification
+                        keyed on (#575; the hardware-report attachment)
+  models list --json           machine model listing; all other models
+                        subcommands are removed (ADR-0015) and answer with a notice
+  auth consent [status]         show privileged face-confirmation policy
+  auth sensor status            show the saved/daemon-observed face sensor policy
+  auth sensor preflight [--user U]  camera-free experimental IR prerequisites
+  auth sensor dual              restore dual sensors (sudo; no PAM changes)
+  auth sensor ir-only --yes      select EXPERIMENTAL IR-only (sudo; not qualified)
+  auth consent required         require confirmation (default; sudo)
+  auth consent hands-free --yes skip the keyword at privileged prompts (sudo;
+                        machine-wide opt-in). Login/lock behavior is separate.
+  biopolicy <on|off|status>       opt-in operation-class gate: restrict which
+                        services a face may satisfy (advanced; password unaffected)
+  update [--check|-n]             update via the channel this was installed from
+                        (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
+  uninstall [--keep-data] [--yes|-y]
+                        un-wire PAM, stop the daemon, wipe enrolled
+                        data, then remove the package through its own manager
+                        (sudo)
+  version                         print the installed irlume version
+
+MACHINE-READABLE OUTPUT (for desktop integrations; see docs/reference/INTEGRATION.md)
+  --json                on version, status, doctor, support-report, profiles list, models list,
+                        camera census, camera diagnostics, login status, login plan/apply/
+                        verify/rollback: one line of JSON on stdout, stable check ids and error
+                        codes, nothing else printed
+  auth test --events=jsonl [--user USER]
+                        streams one JSON document per line once started;
+                        a refusal before streaming is one JSON error document
+  --contract N          declare the contract version you implement; omitted
+                        always means 1, and an unimplemented one is refused
+                        before anything runs
+
+  (developer/benchmark tools are hidden; set IRLUME_DEV=1 to enable them)
+```
+
+<!-- cli-help:end -->
+
+## Authorization before enrollment
 
 `--camera-choice` is a low-level ordinary-pair socket option (ADR-0029 section 3).
 Its JSON contains `rgb`, `ir` and `expected`, where `expected` is the unchanged

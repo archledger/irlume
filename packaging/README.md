@@ -84,10 +84,12 @@ These checks do not launch the TUI or prove desktop-session compatibility.
   on the maintainer's machine (`ppa/nightly/`), built with the release's
   `ppa/container-build.sh` in the same pinned image.
 - **AUR doc-path transition:** Edit `docs/reference/MACHINE-API.md` and
-  `docs/reference/INTEGRATION.md`, then copy both to `docs/` while the
-  published `irlume-git` recipe still reads the old sources. Packaging parity
+  `docs/reference/INTEGRATION.md`, then run `python3 -B scripts/ci/sync-docs.py` to
+  copy both to `docs/` while the published `irlume-git` recipe still reads
+  the old sources. Packaging parity
   checks the copies byte for byte. After the AUR recipe uses `docs/reference/`,
-  remove the two copies, their TODO comments, and the parity check.
+  remove the two copies and their TODO comments, the copy entries in
+  `scripts/ci/sync-docs.py`, and the parity check.
 - **Ubuntu** ([`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume)):
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled

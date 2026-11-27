@@ -323,6 +323,9 @@ Contract 1 has a JSON Schema (2020-12) at `schemas/machine-api-v1.schema.json`,
 installed on packaged systems at
 `/usr/share/irlume/schemas/machine-api-v1.schema.json`.
 
+The [generated schema reference](https://github.com/archledger/irlume/blob/main/docs/reference/SCHEMAS.md)
+lists the envelope, command data definitions, and doctor field shapes.
+
 **The schema does not close its objects, and a consumer's validator must not
 either.** Fields may be added within a contract version, so rejecting unknown
 properties turns a permitted engine update into a broken consumer.
@@ -977,7 +980,7 @@ rebuilding the rest from the JSON by hand. `verify` reports them as
 `already_restored` and excludes them from `rollback_available`, so drift caused
 by irlume's own restore is not reported as somebody's edit.
 
-`rollback --accept-unconfirmed --apply` copies every surface and sidecar as it
+`irlume login rollback --accept-unconfirmed --apply` copies every surface and sidecar as it
 currently stands into a root-only directory before restoring anything, and
 returns that path as `snapshot`. An unconfirmed record has no trustworthy
 after-digest, so the restore does not check what it overwrites; that is how an

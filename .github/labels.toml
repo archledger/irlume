@@ -42,6 +42,10 @@ title_tokens = ["docs", "readme"]
 only_paths = ["docs/*", "*.md", "CITATION.cff"]
 issue_title = '\b(docs?|documentation|README)\b'
 
+[labels.docs-not-needed]
+color = "ededed"
+description = "Maintainer reviewed this change and no user or reference docs apply"
+
 [labels.performance]
 color = "7ee787"
 description = "Latency, throughput, startup time"

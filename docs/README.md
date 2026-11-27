@@ -23,6 +23,7 @@ Use this index to find guides, contracts, security evidence, and maintainer note
 | [Commands](reference/COMMANDS.md) | Command syntax, flags, and authorization notes |
 | [TUI](reference/TUI.md) | The interactive interface, screen by screen |
 | [Machine API](reference/MACHINE-API.md) | Versioned machine output, field by field |
+| [JSON schemas](reference/SCHEMAS.md) | Generated command payload and doctor field shapes |
 | [Integration](reference/INTEGRATION.md) | Use irlume from other software |
 | [Limits](reference/LIMITATIONS.md) | Unsupported configurations and measured limits |
 | [Hardware compatibility](reference/HARDWARE.md) | Generated matrix of recorded results |

@@ -8,6 +8,8 @@ line 12190: search for the names below.
 
 - `src/main.rs` parses argv by hand (`flag`, `flag_present` accept `--x v` and
   `--x=v`); commands are documented in [docs/reference/COMMANDS.md](../../docs/reference/COMMANDS.md).
+  Update `src/cli-help.txt` when terminal help changes. Refresh the generated
+  section with `python3 -B scripts/ci/sync-docs.py` from the repository root.
 - Internal entry points, not in docs/reference/COMMANDS.md, change their arguments only
   with their callers: `--internal-token-delivery-lock-v1` (checked first in
   `main`, run by irlumed's `token_delivery`; `tests/token_lock.rs`) and the

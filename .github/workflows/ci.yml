@@ -18,6 +18,7 @@ on:
   # No base-branch filter: stacked PRs (a branch targeting another feature
   # branch) previously ran ZERO checks.
   pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.
@@ -89,6 +90,8 @@ jobs:
         with:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
+          # Compare the PR merge tree to its first parent, not to a branch tip.
+          fetch-depth: 2
 
       # Scan the checked-out tree, even if a PR only deletes a link target.
       - name: Markdown links (local paths and anchors)
@@ -113,6 +116,15 @@ jobs:
             --remap "^https?://github\.com/archledger/irlume/(blob|tree)/main/ file://$root/" \
             --remap "^https?://raw\.githubusercontent\.com/archledger/irlume/main/ file://$root/" \
             -- "${markdown[@]/#/./}"
+
+      - name: Code-to-docs synchronization
+        run: |
+          python3 -B scripts/ci/sync-docs.py --check
+          python3 -B scripts/ci/test-sync-docs.py
+
+      - name: PR changes carry matching docs
+        if: github.event_name == 'pull_request'
+        run: python3 -B scripts/ci/sync-docs.py --pr-event "$GITHUB_EVENT_PATH"
 
       - name: Prefer the Ubuntu archive for package downloads
         # The image's Azure mirror can keep sending data too slowly to trip

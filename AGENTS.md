@@ -170,6 +170,27 @@ cargo build --release --locked
   `crates/irlume-camera/src/ir_emitter.rs` (which pins `hardware-suite.yml`);
   find more with `grep -rln 'include_str!\|CARGO_MANIFEST_DIR' crates`.
 
+## Code-to-Docs Synchronization
+
+| Code or data | Update these docs |
+|---|---|
+| `crates/irlume-cli/src/`, including `crates/irlume-cli/src/cli-help.txt` | [Commands](docs/reference/COMMANDS.md); update the terminal synopsis and the relevant command details |
+| `schemas/`, CLI machine output, and doctor check IDs | [Machine API](docs/reference/MACHINE-API.md) and the generated [schema reference](docs/reference/SCHEMAS.md); update the doctor ID table when the engine adds a check |
+| Environment variable declarations and reads | The current guide that describes the variable; dated ADRs and evidence are not instructions |
+| `docs/hardware/fleet-evidence.json`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs` | Generated [hardware compatibility](docs/reference/HARDWARE.md) |
+| `kcm/` | [KDE System Settings](docs/user/KCM.md) or [TUI](docs/reference/TUI.md) |
+| `packaging/`, `nix/`, `flake.nix`, `.packit.yaml` | [Setup](docs/user/SETUP.md), [platforms](docs/user/PLATFORMS.md), [NixOS](docs/user/NIXOS.md), or the relevant installation or release guide |
+
+Regenerate with `python3 -B scripts/ci/sync-docs.py` and review the diff.
+CI runs `python3 -B scripts/ci/sync-docs.py --check` and checks paths and anchors
+offline. The same command checks current guides for unknown environment
+variables and checks that recognized parser spellings appear in the authored
+help or reference. Review changes to flag behavior and command descriptions
+even when the spellings have not changed.
+For a PR touching the CLI, schemas, KCM, or packaging, update the matching
+docs or `CHANGELOG.md`. A maintainer may apply `docs-not-needed` when no
+documentation applies; it does not bypass the generation or link checks.
+
 ## Conventions
 
 - Every `.rs` file opens (after `#![no_main]` in fuzz targets) with

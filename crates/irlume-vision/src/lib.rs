@@ -839,7 +839,8 @@ mod onnx {
     }
 
     impl Embedder {
-        /// Load an ONNX embedder from model bytes using the shared heavy inference pool.
+        /// Each embedder session owns its thread pool and defaults to the
+        /// shared settings for heavy models.
         ///
         /// # Errors
         ///

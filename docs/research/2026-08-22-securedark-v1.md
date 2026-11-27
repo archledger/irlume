@@ -51,7 +51,7 @@ CBSR 197 ids / 347,508 impostor pairs deployment-shaped best-of-11; Tufts
   Correction 2026-10-22: the `4.9e-5` above is the uncalibrated k=5 control
   at 0.60, not the shipped calibrated arm at 0.635. The lambda-0.5
   best-of-N rates at a flat 0.635 are 6.10e-5 (k=3) and 6.60e-5 (k=5).
-  See the [ADR-0016 amendment](../adr/0016-securedark-ir-path.md#amendment-2026-10-22-tufts-evidence-attribution)
+  See the [ADR-0016 amendment](../architecture/adr/0016-securedark-ir-path.md#amendment-2026-10-22-tufts-evidence-attribution)
   for the archived counts, separate centroid rates and production-scaling
   limitation. These are existing measurements, not a new run.
 - Within-session-split caveat (labeled in the script): CBSR genuine tails
@@ -65,7 +65,7 @@ shaped support on both corpora (5.2e-5 / 4.9e-5 FAR) and stays live-gated.
 Correction 2026-10-22: the Tufts `4.9e-5` in that historical conclusion
 misattributes the control above. At flat 0.635 the same rounded figure is
 also reached by lambda 1.0, which is not shipped. The
-[ADR-0016 amendment](../adr/0016-securedark-ir-path.md#amendment-2026-10-22-tufts-evidence-attribution)
+[ADR-0016 amendment](../architecture/adr/0016-securedark-ir-path.md#amendment-2026-10-22-tufts-evidence-attribution)
 replaces that attribution; neither the historical Tufts aggregate nor
 this correction is full production-decision or GPU certification evidence.
 

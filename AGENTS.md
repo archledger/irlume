@@ -4,45 +4,65 @@ irlume is face and fingerprint authentication for Linux, in Rust: a privileged
 daemon (`irlumed`), a CLI and TUI (`irlume`), a PAM module (`pam_irlume.so`), a
 KDE System Settings module and TPM-sealed keyring unlock. It is pre-1.0 and
 GPL-3.0-or-later, with one maintainer who decides what merges and ships
-([GOVERNANCE.md](GOVERNANCE.md)). Three things must never break: authentication
+([GOVERNANCE.md](.github/GOVERNANCE.md)). Three things must never break: authentication
 correctness (no grant without a genuine live match), the password fallback (it
 always works) and the privacy of biometric data. If a task seems to need any of
 them weakened, stop and ask.
 
 This file guides coding agents and the people who run them. It condenses
-[CONTRIBUTING.md](CONTRIBUTING.md) and the docs it links; most rules name their
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) and the docs it links; most rules name their
 source. Where prose and code disagree, trust `Cargo.toml`, `ci.yml` and the
-code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
+code, and say so in the PR. `ADR-NNNN` means `docs/architecture/adr/NNNN-*.md`. Nested
 `AGENTS.md` files (crates `irlume-common`, `-daemon`, `-cli`, `-pam`, and
-`docs/adr`) add rules for their area and never relax these.
+`docs/architecture/adr`) add rules for their area and never relax these.
 
 ## Repository map
 
 | Path | What it is | Start at |
 |---|---|---|
-| `crates/irlume-common` | Wire types (`Request`, `Response`), socket client, config. Depends on no other irlume crate. | [its AGENTS.md](crates/irlume-common/AGENTS.md), [docs/SETUP.md](docs/SETUP.md) |
+| `crates/irlume-common` | Wire types (`Request`, `Response`), socket client, config. Depends on no other irlume crate. | [its AGENTS.md](crates/irlume-common/AGENTS.md), [docs/user/SETUP.md](docs/user/SETUP.md) |
 | `crates/irlume-camera` | V4L2/UVC capture, IR emitter, device pinning, inventory. | `crates/irlume-camera/src/lib.rs`; ADR-0007, 0023, 0024, 0027, 0028, 0029, 0032 (split-pair authorization, admission posture and activation gates) |
-| `crates/irlume-vision`, `-liveness` | Detection, alignment, embedding; liveness cues and PAD. | ADR-0013, ADR-0019, [docs/PAD_SELFTEST.md](docs/PAD_SELFTEST.md) |
-| `crates/irlume-core` | Encrypted templates, TPM sealing, keyring and recovery envelopes. | ADR-0025, [docs/SECURITY_AT_REST.md](docs/SECURITY_AT_REST.md) |
-| `crates/irlume-auth` | The `Engine`: the only place a face grant is decided (pam_fprintd verifies fingerprints). | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Authentication flow" |
+| `crates/irlume-vision`, `-liveness` | Detection, alignment, embedding; liveness cues and PAD. | ADR-0013, ADR-0019, [docs/security/PAD_SELFTEST.md](docs/security/PAD_SELFTEST.md) |
+| `crates/irlume-core` | Encrypted templates, TPM sealing, keyring and recovery envelopes. | ADR-0025, [docs/security/SECURITY_AT_REST.md](docs/security/SECURITY_AT_REST.md) |
+| `crates/irlume-auth` | The `Engine`: the only place a face grant is decided (pam_fprintd verifies fingerprints). | [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) "Authentication flow" |
 | `crates/irlume-daemon` | `irlumed`: socket, per-request authorization, the single worker. | [its AGENTS.md](crates/irlume-daemon/AGENTS.md) |
 | `crates/irlume-pam` | `pam_irlume.so`, a thin socket client. | [its AGENTS.md](crates/irlume-pam/AGENTS.md) |
-| `crates/irlume-cli` | `irlume`: CLI, TUI, `--json` API, PAM wiring (`crates/irlume-cli/src/pamwire.rs`). | [its AGENTS.md](crates/irlume-cli/AGENTS.md), [docs/TUI.md](docs/TUI.md), [docs/MACHINE-API.md](docs/MACHINE-API.md) |
+| `crates/irlume-cli` | `irlume`: CLI, TUI, `--json` API, PAM wiring (`crates/irlume-cli/src/pamwire.rs`). | [its AGENTS.md](crates/irlume-cli/AGENTS.md), [docs/reference/TUI.md](docs/reference/TUI.md), [docs/reference/MACHINE-API.md](docs/reference/MACHINE-API.md) |
 | other `crates/` | libexec helpers (`gkr-unlock`, `kwallet-init`, `password-verify`), the fprintd wrapper and `irlume-pam-view` (`pam_irlume_view.so`, a session-only module that detaches LightDM's private PAM view before the desktop session starts). | [crates/README.md](crates/README.md), `crates/irlume-pam-view/src/lib.rs` |
-| `docs/adr/` | Architecture decision records. | [its AGENTS.md](docs/adr/AGENTS.md) |
-| `kcm/` | KDE module (C++/QML, CMake): read-only, launches the TUI. | [docs/KCM.md](docs/KCM.md) |
+| `docs/architecture/adr/` | Architecture decision records. | [its AGENTS.md](docs/architecture/adr/AGENTS.md) |
+| `kcm/` | KDE module (C++/QML, CMake): read-only, launches the TUI. | [docs/user/KCM.md](docs/user/KCM.md) |
 | `fuzz/` | Separate nightly cargo-fuzz workspace with its own `Cargo.lock`. | `fuzz/fuzz_targets/`, `fuzz/seeds/` |
 | `packaging/`, `nix/` | Distro and Nix lanes, systemd units, AppArmor, SELinux, polkit. | [packaging/README.md](packaging/README.md) |
 | `schemas/`, `models/` | Machine API schema and fixtures, and the nightly-candidate schema; model hashes and BOM. | [models/README.md](models/README.md) |
+| `scripts/` | User-facing and packaging entrypoints, maintainer tooling, and automation. CI-specific helpers go under `scripts/ci/`. Existing entrypoint paths stay stable. | [scripts/README.md](scripts/README.md) |
+| `tasks/` | Planning and tracking notes, not executable automation. | `tasks/plan.md`, `tasks/todo.md` |
 
-Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); terms: [CONTEXT.md](CONTEXT.md).
+The public flake stays at the root; `nix/` stays with its established paths
+because the flake, packaging checks, and Rust tests consume them directly.
+
+Design: [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md).
 The main TUI, camera, daemon and auth files run 18k to 29k lines: search, do not read them whole.
+
+## Terminology
+
+- **Capture schedule:** The ordering used to acquire an RGB+IR pair:
+  concurrent or sequential. Avoid "camera mode" and "dual mode".
+- **Capture qualification:** Context-bound evidence authorizing the capture
+  schedule for an exact camera pair, stream contract, and connection. Avoid
+  "camera capability" and "compatibility flag".
+- **Runtime degradation:** A temporary, process-local demotion from concurrent
+  to sequential after live evidence violates the qualified capture contract.
+  It is neither requalification nor a permanent downgrade.
+- **Support report:** A share-safe, human-readable snapshot of sanitized
+  Irlume health and recent diagnostic facts, not a log dump or support bundle.
+- **Diagnostic trace:** A privileged, time-bounded stream of structured events
+  from live Irlume operations, not persistent debug logging.
 
 ## Setup
 
 - `nix develop` pins Rust 1.88.0, libclang, tpm2-tss, linux-pam and ONNX Runtime
   1.28.1 (sets `ORT_DYLIB_PATH`), but has no pamtester, pam_wrapper, swtpm or
-  bubblewrap. Distro packages: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md); the
+  bubblewrap. Distro packages: [docs/architecture/DEVELOPMENT.md](docs/architecture/DEVELOPMENT.md); the
   base Ubuntu list is the `check` job's "Install system build dependencies"
   step in `ci.yml` (later steps add swtpm, ffmpeg and more).
 - The CLI's fixed-path root-probe tests, its tests that bind fixture PAM
@@ -107,8 +127,8 @@ cargo build --release --locked
   passing negative-path tests print `FAILED` text on stderr.
 - New behavior gets tests in the same PR, a defect fix a regression test, a
   fuzzed parser a seed in `fuzz/seeds/<target>/`, hardware-only code an
-  `#[ignore = "..."]` test plus a validation note ([CONTRIBUTING.md](CONTRIBUTING.md)
-  "Ground rules for a security project", [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md)).
+  `#[ignore = "..."]` test plus a validation note ([CONTRIBUTING.md](.github/CONTRIBUTING.md)
+  "Ground rules for a security project", [docs/architecture/CODE_REVIEW.md](docs/architecture/CODE_REVIEW.md)).
 - Tests never write real system paths: use DEVELOPMENT.md "Sandbox environment
   overrides" under the crate's env lock (common `testenv::lock()`; core, camera,
   cli `crate::testenv::ENV_LOCK`; auth `tests::ENV_LOCK`; daemon `env_lock()`).
@@ -150,6 +170,27 @@ cargo build --release --locked
   `crates/irlume-camera/src/ir_emitter.rs` (which pins `hardware-suite.yml`);
   find more with `grep -rln 'include_str!\|CARGO_MANIFEST_DIR' crates`.
 
+## Code-to-Docs Synchronization
+
+| Code or data | Update these docs |
+|---|---|
+| `crates/irlume-cli/src/`, including `crates/irlume-cli/src/cli-help.txt` | [Commands](docs/reference/COMMANDS.md); update the terminal synopsis and the relevant command details |
+| `schemas/`, CLI machine output, and doctor check IDs | [Machine API](docs/reference/MACHINE-API.md) and the generated [schema reference](docs/reference/SCHEMAS.md); update the doctor ID table when the engine adds a check |
+| Environment variable declarations and reads | The current guide that describes the variable; dated ADRs and evidence are not instructions |
+| `docs/hardware/fleet-evidence.json`, `known_control` in `crates/irlume-camera/src/ir_emitter.rs` | Generated [hardware compatibility](docs/reference/HARDWARE.md) |
+| `kcm/` | [KDE System Settings](docs/user/KCM.md) or [TUI](docs/reference/TUI.md) |
+| `packaging/`, `nix/`, `flake.nix`, `.packit.yaml` | [Setup](docs/user/SETUP.md), [platforms](docs/user/PLATFORMS.md), [NixOS](docs/user/NIXOS.md), or the relevant installation or release guide |
+
+Regenerate with `python3 -B scripts/ci/sync-docs.py` and review the diff.
+CI runs `python3 -B scripts/ci/sync-docs.py --check` and checks paths and anchors
+offline. The same command checks current guides for unknown environment
+variables and checks that recognized parser spellings appear in the authored
+help or reference. Review changes to flag behavior and command descriptions
+even when the spellings have not changed.
+For a PR touching the CLI, schemas, KCM, or packaging, update the matching
+docs or `CHANGELOG.md`. A maintainer may apply `docs-not-needed` when no
+documentation applies; it does not bypass the generation or link checks.
+
 ## Conventions
 
 - Every `.rs` file opens (after `#![no_main]` in fuzz targets) with
@@ -166,12 +207,12 @@ cargo build --release --locked
   function-level ones) for `undocumented_unsafe_blocks` (`Cargo.toml`
   comment). New code documents instead; delete an expectation when you
   document its site (an unfulfilled one fails). Prefer `#[expect]` to `#[allow]`.
-- Use [CONTEXT.md](CONTEXT.md) terms ("capture schedule", not "camera mode").
-  Head gestures are removed ([docs/HEAD-GESTURE-REMOVAL.md](docs/HEAD-GESTURE-REMOVAL.md));
-  IR-only login is experimental opt-in ([docs/IR_ONLY_QUALIFICATION.md](docs/IR_ONLY_QUALIFICATION.md)).
+- Use the [terminology](#terminology) above ("capture schedule", not "camera mode").
+  Head gestures are removed ([docs/architecture/HEAD-GESTURE-REMOVAL.md](docs/architecture/HEAD-GESTURE-REMOVAL.md));
+  IR-only login is experimental opt-in ([docs/security/IR_ONLY_QUALIFICATION.md](docs/security/IR_ONLY_QUALIFICATION.md)).
 - Writing (comments, docs, commits, PRs): plain punctuation, no em dashes
   (U+2014), concrete and terse, numbers over adjectives
-  ([CONTRIBUTING.md](CONTRIBUTING.md) "Writing style"). Check with
+  ([CONTRIBUTING.md](.github/CONTRIBUTING.md) "Writing style"). Check with
   `grep -nP '\x{2014}' <files>`; older files still have some.
 
 ## Invariants that are easy to break
@@ -180,7 +221,7 @@ cargo build --release --locked
    daemon makes the PAM module return `PAM_IGNORE`, never `PAM_SUCCESS` or
    `PAM_AUTH_ERR`. Its two deliberate `PAM_ABORT` paths are listed in
    [the PAM AGENTS.md](crates/irlume-pam/AGENTS.md); keep them and add no other
-   ([SECURITY.md](SECURITY.md) "Threat model (summary)", `crates/irlume-pam/src/lib.rs`).
+   ([SECURITY.md](.github/SECURITY.md) "Threat model (summary)", `crates/irlume-pam/src/lib.rs`).
 2. **One decider.** Only `irlume-auth` decides a face grant; shims stay thin; no
    binary links another binary's crate ([crates/README.md](crates/README.md)).
 3. **Privilege split.** `irlumed` alone owns camera, IR emitter, models,
@@ -199,7 +240,7 @@ cargo build --release --locked
    `SealPassword`'s `TokenSealed` and in `ReleaseTokenForDisarm` (after the
    password opens the token's password wrap), so the caller can re-key the
    keyring (ADR-0003, `crates/irlume-common/src/lib.rs`;
-   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) "Privilege separation",
+   [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) "Privilege separation",
    "Authentication flow"). No request, command or flag removes a GNOME keyring
    token envelope: `DisarmKeyring` and `ForgetPassword` (`forget_non_token`)
    erase only a login-password or KDE wallet-key envelope and keep a token or
@@ -208,7 +249,7 @@ cargo build --release --locked
 4. **Posture and wire.** Every `Request` variant has an explicit arm, with no
    wildcard, in the daemon's posture tables. Socket changes stay additive, as
    old and new binaries meet during upgrades (daemon AGENTS.md). `--json` is a
-   public contract ([docs/MACHINE-API.md](docs/MACHINE-API.md)).
+   public contract ([docs/reference/MACHINE-API.md](docs/reference/MACHINE-API.md)).
 5. **Fail closed.** A missing or failed required PAD model is a
    password-fallback denial, never a spoof (ADR-0019). An unreadable or
    malformed `privileged_face_consent` keeps the confirmation (ADR-0018) and
@@ -225,7 +266,7 @@ cargo build --release --locked
    unless the owner set `privileged_face_consent=0`, which the daemon re-checks
    (ADR-0018). On-demand greeter and lock stacks arm on an empty Enter
    (`cosmic-greeter`: a hidden `yes`); `facefirst` and legacy `wait` stacks
-   scan without input ([docs/DESKTOP-AUTH.md](docs/DESKTOP-AUTH.md)). Mixed
+   scan without input ([docs/user/DESKTOP-AUTH.md](docs/user/DESKTOP-AUTH.md)). Mixed
    versions fail closed (ADR-0010).
 7. **Enrollment.** Authentication never adapts templates; only explicit
    enrollment adds them (ADR-0017); one face is one profile (ADR-0005); the
@@ -262,7 +303,7 @@ cargo build --release --locked
   or attach it to issues. Never add model weights to git: they come from the
   `models-v1` release, pinned in `models/SHA256SUMS` (the tracked
   `models/face_landmarks_detector.tflite` is the one exception). A new model is
-  permissive in code, weights and training data ([CONTRIBUTING.md](CONTRIBUTING.md)
+  permissive in code, weights and training data ([CONTRIBUTING.md](.github/CONTRIBUTING.md)
   "Ground rules for a security project", [models/README.md](models/README.md)).
 - No score, threshold value or similarity in the TUI, PAM prompts or the
   attempt record (ADR-0030 section 5), and none in a reply to anyone but root
@@ -280,28 +321,28 @@ cargo build --release --locked
   root beneath the 0700 root-owned `/var/lib/irlume` (subdirectories follow
   the unit's `UMask=0027`), and `/run/lock/irlume` is 2751 root:video on
   purpose (`packaging/tmpfiles.d/irlume.conf`); no face
-  image is stored ([docs/SECURITY_AT_REST.md](docs/SECURITY_AT_REST.md)). Device
+  image is stored ([docs/security/SECURITY_AT_REST.md](docs/security/SECURITY_AT_REST.md)). Device
   text goes through `journal_safe`, `printable` or `camera_display_name`;
   support reports stay share-safe (ADR-0008).
 - New dependencies: crates.io only, a `deny.toml`-allowed license, an audit
-  note in the PR ([docs/CODE_REVIEW.md](docs/CODE_REVIEW.md));
+  note in the PR ([docs/architecture/CODE_REVIEW.md](docs/architecture/CODE_REVIEW.md));
   `advisories.ignore` holds only advisories whose vulnerable code irlume
   never reaches, each with its rationale and a tracking issue
   (`scripts/generate-vex.py` maps the rationale to OpenVEX). Commit
   `Cargo.lock`, and `fuzz/Cargo.lock`
   when a dependency of common, core or camera changes.
 - Vulnerabilities go only to GitHub Private Vulnerability Reporting or the
-  address in [SECURITY.md](SECURITY.md). If you find one, stop and tell the human,
+  address in [SECURITY.md](.github/SECURITY.md). If you find one, stop and tell the human,
   who files it; describe it nowhere public (issue, PR, commit, branch name,
   CHANGELOG, public fork).
 
 ## Commits and pull requests
 
-- One change per PR; self-review against [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md).
+- One change per PR; self-review against [docs/architecture/CODE_REVIEW.md](docs/architecture/CODE_REVIEW.md).
   Weakening a guarantee (votes, budgets, modes, authorization posture) needs an
   ADR (CODE_REVIEW.md); other security-posture changes (grant arms, consent, rate
   limits, fallbacks) usually do, so sketch one in the PR early
-  ([CONTRIBUTING.md](CONTRIBUTING.md) "Changes that touch cameras, PAM, or the daemon").
+  ([CONTRIBUTING.md](.github/CONTRIBUTING.md) "Changes that touch cameras, PAM, or the daemon").
 - Subject `type(scope): summary` (scope optional), e.g.
   `fix(config): safe writes (ADR-0029 B1)`; types
   `fix feat docs perf ci test deps chore refactor bench build diag` (`git log`).
@@ -332,7 +373,7 @@ cargo build --release --locked
   adds the AI line, e.g. "AI assistance: a coding agent drafted the parser and
   tests; I reviewed every line and ran the gate." Describe the final change,
   not the session. A fork's first PR waits for workflow approval
-  (CONTRIBUTING.md "Pull request process").
+  (.github/CONTRIBUTING.md "Pull request process").
 - User-facing changes add a CHANGELOG entry under `## [Unreleased]`, in the
   matching `###` subsection (`Added`, `Changed`, `Fixed`, `Removed`,
   `Security`), newest first: one `- ` bullet, a blank line between bullets,
@@ -348,19 +389,19 @@ cargo build --release --locked
   commit signed off and the squash free of merge commits. A rebase or
   cherry-pick can duplicate `Signed-off-by`; recheck. Merging needs the seven
   required checks listed at the top of `ci.yml` (six jobs there plus
-  `dco.yml`'s) on the final head ([docs/CODE_REVIEW.md](docs/CODE_REVIEW.md))
+  `dco.yml`'s) on the final head ([docs/architecture/CODE_REVIEW.md](docs/architecture/CODE_REVIEW.md))
   and every review conversation resolved (branch protection on `main`). Answer
   automated review comments like a person's: fix, or say why not.
 
 ## Agents must not
 
 - Bump versions, create tags, or sign or publish releases
-  ([GOVERNANCE.md](GOVERNANCE.md), [docs/RELEASING.md](docs/RELEASING.md));
+  ([GOVERNANCE.md](.github/GOVERNANCE.md), [docs/architecture/RELEASING.md](docs/architecture/RELEASING.md));
   the `git commit -s` sign-off is still required.
 - Push, open or merge PRs, or post comments, unless the human asked.
 - Weaken, skip or delete a test to get green, `#[ignore]` a failing test, lower
   a `--min` floor or raise an exposure threshold.
-- Hand-edit `docs/HARDWARE.md` (generated from `docs/hardware/fleet-evidence.json`
+- Hand-edit `docs/reference/HARDWARE.md` (generated from `docs/hardware/fleet-evidence.json`
   and `known_control` in `crates/irlume-camera/src/ir_emitter.rs` by
   `scripts/generate-hardware-matrix.py`) or `schemas/fixtures/` (re-captured
   from an installed daemon before a release by `scripts/capture-machine-fixtures.py`).

@@ -1,0 +1,729 @@
+# Turning irlume off
+
+Three levels of off, in order of how much they remove: stop face on some
+surfaces, stop face everywhere, or remove irlume entirely. The password is
+always the floor underneath every one of these: PAM face lines are
+`sufficient` or `[success=1 default=ignore]`, so unwiring them can only take
+the shortcut away, never the login. Nothing on this page can lock you out.
+
+## See what is wired first
+
+```sh
+irlume login status
+```
+
+A dry run prints exactly what a change would touch without writing anything:
+
+```sh
+sudo irlume login disable        # no --apply: plan only
+```
+
+The surfaces irlume can wire, and what puts each in scope:
+
+| Surface | PAM service | Scope |
+|---|---|---|
+| Login greeter (GNOME, SDDM, LightDM, Plasma, COSMIC, greetd, ly) | `gdm-password`, `sddm`, `lightdm`, `plasmalogin`, `cosmic-greeter`, `greetd`, `ly` | default |
+| Lock screen (KDE) | `kde` | default |
+| Fingerprint keyring handoff (GDM) | `gdm-fingerprint` | default, where present |
+| Terminal privilege (`sudo`) | `sudo` | opt-in `--with-sudo` |
+| App consent prompts (pkexec, Bitwarden) | `polkit-1` | opt-in `--with-polkit` |
+
+Real `/etc/pam.d` files are backed up to `*.pre-irlume` before editing.
+Services a distribution ships only in `/usr/lib/pam.d` (plasmalogin,
+cosmic-greeter and polkit-1 on Fedora; greetd and gdm-password on Fedora 45;
+kde on Arch; sddm, gdm-password, lightdm and sudo on openSUSE Tumbleweed) get
+an `/etc` override created from the vendor copy. Its second line records the
+SHA-256 of the vendor file and of every line in the override except irlume's
+own: the lines whose module path is `pam_irlume.so`, and the `pam_permit.so`
+and `pam_gnome_keyring.so` lines irlume tags. A line that names
+`pam_irlume.so` only in an argument or a comment, such as a `pam_exec.so`
+check, counts as one of yours. irlume rebuilds an override nobody edited when
+the vendor file changes, so distribution updates still reach it. Where
+irlume's lines sit is not part of that record: if you move one of them in an
+override you did not otherwise edit, the next rebuild puts it back where
+irlume puts it.
+
+In an override that has lines irlume did not write, irlume changes only its
+own lines and does not rebuild it from a newer vendor file; `irlume login
+enable` shows how the two differ, and `sudo irlume login enable --apply
+--force` rebuilds it, keeping the previous file as `<file>.pre-irlume` (add
+`--with-sudo` or `--with-polkit` for those two services). It does not when
+irlume's lines would move a numeric jump the vendor file has (a `[success=1
+default=ignore]` just above its password line, say): it says why and keeps
+the override. Do not delete it to force a rebuild: the vendor file would
+take over without your local rules. Before any manual repair, save a
+root-only copy of the override. Compare it with the vendor file, preserve
+local rules and their ordering, and check where each jump lands. Preview the
+wiring and test password fallback in a separate session before relying on
+the repaired stack. irlume's lines keep their
+side of each of your lines: a faillock or group gate you put above irlume's
+line stays above it. A comment you add to a vendor line, or a blank or comment
+line, does not count as a line of yours; a copy of a vendor line does, and so
+does the vendor's own copy of it, since irlume cannot tell the two apart. An
+update that would move one of irlume's lines past one of yours, or change
+where a numeric jump in your lines lands (an `[success=2 default=ignore]` that
+counts irlume's lines), is not made: the file is kept as it is, `irlume login
+enable` says why and exits 1, and irlume's earlier lines stay in effect until
+you adjust your line or rebuild the file. When the only thing in the way is a
+numeric jump in brackets that irlume's new lines would land inside, such as
+`[success=1 default=ignore] pam_fprintd.so` right above the password
+substack, `irlume login enable` also says how `--adjust-jumps` would change
+that line, naming it by its number, and `sudo irlume login enable --apply
+--adjust-jumps` changes it together with irlume's lines. Each adjusted jump
+skips the same lines of yours as before, and irlume's lines among them, and
+lands on the same line as before. One action lands elsewhere, and the output
+says so: the `success` of a `pam_fprintd.so` line lands on irlume's
+`pam_permit.so` landing when irlume puts that line right after the last line
+the jump skips. For the line above, `success=1` becomes `success=2`: it skips
+irlume's face line and the substack, and the landing records the verified
+fingerprint's success, after which irlume's keyring and reseal lines run as
+before. Any other action, such as a failure (`default=1`) or the success of a
+`pam_succeed_if.so` group check, skips irlume's lines up to the line it
+landed on, since the landing would record a success that module did not
+earn. Only the digits of the jump change, so `[success = 1 default=ignore]`
+becomes `[success = 2 default=ignore]`. The output names each line by its
+number and never quotes one, since a module's arguments can hold a secret,
+and so does every message about a numeric jump irlume's lines would move or
+a line of yours they would move past: by its number in the file, or in the
+vendor copy an override is made or rebuilt from, and irlume's own lines by
+what they are.
+With a jump across an `include`, one past the end of the stack, a control
+not in brackets, or, on a disable, a jump that would land on the end of the
+stack once irlume's lines are out (it landed on one of them, with no line of
+its type after them), the flag does not change the jump either: an enable
+keeps the file, and a disable keeps inactive lines. The same holds with an
+`include` above irlume's lines whose stack has a
+numeric jump that could land past its end, or on the auth line irlume adds
+right after it (PAM puts the included lines in the include's place, so such
+a jump counts the lines after it, and no value in your file changes it;
+irlume reads the stack where PAM finds it, and one it cannot read counts), and with a `substack` whose file irlume cannot read
+where PAM finds it, or cannot read as PAM does: PAM counts a substack it
+cannot load as two modules, the substack and one that always fails. After a
+`disable` without the flag, which leaves inactive lines in irlume's places,
+an enable that would move such a jump cannot adjust it either, since those
+lines change as well: it says to run `sudo irlume login disable --apply
+--adjust-jumps`, which takes them out, and then `sudo irlume login enable
+--apply --adjust-jumps`, or why that disable would keep them too.
+
+A file with a line that ends in `\` is not changed at all (see `disable`
+below), with or without `--adjust-jumps`, and neither is one with a line
+PAM reads differently from how irlume would: a type PAM does not know (a typo
+such as `auht`, or a line led by a no-break space, vertical tab or form feed,
+which PAM reads as part of the type; PAM counts such a line in the auth stack
+as one that always fails), a blank other than a space or a tab between
+fields, a carriage return outside comments and valid closed bracketed
+controls (including CRLF line endings, which PAM reads as part of the line),
+a NUL byte, an `@include` without a file, a `substack` without a stack, or a
+module path PAM takes no module name from. `irlume login enable` names the
+line and exits 1, and no override is made from a vendor file with such a
+line; correct it (save the file with LF line endings) and run the command
+again. Every other line is
+read as PAM reads it: `[success = 1 default=ignore]`, blanks around `=`
+included, is the same jump as `[success=1 default=ignore]`. When irlume's
+lines are not in such a file at all (after a disable, or taken out by hand),
+`irlume login enable` puts them next to the file's password line (the
+`include` or `substack` of the shared password stack) and below every line
+above it; when it cannot tell which line that is, it leaves the file unwired
+and says so. A file with an auth line PAM runs as one that always fails (a
+type with no control, no module, or a control PAM rejects, such as
+`[success=bogus]`) is left unwired too, reported as having no anchor to wire:
+PAM fails the stack at that line, and a face line above it could end the
+stack before it.
+
+A login or lock screen stack that names no shared password stack irlume
+knows (no `substack`, no `include` of `system-auth`, `system-login`,
+`system-local-login` or `common-auth`, and no Debian `@include` of a file
+whose name starts with `common-auth` or `login`) is wired next to its first
+auth line only when that line is the password step, or an `include` of a
+stack whose first line is the password step. The password step is a
+`pam_unix.so`, `pam_unix2.so` or `pam_sss.so` rule (without pam_sss's
+`ignore_unknown_user` or `ignore_authinfo_unavail`) that counts a correct
+password (`ok` or `done` for `success`) and whose failure fails the stack:
+`required`, `requisite`, or a bracketed control with `bad` or `die` for
+every failure and no jump. Below the first auth line every auth line must
+be one of the modules that check no password (`pam_env.so`,
+`pam_nologin.so`, `pam_faillock.so`, `pam_succeed_if.so`, `pam_permit.so`,
+`pam_deny.so` and the like, or a keyring module), with no `include` or
+`substack`, and a Debian `@include` only of `common-account`,
+`common-password`, `common-session` or `common-session-noninteractive`.
+PAM reads such a file into the auth stack too, so irlume reads it where
+PAM finds it and holds its auth lines to the same rule. Otherwise
+`irlume login enable` reports `no anchor to wire` for it: irlume's lines
+are designed to follow the password step and a line whose failure fails
+the stack. A file that still holds lines an earlier release wired around
+an anchor that no longer qualifies (ly and cinnamon-screensaver's
+`auth include login`, whose stack starts with `pam_nologin.so`) loses
+them, taken out as `login disable` takes them out, with the same checks
+for the jumps that count them, and both facts are reported: a stack
+irlume edits in place is stripped (a matching backup restored as a
+disable restores it), an irlume-created override nobody edited is removed
+with the vendor copy restored, and one an administrator put lines in is
+kept and loses irlume's lines only. A file without irlume's lines is
+left as it is. An unreadable auth rule can still contain the anchor PAM
+reads, so enable leaves irlume's lines in place until the rule is corrected
+instead of treating that anchor as absent.
+
+PAM puts the lines of an included stack in the include's place, and
+irlume's face line jumps over the first of them onto its landing after the
+include, so a face match stands in for that one line and every other line
+of the stack still runs, gates such as `pam_nologin.so` included. irlume
+reads the included stack where PAM finds it (`/etc/pam.d`, then
+`/usr/lib/pam.d`), with the stacks it includes in turn, four deep at most,
+and takes the include only when the first of those lines is the password
+step (or the shared password `substack` irlume knows), the others follow
+the rule for lines below the first auth line, and none jumps or `reset`s;
+a stack irlume cannot read or does not read as PAM does leaves the file
+unwired. LightDM on openSUSE (`auth include xdm`, whose first line is the
+password substack) and on Alpine (`auth include base-auth`, `pam_unix.so`
+first) are wired that way. ly and cinnamon-screensaver on Arch, whose
+`login` checks `pam_nologin.so` first, are left unwired; such a stack that
+an earlier release wired loses irlume's lines, taken out by the next
+enable or reconcile as described above.
+
+An override written by a release before this tracking gets the line at the
+first reconcile when it still matches its vendor copy. One that no longer
+matches (the vendor file changed after irlume wrote it, or you added a line)
+is kept as it is and reported by `irlume doctor` (check `login-overrides`);
+`sudo irlume login enable --apply --force` rebuilds it the same way. That
+includes one that only lacks lines a later vendor file added, since irlume
+cannot tell those from lines removed on purpose.
+
+If a package removes the vendor copy, the override is the service's only
+configuration: irlume then updates its own lines in place and never deletes
+the file. In one nobody edited, irlume's lines go where a rebuild from that
+file would put them. In one with lines you added, irlume cannot tell yours
+from the vendor's without the vendor file, so it moves none of its lines past
+any line; `irlume login enable` says so, and putting the vendor file back
+(reinstalling its package) lets it tell them apart again.
+
+PAM reads a carriage return as part of the line, so in a file saved with
+CRLF line endings a module or stack named last on a line is one PAM does not
+find, and a blank line is one that always fails. irlume adds nothing to such
+a file: `irlume doctor` reports an override with them, and `irlume login
+enable` names the first such line. Save the file with LF line endings and run
+it again. Carriage returns only in comments change nothing PAM reads, and
+irlume's next write drops them.
+
+## Stop face everywhere
+
+```sh
+sudo irlume login disable --apply
+```
+
+This unwires every greeter and the lock screen, and removes the `sudo` and
+`polkit-1` lines whether or not you opted in originally.
+
+While any account's GNOME login keyring is keyed to an irlume token
+(`irlume keyring status` says so), the disable refuses and changes nothing.
+The session line it removes is what hands that token to the keyring, and
+without it the keyring stays locked at every login, a typed password
+included, under a secret nobody has seen. Token disarm is unavailable, so
+there is no supported removal path for such a token; `--force` bypasses
+this wiring guard only, removing the session line without migrating the
+keyring, which then stays locked. A
+`login enable` that would unwire such a login screen, because the
+configuration no longer wants face or fingerprint there, refuses the same
+way, and so does the reconcile unit. A machine-API `login apply` of either
+action, or a `login rollback --apply` that would restore a stack without that
+line, refuses as `keyring-token-armed`.
+
+The dry run (`irlume login disable` without `--apply`) names the same
+refusal only when it can read the sealed-envelope store. Run without root on
+a packaged install it cannot, since the store is root-only, so it says that
+`--apply` will check as root and shows the plan without having checked; run
+it with `sudo` to see the answer.
+
+The disable also:
+
+- restores the original stacks (moves the `.pre-irlume` backup back, or
+  deletes the `/etc` override so the vendor file shows through again). An
+  override with lines irlume did not write is kept instead: irlume removes
+  only its own lines from it, prints how it differs from the vendor copy, and
+  leaves the file for you to delete. When a numeric jump in your lines counts
+  irlume's lines, removing them would make it land elsewhere, so irlume turns
+  them into inactive `pam_permit.so` lines tagged `# irlume-inert` in the
+  same places instead; the stack then runs as it does when irlume's module
+  declines, and a later `disable` removes them once the jump no longer
+  counts them. A stack irlume edits in place (an `/etc` file with no vendor
+  copy, such as `sudo` or `polkit-1` on Debian, Ubuntu and Arch) gets the
+  same treatment when there is no backup to restore, and while the jump
+  counts the inactive lines, the next `enable` puts irlume's lines back in
+  their places; when they no longer fit there, it leaves the stack as it
+  is and exits 1 rather than move the jump. For an override irlume does
+  the same when it could not tell where to put its lines back without
+  them (the file has no password line irlume can tell from one of yours,
+  such as a copy of the vendor's), so the next `enable` puts them back in
+  the same places. If the machine's configuration changed in between (for
+  example an RGB-only camera no longer does face login), that `enable`
+  turns on the lines it still uses in their places and leaves an inactive
+  line where one is no longer used, so your jump still lands where it
+  did. In an override where a numeric jump of yours counts irlume's lines
+  or lands on one of them, `disable --adjust-jumps` removes them instead
+  of leaving inactive lines: a jump that counts them is lowered by the
+  lines it took out, so it skips the same lines of yours as before and
+  lands on the same line, and a jump that landed on one of them lands on
+  the first line after them. After an `enable --adjust-jumps` that gives
+  the jump back the value you wrote, unless that value already counted
+  irlume's lines, such as the keyring lines of a machine without face
+  login: then it gets the value that lands on the same line without them.
+  The plain `disable` says how the flag would change the line, naming it
+  by its number, and the flag keeps the inactive lines when irlume cannot
+  show that (see `enable` above). An
+  `enable` takes irlume's lines
+  out the same way from a login screen or lock screen its configuration no
+  longer wants them in (face login turned off, say), and there
+  `enable --adjust-jumps` does what `disable --adjust-jumps` does for that
+  file. A numeric jump from the vendor file that irlume's lines had moved
+  lands where the vendor file has it again once they are removed, and
+  `disable --adjust-jumps` leaves it as the vendor wrote it, also where it
+  skips or lands on a jump of yours the flag lowers, and names the line it
+  lands on now. A file
+  with a line that ends in `\`, which PAM joins with the next line into
+  one rule, is left as it is, irlume's lines
+  included: taking out one physical line of it can make the rule before it
+  take in the next one, the password line included. `disable` says so and
+  exits 1; join those lines or take irlume's lines out by hand. From a
+  file with a line irlume does not read as PAM does (see `enable` above),
+  `disable` takes irlume's lines out and keeps every other byte, carriage
+  returns included, when nothing in the file could count irlume's lines:
+  no numeric jump above one of them, and no `include` or Debian `@include`
+  above one of them whose stack has a numeric jump that could land past
+  its end. PAM puts the included lines in the include's place, so such a
+  jump counts the lines after it; irlume reads each stack where PAM finds
+  it, and one it cannot read counts. Otherwise it leaves the file as it
+  is, names that line and exits 1. An override nobody edited is still
+  deleted, and a backup that is the file without irlume's lines still
+  restored. An override whose vendor copy
+  is gone is kept the same way, since PAM has nothing else for that
+  service,
+- removes the SELinux module on Fedora (`semodule -r irlume`, checked: a
+  failure is reported, not papered over),
+- clears the self-heal marker, so the reconcile unit stops re-wiring after
+  distro PAM updates.
+
+Enrollment data and the daemon stay in place; re-enabling later is one
+command and no re-enrollment.
+
+While login is enabled, deleting irlume's `/etc` override for the active
+login screen, the KDE lock screen, `sudo` or `polkit-1` does not turn face off
+for that service: the reconcile unit treats the missing file as a regression
+and creates it again from the current vendor copy. That is a way to reset one
+of those overrides to the vendor file. An override for a login screen that is
+not the active one is not re-created until the next `irlume login enable`. To
+go back to the vendor files for good, run `sudo irlume login disable
+--apply`.
+
+To keep the wiring but stop the automatic re-apply, disable the three
+reconcile units:
+
+```sh
+sudo systemctl disable --now irlume-reconcile.path irlume-reconcile.timer irlume-reconcile.service
+```
+
+Package upgrades leave them disabled (or masked) and run no reconcile then.
+A fresh install enables all three, and so does an Arch upgrade from before
+0.6.1. An upgrade from before 0.7.0, the release that added the timer, also
+enables and starts the timer once, and the timer starts
+`irlume-reconcile.service` even while that is disabled: after such an
+upgrade, run the command above again.
+
+When LightDM's remote-seat check blocks face authentication, reconciliation
+first deactivates its existing `pam_irlume` authentication and credential-release
+rules, before waiting for irlumed or querying capabilities. Each rule becomes
+an inert slot, so numeric PAM jumps keep their positions. Existing reseal
+lines and other services stay untouched by this safety pass. A continued or
+unrecognized PAM line, a link, or an explicit non-inert `PAM_IGNORE` action
+refuses the rewrite and is reported. If capabilities remain unavailable,
+reconcile exits 1 after the safety pass; it does not refresh overrides or add
+or restore authentication rules.
+
+When irlume's LightDM units are installed, LightDM also runs against a
+private, read-only PAM view: `irlume-lightdm-prepare.service` rebuilds it from
+the configuration LightDM is about to load before every start, and while
+XDMCP or VNC is enabled the view replaces `pam_fprintd` and irlume's
+credential rules with inert slots without rewriting the shared stacks.
+Removing irlume takes the `lightdm.service.d` drop-in and the view units away
+with it, and `irlume uninstall` removes its own copies; after the manager
+reloads its unit files, LightDM starts on the ordinary shared stacks again.
+The universal Debian package reloads systemd after removal or purge and stops
+the refresh units without stopping LightDM. If removing a drop-in by hand,
+run `sudo systemctl daemon-reload` before the next LightDM start.
+Runtime view files under
+`/run/irlume-lightdm` stay until reboot so sessions that inherited the view
+keep working.
+
+## Keep some surfaces
+
+Turn everything off, then re-add only what you want:
+
+```sh
+sudo irlume login enable --apply                 # greeter + lock screen only
+sudo irlume login enable --with-sudo --apply     # add face-sudo back
+sudo irlume login enable --with-polkit --apply   # add app prompts back
+```
+
+On RGB-only cameras (no IR pair), face already satisfies the lock screen
+only; greeter and `sudo` keep the password regardless of wiring.
+
+## Stand face down without touching PAM
+
+To leave the wiring intact but have the daemon refuse face so another factor
+drives:
+
+```sh
+sudo irlume fingerprint enable --fingerprint-only
+```
+
+This records method `fingerprint`, and irlume's face recognition stands down.
+The command refuses unless an active `pam_fprintd.so` line is reachable from
+a tracked surface, so face never goes quiet while every prompt is actually
+password-only. To put face back:
+
+```sh
+sudo irlume fingerprint disable
+```
+
+## Canceling a scan that already started
+
+- **Type instead of confirming face.** With privileged confirmation enabled,
+  where irlume asks, typing picks the
+  password path before the camera powers up: probing greeters (SDDM,
+  plasmalogin style, COSMIC's on-demand mode) treat any typed characters as
+  "password", and privileged prompts (`sudo`, polkit) treat anything other
+  than the literal `yes` as "password". Automatic GNOME wiring is on-demand
+  for detected GNOME 46+ (measured on 50, inferred for 46–49). Older or
+  undetected GNOME uses face-first and scans on account selection. Once a
+  scan starts, typing is not a universal immediate switch to password.
+- **Desktop cancellation depends on the frontend.** Stock KDE installations do
+  not automatically provide a parallel face lane that stops on typing. The
+  proposed frontend integration is not shipped by this package; see
+  [desktop authentication boundaries](DESKTOP-AUTH.md).
+- **Close or cancel whatever asked.** Escape, a dialog's Cancel button, or
+  Ctrl+C can end the request when the frontend closes its PAM worker or socket.
+  Merely returning a cancellation error from a synchronous PAM conversation
+  does not interrupt a daemon request already in progress. The daemon checks
+  disconnects cooperatively; physical camera release also depends on the active
+  capture operation. There is no universal quarter-second stop guarantee.
+- **In `irlume tui`:** Esc cancels guided enrollment immediately; q or Esc
+  backs out of a stalled identify or self-test instead of trapping you.
+- **If you just wait:** default admission windows are 15 seconds for login/lock
+  and 10 seconds for short privileged services. When the pair's stored
+  qualification selects a bounded PAD collection, the
+  `privileged_grouped_pad_evidence` route (on by default) extends the latter
+  to 15 seconds;
+  `IRLUME_GRACE_MS` overrides either. These are admission deadlines, not fixed
+  attempt counts or physical camera-off guarantees. See [bounded attempts and
+  cleanup](DESKTOP-AUTH.md#bounded-attempts-and-cleanup).
+
+Face verification and face-gated credential release share a durable per-account
+budget. Before engine work, the daemon reserves one charge for the request;
+internal presence retries, grouped capture and fallbacks share it. The 50th
+charged request can still succeed. If 50 charges remain recorded when another
+face request arrives, the daemon refuses it until a password-verified retry
+reset or an administrator reset clears the count. Irlume's retry limits do not
+block ordinary password login. When the daemon admits a face grant and writes it
+in full, it attempts to reset the count.
+
+Once a request is reserved, cancellation, errors, interruption and completed
+no-face/setup outcomes retain its cumulative charge. Separately, the short
+throttle defaults to a 30-second cooldown after five qualifying strikes.
+No-face and uncertain-evidence outcomes do not consume short strikes; hard spoof
+and below-threshold rejections do. An abandoned reservation conservatively adds
+one short strike when it is next observed.
+Missing or empty enrollment, scans belonging only to a different recognition
+model, a retired eyes-open setting, and invalid or retired consent settings end
+the request without adding or clearing strikes. Fixing those
+settings does not erase earlier face rejections or cancel an active cooldown.
+Camera-binding refusals, PAD failures and grouped
+capture timeouts retain their existing strike behavior.
+
+When the cooldown ends, short strikes start counting from zero; the cumulative
+request count stays in place. This is not a rolling rate limit or a delay before
+every later face request. Both controls survive daemon restarts; profiles,
+modes and PAM services for one Linux account share them. Ordinary password
+login does not reset the count; see
+[password-verified retry reset](#password-verified-retry-reset).
+
+These controls protect local authentication.
+[NIST SP 800-63B-4](https://pages.nist.gov/800-63-4/sp800-63b/introduction/)
+addresses authentication over a network.
+
+### Persistent retry records
+
+The daemon stores version-2 records in `/var/lib/irlume/retry/<uid>.json`.
+The directory is root-owned mode 0700; files are root-owned mode 0600. A record
+contains the account UID/name, short strikes, cumulative count, pending request
+flag, and an optional monotonic
+clock deadline, boot identifier and original cooldown duration. It contains no
+biometric data or credentials. The retry location is fixed; enrollment path
+overrides do not redirect it. The explicit `irlume retry reset` command can reset
+these records after independently verifying the account password, as described
+below; ordinary password login does not notify the counter.
+
+A daemon restart in the same boot keeps the original deadline. Civil-clock
+changes do not affect it. After reboot, partial failures remain and a recorded
+cooldown starts again for its original duration; this can extend the wait.
+`IRLUME_RATE_LIMIT` accepts 1–5; `IRLUME_RATE_COOLDOWN_SECS` accepts 30–86400.
+Invalid values, including zero, use safe defaults (5 and 30 respectively) with a
+fixed diagnostic. These settings cannot disable or increase the cumulative limit.
+
+The first reservation starts an explicitly prospective epoch for a missing or
+strictly valid version-1 record, preserving its short strikes/cooldown. Earlier
+cycles cannot be reconstructed and are not counted or presented as known.
+Status does not migrate records; it distinguishes unknown legacy history from a
+known zero count. Existing malformed, oversized,
+unreadable, wrongly owned or unsafe records refuse the face path with a password
+fallback message. UID/name mismatches also refuse: a reused UID or renamed
+account must be reconciled by an administrator. No engine work starts until its
+reservation is durably committed. The daemon holds the account lock through
+response delivery. For a face grant, the daemon attempts to reset the count
+only after final admission and a successful write and flush.
+A crash after delivery but before reset can conservatively retain a charge.
+A failed reset after delivery cannot retract the grant; the next
+operation re-reads and synchronizes authoritative disk state. Admission checks
+the original window immediately before the first byte and bounds the write
+timeout to remaining time where possible; partially written bytes cannot be
+retracted if cancellation or expiry arrives during the write.
+
+For face requests, `face retry state is busy` reports temporary unavailability,
+not a diagnosis of damaged records or proof that another face scan is running.
+For example, an earlier face reply or a retry-status/reset operation may still
+own the account lock. Use your password or try again later; do not repair,
+delete or reset history solely because of this message.
+
+For repair, use password authentication and inspect `journalctl -u irlumed`.
+Stop `irlumed.socket` and `irlumed.service` while correcting the affected
+record's ownership, permissions,
+account binding or malformed content; preserve the count and deadline whenever
+they can be established. Inspect the exact UID with `id -u <account>` and do not
+follow symlinks or change other users' records. Removing the affected record is
+an explicit root reset of its history; do so only if the administrator intends
+that reset, then start the socket and daemon. Corrected state is re-read automatically.
+Version-1-only daemons refuse version-2 records; older daemons without persistent
+retry support do not enforce this limit. Do not delete records or restore older,
+smaller counts as part of a binary rollback.
+
+Write-ahead charges survive crashes and reboot, but cannot resist root deletion
+or disk rollback. The TPM does not count face attempts
+([ADR-0034](../architecture/adr/0034-attempt-limiting-stays-in-software.md)), so these records
+are the only count: they resist neither root, nor an offline change of
+`/var/lib/irlume`, nor a boot of an older or writes-discarded copy of it on a
+boot chain the seal accepts. Full-disk encryption unlocked by a passphrase or
+PIN under `/var/lib/irlume` narrows the last case to boots that someone who
+knows the secret unlocks, but gives the records no freshness; a verified root
+or a pcrlock policy does not narrow it. Fifty bounds requested composite
+authentication decisions, not individual frames/comparisons or a qualified
+false-accept probability. The independent reset-password budget below also
+reserves before verification.
+
+### Password-verified retry reset
+
+```sh
+irlume retry status
+irlume retry reset
+sudo irlume retry reset --user <account>   # explicit administrator override
+```
+
+`status` inspects face and reset-password counters without requesting a camera
+or password. `reset` probes daemon support and the recovery gate before asking
+for the current login password without terminal echo. Non-root requests are
+limited to the caller's own account. Successful independent password verification
+clears the face retry record and the reset-password budget; it does not change
+the login password, enrollment, template key, or consent settings. A root reset
+is an explicit administrative action and does not ask for the account password.
+Malformed or unsafe records still require the repair procedure above.
+
+A reset commits the face state first, then clears the reset-password budget.
+Interruption or a storage failure between these writes can clear face history
+while retaining a conservative password-check charge. If the command cannot
+confirm the reset, run `irlume retry status` before trying again.
+
+This path requires an updated daemon and the packaged root-only password verifier
+with its fixed `irlume-retry-reset` PAM service. The initial backend is local
+Linux passwords through `pam_unix`; LDAP, SSSD and systemd-homed accounts are not
+qualified. Self-service reset is unavailable under enforcing AppArmor in this
+release. Keep normal password login available and ask an administrator when
+status reports reset unavailable. An older daemon is refused before prompting;
+updating the client alone does not add recovery support.
+
+Password verification for a retry reset has a separate budget stored in
+`/var/lib/irlume/retry/<uid>.reset.json`, with the same private ownership and
+permissions as face records. After five failed checks, each further check needs
+a 30-second wait; the wait never erases failures. At 50 failed checks, an
+administrator must reset the budget. A verification attempt is charged durably
+before the helper runs, so interruption or unknown completion also consumes an
+attempt. This budget survives daemon restarts; reboot can restart its recorded
+cooldown. These checks do not spend the separate face-request budget or limit
+ordinary password login.
+
+`irlume recovery restore` is separate: it uses the recovery passphrase to restore
+the template key and never clears retry counters. A desktop/polkit approval or
+an already open keyring also does not satisfy password verification for retry
+reset. Keep both face and reset-password records when rolling back binaries;
+older daemons do not offer this reset path or enforce the reset-password budget.
+
+## Remove everything
+
+```sh
+sudo irlume uninstall            # add --keep-data to preserve enrollment
+```
+
+Before confirming, preserve the configuration and store evidence described
+under [Manual uninstall recovery](#manual-uninstall-recovery). The uninstaller
+does not save that inventory for you.
+
+After confirmation, teardown records a durable retention barrier, resolves one
+daemon/store snapshot, and un-wires PAM. It stops the daemon and its known
+activation units, checks that execution did not change, disarms non-token
+keyring seals, and wipes enrollment/state/configuration unless `--keep-data`.
+Unit disabling/removal waits for cleanup success. Only then does `uninstall`
+remove the package through its manager, or remove a source installation itself;
+you do not need a second package-removal command after success.
+
+If PAM cannot be unwired, a store cannot be read or removed, or daemon identity
+changes, installation removal is refused. **Fixing that error and running the
+command again is not sufficient when the retention record is retained.** A PAM
+or configuration refusal can occur after the barrier was recorded but before
+any store was removed. Follow the manual procedure below; do not bypass the
+refusal with a package manager while PAM still references the module.
+
+The teardown reads the keyring stores again once irlumed has stopped. If that
+read finds a GNOME keyring token, or cannot complete, it refuses with the data
+in place, PAM un-wired and irlumed stopped; a token is then not delivered at
+login. A reboot brings irlumed back, since the units keep their enabled state
+until the teardown's last step. So does `sudo systemd-tmpfiles --create
+irlume.conf` (it recreates `/run/lock/irlume`, which the teardown removed)
+followed by `sudo systemctl start irlumed.socket`; a source install has
+neither `irlume.conf` nor a socket unit, and there
+`sudo systemctl start irlumed` alone does it. Then wire login again with
+`sudo irlume login enable --apply` and the options used before. The reconcile
+units the teardown stopped start again at the next boot. The retention record
+stays as it is, and the manual procedure below applies before another
+uninstall attempt.
+
+`--keep-data` preserves enrollment, template-key/recovery state and application
+configuration (normally `/etc/irlume`); it does not skip keyring disarm or preserve
+service units/drop-ins. Program files, packaged models and contributor camera
+profiles are removed with the application. GNOME token holders cannot uninstall
+yet: token disarm is unavailable, so the refusal directs them to retain the
+envelopes and their working delivery path until a supported keyring migration
+exists, and not to delete the token files manually. A successful retained-data
+removal may exit 0, but its **WARNING names the retained record and the resulting
+refusal of later uninstall attempts**, even with `--yes` or `--keep-data`.
+An intentional envelope-directory override can retain the SRK and record too.
+Neither application removal nor a reinstall automatically resets that record.
+
+Deliberate residuals include the persistent synchronization/retention file
+`/var/lib/irlume-uninstall-srk-retention`, and the Bitwarden polkit action when
+present (`irlume bitwarden setup --apply` writes Bitwarden's own policy file).
+The retention file remains even when clean; do not unlink its lock-bearing
+inode. Kept state keeps its TPM storage root keys (SRKs). A fully completed,
+eligible wipe attempts their eviction: the original key at its handle, and
+the DA-exempt key of ADR-0034 §3 at any owner handle, each only when a fresh
+derivation of its template gives the same key. Both go through the TPM
+irlumed uses: its unit's `IRLUME_TCTI`, and its `IRLUME_SRK_HANDLE` for the
+original key, checked against the running daemon (#1088). The results are
+reported separately, with that transport and handle.
+Journald logs, filesystem snapshots and backups also survive.
+
+### Manual uninstall recovery
+
+The retention file contains only a versioned state bit. It contains **no phase,
+failure reason, historical configuration, store paths or envelope inventory**.
+There is no automatic recovery, force-reset option or safe inventory guess.
+
+The file holds exactly one of these ASCII lines, not both, ending in one newline:
+
+```text
+irlume-uninstall-srk-v1: retain
+irlume-uninstall-srk-v1: clean
+```
+
+`retain` blocks another destructive teardown. The confirmed teardown writes and
+syncs it before its unit/store observation or PAM changes; an early refusal or an
+interruption therefore leaves it. Successful `--keep-data` and intentional
+override keeps can leave it as well. An existing empty record is also uncertain.
+Malformed or unsafe records refuse rather than authorizing cleanup. `clean`
+means the record does not itself block a fresh attempt; it does not prove that
+the TPM eviction succeeded or that no other data exists.
+
+Argument/root checks, cancellation and the initial token-store preflight occur
+before this attempt creates the barrier. Such a refusal does not create a new
+record, but it can coexist with a retained record from an earlier attempt. Do
+not infer its state from the exit code, current unit contents or file absence
+after a suspected loss of the record.
+
+**Preserve evidence outside every wipe tree before a confirmed attempt.** Keep
+private, access-controlled configuration history and records of:
+
+- the relevant earlier and current unit/drop-ins and environment-file settings;
+- resolved `IRLUME_STATE_DIR`, `IRLUME_KEYRING_DIR`, `IRLUME_RECOVERY_DIR` and
+  `IRLUME_TEMPLATE_KEY_DIR` selections, including defaults, manager inheritance
+  and the CLI's overrides where applicable;
+- the roots from source installs and account homes, separate envelope stores,
+  and any observed moved/replaced directories, including device/inode and
+  ownership facts needed to locate them;
+- the refusal/output and which configuration and daemon execution were being
+  used before a deployment change or stop.
+
+Record paths and non-secret metadata, not envelope contents, passwords, tokens
+or biometric material. Exclude unrelated secrets from configuration copies and
+do not publish the evidence in support reports. A new vendor unit or an empty
+current store does not account for an earlier custom store.
+
+For a retained or uncertain record, an administrator may authorize another
+teardown only through this procedure:
+
+1. Preserve the evidence and existing record. Reconstruct **every earlier store
+   implicated by the retained attempt**, including both sides of a deployment
+   change or a directory move. If the evidence cannot be reconstructed, **do not
+   clear the barrier: retain the data and SRK**. Fixing only the latest PAM error
+   or unlink failure is not reconciliation.
+2. Account for surviving envelopes and their owners. Restore the appropriate
+   configuration/store references, or perform an explicitly authorized cleanup
+   that accounts for those stores. Do not mark the record clean while a surviving
+   earlier store would be outside the next teardown's verified discovery. Do not
+   improvise envelope moves or delete a token envelope: token disarm is
+   unavailable, and that envelope holds the only copy of the secret its owner's
+   keyring opens with. irlume has no command that removes a token envelope,
+   including one recorded for an account whose name was reused. After
+   `--keep-data`, retained state still needs its SRK.
+3. Coordinate a maintenance window: stop additional uninstall attempts and
+   independent deployments/store writers. Ensure the previous uninstall and
+   any package transaction have finished. Preserve needed running-daemon store
+   evidence before stopping or changing it. The record lock serializes teardown
+   participants; it does not freeze unrelated writers or a package manager.
+4. Use an FD-based administrative tool on the **existing inode**. Pin it with
+   `O_PATH | O_NOFOLLOW`; verify a root-owned, private (`0600`), single-link regular
+   file under its root-controlled parent. Reopen the pinned descriptor read-write
+   through `/proc/self/fd`, **without truncating**, and acquire an exclusive
+   `flock` on that read-write descriptor (`LOCK_EX | LOCK_NB`; stop if busy).
+   Recheck that the named path still identifies the held device/inode and that
+   the ownership/type/link conditions still hold. If any check fails, stop and
+   investigate rather than replacing the object.
+5. Keep that lock while revalidating the reconstructed inventory and stable
+   configuration. Only after the preceding conditions hold, seek to offset zero
+   on the same descriptor, write the complete `clean` line shown above, truncate
+   to that newline-terminated payload's exact byte length, and `fsync` that same
+   descriptor. Check every operation and read back the exact line under the
+   lock. On an error, treat completion as unverified; retain data/SRK and do not
+   launch another teardown. Release the lock only after completion is confirmed.
+6. A later `sudo irlume uninstall` is a **new attempt**, not a resumed transaction.
+   It records `retain` again before observation and revalidates current state.
+   Another refusal or intentional keep can require manual reconciliation again.
+
+**Never unlink, rename, replace, recreate or atomically editor-save the record
+to reset it while an uninstaller may hold it.** Do not use shell redirection or
+an open-with-truncation before taking the lock. Removing/replacing the name
+creates another lock inode and can let a second process bypass the first holder;
+it also discards the uncertainty the record preserves. This procedure supplies
+no automatic bit-reset command: the inventory decision must come from the
+administrator's preserved evidence.
+
+## Verify
+
+After any change here, confirm with `irlume login status` (nothing should
+list as wired), then lock and unlock the screen once with your password.
+`irlume doctor` re-checks the PAM stacks and SELinux state if anything reads
+odd. See [SETUP.md](SETUP.md) for the wiring walkthrough this page reverses,
+and [DEBUGGING.md](DEBUGGING.md) if a login misbehaves after a change.

@@ -8,7 +8,7 @@
 //! FairFace within-group FMR is at or under 1e-4 for two of seven groups
 //! (Indian 9.5e-5, White 6.8e-5) and 1.4e-4 to 4.2e-4 for the other five
 //! (`docs/recognition-results/data/ff-*-aura.txt`); about 0.69 holds 1e-4 for
-//! every group (docs/FAIRNESS.md). LFW grouped by identity gives 2e-5 at 0.55;
+//! every group (docs/security/FAIRNESS.md). LFW grouped by identity gives 2e-5 at 0.55;
 //! the mandatory password fallback bounds the residual. See the `RGB` threshold
 //! constant below for the measured numbers. Threshold is NOT ported from
 //! linhello (0.60): AuraFace's score scale differs; derive it from a
@@ -93,7 +93,7 @@ pub(crate) fn test_tmp_dir(name: &str) -> String {
 /// by identity (13,233 images, 5,749 identities, 242,257 genuine and 87,307,271
 /// impostor pairs, same pipeline as production) gives 3e-5 @ 0.50 and 2e-5 @
 /// 0.55 (docs/recognition-results/data/lfw-aura.txt). The all-pairs rates,
-/// 2.3e-3 @ 0.50 (docs/VERIFY.md section 5) and about 2.0e-3 @ 0.55 from the
+/// 2.3e-3 @ 0.50 (docs/security/VERIFY.md section 5) and about 2.0e-3 @ 0.55 from the
 /// counts above, include the genuine pairs among all 87,549,528: an upper
 /// bound, not an impostor rate. Synthetic SFHQ, first 15,000 images,
 /// 112,492,500 pairs: 4.71e-4 @ 0.50 and 1.43e-4 @ 0.55
@@ -101,7 +101,7 @@ pub(crate) fn test_tmp_dir(name: &str) -> String {
 /// before named no subset and could not be reproduced
 /// (docs/recognition-results/2026-08-05-buffalo-l.md). **Set to 0.55** for
 /// demographic headroom: on FairFace no group holds FMR≤1e-4 at 0.50 (White is
-/// closest at 1.05e-4) and ~0.69 holds it for every group (docs/FAIRNESS.md);
+/// closest at 1.05e-4) and ~0.69 holds it for every group (docs/security/FAIRNESS.md);
 /// at 0.55 two of seven groups do
 /// (`docs/recognition-results/data/ff-*-aura.txt`). The change to 0.55 (commit
 /// 11cf4a9e) judged from the live genuine floor that it adds no false-rejects;

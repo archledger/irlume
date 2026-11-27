@@ -51,7 +51,7 @@ jobs:
     targets:
       - fedora-stable
 
-  # The nightly channel (docs/adr/0037-nightly-channel.md): every push to
+  # The nightly channel (docs/architecture/adr/0037-nightly-channel.md): every push to
   # main builds into its own Copr project, never the release one. Packit's
   # default Release suffix (build time, branch, commit) sorts each build above
   # the release of the same Version and above the build before it. The

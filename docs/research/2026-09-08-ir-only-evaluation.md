@@ -175,7 +175,7 @@ supported camera/model configurations.
 
 ## Contributor qualification
 
-Use the [IR-only qualification protocol](../IR_ONLY_QUALIFICATION.md) and its
+Use the [IR-only qualification protocol](../security/IR_ONLY_QUALIFICATION.md) and its
 [campaign record](ir-only-campaign-template.md) before making deployment claims.
 The current diagnostic is available for evaluation; empirical acceptance-arm
 coverage remains open. A [portable contributor harness](../../scripts/ir-evaluation/README.md)

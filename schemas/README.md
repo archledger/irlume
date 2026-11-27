@@ -8,6 +8,11 @@ the engine that implements it are never a version apart on a user's machine.
 Validate against the copy your engine shipped, not against a copy from a
 different release.
 
+The [generated reference](../docs/reference/SCHEMAS.md) summarizes the schema
+shapes. Refresh it with `python3 -B scripts/ci/sync-docs.py` from the repo
+root after changing a schema. The [Machine API](../docs/reference/MACHINE-API.md)
+documents how to interpret the fields and lists the doctor check IDs.
+
 ## The schema allows properties it does not describe
 
 Fields may be added within a contract version, so the schema does not close its

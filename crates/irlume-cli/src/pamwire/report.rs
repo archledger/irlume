@@ -580,14 +580,14 @@ mod tests {
 
     /// With nothing wired, `login status` names the command that wires a
     /// login surface, except on NixOS, where that command refuses and the
-    /// hint names the module and docs/NIXOS.md.
+    /// hint names the module and docs/user/NIXOS.md.
     #[test]
     fn the_enable_hint_names_the_module_on_nixos() {
         let hint = enable_hint(false);
         assert!(hint.contains("sudo irlume login enable --apply"), "{hint}");
         let hint = enable_hint(true);
         assert!(
-            hint.contains("services.irlume.pam.services") && hint.contains("docs/NIXOS.md"),
+            hint.contains("services.irlume.pam.services") && hint.contains("docs/user/NIXOS.md"),
             "{hint}"
         );
         assert!(!hint.contains("irlume login enable"), "{hint}");

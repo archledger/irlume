@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
-"""Check that an irlume build answers contract 1 the way docs/MACHINE-API.md says.
+"""Check that an irlume build answers contract 1 the way docs/reference/MACHINE-API.md says.
 
 Written for consumers, not for this repository: it needs Python 3 and an irlume
 binary, no Rust toolchain and no irlume source tree. A desktop integration can
@@ -87,7 +87,7 @@ STREAMING_CAPABILITY_REFUSALS = {
 }
 
 # Commands whose output must never contain these, per the security and privacy
-# section of docs/MACHINE-API.md. Camera device nodes and PAM file paths are the
+# section of docs/reference/MACHINE-API.md. Camera device nodes and PAM file paths are the
 # two that a well-meaning addition would most plausibly reintroduce. Both camera
 # spellings are listed separately, since neither is a prefix of the other. The
 # census explicitly publishes video nodes in its entries; only that field is

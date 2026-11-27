@@ -6,7 +6,7 @@ Status: implemented through product candidate `392d151`; single-field PAM input
 mechanics are superseded by the
 [single-field privileged authentication design](2026-08-19-single-field-privileged-auth-input-design.md)
 
-Related decision: [ADR-0010: Require conventional confirmation for privileged face authentication](../../adr/0010-conventional-face-intent-confirmation.md)
+Related decision: [ADR-0010: Require conventional confirmation for privileged face authentication](../../architecture/adr/0010-conventional-face-intent-confirmation.md)
 
 Research basis: [Temporal head-gesture recognizer validation](../../research/2026-08-19-temporal-head-gesture-recognizer-validation.md)
 

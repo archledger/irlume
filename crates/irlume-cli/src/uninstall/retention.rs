@@ -16,7 +16,7 @@ const DIRTY: &[u8] = b"irlume-uninstall-srk-v1: retain\n";
 const CLEAN: &[u8] = b"irlume-uninstall-srk-v1: clean\n";
 
 pub(super) const RECOVERY_GUIDE: &str =
-    "https://github.com/archledger/irlume/blob/main/docs/DISABLE.md#manual-uninstall-recovery";
+    "https://github.com/archledger/irlume/blob/main/docs/user/DISABLE.md#manual-uninstall-recovery";
 
 pub(super) fn manual_recovery() -> String {
     format!("Fixing the reported error alone does not clear {PATH}. Later teardown requires manual recovery: preserve earlier unit/envfile configurations and store-path evidence; keep data and the SRK if that evidence cannot be reconstructed. Do not unlink or replace the record. Follow {RECOVERY_GUIDE} for exclusive-flock, same-inode recovery; no automatic reset exists.")

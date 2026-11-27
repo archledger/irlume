@@ -118,7 +118,7 @@ pub(crate) fn parse_since(raw: Option<&str>) -> Result<Duration, &'static str> {
 /// distribution families and NixOS. Decided on the family itself: its display
 /// text is `other/unknown`, which the comparison with `"other"` this replaced
 /// never matched, so an unsupported platform reported `pass`. NixOS is its own
-/// supported platform, the flake's module (docs/NIXOS.md), although its family
+/// supported platform, the flake's module (docs/user/NIXOS.md), although its family
 /// is `Other`.
 fn platform_check(family: &irlume_common::platform::DistroFamily, nixos: bool) -> CheckState {
     match family {

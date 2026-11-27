@@ -4009,7 +4009,7 @@ impl Unreadable {
                     // `camera_busy_error` gives, without the node's path. A
                     // census document names a node only in its `node` field;
                     // scripts/machine-api-conformance.py rejects `/dev/video`
-                    // anywhere else (docs/MACHINE-API.md).
+                    // anywhere else (docs/reference/MACHINE-API.md).
                     (Some(Holders::UnknownBlind), _) => format!(
                         "camera busy; `sudo fuser -v` on this node names the holder. \
                          {UNSEEN_HOLDER_STEPS}"
@@ -4753,7 +4753,7 @@ pub fn node_removable_class(device: &str) -> &'static str {
 
 /// Camera device-pinning: verify `/dev/videoN` is a real, physically-attached
 /// camera before any frame is read, defeating unprivileged software frame
-/// injection (v4l2loopback / OBS virtual camera). See docs/THREAT_MODEL.md.
+/// injection (v4l2loopback / OBS virtual camera). See docs/security/THREAT_MODEL.md.
 ///
 /// Always enforced: the device must resolve through sysfs to a physical bus
 /// (USB/PCI), never a virtual/platform node; the anti-injection gate, needs no
@@ -4779,7 +4779,7 @@ pub fn verify_pinned(device: &str) -> irlume_common::Result<()> {
     // harness (v4l2loopback nodes have no physical bus by definition). The
     // daemon's environment is root-controlled via its systemd unit, so an
     // unprivileged local user cannot set this for the auth path; every use is
-    // logged loudly. See docs/THREAT_MODEL.md (camera injection).
+    // logged loudly. See docs/security/THREAT_MODEL.md (camera injection).
     if virtual_camera_allowed(device) {
         eprintln!(
             "irlume: WARNING: {device} accepted without a physical-device pin \
@@ -5117,7 +5117,7 @@ pub struct Caps {
 
 /// Whether the operator explicitly disabled IR-backed authentication
 /// (`IRLUME_FORCE_NO_IR=1`, the documented drop-to-convenience override in
-/// docs/VERIFY.md). One reader, so a second consumer cannot drift on the
+/// docs/security/VERIFY.md). One reader, so a second consumer cannot drift on the
 /// accepted value.
 pub fn ir_forced_off() -> bool {
     std::env::var("IRLUME_FORCE_NO_IR")
@@ -16451,7 +16451,7 @@ mod tests {
     /// its `comm` is not daemon identity. No arm names a device path: census
     /// evidence is this text, and a census document names a node only in its
     /// `node` field; scripts/machine-api-conformance.py rejects `/dev/video`
-    /// anywhere else (docs/MACHINE-API.md).
+    /// anywhere else (docs/reference/MACHINE-API.md).
     #[test]
     fn a_busy_node_cause_never_contradicts_its_holder() {
         let busy =

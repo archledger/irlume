@@ -3,7 +3,7 @@
 
 //! Shared types: the daemon<->client IPC protocol, well-known paths, errors.
 //!
-//! Trust boundary (see docs/ARCHITECTURE.md): the thin `pam_irlume` module and the
+//! Trust boundary (see docs/architecture/ARCHITECTURE.md): the thin `pam_irlume` module and the
 //! `irlume` CLI are UNTRUSTED clients. The privileged `irlumed` daemon is the only
 //! component that touches the camera, IR emitter, ONNX models, templates and TPM.
 //! Clients speak this protocol over a Unix socket; the daemon authenticates them

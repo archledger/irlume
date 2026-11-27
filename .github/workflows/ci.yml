@@ -1,6 +1,6 @@
 # Format, lint, build, and test on every push / PR to main.
 #
-# Mirrors the Ubuntu path in docs/DEVELOPMENT.md and pins Rust to the project
+# Mirrors the Ubuntu path in docs/architecture/DEVELOPMENT.md and pins Rust to the project
 # MSRV (1.88, the ort / edition-2024 floor), so CI matches `nix develop` and a
 # contributor who follows the developer guide gets the same result CI does.
 name: CI
@@ -18,6 +18,7 @@ on:
   # No base-branch filter: stacked PRs (a branch targeting another feature
   # branch) previously ran ZERO checks.
   pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
 
 # Least privilege for GITHUB_TOKEN: this workflow only reads the repo
 # (checkout + LFS); nothing here publishes or writes.
@@ -89,6 +90,41 @@ jobs:
         with:
           # Do not leave the job token in .git/config for later steps to reach.
           persist-credentials: false
+          # Compare the PR merge tree to its first parent, not to a branch tip.
+          fetch-depth: 2
+
+      # Scan the checked-out tree, even if a PR only deletes a link target.
+      - name: Markdown links (local paths and anchors)
+        env:
+          LYCHEE_VERSION: 0.24.2
+          LYCHEE_SHA256: 73657a111819a30c47c08352896796f23d64e4eb2b3ed39b6d32149241566fc5
+        run: |
+          set -euo pipefail
+          tool_dir=$(mktemp -d "$RUNNER_TEMP/irlume-lychee.XXXXXXXX")
+          platform=lychee-x86_64-unknown-linux-musl
+          url="https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/${platform}.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 "$url" -o "$tool_dir/lychee.tar.gz"
+          printf '%s  %s\n' "$LYCHEE_SHA256" "$tool_dir/lychee.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/lychee.tar.gz" -C "$tool_dir" "$platform/lychee"
+
+          git ls-files -z -- '*.md' > "$tool_dir/markdown"
+          mapfile -d '' -t markdown < "$tool_dir/markdown"
+          test "${#markdown[@]}" -gt 0
+          root=$(pwd -P)
+          "$tool_dir/$platform/lychee" --offline --include-fragments=anchor-only \
+            --root-dir "$root" --no-progress \
+            --remap "^https?://github\.com/archledger/irlume/(blob|tree)/main/ file://$root/" \
+            --remap "^https?://raw\.githubusercontent\.com/archledger/irlume/main/ file://$root/" \
+            -- "${markdown[@]/#/./}"
+
+      - name: Code-to-docs synchronization
+        run: |
+          python3 -B scripts/ci/sync-docs.py --check
+          python3 -B scripts/ci/test-sync-docs.py
+
+      - name: PR changes carry matching docs
+        if: github.event_name == 'pull_request'
+        run: python3 -B scripts/ci/sync-docs.py --pr-event "$GITHUB_EVENT_PATH"
 
       - name: Prefer the Ubuntu archive for package downloads
         # The image's Azure mirror can keep sending data too slowly to trip

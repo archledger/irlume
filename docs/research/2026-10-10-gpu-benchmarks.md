@@ -1,7 +1,7 @@
 # GPU benchmarks and CUDA probe for ADR-0033
 
 > **Superseded (2026-10-30):** GPU inference was removed by
-> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> [ADR-0038](../architecture/adr/0038-remove-gpu-inference.md). The research, measurements and
 > conclusions below remain historical evidence for that decision.
 
 - **What:** #1053 Phase 2 measurements. The recognizer (glintr100,

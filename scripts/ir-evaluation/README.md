@@ -1,13 +1,13 @@
 # Attended IR-only evaluation harness
 
-Developer tooling for the [qualification protocol](../../docs/IR_ONLY_QUALIFICATION.md).
+Developer tooling for the [qualification protocol](../../docs/security/IR_ONLY_QUALIFICATION.md).
 It runs the existing **non-granting diagnostic**, never PAM or a login command.
 Dual-camera authentication remains the default; optional IR-only login is not
 implemented by this tool. A successful harness result means the recorded attempt
 passed instrumentation and preservation checks, not that a sensor or policy is
 qualified.
 
-The separate [verification-request evaluator](../../docs/IR_REQUEST_EVALUATION.md)
+The separate [verification-request evaluator](../../docs/security/IR_REQUEST_EVALUATION.md)
 uses the production request loop and host configuration schema 2. Its
 `would_grant` report remains non-authoritative. The instructions below describe
 the retained schema-1 one-shot workflow unless stated otherwise. Both workflows

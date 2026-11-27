@@ -102,7 +102,7 @@ impl Report {
     /// How a detail names the account doctor reports on. The human report
     /// gives its name, since `--user` can make it an account other than the
     /// caller's; `doctor --json` reads "this account" for it
-    /// (docs/MACHINE-API.md, "Security and privacy").
+    /// (docs/reference/MACHINE-API.md, "Security and privacy").
     pub fn account<'a>(&self, user: &'a str) -> &'a str {
         if self.human() {
             user
@@ -160,7 +160,7 @@ const THIS_ACCOUNT: &str = "this account";
 const CAMERA_NODE: &str = "<camera node>";
 
 /// `text` with every camera device path replaced by [`CAMERA_NODE`]
-/// (docs/MACHINE-API.md, "Security and privacy"): a path that starts with
+/// (docs/reference/MACHINE-API.md, "Security and privacy"): a path that starts with
 /// `/dev/video` (a node such as `/dev/video2`, or a link such as
 /// `/dev/video-ir`) or `/dev/v4l/` (a by-id or by-path link), up to the next
 /// ASCII whitespace, backtick, quote, comma, semicolon, `)`, `]`, `}` or `>`,

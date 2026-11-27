@@ -1,4 +1,4 @@
-# The nightly channel's Ubuntu lane (docs/adr/0037-nightly-channel.md).
+# The nightly channel's Ubuntu lane (docs/architecture/adr/0037-nightly-channel.md).
 # A user unit on minihost; see packaging/ppa/nightly/README.md to install it.
 [Unit]
 Description=Upload irlume main to ppa:archledger/irlume-nightly

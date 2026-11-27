@@ -42,7 +42,7 @@ ARCH_IMAGE = (
 HEADER = """\
 # Generated from packaging/arch/PKGBUILD by scripts/arch-git-pkgbuild.py:
 # edit that recipe, then run the script (CI checks this file is current).
-# The nightly channel (docs/adr/0037-nightly-channel.md): builds main.
+# The nightly channel (docs/architecture/adr/0037-nightly-channel.md): builds main.
 """
 
 PKGVER = '''\

@@ -6,7 +6,7 @@
   #
   # Every input below is version-locked by flake.lock, so every contributor
   # and CI get byte-identical tooling regardless of which distro they run.
-  # See docs/DEVELOPMENT.md for the walkthrough (and the non-Nix path).
+  # See docs/architecture/DEVELOPMENT.md for the walkthrough (and the non-Nix path).
   description = "irlume: reproducible Rust dev environment (face auth for Linux)";
 
   inputs = {
@@ -28,7 +28,7 @@
     # ones (dev shell, package) below.
     {
       # nixosModules.irlume: the daemon, camera access, and the empirically
-      # derived per-greeter PAM wiring. See nix/module.nix and docs/NIXOS.md.
+      # derived per-greeter PAM wiring. See nix/module.nix and docs/user/NIXOS.md.
       nixosModules.irlume = import ./nix/module.nix;
       nixosModules.default = self.nixosModules.irlume;
     }
@@ -73,7 +73,7 @@
         # points the daemon at them. `src = self` uses the flake's own tree.
         packages.default = pkgs.callPackage ./nix/package.nix { src = self; };
         packages.irlume = self.packages.${system}.default;
-        # Plasma System Settings module (optional; see docs/KCM.md). Not part
+        # Plasma System Settings module (optional; see docs/user/KCM.md). Not part
         # of packages.default: loading on NixOS needs the nixpkgs#296999
         # caveat verified on a real host first.
         packages.irlume-kcm = pkgs.callPackage ./nix/package-kcm.nix { src = self; };

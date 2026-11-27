@@ -391,10 +391,10 @@ else
     "libonnxruntime.so.$ort_ref"
   )
   for need in "${doc_needs[@]}"; do
-    if grep -Fq -- "$need" docs/DEVELOPMENT.md; then
-      printf '  ok    %-42s %s\n' docs/DEVELOPMENT.md "$need"
+    if grep -Fq -- "$need" docs/architecture/DEVELOPMENT.md; then
+      printf '  ok    %-42s %s\n' docs/architecture/DEVELOPMENT.md "$need"
     else
-      printf '  MISS  %-42s %s\n' docs/DEVELOPMENT.md "$need"
+      printf '  MISS  %-42s %s\n' docs/architecture/DEVELOPMENT.md "$need"
       fail=1
     fi
   done
@@ -490,7 +490,7 @@ done
 # The developer guide's copy-paste recipe checks the same digest and unpacks
 # only when that check passes: the tar command the version check above pins
 # must follow the check on the next line.
-ORT_DEV_GUIDE=docs/DEVELOPMENT.md
+ORT_DEV_GUIDE=docs/architecture/DEVELOPMENT.md
 if [ -z "$ort_sha_ref" ] || [ -z "$ort_ref" ]; then
   printf '  ERROR %-42s no version and digest to check it against\n' "$ORT_DEV_GUIDE"
   fail=1
@@ -774,12 +774,25 @@ fi
 # match what its evidence inputs would render, the same contract as
 # cargo fmt --check.
 echo
-echo "== hardware matrix regenerated (docs/HARDWARE.md) =="
+echo "== hardware matrix regenerated (docs/reference/HARDWARE.md) =="
 if python3 scripts/generate-hardware-matrix.py --check; then
   :
 else
   fail=1
 fi
+
+# The published irlume-git recipe builds main and still uses the old sources.
+# Keep full copies until that recipe uses the canonical docs/reference/ paths.
+echo
+echo "== machine API docs for the published AUR recipe =="
+for page in MACHINE-API.md INTEGRATION.md; do
+  if cmp -s -- "docs/reference/$page" "docs/$page"; then
+    printf '  ok    %s\n' "$page"
+  else
+    printf '  MISS  %s: copy docs/reference/%s to docs/%s\n' "$page" "$page" "$page"
+    fail=1
+  fi
+done
 
 if [ "$fail" -ne 0 ]; then
   echo "packaging parity: FAILED"

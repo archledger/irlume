@@ -1,3 +1,5 @@
+<!-- TODO: Remove the old docs/ copy after the published AUR irlume-git recipe uses docs/reference/. -->
+
 # Integrating with irlume
 
 For people writing a settings panel, an installer, a status widget, or anything
@@ -171,7 +173,7 @@ are not.
 
 For a live engine without touching the real installation, run your own daemon on
 your own socket. Every privileged path is redirectable, and the full table is in
-[DEVELOPMENT.md](DEVELOPMENT.md#sandbox-environment-overrides):
+[DEVELOPMENT.md](https://github.com/archledger/irlume/blob/main/docs/architecture/DEVELOPMENT.md#sandbox-environment-overrides):
 
 ```sh
 export IRLUME_SOCKET=$XDG_RUNTIME_DIR/irlume-dev.sock
@@ -204,7 +206,7 @@ configured, such as a library, a model, or a camera path outside `/dev/video*`
 and `/dev/v4l/`, is shown as you set it and can lie under your home directory.
 Read the output before you attach it to a public issue; you may replace the
 names. A security problem goes to the private route in
-[SECURITY.md](../SECURITY.md), never into a public issue.
+[SECURITY.md](https://github.com/archledger/irlume/blob/main/.github/SECURITY.md), never into a public issue.
 
 ## PAM credential-release retries
 

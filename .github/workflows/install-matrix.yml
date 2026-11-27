@@ -1,5 +1,5 @@
 # Weekly automation of the install matrix that release prep previously ran by
-# hand (docs/PLATFORMS.md): build the universal .deb in its debian:12 container,
+# hand (docs/user/PLATFORMS.md): build the universal .deb in its debian:12 container,
 # install it on every supported Debian/Ubuntu base and smoke-test the CLI, and
 # do a full build+test pass on rolling Arch. A failed scheduled run emails the
 # maintainer; the sibling-project lesson behind it is that advertised install

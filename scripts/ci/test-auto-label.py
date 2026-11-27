@@ -173,9 +173,9 @@ class Matching(unittest.TestCase):
         cases = [
             ('feat(camera): judge YUYV IR bursts for a ceiling and active-IR evidence (ADR-0031 §4)',
              ['crates/irlume-camera/src/ir.rs', 'crates/irlume-cli/src/main.rs',
-              'docs/adr/0031-ir.md', 'CHANGELOG.md', '.github/workflows/ci.yml'],
+              'docs/architecture/adr/0031-ir.md', 'CHANGELOG.md', '.github/workflows/ci.yml'],
              {'enhancement', 'camera', 'cli', 'design'}),
-            ('docs(adr): ADR-0023 per-camera-model profile layer', ['docs/adr/0023.md', 'README.md'],
+            ('docs(adr): ADR-0023 per-camera-model profile layer', ['docs/architecture/adr/0023.md', 'README.md'],
              {'documentation', 'design'}),
             ('Lock both lockfiles', ['Cargo.lock', 'fuzz/Cargo.lock'], {'dependencies'}),
             ('Stabilize a flaky test', ['crates/irlume-cli/tests/machine_api.rs', 'scripts/test-x.py'],

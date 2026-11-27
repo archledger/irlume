@@ -1,7 +1,7 @@
 # GPU model-cache provenance, 2026-10-12
 
 > **Superseded (2026-10-30):** GPU inference was removed by
-> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> [ADR-0038](../architecture/adr/0038-remove-gpu-inference.md). The research, measurements and
 > conclusions below remain historical evidence for that decision.
 
 This #1053 receipt supplies the two separate-process cache subsets of

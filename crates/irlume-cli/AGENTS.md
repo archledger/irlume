@@ -7,8 +7,10 @@ line 12190: search for the names below.
 ## CLI
 
 - `src/main.rs` parses argv by hand (`flag`, `flag_present` accept `--x v` and
-  `--x=v`); commands are documented in [docs/COMMANDS.md](../../docs/COMMANDS.md).
-- Internal entry points, not in docs/COMMANDS.md, change their arguments only
+  `--x=v`); commands are documented in [docs/reference/COMMANDS.md](../../docs/reference/COMMANDS.md).
+  Update `src/cli-help.txt` when terminal help changes. Refresh the generated
+  section with `python3 -B scripts/ci/sync-docs.py` from the repository root.
+- Internal entry points, not in docs/reference/COMMANDS.md, change their arguments only
   with their callers: `--internal-token-delivery-lock-v1` (checked first in
   `main`, run by irlumed's `token_delivery`; `tests/token_lock.rs`) and the
   `login lightdm-*` hooks, run between them by `packaging/systemd/`,
@@ -42,7 +44,7 @@ line 12190: search for the names below.
 
 ## Machine API (`--json`)
 
-Contract 1 is public ([docs/MACHINE-API.md](../../docs/MACHINE-API.md)): one
+Contract 1 is public ([docs/reference/MACHINE-API.md](../../docs/reference/MACHINE-API.md)): one
 JSON document on stdout except `-events` streams, fields only added, no
 `--contract` means 1. `src/machine.rs` is deliberately narrower than the socket
 protocol. The KCM consumes it and the `tui --page` slugs (`PAGE_NAMES` in
@@ -67,15 +69,15 @@ protocol. The KCM consumes it and the `tui --page` slugs (`PAGE_NAMES` in
 
 ## TUI rules
 
-[ADR-0030](../../docs/adr/0030-tui-interaction-model.md) section 1 and
-[docs/TUI.md](../../docs/TUI.md) are the rules; new code follows them even
+[ADR-0030](../../docs/architecture/adr/0030-tui-interaction-model.md) section 1 and
+[docs/reference/TUI.md](../../docs/reference/TUI.md) are the rules; new code follows them even
 where older pages break them.
 
 - Enter opens and never mutates; Esc closes the innermost thing and never
   quits. Every side effect has its own letter; one that writes or runs as
   root asks first, through the confirmation dialog (`ConfirmAct`) or, for a
   flow that collects text, a typed entry (`Pending`).
-- Global keys are fixed (docs/TUI.md "Keys that mean the same thing on every
+- Global keys are fixed (docs/reference/TUI.md "Keys that mean the same thing on every
   page"): `1`-`9`, Tab, Shift-Tab, arrows, `j`, `k`, `g`, `G`, `h`, `v`, `?`,
   `q`, `M`, `A`, `L`, `r` (refresh only), `i` (Test Recognition only), Home,
   End, PageUp, PageDown, F2, F3, F4, F6. `on_key` takes all but `r` and `i`
@@ -113,8 +115,8 @@ where older pages break them.
    argument (see `tui/attempts.rs`, `tui/dates.rs`).
 5. Map `Response::Error("bad request")` to "needs a newer irlumed". A request
    the TUI sends gets a `request_effect` sentence; a More actions entry goes in
-   `tui/actions.rs` `ACTIONS` and the docs/TUI.md command table. Test, and
-   update docs/TUI.md and the CHANGELOG.
+   `tui/actions.rs` `ACTIONS` and the docs/reference/TUI.md command table. Test, and
+   update docs/reference/TUI.md and the CHANGELOG.
 
 ## Tests
 

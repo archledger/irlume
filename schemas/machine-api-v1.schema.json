@@ -572,7 +572,7 @@
       ],
       "properties": {
         "id": {
-          "description": "Stable check id, public API: the registry grows, but an id is never renamed or reused. The current registry is documented in docs/MACHINE-API.md.",
+          "description": "Stable check id, public API: the registry grows, but an id is never renamed or reused. The current registry is documented in docs/reference/MACHINE-API.md.",
           "type": "string",
           "minLength": 1
         },

@@ -1232,7 +1232,7 @@ fn doctor_json_keeps_system_probe_output_private() {
     }
 }
 
-/// `doctor --json` names no account in any `detail` (docs/MACHINE-API.md,
+/// `doctor --json` names no account in any `detail` (docs/reference/MACHINE-API.md,
 /// "Security and privacy"), while the human report names the account it
 /// checked, which `--user` can make an account other than the caller's: here
 /// doctor runs as root, `USER` names one account and the human run's `--user`
@@ -2862,7 +2862,7 @@ fn a_token_arm_on_fedora_43_or_44_is_told_to_retain_before_upgrading_to_45() {
         out
     };
     // The account `doctor --json` asks about; its detail never names it
-    // (docs/MACHINE-API.md, "Security and privacy").
+    // (docs/reference/MACHINE-API.md, "Security and privacy").
     const PROBE: &str = "doctorjsonprobe";
     let upgrade_check = |sb: &Sandbox| -> serde_json::Value {
         let (_, out, err) = run(command(sb, &["doctor", "--json"])
@@ -3316,7 +3316,7 @@ fn sealed_secrets_off_encrypted_storage_are_told_the_remedies() {
     );
     let (check, _) = checks(&sb);
     assert_eq!(check["state"], "info", "{check}");
-    // `doctor --json` names no account (docs/MACHINE-API.md, "Security and
+    // `doctor --json` names no account (docs/reference/MACHINE-API.md, "Security and
     // privacy"); `seal_storage::tests::the_doctor_check_states` and
     // `doctor_json_details_name_no_account` pin the human wording.
     assert!(
@@ -3581,7 +3581,7 @@ fn sealed(
 }
 
 /// The NixOS module's PAM rules were written for a sealed login password and
-/// add no session `reseal` rule (docs/NIXOS.md). On NixOS `keyring arm`
+/// add no session `reseal` rule (docs/user/NIXOS.md). On NixOS `keyring arm`
 /// refuses an account that has or would get a KDE wallet key or a GNOME
 /// keyring token, before it asks for the password, and asks for the login
 /// password by name otherwise. Everywhere else the daemon still picks the
@@ -3625,7 +3625,7 @@ fn keyring_arm_on_nixos_seals_only_the_login_password() {
         assert_eq!(code, 1, "{armed:?}\n{out}\n{err}");
         let has = if armed.is_some() { "has" } else { "would get" };
         assert!(
-            err.contains(&format!("{has} a KDE wallet key")) && err.contains("docs/NIXOS.md"),
+            err.contains(&format!("{has} a KDE wallet key")) && err.contains("docs/user/NIXOS.md"),
             "{err}"
         );
         // `forget` is named only when there is an arm for it to remove.
@@ -3717,7 +3717,7 @@ fn reseal_on_nixos_keeps_to_the_login_password() {
         })
     };
 
-    // A wallet key or token names `forget` and docs/NIXOS.md. An unreadable
+    // A wallet key or token names `forget` and docs/user/NIXOS.md. An unreadable
     // envelope gets irlumed's own advice instead: keep the file as it is.
     for (tag, kind, refusal, forget) in [
         (
@@ -3742,7 +3742,7 @@ fn reseal_on_nixos_keeps_to_the_login_password() {
             err.contains(refusal) && err.contains("Nothing was sealed"),
             "{tag}: {err}"
         );
-        for needle in ["irlume keyring forget", "docs/NIXOS.md"] {
+        for needle in ["irlume keyring forget", "docs/user/NIXOS.md"] {
             assert_eq!(err.contains(needle), forget, "{tag}: {needle:?} in {err}");
         }
         if !forget {
@@ -3911,7 +3911,7 @@ fn login_changes_on_nixos_name_the_module_and_touch_nothing() {
             .env("IRLUME_PAM_LOCK", &lock));
         assert_eq!(code, want, "{args:?}\n{out}\n{err}");
         assert!(
-            err.contains("services.irlume.pam.services") && err.contains("docs/NIXOS.md"),
+            err.contains("services.irlume.pam.services") && err.contains("docs/user/NIXOS.md"),
             "{args:?}: {err}"
         );
         assert!(!out.contains("DRY RUN"), "{args:?} planned a change: {out}");

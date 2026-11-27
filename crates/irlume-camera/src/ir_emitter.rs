@@ -487,7 +487,7 @@ fn known_control(vid: u16, pid: u16) -> Option<EmitterControl> {
         }),
         // NexiGo HelloCam N930W 60fps; MS-XU is unit 4.
         //
-        // The product name does not identify one design (docs/PLATFORMS.md),
+        // The product name does not identify one design (docs/user/PLATFORMS.md),
         // and an earlier survey listed this ID as RGB-only. On record is one
         // unit at bcdDevice 0.06: its descriptor
         // (tests/fixtures/nexigo-3443-930d.descriptors) and the output of
@@ -549,7 +549,7 @@ fn conf_path() -> PathBuf {
     // Through `state_dir()`, like `emitter_journal::store_dir` and
     // `stream_record`, not the literal. This file decides whether the IR
     // emitter lights at login, and a sandboxed `ir-setup` set up exactly as
-    // docs/INTEGRATION.md documents (SOCKET, STATE, KEYRING, RECOVERY,
+    // docs/reference/INTEGRATION.md documents (SOCKET, STATE, KEYRING, RECOVERY,
     // TEMPLATE_KEY) would have written straight through to the live one. Same
     // split-resolution shape that emptied a real machine's template keys.
     std::env::var("IRLUME_IR_EMITTER_CONF")

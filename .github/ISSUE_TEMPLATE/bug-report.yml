@@ -14,7 +14,7 @@ body:
         exposed, do not file it here and do not post it publicly. Report it
         privately: https://github.com/archledger/irlume/security/advisories/new
         (or the e-mail address in
-        [SECURITY.md](https://github.com/archledger/irlume/blob/main/SECURITY.md)).
+        [SECURITY.md](https://github.com/archledger/irlume/blob/main/.github/SECURITY.md)).
 
 
         A report in your own words is fine.

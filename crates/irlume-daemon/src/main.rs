@@ -11460,7 +11460,7 @@ fn credential_release_purpose() -> irlume_auth::AuthenticationPurpose {
 /// The biometric check happens HERE (inside unseal), so a caller cannot get the
 /// password without a capture that clears the liveness gate and matches the
 /// enrolled templates. Clearing the gate is evidence, not proof, that a live
-/// person is present. Automatic PAD remains required; see docs/PAD_SELFTEST.md
+/// person is present. Automatic PAD remains required; see docs/security/PAD_SELFTEST.md
 /// for the measured limits. Never log the password or its length.
 #[cfg(test)]
 fn do_unseal_password(

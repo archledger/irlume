@@ -278,7 +278,7 @@ mod tests {
         },
     ];
 
-    /// The shell copies and SUPPORT.md hold the same lines: each package
+    /// The shell copies and .github/SUPPORT.md hold the same lines: each package
     /// script once, in a heredoc after a blank line and followed by its
     /// attach line; the installer once, behind `warn`; and SUPPORT.md once,
     /// as whole lines. This compares text only; that the scripts print it
@@ -319,11 +319,11 @@ mod tests {
             "scripts/install.sh"
         );
         assert_eq!(
-            include_str!("../../../SUPPORT.md")
+            include_str!("../../../.github/SUPPORT.md")
                 .matches(&format!("\n{WHERE_TO_REPORT}\n"))
                 .count(),
             1,
-            "SUPPORT.md"
+            ".github/SUPPORT.md"
         );
     }
 

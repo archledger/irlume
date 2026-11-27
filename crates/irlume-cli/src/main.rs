@@ -5625,7 +5625,7 @@ fn ir_node_access_rows(
             .expect("a device row has at least one node");
         let id_text = format!("{:04x}:{:04x}", id.0, id.1);
         // The human report names the nodes; `doctor --json` names the camera
-        // by its USB identity (docs/MACHINE-API.md, "Security and privacy").
+        // by its USB identity (docs/reference/MACHINE-API.md, "Security and privacy").
         let device = if report.human() {
             format!("{id_text} ({paths})")
         } else {
@@ -5776,7 +5776,7 @@ fn selected_stream_minimum_checks(
 /// records, depending on `report`.
 /// `args` carries `--user`, which doctor reports on in eight per-user lines.
 /// Resolving with an empty slice ignored the flag silently, while
-/// `docs/COMMANDS.md` documents `--user U` as a global convention.
+/// `docs/reference/COMMANDS.md` documents `--user U` as a global convention.
 /// Count the VALID failure records in `faillock --user` output. The tally
 /// format is `When Type Source Valid` rows; a header-only output is zero.
 /// Pure so the parsing is unit-testable against the live incident's shape.
@@ -5882,7 +5882,7 @@ fn unwired_login_line(user: &str, nixos: bool) -> String {
             "[doctor] ⚠ {user} is enrolled but no login manager is wired for face auth.\n     \
              On NixOS the system configuration owns the PAM stacks: list the display\n     \
              manager's PAM service under `services.irlume.pam.services` and rebuild\n     \
-             (docs/NIXOS.md)."
+             (docs/user/NIXOS.md)."
         )
     } else {
         format!(
@@ -5921,7 +5921,7 @@ fn unknown_display_manager_line(dm: &str) -> String {
 }
 
 /// Doctor's line when polkit app prompts are not wired. On NixOS `irlume
-/// login enable` refuses, so it points to docs/NIXOS.md instead.
+/// login enable` refuses, so it points to docs/user/NIXOS.md instead.
 fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
     match (bitwarden_action, nixos) {
         (true, false) => {
@@ -5932,7 +5932,7 @@ fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
         (true, true) => {
             "[doctor] polkit app prompts: NOT wired, but Bitwarden's polkit action is installed.\n     \
              Its biometric unlock will fall back to the password prompt. On NixOS the\n     \
-             system configuration owns the PAM stacks (docs/NIXOS.md)."
+             system configuration owns the PAM stacks (docs/user/NIXOS.md)."
         }
         (false, false) => {
             "[doctor] polkit app prompts: not wired (opt-in: sudo irlume login enable \
@@ -5940,7 +5940,7 @@ fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
         }
         (false, true) => {
             "[doctor] polkit app prompts: not wired (on NixOS the system configuration owns \
-             the PAM stacks; docs/NIXOS.md)"
+             the PAM stacks; docs/user/NIXOS.md)"
         }
     }
 }
@@ -7319,7 +7319,7 @@ mod tests {
     }
 
     /// `doctor --json` names the camera by its USB identity, never its nodes
-    /// (docs/MACHINE-API.md, "Security and privacy"), in each state; the
+    /// (docs/reference/MACHINE-API.md, "Security and privacy"), in each state; the
     /// human report names them for the same nodes.
     #[test]
     fn ir_node_access_rows_for_the_machine_report_name_the_camera_only() {
@@ -8773,7 +8773,7 @@ mod tests {
 
     /// Doctor's unwired-login and polkit lines name `irlume login enable`
     /// everywhere but NixOS, where that command refuses; there they name the
-    /// module and docs/NIXOS.md instead.
+    /// module and docs/user/NIXOS.md instead.
     #[test]
     fn doctor_wiring_remedies_name_the_module_on_nixos() {
         let login = unwired_login_line("alice", false);
@@ -8785,7 +8785,7 @@ mod tests {
         assert!(
             login.contains("alice is enrolled")
                 && login.contains("services.irlume.pam.services")
-                && login.contains("docs/NIXOS.md"),
+                && login.contains("docs/user/NIXOS.md"),
             "{login}"
         );
         assert!(!login.contains("irlume login enable"), "{login}");
@@ -8797,7 +8797,7 @@ mod tests {
             );
             let polkit = polkit_unwired_line(bitwarden_action, true);
             assert!(
-                polkit.contains("docs/NIXOS.md") && !polkit.contains("irlume login enable"),
+                polkit.contains("docs/user/NIXOS.md") && !polkit.contains("irlume login enable"),
                 "{polkit}"
             );
             assert_eq!(polkit.contains("Bitwarden"), bitwarden_action, "{polkit}");

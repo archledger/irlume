@@ -360,7 +360,7 @@ else:
 
 
 class ShippedArtifactCoverage(unittest.TestCase):
-    """docs/RELEASING.md: one SBOM per crate that builds a shipped binary."""
+    """docs/architecture/RELEASING.md: one SBOM per crate that builds a shipped binary."""
 
     # The Rust artifacts the packaging recipes install, and the crate each is
     # built from. A recipe that installs another artifact fails here until the

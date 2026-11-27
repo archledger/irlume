@@ -1,7 +1,7 @@
 # AGENTS.md: irlume-daemon
 
 The root [AGENTS.md](../../AGENTS.md) applies; this adds socket protocol and
-posture rules for `irlumed`, a critical-tier component ([SECURITY.md](../../SECURITY.md)).
+posture rules for `irlumed`, a critical-tier component ([SECURITY.md](../../.github/SECURITY.md)).
 `src/main.rs` is about 29k lines: search for the names below.
 
 ## Wire compatibility
@@ -110,7 +110,7 @@ root-or-account read, ask.
    that needs approval joins the list in
    `os_approval_covers_exactly_the_enrollment_and_recovery_changes`.
 5. Clients: `daemon_request` in `crates/irlume-cli/src/main.rs` (380 s list if
-   it waits on polkit), docs/COMMANDS.md for a new command, and the TUI and
+   it waits on polkit), docs/reference/COMMANDS.md for a new command, and the TUI and
    `--json` output per [its AGENTS.md](../irlume-cli/AGENTS.md).
 6. Tests: a refused peer turned away before queueing (`peer(NOBODY)`) and a
    dispatch test on `engine()` and `sandbox()`. `RootOrTarget` resolves through

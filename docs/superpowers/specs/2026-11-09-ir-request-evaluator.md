@@ -5,8 +5,8 @@ autonomous planning, implementation and offline validation within this scope.
 No new camera campaign, threshold change or policy promotion is authorized here.
 
 Source baseline: `bbb2d84f644e3f2d50686cbeb8d2f3d7b37acf8e`.
-Related requirements: [IR-only qualification](../../IR_ONLY_QUALIFICATION.md),
-[threat model](../../THREAT_MODEL.md), and the November 9 qualification audit
+Related requirements: [IR-only qualification](../../security/IR_ONLY_QUALIFICATION.md),
+[threat model](../../security/THREAT_MODEL.md), and the November 9 qualification audit
 in shared project evidence.
 
 ## Objective and scope

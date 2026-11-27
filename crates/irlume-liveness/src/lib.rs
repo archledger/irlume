@@ -371,7 +371,7 @@ pub struct Cues {
     /// surface held at the same distance usually does not, so it is evidence
     /// against a flat spoof. It is a brightness ratio, not a depth measurement:
     /// the sensor has no range-finding, and a glossy print with a hot center
-    /// passes it (see docs/PAD_SELFTEST.md).
+    /// passes it (see docs/security/PAD_SELFTEST.md).
     pub center_edge_ratio_ok: bool,
     /// Corneal glint present (supporting; logged, not decisive).
     ///

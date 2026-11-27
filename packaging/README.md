@@ -34,7 +34,7 @@ The package also includes `/usr/libexec/irlume-password-verify`, the dedicated
 `/etc/pam.d/irlume-retry-reset` service, and enrollment/recovery polkit policies.
 Keep these matched to the daemon. Nix uses store paths and its module installs
 the PAM service. Before a release, follow the [candidate upgrade and rollback
-checklist](../docs/RELEASING.md); recipe parity alone does not validate installation.
+checklist](../docs/architecture/RELEASING.md); recipe parity alone does not validate installation.
 
 ## Per-family
 
@@ -70,7 +70,7 @@ These checks do not launch the TUI or prove desktop-session compatibility.
   and also serves local source builds (`makepkg -si`). Depends on `onnxruntime`
   (system pkg is current), `tpm2-tss`, `pam`; PAM to `/usr/lib/security`.
   Update path: `yay -Syu` / `paru -Syu`, driven by `irlume update`.
-- **Nightly** ([ADR-0037](../docs/adr/0037-nightly-channel.md)): builds of
+- **Nightly** ([ADR-0037](../docs/architecture/adr/0037-nightly-channel.md)): builds of
   `main`, beside the release lanes and never in their place. Fedora: the
   Copr project `archledger/irlume-nightly`, built by the `.packit.yaml`
   commit job on every push to `main`. Arch: the AUR's `irlume-git` and
@@ -83,6 +83,13 @@ These checks do not launch the TUI or prove desktop-session compatibility.
   uploaded at most once a day by `scripts/ppa-nightly.py` from a user timer
   on the maintainer's machine (`ppa/nightly/`), built with the release's
   `ppa/container-build.sh` in the same pinned image.
+- **AUR doc-path transition:** Edit `docs/reference/MACHINE-API.md` and
+  `docs/reference/INTEGRATION.md`, then run `python3 -B scripts/ci/sync-docs.py` to
+  copy both to `docs/` while the published `irlume-git` recipe still reads
+  the old sources. Packaging parity
+  checks the copies byte for byte. After the AUR recipe uses `docs/reference/`,
+  remove the two copies and their TODO comments, the copy entries in
+  `scripts/ci/sync-docs.py`, and the parity check.
 - **Ubuntu** ([`ppa:archledger/irlume`](https://launchpad.net/~archledger/+archive/ubuntu/irlume)):
   source package built on Launchpad from a self-contained orig tarball
   (`ppa/debian/` + `scripts/build-ppa-source.sh`: vendored crates, bundled

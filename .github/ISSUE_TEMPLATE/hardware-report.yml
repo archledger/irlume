@@ -14,7 +14,7 @@ body:
         exposed, do not file it here and do not post it publicly. Report it
         privately: https://github.com/archledger/irlume/security/advisories/new
         (or the e-mail address in
-        [SECURITY.md](https://github.com/archledger/irlume/blob/main/SECURITY.md)).
+        [SECURITY.md](https://github.com/archledger/irlume/blob/main/.github/SECURITY.md)).
 
 
         A report in your own words is fine; if a command below does not run,
@@ -43,7 +43,7 @@ body:
         camera-like device with the evidence each row keyed on, so "broken,
         unsupported class, or configuration" is answered before the first
         reply). Before filing, also try the two-minute kernel check in
-        docs/DEBUGGING.md ("Cameras: check the kernel first"): most camera
+        docs/user/DEBUGGING.md ("Cameras: check the kernel first"): most camera
         misbehavior has a uvcvideo quirk-table entry for your exact USB ID.
 
 

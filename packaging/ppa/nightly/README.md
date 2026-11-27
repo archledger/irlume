@@ -1,7 +1,7 @@
 # The nightly PPA uploader
 
 `scripts/ppa-nightly.py` uploads `main` to `ppa:archledger/irlume-nightly`
-once a day ([ADR-0037](../../../docs/adr/0037-nightly-channel.md) section 3).
+once a day ([ADR-0037](../../../docs/architecture/adr/0037-nightly-channel.md) section 3).
 It runs as a user timer on minihost, which holds the key Launchpad has for
 `~archledger` and already runs user timers with lingering enabled.
 

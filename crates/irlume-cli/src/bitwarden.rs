@@ -2,7 +2,7 @@
 // Copyright the irlume contributors.
 
 //! `irlume bitwarden`: set up Bitwarden's biometric-unlock polkit action so
-//! its prompt can be face-approved (docs/APP-INTEGRATION.md).
+//! its prompt can be face-approved (docs/user/APP-INTEGRATION.md).
 //!
 //! Bitwarden's "unlock with system authentication" is a polkit
 //! CheckAuthorization on `com.bitwarden.Bitwarden.unlock`, which only exists
@@ -377,7 +377,7 @@ fn setup(apply: bool) -> ExitCode {
             "[bitwarden] this is an ostree/immutable system: /usr is read-only and polkit \
              has no other actions directory. Install the policy by layering a small rpm \
              that owns {ACTIONS_DIR}/{POLICY_FILE} (rpm-ostree install --apply-live), \
-             then restart polkit. See docs/APP-INTEGRATION.md."
+             then restart polkit. See docs/user/APP-INTEGRATION.md."
         );
         return ExitCode::FAILURE;
     }

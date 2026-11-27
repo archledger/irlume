@@ -55,39 +55,28 @@ flowchart TD
     daemon -. "runs" .-> pwv
 ```
 
-## One authentication, crate by crate
+## Responsibilities and stability boundaries
 
-A greeter or `sudo` reaches `pam_irlume.so` (**irlume-pam**), which sends
-one request over the Unix socket whose `Request`/`Response` protocol and
-bounded client live in **irlume-common**. That crate also owns shared
-config handling and the third-party model catalog; pins enforced by a
-model-specific loader live beside that loader, including the production
-TFLite mesh pin in **irlume-vision**.
-**irlume-daemon** owns the socket, the systemd watchdog contract, and the
-per-request authorization (`SO_PEERCRED`), and hands the work to the
-Engine in **irlume-auth**. The Engine runs the pipeline: **irlume-camera**
-captures the RGB and IR frames (stream negotiation, the IR emitter and its
-strobe metadata, the per-camera concurrent-or-sequential contention
-verdict), **irlume-vision** runs the models on them (YuNet detection, the face
-mesh, whose loader routes a file to the TFLite or ONNX backend by its
-bytes and fails plainly rather than retrying the other, and the
-recognizer), **irlume-liveness** turns the readings into cue verdicts
-(cross-spectrum checks, EAR, the deny-only third-party PAD slot), and
-**irlume-core** compares the embedding against the enrolled templates it
-stores encrypted, with the template key sealed in the TPM. On a grant the
-daemon can unseal the keyring secret, and two libexec helpers
-(**irlume-gkr-unlock**, **irlume-kwallet-init**) deliver it to
-gnome-keyring or ksecretd so the wallet opens without a prompt.
+The Rust library APIs are internal. Compatibility applies to the wire,
+storage, CLI and system interfaces the project documents, not to arbitrary
+Rust symbols or unlisted commands.
 
-**irlume-cli** is the same socket client grown a full CLI and TUI: setup,
-enrollment, diagnostics, model management, uninstall. For development and
-benchmarks it can also drive the Engine directly, bypassing the daemon
-(the solid `cli --> auth` edge; the dotted one is the socket path it
-bypasses). **irlume-fingerprint** wraps fprintd so a fingerprint
-can stand beside face auth where hardware exists.
-**irlume-password-verify** is the third libexec helper: for a password
-retry reset the daemon runs it to verify the account's password through
-PAM (the `/etc/pam.d/irlume-retry-reset` service).
+| Crate | Responsibility | Boundary |
+|---|---|---|
+| `irlume-common` | Socket protocol and client, shared config and model catalog | Keep socket changes additive for mixed versions; no internal crate dependencies |
+| `irlume-camera` | V4L2/UVC capture, device pinning, IR emitter and schedule qualification | Hardware and qualification contracts; no grant decisions |
+| `irlume-vision` | Detection, alignment and inference, including the pinned TFLite mesh | Model loader contracts; no PAM or daemon dependency |
+| `irlume-liveness` | Cross-spectrum cues and presentation-attack checks | Cue verdicts only; PAD cues can deny, not grant |
+| `irlume-core` | Enrollment storage and matching, TPM sealing and recovery | On-disk formats and TPM policy; not a public Rust API |
+| `irlume-auth` | Composes the pipeline and decides face authentication | Sole face grant decision; no socket or PAM handling |
+| `irlume-daemon` | `irlumed`, peer authorization, socket, serialized engine work and watchdog | Privileged service and socket contract |
+| `irlume-cli` | `irlume` commands, TUI, PAM wiring and machine API | Documented CLI and versioned machine API; [reference](../docs/reference/MACHINE-API.md) |
+| `irlume-fingerprint` | fprintd adapter for fingerprint companion flows | Internal wrapper; the provider verifies fingerprints |
+| `irlume-pam` | `pam_irlume.so`, thin daemon client in PAM | PAM ABI and password fallback |
+| `irlume-pam-view` | `pam_irlume_view.so`, session-only LightDM view detach | PAM session ABI; no grant decisions or internal crate dependencies |
+| `irlume-gkr-unlock` | Delivers a secret to the GNOME keyring | Private packaged helper, not a second socket client |
+| `irlume-kwallet-init` | Delivers the wallet key to KDE's secrets service | Private packaged helper, not a second socket client |
+| `irlume-password-verify` | Verifies the password for a retry reset through `/etc/pam.d/irlume-retry-reset` | Private daemon-to-helper contract; no internal crate dependencies |
 
 ## What the graph does and does not promise
 

@@ -345,7 +345,7 @@ fn is_remote_session(pamh: &Pam) -> bool {
             _ => {}
         }
     }
-    // RESIDUAL (docs/THREAT_MODEL.md, "Remote sessions"): a deny-list by service name
+    // RESIDUAL (docs/security/THREAT_MODEL.md, "Remote sessions"): a deny-list by service name
     // cannot catch every remote login. Two known classes:
     //  - Remote-control software attached to the GENUINE local greeter/desktop on
     //    seat0 (x11vnc of :0, an RDP screen-share, NoMachine to the physical
@@ -755,7 +755,7 @@ impl PamServiceModule for IrlumePam {
             //    leave password input to the frontend's password transaction.
             //    Cancellation depends on that frontend's worker lifecycle; a queued
             //    PAM conversation cancellation may not interrupt our synchronous
-            //    daemon request (see docs/DESKTOP-AUTH.md).
+            //    daemon request (see docs/user/DESKTOP-AUTH.md).
             //    A privileged one-shot service offers its explicit
             //    face-intent choice only after this password-first check, then obtains
             //    the ordinary PAM token so a non-`yes` password is not asked twice.

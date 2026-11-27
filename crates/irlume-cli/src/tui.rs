@@ -9203,7 +9203,7 @@ impl App {
         // None = RecoveryStatus never answered. The old default here claimed
         // "plaintext at rest" and "No TPM" about templates that are encrypted
         // on a TPM machine, one Tab away from the Keyring tab saying "TPM
-        // ● present"; a failed read establishes nothing (docs/MACHINE-API.md).
+        // ● present"; a failed read establishes nothing (docs/reference/MACHINE-API.md).
         let unknown = || {
             Span::styled(
                 format!("◐ unknown ({})", self.unanswered_reason(Source::Recovery)),
@@ -18550,7 +18550,7 @@ mod tests {
         );
         let err = app.error.take().expect("the refusal must surface");
         assert!(
-            err.contains("would get a KDE wallet key") && err.contains("docs/NIXOS.md"),
+            err.contains("would get a KDE wallet key") && err.contains("docs/user/NIXOS.md"),
             "got: {err}"
         );
     }
@@ -21279,7 +21279,7 @@ mod tests {
 
     /// A check with nothing to run says so without claiming a pass: only a
     /// passed check needs no action. An unavailable automatic fix does not
-    /// imply a pass (docs/TUI.md).
+    /// imply a pass (docs/reference/TUI.md).
     #[test]
     fn diagnostics_check_without_a_fix_claims_no_pass_it_has_not_earned() {
         let no_repair =
@@ -23430,7 +23430,7 @@ mod tests {
     }
 
     // ---- an unanswered question renders as unknown, never as a negative ----
-    // The machine-API contract (docs/MACHINE-API.md): a failed read
+    // The machine-API contract (docs/reference/MACHINE-API.md): a failed read
     // "established nothing", and a consumer must not render it as disabled.
     // These pin the TUI surfaces that used to claim "none"/"no"/"plaintext"
     // while the daemon had never answered.

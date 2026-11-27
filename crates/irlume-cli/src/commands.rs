@@ -2684,7 +2684,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("\n[7/7] PAM login wiring");
     if crate::nixos::host_is_nixos() {
         println!("  on NixOS the system configuration owns PAM: list the services under");
-        println!("  `services.irlume.pam.services` and rebuild (docs/NIXOS.md).");
+        println!("  `services.irlume.pam.services` and rebuild (docs/user/NIXOS.md).");
     } else {
         println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
         println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
@@ -2767,121 +2767,7 @@ fn yes_no(q: &str, default_yes: bool) -> bool {
 
 /// `irlume help` / no args: top-level command listing.
 pub fn help() -> ExitCode {
-    println!(
-        "\
-irlume - local face authentication
-
-USAGE: irlume <command> [options]   (default user = $USER; override with --user U)
-
-SETUP & STATUS
-  tui [--page P] [--new]  guided setup + live dashboard (enroll & configure here);
-                        --page starts on a named screen (overview, diagnostics,
-                        cameras, faces, wallet, recovery, fingerprint, login,
-                        settings); --new skips the single-instance guard
-  setup                 scripted onboarding (enroll, keyring, recovery, wiring)
-  status                health dashboard (daemon, enrollment, keyring, cameras)
-  detect                script probe; exit 0=ready / 10=partial / 20=absent
-  doctor                platform / TPM / Secure Boot / camera / model checks
-  support-report [--output FILE.txt] [--since 10m] [--probe]
-  trace [record] [--duration 60s] [--output FILE.jsonl]
-  trace explain FILE.jsonl [--output FILE.txt]
-  trace analyze FILE.jsonl [--output FILE.txt]
-                        create a private 0600 report; default is read-only and
-                        camera-free, while --probe is explicit and root-only
-  deps                  verify runtime dependencies (onnxruntime, models, TPM)
-  split <list|status|add|remove|select>
-                        split camera authorizations; split --help gives JSON
-                        guard/side syntax. Status and changes require root.
-
-ENROLLMENT & AUTH
-  enroll [--name N] [--scans K] [--reset] [--add-camera]
-         [--camera-choice JSON] [--split-camera-choice JSON]
-                        capture a face profile (or a second camera group:
-                        ADR-0024); a choice flag names a guarded ordinary
-                        or authorized split pair for this operation only
-                        (split stays refused until activation)
-  profiles [list|add-scan|remove-camera|rename|delete|forget-model|eyes-open off]   manage profiles
-                        (one-release migration only: clears the retired gate;
-                        it cannot be turned on, see issue #386)
-  identify              1:N \"who is this?\" (all users as root; else scoped to you)
-KEYRING / TPM
-  keyring <arm|status|forget>     TPM-sealed secret so a login opens your wallet
-                        (GNOME token disarm is unavailable; --force does not erase tokens)
-  reseal                re-bind the sealed secret to current PCRs (after a
-                        firmware/kernel update); safe, re-enters the password
-  recovery <status|setup|restore|forget>   recovery passphrase + encryption
-  retry <status|reset> [--user U]         inspect/reset face retry state
-                        reset verifies your local password; root is an admin override
-  diag                  TPM seal + PCR-drift diagnostics (run with sudo for detail)
-
-SYSTEM INTEGRATION
-  login <status|enable|disable|reconcile> [--with-sudo] [--with-polkit] [--apply] [--force]
-        [--adjust-jumps]
-                        PAM wiring: greeters, lock screen, sudo, and app prompts
-                        (--with-polkit lets your face approve Bitwarden/pkexec);
-                        reconcile re-applies it after a distro PAM regeneration and
-                        applies immediately (no --apply; the self-heal unit runs it);
-                        enable --force rebuilds irlume's /etc copies of vendor PAM
-                        files that have lines of yours, keeping each as .pre-irlume;
-                        --adjust-jumps changes the value of a numeric jump of yours
-                        in such a copy that irlume's lines would move, so it skips
-                        the same lines of yours and lands on the same line (a
-                        fingerprint's success: on irlume's pam_permit.so landing;
-                        where irlume's lines come out and it landed on one: the
-                        first line after them)
-  logs [-f] [--since T]           the face-auth journal in one view (daemon, PAM, keyring)
-  logs debug <on|off>             per-stage pipeline tracing in the daemon (sudo)
-  fingerprint <status|add|verify|reset|enable|disable> [--fingerprint-only]
-                        fprintd companion; enable = face OR fingerprint (both),
-                        --fingerprint-only replaces face with fingerprint
-  bitwarden <status|setup> [--apply]
-                        install Bitwarden's biometric-unlock polkit action
-                        (flatpak/native; snap is handled by snapd already)
-  selinux <status|load>           SELinux module for the login greeter
-  ir-setup [--dry-run]            configure the IR emitter (sudo; rarely needed,
-                        and only ever run when you ask; it writes to the
-                        camera, so --dry-run first)
-  set-cameras <rgb> <ir>          persist the RGB+IR camera pair (sudo; the TUI
-                        camera picker runs this for you)
-  camera-tune [--rounds N]        measure whether this camera can stream RGB and
-                        IR at once without dimming, and store the answer (sudo)
-  camera-mode                     report the capture mode in force for the
-                        auto-selected pair, and where that verdict came from
-  camera census [--json]          classify every camera-like device on the
-                        machine, printing the evidence each classification
-                        keyed on (#575; the hardware-report attachment)
-  models list --json           machine model listing; all other models
-                        subcommands are removed (ADR-0015) and answer with a notice
-  auth consent [status]         show privileged face-confirmation policy
-  auth sensor status            show the saved/daemon-observed face sensor policy
-  auth sensor preflight [--user U]  camera-free experimental IR prerequisites
-  auth sensor dual              restore dual sensors (sudo; no PAM changes)
-  auth sensor ir-only --yes      select EXPERIMENTAL IR-only (sudo; not qualified)
-  auth consent required         require confirmation (default; sudo)
-  auth consent hands-free --yes skip the keyword at privileged prompts (sudo;
-                        machine-wide opt-in). Login/lock behavior is separate.
-  biopolicy <on|off|status>       opt-in operation-class gate: restrict which
-                        services a face may satisfy (advanced; password unaffected)
-  update [--check]                update via the channel this was installed from
-                        (Copr/PPA: runs it; .deb/pkg/source: shows the steps)
-  uninstall [--keep-data] [--yes] un-wire PAM, stop the daemon, wipe enrolled
-                        data, then remove the package through its own manager
-                        (sudo)
-  version                         print the installed irlume version
-
-MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
-  --json                on version, status, doctor, support-report, profiles list, models list,
-                        camera census, camera diagnostics, login status, login plan/apply/
-                        verify/rollback, auth test --events=jsonl:
-                        one line of JSON on stdout, stable check ids and error
-                        codes, nothing else printed
-  --contract N          declare the contract version you implement; omitted
-                        always means 1, and an unimplemented one is refused
-                        before anything runs
-
-  (developer/benchmark tools are hidden; set IRLUME_DEV=1 to enable them)
-"
-    );
+    println!("{}", include_str!("cli-help.txt"));
     ExitCode::SUCCESS
 }
 

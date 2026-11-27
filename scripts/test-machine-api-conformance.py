@@ -88,7 +88,7 @@ class ContractTests(unittest.TestCase):
         )
 
     def test_doctor_detail_may_not_name_a_video_node(self):
-        # docs/MACHINE-API.md, "Security and privacy": doctor's `detail`
+        # docs/reference/MACHINE-API.md, "Security and privacy": doctor's `detail`
         # names no camera device path, in either spelling, so it is not
         # exempt as the census `node` field is.
         document = fixture("doctor.json")
@@ -107,7 +107,7 @@ class ContractTests(unittest.TestCase):
 
     def test_camera_diagnostics_is_checked_by_refusal_not_skipped(self):
         # `camera diagnostics --json` operates the camera through the daemon
-        # (docs/MACHINE-API.md), so an entry in neither table makes the
+        # (docs/reference/MACHINE-API.md), so an entry in neither table makes the
         # conformance run skip it, and a skip reads as a pass. Its refusals
         # must cover a contract negotiation refusal and a usage error.
         self.assertNotIn("camera-diagnostics", CONFORMANCE.CAPABILITY_COMMANDS)

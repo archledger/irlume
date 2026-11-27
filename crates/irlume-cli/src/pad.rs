@@ -16,7 +16,7 @@
 //! RGB+IR path (`--path full`, default) and the dark IR-only path
 //! (`--path ir-only`). The RGB-only convenience tier is deterrent-grade, is limited
 //! to lock-screen unlock and never releases credentials, and is deliberately
-//! excluded from the PAD claim (see docs/PAD_SELFTEST.md).
+//! excluded from the PAD claim (see docs/security/PAD_SELFTEST.md).
 
 use irlume_core::pad as metrics;
 use irlume_liveness::{FaceBox, LivenessGate, Signals, Verdict};
@@ -709,7 +709,7 @@ fn render_markdown(r: &metrics::PadReport, input: &str, paths: &[String]) -> Str
         o.push_str(&format!("- **ACER:** {} (legacy)\n", pct(a).trim()));
     }
     o.push_str("\n> Self-administered per ISO/IEC 30107-3 methodology; not a lab-accredited\n");
-    o.push_str("> evaluation. See `docs/PAD_SELFTEST.md` for protocol, PAI species, and limits.\n");
+    o.push_str("> evaluation. See `docs/security/PAD_SELFTEST.md` for protocol, PAI species, and limits.\n");
     o
 }
 

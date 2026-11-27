@@ -19,7 +19,7 @@ In scope, in decreasing order of attention:
 5. Supply chain (model files, packaging scriptlets).
 
 Out of scope, per the standing threat model
-([THREAT_MODEL.md](../THREAT_MODEL.md)): a root attacker, and cryptographic
+([THREAT_MODEL.md](../security/THREAT_MODEL.md)): a root attacker, and cryptographic
 camera attestation against malicious hardware.
 
 ## What held (verified controls)
@@ -156,7 +156,7 @@ trust boundary, hardens a fail-closed path, or is cosmetic:
 
 ## Threat model delta
 
-The standing [THREAT_MODEL.md](../THREAT_MODEL.md) validated against the
+The standing [THREAT_MODEL.md](../security/THREAT_MODEL.md) validated against the
 code: the camera-pinning conditions, the posture table, the sealing-tier
 ladder, the fingerprint-tier residual (ADR-0003), and the score-exposure
 rules all match their implementations. Two additions from this audit:

@@ -306,7 +306,7 @@ restorecon /run/irlume.sock 2>/dev/null || :
 %{_datadir}/polkit-1/actions/org.irlume.enroll.policy
 %{_datadir}/polkit-1/actions/org.irlume.recovery-manage.policy
 %license LICENSE
-%doc README.md docs/SECURITY_AT_REST.md docs/MACHINE-API.md docs/INTEGRATION.md
+%doc README.md docs/security/SECURITY_AT_REST.md docs/reference/MACHINE-API.md docs/reference/INTEGRATION.md
 %{_bindir}/irlumed
 %{_bindir}/irlume
 %{_datadir}/applications/io.github.archledger.Irlume.desktop

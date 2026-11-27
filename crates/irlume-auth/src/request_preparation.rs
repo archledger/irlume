@@ -815,7 +815,7 @@ fn split_activation_refusal() -> Error {
 /// entry point; it is not a remedy for the refused operation. `identify`,
 /// `profiles add-scan` and positioning have no split counterpart. The
 /// `irlume split` subcommands are a separate, authorization-only interface and
-/// are not a remedy either. docs/COMMANDS.md carries this per request context,
+/// are not a remedy either. docs/reference/COMMANDS.md carries this per request context,
 /// together with the closed-gate refusal a split-specific request keeps.
 pub(crate) const ORDINARY_PATH_SPLIT_REFUSAL: &str =
     "this request uses the ordinary camera path, which never opens a split camera pair; \

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -103,6 +104,37 @@ class ArchGitRecipe(unittest.TestCase):
                 RELEASE.split(marker, 1)[1].split(")", 1)[0],
                 marker,
             )
+
+    def test_machine_docs_install_from_the_release_tag_and_current_layout(self) -> None:
+        for recipe, name, canonical in (
+            (RELEASE, "package_irlume", False),
+            (RELEASE, "package_irlume", True),
+            (NIGHTLY, "package_irlume-git", True),
+        ):
+            with self.subTest(name=name, canonical=canonical), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "schemas").mkdir()
+                (root / "schemas/machine-api-v1.schema.json").write_text("{}\n")
+                (root / "docs").mkdir()
+                if canonical:
+                    (root / "docs/reference").mkdir()
+                pages = ("MACHINE-API.md", "INTEGRATION.md")
+                for page in pages:
+                    (root / "docs" / page).write_text("tag layout\n")
+                    if canonical:
+                        (root / "docs/reference" / page).write_text("current layout\n")
+                body = function(recipe, name)
+                offset = body.index("    install -Dm0644 schemas/machine-api-v1.schema.json")
+                result = subprocess.run(
+                    ["bash", "-euc", "package_tail() {\n" + body[offset:] +
+                     "\n}\npkgdir=$PWD/out\npkgname=$1\npackage_tail\n", "bash",
+                     name.removeprefix("package_")],
+                    cwd=root, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for page in pages:
+                    installed = root / "out/usr/share/doc" / name.removeprefix("package_") / page
+                    self.assertEqual(installed.read_text(), "current layout\n" if canonical else "tag layout\n")
 
     def test_only_the_main_package_carries_the_install_hooks(self) -> None:
         # Set before the package functions, install= gave the KCM package

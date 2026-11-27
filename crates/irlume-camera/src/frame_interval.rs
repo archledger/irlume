@@ -53,7 +53,7 @@ impl Ord for FrameInterval {
     }
 }
 
-const fn gcd(mut left: u32, mut right: u32) -> u32 {
+pub(crate) const fn gcd(mut left: u32, mut right: u32) -> u32 {
     while right != 0 {
         let remainder = left % right;
         left = right;

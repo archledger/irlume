@@ -5945,6 +5945,131 @@ fn polkit_unwired_line(bitwarden_action: bool, nixos: bool) -> &'static str {
     }
 }
 
+fn report_model_runtime_checks(report: &mut crate::doctor_report::Report) {
+    use crate::doctor_report::State;
+
+    dout!(report, "[doctor] models:");
+    if commands::daemon_models_loaded() == Some(true) {
+        dout!(report, "  loaded by the daemon ✓");
+        report.check("models", State::Pass);
+    } else {
+        report.check(
+            "models",
+            if commands::REQUIRED_MODELS
+                .iter()
+                .all(|(f, env)| commands::resolve_model(f, env).is_some())
+            {
+                State::Pass
+            } else {
+                State::Fail
+            },
+        );
+        for (f, env) in commands::REQUIRED_MODELS {
+            match commands::resolve_model(f, env) {
+                Some(p) => dout!(report, "  {f}: present ✓ ({})", p.display()),
+                None => {
+                    dout!(
+                        report,
+                        "  {f}: not found; install the irlume package (or run from the repo)"
+                    )
+                }
+            }
+        }
+    }
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+    report.check("ort-dylib-path", State::Info);
+    dout!(
+        report,
+        "[doctor] ORT_DYLIB_PATH: {}",
+        if ort.is_empty() {
+            "(unset)".into()
+        } else {
+            ort
+        }
+    );
+    // Which ONNX Runtime this shell would actually load, and whether it is
+    // usable. The resolver prefers a packaged copy over the system library,
+    // so a stale file at a packaged path silently outranks a healthy system
+    // install; naming the resolved candidate and its version here is what
+    // makes that visible (#187: a below-floor leftover from a previous
+    // distro's package hung the daemon, and nothing reported which library
+    // had been chosen).
+    {
+        let (candidate, verdict) = irlume_vision::runtime_resolution();
+        let source = match &candidate {
+            Some(path) => path.display().to_string(),
+            None => "system libonnxruntime.so".to_string(),
+        };
+        match verdict {
+            Ok(version) => {
+                let detail = format!("{source} ({version})");
+                report.check_detail("onnxruntime", State::Pass, &detail);
+                dout!(report, "[doctor] ONNX Runtime: {detail} ✓");
+            }
+            Err(why) => {
+                report.check_detail("onnxruntime", State::Fail, format!("{source}: {why}"));
+                dout!(
+                    report,
+                    "[doctor] ONNX Runtime: {source} UNUSABLE ✗ ({why}). The daemon \
+                     cannot load models from this; if a packaged path above is a \
+                     leftover from a previous install, remove it"
+                );
+            }
+        }
+    }
+    // The TFLite runtime the mesh runs on, probed the same way the ONNX row
+    // is: a real load in this shell, naming what resolved. The mesh has been
+    // a .tflite since #295 and a packaged daemon refuses to start without
+    // the runtime, yet no surface reported it (found by the 2026-08-12
+    // release audit through the Repair tab's same gap). The caveat both
+    // rows share: this shell is unconfined, so a load that succeeds here
+    // can still fail under the daemon's AppArmor profile.
+    {
+        use irlume_vision::tflite::{tflite_lib_candidates, tflite_runtime, TfliteUnavailable};
+        match tflite_runtime() {
+            Ok(_) => {
+                let path = tflite_lib_candidates(
+                    std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
+                        .ok()
+                        .as_deref(),
+                    |p| p.exists(),
+                )
+                .first()
+                .map_or_else(|| "resolved".to_string(), |p| p.display().to_string());
+                report.check_detail("tflite-runtime", State::Pass, &path);
+                dout!(report, "[doctor] TFLite runtime: {path} ✓");
+            }
+            // A visible override error is an operator mistake THIS shell can
+            // see: Fail. A plain not-found is a guess about the daemon's env
+            // (the unit may set IRLUME_TFLITE_LIB), so Warn, matching the
+            // ONNX fallback row's reasoning.
+            Err(
+                e @ (TfliteUnavailable::OverrideInvalid { .. }
+                | TfliteUnavailable::OverrideFailed { .. }),
+            ) => {
+                report.check_detail("tflite-runtime", State::Fail, e.to_string());
+                dout!(
+                    report,
+                    "[doctor] TFLite runtime: UNUSABLE ✗ ({e}); fix or unset \
+                     IRLUME_TFLITE_LIB (the resolver refuses to fall through a \
+                     broken override)"
+                );
+            }
+            Err(e @ TfliteUnavailable::NotFound { .. }) => {
+                report.check_detail("tflite-runtime", State::Warn, e.to_string());
+                dout!(
+                    report,
+                    "[doctor] TFLite runtime: not loadable from this shell ⚠ ({e}). \
+                     The mesh is a .tflite, so a daemon without it does not start; \
+                     install the irlume package's runtime \
+                     (/usr/share/irlume/tflite/libtensorflowlite_c.so) or set \
+                     IRLUME_TFLITE_LIB in the irlumed unit"
+                );
+            }
+        }
+    }
+}
+
 fn doctor_run(
     report: &mut crate::doctor_report::Report,
     args: &[String],
@@ -6325,127 +6450,8 @@ fn doctor_run(
         selected_stream_minimum_checks(report, irlume_camera::select_pair());
     }
 
-    // --- models / runtime --------------------------------------------------
-    dout!(report, "[doctor] models:");
-    if commands::daemon_models_loaded() == Some(true) {
-        dout!(report, "  loaded by the daemon ✓");
-        report.check("models", State::Pass);
-    } else {
-        report.check(
-            "models",
-            if commands::REQUIRED_MODELS
-                .iter()
-                .all(|(f, env)| commands::resolve_model(f, env).is_some())
-            {
-                State::Pass
-            } else {
-                State::Fail
-            },
-        );
-        for (f, env) in commands::REQUIRED_MODELS {
-            match commands::resolve_model(f, env) {
-                Some(p) => dout!(report, "  {f}: present ✓ ({})", p.display()),
-                None => {
-                    dout!(
-                        report,
-                        "  {f}: not found; install the irlume package (or run from the repo)"
-                    )
-                }
-            }
-        }
-    }
-    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
-    report.check("ort-dylib-path", State::Info);
-    dout!(
-        report,
-        "[doctor] ORT_DYLIB_PATH: {}",
-        if ort.is_empty() {
-            "(unset)".into()
-        } else {
-            ort
-        }
-    );
-    // Which ONNX Runtime this shell would actually load, and whether it is
-    // usable. The resolver prefers a packaged copy over the system library,
-    // so a stale file at a packaged path silently outranks a healthy system
-    // install; naming the resolved candidate and its version here is what
-    // makes that visible (#187: a below-floor leftover from a previous
-    // distro's package hung the daemon, and nothing reported which library
-    // had been chosen).
-    {
-        let (candidate, verdict) = irlume_vision::runtime_resolution();
-        let source = match &candidate {
-            Some(path) => path.display().to_string(),
-            None => "system libonnxruntime.so".to_string(),
-        };
-        match verdict {
-            Ok(version) => {
-                let detail = format!("{source} ({version})");
-                report.check_detail("onnxruntime", State::Pass, &detail);
-                dout!(report, "[doctor] ONNX Runtime: {detail} ✓");
-            }
-            Err(why) => {
-                report.check_detail("onnxruntime", State::Fail, format!("{source}: {why}"));
-                dout!(
-                    report,
-                    "[doctor] ONNX Runtime: {source} UNUSABLE ✗ ({why}). The daemon \
-                     cannot load models from this; if a packaged path above is a \
-                     leftover from a previous install, remove it"
-                );
-            }
-        }
-    }
-    // The TFLite runtime the mesh runs on, probed the same way the ONNX row
-    // is: a real load in this shell, naming what resolved. The mesh has been
-    // a .tflite since #295 and a packaged daemon refuses to start without
-    // the runtime, yet no surface reported it (found by the 2026-08-12
-    // release audit through the Repair tab's same gap). The caveat both
-    // rows share: this shell is unconfined, so a load that succeeds here
-    // can still fail under the daemon's AppArmor profile.
-    {
-        use irlume_vision::tflite::{tflite_lib_candidates, tflite_runtime, TfliteUnavailable};
-        match tflite_runtime() {
-            Ok(_) => {
-                let path = tflite_lib_candidates(
-                    std::env::var(irlume_vision::tflite::TFLITE_LIB_ENV)
-                        .ok()
-                        .as_deref(),
-                    |p| p.exists(),
-                )
-                .first()
-                .map_or_else(|| "resolved".to_string(), |p| p.display().to_string());
-                report.check_detail("tflite-runtime", State::Pass, &path);
-                dout!(report, "[doctor] TFLite runtime: {path} ✓");
-            }
-            // A visible override error is an operator mistake THIS shell can
-            // see: Fail. A plain not-found is a guess about the daemon's env
-            // (the unit may set IRLUME_TFLITE_LIB), so Warn, matching the
-            // ONNX fallback row's reasoning.
-            Err(
-                e @ (TfliteUnavailable::OverrideInvalid { .. }
-                | TfliteUnavailable::OverrideFailed { .. }),
-            ) => {
-                report.check_detail("tflite-runtime", State::Fail, e.to_string());
-                dout!(
-                    report,
-                    "[doctor] TFLite runtime: UNUSABLE ✗ ({e}); fix or unset \
-                     IRLUME_TFLITE_LIB (the resolver refuses to fall through a \
-                     broken override)"
-                );
-            }
-            Err(e @ TfliteUnavailable::NotFound { .. }) => {
-                report.check_detail("tflite-runtime", State::Warn, e.to_string());
-                dout!(
-                    report,
-                    "[doctor] TFLite runtime: not loadable from this shell ⚠ ({e}). \
-                     The mesh is a .tflite, so a daemon without it does not start; \
-                     install the irlume package's runtime \
-                     (/usr/share/irlume/tflite/libtensorflowlite_c.so) or set \
-                     IRLUME_TFLITE_LIB in the irlumed unit"
-                );
-            }
-        }
-    }
+    report_model_runtime_checks(report);
+
     // --- pipeline stages (#276) -----------------------------------------
     // Each stage's model CANDIDATE from this process's search order. A
     // candidate, not a claim about the daemon: the service unit (or a

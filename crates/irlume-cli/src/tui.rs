@@ -5139,10 +5139,7 @@ impl App {
     /// predictable instead of exiting the app.
     fn go_home(&mut self) {
         if self.visible.contains(&SC_WELCOME) && self.screen != SC_WELCOME {
-            self.screen = SC_WELCOME;
-            // Entering Overview re-reads the attempt it leads with, however
-            // it was reached (enter_screen does the same).
-            self.refresh_attempts();
+            self.enter_screen(SC_WELCOME);
         }
     }
 
@@ -7525,9 +7522,6 @@ impl App {
     /// first-run button replays its key. Clicks while a modal/flow owns the
     /// screen are ignored.
     fn on_click(&mut self, col: u16, row: u16, area: Rect) {
-        if self.enrollment_result_is_exposed() {
-            self.enrollment_result = None;
-        }
         let last_click = self.repair_click.take();
         if self.activity_history_open && !self.dialog_open() {
             let key = self
@@ -19766,6 +19760,57 @@ mod tests {
         assert!(app.enrollment_result.is_none());
         drain_loads(&mut app);
         wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_survives_clicking_history() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+
+        let area = Rect::new(0, 0, 128, 48);
+        assert!(draw_text_at(&app, area.width, area.height).contains("Enrollment complete"));
+        let history = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, target)| match target {
+                Click::Key(KeyCode::Char('L')) => Some(*rect),
+                _ => None,
+            })
+            .expect("rendered full-history button");
+        app.on_click(history.x, history.y, area);
+        assert!(app.activity_history_open);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, area.width, area.height).contains("Enrollment complete"));
+        app.on_key(KeyCode::Esc);
+        assert!(app.enrollment_result.is_none());
+    }
+
+    #[test]
+    fn continuous_enrollment_result_clears_when_returning_to_overview() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+
+        app.on_key(KeyCode::Char('h'));
+        drain_loads(&mut app);
+        assert_eq!(app.screen, SC_WELCOME);
+        assert!(app.enrollment_result.is_none());
     }
 
     #[test]

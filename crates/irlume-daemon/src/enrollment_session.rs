@@ -149,7 +149,7 @@ impl Connection {
     fn pump_inner(&mut self, stream: &UnixStream, allow_optional: bool) -> io::Result<()> {
         if allow_optional {
             if !self.optional_tail.is_empty() {
-                let sent = try_write_optional(stream, &self.optional_tail);
+                let sent = try_write_optional(stream, &self.optional_tail)?;
                 self.optional_tail.drain(..sent);
                 if !self.optional_tail.is_empty() {
                     // Do not dequeue control events or block on optional
@@ -249,7 +249,8 @@ impl Connection {
         }
         if let Ok(mut line) = serde_json::to_vec(&Response::EnrollmentSession(event)) {
             line.push(b'\n');
-            let sent = try_write_optional(stream, &line);
+            // No bytes from this sample are on the wire yet if send fails.
+            let sent = try_write_optional(stream, &line).unwrap_or(0);
             if sent != 0 && sent < line.len() {
                 self.optional_tail.extend_from_slice(&line[sent..]);
             }
@@ -257,9 +258,9 @@ impl Connection {
     }
 }
 
-fn try_write_optional(stream: &UnixStream, line: &[u8]) -> usize {
+fn try_write_optional(stream: &UnixStream, line: &[u8]) -> io::Result<usize> {
     // SAFETY: line is valid for the syscall; only this connection writes to
-    // the socket. A full buffer drops new feedback instead of blocking.
+    // the socket. MSG_DONTWAIT affects only this send.
     let sent = unsafe {
         libc::send(
             stream.as_raw_fd(),
@@ -268,7 +269,14 @@ fn try_write_optional(stream: &UnixStream, line: &[u8]) -> usize {
             libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
         )
     };
-    usize::try_from(sent).unwrap_or(0).min(line.len())
+    if let Ok(sent) = usize::try_from(sent) {
+        return Ok(sent);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(0),
+        _ => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +398,20 @@ mod tests {
                 target: 3
             })
         ));
+    }
+
+    #[test]
+    fn enrollment_framing_partial_line_reports_a_permanent_write_error() {
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (server, client) = UnixStream::pair().unwrap();
+        connection.optional_tail = b"null}}\n".to_vec();
+        worker.progress(1, 3).unwrap();
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(!super::super::peer_gone(&server));
+
+        let error = connection.pump(&server).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

@@ -4,7 +4,7 @@ The root [AGENTS.md](../../AGENTS.md) applies. ADRs record security-posture and
 design decisions. Weakening a guarantee (votes, budgets, modes, authorization
 posture) needs an ADR ([docs/CODE_REVIEW.md](../CODE_REVIEW.md)); other
 security-posture changes (grant arms, consent, rate limits, fallbacks) usually
-do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
+do, so sketch one in the PR early ([CONTRIBUTING.md](../../.github/CONTRIBUTING.md)
 "Changes that touch cameras, PAM, or the daemon").
 
 ## Recipe: write an ADR
@@ -31,7 +31,7 @@ do, so sketch one in the PR early ([CONTRIBUTING.md](../../CONTRIBUTING.md)
    (ADR-0038, ADR-0039), and the withdrawn ADR's Status opens with a dated
    `Withdrawn YYYY-MM-DD by ADR-NNNN` line saying its text is kept as the
    record (ADR-0022, ADR-0033).
-5. Plain punctuation, no em dashes (CONTRIBUTING.md "Writing style").
+5. Plain punctuation, no em dashes (.github/CONTRIBUTING.md "Writing style").
 
 Before camera or TUI work, read ADR-0007, 0023, 0024, 0027, 0028, 0029 and
 0030; before camera work, also ADR-0020, 0021, 0031 (YUYV-luma IR endpoints)

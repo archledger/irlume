@@ -16,7 +16,7 @@ IR camera. Enrollment stores embeddings, never images. Password fallback stays a
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
 [![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/FAQ.md)
 
-**[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[Problems?](SUPPORT.md)** · **[All docs](docs/)**
+**[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[Problems?](.github/SUPPORT.md)** · **[All docs](docs/)**
 
 <br>
 
@@ -122,7 +122,7 @@ unlock · **fingerprint** → companion factor.
 | [**Verify**](docs/VERIFY.md) | Reproduce every claim on your machine |
 | [**Integration**](docs/INTEGRATION.md) · [**Machine API**](docs/MACHINE-API.md) | Drive irlume from your own software |
 | [**Debugging**](docs/DEBUGGING.md) | Trace a failing login |
-| [**Contributing**](CONTRIBUTING.md) · [**Changelog**](CHANGELOG.md) · [**Credits**](docs/CREDITS.md) | |
+| [**Contributing**](.github/CONTRIBUTING.md) · [**Changelog**](CHANGELOG.md) · [**Credits**](docs/CREDITS.md) | |
 
 ## Status
 
@@ -153,7 +153,7 @@ their next write; hosts without a TPM retain root-only plaintext storage.
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:
 [Issues](https://github.com/archledger/irlume/issues) ·
-[Security](SECURITY.md)
+[Security](.github/SECURITY.md)
 
 If irlume is useful to you and you feel like it, star the repository to help
 others find it; there is also GitHub Sponsors, a Ko-fi, or PayPal, all

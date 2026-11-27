@@ -14,7 +14,7 @@ paths:
 For *what* you're building (the daemon/PAM/CLI split and the model pipeline),
 read [`ARCHITECTURE.md`](ARCHITECTURE.md). For the contribution rules (DCO,
 biometric-data and model-license policy, PAD self-tests), read
-[`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+[CONTRIBUTING.md](../.github/CONTRIBUTING.md).
 
 ## Get the source (with model weights)
 
@@ -382,7 +382,7 @@ Crate roles (details and the privilege-separation diagram are in
 
 ## Before you open a PR
 
-Sign your commits (DCO; see [`../CONTRIBUTING.md`](../CONTRIBUTING.md)):
+Sign your commits (DCO; see [CONTRIBUTING.md](../.github/CONTRIBUTING.md)):
 
 ```sh
 git commit -s -m "your message"

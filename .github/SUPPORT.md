@@ -3,7 +3,7 @@
 irlume is pre-1.0, solo-maintained software. This page states plainly what
 support a release receives; the security-reporting side lives in
 [SECURITY.md](SECURITY.md) and the trust boundaries in
-[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+[docs/THREAT_MODEL.md](../docs/THREAT_MODEL.md).
 
 ## Where to report a problem
 
@@ -40,7 +40,7 @@ The maintainer never asks for:
 There is no long-term-support branch: security fixes land on `main` and ship
 in the next release. When a new version is published, the previous version
 stops receiving security updates at that moment, and the release notes plus
-[CHANGELOG.md](CHANGELOG.md) state what changed and how to upgrade.
+[CHANGELOG.md](../CHANGELOG.md) state what changed and how to upgrade.
 
 ## Kinds of support
 
@@ -62,7 +62,7 @@ There is no SLA, no dedicated support channel and no paid tier.
 
 On a supported PAM stack, when irlume declines face sign-in, it returns
 control to the password provider. The
-[login frontend](docs/DESKTOP-AUTH.md#frontend-boundary) controls when you can
+[login frontend](../docs/DESKTOP-AUTH.md#frontend-boundary) controls when you can
 enter a password, and the operating system's account policy still applies.
 For example, `pam_faillock` can reject even a correct password while the
 account is locked after repeated failed attempts.

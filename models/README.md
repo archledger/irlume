@@ -8,7 +8,7 @@ clone, fetch and sha256-verify them with `bash ../scripts/fetch-models.sh`; a
 distro package bundles them, so an installed system needs no download.
 
 `SHA256SUMS` holds the release checksums; the daemon embeds it at build time
-and warns at startup when a loaded model doesn't match (see ../SECURITY.md).
+and warns at startup when a loaded model doesn't match (see [SECURITY.md](../.github/SECURITY.md)).
 The same hashes are pinned in `scripts/fetch-models.sh`, the Fedora spec, the
 Arch PKGBUILD, and `flake.nix`. To change a shipped model: upload the new file
 to a fresh `models-vN` release, regenerate `SHA256SUMS`

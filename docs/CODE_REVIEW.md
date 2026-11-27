@@ -24,7 +24,7 @@ Every change to `main` arrives as a pull request and is reviewed before merge.
 ## How review is conducted
 
 This is a solo-maintainer project. Proposed modifications - whether from the
-project's automation or from human contributors, whom `CONTRIBUTING.md`
+project's automation or from human contributors, whom [CONTRIBUTING.md](../.github/CONTRIBUTING.md)
 welcomes - are gated by the owner before every merge. The primary reviewer
 is the validation itself: the required checks on the final head, the
 hardware lanes (real TPM, real cameras, PAM) and the exhaustive audits

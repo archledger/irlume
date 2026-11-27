@@ -1,7 +1,7 @@
 # AGENTS.md: irlume-daemon
 
 The root [AGENTS.md](../../AGENTS.md) applies; this adds socket protocol and
-posture rules for `irlumed`, a critical-tier component ([SECURITY.md](../../SECURITY.md)).
+posture rules for `irlumed`, a critical-tier component ([SECURITY.md](../../.github/SECURITY.md)).
 `src/main.rs` is about 29k lines: search for the names below.
 
 ## Wire compatibility

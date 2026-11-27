@@ -8,6 +8,6 @@ contact_links:
     about: >-
       If a photo, video, mask or another person got in, face sign-in worked
       without your face, or face data was exposed, never post it publicly.
-      Report it privately here, or by the e-mail address in SECURITY.md.
+      Report it privately here, or by the e-mail address in .github/SECURITY.md.
       Not a security problem, and not sure it is a bug? Open a blank issue;
       a report in your own words is fine.

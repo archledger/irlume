@@ -4,13 +4,13 @@ irlume is face and fingerprint authentication for Linux, in Rust: a privileged
 daemon (`irlumed`), a CLI and TUI (`irlume`), a PAM module (`pam_irlume.so`), a
 KDE System Settings module and TPM-sealed keyring unlock. It is pre-1.0 and
 GPL-3.0-or-later, with one maintainer who decides what merges and ships
-([GOVERNANCE.md](GOVERNANCE.md)). Three things must never break: authentication
+([GOVERNANCE.md](.github/GOVERNANCE.md)). Three things must never break: authentication
 correctness (no grant without a genuine live match), the password fallback (it
 always works) and the privacy of biometric data. If a task seems to need any of
 them weakened, stop and ask.
 
 This file guides coding agents and the people who run them. It condenses
-[CONTRIBUTING.md](CONTRIBUTING.md) and the docs it links; most rules name their
+[CONTRIBUTING.md](.github/CONTRIBUTING.md) and the docs it links; most rules name their
 source. Where prose and code disagree, trust `Cargo.toml`, `ci.yml` and the
 code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
 `AGENTS.md` files (crates `irlume-common`, `-daemon`, `-cli`, `-pam`, and
@@ -34,9 +34,29 @@ code, and say so in the PR. `ADR-NNNN` means `docs/adr/NNNN-*.md`. Nested
 | `fuzz/` | Separate nightly cargo-fuzz workspace with its own `Cargo.lock`. | `fuzz/fuzz_targets/`, `fuzz/seeds/` |
 | `packaging/`, `nix/` | Distro and Nix lanes, systemd units, AppArmor, SELinux, polkit. | [packaging/README.md](packaging/README.md) |
 | `schemas/`, `models/` | Machine API schema and fixtures, and the nightly-candidate schema; model hashes and BOM. | [models/README.md](models/README.md) |
+| `scripts/` | User-facing and packaging entrypoints, maintainer tooling, and automation. CI-specific helpers go under `scripts/ci/`. Existing entrypoint paths stay stable. | [scripts/README.md](scripts/README.md) |
+| `tasks/` | Planning and tracking notes, not executable automation. | `tasks/plan.md`, `tasks/todo.md` |
 
-Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); terms: [CONTEXT.md](CONTEXT.md).
+The public flake stays at the root; `nix/` stays with its established paths
+because the flake, packaging checks, and Rust tests consume them directly.
+
+Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 The main TUI, camera, daemon and auth files run 18k to 29k lines: search, do not read them whole.
+
+## Terminology
+
+- **Capture schedule:** The ordering used to acquire an RGB+IR pair:
+  concurrent or sequential. Avoid "camera mode" and "dual mode".
+- **Capture qualification:** Context-bound evidence authorizing the capture
+  schedule for an exact camera pair, stream contract, and connection. Avoid
+  "camera capability" and "compatibility flag".
+- **Runtime degradation:** A temporary, process-local demotion from concurrent
+  to sequential after live evidence violates the qualified capture contract.
+  It is neither requalification nor a permanent downgrade.
+- **Support report:** A share-safe, human-readable snapshot of sanitized
+  Irlume health and recent diagnostic facts, not a log dump or support bundle.
+- **Diagnostic trace:** A privileged, time-bounded stream of structured events
+  from live Irlume operations, not persistent debug logging.
 
 ## Setup
 
@@ -107,7 +127,7 @@ cargo build --release --locked
   passing negative-path tests print `FAILED` text on stderr.
 - New behavior gets tests in the same PR, a defect fix a regression test, a
   fuzzed parser a seed in `fuzz/seeds/<target>/`, hardware-only code an
-  `#[ignore = "..."]` test plus a validation note ([CONTRIBUTING.md](CONTRIBUTING.md)
+  `#[ignore = "..."]` test plus a validation note ([CONTRIBUTING.md](.github/CONTRIBUTING.md)
   "Ground rules for a security project", [docs/CODE_REVIEW.md](docs/CODE_REVIEW.md)).
 - Tests never write real system paths: use DEVELOPMENT.md "Sandbox environment
   overrides" under the crate's env lock (common `testenv::lock()`; core, camera,
@@ -166,12 +186,12 @@ cargo build --release --locked
   function-level ones) for `undocumented_unsafe_blocks` (`Cargo.toml`
   comment). New code documents instead; delete an expectation when you
   document its site (an unfulfilled one fails). Prefer `#[expect]` to `#[allow]`.
-- Use [CONTEXT.md](CONTEXT.md) terms ("capture schedule", not "camera mode").
+- Use the [terminology](#terminology) above ("capture schedule", not "camera mode").
   Head gestures are removed ([docs/HEAD-GESTURE-REMOVAL.md](docs/HEAD-GESTURE-REMOVAL.md));
   IR-only login is experimental opt-in ([docs/IR_ONLY_QUALIFICATION.md](docs/IR_ONLY_QUALIFICATION.md)).
 - Writing (comments, docs, commits, PRs): plain punctuation, no em dashes
   (U+2014), concrete and terse, numbers over adjectives
-  ([CONTRIBUTING.md](CONTRIBUTING.md) "Writing style"). Check with
+  ([CONTRIBUTING.md](.github/CONTRIBUTING.md) "Writing style"). Check with
   `grep -nP '\x{2014}' <files>`; older files still have some.
 
 ## Invariants that are easy to break
@@ -180,7 +200,7 @@ cargo build --release --locked
    daemon makes the PAM module return `PAM_IGNORE`, never `PAM_SUCCESS` or
    `PAM_AUTH_ERR`. Its two deliberate `PAM_ABORT` paths are listed in
    [the PAM AGENTS.md](crates/irlume-pam/AGENTS.md); keep them and add no other
-   ([SECURITY.md](SECURITY.md) "Threat model (summary)", `crates/irlume-pam/src/lib.rs`).
+   ([SECURITY.md](.github/SECURITY.md) "Threat model (summary)", `crates/irlume-pam/src/lib.rs`).
 2. **One decider.** Only `irlume-auth` decides a face grant; shims stay thin; no
    binary links another binary's crate ([crates/README.md](crates/README.md)).
 3. **Privilege split.** `irlumed` alone owns camera, IR emitter, models,
@@ -262,7 +282,7 @@ cargo build --release --locked
   or attach it to issues. Never add model weights to git: they come from the
   `models-v1` release, pinned in `models/SHA256SUMS` (the tracked
   `models/face_landmarks_detector.tflite` is the one exception). A new model is
-  permissive in code, weights and training data ([CONTRIBUTING.md](CONTRIBUTING.md)
+  permissive in code, weights and training data ([CONTRIBUTING.md](.github/CONTRIBUTING.md)
   "Ground rules for a security project", [models/README.md](models/README.md)).
 - No score, threshold value or similarity in the TUI, PAM prompts or the
   attempt record (ADR-0030 section 5), and none in a reply to anyone but root
@@ -291,7 +311,7 @@ cargo build --release --locked
   `Cargo.lock`, and `fuzz/Cargo.lock`
   when a dependency of common, core or camera changes.
 - Vulnerabilities go only to GitHub Private Vulnerability Reporting or the
-  address in [SECURITY.md](SECURITY.md). If you find one, stop and tell the human,
+  address in [SECURITY.md](.github/SECURITY.md). If you find one, stop and tell the human,
   who files it; describe it nowhere public (issue, PR, commit, branch name,
   CHANGELOG, public fork).
 
@@ -301,7 +321,7 @@ cargo build --release --locked
   Weakening a guarantee (votes, budgets, modes, authorization posture) needs an
   ADR (CODE_REVIEW.md); other security-posture changes (grant arms, consent, rate
   limits, fallbacks) usually do, so sketch one in the PR early
-  ([CONTRIBUTING.md](CONTRIBUTING.md) "Changes that touch cameras, PAM, or the daemon").
+  ([CONTRIBUTING.md](.github/CONTRIBUTING.md) "Changes that touch cameras, PAM, or the daemon").
 - Subject `type(scope): summary` (scope optional), e.g.
   `fix(config): safe writes (ADR-0029 B1)`; types
   `fix feat docs perf ci test deps chore refactor bench build diag` (`git log`).
@@ -332,7 +352,7 @@ cargo build --release --locked
   adds the AI line, e.g. "AI assistance: a coding agent drafted the parser and
   tests; I reviewed every line and ran the gate." Describe the final change,
   not the session. A fork's first PR waits for workflow approval
-  (CONTRIBUTING.md "Pull request process").
+  (.github/CONTRIBUTING.md "Pull request process").
 - User-facing changes add a CHANGELOG entry under `## [Unreleased]`, in the
   matching `###` subsection (`Added`, `Changed`, `Fixed`, `Removed`,
   `Security`), newest first: one `- ` bullet, a blank line between bullets,
@@ -355,7 +375,7 @@ cargo build --release --locked
 ## Agents must not
 
 - Bump versions, create tags, or sign or publish releases
-  ([GOVERNANCE.md](GOVERNANCE.md), [docs/RELEASING.md](docs/RELEASING.md));
+  ([GOVERNANCE.md](.github/GOVERNANCE.md), [docs/RELEASING.md](docs/RELEASING.md));
   the `git commit -s` sign-off is still required.
 - Push, open or merge PRs, or post comments, unless the human asked.
 - Weaken, skip or delete a test to get green, `#[ignore]` a failing test, lower

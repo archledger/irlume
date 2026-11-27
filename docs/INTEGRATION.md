@@ -204,7 +204,7 @@ configured, such as a library, a model, or a camera path outside `/dev/video*`
 and `/dev/v4l/`, is shown as you set it and can lie under your home directory.
 Read the output before you attach it to a public issue; you may replace the
 names. A security problem goes to the private route in
-[SECURITY.md](../SECURITY.md), never into a public issue.
+[SECURITY.md](../.github/SECURITY.md), never into a public issue.
 
 ## PAM credential-release retries
 

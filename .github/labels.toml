@@ -213,7 +213,7 @@ issue_area = ["KDE System Settings module"]
 
 [labels.security]
 color = "b60205"
-description = "Security posture discussion; real vulnerabilities go through SECURITY.md, never issues"
+description = "Security posture discussion; real vulnerabilities go through .github/SECURITY.md, never issues"
 
 [labels.regression]
 color = "e99695"
@@ -229,7 +229,7 @@ description = "Rust implementation detail that is not user-facing"
 
 [labels."good first issue"]
 color = "0e8a16"
-description = "Self-contained and scoped; see CONTRIBUTING.md before starting"
+description = "Self-contained and scoped; see .github/CONTRIBUTING.md before starting"
 
 [labels."help wanted"]
 color = "008672"

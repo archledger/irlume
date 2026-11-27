@@ -3,7 +3,7 @@
 The root [AGENTS.md](../../AGENTS.md) applies. `pam_irlume.so` is loaded into
 login, sudo, polkit, greeter and lock-screen processes: a bug here grants a
 login or locks a person out. It is critical-tier
-([SECURITY.md](../../SECURITY.md)); the `src/lib.rs` header and the comments in
+([SECURITY.md](../../.github/SECURITY.md)); the `src/lib.rs` header and the comments in
 `authenticate` document the modes and arguments.
 
 ## Safety rules
@@ -12,7 +12,7 @@ login or locks a person out. It is critical-tier
   `SUCCESS`, every path that is not a confirmed grant returns `PAM_IGNORE`:
   errors, timeouts, no-match, an unavailable or older daemon, odd replies,
   remote sessions, a failed unseal, or a refused one with no identity
-  fallback. Never `PAM_AUTH_ERR`; the password is the floor (SECURITY.md
+  fallback. Never `PAM_AUTH_ERR`; the password is the floor (.github/SECURITY.md
   "Threat model (summary)").
 - Two paths return `PAM_ABORT` on purpose; keep them and add no other: a
   consumed `yes` or empty intent token that `clear_authtok` cannot clear

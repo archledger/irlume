@@ -43,8 +43,10 @@ TURNED_OFF_URLS = (
 # Documents whose links direct people. Dated records under docs
 # subdirectories (adr, hardware, plans, research) are archives, not
 # directions, so they are not scanned.
-CURATED_DOCUMENTS = ('README.md', 'CONTRIBUTING.md', 'GOVERNANCE.md', 'SECURITY.md',
-                     '.github/pull_request_template.md')
+COMMUNITY_DOCUMENTS = ('CODE_OF_CONDUCT.md', 'CONTRIBUTING.md', 'GOVERNANCE.md',
+                       'SECURITY.md', 'SUPPORT.md')
+CURATED_DOCUMENTS = ('README.md', '.github/pull_request_template.md',
+                     *(f'.github/{name}' for name in COMMUNITY_DOCUMENTS))
 
 
 def curated_documents(root=ROOT):
@@ -148,6 +150,12 @@ class ConfigShape(unittest.TestCase):
 
 
 class CuratedLinks(unittest.TestCase):
+    def test_community_files_live_only_in_dot_github(self):
+        for name in COMMUNITY_DOCUMENTS:
+            with self.subTest(name):
+                self.assertTrue((ROOT / '.github' / name).is_file())
+                self.assertFalse((ROOT / name).exists())
+
     def test_the_curated_documents_exist(self):
         # A renamed or moved file must fail here, not quietly leave the set.
         for name in CURATED_DOCUMENTS:

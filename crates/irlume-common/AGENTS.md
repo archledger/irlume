@@ -40,7 +40,7 @@ other irlume crate, and nearly every crate depends on it
   `crates/irlume-pam/src/lib.rs`), so check both for a remote-session service.
   A new or changed entry is sourced, not guessed: name the distro, greeter or
   lock screen that ships the `/etc/pam.d` file
-  ([CONTRIBUTING.md](../../CONTRIBUTING.md)).
+  ([CONTRIBUTING.md](../../.github/CONTRIBUTING.md)).
 - Secrets crossing the wire or held in memory use `SecretBytes`.
 
 ## Recipe: add a config key

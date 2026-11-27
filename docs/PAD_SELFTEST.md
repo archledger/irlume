@@ -13,7 +13,7 @@ path and are out of scope here; see `docs/pad-results/`.
 This document defines how irlume's presentation-attack-detection (PAD) gate is
 self-tested against the methodology of **ISO/IEC 30107-3** (*Biometric presentation
 attack detection, Part 3: Testing and reporting*). It is the reference the
-`CONTRIBUTING.md` mandate points at ("Liveness/PAD changes should come with a
+[CONTRIBUTING.md](../.github/CONTRIBUTING.md) mandate points at ("Liveness/PAD changes should come with a
 self-test against the relevant ISO/IEC 30107-3 attack class") and the concrete
 form of the "self-test against ISO/IEC 30107-3 attack classes" milestone named in
 [`THREAT_MODEL.md`](THREAT_MODEL.md).

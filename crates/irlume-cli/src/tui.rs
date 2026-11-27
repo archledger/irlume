@@ -19341,7 +19341,8 @@ mod tests {
         });
         app.enroll = Some(enrollment);
 
-        for (w, h) in [(128, 48), (100, 30), (100, 29)] {
+        for (w, h, activity) in [(128, 48, false), (100, 32, false), (120, 36, true)] {
+            app.activity_open = activity;
             let viewport = Rect::new(0, 0, w, h);
             let (_, pane) = app.body_split(app.frame_rows(viewport)[2]);
             let axis = usize::from(pane.x * 2 + pane.width);
@@ -19350,7 +19351,24 @@ mod tests {
             let guide = locate(&framing, "Framing guide");
             let progress = locate(&framing, "[███████░░░░░░░░░░░░░░░░░]");
             let captured = locate(&framing, "3/10 captured");
-            assert!(old_cue.0 < guide.0 && guide.0 < progress.0 && progress.0 < captured.0);
+            let profile = locate(&framing, "Enrolling 'p'");
+            let face_check = locate(&framing, "Face detected");
+            assert_eq!(guide.0, old_cue.0 + 2, "one row between cue and guide");
+            assert_eq!(profile.0, guide.0 + 10, "one row after all nine guide rows");
+            assert!(profile.0 < progress.0 && progress.0 < captured.0);
+            assert_eq!(face_check.0, captured.0 + 2, "one row before the checklist");
+            let rows: Vec<_> = framing.lines().collect();
+            assert!(rows[guide.0 + 8].contains("└"));
+            for row in [old_cue.0 + 1, profile.0 - 1, captured.0 + 1] {
+                assert!(
+                    rows[row]
+                        .chars()
+                        .skip(usize::from(pane.x + 1))
+                        .take(usize::from(pane.width - 2))
+                        .all(|cell| cell == ' '),
+                    "{w}x{h}: nonblank separator at row {row}: {framing}"
+                );
+            }
             for (_, center) in [old_cue, guide, progress, captured] {
                 assert!(axis.abs_diff(center) <= 1, "{w}x{h}: {framing}");
             }
@@ -19394,10 +19412,10 @@ mod tests {
             (80, 24, false),
             (96, 24, false),
             (106, 24, false),
-            (100, 28, false),
+            (100, 31, false),
             (120, 24, true),
             (120, 27, true),
-            (120, 32, true),
+            (120, 35, true),
         ] {
             app.activity_open = activity;
             let before_sample = draw_text_at(&app, width, height);
@@ -19436,13 +19454,13 @@ mod tests {
         });
         app.enroll = Some(enrollment);
 
-        let short = draw_text_at(&app, 100, 29);
+        let short = draw_text_at(&app, 100, 32);
         assert!(!short.contains("Framing guide"));
         assert!(short.contains("0/4 captured"));
         assert!(short.contains("Original office appearance") && short.contains("glasses enabled"));
         assert!(short.contains("[esc] cancel"));
 
-        let roomy = draw_text_at(&app, 100, 30);
+        let roomy = draw_text_at(&app, 100, 33);
         assert!(roomy.contains("Framing guide"));
         assert!(roomy.contains("0/4 captured"));
         assert!(roomy.contains("Original office appearance") && roomy.contains("glasses enabled"));

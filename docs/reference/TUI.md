@@ -246,9 +246,10 @@ switch confirmation rather than silently choosing a replacement.
 ## Enrollment framing guide
 
 When the terminal has room, the enrollment screen stacks the text cue or
-countdown, the framing guide, and scan progress in the center. The guide
-appears after the first detected position. Move to your right and the
-marker moves right; move closer and it grows. The brackets are a visual
+countdown, the framing guide, scan progress, and the checklist in the
+center, with one blank row between sections. The guide appears after the
+first detected position. Move to your right and the marker moves right;
+move closer and it grows. The brackets are a visual
 reference, not a readiness check. Follow the text cue for position,
 angle, and lighting.
 

@@ -12,6 +12,7 @@ use ratatui::{
 
 const WIDTH: u16 = 33;
 const HEIGHT: u16 = 9;
+const GUIDE_GAP_ROWS: u16 = 3;
 
 pub(super) enum Guide {
     TextOnly,
@@ -49,13 +50,13 @@ pub(super) fn draw_stack(
         return false;
     };
     let (guide, guide_rows, intervals) = match guide {
-        Guide::Frame(marker) if area.width >= WIDTH && text_slack >= HEIGHT => {
-            (Guide::Frame(marker), HEIGHT, 3)
+        Guide::Frame(marker) if area.width >= WIDTH && text_slack >= HEIGHT + GUIDE_GAP_ROWS => {
+            (Guide::Frame(marker), HEIGHT, GUIDE_GAP_ROWS)
         }
         _ => (Guide::TextOnly, 0, 2),
     };
     let slack = text_slack - guide_rows;
-    let gap = (slack / intervals).min(2);
+    let gap = u16::from(slack >= intervals);
     let top = area.y + (slack - gap * intervals) / 2;
     let [cue, progress, details] = panels;
     let row_area = |y, height| Rect::new(area.x, y, area.width, height);

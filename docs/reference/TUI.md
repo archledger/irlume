@@ -257,11 +257,14 @@ fresh position data. The guide closes before authorization and scan
 capture. It uses coarse position and size, not webcam video or facial
 landmarks. Compact terminals, older daemons, root or other-account
 sessions, and `IRLUME_REDUCE_MOTION=1` keep the text-only guide.
+On a wide but short terminal, the text and progress can stay centered
+without the framing box.
 
 During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
 The guide checks cancellation after waiting or sampling, and the client checks
 again before sending a new capture request, including the older-daemon fallback.
 Cancellation does not undo work the daemon has already received.
+Other page actions stay inactive while enrollment is in progress.
 
 ## Leaving an action in progress
 

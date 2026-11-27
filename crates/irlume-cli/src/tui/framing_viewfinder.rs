@@ -42,17 +42,19 @@ pub(super) fn draw_stack(
     else {
         return false;
     };
-    let (guide_rows, intervals) = match guide {
-        Guide::TextOnly => (0, 2),
-        Guide::Frame(_) if area.width >= WIDTH => (HEIGHT, 3),
-        Guide::Frame(_) => return false,
-    };
-    let Some(slack) = [cue_rows, guide_rows, progress_rows, detail_rows]
+    let Some(text_slack) = [cue_rows, progress_rows, detail_rows]
         .into_iter()
         .try_fold(area.height, u16::checked_sub)
     else {
         return false;
     };
+    let (guide, guide_rows, intervals) = match guide {
+        Guide::Frame(marker) if area.width >= WIDTH && text_slack >= HEIGHT => {
+            (Guide::Frame(marker), HEIGHT, 3)
+        }
+        _ => (Guide::TextOnly, 0, 2),
+    };
+    let slack = text_slack - guide_rows;
     let gap = (slack / intervals).min(2);
     let top = area.y + (slack - gap * intervals) / 2;
     let [cue, progress, details] = panels;
@@ -62,7 +64,7 @@ pub(super) fn draw_stack(
     if let Guide::Frame(marker) = guide {
         draw(
             frame,
-            Rect::new(area.x + (area.width - WIDTH) / 2, y, WIDTH, HEIGHT),
+            Rect::new(area.x + area.width / 2 - WIDTH / 2, y, WIDTH, HEIGHT),
             marker,
         );
         y += guide_rows + gap;

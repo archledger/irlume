@@ -19341,7 +19341,7 @@ mod tests {
         });
         app.enroll = Some(enrollment);
 
-        for (w, h) in [(128, 48), (100, 30)] {
+        for (w, h) in [(128, 48), (100, 30), (100, 29)] {
             let viewport = Rect::new(0, 0, w, h);
             let (_, pane) = app.body_split(app.frame_rows(viewport)[2]);
             let axis = usize::from(pane.x * 2 + pane.width);
@@ -19354,8 +19354,19 @@ mod tests {
             for (_, center) in [old_cue, guide, progress, captured] {
                 assert!(axis.abs_diff(center) <= 1, "{w}x{h}: {framing}");
             }
+            assert_eq!(guide.1, old_cue.1, "frame and cue share one cell axis");
             assert!(framing.contains("Scan 4 of 10"));
-            assert!(framing.contains("cancel enrollment"));
+            for label in [
+                "Face detected",
+                "Centered in frame",
+                "Facing the camera",
+                "Well lit",
+                "Approve the system dialog when prompted to continue.",
+                "[esc] cancel",
+                "cancel enrollment",
+            ] {
+                assert!(framing.contains(label), "{w}x{h}: missing {label}");
+            }
 
             app.enroll.as_mut().unwrap().count = Some(3);
             let countdown = draw_text_at(&app, w, h);
@@ -19373,10 +19384,6 @@ mod tests {
         let (_tx, mut enrollment) = fake_enroll(0, 4);
         let now = Instant::now();
         app.clock_override = Some(now);
-        enrollment.viewfinder = Some(ViewfinderSample {
-            position: None,
-            sampled_at: now,
-        });
         enrollment.last = Some(PositionReport {
             guidance: "No face detected; look straight at the camera and center yourself".into(),
             ..PositionReport::default()
@@ -19387,16 +19394,59 @@ mod tests {
             (80, 24, false),
             (96, 24, false),
             (106, 24, false),
+            (100, 28, false),
+            (120, 24, true),
             (120, 27, true),
+            (120, 32, true),
         ] {
             app.activity_open = activity;
+            let before_sample = draw_text_at(&app, width, height);
+            app.enroll.as_mut().unwrap().viewfinder = Some(ViewfinderSample {
+                position: None,
+                sampled_at: now,
+            });
             let text = draw_text_at(&app, width, height);
+            assert_eq!(text, before_sample, "{width}x{height}: text layout jumped");
             assert!(!text.contains("Framing guide"), "{width}x{height}: {text}");
             assert!(text.contains("No face detected"));
             assert!(text.contains("Scan 1 of 4"));
             assert!(text.contains("[esc] cancel"));
             assert!(text.contains("cancel enrollment"));
+            app.enroll.as_mut().unwrap().viewfinder = None;
         }
+    }
+
+    #[test]
+    fn enrollment_viewfinder_measures_wrapped_profile_before_showing_the_frame() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(0, 4);
+        enrollment.profile =
+            "Original office appearance with bright lighting and reading glasses enabled".into();
+        enrollment.last = Some(good_report("Center your face in the frame"));
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.viewfinder = Some(ViewfinderSample {
+            position: Some(FramingPosition {
+                x: 5,
+                y: 5,
+                size: 1,
+            }),
+            sampled_at: now,
+        });
+        app.enroll = Some(enrollment);
+
+        let short = draw_text_at(&app, 100, 29);
+        assert!(!short.contains("Framing guide"));
+        assert!(short.contains("0/4 captured"));
+        assert!(short.contains("Original office appearance") && short.contains("glasses enabled"));
+        assert!(short.contains("[esc] cancel"));
+
+        let roomy = draw_text_at(&app, 100, 30);
+        assert!(roomy.contains("Framing guide"));
+        assert!(roomy.contains("0/4 captured"));
+        assert!(roomy.contains("Original office appearance") && roomy.contains("glasses enabled"));
+        assert!(roomy.contains("[esc] cancel"));
     }
 
     #[test]

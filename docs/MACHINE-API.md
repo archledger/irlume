@@ -1,3 +1,5 @@
+<!-- TODO: Remove the old docs/ copy after the published AUR irlume-git recipe uses docs/reference/. -->
+
 # Machine API
 
 `irlume` exposes a deliberately small, versioned JSON interface for desktop
@@ -252,7 +254,7 @@ reused for a different meaning. The registry as of this contract:
 | Check id | Reports on |
 |---|---|
 | `platform` | the distribution family irlume detected |
-| `install-origin` | where this build came from: a distro package, the Copr, or a source install; a nightly lane ([ADR-0037](adr/0037-nightly-channel.md): the nightly Copr, the nightly PPA, or the AUR's `irlume-git`) is named as such, with its package version |
+| `install-origin` | where this build came from: a distro package, the Copr, or a source install; a nightly lane ([ADR-0037](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0037-nightly-channel.md): the nightly Copr, the nightly PPA, or the AUR's `irlume-git`) is named as such, with its package version |
 | `tpm` | a usable TPM 2.0 resource-manager device |
 | `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
 | `secure-boot-certificates` | where the Secure Boot `KEK` and `db` stand in Microsoft's 2026 certificate rollover, read from efivarfs. Microsoft's certificates are recognized by SHA-256 hash, of the certificate or, for an entry held as a bare RSA-2048 key, of its modulus, never by subject. `pass` when every Microsoft 2011 certificate enrolled has its 2023 replacement; `warn` naming the 2023 certificates still to be enrolled, since enrolling them changes PCR 7 and a seal bound to PCR 7 then stops opening; `info` for a machine with its own keys, no keys enrolled (setup mode) or no UEFI boot; `unknown` when a database exists but cannot be read, or both are absent outside setup mode (efivarfs unmounted, empty databases in user mode) |
@@ -402,7 +404,7 @@ Privileged face confirmation is fixed service policy, not mutable machine
 state. PAM and the daemon enforce it from the shared normalized service table;
 CLI/TUI render the same rule. Contract 1 therefore adds no confirmation or
 attestation field. Head gestures have been removed. See
-[ADR-0010](adr/0010-conventional-face-intent-confirmation.md).
+[ADR-0010](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0010-conventional-face-intent-confirmation.md).
 
 ### `irlume profiles list --json [--user USER]`
 
@@ -411,7 +413,7 @@ Capability: `profiles-list-json`.
 Returns display names and scan display names. `require_eyes_open` and
 `require_challenge` are required contract-1 compatibility fields, both frozen
 at `false`; they do not report enrollment policy or a current detector. They may
-leave with contract 2. See [ADR-0009](adr/0009-head-gesture-only-consent.md).
+leave with contract 2. See [ADR-0009](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0009-head-gesture-only-consent.md).
 The current enrollment store identifies these records by mutable names,
 so this first read-only contract intentionally does not invent opaque IDs or
 advertise profile mutations. Mutation-safe IDs must originate in the engine
@@ -590,9 +592,9 @@ daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
 | `report_schema` | The report layout's own version, `1` |
 | `effective_privilege` | `root` or `user`; some daemon sections need root |
 | `platform` | `Debian-family`, `Fedora-family`, `Arch-family`, or `other/unknown` |
-| `install_channel` | How irlume was installed, as doctor's `install-origin` reads it: `fedora_copr`, `local_rpm`, `ubuntu_ppa`, `local_deb`, `arch_package`, `source`, or a [nightly channel](adr/0037-nightly-channel.md) lane, `fedora_copr_nightly`, `ubuntu_ppa_nightly` or `arch_git` (added after 0.15.0) |
+| `install_channel` | How irlume was installed, as doctor's `install-origin` reads it: `fedora_copr`, `local_rpm`, `ubuntu_ppa`, `local_deb`, `arch_package`, `source`, or a [nightly channel](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0037-nightly-channel.md) lane, `fedora_copr_nightly`, `ubuntu_ppa_nightly` or `arch_git` (added after 0.15.0) |
 | `checks` | `id` (`platform_supported`, `install_channel`, `daemon_reachable`, `tpm_present`, `secure_boot`) and `state`, as doctor's states |
-| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer. The cameras' `qualification_token` and the capture's `qualification_context` and `runtime_context` are keyed for each document, so values equal in the daemon's snapshot stay equal within one document and two documents carry unrelated values ([ADR-0008](adr/0008-privacy-bounded-diagnostics.md), amendment 2026-11-12) |
+| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer. The cameras' `qualification_token` and the capture's `qualification_context` and `runtime_context` are keyed for each document, so values equal in the daemon's snapshot stay equal within one document and two documents carry unrelated values ([ADR-0008](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0008-privacy-bounded-diagnostics.md), amendment 2026-11-12) |
 | `unavailable` | Each section the report could not fill (`daemon`, `camera_context`, `capture_schedule`, `recent_events`, `support_probe`) and why (`daemon_unavailable`, `daemon_restarted`, `no_camera`, `no_ir_pair`, `not_authorized`, `collection_failed`) |
 
 ### Error codes
@@ -603,7 +605,7 @@ daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
 | `unsupported-contract` | The engine does not implement the requested contract. Refused before any side effect. Exits 2. | no |
 | `daemon-unavailable` | The daemon could not be reached. | yes |
 | `not-authorized` | The caller may not act on the named account. From `auth test`, it can also mean the calling account does not hold the active local session on a seat, which a request that turns the camera on needs unless it comes from root. | no |
-| `operation-failed` | The engine could not carry out a well-formed request. | no, except for a pre-empted operation and for IR frames no illumination record named, which a camera stream that has just opened can produce once ([ADR-0032](adr/0032-cross-device-pairing-by-administrator-pin.md), amendment 2026-10-18) |
+| `operation-failed` | The engine could not carry out a well-formed request. | no, except for a pre-empted operation and for IR frames no illumination record named, which a camera stream that has just opened can produce once ([ADR-0032](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0032-cross-device-pairing-by-administrator-pin.md), amendment 2026-10-18) |
 | `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
 | `deadline-expired` | The authentication window elapsed before a decision; the attempt ended without a verdict. Not retryable as this transaction; a fresh attempt starts a new window. | no |
 | `protocol-error` | The daemon replied with something this command did not expect. | no |
@@ -779,7 +781,7 @@ already right. The same file can be either, depending on the lines the
 configuration wants. `kept` was added in 0.15.0 and is absent from older
 builds. `jumps_adjustable` is true on a surface the human `--adjust-jumps` flag
 would handle differently because of a numeric jump in an administrator's line
-(see [DISABLE.md](DISABLE.md)). On a `kept` surface of an enable plan, the
+(see [DISABLE.md](https://github.com/archledger/irlume/blob/main/docs/user/DISABLE.md)). On a `kept` surface of an enable plan, the
 only obstacle is such a jump, which irlume's new lines would land
 inside: `login enable --adjust-jumps` would make the update. On a surface the
 run takes irlume's lines out of, `strip-in-place` or `not-wired` with `kept`
@@ -1038,7 +1040,7 @@ path (a `/dev/video*` node or a `/dev/v4l/` link to one) except in the
 It names no account, with two exceptions. Run as root, `doctor --json`'s
 `tpm-firmware`, `tpm-lockout` and `tpm-storage-keys` details name the
 accounts whose sealed envelopes they concern
-([ADR-0034](adr/0034-attempt-limiting-stays-in-software.md) section 4 and
+([ADR-0034](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0034-attempt-limiting-stays-in-software.md) section 4 and
 its amendment 2026-10-16), since the report behind them is root-only and
 an administrator acts on it. And a path that was configured and is
 reported back as set, such as the library `ORT_DYLIB_PATH` names, a model

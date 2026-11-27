@@ -12,8 +12,8 @@ implementation plan at
 
 Related decisions and evidence:
 
-- [ADR-0011: Use one hidden field for privileged face intent or password](../../adr/0011-single-field-privileged-auth-input.md)
-- [ADR-0012: Maintain a GitHub-only pamsm fork](../../adr/0012-maintain-pamsm-github-fork.md)
+- [ADR-0011: Use one hidden field for privileged face intent or password](../../architecture/adr/0011-single-field-privileged-auth-input.md)
+- [ADR-0012: Maintain a GitHub-only pamsm fork](../../architecture/adr/0012-maintain-pamsm-github-fork.md)
 - [Single-field privileged authentication verification](../../research/2026-08-19-single-field-privileged-auth-input-verification.md)
 - Upstream repository: <https://github.com/rcatolino/pam_sm_rust>
 - Upstream base: tag `0.5.5`, commit

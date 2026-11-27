@@ -6,7 +6,7 @@
 //! release upgrade notices in [`crate::upgrade_notice`]. One file order, one
 //! override and one parser, so the two can never disagree about the host.
 
-/// Redirects the os-release file, for tests (docs/DEVELOPMENT.md "Sandbox
+/// Redirects the os-release file, for tests (docs/architecture/DEVELOPMENT.md "Sandbox
 /// environment overrides").
 pub(crate) const OS_RELEASE_ENV: &str = "IRLUME_OS_RELEASE";
 
@@ -25,7 +25,7 @@ pub(crate) fn read_host() -> std::io::Result<String> {
 /// The system's own os-release, `/etc/os-release` then
 /// `/usr/lib/os-release`, ignoring [`OS_RELEASE_ENV`]. The support report's
 /// `platform` facts describe the host a reader is shown, whatever the
-/// override says (docs/DEVELOPMENT.md).
+/// override says (docs/architecture/DEVELOPMENT.md).
 ///
 /// # Errors
 /// Neither file can be read.

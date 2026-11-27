@@ -1,7 +1,7 @@
 # IR-only campaign record
 
 Copy this form for one frozen campaign. Follow the
-[qualification protocol](../IR_ONLY_QUALIFICATION.md). This unfilled form is not
+[qualification protocol](../security/IR_ONLY_QUALIFICATION.md). This unfilled form is not
 an accepted plan or evidence of qualification. Do not put personal identifiers,
 biometric payloads or raw errors in any field. A missing required entry makes a
 qualification campaign incomplete.

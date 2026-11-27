@@ -72,7 +72,7 @@ title_tokens = ["chore", "refactor", "build", "style"]
 color = "5319e7"
 description = "Release preparation, provenance, SBOM and release verification"
 title_tokens = ["release"]
-paths = ["docs/RELEASING.md", "scripts/*release*", "scripts/generate-vex.py", ".github/workflows/slsa-provenance.yml", ".github/workflows/verify-release.yml"]
+paths = ["docs/architecture/RELEASING.md", "scripts/*release*", "scripts/generate-vex.py", ".github/workflows/slsa-provenance.yml", ".github/workflows/verify-release.yml"]
 # Not the bare word: irlume releases credentials and buffers too.
 issue_title = '\b(SBOM|VEX|SLSA|slsa-provenance|release (assets|signing|notes|tooling|workflow)|releasing)\b'
 
@@ -80,7 +80,7 @@ issue_title = '\b(SBOM|VEX|SLSA|slsa-provenance|release (assets|signing|notes|to
 color = "d4c5f9"
 description = "Architecture decision records and design proposals"
 title_tokens = ["adr", "design"]
-paths = ["docs/adr/*"]
+paths = ["docs/architecture/adr/*"]
 issue_title = '\b(ADR|design proposal)\b'
 
 [labels.github_actions]
@@ -97,7 +97,7 @@ issue_title = '\b(CI|workflows?|GitHub Actions|runners?|Dependabot|CodeQL|zizmor
 color = "00b8d9"
 description = "Capture path, streams, and camera subsystem code"
 title_tokens = ["camera", "ir", "emitter", "capture", "census", "split"]
-paths = ["crates/irlume-camera/*", "crates/irlume-core/src/multi_camera*", "crates/irlume-common/src/live_camera.rs", "crates/irlume-common/src/split_*", "scripts/emitter-lock-tests.sh", "scripts/diagnose-missing-camera.sh", "scripts/ir-evaluation/*", "docs/IR_ONLY_QUALIFICATION.md"]
+paths = ["crates/irlume-camera/*", "crates/irlume-core/src/multi_camera*", "crates/irlume-common/src/live_camera.rs", "crates/irlume-common/src/split_*", "scripts/emitter-lock-tests.sh", "scripts/diagnose-missing-camera.sh", "scripts/ir-evaluation/*", "docs/security/IR_ONLY_QUALIFICATION.md"]
 issue_title = '\b(cameras?|webcam|IR[- ]only|IR (node|camera|emitter|stream)s?|emitters?|UVC|V4L2|YUYV|NV12|MJPEG|streams?|capture)\b'
 issue_area = ["Camera or IR emitter"]
 
@@ -105,7 +105,7 @@ issue_area = ["Camera or IR emitter"]
 color = "1d76db"
 description = "PAM integration: greeters, lock screens, sudo, polkit"
 title_tokens = ["pam", "pamwire", "polkit", "lightdm", "greeter"]
-paths = ["crates/irlume-pam/*", "crates/irlume-pam-view/*", "crates/irlume-common/src/pam_*", "packaging/pam/*", "packaging/lightdm/*", "packaging/polkit/*", "docs/INTEGRATION.md", "docs/DESKTOP-AUTH.md"]
+paths = ["crates/irlume-pam/*", "crates/irlume-pam-view/*", "crates/irlume-common/src/pam_*", "packaging/pam/*", "packaging/lightdm/*", "packaging/polkit/*", "docs/reference/INTEGRATION.md", "docs/user/DESKTOP-AUTH.md"]
 issue_title = '\b(PAM|pamwire|greeters?|lock ?screens?|sudo|polkit|SDDM|GDM|LightDM|login managers?|hyprlock|swaylock|kscreenlocker)\b'
 issue_area = ["Login, lock screen, sudo or polkit (PAM)"]
 
@@ -121,7 +121,7 @@ issue_area = ["TPM or Secure Boot"]
 color = "bfe5bf"
 description = "Presentation-attack detection and liveness (ISO/IEC 30107-3)"
 title_tokens = ["pad", "liveness"]
-paths = ["crates/irlume-liveness/*", "crates/irlume-core/src/pad.rs", "docs/PAD_SELFTEST.md", "docs/pad-results/*"]
+paths = ["crates/irlume-liveness/*", "crates/irlume-core/src/pad.rs", "docs/security/PAD_SELFTEST.md", "docs/pad-results/*"]
 issue_title = '\b(liveness|PAD|anti-?spoof\w*|presentation[- ]attacks?|spoof\w*)\b'
 issue_area = ["Liveness or anti-spoofing"]
 
@@ -136,14 +136,14 @@ issue_title = '\b(ONNX|TFLite|recogni[sz]ers?|model (weights|BOM|files?))\b'
 color = "d4c5f9"
 description = "Distro lanes: Fedora and Copr, Debian and PPA, Arch and AUR, Nix"
 title_tokens = ["packaging", "ppa", "rpm", "deb", "arch", "fedora", "nix", "packit", "apparmor", "selinux", "copr", "aur", "install"]
-paths = ["packaging/*", "nix/*", "flake.nix", ".packit.yaml", "scripts/build-ppa-source.sh", "scripts/install.sh", "scripts/install-host.sh", "scripts/check-packaging-parity.sh", "scripts/verify-ppa-publish.py", "scripts/test-ppa-*", "scripts/test-package-*", "scripts/check-upgrade-*", "docs/NIXOS.md"]
+paths = ["packaging/*", "nix/*", "flake.nix", ".packit.yaml", "scripts/build-ppa-source.sh", "scripts/install.sh", "scripts/install-host.sh", "scripts/check-packaging-parity.sh", "scripts/verify-ppa-publish.py", "scripts/test-ppa-*", "scripts/test-package-*", "scripts/check-upgrade-*", "docs/user/NIXOS.md"]
 issue_title = '\b(packag(e|es|ing)|Copr|PPA|AUR|RPM|deb|Debian|Ubuntu|Fedora|Arch|NixOS|Nix|flake|installer|install\.sh|AppArmor|SELinux)\b'
 issue_area = ["Installing or packaging"]
 
 [labels.hardware]
 color = "fbca04"
 description = "Camera, IR emitter, fingerprint reader, or TPM behavior on a specific machine"
-paths = ["docs/hardware/*", "docs/HARDWARE.md", "scripts/hardware/*", "scripts/generate-hardware-matrix.py"]
+paths = ["docs/hardware/*", "docs/reference/HARDWARE.md", "scripts/hardware/*", "scripts/generate-hardware-matrix.py"]
 # A USB vendor:product pair, such as 04f2:b74f, names a specific device.
 issue_title = '(^\[hw\]|\b[0-9a-f]{4}:[0-9a-f]{4}\b)'
 
@@ -158,7 +158,7 @@ issue_title = '\b(daemon|irlumed|socket)\b'
 color = "bfd4f2"
 description = "The irlume command and its TUI: setup, doctor, status, uninstall, machine API"
 title_tokens = ["cli", "tui", "doctor", "uninstall", "setup", "machine-api", "machine", "diagnostics", "diag", "status"]
-paths = ["crates/irlume-cli/*", "schemas/*", "docs/COMMANDS.md", "docs/TUI.md", "docs/MACHINE-API.md", "scripts/machine-api-conformance.py"]
+paths = ["crates/irlume-cli/*", "schemas/*", "docs/reference/COMMANDS.md", "docs/reference/TUI.md", "docs/reference/MACHINE-API.md", "scripts/machine-api-conformance.py"]
 issue_title = '\b(CLI|TUI|doctor|setup wizard|status --json|machine[- ]API|irlume (setup|enroll|auth|status|doctor|uninstall|recovery))\b'
 issue_area = ["The irlume command or its TUI"]
 
@@ -181,7 +181,7 @@ issue_title = '\b(onnxruntime|execution providers?|inference|face detect\w*|land
 color = "fbca04"
 description = "Enrolling faces, stored templates and profiles, and their data at rest"
 title_tokens = ["enroll", "enrollment", "storage", "profiles", "recovery"]
-paths = ["crates/irlume-core/src/storage.rs", "crates/irlume-core/src/account.rs", "crates/irlume-core/src/envelope.rs", "crates/irlume-core/src/crypto.rs", "crates/irlume-core/src/replacement.rs", "crates/irlume-core/src/recovery.rs", "crates/irlume-common/src/storage_encryption.rs", "docs/SECURITY_AT_REST.md"]
+paths = ["crates/irlume-core/src/storage.rs", "crates/irlume-core/src/account.rs", "crates/irlume-core/src/envelope.rs", "crates/irlume-core/src/crypto.rs", "crates/irlume-core/src/replacement.rs", "crates/irlume-core/src/recovery.rs", "crates/irlume-common/src/storage_encryption.rs", "docs/security/SECURITY_AT_REST.md"]
 issue_title = '\b(enrol(l|ls|led|ling|ment|ments)?|re-?enrol\w*|templates?|profiles?)\b'
 issue_area = ["Enrollment"]
 
@@ -205,7 +205,7 @@ issue_area = ["Fingerprint"]
 color = "c5def5"
 description = "Desktop integration: the KDE System Settings module and desktop entries"
 title_tokens = ["kcm", "desktop"]
-paths = ["kcm/*", "packaging/desktop/*", "nix/package-kcm.nix", "docs/KCM.md"]
+paths = ["kcm/*", "packaging/desktop/*", "nix/package-kcm.nix", "docs/user/KCM.md"]
 issue_title = '\b(KCM|System Settings|Plasma|KDE)\b'
 issue_area = ["KDE System Settings module"]
 

@@ -51,7 +51,7 @@ commercial freedom GPLv3 promises downstream.
 
 Its replacement is per-enrollment on-device calibration fitted from each user's
 own scans (`../crates/irlume-core/src/calib.rs`), which carries no third-party
-data. See [ADR-0004](../docs/adr/0004-per-enrollment-ir-adapter.md) for the
+data. See [ADR-0004](../docs/architecture/adr/0004-per-enrollment-ir-adapter.md) for the
 decision and the measurement: the global adapter improved recognition for the
 handful of identities it was trained on but slightly *worsened* every unseen
 face (Tufts NIR-NIR 1.43% → 1.53% EER), so raw AuraFace plus per-enrollment
@@ -98,10 +98,10 @@ is RGB/selfie-trained, so rescue behavior on IR-grey frames must be validated.
   does not license weights whose provenance is unwarrantable. **Fails the clean-BOM
   bar**; do not bundle. The shipped stack instead includes the default-on ViT
   RGB and FLIR IR PAD models under
-  [ADR-0013](../docs/adr/0013-ship-pad-models-default-on.md), alongside the
+  [ADR-0013](../docs/architecture/adr/0013-ship-pad-models-default-on.md), alongside the
   algorithmic checks. Head-gesture consent from
-  [ADR-0009](../docs/adr/0009-head-gesture-only-consent.md) was subsequently
-  [removed](../docs/HEAD-GESTURE-REMOVAL.md); privileged confirmation uses typed
+  [ADR-0009](../docs/architecture/adr/0009-head-gesture-only-consent.md) was subsequently
+  [removed](../docs/architecture/HEAD-GESTURE-REMOVAL.md); privileged confirmation uses typed
   `yes` by default.
 
 ## Verification

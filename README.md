@@ -14,16 +14,16 @@ IR camera. Enrollment stores embeddings, never images. Password fallback stays a
 [![Version](https://img.shields.io/github/v/release/archledger/irlume?label=version&color=c0304f)](https://github.com/archledger/irlume/releases)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/archledger/irlume/badge)](https://scorecard.dev/viewer/?uri=github.com/archledger/irlume)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13671/badge)](https://www.bestpractices.dev/projects/13671)
-[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/FAQ.md)
+[![AI-assisted](https://img.shields.io/badge/AI--assisted-human--directed-7c5cbf)](docs/user/FAQ.md)
 
-**[Setup](docs/SETUP.md)** · **[Commands](docs/COMMANDS.md)** · **[Limits](docs/LIMITATIONS.md)** · **[FAQ](docs/FAQ.md)** · **[Problems?](.github/SUPPORT.md)** · **[All docs](docs/)**
+**[Setup](docs/user/SETUP.md)** · **[Commands](docs/reference/COMMANDS.md)** · **[Limits](docs/reference/LIMITATIONS.md)** · **[FAQ](docs/user/FAQ.md)** · **[Problems?](.github/SUPPORT.md)** · **[All docs](docs/README.md)**
 
 <br>
 
 <img src="docs/assets/irlume-demo.gif" alt="irlume demo: install, guided face enrollment in the TUI, wiring the greeter and lock screen, and opt-in face-sudo" width="760">
 
 <sub>Demo recorded on v0.3.0 (July 2026); the interface and flows have
-evolved since - [COMMANDS.md](docs/COMMANDS.md) and [TUI.md](docs/TUI.md)
+evolved since - [COMMANDS.md](docs/reference/COMMANDS.md) and [TUI.md](docs/reference/TUI.md)
 document the current ones.</sub>
 
 </div>
@@ -37,7 +37,7 @@ document the current ones.</sub>
 > checksums at startup. Missing, disabled, or failed required PAD falls back to
 > password without granting face authentication; kill switches
 > `IRLUME_PAD_VIT=0` and `IRLUME_PAD_IR=0` are password-only controls.
-> Read **[Limits](docs/LIMITATIONS.md)** before wiring this
+> Read **[Limits](docs/reference/LIMITATIONS.md)** before wiring this
 > into anything that matters.
 
 <br>
@@ -46,13 +46,13 @@ document the current ones.</sub>
 
 |  |  |
 |:--|:--|
-| 🌑 **Works in the dark** | Infrared recognition with a working emitter; camera and lighting limits are documented in [Platforms](docs/PLATFORMS.md) |
-| 🔓 **Login and app prompts** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/LIMITATIONS.md)), `sudo`, polkit prompts |
+| 🌑 **Works in the dark** | Infrared recognition with a working emitter; camera and lighting limits are documented in [Platforms](docs/user/PLATFORMS.md) |
+| 🔓 **Login and app prompts** | Login, lock screen (GNOME/KDE/Cinnamon/Omarchy; XFCE's screensaver is unsupported, see [Limits](docs/reference/LIMITATIONS.md)), `sudo`, polkit prompts |
 | 🗝️ **Opens your wallet** | A face match TPM-unseals your keyring secret |
-| 🧬 **No enrollment images** | 512-D embeddings; primary and secondary stores use AES-256-GCM on TPM hosts, with secondary migration on write. No-TPM storage is root-only plaintext ([details](docs/SECURITY_AT_REST.md)) |
-| 🙋 **Choose face or password** | Privileged prompts accept `yes` for face or your password before scanning. On-demand desktops use empty Enter; automatic-capture exceptions and active-scan cancellation depend on the [desktop flow](docs/DESKTOP-AUTH.md) |
-| 🛡️ **Anti-spoofing by default** | RGB and IR PAD models plus cross-spectrum checks; measured print and screen refusals, with [explicit test limits](docs/LIMITATIONS.md) |
-| 🔁 **Password fallback** | Face refusal returns to the password provider. Frontend delays and OS account lockouts remain possible; see [support boundaries](docs/PLATFORMS.md#v0140-behavior-and-support-boundaries) |
+| 🧬 **No enrollment images** | 512-D embeddings; primary and secondary stores use AES-256-GCM on TPM hosts, with secondary migration on write. No-TPM storage is root-only plaintext ([details](docs/security/SECURITY_AT_REST.md)) |
+| 🙋 **Choose face or password** | Privileged prompts accept `yes` for face or your password before scanning. On-demand desktops use empty Enter; automatic-capture exceptions and active-scan cancellation depend on the [desktop flow](docs/user/DESKTOP-AUTH.md) |
+| 🛡️ **Anti-spoofing by default** | RGB and IR PAD models plus cross-spectrum checks; measured print and screen refusals, with [explicit test limits](docs/reference/LIMITATIONS.md) |
+| 🔁 **Password fallback** | Face refusal returns to the password provider. Frontend delays and OS account lockouts remain possible; see [support boundaries](docs/user/PLATFORMS.md#v0140-behavior-and-support-boundaries) |
 | 📦 **Packaged native authentication** | Rust authentication binaries without a Python/dlib/pip recognition stack; distro, driver and package dependencies still need validation |
 | 🩺 **Repairs itself** | A live TUI fixes faults; PAM wiring survives updates |
 
@@ -78,11 +78,11 @@ yay -S irlume                                                       # Arch
 sudo apt install ./irlume_*.deb                                     # Debian 12+, from Releases
 ```
 
-On NixOS use `nixosModules.irlume` from this flake ([docs/NIXOS.md](docs/NIXOS.md)).
+On NixOS use `nixosModules.irlume` from this flake ([docs/user/NIXOS.md](docs/user/NIXOS.md)).
 Signed packages for every distro are attached to each
 [release](https://github.com/archledger/irlume/releases) as a fallback.
-Which lane suits which distro version: [docs/PLATFORMS.md](docs/PLATFORMS.md#install-lane-per-distro).
-To try a fix before the next release, the [nightly channel](docs/PLATFORMS.md#nightly-channel)
+Which lane suits which distro version: [docs/user/PLATFORMS.md](docs/user/PLATFORMS.md#install-lane-per-distro).
+To try a fix before the next release, the [nightly channel](docs/user/PLATFORMS.md#nightly-channel)
 builds `main` (unreleased: no release checks, and it can break face login; the password always works).
 
 </details>
@@ -101,54 +101,32 @@ terminal, run `irlume tui` in one you opened yourself.
 
 On KDE Plasma 6, install the optional `irlume-kcm` package for an Irlume page
 in System Settings. It shows status, diagnostics, cameras, and login wiring;
-interactive changes open the TUI. See [KDE System Settings](docs/KCM.md) for
+interactive changes open the TUI. See [KDE System Settings](docs/user/KCM.md) for
 package availability and the optional NixOS configuration.
 
 **You need** x86-64 Linux with systemd and PAM. A TPM 2.0 is strongly recommended.
-Camera support sets your tier (usable IR requires an 8-bit grey stream and qualified illumination; see [Platforms](docs/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
+Camera support sets your tier (usable IR requires an 8-bit grey stream and qualified illumination; see [Platforms](docs/user/PLATFORMS.md)): **IR** → secure login · **RGB** → screen
 unlock · **fingerprint** → companion factor.
 
 ## Documentation
 
-| | |
-|:--|:--|
-| [**Setup**](docs/SETUP.md) | Install and configure, guided or by hand |
-| [**Turning it off**](docs/DISABLE.md) | Per-surface disable, canceling a scan, uninstall |
-| [**Commands**](docs/COMMANDS.md) | Every command and flag |
-| [**Limits**](docs/LIMITATIONS.md) | What irlume does not do, and the measurements |
-| [**FAQ**](docs/FAQ.md) | Common questions |
-| [**Architecture**](docs/ARCHITECTURE.md) | How it works inside |
-| [**Security**](docs/SECURITY_AT_REST.md) · [**Threat model**](docs/THREAT_MODEL.md) | What is protected, and from whom |
-| [**Verify**](docs/VERIFY.md) | Reproduce every claim on your machine |
-| [**Integration**](docs/INTEGRATION.md) · [**Machine API**](docs/MACHINE-API.md) | Drive irlume from your own software |
-| [**Debugging**](docs/DEBUGGING.md) | Trace a failing login |
-| [**Contributing**](.github/CONTRIBUTING.md) · [**Changelog**](CHANGELOG.md) · [**Credits**](docs/CREDITS.md) | |
+The [documentation index](docs/README.md) lists user guides, reference
+material, security documentation, and architecture decisions.
+See [Contributing](.github/CONTRIBUTING.md) for project guidelines.
 
 ## Status
 
 **v0.16.0 is the latest published release.**
 Recorded face-authentication results cover Fedora, Ubuntu and
 Arch; Debian install checks and a NixOS module are also available. Build and
-test dates differ: see the [versioned support matrix](docs/PLATFORMS.md).
+test dates differ: see the [versioned support matrix](docs/user/PLATFORMS.md).
 Self-tested against ISO/IEC 30107-3, not
 lab-certified. Interfaces may shift before 1.0. Validated cameras are listed
-in [Hardware compatibility](docs/HARDWARE.md) (generated from measured
+in [Hardware compatibility](docs/reference/HARDWARE.md) (generated from measured
 evidence, never hand-edited), with [newer validation records](docs/validation/2026-09-19-support-baseline.md).
 
-Since 0.11: multi-camera enrollment, where a secondary camera becomes its own
-group with a separate store
-([ADR-0024](docs/adr/0024-multi-camera-enrollment.md)); a measured latency
-workstream, about two seconds off warm concurrent attempts and roughly three
-seconds for an IR-only unlock; grouped RGB-only capture, which collects the
-five-sample anti-spoofing vote in one camera session, so screen unlock
-completes in about five seconds on a 15 fps RGB sensor that previously could
-not finish the vote at all; and signed releases carrying per-binary
-CycloneDX SBOMs and an OpenVEX document ([Verify](docs/VERIFY.md)).
-
-New in 0.14: a Plasma System Settings module, TUI page deep links and
-single-instance navigation, and encryption for secondary camera stores under
-the account template key. Existing plaintext secondary stores migrate on
-their next write; hosts without a TPM retain root-only plaintext storage.
+For changes by version and historical measurements, see the
+[changelog](CHANGELOG.md) and [release notes](https://github.com/archledger/irlume/releases).
 
 Hardware reports from laptops with IR cameras, working or not, are the most
 useful contribution right now:
@@ -167,9 +145,9 @@ No obligation; the project stays free and GPL either way.
 
 <div align="center">
 
-**GPL-3.0-or-later** · no CLA, no commercial relicensing · [credits](docs/CREDITS.md)
+**GPL-3.0-or-later** · no CLA, no commercial relicensing · [credits](docs/reference/CREDITS.md)
 
-<sub>Built with Rust and AI assistance, human-directed ([details](docs/FAQ.md)) ·
+<sub>Built with Rust and AI assistance, human-directed ([details](docs/user/FAQ.md)) ·
 Windows Hello is a Microsoft trademark; irlume is independent · your face stays yours</sub>
 
 </div>

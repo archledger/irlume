@@ -3,7 +3,7 @@
 # Copyright the irlume contributors.
 """Generate the Rust release SBOMs from a committed, isolated source snapshot.
 
-One document per crate that builds a shipped binary (docs/RELEASING.md).
+One document per crate that builds a shipped binary (docs/architecture/RELEASING.md).
 """
 import argparse
 import json

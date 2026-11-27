@@ -8,9 +8,9 @@ verified on Fedora KDE, and merged in PR #502 as
 
 Related decisions:
 
-- [ADR-0010: Require conventional confirmation for privileged face authentication](../../adr/0010-conventional-face-intent-confirmation.md)
-- [ADR-0011: Use one hidden field for privileged face intent or password](../../adr/0011-single-field-privileged-auth-input.md)
-- [ADR-0012: Maintain a GitHub-only pamsm fork](../../adr/0012-maintain-pamsm-github-fork.md)
+- [ADR-0010: Require conventional confirmation for privileged face authentication](../../architecture/adr/0010-conventional-face-intent-confirmation.md)
+- [ADR-0011: Use one hidden field for privileged face intent or password](../../architecture/adr/0011-single-field-privileged-auth-input.md)
+- [ADR-0012: Maintain a GitHub-only pamsm fork](../../architecture/adr/0012-maintain-pamsm-github-fork.md)
 
 Observed evidence: Fedora 44 KDE Plasma 6.7.4 with Linux-PAM 1.7.2 and the
 exact product candidate `392d15132322e2bde29559a23540ce9fbeb25f43`.

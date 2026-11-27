@@ -113,7 +113,7 @@ jobs:
         run: |
           set -euo pipefail
           # Releases through v0.16.0 carry the slsa-github-generator's
-          # bundle, and docs/VERIFY.md still teaches slsa-verifier for
+          # bundle, and docs/security/VERIFY.md still teaches slsa-verifier for
           # them: clobbering an attestation bundle over that would break
           # the verification path those releases document. The migration
           # to actions/attest-build-provenance (#1367) is the boundary;
@@ -128,7 +128,7 @@ jobs:
             echo "::error::$RELEASE_TAG is at or below v0.16.0, whose releases carry the generator's bundle; refusing to clobber it"
             exit 1
           fi
-          # The stable asset name is part of docs/VERIFY.md and of Scorecard's
+          # The stable asset name is part of docs/security/VERIFY.md and of Scorecard's
           # Signed-Releases check. --clobber so re-dispatching after a
           # corrected upload replaces the stale bundle.
           test -s "$BUNDLE"

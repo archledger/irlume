@@ -1,0 +1,1059 @@
+<!-- TODO: Remove the old docs/ copy after the published AUR irlume-git recipe uses docs/reference/. -->
+
+# Machine API
+
+`irlume` exposes a deliberately small, versioned JSON interface for desktop
+integrations. Human-facing output remains the default.
+
+## Compatibility
+
+Every document contains:
+
+```json
+{
+  "contract_version": 1,
+  "engine_version": "0.7.0",
+  "command": "version",
+  "ok": true,
+  "data": {}
+}
+```
+
+Machine-mode standard output contains exactly one JSON document and standard
+error stays empty. Failures are reported in the JSON error object, including
+invalid arguments and unsupported contracts. Startup account-existence notes
+are human-mode diagnostics only; machine commands let the daemon report their
+per-user state or refusal. This also applies to machine-only commands invoked
+without `--json` or the required streaming flags.
+
+**Streaming capabilities are the exception, and only ever by invitation.** A
+capability whose name ends in `-events` emits newline-delimited JSON: one event
+per line, many lines. A consumer reaches one only by invoking a command it found
+in `capabilities`, so a consumer that does not implement streaming never sees
+more than one document. The rule above is what every non-streaming command
+follows, and it is what a contract 1 consumer built before streaming existed
+will continue to observe. A successful command exits with zero. Usage errors exit
+with 2, while unavailable or failed operations exit nonzero and return:
+
+```json
+{
+  "contract_version": 1,
+  "engine_version": "0.7.0",
+  "command": "profiles.list",
+  "ok": false,
+  "error": {
+    "code": "daemon-unavailable",
+    "retryable": true
+  }
+}
+```
+
+Fields may be added within a contract version. Removing a field or changing its
+meaning requires a new contract version. Consumers must first call
+`irlume version --json` and use only advertised capabilities.
+
+The machine API is not the daemon socket protocol. The socket remains private,
+and its serialized Rust enums are not a public compatibility promise.
+
+### Declaring which contract you implement
+
+Pass `--contract N` on any machine command. The engine agrees only to a version
+it implements, and refuses anything else **before** contacting the daemon and
+before any command with side effects begins:
+
+```
+$ irlume profiles list --contract 9 --json
+{"contract_version":1,...,"error":{"code":"unsupported-contract","retryable":false}}
+```
+
+Exit code 2. A malformed flag (no value, a non-number, repeated) is a
+`usage-error`.
+
+`irlume version --json` advertises the range this build speaks:
+
+```json
+"contract_versions": { "min": 1, "max": 1 }
+```
+
+Pick a version inside that range and pass it. Every response echoes the contract
+actually in force in `contract_version`, so a consumer can assert the engine
+agreed to the version it implements rather than inferring it.
+
+**Omitting the flag always means contract 1.** It does not mean "whatever is
+newest", and it never will. A program written against contract 1 that omits the
+flag keeps receiving contract 1 on an engine that has since learned contract 2,
+because the alternative is changing the meaning of a response under a program
+that never asked for it. Passing the flag is still better: it makes the refusal
+explicit and immediate when a consumer meets an engine too old for it.
+
+### A capability is not a compatibility promise
+
+`capabilities` says a command exists and is reachable. It does not say the
+engine's version is one a consumer has been tested against, and it is not a
+substitute for `contract_version`. Gate on the contract version you implement;
+treat a capability as an availability check on top of that.
+
+Read this the way irlume writes it: a name in that list is permanent public API.
+Once a name ships, consumers in the field may enable behaviour on seeing it, and
+irlume cannot know which versions those are. So a name is never reused for
+different semantics, and never appears before the command behind it is finished.
+
+### Authorization
+
+Every operation is authorized by the daemon from the connecting process's
+credentials, not from anything the caller says about itself. An operation is
+permitted for `root`, or for the user that owns the records being touched.
+`--user` names which account to act on; it does not grant anything. An ordinary
+user naming another account is refused.
+
+Consumers should not attempt to pre-check permission. Call the command and read
+the error.
+
+### Timeouts and cancellation
+
+Commands that only read state return promptly. Commands that use the camera take
+as long as a capture takes, and irlume applies its own internal bounds. A
+consumer should set its own timeout, and should treat terminating the process as
+the cancellation mechanism for this contract version. There is no cancel
+command in contract version 1.
+
+### Deprecation
+
+Within a contract version, no command or documented field is removed and no
+documented meaning changes. If a command must change incompatibly, the new shape
+arrives under a new `contract_version` and the previous one keeps working for at
+least one minor release series, so a consumer has a window in which both are
+available. Capability names are not removed once published; a capability that
+becomes unavailable on a given machine simply stops being listed by that
+machine.
+
+One exception is on record, for surfaces no tagged release carried. Nightly
+builds reported a `gpu` selection, the `recognizer` fields `accelerator`,
+`gpu_platform`, `gpu_runtime_available` and `gpu_qualified`, and the doctor ids
+`gpu-platform`, `gpu-runtime` and `gpu-qualification`. They left contract 1 with
+GPU inference, before any release (ADR-0038 section 4). The three doctor ids are
+never reused.
+
+A second exception, on the same grounds. Nightly builds reported a `recognizer`
+object with its selection provenance, and the doctor ids `recognizer-device`,
+`recognizer-selection`, `npu-platform`, `npu-runtime` and `npu-qualification`. They
+left contract 1 with NPU inference, before any release (ADR-0039 section 5). The
+five doctor ids are never reused.
+
+## Commands
+
+### `irlume version --json`
+
+Does not contact the daemon. It returns the engine version, contract version,
+advertised capabilities, and public limits.
+
+### `irlume status --json [--user USER]`
+
+Capability: `status-json`.
+
+The readiness summary, as values rather than prose. Deliberately narrower than
+the human `status`: it reports camera **capability** and never camera identity,
+and it does not name the account, because the caller already knows which one it
+asked about.
+
+```json
+{
+  "daemon": "running",
+  "auth_method": "auto",
+  "face_disabled": false,
+  "enrollment": { "known": true, "profiles": 1, "scans": 10 },
+  "templates": "encrypted",
+  "keyring": { "known": true, "armed": true, "policy": "…" },
+  "recovery": { "known": true, "passphrase_set": true, "key_present": true },
+  "camera": { "known": true, "rgb": true, "ir": true },
+  "fingerprint": false,
+  "fingerprint_known": true,
+  "recognizer": { "known": true, "device": "cpu", "reason": "…", "selection": "auto" }
+}
+```
+
+`daemon` is one of `running`, `starting`, `access-denied` or `unreachable`.
+`starting` means the socket answered but the engine is still loading models,
+which lasts a few seconds after every daemon (re)start; retry shortly rather
+than restarting. An unreachable daemon is reported, not raised as an error,
+because the fields that do not need it are still worth having.
+
+Anything derived from the daemon carries `known`. **Unknown is not zero**: when
+`known` is false the counts are absent entirely rather than reported as `0`, so a
+consumer cannot mistake "we could not find out" for "this account has nothing
+enrolled".
+
+Status observations share a two-second deadline. A starting or unreachable
+daemon receives no follow-up queries; a slow response leaves remaining fields
+unknown. This bounds daemon/helper waiting, not arbitrary filesystem or process
+scheduling delays. Keyring status reads sealed-envelope metadata without reading
+live PCRs. On an older daemon it falls back to the armed bit with a null policy.
+Use explicit keyring diagnostics when checking PCR drift.
+
+`camera.known` says a daemon Health observation was obtained. Without one, the
+RGB/IR booleans use configured-path existence only, and status never opens camera
+nodes. `fingerprint_known` says the bounded tooling/reader probe completed; when
+false, the retained `fingerprint: false` boolean is an unobserved fallback rather
+than confirmed absence. These added fields are optional for older contract-1
+producers; consumers should not infer an observation when they are absent.
+
+`templates` is `encrypted`, `plaintext`, or `unknown`.
+
+`recovery.key_present` is whether a sealed template key currently exists. It is
+a separate field rather than a third value of `templates` because contract 1
+permits added fields and not new enum values, and because the two facts are
+independent: `templates: "encrypted"` with `key_present: false` means the
+templates cannot currently be opened, which no single value can say. When
+`passphrase_set` is true, `irlume recovery restore` can recreate the sealed key
+from the recovery envelope; when it is false, re-enrollment is the only path. A daemon older than 0.9.0 never sends it and it reads as
+`true`, which is the only safe default for a field whose false value means data
+loss.
+
+### `irlume doctor --json`
+
+Capability: `doctor-json`.
+
+Every readiness check as an identified result:
+
+```json
+{ "checks": [
+  { "id": "tpm", "state": "pass" },
+  { "id": "platform", "state": "info", "detail": "Fedora-family" },
+  { "id": "keyring-secrets", "state": "unknown" }
+] }
+```
+
+`state` is one of `pass`, `warn`, `fail`, `unknown` or `info`. `unknown` is not a
+synonym for `fail`: it means the check could not be carried out, usually because
+the daemon was unreachable or the command ran without a session bus, and a
+consumer should say so rather than report a problem the machine may not have.
+`info` is a fact worth reporting that is neither good nor bad, such as the
+platform family.
+
+`detail` is English elaboration for a support report. It is not stable and not
+for matching. A consumer that branches on that text has reintroduced the problem
+this command removes. It names no account and no camera device path, except as
+[Security and privacy](#security-and-privacy) says. Outside those exceptions, a
+detail that would name the account doctor checked reads "this account" in its
+place, `ir-node-access` names the camera by its USB identity, and any other
+detail that would give a camera device path reads `<camera node>` instead. The
+human `irlume doctor` report gives the account's name and the paths.
+
+**The array is complete for the always-on checks.** Every check below reports
+on every run, including checks that do not apply to this machine, so a consumer
+may read an id it knows about and cannot find as "this engine version does not
+run that check" rather than as "it passed". A check never disappears because it
+had nothing to say. Two later additions are conditionally present instead:
+`camera-groups` (emitted when camera groups exist or the secondary store cannot
+be read) and `pam-faillock` (emitted only when running as root and the
+`faillock` tool answers; see their rows).
+
+`id` values are public API. The list may grow; an id is never renamed and never
+reused for a different meaning. The registry as of this contract:
+
+| Check id | Reports on |
+|---|---|
+| `platform` | the distribution family irlume detected |
+| `install-origin` | where this build came from: a distro package, the Copr, or a source install; a nightly lane ([ADR-0037](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0037-nightly-channel.md): the nightly Copr, the nightly PPA, or the AUR's `irlume-git`) is named as such, with its package version |
+| `tpm` | a usable TPM 2.0 resource-manager device |
+| `secure-boot` | Secure Boot enabled, disabled, or in setup mode |
+| `secure-boot-certificates` | where the Secure Boot `KEK` and `db` stand in Microsoft's 2026 certificate rollover, read from efivarfs. Microsoft's certificates are recognized by SHA-256 hash, of the certificate or, for an entry held as a bare RSA-2048 key, of its modulus, never by subject. `pass` when every Microsoft 2011 certificate enrolled has its 2023 replacement; `warn` naming the 2023 certificates still to be enrolled, since enrolling them changes PCR 7 and a seal bound to PCR 7 then stops opening; `info` for a machine with its own keys, no keys enrolled (setup mode) or no UEFI boot; `unknown` when a database exists but cannot be read, or both are absent outside setup mode (efivarfs unmounted, empty databases in user mode) |
+| `pcr7-binding` | what PCR 7 bound in this boot, read from the firmware's TCG event log (`/sys/kernel/security/tpm0/binary_bios_measurements`, readable by root; some distributions also let the `tss` group read it) once the log accounts for PCR 7: its SHA-256 digests replay to the value the kernel reports at `/sys/class/tpm/tpm0/pcr-sha256/7`, and each configuration, separator, authority and action event hashes to its digest. Judged against the PCR 7 measurements Microsoft's BitLocker guidance lists. `pass` naming the authorities that verified the boot, at most eight and then a count (Microsoft's certificates by hash, also one `db` holds as a bare RSA-2048 key; shim's SBAT level and MokList), and noting when a 2011 Microsoft CA signed the boot loader, since one signed by its 2023 replacement changes PCR 7; `warn` when the firmware recorded a measurement error in PCR 7 (a separator whose digest is that of the value 1, whatever its event data), UEFI debug mode or disabled pre-boot DMA protection, when Secure Boot was measured as off (0, or no data for an absent variable), when SecureBoot, PK, KEK, db and dbx (under their UEFI vendor GUIDs) were not measured first, in that order with no other event in between, when SecureBoot, PK or KEK was measured with no data, when shim measured `MokSBState` (its validation disabled, so nothing verifies what it loads), or when no authority that verifies an image (`db`, or shim's `vendor_db`, `MokListRT` or built-in certificate) was measured, shim's SBAT level being policy, or when an image or driver load was measured into PCR 7 (extraneous under Microsoft's guidance); `info` when securityfs is mounted and the kernel exposes no event log; `unknown` when the log or PCR 7's value cannot be read, securityfs is not mounted (a container or a chroot), or the log is not in the crypto-agile format (including a Spec ID header outside PCR 0, with a nonzero SHA-1 digest, a version before 2.0, a UINTN size other than 1 or 2, no algorithm or one declared twice, or a malformed algorithm table or vendor information), ends in an event that does not parse (one that runs past the end, or does not carry exactly one digest for each declared algorithm, in any order), has a PCR 7 event that does not have the form its type requires (a configuration or authority event that is not well-formed UEFI variable data, a separator that is neither an error nor a 4-byte 0 or all ones, a SecureBoot value other than 0 or 1), does not account for PCR 7, or holds a PCR 7 event of a type doctor does not read (such as SPDM device policy or authority), named by type |
+| `shim-validation` | whether shim verifies the boot loader and kernel it loads, read from efivarfs as mokutil 0.7.2 does. `pass` when this boot went through shim (`MokListRT` or `SbatLevelRT` present) and validation is on; `warn` when `MokSBStateRT` exists (`mokutil --disable-validation`), since shim then measures no image's authority into PCR 7 and a seal bound to PCR 7 binds no boot chain; `info` when Secure Boot is not enforcing (off or setup mode), the boot did not go through shim, or it is not a UEFI boot; `unknown` when the SecureBoot variable does not read |
+| `tpm-firmware` | the TPM's manufacturer, vendor string and firmware version from its fixed properties, from irlumed's root-only `TpmReadiness` request (the CLI never opens the TPM). `info`, also for a version NVD lists under CVE-2019-16863 (TPM-FAIL, ECDSA signing, which irlume does not use); `warn` for an Infineon version listed under CVE-2017-15361 (ROCA), since irlume's storage key is an RSA key the TPM generated, and whenever irlume's persisted storage key carries the ROCA fingerprint, which a later firmware update does not remove (the detail names an eviction command when that key is the one irlume's template derives at the handle, or when the TPM now derives a key without the fingerprint from that template, as after a firmware update fixed its key generation; otherwise it says another tool may have placed it); `warn` also, from irlumed's per-key report (ADR-0034, Phase 3 amendment), when irlume's DA-exempt storage key carries the fingerprint, with why it is not replaced yet (the firmware still generates affected keys, so update it first, or the replacement could not be persisted, with when irlumed tries again) or that irlumed's next start replaces it by moving its envelopes (while no envelope is stored, the first start after one is: until then new seals go under it), and when a weak key that DA-exempt key superseded is still persisted, with the envelopes that still name it, or, once none has since a start in an earlier boot, the manual `sudo tpm2_evictcontrol -C o -c <handle>` command to run after checking nothing else uses the key (a superseded key without the fingerprint is `info` the same way), when the original key irlumed's record names at a handle `IRLUME_SRK_HANDLE` no longer names carries it, and when a key in a role this client does not know carries it; `unknown` when irlumed cannot report it, when an Infineon part's firmware is past the ROCA range but the storage key could not be checked (not running, older than the request, or the caller is not root), or when irlumed could not check its DA-exempt and superseded keys. An irlumed that predates the per-key report is read for the original key alone, as before |
+| `tpm-pcr-bank` | whether the SHA-256 PCR bank can carry a literal seal over the PCRs irlumed is configured for (its own `IRLUME_PCRS`), from the same request. `pass` when each has a SHA-256 value; `fail` when one has none, since sealing then refuses; `warn` when a firmware-measured PCR (0 to 7) is still zero, so a seal binds no boot state there; `unknown` as for `tpm-firmware` |
+| `tpm-lockout` | the TPM's dictionary-attack lockout state, from the same request (ADR-0034 §4): `TPMA_PERMANENT`'s `lockoutAuthSet` and `inLockout`, and the lockout counter, maximum, interval and recovery time, read with GetCapability, which needs no authorization and changes nothing. The counter is shared by everything that uses the TPM. `warn` when the TPM is in lockout: while any envelope is still on irlume's original storage key, which is not DA-exempt (ADR-0034 §3), face login with an encrypted enrollment and the release of sealed keyring secrets whose envelopes are on it then use the password until the lockout ends (a plaintext enrollment, saved on a host with no TPM device, does not use the TPM): the detail names each account and envelope kind still on that key, up to 12 with a count of the rest, with what the lockout blocks for it (a template key, that account's face login; a keyring secret, its credential release after a face or fingerprint login), and with a DA-exempt key irlume is unaffected but disk unlock PINs and other TPM PIN users are; the detail says when it ends and how an administrator clears it. `warn` also when the TPM is not in lockout but irlumed could not persist irlume's DA-exempt storage key (ADR-0034 §3.2): the detail names the refusal (no room, no free owner handle, an owner authorization set, or a refused `IRLUME_SRK_HANDLE`), the envelopes that stay on the original key, and when irlumed tries again. `info` when no lockout authorization is set, so any process that can open the TPM can reset the lockout or change its parameters; `pass` otherwise; `unknown` as for `tpm-firmware`, and when irlumed predates the lockout report |
+| `tpm-storage-keys` | irlume's original storage key and its retirement at irlumed's start (ADR-0034, Phase 3 amendment), from the same request. `pass` once the key irlumed recorded is no longer persisted at its handle (retired at irlumed's start, or evicted by hand). `info` while the retirement waits, naming the key's handle and TPM name and what it waits for: envelopes still under it (named as for `tpm-lockout`), a move off it in this boot not yet shown durable (named by account and kind), a count at irlumed's next start, a start in a later boot, or irlumed's next start; `info` also when no key was recorded, when another key is at the handle, and when irlumed's `IRLUME_SRK_HANDLE` now names another handle than the key was recorded at (irlumed retires the key only at the handle it names, and the detail says which value to set back). `warn` when the last retirement failed or did not finish, with the error and when irlumed tries again (no eviction command: only a derivation shows the key is irlume's), when it waits for irlume's DA-exempt storage key, and when today's derivation of irlume's template does not give the key and no envelope is under it (an envelope irlumed cannot read counts as one), with the manual `sudo tpm2_evictcontrol -C o -c <handle>` command to run after checking nothing else uses the key. `unknown` as for `tpm-firmware`, and when irlumed predates the report |
+| `tpm-endorsement` | whether the TPM is the one its endorsement key (EK) certificate names (ADR-0036), from irlumed's root-only `TpmEndorsement` request, which reads the EK certificates the TCG EK Credential Profile assigns, verifies each chain offline against the vendor CAs irlume ships, and asks the TPM to release a credential bound to irlume's storage key through the certified EK (the CLI never opens the TPM, and nothing is fetched). `pass` when a certificate verifies, is for this TPM's EK and irlume's storage key is in the same TPM: the detail names the TPM's manufacturer, model and firmware version as the certificate states them, and the root. `warn` when a certificate is not for this TPM's EK, fails a signature, a CA constraint or the EK certificate profile on a path to a pinned root, or the TPM refuses the credential: each points at a swapped device, an emulator or the wrong `IRLUME_TCTI`. `info` when the TPM stores no EK certificate (common on firmware TPMs), or only certificates for EKs irlume cannot test, since irlume does not fetch one. `unknown` when a chain cannot be completed from irlume's list (a newer intermediate, another manufacturer, SHA-1), which never means the TPM is not genuine; when the endorsement hierarchy is disabled or its authorization is set; when the test could not run (a lockout without irlume's DA-exempt key, a busy TPM); when the check ran out of time; when a fifth storage EK certificate is not judged; and when irlumed cannot report it (not running, older than the request, or the caller is not root). The worst result of any certificate decides the state; the detail names each certificate by index and algorithm, the CAs whose validity ended (reported, not enforced), and the certificates for EKs irlume cannot test. Certificate text appears as visible ASCII; no EK public key, hash, serial or fingerprint appears |
+| `boot-mode` | the boot chain, which decides which PCR policy tier applies |
+| `emitter-undo-pending` | camera controls an interrupted `ir-setup` left changed and has not put back. `unknown` when the root-only record store cannot be read, which is any run that is not root |
+| `emitter-stream-pending` | per-stream emitter records not yet resolved. An `applied` record is restored by a later authentication; a record whose write may never have reached the camera is never claimed, and is replaced by the next capture once the control no longer holds its bytes (a full power-off does that); a record that will not parse blocks until an administrator removes the named file. Either kind also refuses new stream writes, so this explains an emitter that stays dark. `unknown` when the root-only store cannot be read, which is any run that is not root |
+| `capture-mode` | the daemon-owned v2 resolution for its exact open RGB+IR pair. Reports qualified concurrent, measured sequential, the safe unmeasured/changed-context sequential default, a daemon environment override, or generation-scoped runtime degradation. `info` for a resolved strategy and `unknown` only when the daemon cannot collect exact status. Neither `doctor` nor `camera-mode` treats legacy `capture_mode.*` values in `cameras.conf` as concurrent authority |
+| `debug-tracing` | whether `irlume logs debug on` left its drop-in in place: `pass` when it is off, `warn` with the reason in `detail` while the daemon logs exact scores and liveness measurements to the system journal, `unknown` when the caller cannot read the drop-in directory |
+| `signed-pcr-policy` | whether the boot chain publishes a systemd signed-PCR (Tier 1) policy. New seals do not use it: it binds only PCR 11, which the booted OS extends. A Tier 1 envelope an earlier release wrote needs it to unseal until its next reseal moves it |
+| `pcrlock` | the systemd-pcrlock (Tier 2) policy and its NV index: `pass` when a provisioned policy covers a firmware-measured PCR (0 to 7), so seals use it; `info` when none is provisioned or it covers OS-measured PCRs only |
+| `camera-nodes` | whether an RGB and an IR node were classified. Capability only; no device paths. A deliberately hardened no-records YUYV IR node (the `72-irlume-ir-nodes.rules` class, #1069) counts as IR capability even though the seat user's scan cannot open it: the daemon opens it as root. `unknown` is not used |
+| `ir-node-access` | whether the seat user can open the node of a descriptor-attested YUYV IR camera without per-frame illumination records (the `NO_RECORDS_YUYV_IR` class, keyed on the USB identity; #1069, ADR-0031 amendment 2026-10-17). Such a camera's burst proof needs the node closed, so `pass` means every node of the class on this machine is root-only (0600, no named ACL entry) (the proof stands without the experimental split opt-in); `warn` means one is still open to the seat (the proof stays inside the opt-in; the detail names the camera by its USB identity and gives the remedy: the packaged udev rule applies it at the next plug or boot; the human report also names its nodes); `unknown` when a node's access state could not be read; `info` when no camera of the class is on this machine. Always emitted |
+| `ir-stream-hello-minimum` | the negotiated IR stream compared with the published Windows Hello IR minimum (340x340@15fps). `info` when no IR node is selected or the dimensions meet it with no reported rate; `unknown` when the node cannot be negotiated right now |
+| `rgb-stream-hello-minimum` | the negotiated RGB stream compared with the published Windows Hello RGB minimum (480x480@7.5fps). Same states as the IR check |
+| `models` | the ONNX weights irlume needs, present and checksummed |
+| `stage-detection-model` | the face-detection stage's model: the resolved file and whether it is shipped or an env override. `fail` when missing, because the daemon cannot start |
+| `stage-landmarks-model` | the landmarks (mesh) stage's model. `warn` when missing: BlazeFace detection-rescue alignment is unavailable; recognition and PAM intent confirmation are unaffected |
+| `stage-recognition-model` | the recognizer stage's model. `fail` when missing, because the daemon cannot start |
+| `ort-dylib-path` | the `ORT_DYLIB_PATH` override, when one is set |
+| `onnxruntime` | the ONNX Runtime the resolver would load in this shell: the resolved path (or the system library) and its version. `fail` when that library is unloadable or below the API level irlume needs, because model loading cannot succeed against it (#187) |
+| `tflite-runtime` | the TFLite C runtime the mesh runs on, loaded in this shell. `fail` when an explicit `IRLUME_TFLITE_LIB` is set but invalid or unloadable (an operator mistake this shell can see); `warn` when nothing resolved, because the daemon's unit may set its own path this shell cannot observe |
+| `fingerprint-reader` | whether a fingerprint reader was found |
+| `templates` | face templates encrypted at rest for the account asked about |
+| `recovery-passphrase` | whether a recovery passphrase is set |
+| `sealed-storage` | what protects the secrets sealed for the account asked about (its keyring secret and the template key that protects its face templates) at rest, against the storage under the directories irlumed keeps them in and under the installed system (`/`, `/usr`, `/etc`). A TPM seal binds the boot chain, not the root filesystem, so this applies under any policy. The storage probe looks for a dm-crypt layer; it does not detect a drive's hardware encryption, a filesystem's own encryption or a dm-verity root, and cannot show whether a dm-crypt volume asks for a passphrase or PIN. `warn` when something is sealed and no dm-crypt layer is found under a directory that holds it or under the installed system, or the storage cannot be established; `info` whenever it is on dm-crypt, since the storage does not show whether the volume asks for a passphrase or PIN, naming each sealed secret's policy another operating system may reproduce: one that does not cover the boot loader code, PCR 4 (the literal PCR 7 policy, a literal `IRLUME_PCRS` set without PCR 4, a signed PCR 11 policy, a pcrlock policy without PCR 4), one that covers PCR 4 where the boot loader does not measure what it loads next (a GRUB boot), a policy irlume cannot read, and a sealed template key's, which the daemon does not report, and saying that what the boot reads before the volume is unlocked (the EFI system partition, an unencrypted /boot) is not encrypted and can be changed offline; `info` also when nothing is sealed; `unknown` when the daemon did not say what is sealed. The CLI first asks irlumed with the read-only `SealedStorage` request. Any local peer may read the storage results for the keyring and template-key directories and `/`, `/usr` and `/etc`. Root receives configured paths and detailed reasons; other peers receive logical labels and generic reasons as described below. Each entry is encrypted, not-encrypted or unknown; the reply contains no per-account data and uses no camera or TPM. irlumed resolves its own directories, including relative overrides against its working directory and links inside its state directory, so the CLI's environment does not override them. The check considers the keyring directory for a keyring secret and the template-key directory for a template key (both when the daemon did not say whether a template key is sealed), together with the installed system; the least protected directory decides and is named. Only an older daemon's `bad request` reply or a proven absent daemon uses the CLI's fallback probe; a timeout or denied connection leaves storage unknown. That fallback resolves `IRLUME_KEYRING_DIR`, `IRLUME_TEMPLATE_KEY_DIR` and `IRLUME_STATE_DIR` from the CLI environment, then systemd's unit and manager environments, then the defaults. An unresolved directory is named with a reason; the causes are an `EnvironmentFile=`, `PassEnvironment=`, a relative value or a failed systemd query. A directory not created yet is judged by its nearest existing parent; a directory the caller cannot look into stays unknown, since it may conceal a link to different storage. `detail` carries the guidance; the JSON shape is unchanged |
+| `credential-release-challenge` | reserved legacy check; always `info` after head-gesture removal |
+| `polkit-app-prompts` | whether polkit application prompts accept a face match |
+| `polkit-helper-sandbox` | whether the polkit helper's sandbox permits what irlume needs |
+| `ir-calibration` | whether this account's IR enrollment carries the per-user liveness floor |
+| `login-wiring` | whether face auth is wired into the login stack, read from its authentication mode: a stack holding only irlume's reseal lines is not wired |
+| `login-overrides` | whether the `/etc/pam.d` copies irlume made of vendor PAM files are in step with them. `warn` names a copy with a line irlume does not read as PAM does, by its line number and why (a carriage return outside comments and valid closed bracketed controls among them, as CRLF line endings leave, which PAM reads as part of its line; irlume adds nothing to the copy until that line is corrected), a copy with lines irlume did not write whose vendor copy changed since irlume wrote it (or that predates vendor tracking and differs from its vendor copy, including one that only lacks lines its vendor copy has), or one that predates vendor tracking, lacks irlume's lines and has a numeric jump that may have counted them; `info` names one waiting for the next reconcile, one whose vendor copy changed but that reconcile does not rebuild (and why), one whose vendor copy is gone (it is then the service's only configuration), one without irlume's lines that keeps lines irlume did not write, or one where inactive lines hold the places of irlume's lines after a disable; `pass` with none. The detail is one `<service>: <note>` per copy, joined with ` \| ` (no note contains that), and names services and commands, never paths or PAM lines |
+| `display-manager` | whether the active display manager is one irlume can target; `warn` with a detail when irlume keeps face off it on purpose (a LightDM whose XDMCP or VNC server is on) |
+| `pam-regeneration-guard` | whether a distro PAM regeneration would strip the wiring unnoticed |
+| `install-hygiene` | leftover backups, and hand-installed builds overlaying packaged ones |
+| `keyring-secrets` | the login keyring's lock state and provider |
+| `keyring-os-upgrade` | whether the armed keyring secret survives the next upgrade of this release. `warn`, with the step in `detail`, when the account has a GNOME keyring token armed on a release whose upgrade does not carry it over (Fedora 43 or 44, before Fedora 45: the detail says to retain the sealed token and postpone the migration, since GNOME token disarm is unavailable); `pass` for any other kind, or nothing armed, on such a release; `unknown` when the daemon does not answer its metadata query or does not report the kind, or when the release cannot be determined (no readable os-release, or an `ID` or `VERSION_ID` that is missing, empty or unbalanced in its quoting); `info` on every other release |
+| `camera-groups` | enrolled secondary-camera groups (ADR-0024): present and healthy, stale, or the secondary store unreadable. Conditionally present: emitted only when groups exist or the store cannot be read |
+| `pam-faillock` | the `pam_faillock` tally for the target account (the OS-level lockout counter, distinct from irlume's own retry throttle): quiet when clean, `warn` with the count and the `faillock --reset` remedy at/above the threshold. Conditionally present: root-only and requires the `faillock` binary |
+
+For `SealedStorage`, the keyring and template-key `path` fields contain
+`keyring` and `template-key` labels for non-root callers. Only root receives
+the configured paths and detailed resolution errors. Non-root unknown
+results carry a generic reason, including for the system directories, so
+an error cannot disclose a resolved link target. Encryption results are
+the same for both callers; the system labels remain `/`, `/usr` and `/etc`.
+
+`CaptureModeStatus` includes `qualification_state` (`qualified_concurrent`,
+`measured_sequential`, `unqualified_no_authority`,
+`unqualified_context_changed`, `inconclusive`, `unreadable`, or `no_ir_pair`), an optional
+`qualification_reason`, the complete serialized v2 `qualification_context`
+(endpoint identity, requested and driver-accepted tuples, minimum rates, and
+USB connection facts), and an optional `runtime_degradation` cause. `ir` is
+nullable for an RGB-only host. `runtime_context` is the process-local exact
+context+camera-generation key; it is diagnostic, not durable authority.
+
+## Schema, fixtures, and conformance
+
+Contract 1 has a JSON Schema (2020-12) at `schemas/machine-api-v1.schema.json`,
+installed on packaged systems at
+`/usr/share/irlume/schemas/machine-api-v1.schema.json`.
+
+**The schema does not close its objects, and a consumer's validator must not
+either.** Fields may be added within a contract version, so rejecting unknown
+properties turns a permitted engine update into a broken consumer.
+
+`schemas/fixtures/v1/` holds documents captured from a real engine, including the
+daemon-unreachable and refusal cases, for building against without an
+installation. `scripts/machine-api-conformance.py` checks a build the way a
+consumer would: envelope rules, every advertised capability answering, and the
+refusals behaving. [INTEGRATION.md](INTEGRATION.md) is the guide for writing a
+consumer.
+
+### `irlume login status --json`
+
+Capability: `login-status-json`.
+
+Which PAM surfaces carry face auth, by service name:
+
+```json
+{
+  "login_manager": {
+    "known": true,
+    "name": "plasmalogin",
+    "recognized": true,
+    "services": ["plasmalogin"]
+  },
+  "surfaces": [
+    { "id": "plasmalogin", "role": "login-screen", "present": true, "wired": true, "mode": "on-demand" },
+    { "id": "sddm", "role": "login-screen", "present": false, "wired": false },
+    { "id": "kde", "role": "lock-screen", "present": true, "wired": true, "mode": "on-demand" },
+    { "id": "sudo", "role": "sudo", "present": true, "wired": true, "mode": "verify" }
+  ],
+  "selinux_module": "loaded"
+}
+```
+
+`id` is the PAM service name, and it is public API on the same terms as a doctor
+check id: the list may grow, an id is never renamed and never reused. Paths under
+`/etc/pam.d` are not published, for the reason `status --json` publishes camera
+capability and not camera nodes.
+
+`role` is one of `login-screen`, `login-screen-fingerprint`, `lock-screen`,
+`sudo` or `polkit`.
+
+`present` is whether the service exists on this machine at all, counting a vendor
+copy an override would be materialized from. `wired` is whether it currently
+carries an irlume authentication rule for face verification or the fingerprint
+keyring landing marker. Non-authentication rules and reseal-only rules do not
+count. Modes use the arguments of those authentication rules, not options
+from other phases or a separate reseal rule.
+
+**The surface array is complete.** A service absent from the machine is still
+reported, with `present: false`, so a consumer that knows an id and cannot find
+it may read that as "this engine version does not wire that service" rather than
+as "it is not wired here".
+
+`mode` says how face fires on a wired surface: `face-first` (the camera verifies
+as soon as the greeter prompts), `on-demand` (the user submits an empty password
+to trigger face), `keyring` (the fingerprint keyring-unlock line, which is not a
+face factor), or `verify` (the plain sudo and polkit stanza). It is absent, never
+null, when the surface is not wired.
+
+`login_manager.known` is false when no `display-manager.service` is set: a
+headless host, or a greeter that registers none. That is not the same as "no
+login manager is installed", and a consumer should not render it that way.
+`recognized` is whether irlume can wire face login for this login manager. It is
+false both for one irlume has no mapping for and for one whose mapped PAM service
+irlume has no wiring recipe for; either way `login enable` cannot target it, which
+is what a consumer needs to know. `services` are the PAM
+services that login manager consults, which is how a consumer decides which
+surface entry describes its own login screen without matching on names. A service
+listed there with no matching entry in `surfaces` is one this engine has no
+wiring recipe for.
+
+`selinux_module` is `loaded`, `not-loaded` or `unknown`. Reading the policy store
+needs root, so an ordinary caller gets `unknown`, which is not a synonym for
+`not-loaded`.
+
+Privileged face confirmation is fixed service policy, not mutable machine
+state. PAM and the daemon enforce it from the shared normalized service table;
+CLI/TUI render the same rule. Contract 1 therefore adds no confirmation or
+attestation field. Head gestures have been removed. See
+[ADR-0010](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0010-conventional-face-intent-confirmation.md).
+
+### `irlume profiles list --json [--user USER]`
+
+Capability: `profiles-list-json`.
+
+Returns display names and scan display names. `require_eyes_open` and
+`require_challenge` are required contract-1 compatibility fields, both frozen
+at `false`; they do not report enrollment policy or a current detector. They may
+leave with contract 2. See [ADR-0009](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0009-head-gesture-only-consent.md).
+The current enrollment store identifies these records by mutable names,
+so this first read-only contract intentionally does not invent opaque IDs or
+advertise profile mutations. Mutation-safe IDs must originate in the engine
+store before a later capability can expose them.
+
+Display names are chosen by the user, so treat them as user text rather than
+identifiers: they may contain anything the user typed.
+
+Each profile also carries `recognizers`: how many of its scans belong to each
+recognizer, and which recognizer the daemon has loaded. A profile can hold
+templates from several recognizers at once, since a scan records the model
+that produced it, and only the loaded recognizer's templates can match. The
+flat `scans` list therefore cannot answer whether a profile is usable right
+now; the entry whose `live` is true can. None is live when the loaded
+recognizer has no templates in that profile, which is what an operator sees
+after switching models before re-adding scans.
+
+`recognizers` is ABSENT, not empty, when the daemon did not report the counts.
+That happens against a daemon older than 0.9.0, which is what a consumer sees
+between the package upgrade and the daemon restart. An empty array would mean
+"no recognizer has templates here", so emitting it beside a populated `scans`
+list would be the unknown-as-zero mistake. Treat a missing `recognizers` as
+unknown and fall back to `scans`; do not treat it as a profile that needs
+re-enrolling.
+
+Profiles may also carry `ir`, reported by the daemon for its loaded
+recognizer and IR pipeline. Its `compatible_scans`, `missing_scans`,
+`unknown_scans`, and `incompatible_scans` partition that recognizer's scans.
+Missing means no IR template; unknown means no recorded IR pipeline tag;
+incompatible means a different pipeline tag or embedding dimension. Scans
+for other recognizers remain in the existing `recognizers` breakdown.
+
+`calibration_withheld` reports a stored raw-IR calibration that cannot be used
+while unknown IR scans for this recognizer remain in the profile. Compatible
+IR scans can still match without calibration. Adding fresh scans alone does
+not clear this restriction while the unknown scans remain.
+
+An absent `ir` means the daemon did not report compatibility; do not treat it
+as zero scans or prescribe re-enrollment. These are template counts, not a
+camera/liveness check or a guarantee that dark authentication will succeed.
+The field is additive within contract 1; older consumers ignore it.
+
+### `irlume models list --json`
+
+Capability: `models-list-json`.
+
+The pipeline stages in order, each with its model **candidate**: the file this
+CLI process's search order lands on, its origin (`shipped`, `caller-env` when
+the calling process's environment chose the path, or `built-in` for the PAD
+stage's gate, which is code rather than a swappable file), and whether it
+opened as a regular file (`readable`). It is a candidate and not a claim about
+the daemon, because the daemon's service unit (or an administrator's drop-in)
+sets the daemon's own environment, which a shell invocation cannot observe. On
+a stock install the candidate coincides with what the daemon loads; an
+authoritative loaded-model report can only ever come from the daemon itself.
+`observed: true` with `readable: false` (a directory at the path, an
+unreadable file) means the daemon's load of that same candidate would fail.
+
+Each stage also reports whether the daemon requires the file to start, and
+`open`, which is `false` on every stage since third-party model support was
+removed (ADR-0015): irlume ships and supports exactly the models-v1 set. A
+closed stage never carries a `third_party` object.
+
+The command needs no daemon, so it still answers when the daemon will not
+start.
+
+### `irlume camera census --json`
+
+Capability: `camera-census`.
+
+Every video-adjacent device on the machine, classified once, each row
+carrying the evidence its classification keyed on (#575). The command runs
+CLI-side like `doctor --json` (read-only `/dev/video*` opens and sysfs
+walks; no daemon), so unreadable nodes are their own class with the errno as
+evidence rather than a failure.
+
+```json
+{
+  "listing_error": null,
+  "entries": [
+    {
+      "node": "/dev/video0",
+      "class": "uvc_rgb",
+      "paired": true,
+      "verdict": "supported",
+      "note": null,
+      "privacy_engaged": false,
+      "evidence": ["driver uvcvideo on USB", "USB 046d:085e", "internal", "formats MJPG/YUYV"]
+    }
+  ]
+}
+```
+
+Row fields:
+
+| Field | Meaning |
+| --- | --- |
+| `node` | The `/dev/videoN` row, or `null` for machine-level rows (MIPI pipelines, unbound USB devices) |
+| `class` | One of `uvc_rgb`, `uvc_ir`, `y8_ir`, `metadata_only`, `dummy_node`, `unreadable_node`, `mc_centric`, `mipi_ipu`, `mipi_vendor_bridge`, `usb_camera_without_driver`. Class-specific side fields (`paired`, `generation`, `usb_id`) sit beside it |
+| `verdict` | `supported` (with a tier `note`), `supported_with_limits`, `informational`, `not_hardware`, `unsupported`, or `broken`. Every `note` names the supported path or the next step |
+| `privacy_engaged` | The hardware privacy shutter is engaged on that node: nothing is wrong, the shutter needs opening. `null` on machine-level rows (no node to probe) or when the control could not be read |
+| `evidence` | The facts the classification keyed on (driver, USB identity, format fourccs, internal/external, cause). Never empty. A `uvc_ir` or `uvc_rgb` row whose node offers only YUYV also carries its USB descriptor's answer (ADR-0031 §1): `IR by USB descriptor: one video stream (interface N), Microsoft face-authentication control (unit N), no colour controls` on a `uvc_ir` row, or `not IR by USB descriptor: <reason>` on a `uvc_rgb` row. A `dummy_node` row, such as a v4l2loopback feeder, carries neither. Evidence strings are for people; no new class or field |
+
+`listing_error` is non-null when `/dev` could not be listed: the census may
+be incomplete, which is not the same as empty.
+
+### `irlume camera diagnostics --json`
+
+Capability: `camera-diagnostics`.
+
+Machine-readable delivered-rate evidence for the configured pair (#462), plus
+the MS-XU illumination stream state (#568). Runs through the daemon: one
+bounded, gated capture per present role. No device path, account identity, or
+template data is exposed.
+
+The configured pair is the daemon's standing camera pair, unless a split pair
+(an administrator-authorized RGB camera and IR camera on separate USB devices,
+ADR-0032) is the saved selection and no `IRLUME_RGB_DEVICE`/`IRLUME_IR_DEVICE`
+override is set. Then both sides of the selected pair are measured, RGB then
+IR, under one split diagnostic operation, never the RGB camera the daemon
+would otherwise fall back to. A selected pair that does not resolve (not
+connected, or a side that an ordinary RGB+IR camera claims) reports both roles
+`"missing"`; a split configuration that cannot be verified reports both roles
+`"unknown"`, and no camera is opened. Both carry `known: true`.
+
+```json
+{
+  "rgb": { "known": true, "state": "measured", "evidence": { ... } },
+  "ir": { "known": true, "state": "measured", "evidence": { ... } },
+  "skew_us": 3612533,
+  "capture_strategy": "burst",
+  "illumination": { "node": "present", "frames_classified": 10, "frames_lit": 5, "ambient_observed": true }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `rgb`, `ir` | Per-role diagnostic: `"measured"` (floor cleared), `"fail"` (under-rate), `"missing"` (no node), or `"unknown"` (open/transport failure) |
+| `rgb.evidence` / `ir.evidence` | Exact requested/accepted/delivered rationals, floor, tolerance, window count/span, sequence gap, cumulative drops, timestamp clock and source, latest timestamp |
+| `skew_us` | Same-domain RGB/IR skew in microseconds. `null` means unknown (the two latest timestamps do not share clock and source, or a role is missing) |
+| `capture_strategy` | The strategy the diagnostic used (`"burst"`, `"streaming"`) |
+| `illumination` | The MS-XU illumination metadata stream state (#568): `node` (`"present"`/`"absent"`), `frames_classified`, `frames_lit`, `ambient_observed`. `null` on an RGB-only pair (no IR node to probe). Reports written before #568 deserialize this as `null` |
+
+The `illumination` section: `node` is whether the IR node's metadata sibling
+accepted the UVCM probe; `frames_classified` is how many burst frames the
+camera's own illumination metadata classified; `frames_lit` the subset it
+flagged lit; `ambient_observed` is true only when the camera flagged both a
+lit and a dark frame, meaning the counts reflect a real emitter-off
+observation rather than absent records.
+
+### `irlume support-report --json [--since N]`
+
+Capability: `support-report-json`.
+
+The support report as one document: the same privacy-bounded facts as the
+text report `irlume support-report` writes, without writing a file or opening
+a camera (`--probe` is not available with `--json`). `--since` bounds the
+daemon's recent events (`30s`, `10m`, `1h`; default 10 minutes, at most 30).
+
+```json
+{
+  "report_schema": 1,
+  "engine_version": "0.15.0",
+  "created_utc": "2026-10-17T23:24:22Z",
+  "effective_privilege": "user",
+  "platform": "Arch-family",
+  "kernel_release": "6.12.1-arch1-1",
+  "install_channel": "arch_package",
+  "checks": [{ "id": "daemon_reachable", "state": "unknown" }],
+  "unavailable": [{ "section": "daemon", "reason": "daemon_unavailable" }]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `report_schema` | The report layout's own version, `1` |
+| `effective_privilege` | `root` or `user`; some daemon sections need root |
+| `platform` | `Debian-family`, `Fedora-family`, `Arch-family`, or `other/unknown` |
+| `install_channel` | How irlume was installed, as doctor's `install-origin` reads it: `fedora_copr`, `local_rpm`, `ubuntu_ppa`, `local_deb`, `arch_package`, `source`, or a [nightly channel](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0037-nightly-channel.md) lane, `fedora_copr_nightly`, `ubuntu_ppa_nightly` or `arch_git` (added after 0.15.0) |
+| `checks` | `id` (`platform_supported`, `install_channel`, `daemon_reachable`, `tpm_present`, `secure_boot`) and `state`, as doctor's states |
+| `daemon` | The daemon's share-safe snapshot: uptime, retained history, capture schedule, sanitized camera context and recent share-safe events. Absent when the daemon did not answer. The cameras' `qualification_token` and the capture's `qualification_context` and `runtime_context` are keyed for each document, so values equal in the daemon's snapshot stay equal within one document and two documents carry unrelated values ([ADR-0008](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0008-privacy-bounded-diagnostics.md), amendment 2026-11-12) |
+| `unavailable` | Each section the report could not fill (`daemon`, `camera_context`, `capture_schedule`, `recent_events`, `support_probe`) and why (`daemon_unavailable`, `daemon_restarted`, `no_camera`, `no_ir_pair`, `not_authorized`, `collection_failed`) |
+
+### Error codes
+
+| Code | Meaning | `retryable` |
+|---|---|---|
+| `usage-error` | The command line was not one this contract accepts. Exits 2. | no |
+| `unsupported-contract` | The engine does not implement the requested contract. Refused before any side effect. Exits 2. | no |
+| `daemon-unavailable` | The daemon could not be reached. | yes |
+| `not-authorized` | The caller may not act on the named account. From `auth test`, it can also mean the calling account does not hold the active local session on a seat, which a request that turns the camera on needs unless it comes from root. | no |
+| `operation-failed` | The engine could not carry out a well-formed request. | no, except for a pre-empted operation and for IR frames no illumination record named, which a camera stream that has just opened can produce once ([ADR-0032](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0032-cross-device-pairing-by-administrator-pin.md), amendment 2026-10-18) |
+| `camera-busy` | The camera driver reported contention. Close apps using the camera, then retry. Auth tests include a fixed human-readable `message`. | yes |
+| `deadline-expired` | The authentication window elapsed before a decision; the attempt ended without a verdict. Not retryable as this transaction; a fresh attempt starts a new window. | no |
+| `protocol-error` | The daemon replied with something this command did not expect. | no |
+
+`not-authorized` and `operation-failed` are distinct so a consumer can tell "you
+may not do that" from "something broke", and act accordingly: the first is worth
+a message about permissions, the second is worth a retry or a support report.
+
+`not-authorized` deliberately says nothing about whether the named account
+exists. An ordinary caller is refused before the enrollment store is consulted,
+so a real account and an invented one produce the identical answer, and this
+command cannot be used to discover which accounts exist or which are enrolled.
+
+`retryable` means an identical request could plausibly succeed later without the
+caller changing the request. A camera conflict or another Irlume operation may
+clear, so `camera-busy` and `session-busy` can also be retryable. It is not a
+promise that a retry will succeed, and it carries no suggested delay.
+
+### `irlume auth test --events=jsonl`
+
+Capability: `auth-test-events`.
+
+Camera-busy authentication errors are typed at the camera I/O boundary; text
+containing "camera busy" is never treated as a code. The diagnostic client opts
+in to structured daemon errors. An older daemon may still return
+`operation-failed`; no automatic second capture is attempted. Older clients
+retain legacy daemon replies. An identified Irlume-only holder fault remains a
+generic hardware failure rather than advice to close another application.
+The TUI's authentication test uses the same request and renders actionable
+camera-busy guidance rather than raw JSON. `retryable` does not trigger an
+automatic retry: the camera must become available first.
+
+Does the claimed account's live face match its own enrolment? This is
+verification against one account, never identification, and it releases nothing:
+the answer is a verdict. It cannot alter a profile, a threshold, or a credential,
+because it issues no request that could.
+
+Output is newline-delimited JSON, one event per line:
+
+```
+{"contract_version":1,"engine_version":"0.7.1","command":"auth.test","operation_id":"8db4...","session_id":"a14a...","sequence":0,"event":"started","terminal":false,"data":{"operation":"auth-test"}}
+{"contract_version":1,...,"sequence":1,"event":"capturing","terminal":false,"data":{}}
+{"contract_version":1,...,"sequence":2,"event":"result","terminal":true,"data":{"granted":false,"live":true,"reason":"no-match"}}
+```
+
+Every line carries the whole envelope rather than relying on a header sent once,
+so a line remains meaningful on its own in a log or after a dropped read.
+
+Three properties a consumer may rely on:
+
+- `sequence` starts at zero and increments by one with no gaps, so a lost line
+  is detected by arithmetic rather than by timeout;
+- exactly one event has `terminal` true, and it is the last, so a reader knows
+  when to stop without waiting. **A stream that ends without one means the
+  producer died**: it was killed, lost power, or hit a signal it could not
+  handle. Treat end-of-file as terminal as well, because a reader that waits for
+  the flag alone will wait forever. Verified: killing the command mid-stream
+  leaves the lines already emitted and no terminal event, which is the only
+  honest thing a dead process can do;
+- `operation_id` is identical on every line of one invocation.
+
+`reason` is one of `granted`, `not-live`, or `no-match`, derived from `granted`
+and `live`. It is never derived from daemon wording, so a reworded message is not
+a breaking change.
+
+`reason` cannot express a refusal that never looked at a face. The configured
+method being fingerprint, the RGB-only convenience tier, the opt-in biopolicy
+gate and the rate limiter all answer `granted: false, live: false`, and `reason`
+reports every one of them as `not-live`: a face looked fake when none was
+examined. `refusal` carries that distinction and is absent when granted:
+
+| `refusal` | what happened |
+| --- | --- |
+| `policy` | refused before any capture: the configured method, the tier, the biopolicy gate, or the rate limiter |
+| `declined` | legacy daemon cancellation; current daemons do not emit this value |
+| `no-match` | a live face that did not match the enrolment |
+| `not-live` | the liveness gate refused the capture |
+
+`reason` keeps its three values and its meaning, so a consumer written before
+`refusal` existed reads exactly what it read before.
+
+**The match score is not reported.** A caller that can read a continuous score
+can hill-climb against it, adjusting a presentation until it crosses the
+threshold, which would turn a diagnostic into an oracle. `granted` and `live`
+are the facts a settings panel needs.
+
+The account is not echoed back, for the same reason machine output names no
+account ([Security and privacy](#security-and-privacy)): the caller already
+knows which account it asked about, and a desktop may log the stream.
+
+An exit status of zero means the test ran. It does not mean the face matched;
+read `granted` for that. A refusal before the stream begins is reported as a
+single document with the usual error codes and exit 2, not as a stream. A
+failure once the stream has started is a terminal `error` event and exit 1.
+
+Naming an account the caller may not act on is one such failure, and it reports
+`operation-failed` rather than `not-authorized`. That flattening is deliberate:
+distinguishing the two would answer "does this account exist and is it enrolled"
+for any local process, and the engine already refuses to let one account's face
+be tested against another's enrolment for the same reason.
+
+One session per user runs at a time. A second concurrent invocation is refused
+with `session-busy`, which is retryable. The session lock is
+`machine-session.lock` in the caller's runtime directory (`$XDG_RUNTIME_DIR`),
+used only when that is an absolute path to a directory, not a symlink, owned by
+the caller and not writable by group or others, as systemd creates
+`/run/user/<uid>`. Root without such a directory, as under `sudo`, uses
+`/run/irlume`, a root-owned directory created at 0700 on first use; no other
+account has a fallback, and no shared directory such as `/tmp` is used. The
+lock is opened without following a symlink and must be a regular file the
+caller owns. A lock that cannot be taken at all, because no directory
+qualifies or the runtime directory is unwritable, is `operation-failed` and is
+not retryable: the two mean opposite things to a caller, and reporting both as
+busy would tell a consumer to keep trying against a permission error. The lock
+is held by the running process and released by the kernel when it exits, so a
+panel that is killed mid-capture does not strand the user.
+
+`--preview` is refused. Preview frames are a separate capability that this
+build does not advertise; accepting the flag and ignoring it would suggest that
+frames were withheld by policy rather than never implemented.
+
+Stream lines validate against `$defs/event` in the schema, not against the
+document root. `schemas/fixtures/v1/auth-test-events.ndjson` is a capture from a
+real engine.
+
+### `irlume login plan --action {enable|disable} --json`
+
+Capability: `login-plan-json`.
+
+The plan phase of a login transaction: what `login enable` or `login disable`
+would change, without changing anything.
+
+```json
+{
+  "plan_id": "c574f96dba23c06bbb2e2f395a74f074",
+  "action": "disable",
+  "changes": [
+    { "surface": "gdm-password", "role": "login-screen", "change": "not-installed", "writes": false, "kept": false, "jumps_adjustable": false },
+    { "surface": "plasmalogin", "role": "login-screen", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "kde", "role": "lock-screen", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "sudo", "role": "sudo", "change": "restore-backup", "writes": true, "kept": false, "jumps_adjustable": false },
+    { "surface": "polkit-1", "role": "polkit", "change": "remove-override", "writes": true, "kept": false, "jumps_adjustable": false }
+  ],
+  "writes": 4,
+  "requires_root": true
+}
+```
+
+Absent surfaces are trimmed from this example for length; a real document lists
+every one. The top-level `writes` always equals the number of entries whose own
+`writes` is true.
+
+This runs the identical decision the apply path runs, with writing switched off,
+so a plan cannot describe an outcome the apply would not produce. Reading the PAM
+stack needs no privilege; `requires_root` says whether applying would.
+
+Every surface irlume can wire appears, including absent ones, so a consumer
+reading an id it knows and cannot find learns "this engine does not wire that
+service" rather than "not wired here". Surfaces are named by PAM service, never
+by path, in keeping with the no-paths rule.
+
+`change` is one of `wire`, `materialize-override`, `restore-backup`,
+`remove-override`, `rewire-override`, `keep-edited-override`,
+`strip-in-place`, `already-correct`, `not-installed`, `no-anchor`,
+`not-wired`. `writes` on a change says whether applying it would touch disk,
+and the top-level `writes` counts them, so "nothing to do" is a fact the engine
+states rather than one a consumer infers from outcome names it may not
+recognise. `kept` on a change is true when the apply will keep that surface
+as it is although irlume's lines there are not the ones this run wants,
+which fails the apply (`kept` in `login apply` below); it is false for every
+other surface, including a `keep-edited-override` whose irlume lines are
+already right. The same file can be either, depending on the lines the
+configuration wants. `kept` was added in 0.15.0 and is absent from older
+builds. `jumps_adjustable` is true on a surface the human `--adjust-jumps` flag
+would handle differently because of a numeric jump in an administrator's line
+(see [DISABLE.md](https://github.com/archledger/irlume/blob/main/docs/user/DISABLE.md)). On a `kept` surface of an enable plan, the
+only obstacle is such a jump, which irlume's new lines would land
+inside: `login enable --adjust-jumps` would make the update. On a surface the
+run takes irlume's lines out of, `strip-in-place` or `not-wired` with `kept`
+false, irlume's lines stay as inactive lines because such a jump counts them
+or lands on one of them: the same command with `--adjust-jumps` would remove
+them, lowering a jump that counts them, or moving a landing off a line of
+irlume's it takes out to the first line after them. That is every surface of a
+disable plan, and a surface of an enable plan whose configuration no longer
+wants irlume's lines there, such as a login screen once face login is off, so
+an enable plan can mark a surface `jumps_adjustable` with `kept` false. It is
+false everywhere else, including a surface the flag cannot help and every
+stack irlume edits in place: the flag applies to irlume's `/etc` copies of
+vendor files only, and a stack edited in place keeps inactive lines. The API
+itself never changes such a line: `login apply` keeps a `kept` surface and
+fails on it, and leaves inactive lines where it takes irlume's lines out,
+either way. `jumps_adjustable` was added in 0.15.0 and is absent from older
+builds.
+
+The override changes concern a service a distribution ships only under
+`/usr/lib/pam.d`, for which irlume keeps its own copy in `/etc/pam.d`.
+`materialize-override` creates that copy from the vendor file, rebuilds one
+nobody edited (after a vendor change, or when irlume's lines change), or adds
+the tracking header line to a copy an earlier release wrote that still matches
+its vendor file (no PAM line changes; it still writes). `rewire-override`
+updates irlume's lines in a copy and keeps every other line: one with lines
+irlume did not write, or one whose vendor file is gone. irlume's lines keep
+their side of every line an administrator added. `keep-edited-override` writes
+nothing: the copy has lines irlume did not write and its vendor file changed
+since irlume created it (or it predates vendor tracking and differs), or
+updating irlume's lines would move where one of its numeric jumps lands or
+move one of irlume's lines past an administrator's line. A stack irlume edits
+in place reports it too when a disable left inactive lines in the places of
+irlume's lines because a numeric jump counts them, and irlume's lines no
+longer fit those places; while they fit, `wire` puts irlume's lines back in
+them, so the jump lands where it did. A write to an override or to a stack
+irlume edits in place, and an override made from a vendor file, is not made
+either when that file has a line irlume does not read as PAM does (a type
+PAM does not know, a blank other than a space or a tab between fields, a
+carriage return outside comments and valid closed bracketed controls, as
+CRLF line endings leave, a NUL byte, an `@include` without a file, a
+`substack` without a stack, or a module path PAM takes no module name from):
+the surface reports `keep-edited-override` with `kept` true. A disable still
+deletes an override nobody edited and restores a
+backup that is the file without irlume's lines, byte for byte where the file
+has a carriage return; from any other such file it takes irlume's lines out
+and keeps every other byte (`strip-in-place`) when no numeric jump in the
+file could count irlume's lines, and reports `keep-edited-override` with
+`kept` true otherwise. A login or lock screen stack that names no shared
+password stack irlume knows reports `no-anchor` unless its first auth line is
+the password step (a `pam_unix.so`, `pam_unix2.so` or `pam_sss.so` rule whose
+failure fails the stack) or an `include` of a stack that runs one, read where
+PAM finds it, with no auth line below it that can check a password.
+When irlume's lines in the kept file are not the ones this run wants (the
+plan's `kept`), `login apply` counts such a surface as failed
+(`applied: false`, and the apply fails), since
+irlume's lines are not the ones it was asked for; as on the command line, the
+self-heal marker still follows the other surfaces. A copy nobody edited is not
+rebuilt either when irlume's lines would make a numeric jump in its new vendor
+file land somewhere other than it does there (a jump the update added, or one
+whose landing it changed); it reports `already-correct`, since its irlume
+lines are right for the vendor text it was built from, and `doctor`'s
+`login-overrides` check carries the pending update. A copy with lines irlume
+did not write and none of irlume's gets them next to its password line, below
+every line above it; when irlume cannot tell which line that is (another line
+has the same text and there is no vendor file to compare with, or every
+candidate is a line an administrator added), it reports `no-anchor` and writes
+nothing. `remove-override` deletes a copy nobody edited; a disable turns one
+with other lines into `strip-in-place` and keeps the file. When a numeric jump
+in those lines counts irlume's lines, `strip-in-place` replaces them with
+inactive `pam_permit.so` lines in the same places rather than removing them,
+so the jump lands where it did; it does the same when irlume could not tell
+where to put its lines back without them. The API never rebuilds an edited
+copy, and never changes the value or the landing of a numeric jump in one:
+those take the human `login enable --force` and `login enable --adjust-jumps`
+(or `login disable --adjust-jumps`).
+
+`plan_id` is a digest of the action and the exact per-surface outcomes it was
+computed against, `kept` and `jumps_adjustable` included. Two plans over an
+unchanged machine share an id; any change to what would happen produces a
+different one. For a surface with a vendor path it
+covers the vendor file too, whether or not an override exists yet, so a vendor
+update between `plan` and `apply` makes the plan stale. It exists so that a
+later apply can refuse a plan that no longer matches the machine rather than
+silently doing something the consumer never displayed. It is an identifier,
+not a security boundary: apply will re-derive the plan from the machine rather
+than trusting anything the id encodes.
+
+Sudo and polkit are opt-in on the human command and are not included in a plan,
+so a panel never shows a user surfaces they did not ask for. Disabling still
+covers every surface, because turning login off leaves nothing behind.
+
+A plan is carried out by `login apply` below, which re-derives it and refuses a
+`plan_id` that no longer matches.
+
+### `irlume login apply` / `verify` / `rollback`
+
+Capability: `login-transactions`. The mutating half of a login transaction;
+`login plan` above is the read-only half.
+
+```
+irlume login apply    --action {enable|disable} --plan-id ID --json   # root
+irlume login verify   --transaction-id ID --json
+irlume login rollback --transaction-id ID [--apply] --json            # root to apply
+```
+
+**apply** re-derives the plan from the machine and recomputes its id. A
+`plan_id` that no longer matches is refused as `plan-stale`: the consumer
+displayed one set of changes and the machine now calls for another, so applying
+would change something nobody was shown. The supplied id is never trusted as
+input, only compared. On success it returns a `transaction_id`.
+
+A partial apply is reported as a failure and still records its transaction, so
+the surfaces that did change can be rolled back. The id travels IN THE
+DOCUMENT in that case, as a top-level `transaction_id` beside `failed`, not on
+standard error: machine mode promises stdout carries the answer and stderr
+stays empty, and a caller recovering from a half-changed login stack needs the
+id from the same place it reads everything else. Beside them, `changes` lists
+every surface as the success document does (`surface`, `role`, `change`,
+`applied`), so a caller can name the surface that failed. Each change in either
+document also carries `kept`: true for a surface irlume left as it was rather
+than update it (its lines would have moved an administrator's jump or line, or
+the file has a continued line or a line irlume does not read as PAM does; the
+plan marks it `kept`),
+which fails the apply without anything written there.
+
+**verify** answers whether the machine is still as that transaction left it,
+per surface: `as-applied`, `changed-since-apply`, or `unreadable`. An override
+the transaction created whose vendor file has gone since reads
+`changed-since-apply` (see below). It also
+states `rollback_available`, so a consumer does not have to infer it from
+per-surface states it may not recognise. Read-only.
+
+**rollback** restores what the transaction changed, and **refuses unless every
+surface is still exactly as apply left it**. Restoring a file something else has
+edited since would revert a change the transaction never made, so drift stops
+the whole rollback rather than skipping the drifted surface: a half-rolled-back
+login stack is its own hazard. Every surface is checked before any is written.
+A file that already holds the content recorded for it, such as a surface apply
+refused or left alone, is not written again, so its mode, owner and links stay
+as they are. Without `--apply` it reports what it would restore and touches
+nothing.
+
+Transaction records live under the state directory, `0600` in a `0700`
+directory. They contain the pre-change content of each file, which is not secret
+(PAM stacks are world-readable) but does describe exactly how a machine
+authenticates.
+
+A transaction id is a 32-character hex string. Anything else is a `usage-error`,
+rejected rather than sanitised, because the id becomes a filename.
+
+Error codes: `plan-stale`, `changed-since-apply`, `not-found`,
+`keyring-token-armed` (a disable, an enable that would unwire a login screen
+the configuration no longer wants, or a `rollback --apply` that would restore
+a stack without it, while an account's GNOME keyring is keyed to an irlume
+token and a login stack carries the session line that delivers it; refused
+before anything is recorded or written, and not retryable while that token
+must be retained: token disarm is unavailable),
+`not-authorized` (apply and `rollback --apply` need root, checked before
+anything is written rather than left to a write failing partway),
+`unconfirmed-transaction`, `unsupported-record`, `unmanaged-path` (a record
+names a file irlume does not manage, so rollback refuses to touch it),
+`operation-failed`.
+
+A surface's `.pre-irlume` backup is part of the surface. The plan id covers it,
+so a backup that changes between `plan` and `apply` makes the plan stale: the
+backup decides what a disable does (restore it, or strip irlume's lines in
+place), so a consumer would otherwise be shown one outcome while the machine got
+another. The vendor file decides an override's outcome the same way and is
+covered the same way; apply compares each surface's files with the plan
+immediately before writing it and refuses one whose `/etc` file, backup or
+vendor file changed (`<file> or its vendor copy changed between the plan and
+the write`). Rollback checks the backup too and refuses the whole record if it
+is not as apply left it. A backup apply created is removed by the rollback.
+
+Rollback also refuses (`changed-since-apply`) a record that would delete an
+override apply created when that override's vendor file has gone since: the
+file is then the service's only PAM configuration, and deleting it would leave
+the service on the denying `other` stack.
+
+The reconcile unit keeps irlume's overrides in step with their vendor files
+between transactions: it adds the tracking line to one written by an older
+release, and rebuilds one nobody edited when its vendor file changes. Such a
+write makes an earlier transaction that touched that file read as changed
+since apply, which blocks its rollback. Rolling back a rebuild of an override
+nobody edited is undone again at the next timer run, since the vendor file is
+still newer than the copy.
+
+A rollback that stops partway records which surfaces it put back, durably, as it
+goes. Re-running it resumes: those surfaces are skipped rather than re-checked,
+because a restored file deliberately no longer matches the digest apply left and
+checking it would refuse the whole record, which used to leave the operator
+rebuilding the rest from the JSON by hand. `verify` reports them as
+`already_restored` and excludes them from `rollback_available`, so drift caused
+by irlume's own restore is not reported as somebody's edit.
+
+`rollback --accept-unconfirmed --apply` copies every surface and sidecar as it
+currently stands into a root-only directory before restoring anything, and
+returns that path as `snapshot`. An unconfirmed record has no trustworthy
+after-digest, so the restore does not check what it overwrites; that is how an
+interrupted apply is recovered, and equally how a package update made after the
+crash gets reverted. The copies are for a person to find, and feed no automatic
+path. A confirmed rollback has no `snapshot`: its drift check has already
+established every file is byte-for-byte what apply left.
+
+`unsupported-record` means the record was written to a record schema this engine
+does not implement, and it is not retryable: run the newer irlume. A record
+carries a `schema_version`, which is a gate rather than a description. It is
+raised only when the MEANING of a record changes, so a purely descriptive
+addition does not raise it and an older engine keeps reading such records. What
+an engine will not do is act on the parts of a newer record it recognises: the
+fields would parse and look reasonable while meaning something else, and a
+record is the recovery path for a machine's login stack.
+
+Every irlume path that changes PAM (`login apply`, `login rollback --apply`,
+the human `login enable`/`disable`, and the self-heal reconcile) holds one
+exclusive lock for the whole operation, so a consumer's transaction cannot
+interleave with another irlume process. The lock does not cover package managers
+or an administrator with an editor, which is why each surface is re-checked
+immediately before it is written. The lock is `/run/irlume/pam.lock`, a 0600
+file in the root-owned 0700 directory root's session lock uses, so no other
+account can open or hold it. It is opened without following a symlink and must
+be a regular file root owns. A second operation waits for the first, naming its
+process on stderr. While an irlume release that kept the lock at
+`/run/lock/irlume-pam.lock` may still be running, as during an upgrade, that file
+is taken too. It is created at 0600 when it is missing, so such a release that
+reaches its lock later waits for the operation; a symlink or other special file
+root owns there stops the operation with the command that removes it, and group
+and other permissions are removed from a file root owns. Whatever
+another account owns there is replaced, in one rename (`RENAME_EXCHANGE`), by a
+new 0600 file root owns, which the operation holds and leaves in place, so that
+account cannot move the lock off its name while the operation runs. A regular
+file or a FIFO there is locked, as below, before it is replaced (a FIFO is
+opened without waiting for a writer and never read), so an operation that
+fails while waiting for it leaves it at the name; a file that took the name
+meanwhile is waited for too, and goes back to the name if the operation fails
+then. Where the rename cannot be made the operation fails, as
+`operation-failed` with `retryable` true. A process holding the old lock is
+waited for at most 60 seconds. If a root process that has the file open still
+holds it or waits for it then, or `/proc` cannot show which process holds it,
+the operation fails, as `operation-failed` with `retryable` true, rather than
+write beside what may be an earlier irlume; a holder `/proc` shows to be
+something else, such as another account's process, is passed over.
+
+irlume refuses to write a PAM path that is a symlink or that has more than one
+hard link, on every one of those paths. Renaming over a symlink would silently
+convert it to a regular file, and replacing a multiply-linked file would leave
+the other names on the old content; neither is recorded, so neither could be
+undone. Such a surface is reported as not installed with the reason.
+
+## Security and privacy
+
+Machine output never includes camera frames, embeddings, templates,
+passwords, credential material or TPM secrets. It names no camera device
+path (a `/dev/video*` node or a `/dev/v4l/` link to one) except in the
+`node` field of `camera census --json`, which lists the nodes by design.
+It names no account, with two exceptions. Run as root, `doctor --json`'s
+`tpm-firmware`, `tpm-lockout` and `tpm-storage-keys` details name the
+accounts whose sealed envelopes they concern
+([ADR-0034](https://github.com/archledger/irlume/blob/main/docs/architecture/adr/0034-attempt-limiting-stays-in-software.md) section 4 and
+its amendment 2026-10-16), since the report behind them is root-only and
+an administrator acts on it. And a path that was configured and is
+reported back as set, such as the library `ORT_DYLIB_PATH` names, a model
+override, a state directory or a camera configured by a path outside
+`/dev/video*` and `/dev/v4l/`, can lie under a home directory and so
+contain an account name. Errors contain stable codes instead of daemon
+prose.
+
+The following are not part of contract version 1 yet and must not be inferred
+from human output or the private socket protocol:
+
+- enrollment event streams;
+- preview images and cancellation semantics;
+- profile or scan mutation;
+- camera configuration mutation;
+- enrollment preview images and their cancellation semantics.

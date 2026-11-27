@@ -30,7 +30,7 @@ other irlume crate, and nearly every crate depends on it
   is what irlumed reports at start and checks before a save;
   `camera_conf_observation_agrees_with_read_camera_pin_on_files_irlume_writes`
   keeps them in step. The grammar is the `parse_camera_conf` doc, the rows of
-  `parse_camera_conf_follows_the_grammar` and the docs/SETUP.md files table. A
+  `parse_camera_conf_follows_the_grammar` and the docs/user/SETUP.md files table. A
   fix that makes the code match it is a `fix(config)` with a new test row;
   accepting or rejecting a new shape (or a key beyond `CAMERA_SELECTION_KEYS`
   and the legacy capture-mode keys) needs the maintainer and an ADR-0029
@@ -70,6 +70,6 @@ other irlume crate, and nearly every crate depends on it
    temp dir, including an unreadable file (a directory at its path, as
    `privileged_consent_requires_an_explicit_opt_out` does; mode 000 does not
    stop root).
-7. Document the key in [docs/SETUP.md](../../docs/SETUP.md) (files and
+7. Document the key in [docs/user/SETUP.md](../../docs/user/SETUP.md) (files and
    environment tables), the TUI Preferences page if shown there, and the
    CHANGELOG.

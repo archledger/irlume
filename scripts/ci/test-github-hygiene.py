@@ -40,21 +40,19 @@ TURNED_OFF_URLS = (
     'http://github.com/archledger/irlume/discussions',
 )
 
-# Documents whose links direct people. Dated records under docs
-# subdirectories (adr, hardware, plans, research) are archives, not
-# directions, so they are not scanned.
+# Dated records and individual ADRs are archives, not directions.
+DOC_SECTIONS = ('user', 'reference', 'security', 'architecture')
 COMMUNITY_DOCUMENTS = ('CODE_OF_CONDUCT.md', 'CONTRIBUTING.md', 'GOVERNANCE.md',
                        'SECURITY.md', 'SUPPORT.md')
-CURATED_DOCUMENTS = ('README.md', '.github/pull_request_template.md',
+CURATED_DOCUMENTS = ('README.md', 'docs/README.md', '.github/pull_request_template.md',
                      *(f'.github/{name}' for name in COMMUNITY_DOCUMENTS))
 
 
 def curated_documents(root=ROOT):
-    """The documents the link rule reads: the named pages, docs/*.md and the
-    issue templates, .md and .yml alike (the chooser's own contact link is
-    one of the links checked)."""
+    """Read current guides, community files, and both kinds of issue template."""
     paths = [root / name for name in CURATED_DOCUMENTS]
-    paths += sorted((root / 'docs').glob('*.md'))
+    for section in DOC_SECTIONS:
+        paths += sorted((root / 'docs' / section).glob('*.md'))
     paths += sorted((root / '.github/ISSUE_TEMPLATE').glob('*.md'))
     paths += sorted((root / '.github/ISSUE_TEMPLATE').glob('*.yml'))
     return paths
@@ -160,7 +158,9 @@ class CuratedLinks(unittest.TestCase):
         # A renamed or moved file must fail here, not quietly leave the set.
         for name in CURATED_DOCUMENTS:
             self.assertTrue((ROOT / name).is_file(), f'{name} is missing')
-        self.assertTrue(list((ROOT / 'docs').glob('*.md')), 'docs/*.md matched nothing')
+        for section in DOC_SECTIONS:
+            self.assertTrue(list((ROOT / 'docs' / section).glob('*.md')),
+                            f'docs/{section}/*.md matched nothing')
         self.assertIn(CHOOSER, curated_documents())
 
     def test_no_curated_document_links_a_turned_off_feature(self):

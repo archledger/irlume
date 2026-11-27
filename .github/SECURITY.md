@@ -13,7 +13,7 @@ branch; security fixes land on `main` and ship in the next release.
 | Version | Supported |
 |---|---|
 | `main` / latest release | ✅ |
-| the [nightly channel](../docs/PLATFORMS.md#nightly-channel) (builds of `main`) | ✅ |
+| the [nightly channel](../docs/user/PLATFORMS.md#nightly-channel) (builds of `main`) | ✅ |
 | older pre-1.0 tags | ❌ |
 
 ## Component risk tiers
@@ -28,7 +28,7 @@ branch; security fixes land on `main` and ship in the next release.
 
 ## Threat model (summary)
 
-Full detail in [`docs/THREAT_MODEL.md`](../docs/THREAT_MODEL.md). Primary concerns:
+Full detail in [`docs/security/THREAT_MODEL.md`](../docs/security/THREAT_MODEL.md). Primary concerns:
 
 - **Authentication bypass**: `PAM_SUCCESS` without a genuine live match; FFI
   unsoundness in the PAM module. The module never grants on error: any error,
@@ -61,7 +61,7 @@ Full detail in [`docs/THREAT_MODEL.md`](../docs/THREAT_MODEL.md). Primary concer
   loading; missing cues are unavailable; read errors, strict checksum rejection
   and load errors leave the cue unavailable without terminating the daemon.
   Face grants requiring that cue fall back to the password
-  ([ADR-0019](../docs/adr/0019-fail-closed-pad-availability.md)).
+  ([ADR-0019](../docs/architecture/adr/0019-fail-closed-pad-availability.md)).
   Loader errors are separate from checksum policy: load failures of the
   detector, recognizer, or a present Blaze model or IR adapter are
   startup-fatal.

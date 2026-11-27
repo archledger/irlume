@@ -2684,7 +2684,7 @@ pub fn setup(args: &[String]) -> ExitCode {
     println!("\n[7/7] PAM login wiring");
     if crate::nixos::host_is_nixos() {
         println!("  on NixOS the system configuration owns PAM: list the services under");
-        println!("  `services.irlume.pam.services` and rebuild (docs/NIXOS.md).");
+        println!("  `services.irlume.pam.services` and rebuild (docs/user/NIXOS.md).");
     } else {
         println!("  preview the changes with `irlume login enable` (dry-run), then apply with");
         println!("  `sudo irlume login enable --apply` to wire greeters + lock screen.");
@@ -2869,7 +2869,7 @@ SYSTEM INTEGRATION
                         (sudo)
   version                         print the installed irlume version
 
-MACHINE-READABLE OUTPUT (for desktop integrations; see docs/INTEGRATION.md)
+MACHINE-READABLE OUTPUT (for desktop integrations; see docs/reference/INTEGRATION.md)
   --json                on version, status, doctor, support-report, profiles list, models list,
                         camera census, camera diagnostics, login status, login plan/apply/
                         verify/rollback, auth test --events=jsonl:

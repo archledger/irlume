@@ -24,7 +24,7 @@ tutorial and KF6 porting guide, fetched 2026-09-18).
   needs a NixOS host; this documented limitation was accepted for v0.14.0.
 - Validation includes the user-accepted Fedora walkthrough, installed Arch KCM
   loadtest against the real daemon, hosted Fedora/Arch loadtests, and clean
-  Ubuntu 26.04 package installation and QML loading. See [KCM.md](../../KCM.md)
+  Ubuntu 26.04 package installation and QML loading. See [KCM.md](../../user/KCM.md)
   for the supported interaction model.
 
 The design below records the reviewed architecture and optional future scope.

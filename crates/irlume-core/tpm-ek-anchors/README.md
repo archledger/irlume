@@ -2,7 +2,7 @@
 
 The root and intermediate CA certificates irlume trusts when it checks a TPM's
 endorsement key (EK) certificate: the `tpm-endorsement` doctor check of
-[ADR-0036](../../../docs/adr/0036-tpm-endorsement-evidence-offline.md). irlumed
+[ADR-0036](../../../docs/architecture/adr/0036-tpm-endorsement-evidence-offline.md). irlumed
 embeds them at build time through `src/ek_cert/shipped.rs`; nothing here is
 read at run time, and irlume never fetches a certificate.
 

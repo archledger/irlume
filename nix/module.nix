@@ -7,7 +7,7 @@
 ##   };
 ##
 ## The PAM control flags below are not guesses; each was derived on a live VM
-## against the actual greeter/lock stacks (docs/NIXOS.md records the matrix).
+## against the actual greeter/lock stacks (docs/user/NIXOS.md records the matrix).
 ## The short version:
 ##
 ##   * A login greeter (sddm, gdm-password, greetd, ly, tty login) gets
@@ -47,7 +47,7 @@
 ## The keyring backend itself (KWallet on Plasma, gnome-keyring on GNOME/wlroots)
 ## is whatever your desktop already enables; this module does not pick one. For
 ## greetd on a wlroots compositor there is one more piece, the keyring session
-## wrapper, documented in docs/NIXOS.md and exposed here as
+## wrapper, documented in docs/user/NIXOS.md and exposed here as
 ## `config.services.irlume.keyringSessionWrapper`.
 {
   config,
@@ -314,7 +314,7 @@ in
     };
 
     kcm = {
-      enable = lib.mkEnableOption "the irlume Plasma System Settings module (read-only status and launch actions; requires a Plasma 6 session; see docs/KCM.md)";
+      enable = lib.mkEnableOption "the irlume Plasma System Settings module (read-only status and launch actions; requires a Plasma 6 session; see docs/user/KCM.md)";
 
       package = lib.mkOption {
         type = lib.types.package;
@@ -371,7 +371,7 @@ in
       description = ''
         A script that starts one gnome-keyring and exports its environment, for
         wrapping a greetd compositor command so a wlroots session does not spawn
-        a second, locked keyring. See docs/NIXOS.md.
+        a second, locked keyring. See docs/user/NIXOS.md.
       '';
     };
   };
@@ -562,7 +562,7 @@ in
         ORT_DYLIB_PATH = "${onnxruntime-bin}/lib/libonnxruntime.so";
         IRLUME_DET_MODEL = "${models}/face_detection_yunet_2023mar.onnx";
         IRLUME_MODEL = "${models}/glintr100.onnx";
-        # Nix does not yet package libtensorflowlite_c.so (docs/NIXOS.md), so
+        # Nix does not yet package libtensorflowlite_c.so (docs/user/NIXOS.md), so
         # this lane keeps the pinned ONNX conversion as its production mesh
         # until the runtime dependency is wired. The mesh remains dense-landmark
         # infrastructure for BlazeFace rescue alignment; every FHS lane runs the

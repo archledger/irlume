@@ -15,9 +15,9 @@ The audience is opt-in nightly testers. Stable releases keep their existing
 identity, installation paths and release gates. Existing nightly lanes stay
 unchanged until their replacements are separately verified and approved.
 
-This extends the direction in [ADR-0037](../../adr/0037-nightly-channel.md).
+This extends the direction in [ADR-0037](../../architecture/adr/0037-nightly-channel.md).
 It does not yet replace that ADR's per-lane implementation or its stated
-qualification limits. [RELEASING.md](../../RELEASING.md) continues to govern
+qualification limits. [RELEASING.md](../../architecture/RELEASING.md) continues to govern
 release publication and complete-package qualification.
 
 ## Scope and assumptions

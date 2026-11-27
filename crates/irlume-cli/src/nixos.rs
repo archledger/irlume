@@ -12,7 +12,7 @@
 //! The module's rules were written for a sealed login password: one auth rule
 //! per service, and no session-phase `reseal` rule, which a KDE wallet key or
 //! a GNOME keyring token needs. Until the module adds those rules, the keyring
-//! arm paths refuse the other two kinds (docs/NIXOS.md).
+//! arm paths refuse the other two kinds (docs/user/NIXOS.md).
 
 use irlume_common::{KeyringSecretKind, Request, Response, WalletSalt};
 use std::path::{Path, PathBuf};
@@ -20,17 +20,17 @@ use std::path::{Path, PathBuf};
 /// Why `irlume login enable` and `disable` change nothing on NixOS.
 pub(crate) const LOGIN_REFUSAL: &str = "[login] refusing: on NixOS the system configuration owns \
      the PAM stacks, so irlume does not edit them. Add or remove services under \
-     `services.irlume.pam.services` and rebuild (docs/NIXOS.md). Nothing was changed.";
+     `services.irlume.pam.services` and rebuild (docs/user/NIXOS.md). Nothing was changed.";
 
 /// Why `irlume login reconcile` has nothing to do on NixOS.
 pub(crate) const RECONCILE_NOTICE: &str = "[login] reconcile: nothing to do on NixOS: the system \
      configuration owns the PAM stacks, and `services.irlume.pam.services` sets irlume's rules \
-     (docs/NIXOS.md).";
+     (docs/user/NIXOS.md).";
 
 /// What the hints that elsewhere name `sudo irlume login enable --apply` say
 /// on NixOS.
 pub(crate) const PAM_POINTER: &str = "on NixOS the system configuration owns the PAM stacks: set \
-     irlume's services under `services.irlume.pam.services` and rebuild (docs/NIXOS.md)";
+     irlume's services under `services.irlume.pam.services` and rebuild (docs/user/NIXOS.md)";
 
 /// Whether os-release text describes NixOS: its `ID` is `nixos`. An `ID`
 /// that is empty or quoted on one side only names no distribution.
@@ -181,7 +181,7 @@ fn nixos_seal_kind(
     };
     Err(format!(
         "refusing: this account {has} {what}, and on NixOS irlume seals only the login \
-         password, {WRITTEN_FOR}. Nothing was sealed{remedy} (docs/NIXOS.md, \
+         password, {WRITTEN_FOR}. Nothing was sealed{remedy} (docs/user/NIXOS.md, \
          \"Keyring unlock\")."
     ))
 }
@@ -291,7 +291,7 @@ mod tests {
             match (want, &got) {
                 (Ok(want), Ok(got)) => assert_eq!(*got, want),
                 (Err(fragment), Err(refusal)) => {
-                    for needle in [fragment, "docs/NIXOS.md", "Nothing was sealed"] {
+                    for needle in [fragment, "docs/user/NIXOS.md", "Nothing was sealed"] {
                         assert!(refusal.contains(needle), "{needle:?} not in {refusal}");
                     }
                     assert_eq!(

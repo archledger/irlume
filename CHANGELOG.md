@@ -13,11 +13,11 @@ All notable changes to irlume are documented here. This project adheres to
   (ADR-0008, diagnostic trace contract; #1399).
 
 - The reproducibility claim has a recorded scope,
-  [ADR-0040](docs/adr/0040-reproducibility-scope.md): every input of a
+  [ADR-0040](docs/architecture/adr/0040-reproducibility-scope.md): every input of a
   lane the repository controls is pinned and digest-verified, the PPA
   orig tarball is packed deterministically, and no lane is certified
   bit-for-bit reproducible. A [build reproducibility
-  guide](docs/REPRODUCIBILITY.md) documents what every lane pins
+  guide](docs/security/REPRODUCIBILITY.md) documents what every lane pins
   (compiler, crates, model weights, ONNX Runtime, container base
   images), how the PPA orig tarball is packed deterministically from
   the release tag's commit date, what is not claimed (no released
@@ -521,7 +521,7 @@ All notable changes to irlume are documented here. This project adheres to
   the CLI stops there and asks for an irlumed restart; it never sends
   `ForgetPassword` in its place (ADR-0003, amendment 2026-11-10).
 
-- A developer-only [IR verification-request evaluator](docs/IR_REQUEST_EVALUATION.md)
+- A developer-only [IR verification-request evaluator](docs/security/IR_REQUEST_EVALUATION.md)
   reuses the production engine's retries, PAD, identity and final binding checks.
   It reports non-granting measurements, refuses protected state requiring repair,
   and keeps the experimental policy and thresholds unchanged.
@@ -1029,7 +1029,7 @@ All notable changes to irlume are documented here. This project adheres to
   stays on the password. On Fedora 43 and 44, `irlume keyring arm`, `irlume
   keyring status` and the `keyring-os-upgrade` doctor check say to retain
   the token and postpone the Fedora 45 keyring migration (ADR-0003,
-  amendment 2026-11-10; [docs/SETUP.md](docs/SETUP.md) "Keyring unlock").
+  amendment 2026-11-10; [docs/SETUP.md](docs/user/SETUP.md) "Keyring unlock").
 
 - `irlume recovery restore` requires the recovered key to open the stored
   enrollment and the added-camera store before it reseals. A store that
@@ -3992,12 +3992,12 @@ All notable changes to irlume are documented here. This project adheres to
 
 - Durable 50-request face failure limit and independently password-verified retry
   recovery. Cancellation and interruption retain their charge; password login
-  stays available. See [upgrade and recovery requirements](docs/RELEASING.md).
+  stays available. See [upgrade and recovery requirements](docs/architecture/RELEASING.md).
 
 ### Removed
 
 - Head nod/shake consent gestures. Retired settings no longer select a gesture;
-  follow [the migration notes](docs/HEAD-GESTURE-REMOVAL.md) for stale configuration.
+  follow [the migration notes](docs/architecture/HEAD-GESTURE-REMOVAL.md) for stale configuration.
 
 ### Changed
 

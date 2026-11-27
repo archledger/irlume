@@ -11,7 +11,7 @@ had actual licenses on their weights (the bar Silent-Face fails, see
   and a NexiGo HelloCam N930W USB Windows-Hello camera (RGB + IR).
 - **Subject/operator:** the enrolled user, single subject, home + car field
   conditions. Attacks target that identity per the
-  [PAD self-test protocol](../PAD_SELFTEST.md).
+  [PAD self-test protocol](../security/PAD_SELFTEST.md).
 - **Numbers are frame-level** (each scored frame counted separately), not
   presentation-level like the June self-test; conservative for comparing
   attack coverage, and stated per condition.
@@ -95,7 +95,7 @@ sets), the domain does not transfer to this hardware.
 ## Limitations
 
 1. Frame-level rates, single subject, single operator, uncertified; the
-   [PAD self-test caveats](../PAD_SELFTEST.md#7-limitations-read-before-quoting-any-number)
+   [PAD self-test caveats](../security/PAD_SELFTEST.md#7-limitations-read-before-quoting-any-number)
    apply unchanged.
 2. Attack instruments: one vinyl banner, one phone (static photo). No 3D masks,
    no print-cutout variants this session.
@@ -111,7 +111,7 @@ Eval scripts and score summaries are committed in
 contain the operator's face and are not committed. Model artifacts download
 from their publishers (URLs in the scripts); verify the sha256 values above.
 The live capture harness is `landmark_dump`
-([DEVELOPMENT.md walkthrough](../DEVELOPMENT.md)) plus ffmpeg for RGB.
+([DEVELOPMENT.md walkthrough](../architecture/DEVELOPMENT.md)) plus ffmpeg for RGB.
 
 ## Addendum, 2026-07-27: threshold moved to 0.9 after a genuine-side denial
 

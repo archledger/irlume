@@ -7,7 +7,7 @@ your contributions remain under the same copyleft terms everyone else enjoys.
 Ways to help, in rough order of usefulness right now:
 
 - **Hardware reports** from laptops and webcams with IR sensors, working or
-  not. These feed [`docs/HARDWARE.md`](../docs/HARDWARE.md), which is generated
+  not. These feed [`docs/reference/HARDWARE.md`](../docs/reference/HARDWARE.md), which is generated
   from measured evidence, and they shape which capture paths get fixed next.
   Use the *Hardware report* issue template.
 - **Bug reports** with the file `irlume support-report` writes, camera model,
@@ -90,9 +90,9 @@ Your PR description says briefly whether and how an AI tool helped.
   ISO/IEC 30107-3 attack class: run `IRLUME_DEV=1 irlume padcapture` /
   `padreport` and
   include the per-species APCER/BPCER numbers. See
-  [`docs/PAD_SELFTEST.md`](../docs/PAD_SELFTEST.md) for the methodology and protocol.
+  [`docs/security/PAD_SELFTEST.md`](../docs/security/PAD_SELFTEST.md) for the methodology and protocol.
   Optional IR-only full-path evaluation additionally follows
-  [`docs/IR_ONLY_QUALIFICATION.md`](../docs/IR_ONLY_QUALIFICATION.md); the component
+  [`docs/security/IR_ONLY_QUALIFICATION.md`](../docs/security/IR_ONLY_QUALIFICATION.md); the component
   self-test does not qualify the proposed login mode.
 - **A pull request from a fork is not CodeQL-scanned before merge.** GitHub's
   default setup for code scanning does not analyse fork pull requests, so an
@@ -129,7 +129,7 @@ that gate yourself and are not expected to. What helps review move fast:
 - Design-level changes to security posture (grant arms, consent flow, rate
   limiting, fallbacks) usually need an ADR; sketching one in the PR description
   early saves a round trip. Existing examples live in
-  [`docs/adr/`](../docs/adr/).
+  [`docs/architecture/adr/`](../docs/architecture/adr/).
 
 ## Writing style
 
@@ -150,7 +150,7 @@ the same rules as your own (see the ground rules above).
 
 ## Setting up a dev environment
 
-See [`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md) for the full walkthrough. The
+See [`docs/architecture/DEVELOPMENT.md`](../docs/architecture/DEVELOPMENT.md) for the full walkthrough. The
 quickest path is Nix: `nix develop` gives you the whole pinned toolchain
 (Rust, libclang, TPM/PAM libs, the ONNX runtime) on any distro with one
 command; the guide also lists the per-distro `dnf`/`apt`/`pacman` dependencies

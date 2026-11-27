@@ -62,7 +62,7 @@ TimeoutStopSec=10s
 # Sandboxing. On AppArmor systems the profile in packaging/apparmor, loaded in
 # enforce mode, confines the daemon as well; Fedora's SELinux module does not
 # confine it (irlumed runs as unconfined_service_t), so there this sandbox is
-# the confinement (docs/THREAT_MODEL.md "Confinement").
+# the confinement (docs/security/THREAT_MODEL.md "Confinement").
 # Scoped to what the daemon actually needs: it opens /dev/video* and the TPM
 # (why PrivateDevices is deliberately NOT set), binds a Unix socket, and reads
 # users' home directories to tell which keyring an account keeps there before a

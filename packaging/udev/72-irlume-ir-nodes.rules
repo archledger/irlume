@@ -1,6 +1,6 @@
 # Descriptor-attested YUYV IR cameras that supply no per-frame illumination
 # records (irlume's `NO_RECORDS_YUYV_IR` table in
-# crates/irlume-camera/src/uvc_descriptor.rs; the class docs/DEBUGGING.md
+# crates/irlume-camera/src/uvc_descriptor.rs; the class docs/user/DEBUGGING.md
 # describes). On such a camera the active-IR evidence is the burst's own
 # proven alternation (ADR-0031 section 4), and irlumed reads the emitter
 # control right before and right after each burst. UVCIOC_CTRL_QUERY carries

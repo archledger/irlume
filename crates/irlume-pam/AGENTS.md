@@ -39,7 +39,7 @@ login or locks a person out. It is critical-tier
   answered `SUCCESS` is how #365 happened.
 - The module holds no camera, models, templates or images and decides no
   grant: it maps each daemon reply to a PAM code
-  ([docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) "Privilege separation").
+  ([docs/architecture/ARCHITECTURE.md](../../docs/architecture/ARCHITECTURE.md) "Privilege separation").
   Before privileged intent, camera-free `Health` and, for convenience tier,
   `FaceSensorStatus { user: None }` share a 1.5-second deadline. Known RGB-only
   (a `convenience` tier without reported `split_trust`) without explicit

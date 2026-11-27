@@ -5,7 +5,7 @@
 //!
 //! Keep this module deliberately narrower than the daemon's private wire
 //! protocol. A capability is advertised only after its public command, output
-//! shape, and compatibility rules are covered here and in `docs/MACHINE-API.md`.
+//! shape, and compatibility rules are covered here and in `docs/reference/MACHINE-API.md`.
 
 use irlume_common::{OperationErrorCode, ProfileSummary, Request, Response};
 use serde::Serialize;

@@ -1,0 +1,339 @@
+# Architecture
+
+- [Privilege separation](#privilege-separation): who is trusted, and the one
+  socket everything crosses
+- [Authentication flow](#authentication-flow): what happens on a login attempt
+- [Model stack](#model-stack): the seven bundled models, and what is
+  deliberately not a model
+- [IR capture: strobe and ambient subtraction](#ir-capture-strobe-and-ambient-subtraction)
+- [Face login → keyring unlock](#face-login--keyring-unlock): the
+  TPM-sealed-password path
+- [Defense-to-threat mapping](#defense-to-threat-mapping)
+
+## Privilege separation
+
+The two untrusted clients, `pam_irlume.so` and the `irlume` CLI, reach the
+privileged daemon through a single `SO_PEERCRED`-checked Unix socket. Everything
+sensitive (the camera, IR emitter, ONNX models, enrolled templates, and the TPM)
+lives only inside `irlumed`. Its biometric worker serializes engine and camera
+work; connection threads also serve lightweight status requests. The camera is
+one shared resource; RGB and IR capture within a request can run concurrently:
+
+```mermaid
+flowchart LR
+    callers("login · sudo<br/>display-manager · lock screen")
+    subgraph untrusted["Untrusted clients: no secrets, no hardware"]
+        direction TB
+        pam("pam_irlume.so")
+        cli("irlume CLI / TUI")
+    end
+    socket{{"/run/irlume.sock<br/>SO_PEERCRED · root-or-self"}}
+    subgraph trust["irlumed: privileged · one serialized camera worker"]
+        daemon("owns: camera · IR emitter · ONNX models · templates · TPM<br/><i>raw frames never leave here</i>")
+    end
+    callers -->|invokes| pam
+    pam --> socket
+    cli --> socket
+    socket ==>|request / response| daemon
+    classDef base fill:#ffffff,stroke:#d2d2d7,stroke-width:1px,color:#1d1d1f;
+    classDef gate fill:#ffffff,stroke:#34c759,stroke-width:1.5px,color:#1d1d1f;
+    class callers,pam,cli,daemon base;
+    class socket gate;
+    style untrusted fill:#f7f7f9,stroke:#e5e5ea,color:#6e6e73;
+    style trust fill:#eafaf1,stroke:#34c759,color:#1d1d1f;
+    linkStyle default stroke:#b0b0b8,stroke-width:1.5px;
+    linkStyle 3 stroke:#34c759,stroke-width:3px;
+```
+
+- **Untrusted clients** (`pam_irlume.so`, `irlume` CLI) hold no secrets and touch
+  no hardware in production paths; they only send `Request`s and read
+  `Response`s. (The `IRLUME_DEV=1` benchmark/capture tools open the camera
+  directly by design; they are diagnostics, not auth paths.)
+- **`irlumed`** is the sole owner of the camera/IR/models/templates/TPM. This is
+  the Linux analogue of Windows Hello ESS's isolated camera→matcher pathway: the
+  login/display-manager process tree never sees raw image data. It is an
+  analogue, not an equivalent: Windows adds a Device MFT, secure device
+  enumeration and a VBS-protected pathway that Linux does not expose, and
+  [#169](https://github.com/archledger/irlume/issues/169) tracks each
+  difference. Connections are
+  handled concurrently, but exactly ONE worker owns and advances the biometric
+  engine and camera state; non-auth camera work is refused while an
+  authentication is pending and, for an account other than root, while its
+  live status shows another account's or unresolved work, in the same
+  words. Long operations yield only at complete capture boundaries. The
+  security invariant is the serialized owner, not the thread count.
+- **Trust boundary:** `irlumed` reads `SO_PEERCRED` on every connection. Only
+  root or the target user may enroll/delete that user's profiles, and the sealed
+  login password is released only to a root peer. (We use a raw Unix socket +
+  explicit peer check rather than D-Bus policy; that is the concrete hardening
+  over the `visage` reference design.)
+- **Camera use follows the seat:** a request that turns a camera on
+  (authentication, identification, enrollment, the framing guide, camera
+  diagnostics) from a non-root peer is served only while the peer's uid holds
+  the active local session on a seat, as logind reports it, which is the rule
+  udev's `uaccess` applies to the camera devices. Root peers (greeters, `sudo`,
+  the polkit helper) are not asked, and seat state `irlumed` cannot read
+  refuses. The posture table declares which requests turn a camera on, and the
+  shared pre-gate enforces it before any camera work
+  ([THREAT_MODEL.md](../security/THREAT_MODEL.md#camera-use-by-local-accounts)).
+
+### Account lookup boundary
+
+`irlumed` installs a process-isolated NSS resolver before starting its threads.
+Native `getpwnam_r` and `getpwuid_r` for worker checks run in a fresh execution of
+the running daemon image, in a private lookup mode that exits before opening
+sockets, models, cameras or the TPM. Each fresh lookup has a one-second deadline covering
+helper observation and a 64 KiB combined-output limit. The query uses a private
+stdin pipe with a 4096-byte bound, never command-line arguments. Timeout, malformed reply
+or provider error means unknown; only a successful native no-entry result means
+no account. Name queries and UID queries are distinct, including numeric names.
+
+The existing request UID holds still avoid lookups for core record checks.
+Canonical-name checks for retry records and fresh shared-greeter ownership
+checks retain their identity rules and use the bounded resolver. No account
+record or attempt-history path is removed. A failed required lookup refuses
+the operation. The existing history writer retains its native reverse-name
+lookup off the authentication worker: it can wait for NSS to recover without
+losing an otherwise valid queued attempt to the worker's helper deadline. Its
+single thread and 64-entry queue retain their existing bounds and canonical-name
+checks; account changes and actual lookup failures still prevent a wrong-owner
+write. Test builds keep the existing inline-writer fixture.
+
+The shared helper collector admits at most 32 children per process, counting a
+killed child until it is reaped. One polling reaper uses nonblocking waits;
+exhausted capacity refuses a new helper instead of starting another waiting
+thread. NSS helpers inherit the daemon's confinement; AppArmor permits only
+same-profile execution of its executable and the self-profile signals needed
+for termination/reaping. This does not change socket messages or grant rules.
+Reaper initialization caches only a successfully started thread, so transient
+resource pressure does not permanently disable helper creation.
+
+## Live interface observations
+
+`LiveStatus` is an additive, unprivileged read on the peer-checked socket. It
+copies bounded metadata before engine readiness and without entering the
+biometric worker: daemon instance and stage, current worker operation, waiting
+counts, independently tracked background qualification, and the passive camera
+inventory. Polling does not create diagnostic
+history events, initialize monitors, open camera nodes or read the TPM.
+
+Worker registration follows admission, claim, cancellation request and actual
+completion. A cancellation request does not clear running work. Closed operation
+categories omit account names, request arguments and biometric outcomes. A
+reader other than root sees every operation of another account as `unknown`
+work, whatever its kind, still running or waiting, with a stop request only
+when its connection abandons it, including client departure or an expired
+reply wait, never a yield to queued authentication. The share-safe event ring
+gives it only the events of its own operations and of daemon-wide work
+(ADR-0030 §5, amended 2026-09-27). The ring keeps each account's events,
+daemon-wide events and unresolved ones apart, the latest 256 of each for
+30 minutes and for at most 32 accounts at once, so other accounts' activity
+does not push a reader's events out. Root's request for an account resolves
+the name once, through
+NSS, when the request arrives: the worker acts for that uid, the one its
+events, live entry and attempt record entry are shown to. While it holds that
+uid, a request for the same name that would act for another uid is refused. A
+state revision advances after potentially mutating work; it tells clients to
+invalidate their observations, not that a write succeeded. A reader other
+than root reads a revision that advances for its own account's changes and
+for camera setup and qualification and other daemon-wide work, not for
+another account's. This is a logical
+mutation hint, not a disk-write audit: best-effort storage upgrades during a
+profile read do not recursively invalidate that read. Background qualification
+has its own scoped lifetime and does not infer cancellation from the foreground
+worker's stop signal.
+
+Camera connection metadata comes from the daemon's independently initialized
+udev/sysfs monitor. Its copied publication distinguishes current, refreshing,
+uninitialized and unavailable, including a valid empty UVC inventory. Instance
+and generation identify continuity within a supervisor lifetime. RGB/IR role
+classification remains a separate node-opening operation; passive connection
+metadata cannot establish roles, privacy state or physical streaming state.
+The TUI's camera switch carries the selected supervisor and candidate identity
+through sudo. `SetCamerasIfCurrent` checks that observation again before changing
+the pin. The distinct request prevents an older daemon from silently ignoring
+the continuity guard; the original headless `SetCameras` request remains available.
+
+The TUI tracks source freshness and invalidation generations separately. Old
+in-flight responses cannot satisfy a newer explicit refresh. A missing or
+unsupported live response becomes unavailable, not idle. Session history is a
+separate record of TUI observations; neither source claims to audit every process
+or prove physical camera/emitter shutdown.
+
+## Authentication flow
+
+1. Client sends `Authenticate { user, service }` (root or the account owner
+   only; the service name drives tier/operation-class gating).
+2. `irlumed`: capture RGB (+detect) → capture IR burst → align to ArcFace 112×112
+   → AuraFace embed → **liveness gate** (hard) → **matcher** at fixed threshold.
+3. On `live && score ≥ threshold`: return `AuthResult { granted: true, .. }`.
+   Credential release is a **separate, root-peer-only request**
+   (`UnsealPassword`), used by the login stack to open the keyring; a plain
+   `Authenticate` never touches the TPM seal.
+4. On any failure/timeout: `granted: false` (or an error) → PAM falls through
+   to password (mandatory non-biometric fallback, per NIST SP 800-63B-4).
+
+## Model stack
+
+Seven model files ship with every package (five recognizers/landmarkers plus
+the two PAD models below). `irlumed` loads the selected models at startup
+and checks their digests against a built-in manifest. Unknown digests warn
+by default. `IRLUME_MODELS_STRICT=1` makes core verification failures
+startup-fatal; a rejected PAD cue instead stays unavailable without stopping
+the daemon, and affected face grants fall back to the password
+([ADR-0019](adr/0019-fail-closed-pad-availability.md)).
+Disabled PAD cues skip checksum checking and loading. Six of the seven are
+ONNX (all five recognizers/landmarkers except the mesh, plus both PAD
+models); the
+landmark mesh is Google's published `.tflite`, run on the TFLite C runtime the
+FHS packages bundle at `/usr/share/irlume/tflite` (NixOS has no packaged
+runtime yet and keeps the pinned ONNX conversion as its production mesh,
+[NIXOS.md](../user/NIXOS.md)). All inference is local; nothing is downloaded at
+runtime.
+
+| Model | Pipeline stage | What it does | License |
+|---|---|---|---|
+| YuNet (`face_detection_yunet_2023mar.onnx`) | detection | finds the face in both the RGB and IR frames: bbox + 5 landmarks | MIT |
+| BlazeFace short-range (`blaze_face_short_range.onnx`) | detection rescue | cascade stage 2, runs only when YuNet finds nothing (saturated or backlit frames); its coarse box is refined by FaceMesh before use | Apache-2.0 |
+| MediaPipe FaceLandmarker mesh (`face_landmarks_detector.tflite`, Google's published artifact run on the bundled TFLite runtime; `face_landmark.onnx` ships as the ONNX conversion fallback) | rescue alignment | 478 dense landmarks; turns BlazeFace rescue boxes into alignment points. Never used for recognition or head consent | Apache-2.0 |
+| AuraFace (`glintr100.onnx`) | recognition | 512-D ArcFace-style embedding of the aligned 112×112 face; matching is cosine similarity against the enrolled templates | Apache-2.0 |
+
+```mermaid
+flowchart LR
+    cap(["RGB + IR<br/>frames"])
+    subgraph models["learned models: perception only"]
+        direction LR
+        yunet["YuNet<br/>detection"]
+        blaze["BlazeFace<br/>rescue"]
+        mesh["FaceMesh<br/>478 landmarks"]
+        aura["AuraFace<br/>512-D embedding"]
+    end
+    live{{"liveness gate<br/>IR physics<br/>algorithmic"}}
+    match{{"matcher<br/>cosine vs enrolled templates<br/>algorithmic"}}
+    out(["grant / deny"])
+    cap --> yunet
+    yunet -->|"bbox + 5 points → align 112×112"| aura
+    yunet -.->|"no face"| blaze
+    blaze -.->|"coarse box"| mesh
+    mesh -.->|"refined 5 points"| aura
+    cap --> live
+    live ==>|"hard gate"| match
+    aura --> match
+    match --> out
+    classDef base fill:#ffffff,stroke:#d2d2d7,stroke-width:1px,color:#1d1d1f;
+    classDef gate fill:#ffffff,stroke:#34c759,stroke-width:1.5px,color:#1d1d1f;
+    class cap,yunet,blaze,mesh,aura,out base;
+    class live,match gate;
+    style models fill:#f7f7f9,stroke:#e5e5ea,color:#6e6e73;
+    linkStyle default stroke:#b0b0b8,stroke-width:1.5px;
+    linkStyle 7 stroke:#34c759,stroke-width:3px;
+```
+
+Two things are deliberately *not* learned models. The liveness gate is IR
+physics (cross-spectrum co-location, center/edge brightness falloff, corneal glint, moiré),
+and the matcher is a fixed cosine threshold; both are plain, auditable
+algorithms. Per-user IR calibration is fitted on-device from the user's own
+enrollment scans ([ADR-0004](adr/0004-per-enrollment-ir-adapter.md); it
+replaced a retired, dataset-trained IR adapter). Two learned anti-spoof
+models ship default-on as deny-only cues
+([ADR-0013](adr/0013-ship-pad-models-default-on.md)); the acceptance bar a
+grant-capable model would have to clear is in
+[ADR-0001](adr/0001-liveness-pad-strategy.md).
+
+Per-model provenance, license verification notes, and the models this project
+refuses to bundle are documented in [`models/README.md`](../../models/README.md);
+demographic-fairness measurements are in [FAIRNESS.md](../security/FAIRNESS.md).
+
+Privileged intent is established through a conventional PAM conversation before
+camera work: hidden literal `yes` authorizes one face attempt, and the root PAM
+client carries an additive typed assertion that the daemon validates against
+the shared service class and `SO_PEERCRED`. The assertion is not cryptographic
+proof against root or a compromised conversation provider.
+
+Head gestures have been removed. Face matching, passive PAD, camera binding,
+retry limits, and operation-class policy remain the authentication boundaries.
+See [the migration notes](HEAD-GESTURE-REMOVAL.md).
+
+## IR capture: strobe and ambient subtraction
+
+The 850 nm emitter strobes rather than holding steady, so `irlumed` captures an
+IR burst and keeps a lit strobe phase: the brightest frame that clips at most 5%
+of its pixels, because a blown frame flattens the liveness cues and blinds the
+PAD model (#221). The frames around
+it are emitter-off exposures holding only ambient IR, and they are not simply
+discarded: with `IRLUME_IR_AMBIENT_SUBTRACT=1` the daemon subtracts the
+off-frame adjacent to the lit one, isolating the emitter's own reflected light.
+This is the same illuminated/ambient pairing Windows Hello uses.
+
+Subtraction is experimental and off by default. Its job is surviving exposure extremes
+under strong ambient IR (sunlight), not spoof detection; the center/edge and glint
+cues in the liveness gate carry that. Field captures set the gates it runs
+behind (`crates/irlume-camera/src/lib.rs`):
+
+- The strobe gap (lit mean minus off mean) must exceed the sensor noise floor
+  (`STROBE_MIN_GAP = 8`). Under saturating ambient the gap collapses to single
+  digits and there is nothing real to subtract.
+- The off-frame mean must reach `LOW_AMBIENT_SKIP = 5`; indoors the off-frame
+  is near zero and subtraction would only inject sensor noise.
+- The subtracted frame must keep a mean of `SUBTRACT_MIN_RESULT = 12`, or the
+  raw lit frame is kept, so subtracting a bright pedestal can never hand a
+  blank image downstream.
+
+If the gate has refused an IR reading as too dark or flat, an ambient mean at
+or above `IR_AMBIENT_FLOOD` can explain the refusal. The advisory requires the
+camera to have marked both the selected lit frame and an adjacent dark frame
+in the same burst. A bright reading without that pair gets neutral password
+guidance, not a claim about the light. The advisory does not change the verdict.
+
+## Face login → keyring unlock
+
+irlume's headline feature is Windows-Hello-style keyring unlock: log in with your
+face and your GNOME-keyring / KWallet is already open. When you submit an empty
+password field, `pam_irlume.so` (in `unseal` mode) asks the daemon to
+`UnsealPassword`. The daemon runs the same pipeline and, **only on a live
+match**, TPM-unseals the sealed secret and hands it back. A login password is
+set as `PAM_AUTHTOK`, so the downstream keyring module can open the wallet.
+A KDE wallet key instead goes to `irlume-kwallet-init`, never to `PAM_AUTHTOK`.
+With `defer_wallet`, a missing runtime directory defers that key in zeroizing
+PAM memory until the matching `reseal` session hook runs after `pam_systemd`.
+The key is bound to this user and service, consumed once, and never re-requested.
+Without that argument, the helper's not-ready result keeps the password
+fallback. A GNOME token also uses a session-phase stash, as described in
+[ADR-0003](adr/0003-fingerprint-keyring-unlock.md). Anything
+short of a live match returns `PAM_IGNORE` and the stack falls through to the
+password. (The fingerprint companion reaches the same keyring unlock through a
+distinct `UnsealKeyring` request, gated on a root peer in a login context; see
+`THREAT_MODEL.md`.)
+
+The login-password path is:
+
+```mermaid
+flowchart LR
+    start(["empty password + Enter<br/>at the greeter / lock screen"])
+    pam("pam_irlume.so · unseal")
+    subgraph daemon["irlumed: privileged"]
+        direction TB
+        face["capture → liveness → match"]
+        tpm["TPM: unseal login password"]
+        face -->|live match| tpm
+    end
+    kr("pam_gnome_keyring / pam_kwallet")
+    wallet(["wallet / keyring open"])
+    pw(["password prompt<br/>always the fallback"])
+    start --> pam
+    pam ==>|"UnsealPassword · /run/irlume.sock"| face
+    tpm ==>|"password → PAM_AUTHTOK"| kr
+    kr ==> wallet
+    pam -. "no live match → PAM_IGNORE" .-> pw
+    classDef base fill:#ffffff,stroke:#d2d2d7,stroke-width:1px,color:#1d1d1f;
+    classDef ok fill:#eafaf1,stroke:#34c759,stroke-width:1.5px,color:#1d1d1f;
+    class start,pam,kr,pw,face,tpm base;
+    class wallet ok;
+    style daemon fill:#eafaf1,stroke:#34c759,color:#1d1d1f;
+    linkStyle default stroke:#b0b0b8,stroke-width:1.5px;
+```
+
+## Defense-to-threat mapping
+
+See [THREAT_MODEL.md](../security/THREAT_MODEL.md) for the Windows Hello bypass classes
+(CVE-2021-34466 IR injection; ESS device-trust) each defense maps to.

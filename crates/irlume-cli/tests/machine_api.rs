@@ -355,9 +355,9 @@ fn every_doctor_check_id_is_documented_and_every_documented_id_exists() {
     // holds it to the engine in both directions.
     let doc = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/MACHINE-API.md"
+        "/../../docs/reference/MACHINE-API.md"
     ))
-    .expect("read docs/MACHINE-API.md");
+    .expect("read docs/reference/MACHINE-API.md");
     // The registry is one table among several with the same row shape, so take
     // the rows under its header and stop at the blank line that ends it.
     let documented: std::collections::BTreeSet<&str> = doc

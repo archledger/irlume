@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright the irlume contributors.
 
-"""Generate docs/HARDWARE.md from measured evidence, never by hand.
+"""Generate docs/reference/HARDWARE.md from measured evidence, never by hand.
 
 The competitor survey (docs/research/2026-08-24-face-unlock-competitor-
 pain-survey.md) recorded that both Howdy's and visage's hardware-compat
@@ -21,7 +21,7 @@ Community reports extend the JSON by PR with their evidence attached;
 the generator merges nothing from thin air.
 
 Usage: python3 scripts/generate-hardware-matrix.py
-Writes docs/HARDWARE.md. CI-parity check: run with --check to exit 1
+Writes docs/reference/HARDWARE.md. CI-parity check: run with --check to exit 1
 when the committed file differs from what the inputs would render (same
 pattern as cargo fmt --check).
 """
@@ -35,7 +35,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 EVIDENCE = REPO / "docs/hardware/fleet-evidence.json"
-OUT = REPO / "docs/HARDWARE.md"
+OUT = REPO / "docs/reference/HARDWARE.md"
 EMITTER_SRC = REPO / "crates/irlume-camera/src/ir_emitter.rs"
 
 HEADER = """\

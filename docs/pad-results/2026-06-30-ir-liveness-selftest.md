@@ -1,7 +1,7 @@
 # IR liveness PAD self-test, 2026-06-30
 
 First run of the ISO/IEC 30107-3 self-test (`irlume padcapture` / `padreport`, see
-[`../PAD_SELFTEST.md`](../PAD_SELFTEST.md)) against the credential-releasing IR gate.
+[`../PAD_SELFTEST.md`](../security/PAD_SELFTEST.md)) against the credential-releasing IR gate.
 
 - **Hardware:** Zenbook S14 (UX5406S) Windows-Hello RGB + 2D-IR module, 850 nm emitter.
 - **Gate commit:** `5cd24e0` · path: `full` (RGB+IR) · fixed thresholds
@@ -51,7 +51,7 @@ it is not a reliable fix: it false-rejects glasses / dry-eyes / off-angle users
 ## Interpretation
 
 This **empirically confirms** the residual risk documented in
-[`../adr/0001-liveness-pad-strategy.md`](../adr/0001-liveness-pad-strategy.md)
+[`../adr/0001-liveness-pad-strategy.md`](../architecture/adr/0001-liveness-pad-strategy.md)
 ("3D physical replicas / IR-approximating spoofs"), with a concrete, cheaply-sourced
 instrument: a large **glossy vinyl print**, not an exotic 3D mask. It also
 **falsifies** that ADR's premise that "the IR depth gradient subsumes 2D attacks":

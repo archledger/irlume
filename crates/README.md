@@ -70,7 +70,7 @@ Rust symbols or unlisted commands.
 | `irlume-core` | Enrollment storage and matching, TPM sealing and recovery | On-disk formats and TPM policy; not a public Rust API |
 | `irlume-auth` | Composes the pipeline and decides face authentication | Sole face grant decision; no socket or PAM handling |
 | `irlume-daemon` | `irlumed`, peer authorization, socket, serialized engine work and watchdog | Privileged service and socket contract |
-| `irlume-cli` | `irlume` commands, TUI, PAM wiring and machine API | Documented CLI and versioned machine API; [reference](../docs/MACHINE-API.md) |
+| `irlume-cli` | `irlume` commands, TUI, PAM wiring and machine API | Documented CLI and versioned machine API; [reference](../docs/reference/MACHINE-API.md) |
 | `irlume-fingerprint` | fprintd adapter for fingerprint companion flows | Internal wrapper; the provider verifies fingerprints |
 | `irlume-pam` | `pam_irlume.so`, thin daemon client in PAM | PAM ABI and password fallback |
 | `irlume-pam-view` | `pam_irlume_view.so`, session-only LightDM view detach | PAM session ABI; no grant decisions or internal crate dependencies |

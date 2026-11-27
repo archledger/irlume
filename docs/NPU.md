@@ -1,7 +1,7 @@
 # NPU inference was removed
 
 Irlume no longer supports NPU inference. See
-[ADR-0039](adr/0039-remove-npu-inference.md) for the decision and migration notes.
+[ADR-0039](architecture/adr/0039-remove-npu-inference.md) for the decision and migration notes.
 
 ## Explicit cache controls
 

@@ -3,7 +3,7 @@
 
 //! Guidance on what protects the secrets irlume seals in the TPM at rest:
 //! an armed keyring secret, and the template key that protects the face
-//! templates (docs/SECURITY_AT_REST.md, layer 3).
+//! templates (docs/security/SECURITY_AT_REST.md, layer 3).
 //!
 //! A TPM seal binds the boot chain it measures, not the root filesystem.
 //! Where irlume's state directory is not on encrypted storage, someone with
@@ -55,7 +55,7 @@ use irlume_core::envelope::PolicyKind;
 use std::path::{Path, PathBuf};
 
 /// Where the guidance sends the reader for the detail.
-const DOC: &str = "docs/SECURITY_AT_REST.md";
+const DOC: &str = "docs/security/SECURITY_AT_REST.md";
 
 /// PCR 4, the boot loader code: the firmware measures the boot loader and
 /// the binaries it loads there, so another operating system changes it.

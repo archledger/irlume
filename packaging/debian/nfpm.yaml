@@ -163,9 +163,9 @@ contents:
   # The machine-API contract, beside the engine that implements it.
   - src: ../../schemas/machine-api-v1.schema.json
     dst: /usr/share/irlume/schemas/machine-api-v1.schema.json
-  - src: ../../docs/MACHINE-API.md
+  - src: ../../docs/reference/MACHINE-API.md
     dst: /usr/share/doc/irlume/MACHINE-API.md
-  - src: ../../docs/INTEGRATION.md
+  - src: ../../docs/reference/INTEGRATION.md
     dst: /usr/share/doc/irlume/INTEGRATION.md
 
 scripts:

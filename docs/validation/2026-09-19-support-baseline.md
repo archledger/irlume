@@ -10,7 +10,7 @@ the subsequent attended Face Authentication parser-candidate checks.
 
 September 17 tests used evolving pre-v0.13 candidates. They must not be
 reported as a fresh v0.14.0 camera campaign or a single immutable-build benchmark.
-The older generated [hardware matrix](../HARDWARE.md) remains a dated record.
+The older generated [hardware matrix](../reference/HARDWARE.md) remains a dated record.
 
 | Configuration | Recorded result | Boundary |
 |---|---|---|
@@ -52,7 +52,7 @@ have tree `d02c02baec8ce040f175b57bef1bd9db1b953777`.
 Package/state preservation does not prove authorized-write migration of every
 legacy secondary store. These checks also do not establish all-distro rollback,
 new attended face grants, or Atomic/Nix bare-metal qualification. The
-[upgrade harness](../UPGRADE-VALIDATION.md) still describes an older version
+[upgrade harness](../architecture/UPGRADE-VALIDATION.md) still describes an older version
 pair; its existence is not a receipt for v0.14.0.
 
 ## Next qualification

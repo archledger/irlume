@@ -1,7 +1,7 @@
 # GPU platform identity probe (ADR-0033 section 3)
 
 > **Superseded (2026-10-30):** GPU inference was removed by
-> [ADR-0038](../adr/0038-remove-gpu-inference.md). The research, measurements and
+> [ADR-0038](../architecture/adr/0038-remove-gpu-inference.md). The research, measurements and
 > conclusions below remain historical evidence for that decision.
 
 - **What:** #1053 identity measurements behind the complete GPU

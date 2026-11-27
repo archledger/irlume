@@ -1,0 +1,391 @@
+# Developing irlume
+
+This guide gets you from a fresh clone to a working build. There are three
+paths:
+
+- **[Nix](#option-a-nix-recommended)**: one command, identical on every
+  distro, nothing installed globally. Recommended.
+- **[Manual, per distro](#option-b-manual-per-distro)**: install the build
+  dependencies yourself with `dnf` / `apt` / `pacman`.
+- **[Container](#option-c-container-podmandocker)**: a throwaway distro
+  container as a clean-room build/test environment, with optional camera
+  passthrough.
+
+For *what* you're building (the daemon/PAM/CLI split and the model pipeline),
+read [`ARCHITECTURE.md`](ARCHITECTURE.md). For the contribution rules (DCO,
+biometric-data and model-license policy, PAD self-tests), read
+[CONTRIBUTING.md](../../.github/CONTRIBUTING.md).
+
+## Get the source (with model weights)
+
+The ONNX models are hosted as release assets (on the version-independent
+`models-v1` release), not committed to the repo, so a plain clone stays small
+and a fetch pulls the real weights. You need them to *run* irlume or run tests
+that load a model (you can compile without them).
+
+```sh
+git clone https://github.com/archledger/irlume.git
+cd irlume
+bash scripts/fetch-models.sh   # download + sha256-verify models/*.onnx
+```
+
+## Option A: Nix (recommended)
+
+### 1. Install Nix (once)
+
+The [Determinate Systems installer](https://determinate.systems/) turns on
+flakes by default and is cleanly uninstallable:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+Open a new shell afterwards so `nix` is on your PATH.
+
+### 2. Enter the dev shell and build
+
+```sh
+nix develop            # drops you into a shell with the whole toolchain
+cargo build --release
+```
+
+The first `nix develop` writes a `flake.lock` pinning every input to an exact
+commit. **Commit that file** so everyone (and CI) gets identical tooling.
+
+### What the flake pins for you
+
+Everything irlume's messy build needs, so you don't hunt distro packages:
+
+| Pinned by the flake | Why |
+| --- | --- |
+| Rust (MSRV from `Cargo.toml`) | edition/toolchain floor via the `ort` binding |
+| `pkg-config` + `tpm2-tss` | the `tss-esapi` crate finds the TPM libs |
+| `clang` + `libclang` (`LIBCLANG_PATH`) | `v4l2-sys-mit`'s bindgen needs it |
+| kernel headers (`BINDGEN_EXTRA_CLANG_ARGS`) | bindgen parses `<linux/videodev2.h>` |
+| `linux-pam` | the `pamsm` crate links `libpam`; `pamsm` itself comes from the irlume-maintained fork [`archledger/pam_sm_rust`](https://github.com/archledger/pam_sm_rust), pinned by exact commit in `Cargo.toml`/`Cargo.lock` (ADR-0012). Offline builds vendor it like any other git dependency: `cargo vendor --locked vendor` then `--offline` builds resolve it from the vendor dir. |
+| onnxruntime **1.28.1** (`ORT_DYLIB_PATH`) | irlume needs the `api-24` ABI; nixpkgs' is older |
+
+To bump the toolchain or nixpkgs later: edit the version string in `flake.nix`
+or run `nix flake update`, then commit the changed `flake.lock`.
+
+### Optional: auto-activation with direnv
+
+If you use [direnv](https://direnv.net/) with
+[nix-direnv](https://github.com/nix-community/nix-direnv), drop an `.envrc`
+containing `use flake` in the repo root and the shell loads automatically when
+you `cd` in.
+
+## Option B: Manual, per distro
+
+Install the build dependencies, then use `cargo` as usual.
+
+**Fedora**
+
+```sh
+sudo dnf install cargo rust clang-devel pkgconf-pkg-config gcc \
+    pam-devel dbus-devel tpm2-tss-devel systemd-devel kernel-headers curl
+```
+
+**Ubuntu / Debian**: the archive's `rustc` is usually too old (the `ort`
+binding needs Rust ≥ 1.88), so install the toolchain with
+[rustup](https://rustup.rs/):
+
+```sh
+sudo apt install build-essential pkg-config clang libclang-dev \
+    libpam0g-dev libtss2-dev libudev-dev libdbus-1-dev dbus-daemon curl
+rustup toolchain install 1.88.0   # or newer stable
+```
+
+**Arch**
+
+```sh
+sudo pacman -S --needed base-devel rust clang tpm2-tss pam systemd onnxruntime-cpu curl
+```
+
+### ONNX runtime (non-Nix)
+
+irlume needs onnxruntime **≥ 1.24** (the `api-24` ABI) and loads it dynamically
+at runtime. Arch's `onnxruntime-cpu` package is new enough. On Fedora/Ubuntu the
+distro build is older, so fetch the original upstream archive from the
+dependency mirror, check it against the sha256 CI and the packages pin,
+and point `ORT_DYLIB_PATH` at it
+(`scripts/fetch-ort.sh 1.28.1` does the same download, check and unpack):
+
+```sh
+curl -fsSLO https://github.com/archledger/irlume-ci-assets/releases/download/onnxruntime-1.28.1-linux-x64/onnxruntime-linux-x64-1.28.1.tgz
+echo '2529aef968d0ad0603365054bc46ebefa7f0fe3bc12f28c5f729c99ddffe2a81  onnxruntime-linux-x64-1.28.1.tgz' | sha256sum -c - &&
+  tar xzf onnxruntime-linux-x64-1.28.1.tgz
+export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-1.28.1/lib/libonnxruntime.so"
+```
+
+## Option C: Container (Podman/Docker)
+
+A throwaway distro container gives you a clean-room build without touching
+the host. This path was validated end-to-end (fresh clone, build, live
+camera capture) on `ubuntu:26.04`, `archlinux`, and `fedora:44` images.
+Mount your checkout and install that distro's Option B package list inside:
+
+```sh
+podman run --rm -it -v "$PWD":/work:Z -w /work fedora:44
+# inside: the Fedora package list from Option B, then build as usual
+```
+
+The `:Z` matters on SELinux hosts (Fedora among them): it relabels the
+checkout so the container may read and write it; without it the mount is
+permission-denied. Inside the container, set `CARGO_TARGET_DIR=/work/target-container`
+(or similar) so container-built artifacts, linked against the container's
+glibc, don't overwrite your host `target/`.
+
+On Ubuntu images use rustup (Option B's note applies); on Arch the system
+`onnxruntime-cpu` covers the runtime, elsewhere use the tarball recipe above.
+
+To run the camera examples inside the container, pass the IR node through:
+
+```sh
+podman run --rm -it \
+  --device /dev/video2 --group-add keep-groups --security-opt label=disable \
+  -v "$PWD":/work -w /work fedora:44
+```
+
+`--group-add keep-groups` carries the host ACL that grants your user the
+camera into the container; `--security-opt label=disable` lifts SELinux
+confinement, which otherwise blocks the v4l device on SELinux hosts. Both
+weaken the container's isolation; use them for local testing only, never for
+a container that runs untrusted code.
+
+A container tests no more of the stack than the Nix shell does: TPM sealing,
+PAM wiring, greeter/lock integration, and SELinux policy still need the
+real-hardware path below.
+
+## Build, lint, test, run
+
+```sh
+cargo build --release
+cargo clippy --all-targets      # required before a PR (what CI runs, as -D warnings)
+cargo fmt                       # required before a PR
+cargo test
+cargo run -p irlume-cli -- doctor   # platform / TPM / camera / model check
+```
+
+Developer-only benchmark and capture subcommands are gated behind `IRLUME_DEV=1`
+(e.g. `IRLUME_DEV=1 cargo run -p irlume-cli -- selftest align --model models/glintr100.onnx`).
+
+### AddressSanitizer
+
+The unsafe code in irlume is a few dozen lines: NSS `getpwnam_r` buffers, the
+mlock and madvise page arithmetic around a decrypted secret, `secure_getenv`, a
+UVC control ioctl, and the daemon's `SO_PEERCRED` path. Clippy cannot see into
+them, so a weekly job runs the suite instrumented. To reproduce it:
+
+```sh
+RUSTFLAGS=-Zsanitizer=address \
+LSAN_OPTIONS="suppressions=$PWD/.github/lsan-suppressions.txt" \
+  cargo +nightly test --workspace --target x86_64-unknown-linux-gnu
+```
+
+`--target` is not optional: without it, build scripts and proc macros are
+instrumented too and the build fails. The whole suite takes about twenty seconds
+once warm.
+
+A leak suppression matches the symbol names in an allocation stack, so it does
+nothing on a machine with no symbolizer: the suppressed leak comes back looking
+like a real one, with a stack of bare addresses. If that happens, install
+`llvm-symbolizer` and set `ASAN_SYMBOLIZER_PATH` to it. The CI job resolves it
+explicitly and refuses to run without one.
+
+Two interactions are worth knowing before you read a failure. The sanitizer
+runtime defines its own `mlock`, so `RLIMIT_MEMLOCK` cannot refuse anything and
+`mlock_refusal_warns_and_continues` prints which assertion it skipped instead of
+failing. And `pamwire`'s wiring tests leak a `&'static str` deliberately;
+`.github/lsan-suppressions.txt` explains the scope, which is why the suppression
+names those tests rather than the crate.
+
+The TPM-gated tests (marked `#[ignore]`) run against a software TPM, no
+hardware or root needed; CI does exactly this:
+
+```sh
+swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm \
+  --server type=tcp,port=2321,disconnect --ctrl type=tcp,port=2322 \
+  --flags not-need-init,startup-clear --daemon --pid file=/tmp/swtpm/pid
+IRLUME_TCTI="swtpm:host=127.0.0.1,port=2321" cargo test -p irlume-core --lib -- --ignored \
+  seal_unseal_roundtrip_real_tpm arm_and_unseal_roundtrip reseal_only_when_stale \
+  tpm_key_and_recovery_lifecycle seal_unseal_pcrlock_roundtrip_provisioned_nv --test-threads=1
+```
+
+The camera-path tests (also `#[ignore]`) run against v4l2loopback virtual
+cameras fed by ffmpeg test patterns; CI does this too (Secure Boot hosts
+cannot load the unsigned module, which is why the gate is an env var):
+
+```sh
+sudo modprobe v4l2loopback devices=2 video_nr=42,43 exclusive_caps=0
+ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video42 &
+ffmpeg -loglevel error -re -f lavfi -i testsrc2=size=640x400:rate=30 -pix_fmt gray -f v4l2 /dev/video43 &
+IRLUME_TEST_RGB_DEVICE=/dev/video42 IRLUME_TEST_IR_DEVICE=/dev/video43 \
+  cargo test -p irlume-camera -p irlume-auth -- --ignored loopback_ --test-threads=1
+```
+
+`IRLUME_TCTI` is the production TCTI override; the remaining ignored tests
+(durability, fault-injection, and the host-provisioned pcrlock roundtrip)
+are campaign tools that need a provisioned host and stay manual; the
+`_provisioned_nv` pcrlock test needs no host provisioning because it defines
+the NV index itself, the same way `systemd-pcrlock make-policy` does.
+
+## Isolated CLI checks
+
+Run the generic machine API checks with
+`bash scripts/test-machine-api-isolated.sh target/release/irlume` after
+building the release binary. It keeps the fixture/schema checks outside an
+empty-root namespace and isolates every invocation of the compiled CLI in it,
+which needs bubblewrap, a C compiler and the Python `lddtree` from pax-utils;
+its `--strict` schema check also needs Python `jsonschema` and exits 2
+without it (Ubuntu CI installs `pax-utils`, `python3-pyelftools` and
+`python3-jsonschema`). There is no host execution fallback.
+Read-only commands such as doctor and camera census can open devices, so a
+dead daemon socket alone is not an isolation boundary.
+
+The namespace exposes individual ELF dependency files, private device and
+process trees, synthetic account records and temporary state. It exposes
+no host sysfs, camera/TPM/render devices, service buses or installed
+authentication state. `IRLUME_TEST_LDDTREE` and
+`IRLUME_TEST_ELFTOOLS_WHEEL` may select reviewed local test-tool copies;
+they are consumed only by the test runner, not by the CLI or daemon.
+
+## Sandbox environment overrides
+
+Every path a privileged component touches can be redirected, so tests and a
+throwaway dev daemon never write to the real system:
+
+| Variable | Redirects | Default |
+|---|---|---|
+| `IRLUME_SOCKET` | the daemon socket (daemon and all clients read it) | `/run/irlume.sock` |
+| `IRLUME_STATE_DIR` | enrollment profiles (JSON, 0600) | `$HOME/.local/share/irlume` for dev builds, `/var/lib/irlume` in production |
+| `IRLUME_CONFIG_DIR` | the `key=value` config root | `/etc/irlume` |
+| `IRLUME_KEYRING_DIR` | sealed-password envelopes | `/var/lib/irlume/keyring` |
+| `IRLUME_TEMPLATE_KEY_DIR` | template encryption keys | `/var/lib/irlume/template-keys` |
+| `IRLUME_RECOVERY_DIR` | recovery-passphrase envelopes | `/var/lib/irlume/recovery` |
+| `IRLUME_PCR_SIGNATURE` / `IRLUME_PCR_PUBKEY` | the pcrlock signature JSON / public-key PEM | discovered on the system paths |
+| `IRLUME_PCRLOCK_JSON` | the systemd-pcrlock prediction file (Tier-2 gate) | `/var/lib/systemd/pcrlock.json` |
+| `IRLUME_SELINUX_PP` | the compiled SELinux module `irlume login` loads (source builds have no packaged `.pp`) | packaged path |
+| `IRLUME_METHOD_CONF` | the auth-method policy (auto, face, fingerprint, both) | `/etc/irlume/method` |
+| `IRLUME_EMITTER_LOCK_DIR` / `IRLUME_TPM_MARKER_DIR` | IR emitter locks / the raw-TPM marker | `/run/lock/irlume` |
+| `IRLUME_PAM_LOCK` | the lock every PAM change holds; its directory is created at 0700 when missing and must be owned by the caller and not writable by group or others, and the lock of earlier releases (`/run/lock/irlume-pam.lock`) is then left alone | `/run/irlume/pam.lock` |
+| `IRLUME_GKR_RUNTIME_DIR` | the runtime directory holding the GNOME keyring control socket and the user bus `irlume-gkr-unlock` watches (refused when privileged) | `/run/user/<uid>` |
+| `IRLUME_OS_RELEASE` | the os-release file the CLI reads for its release-specific behaviour: the upgrade notices in `doctor`, `keyring arm`, `keyring status` and the TUI, and the NixOS checks, where `irlume login enable`, `disable` and `reconcile` change nothing, `login status` and `doctor` name the NixOS module, and the keyring arm paths seal only the login password ([NIXOS.md](../user/NIXOS.md)). Honoured as root, since it changes only what the CLI shows, refuses or asks irlumed for, not what irlumed accepts (the `platform` and `install-origin` checks of `doctor` and `support-report` still read the system's own os-release, not this file) | `/etc/os-release`, then `/usr/lib/os-release` |
+
+## Example binaries
+
+Measurement harnesses live as cargo examples; run with
+`cargo run -p <crate> --example <name>`, e.g.
+`cargo run -p irlume-camera --example burst_dump`. Like the `IRLUME_DEV=1`
+CLI tools, they open the camera directly and hold no privileged path.
+
+| Example (crate) | What it measures |
+|---|---|
+| `burst_dump` (irlume-camera) | dumps a raw IR strobe burst as PGM frames + a means index, for offline center/edge and subtraction tuning |
+| `rgb_burst_dump` (irlume-camera) | the RGB companion (PPM), for detection-floor and fusion analysis |
+| `ambient_ab` (irlume-camera) | A/B harness for ambient subtraction under a real ambient-IR or spoof condition |
+| `ir_strobe_probe` (irlume-camera) | prints per-frame burst brightness: does this module strobe the emitter or hold it steady? |
+| `capture_bench` (irlume-camera) | sequential vs concurrent RGB+IR capture timing and brightness distributions |
+| `concurrency_probe` (irlume-camera) | whether the module starves when RGB and IR stream at the same time |
+| `assess_probe` (irlume-auth) | drives the real liveness assessment N times and reports verdicts + RGB self-heal firing |
+| `embed_parity` (irlume-auth) | whether concurrent-load RGB dimming shifts the face embedding enough to hurt recognition |
+| `landmark_dump` (irlume-auth) | IR strobe burst + per-frame FaceMesh coordinates and the IR brightness at each landmark, for landmark-relief prototyping |
+
+The `irlume-auth` examples load ONNX models. Without `ORT_DYLIB_PATH` they
+use the first packaged runtime present
+(`/usr/share/irlume/onnxruntime/lib/libonnxruntime.so` on an installed
+Fedora/RPM box, `/opt/irlume/onnxruntime/lib/libonnxruntime.so` on a
+Debian/PPA box, which ships the upstream `libonnxruntime.so.1.28.1` beside
+that link), else the system loader; if that fails, or the runtime is
+older than 1.24, the model load fails at once with a load error. On a source
+checkout, set the variable (see the ONNX runtime section above).
+
+### Using landmark_dump
+
+```sh
+bash scripts/fetch-models.sh                                     # real model weights
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so # see above
+cargo run --release -p irlume-auth --example landmark_dump -- \
+  models/face_detection_yunet_2023mar.onnx models/face_landmarks_detector.tflite \
+  out/ /dev/video2 36
+```
+
+Look at the camera; a 36-frame burst takes about 2.5 s. The IR node is the
+V4L2 device that lists a `GREY` format (`v4l2-ctl -d /dev/videoN
+--list-formats`). `out/` then holds:
+
+- `frameNN.pgm`: the raw IR frame. PGM is plain grayscale: a `P5` text
+  header (width, height, 255) followed by one byte per pixel. Any image
+  viewer opens it and numpy reads it without a decoder.
+- `frameNN.landmarks.csv`: `idx,x,y,brightness` for the 478 FaceMesh
+  points, written only for frames where a face was detected. `brightness`
+  is the mean of the 3x3 pixel patch centered on the landmark; coordinates
+  carry full f32 precision, so re-sampling the PGM at `(x, y)` reproduces
+  the CSV value exactly.
+- `index.txt`: one line per frame: index, frame mean, ms since the first
+  frame, detection score and bbox (`- -` when no face).
+
+On a strobing emitter, alternate frames are emitter-off (near-black indoors,
+ambient-lit outdoors) and normally carry no CSV; the lit/dark pairing in
+`index.txt` is the ambient-subtraction signal. The first few lit frames can
+come out overexposed (frame mean around 200+) with no detection while the
+camera's auto-exposure settles; that is normal, later frames recover. Reading the output in Python:
+
+```python
+import numpy as np, csv
+
+def pgm(path):
+    with open(path, "rb") as f:
+        assert f.readline().strip() == b"P5"
+        w, h = map(int, f.readline().split())
+        f.readline()  # maxval
+        return np.frombuffer(f.read(), np.uint8).reshape(h, w)
+
+# first frame with a detection (whether frame 00 has one depends on the
+# strobe phase it landed on), via index.txt's score column
+n = next(l.split()[0] for l in open("out/index.txt") if l.split()[3] != "-")
+frame = pgm(f"out/frame{n}.pgm")
+points = list(csv.DictReader(open(f"out/frame{n}.landmarks.csv")))
+```
+
+The MediaPipe canonical face-landmark map names each index (nose tip, eye
+rings, cheek centers); irlume's own eye rings are `RESCUE_LEFT_EYE_RING` /
+`RESCUE_RIGHT_EYE_RING` in `rescue_detect` (`crates/irlume-auth/src/lib.rs`).
+
+## What the dev shell can't do: real-hardware testing
+
+The build shell compiles and runs the code, but the security-critical paths
+(**an IR camera, TPM sealing, PAM wiring, greeter/lock integration, SELinux**)
+can only be exercised on a physical machine. For enrolling, wiring a greeter,
+and end-to-end login/lock/sudo testing on real hardware, follow
+[`SETUP.md`](../user/SETUP.md). To build the distro packages (RPM/`.deb`/Arch), see the
+recipes under [`../packaging/`](../../packaging/). Liveness/PAD changes must ship
+with an ISO/IEC 30107-3 self-test; see [`PAD_SELFTEST.md`](../security/PAD_SELFTEST.md).
+
+## Project layout
+
+Crate roles (details and the privilege-separation diagram are in
+[`ARCHITECTURE.md`](ARCHITECTURE.md)):
+
+| Crate | Role |
+| --- | --- |
+| `irlume-common` | shared types / IPC request-response protocol |
+| `irlume-camera` | V4L2 capture + IR emitter control |
+| `irlume-vision` | detection / recognition (ONNX via `ort`) |
+| `irlume-liveness` | anti-spoof / presentation-attack detection |
+| `irlume-core` | matching, encrypted template storage, TPM-bound secret release (`tss-esapi`) |
+| `irlume-auth` | shared authentication orchestration (the security-critical decision flow) |
+| `irlume-fingerprint` | optional fprintd companion factor |
+| `irlume-daemon` | privileged `irlumed`, the only thing that touches hardware |
+| `irlume-pam` | `pam_irlume.so`, the untrusted PAM client |
+| `irlume-cli` | the `irlume` command + guided TUI |
+
+## Before you open a PR
+
+Sign your commits (DCO; see [CONTRIBUTING.md](../../.github/CONTRIBUTING.md)):
+
+```sh
+git commit -s -m "your message"
+```
+
+and make sure `cargo fmt`, `cargo clippy`, and `cargo test` are clean.

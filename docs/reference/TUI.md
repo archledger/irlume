@@ -243,6 +243,20 @@ Inspection failure is shown separately from an empty device list. Selection
 follows device identity, and a connection change invalidates an open camera
 switch confirmation rather than silently choosing a replacement.
 
+### Enrollment framing guide
+
+During enrollment, the text cue tells you what to adjust. On a wide
+terminal, the framing guide also shows a generic marker inside a box.
+The brackets mark the center. Move to your right and the marker moves
+right; move closer and it grows. A centered marker does not tell you
+whether your angle or lighting is right. Follow the text cue for those.
+
+The marker clears if Irlume loses track of your face or stops receiving
+fresh position data. The guide closes before authorization and scan
+capture. It uses coarse position and size, not webcam video or facial
+landmarks. Compact terminals, older daemons, and
+`IRLUME_REDUCE_MOTION=1` keep the text-only guide.
+
 During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
 The guide checks cancellation after waiting or sampling, and the client checks
 again before sending a new capture request, including the older-daemon fallback.

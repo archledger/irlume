@@ -221,6 +221,7 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
         "test-profile".into(),
         improve.then(|| "test-profile".into()),
         1,
+        false,
         stop.clone(),
         tx,
     );

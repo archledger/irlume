@@ -7,6 +7,10 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The TUI enrollment guide shows a mirrored position and distance marker
+  alongside the existing cues and countdown, without sending webcam
+  images or facial landmarks to the terminal.
+
 - `irlume trace explain` summarizes recorded IR face-region clipping,
   distinguishing above-limit saturation, measurements within the limit,
   and insufficient evidence. It does not test exposure controls

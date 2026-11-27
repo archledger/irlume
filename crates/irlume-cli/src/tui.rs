@@ -5,15 +5,15 @@
 //!
 //! Layout & feel follow a system-settings app: stable, grouped navigation; a
 //! focused Overview that names the next useful action; contextual activity
-//! history; and a compact action footer. Enrollment uses **guided cues**, a
-//! live framing guide (quality + checklist + guidance) with a 3-2-1 countdown
-//! and auto-capture, instead of a live video preview (which a terminal can't
-//! show). A thin client: all work happens in the daemon.
+//! history; and a compact action footer. Enrollment uses text cues and a
+//! pixel-free framing guide with a 3-2-1 countdown and auto-capture. Camera
+//! work stays in the daemon.
 
 mod actions;
 mod activity;
 mod attempts;
 pub(crate) mod dates;
+mod framing_viewfinder;
 mod freshness;
 mod launch;
 mod polling;
@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use irlume_common::{PositionReport, ProfileSummary, Request, Response};
+use irlume_common::{FramingPosition, PositionReport, ProfileSummary, Request, Response};
 
 /// Semantic foregrounds use the user's ANSI palette on both light and dark
 /// terminals. Leave backgrounds at their terminal defaults; fixed RGB pastels
@@ -547,6 +547,10 @@ struct RecoveryInfo {
 #[derive(Debug)]
 enum WMsg {
     Cue(PositionReport),
+    Viewfinder {
+        position: Option<FramingPosition>,
+        sampled_at: Instant,
+    },
     /// A framing-guide poll got no answer (timeout / connection error). NOT a
     /// biometric observation: the UI must stop showing the last cue as if it
     /// were current (#309).
@@ -597,12 +601,18 @@ struct SessionMerge {
     answer: mpsc::Sender<bool>,
 }
 
+struct ViewfinderSample {
+    position: Option<FramingPosition>,
+    sampled_at: Instant,
+}
+
 struct EnrollUi {
     session_merge: Option<SessionMerge>,
     rx: mpsc::Receiver<WMsg>,
     stop: Arc<AtomicBool>,
     profile: String,
     last: Option<PositionReport>,
+    viewfinder: Option<ViewfinderSample>,
     count: Option<u8>,
     /// The framing guide stopped answering (timeout or connection error), with
     /// the transport error. Rendered INSTEAD of the last cue: a stale
@@ -3970,7 +3980,8 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (st, pn, addc) = (stop.clone(), profile.clone(), add.clone());
-        std::thread::spawn(move || enroll_worker(user, pn, addc, target, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, addc, target, viewfinder, st, tx));
         self.log(
             '→',
             format!("guided enroll → '{profile}' ({target} scan(s))"),
@@ -3981,6 +3992,7 @@ impl App {
             stop,
             profile,
             last: None,
+            viewfinder: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -4010,13 +4022,15 @@ impl App {
         let add = Some(mc.profile.clone());
         let base = mc.added_scans.len(); // the merged scan(s), for a continuous count
         let ambient_base = mc.ambient_lit;
-        std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, viewfinder, st, tx));
         self.enroll = Some(EnrollUi {
             session_merge: None,
             rx,
             stop,
             profile: mc.profile,
             last: None,
+            viewfinder: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -4328,6 +4342,7 @@ impl App {
                             e.profile = prompt.profile.clone();
                             e.session_merge = Some(prompt);
                             e.count = None;
+                            e.viewfinder = None;
                         }
                     }
                     WMsg::Authorizing => {
@@ -4337,6 +4352,7 @@ impl App {
                         );
                         if let Some(e) = &mut self.enroll {
                             e.count = None;
+                            e.viewfinder = None;
                         }
                     }
                     WMsg::Cue(r) => {
@@ -4346,10 +4362,22 @@ impl App {
                             e.stalled = None;
                         }
                     }
+                    WMsg::Viewfinder {
+                        position,
+                        sampled_at,
+                    } => {
+                        if let Some(e) = &mut self.enroll {
+                            e.viewfinder = Some(ViewfinderSample {
+                                position: position.filter(|p| p.in_bounds()),
+                                sampled_at,
+                            });
+                        }
+                    }
                     WMsg::Stall(err) => {
                         if let Some(e) = &mut self.enroll {
                             e.stalled = Some(err);
                             e.count = None;
+                            e.viewfinder = None;
                         }
                     }
                     WMsg::Count(c) => {
@@ -4363,6 +4391,7 @@ impl App {
                             e.captured = n;
                             e.target = t;
                             e.count = None;
+                            e.viewfinder = None;
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
@@ -6831,7 +6860,8 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (st, pn) = (stop.clone(), name.clone());
-        std::thread::spawn(move || enroll_worker(user, pn, None, ENROLL_SCANS, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, None, ENROLL_SCANS, viewfinder, st, tx));
         self.log(
             '→',
             format!("guided enroll → '{name}' ({ENROLL_SCANS} scans)"),
@@ -6842,6 +6872,7 @@ impl App {
             stop,
             profile: name,
             last: None,
+            viewfinder: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -7848,6 +7879,36 @@ impl App {
             "  [esc] cancel",
             Style::new().dim(),
         )));
+        let area = if let Some(sample) = e.viewfinder.as_ref().filter(|_| {
+            !self.reduce_motion
+                && f.area().width >= SIDEBAR_MIN_COLS
+                && area.width >= 68
+                && area.height >= 12
+        }) {
+            let [text, _, guide] = Layout::horizontal([
+                Constraint::Min(43),
+                Constraint::Length(2),
+                Constraint::Length(framing_viewfinder::WIDTH),
+            ])
+            .areas(area);
+            let fresh = self
+                .now()
+                .checked_duration_since(sample.sampled_at)
+                .is_some_and(|age| age < Duration::from_secs(2));
+            framing_viewfinder::draw(
+                f,
+                Rect::new(
+                    guide.x,
+                    guide.y + 1,
+                    guide.width,
+                    framing_viewfinder::HEIGHT,
+                ),
+                sample.position.filter(|_| fresh),
+            );
+            text
+        } else {
+            area
+        };
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }
 
@@ -11997,22 +12058,45 @@ fn enroll_worker(
     profile: String,
     add: Option<String>,
     target: usize,
+    viewfinder: bool,
     stop: Arc<AtomicBool>,
     tx: mpsc::Sender<WMsg>,
 ) {
+    use irlume_common::client::PositionSession;
+
     let send = |m| tx.send(m).is_ok();
     let mut misses = 0;
-    let mut session = match irlume_common::client::PositionSession::connect(&user, &stop) {
+    let connect = if viewfinder {
+        PositionSession::connect_with_viewfinder
+    } else {
+        PositionSession::connect
+    };
+    let mut session = match connect(&user, &stop) {
         Ok(session) => session,
         Err(error) => {
             let _ = send(WMsg::Err(format!("camera guide could not start: {error}")));
             return;
         }
     };
+    let mut seen_viewfinder = false;
     loop {
         let mut sample = |request: &Request| match session.as_mut() {
             Some(session) => Ok(match session.sample(&stop) {
-                Ok(report) => Response::Position(report),
+                Ok(mut report) => {
+                    let position = report.viewfinder.take().filter(|_| report.face);
+                    if viewfinder && !stop.load(Ordering::Relaxed) {
+                        seen_viewfinder |= position.is_some();
+                        if seen_viewfinder
+                            && !send(WMsg::Viewfinder {
+                                position,
+                                sampled_at: Instant::now(),
+                            })
+                        {
+                            return Err("enrollment UI closed".into());
+                        }
+                    }
+                    Response::Position(report)
+                }
                 // An accepted session cannot safely resume through another
                 // connection after a framing, transport or deadline failure.
                 Err(error) => Response::Error(format!("camera guide stopped: {error}")),
@@ -12536,6 +12620,7 @@ mod tests {
             "New".into(),
             None,
             10,
+            false,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -12558,6 +12643,37 @@ mod tests {
 
     #[test]
     fn guided_enrollment_reuses_framing_connection_and_releases_it_before_authorization() {
+        let messages = exercise_guided_session(false);
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, WMsg::Viewfinder { .. })));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_updates_without_touching_countdown() {
+        let messages = exercise_guided_session(true);
+        let beats: Vec<_> = messages
+            .windows(2)
+            .filter_map(|pair| match pair {
+                [WMsg::Count(count), WMsg::Viewfinder {
+                    position: Some(position),
+                    ..
+                }] => Some((*count, position.x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(beats, [(3, 4), (2, 5), (1, 6)]);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Cue(_)))
+                .count(),
+            3,
+            "countdown samples update only the viewfinder, not the cue"
+        );
+    }
+
+    fn exercise_guided_session(viewfinder: bool) -> Vec<WMsg> {
         use std::io::{BufRead, Write};
         let _guard = dead_socket();
         let path =
@@ -12566,23 +12682,31 @@ mod tests {
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
             let (mut guide, mut reader, mut line) = accept_wanted(&listener, framing_start);
-            if serde_json::from_str::<serde_json::Value>(&line).unwrap()
-                != serde_json::json!({"PositionSession":{"user":"test-user"}})
-            {
-                return false;
-            }
+            let expected = if viewfinder {
+                serde_json::json!({"PositionSession":{"user":"test-user","viewfinder":true}})
+            } else {
+                serde_json::json!({"PositionSession":{"user":"test-user"}})
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                expected
+            );
             writeln!(guide, "\"PositionSessionStarted\"").unwrap();
-            for _ in 0..6 {
+            for x in 1..=6 {
                 line.clear();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&line).unwrap(),
                     "Sample"
                 );
+                let mut report = good_report("Ready");
+                if viewfinder {
+                    report.viewfinder = Some(irlume_common::FramingPosition { x, y: 5, size: 1 });
+                }
                 writeln!(
                     guide,
                     "{}",
-                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                    serde_json::to_string(&Response::Position(report)).unwrap()
                 )
                 .unwrap();
             }
@@ -12641,6 +12765,7 @@ mod tests {
             "New".into(),
             None,
             10,
+            viewfinder,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -12659,6 +12784,7 @@ mod tests {
             3
         );
         assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+        messages
     }
 
     #[test]
@@ -12699,6 +12825,7 @@ mod tests {
             "New".into(),
             None,
             10,
+            false,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -13684,6 +13811,7 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 profile: "p".into(),
                 last: None,
+                viewfinder: None,
                 count: None,
                 stalled: None,
                 captured: 0,
@@ -19154,6 +19282,150 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_viewfinder_mirrors_and_scales_without_color() {
+        use irlume_common::FramingPosition;
+
+        let draw = |position| {
+            let mut terminal = Terminal::new(TestBackend::new(23, 7)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    framing_viewfinder::draw(frame, area, position);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let marker = buffer
+                .area
+                .positions()
+                .find(|&position| buffer[position].symbol() == "o")
+                .unwrap();
+            assert_eq!(buffer[marker].fg, Color::Reset);
+            assert_eq!(buffer[marker].bg, Color::Reset);
+            (marker, rendered(&terminal))
+        };
+
+        let (upper, _) = draw(Some(FramingPosition {
+            x: 2,
+            y: 2,
+            size: 0,
+        }));
+        let (lower, _) = draw(Some(FramingPosition {
+            x: 8,
+            y: 8,
+            size: 0,
+        }));
+        let (center, small) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 0,
+        }));
+        assert!(lower.x < center.x && center.x < upper.x);
+        assert!(upper.y < center.y && center.y < lower.y);
+        assert!(small.lines().any(|row| row.contains("[   o   ]")));
+
+        let (medium_center, medium) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 1,
+        }));
+        let (large_center, large) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 2,
+        }));
+        assert_eq!(medium_center, center);
+        assert_eq!(large_center, center);
+        assert!(medium.lines().any(|row| row.contains("[  (o)  ]")));
+        assert!(large.lines().any(|row| row.contains("[ ((o)) ]")));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_clears_and_preserves_text_fallback() {
+        use irlume_common::FramingPosition;
+
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        let at = Instant::now();
+        app.clock_override = Some(at);
+        let update = |position| WMsg::Viewfinder {
+            position,
+            sampled_at: at,
+        };
+        let marker = Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 2,
+        });
+        let wide = |app: &App| draw_text_at(app, 120, 40);
+        let present = |text: &str| text.contains("((o))");
+
+        tx.send(WMsg::Cue(good_report("Lift your chin"))).unwrap();
+        app.poll();
+        assert!(!wide(&app).contains("Framing guide"), "older daemon");
+        assert!(wide(&app).contains("Lift your chin"));
+
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(present(&wide(&app)));
+        assert!(wide(&app).contains("Lift your chin"));
+
+        let compact = draw_text_at(&app, 80, 24);
+        assert!(!compact.contains("Framing guide"));
+        assert!(compact.contains("Lift your chin"));
+        assert!(compact.contains("cancel enrollment"));
+
+        app.reduce_motion = true;
+        assert!(!wide(&app).contains("Framing guide"));
+        assert!(wide(&app).contains("Lift your chin"));
+        app.reduce_motion = false;
+
+        tx.send(WMsg::Count(2)).unwrap();
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(wide(&app).contains("capturing in 2"));
+        assert!(present(&wide(&app)));
+        app.clock_override = Some(at + Duration::from_secs(2));
+        assert!(!present(&wide(&app)), "expired marker");
+        app.clock_override = Some(at);
+
+        for position in [
+            None,
+            Some(FramingPosition {
+                x: 20,
+                y: 5,
+                size: 2,
+            }),
+        ] {
+            tx.send(update(position)).unwrap();
+            app.poll();
+            assert!(!present(&wide(&app)));
+            assert!(wide(&app).contains("Framing guide"), "target stays visible");
+        }
+
+        tx.send(WMsg::Stall("synthetic timeout".into())).unwrap();
+        app.poll();
+        assert!(!present(&wide(&app)));
+        assert!(wide(&app).contains("not answering"));
+
+        tx.send(WMsg::Cue(good_report("Ready"))).unwrap();
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(present(&wide(&app)));
+        tx.send(WMsg::Authorizing).unwrap();
+        app.poll();
+        assert!(!wide(&app).contains("Framing guide"));
+
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll.is_none());
+        assert!(!wide(&app).contains("Framing guide"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
     fn enroll_esc_cancels_and_signals_the_worker_to_stop() {
         let _sock = dead_socket();
         let mut app = test_app();
@@ -22267,6 +22539,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),
             last: None,
+            viewfinder: None,
             count: None,
             stalled: None,
             captured: 1,
@@ -25660,6 +25933,7 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),
             last: None,
+            viewfinder: None,
             count: None,
             stalled: None,
             captured: 1,

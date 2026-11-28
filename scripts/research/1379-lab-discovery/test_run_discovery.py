@@ -192,6 +192,28 @@ class VerifierTests(unittest.TestCase):
         self.assertIn('LIBCAMERA_SYSCONF_DIR "/configuration.yaml"', guard)
         self.assertIn('LIBCAMERA_DATA_DIR "/configuration.yaml"', guard)
 
+    def test_meson_setup_avoids_host_lookups(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        setup = script.split('"$MESON" setup', 1)[1].split(">", 1)[0]
+        self.assertIn('--native-file "$native"', setup)
+        self.assertIn("-Dforce_fallback_for=libyuv", setup)
+        self.assertIn("cmake = 'false'", script)
+        self.assertIn("grep -Eq 'Found CMake: [^N]|dependency libyuv|Library yuv|libyuv[.]h'", script)
+
+    def test_needed_gate_is_an_allowlist(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        self.assertNotIn("libudev|libdw|libunwind|lttng", script)
+        self.assertIn("needed_allow=(", script)
+        allow = script.split("needed_allow=(", 1)[1].split(")", 1)[0].split()
+        self.assertEqual(sorted(allow), sorted([
+            "ld-linux-x86-64.so.2", "libc.so.6", "libcamera-base.so.0.8", "libcamera.so.0.8", "libgcc_s.so.1",
+            "libgnutls.so.30", "libm.so.6", "libstdc++.so.6", "libyaml-0.so.2"]))
+
+    def test_lab_image_drops_isolated_proxy(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        self.assertIn('rm -f -- "$scratch/lc-lab-stage/usr/libexec/libcamera/ipu3_ipa_proxy"', script)
+        self.assertIn('grep -q ipa_proxy "$out/lab.list"', script)
+
     def test_readme_runs_every_case_in_both_rounds(self):
         text = (rd.HERE / "README.md").read_text()
         self.assertIn("for round in 1 2; do\n", text)

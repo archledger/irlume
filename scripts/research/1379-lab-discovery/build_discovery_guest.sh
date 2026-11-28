@@ -108,6 +108,11 @@ while ((${#queue[@]})); do
     done < <(pkg-config --print-requires --print-requires-private "$module")
 done
 ls "$pkgview" >"$out/pkgconfig-view.txt"
+# No CMake lookups and no libyuv probe, so no host library outside the view is found.
+native="$scratch/meson-native.ini"
+printf '%s\n' '[binaries]' "cmake = 'false'" >"$native"
+needed_allow=(ld-linux-x86-64.so.2 libc.so.6 libcamera-base.so.0.8 libcamera.so.0.8 libgcc_s.so.1 libgnutls.so.30
+    libm.so.6 libstdc++.so.6 libyaml-0.so.2)
 
 build_libcamera() {
     local name=$1 source=$2
@@ -115,12 +120,15 @@ build_libcamera() {
     rm -rf -- "$bdir" "$stage"
     PATH="$(dirname -- "$MESON"):$PATH" PKG_CONFIG_LIBDIR="$pkgview" PKG_CONFIG_PATH='' \
         "$MESON" setup "$bdir" "$source" --prefix=/usr --buildtype=debugoptimized --wrap-mode=nodownload \
-        -Dpipelines=ipu3 -Dipas=ipu3 -Dudev=disabled -Dlibdw=disabled -Dlibunwind=disabled \
+        --native-file "$native" -Dforce_fallback_for=libyuv -Dpipelines=ipu3 -Dipas=ipu3 -Dudev=disabled -Dlibdw=disabled -Dlibunwind=disabled \
         -Dtracing=disabled -Dcam=disabled -Dqcam=disabled -Dgstreamer=disabled -Dv4l2=disabled \
         -Dpycamera=disabled -Dlc-compliance=disabled -Ddocumentation=disabled -Dtest=false \
         -Dandroid=disabled >"$out/lc-$name-setup.log" 2>&1 || { tail -30 "$out/lc-$name-setup.log" >&2; exit 1; }
     grep -Eq 'IPA modules signed with[[:space:]]*:[[:space:]]*gnutls' "$out/lc-$name-setup.log" ||
         die "$name libcamera does not sign IPA modules with gnutls"
+    if grep -Eq 'Found CMake: [^N]|dependency libyuv|Library yuv|libyuv[.]h' "$out/lc-$name-setup.log"; then
+        die "$name libcamera setup looked up host CMake packages or libyuv"
+    fi
     PATH="$(dirname -- "$MESON"):$PATH" "$MESON" compile -C "$bdir" >"$out/lc-$name-compile.log" 2>&1 ||
         { tail -30 "$out/lc-$name-compile.log" >&2; exit 1; }
     PATH="$(dirname -- "$MESON"):$PATH" DESTDIR="$stage" "$MESON" install -C "$bdir" --strip \
@@ -130,9 +138,10 @@ build_libcamera() {
     if readelf -dW "$lib" | grep -Eq '\((RUNPATH|RPATH)\)'; then die "$name libcamera keeps a build rpath"; fi
     find "$stage" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF && readelf -dW "$1"' _ {} \; \
         >"$out/lc-$name-dynamic.txt"
-    if grep -Eq 'NEEDED.*(libudev|libdw|libunwind|lttng)' "$out/lc-$name-dynamic.txt"; then
-        die "$name libcamera links a disabled optional dependency"
-    fi
+    grep -q '(NEEDED)' "$out/lc-$name-dynamic.txt" || die "$name libcamera dynamic sections not recorded"
+    unexpected=$(sed -nE 's/.*\(NEEDED\)[[:space:]]+Shared library: \[(.*)\]$/\1/p' "$out/lc-$name-dynamic.txt" |
+        sort -u | grep -vxF -f <(printf '%s\n' "${needed_allow[@]}") || true)
+    [[ -z $unexpected ]] || die "$name libcamera links outside the allowlist: $unexpected"
     "${strict_cxx[@]}" -I "$stage/usr/include/libcamera" "$here/guest/discovery_worker.cpp" \
         -L "$stage/usr/lib" -lcamera -lcamera-base -o "$out/worker-$name"
 }
@@ -158,6 +167,8 @@ expected=$' M include/libcamera/internal/ipa_manager.h\n M include/libcamera/int
 [[ $status == "$expected" ]] || die "unexpected lab libcamera tree changes: $status"
 printf '%s\n' "$status" >"$out/libcamera-lab-tree.status"
 build_libcamera lab "$lc_lab"
+# The lab factory constructs only the threaded proxy; the isolated proxy binary is not shipped.
+rm -f -- "$scratch/lc-lab-stage/usr/libexec/libcamera/ipu3_ipa_proxy"
 
 # Runtime closure from NEEDED entries, resolved in /usr/lib without running anything.
 closure() {
@@ -250,6 +261,7 @@ image_list "$out/supervisor" "$out/worker-lab" "$scratch/lc-lab-stage" "$out/clo
 printf '%s\n' "file /lab/front.contract $here/contract/front.contract 644 0 0" \
     "file /lab/ipa_ipu3.sha256 $out/ipa_ipu3.sha256 644 0 0" "file /lab/ir-stub $out/ir-stub 755 0 0" \
     >>"$out/lab.list"
+if grep -q ipa_proxy "$out/lab.list"; then die "lab image ships an isolated IPA proxy"; fi
 "$out/gen_init_cpio" "$out/lab.list" >"$out/lab.cpio"
 image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out/closure-stock.txt" \
     >"$out/stock.list"

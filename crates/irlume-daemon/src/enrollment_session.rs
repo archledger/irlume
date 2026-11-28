@@ -6,16 +6,26 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use irlume_auth::EnrollmentObserver;
-use irlume_common::{EnrollmentDecision, EnrollmentEvent, Response};
+use irlume_common::{EnrollmentDecision, EnrollmentEvent, FramingPosition, Response};
+use irlume_core::storage::MAX_SCANS_PER_PROFILE;
+
+type FramingSlot = Arc<Mutex<Option<EnrollmentEvent>>>;
+
+// A partially written framing line must finish before the next wire line.
+// Keep room for all required events while it yields to a slow reader: each
+// capture stage can restart once, plus Started and at most two merge prompts.
+const GUIDED_EVENT_CAPACITY: usize = 2 * MAX_SCANS_PER_PROFILE + 3;
 
 pub(super) struct Worker {
     events: SyncSender<EnrollmentEvent>,
     decisions: Receiver<bool>,
     stop: super::arbiter::CancelToken,
     deadline: Instant,
+    framing: Option<FramingSlot>,
 }
 
 pub(super) struct Connection {
@@ -23,23 +33,37 @@ pub(super) struct Connection {
     decisions: SyncSender<bool>,
     waiting: bool,
     input: Vec<u8>,
+    framing: Option<FramingSlot>,
+    optional_tail: Vec<u8>,
 }
 
+#[cfg(test)]
 pub(super) fn channel(stop: super::arbiter::CancelToken) -> (Worker, Connection) {
-    let (events, read_events) = mpsc::sync_channel(8);
+    channel_with_framing(stop, false)
+}
+
+pub(super) fn channel_with_framing(
+    stop: super::arbiter::CancelToken,
+    framing: bool,
+) -> (Worker, Connection) {
+    let (events, read_events) = mpsc::sync_channel(if framing { GUIDED_EVENT_CAPACITY } else { 8 });
     let (decisions, read_decisions) = mpsc::sync_channel(1);
+    let framing = framing.then(|| Arc::new(Mutex::new(None)));
     (
         Worker {
             events,
             decisions: read_decisions,
             stop,
             deadline: Instant::now() + super::WORKER_REPLY_TIMEOUT,
+            framing: framing.clone(),
         },
         Connection {
             events: read_events,
             decisions,
             waiting: false,
             input: Vec::new(),
+            framing,
+            optional_tail: Vec::new(),
         },
     )
 }
@@ -72,6 +96,23 @@ impl EnrollmentObserver for Worker {
         self.send(EnrollmentEvent::Progress { captured, target })
     }
 
+    fn wants_framing(&self) -> bool {
+        self.framing.is_some()
+    }
+
+    fn framing(&self, position: Option<FramingPosition>) {
+        if self.check().is_err() {
+            return;
+        }
+        if let Some(mut slot) = self.framing.as_ref().and_then(|slot| slot.try_lock().ok()) {
+            let sampled_mono_ms = irlume_common::enrollment_monotonic_ms();
+            *slot = sampled_mono_ms.map(|sampled_mono_ms| EnrollmentEvent::Framing {
+                position: position.filter(|position| position.in_bounds()),
+                sampled_mono_ms,
+            });
+        }
+    }
+
     fn confirm_merge(&self, profile: &str, remaining: usize) -> irlume_common::Result<()> {
         self.send(EnrollmentEvent::Merge {
             profile: profile.into(),
@@ -96,12 +137,47 @@ impl Connection {
     /// Only the connection thread writes to the socket. A slow reader cannot
     /// hold the camera worker in a write syscall.
     pub(super) fn pump(&mut self, stream: &UnixStream) -> io::Result<()> {
+        self.pump_inner(stream, true)
+    }
+
+    pub(super) fn pump_final(&mut self, stream: &UnixStream) -> io::Result<()> {
+        self.pump_inner(stream, false)
+    }
+
+    fn complete_optional_line(&mut self, mut stream: &UnixStream) -> io::Result<()> {
+        if !self.optional_tail.is_empty() {
+            stream.write_all(&self.optional_tail)?;
+            self.optional_tail.clear();
+        }
+        Ok(())
+    }
+
+    fn pump_inner(&mut self, stream: &UnixStream, allow_optional: bool) -> io::Result<()> {
+        if allow_optional {
+            if !self.optional_tail.is_empty() {
+                let sent = try_write_optional(stream, &self.optional_tail)?;
+                self.optional_tail.drain(..sent);
+                if !self.optional_tail.is_empty() {
+                    // Do not dequeue control events or block on optional
+                    // bytes. A later pump resumes this line before any other.
+                    return Ok(());
+                }
+            }
+        } else {
+            // The final reply already uses the socket's write timeout. Finish
+            // any line already started so the final reply stays decodable.
+            self.complete_optional_line(stream)?;
+        }
         while let Ok(event) = self.events.try_recv() {
             if matches!(event, EnrollmentEvent::Merge { .. }) {
                 if self.waiting {
                     return Err(io::Error::other("duplicate merge prompt"));
                 }
                 self.waiting = true;
+                if let Some(mut slot) = self.framing.as_ref().and_then(|slot| slot.try_lock().ok())
+                {
+                    *slot = None;
+                }
             }
             let mut line = serde_json::to_vec(&Response::EnrollmentSession(event))?;
             line.push(b'\n');
@@ -151,13 +227,271 @@ impl Connection {
                 self.waiting = false;
             }
         }
+        if allow_optional && !self.waiting {
+            self.pump_optional(stream);
+        }
         Ok(())
+    }
+
+    fn pump_optional(&mut self, stream: &UnixStream) {
+        let sample = self
+            .framing
+            .as_ref()
+            .and_then(|slot| slot.try_lock().ok())
+            .and_then(|mut slot| slot.take());
+        let Some(
+            event @ EnrollmentEvent::Framing {
+                sampled_mono_ms, ..
+            },
+        ) = sample
+        else {
+            return;
+        };
+        let Some(now) = irlume_common::enrollment_monotonic_ms() else {
+            return;
+        };
+        if !irlume_common::enrollment_framing_is_fresh(sampled_mono_ms, now) {
+            return;
+        }
+        if let Ok(mut line) = serde_json::to_vec(&Response::EnrollmentSession(event)) {
+            line.push(b'\n');
+            // No bytes from this sample are on the wire yet if send fails.
+            let sent = try_write_optional(stream, &line).unwrap_or(0);
+            if sent != 0 && sent < line.len() {
+                self.optional_tail.extend_from_slice(&line[sent..]);
+            }
+        }
+    }
+}
+
+fn try_write_optional(stream: &UnixStream, line: &[u8]) -> io::Result<usize> {
+    // SAFETY: line is valid for the syscall; only this connection writes to
+    // the socket. MSG_DONTWAIT affects only this send.
+    let sent = unsafe {
+        libc::send(
+            stream.as_raw_fd(),
+            line.as_ptr().cast(),
+            line.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    if let Ok(sent) = usize::try_from(sent) {
+        return Ok(sent);
+    }
+    let error = io::Error::last_os_error();
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => Ok(0),
+        _ => Err(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrollment_framing_does_not_block_control_events() {
+        use irlume_common::FramingPosition;
+        use std::io::{BufRead, BufReader};
+
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (mut server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        worker.started().unwrap();
+        for _ in 0..24 {
+            worker.framing(None);
+        }
+        let expected = FramingPosition {
+            x: 5,
+            y: 4,
+            size: 2,
+        };
+        worker.framing(Some(expected));
+        worker.progress(1, 10).unwrap();
+        connection.pump(&server).unwrap();
+        let mut reader = BufReader::new(client);
+        let mut event = || {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str::<Response>(&line).unwrap()
+        };
+        assert!(matches!(
+            event(),
+            Response::EnrollmentSession(EnrollmentEvent::Started)
+        ));
+        assert!(matches!(
+            event(),
+            Response::EnrollmentSession(EnrollmentEvent::Progress {
+                captured: 1,
+                target: 10
+            })
+        ));
+        assert!(
+            matches!(event(), Response::EnrollmentSession(EnrollmentEvent::Framing { position: Some(p), .. }) if p == expected)
+        );
+
+        // Deterministically model a short optional write, then drain a real
+        // control event and prove both wire lines are still well-formed.
+        server.write_all(b"{\"EnrollmentSession\":").unwrap();
+        connection.optional_tail =
+            b"{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n".to_vec();
+        worker.progress(2, 10).unwrap();
+        connection.pump_final(&server).unwrap();
+        assert!(matches!(
+            event(),
+            Response::EnrollmentSession(EnrollmentEvent::Framing { position: None, .. })
+        ));
+        assert!(matches!(
+            event(),
+            Response::EnrollmentSession(EnrollmentEvent::Progress {
+                captured: 2,
+                target: 10
+            })
+        ));
+        assert!(connection.optional_tail.is_empty());
+    }
+
+    #[test]
+    fn enrollment_framing_partial_line_retains_all_progress_under_backpressure() {
+        use std::io::{BufRead, BufReader, Read};
+
+        let target = MAX_SCANS_PER_PROFILE;
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let prefix = b"{\"EnrollmentSession\":";
+        server.write_all(prefix).unwrap();
+        let mut line = vec![0; prefix.len()];
+        client.read_exact(&mut line).unwrap();
+        assert_eq!(line, prefix);
+
+        let mut filled = 0;
+        loop {
+            match server.write(&[0_u8; 4096]) {
+                Ok(n) if n != 0 => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected fixture write: {other:?}"),
+            }
+            assert!(filled < 1_000_000);
+        }
+        // The prefix is already with the reader; inject a short write's suffix.
+        let tail = b"{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n";
+        connection.optional_tail = tail.to_vec();
+        // Capture can report progress again after a concurrent pair failure.
+        let progress = (1..target).chain(1..=target);
+        for captured in progress.clone() {
+            worker
+                .progress(captured, target)
+                .unwrap_or_else(|error| panic!("lost progress {captured} of {target}: {error}"));
+            connection
+                .pump(&server)
+                .expect("backpressure on an optional tail is not an error");
+        }
+        worker
+            .send(EnrollmentEvent::Merge {
+                profile: "fixture".into(),
+                remaining: 0,
+            })
+            .unwrap();
+        assert_eq!(connection.optional_tail, tail);
+
+        client.read_exact(&mut vec![0; filled]).unwrap();
+        connection.pump(&server).unwrap();
+        assert!(connection.optional_tail.is_empty());
+        let mut reader = BufReader::new(client);
+        reader.read_until(b'\n', &mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(&line).unwrap(),
+            Response::EnrollmentSession(EnrollmentEvent::Framing { position: None, .. })
+        ));
+        for expected in progress {
+            line.clear();
+            reader.read_until(b'\n', &mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Response>(&line).unwrap(),
+                Response::EnrollmentSession(EnrollmentEvent::Progress {
+                    captured,
+                    target: reported_target
+                }) if captured == expected && reported_target == target
+            ));
+        }
+        line.clear();
+        reader.read_until(b'\n', &mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(&line).unwrap(),
+            Response::EnrollmentSession(EnrollmentEvent::Merge { profile, remaining: 0 })
+            if profile == "fixture"
+        ));
+    }
+
+    #[test]
+    fn enrollment_framing_partial_line_reports_a_permanent_write_error() {
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (server, client) = UnixStream::pair().unwrap();
+        connection.optional_tail = b"null}}\n".to_vec();
+        worker.progress(1, 3).unwrap();
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        assert!(!super::super::peer_gone(&server));
+
+        let error = connection.pump(&server).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn enrollment_framing_requires_opt_in() {
+        let (worker, mut connection) = channel(super::super::arbiter::CancelToken::new());
+        worker.framing(None);
+        assert!(!worker.wants_framing());
+        let (server, mut client) = UnixStream::pair().unwrap();
+        connection.pump(&server).unwrap();
+        client.set_nonblocking(true).unwrap();
+        use std::io::Read;
+        assert_eq!(
+            client.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn enrollment_framing_is_disposable_when_the_socket_is_full() {
+        use std::io::Read;
+        let (worker, mut connection) =
+            channel_with_framing(super::super::arbiter::CancelToken::new(), true);
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        server.set_nonblocking(true).unwrap();
+        let mut filled = 0;
+        let buffer = [0_u8; 4096];
+        loop {
+            match server.write(&buffer) {
+                Ok(n) if n != 0 => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected synthetic socket write: {other:?}"),
+            }
+            assert!(filled < 1_000_000, "synthetic socket did not fill");
+        }
+        worker.framing(None);
+        connection.pump(&server).unwrap();
+        assert!(connection.optional_tail.is_empty());
+        worker.progress(2, 10).unwrap();
+        client.read_exact(&mut vec![0; filled]).unwrap();
+        server.set_nonblocking(false).unwrap();
+        connection.pump(&server).unwrap();
+        let expected = b"{\"EnrollmentSession\":{\"Progress\":{\"captured\":2,\"target\":10}}}\n";
+        let mut progress = [0; 64];
+        client.read_exact(&mut progress[..expected.len()]).unwrap();
+        assert_eq!(expected, &progress[..expected.len()]);
+    }
 
     #[test]
     fn merge_decline_and_authentication_preemption_end_the_wait() {

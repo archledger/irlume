@@ -47,9 +47,6 @@ pub(super) fn wait_and_respond(
         }
         match answer.recv_timeout(CLIENT_ALIVE_POLL) {
             Ok(resp) => {
-                if let Some(connection) = &mut session_connection {
-                    connection.pump(&stream)?;
-                }
                 if let Some(connection) = &mut position_connection {
                     connection.pump(&stream)?;
                 }
@@ -79,6 +76,9 @@ pub(super) fn wait_and_respond(
             }
         }
     };
+    if let Some(connection) = &mut session_connection {
+        connection.pump_final(&stream)?;
+    }
     resp.respond(stream)
 }
 

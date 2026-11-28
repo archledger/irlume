@@ -575,8 +575,20 @@ pub enum IntentAttestation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EnrollmentEvent {
     Started,
-    Progress { captured: usize, target: usize },
-    Merge { profile: String, remaining: usize },
+    Progress {
+        captured: usize,
+        target: usize,
+    },
+    Merge {
+        profile: String,
+        remaining: usize,
+    },
+    /// Optional display-only position from an opt-in enrollment connection.
+    Framing {
+        #[serde(default, deserialize_with = "deserialize_framing_position")]
+        position: Option<FramingPosition>,
+        sampled_mono_ms: u64,
+    },
 }
 
 /// The sole continuation accepted on an enrollment session's own socket.
@@ -661,6 +673,9 @@ pub enum Request {
         profile: Option<String>,
         scans: usize,
         improve: bool,
+        /// Ask for bounded capture framing feedback after authorization.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewfinder: bool,
     },
     /// 1:N identify ("who is this?"): one live capture, no claimed identity.
     /// Unprivileged (no credential release), but NOT unscoped: a root peer is
@@ -903,7 +918,13 @@ pub enum Request {
     /// `PositionSessionControl::Sample` receives one fresh `Position` report.
     /// Finish receives `PositionSessionEnded` after camera release. Closing
     /// the connection cancels. No enrollment or auth.
-    PositionSession { user: Option<String> },
+    PositionSession {
+        user: Option<String>,
+        /// Ask for coarse geometry. Only the acting non-root account's
+        /// admitted session can receive it; older daemons ignore the flag.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        viewfinder: bool,
+    },
 
     // --- keyring unlock (TPM-sealed password) -------------------------------
     /// Seal `user`'s login password in the TPM so a later face login can release
@@ -1488,9 +1509,65 @@ pub struct ProfileIrSummary {
     pub calibration_withheld: bool,
 }
 
-/// Framing-guide sample for guided enrollment; no raw image, safe to poll. The
-/// gates that set `well_framed` mirror the enroll/auth path, so "well framed"
-/// implies a capture will succeed.
+/// Coarse display position for the enrollment viewfinder, not a face image
+/// or a readiness decision. No facial landmarks or identity data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FramingPosition {
+    /// Horizontal bucket from the camera frame's left (0) to right (10).
+    pub x: u8,
+    /// Vertical bucket from the camera frame's top (0) to bottom (10).
+    pub y: u8,
+    /// Relative face size, from small (0) through large (2).
+    pub size: u8,
+}
+
+impl FramingPosition {
+    /// Whether the sample fits the viewfinder's coarse grid.
+    pub const fn in_bounds(self) -> bool {
+        self.x <= 10 && self.y <= 10 && self.size <= 2
+    }
+}
+
+/// Current Linux monotonic clock in milliseconds. This clock is shared by
+/// the local daemon and client under their normal time namespace.
+#[must_use]
+pub fn enrollment_monotonic_ms() -> Option<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is valid writable storage for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return None;
+    }
+    u64::try_from(value.tv_sec)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()? / 1_000_000)
+}
+
+/// Whether an enrollment observation is neither stale nor from the future.
+#[must_use]
+pub fn enrollment_framing_is_fresh(sampled_mono_ms: u64, now_mono_ms: u64) -> bool {
+    now_mono_ms
+        .checked_sub(sampled_mono_ms)
+        .is_some_and(|age| age < 2000)
+}
+
+fn deserialize_framing_position<'de, D>(
+    de: D,
+) -> std::result::Result<Option<FramingPosition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let position = serde_json::Value::deserialize(de)?;
+    Ok(serde_json::from_value::<FramingPosition>(position)
+        .ok()
+        .filter(|position| position.in_bounds()))
+}
+
+/// Framing-guide sample for guided enrollment; no raw image.
+/// `well_framed` is the cue to start a fresh capture, not its verdict.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PositionReport {
     pub face: bool,
@@ -1510,6 +1587,14 @@ pub struct PositionReport {
     pub well_framed: bool,
     /// One plain-language cue for the user ("Move closer", "Hold still", …).
     pub guidance: String,
+    /// Optional display-only position. Older peers omit it. Bad geometry
+    /// drops only the marker so it cannot stop the text guide.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_framing_position"
+    )]
+    pub viewfinder: Option<FramingPosition>,
 }
 
 /// Camera-free prerequisites; never qualification or login permission.
@@ -3189,6 +3274,49 @@ mod tests {
         }
         assert!(serde_json::from_str::<OldRequest>(&wire).is_err());
         assert!(serde_json::from_str::<OldRequest>(r#""Identify""#).is_ok());
+    }
+
+    #[test]
+    fn enrollment_framing_is_opt_in_and_additive() {
+        assert!(enrollment_framing_is_fresh(1_000, 2_999));
+        assert!(!enrollment_framing_is_fresh(1_000, 3_000));
+        assert!(!enrollment_framing_is_fresh(1_000, 999));
+        #[derive(Deserialize)]
+        enum OldRequest {
+            EnrollmentSession {
+                user: String,
+                profile: Option<String>,
+                scans: usize,
+                improve: bool,
+            },
+        }
+        let json =
+            r#"{"EnrollmentSession":{"user":"alice","profile":null,"scans":3,"improve":false}}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&req).unwrap(), json);
+        let opted_in = json.replace(r#""improve":false"#, r#""improve":false,"viewfinder":true"#);
+        let req: Request = serde_json::from_str(&opted_in).unwrap();
+        assert_eq!(serde_json::to_string(&req).unwrap(), opted_in);
+        let OldRequest::EnrollmentSession {
+            user,
+            profile,
+            scans,
+            improve,
+        } = serde_json::from_str(&opted_in).unwrap();
+        assert_eq!(
+            (user.as_str(), profile, scans, improve),
+            ("alice", None, 3, false)
+        );
+
+        let encoded = r#"{"EnrollmentSession":{"Framing":{"position":{"x":5,"y":4,"size":2},"sampled_mono_ms":1000}}}"#;
+        let reply: Response = serde_json::from_str(encoded).unwrap();
+        assert_eq!(serde_json::to_string(&reply).unwrap(), encoded);
+        let malformed = encoded.replace(r#""size":2"#, r#""size":100"#);
+        let reply: Response = serde_json::from_str(&malformed).unwrap();
+        assert_eq!(
+            serde_json::to_string(&reply).unwrap(),
+            r#"{"EnrollmentSession":{"Framing":{"position":null,"sampled_mono_ms":1000}}}"#
+        );
     }
 
     #[test]

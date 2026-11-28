@@ -483,6 +483,14 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             enrollment.profile = "Synthetic enrollment".into();
             enrollment.captured = 1;
             enrollment.last = Some(good_report("Synthetic guidance: hold still"));
+            enrollment.viewfinder = Some(ViewfinderSample {
+                position: Some(FramingPosition {
+                    x: if state == "countdown" { 5 } else { 2 },
+                    y: 5,
+                    size: 1,
+                }),
+                sampled_at: app.now(),
+            });
             if state == "countdown" {
                 enrollment.count = Some(3);
             } else if state == "stalled" {

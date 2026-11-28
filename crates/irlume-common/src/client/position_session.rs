@@ -25,6 +25,23 @@ impl PositionSession {
     /// Returns transport, cancellation, deadline or protocol errors. All other
     /// daemon refusals are errors and must not trigger compatibility fallback.
     pub fn connect(user: &str, cancelled: &AtomicBool) -> io::Result<Option<Self>> {
+        Self::connect_inner(user, false, cancelled)
+    }
+
+    /// Start a framing session and request optional viewfinder geometry.
+    /// Older daemons can start the session and return only text cues.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::connect`].
+    pub fn connect_with_viewfinder(user: &str, cancelled: &AtomicBool) -> io::Result<Option<Self>> {
+        Self::connect_inner(user, true, cancelled)
+    }
+
+    fn connect_inner(
+        user: &str,
+        viewfinder: bool,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Option<Self>> {
         let stream = super::connect_stream(Duration::from_millis(100))?;
         let mut session = Self {
             stream,
@@ -34,6 +51,7 @@ impl PositionSession {
         session.check(cancelled)?;
         (&session.stream).write_all(&super::serialize_request(&Request::PositionSession {
             user: Some(user.to_owned()),
+            viewfinder,
         })?)?;
         match session.read_reply(cancelled, true)? {
             Response::PositionSessionStarted => Ok(Some(session)),
@@ -193,6 +211,53 @@ impl PositionSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_viewfinder_is_additive_on_the_wire() {
+        const OLD_REQUEST: &str = r#"{"PositionSession":{"user":"alice"}}"#;
+        const NEW_REQUEST: &str = r#"{"PositionSession":{"user":"alice","viewfinder":true}}"#;
+
+        for wire in [OLD_REQUEST, NEW_REQUEST] {
+            let request: Request = serde_json::from_str(wire).unwrap();
+            assert_eq!(serde_json::to_string(&request).unwrap(), wire);
+        }
+
+        #[derive(serde::Deserialize)]
+        enum OldRequest {
+            PositionSession { user: Option<String> },
+        }
+        let OldRequest::PositionSession { user } = serde_json::from_str(NEW_REQUEST).unwrap();
+        assert_eq!(user.as_deref(), Some("alice"));
+
+        let mut legacy = serde_json::json!({"Position": {
+            "face": true, "face_frac": 0.25, "centered": false, "yaw_asym": 0.0,
+            "pitch_frac": 0.5, "brightness": 100.0, "ir_ok": false, "quality": 70,
+            "well_framed": false, "guidance": "Center your face in the frame"
+        }});
+        let old_report: Response = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(old_report).unwrap(), legacy);
+
+        let expected = serde_json::json!({"x": 1, "y": 6, "size": 2});
+        legacy["Position"]["viewfinder"] = expected.clone();
+        let new_report: Response = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(new_report).unwrap()["Position"]["viewfinder"],
+            expected
+        );
+
+        for invalid in [
+            serde_json::json!({"x": 11, "y": 6, "size": 2}),
+            serde_json::json!({"x": -1, "y": 6, "size": 2}),
+            serde_json::json!({"x": 1, "y": 6, "size": 3}),
+        ] {
+            legacy["Position"]["viewfinder"] = invalid;
+            let Response::Position(report) = serde_json::from_value(legacy.clone()).unwrap() else {
+                panic!("expected a usable position report");
+            };
+            assert_eq!(report.guidance, "Center your face in the frame");
+            assert!(report.viewfinder.is_none());
+        }
+    }
 
     fn local_session() -> (PositionSession, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();

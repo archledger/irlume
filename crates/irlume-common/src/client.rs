@@ -346,8 +346,12 @@ fn enrollment_session_with_connect(
     };
     let mut reader = std::io::BufReader::new(reader);
     // The scan cap is 30, with one probe/merge and occasional target updates.
-    // A fake endpoint cannot send an unbounded event stream.
-    for _ in 0..128 {
+    // The daemon's optional 250 ms pump can send many more observations over
+    // the 380 s deadline. Once advisory delivery is capped, keep reading
+    // under the existing deadline and line-size bound for progress or result.
+    let mut mandatory_left = 128_u16;
+    let mut advisory_left = 2048_u16;
+    while mandatory_left != 0 {
         if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -372,6 +376,14 @@ fn enrollment_session_with_connect(
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         match response {
             Response::EnrollmentSession(progress) => {
+                if matches!(progress, crate::EnrollmentEvent::Framing { .. }) {
+                    if advisory_left == 0 {
+                        continue;
+                    }
+                    advisory_left -= 1;
+                } else {
+                    mandatory_left -= 1;
+                }
                 let merge = matches!(progress, crate::EnrollmentEvent::Merge { .. });
                 let answer = event(progress)?;
                 if merge {
@@ -821,6 +833,7 @@ mod tests {
                 profile: Some("main".into()),
                 scans: 1,
                 improve: false,
+                viewfinder: false,
             },
             &cancelled,
             |_| panic!("cancelled request emitted an event"),
@@ -863,6 +876,7 @@ mod tests {
                 profile: Some("main".into()),
                 scans: 1,
                 improve: false,
+                viewfinder: false,
             },
         ];
         let results: Vec<_> = requests
@@ -910,6 +924,7 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: false,
+                viewfinder: false,
             },
             &stop,
             |_| {
@@ -924,6 +939,52 @@ mod tests {
             matches!(result,Err(ref e) if e.kind()==io::ErrorKind::ConnectionAborted),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn enrollment_framing_does_not_consume_the_progress_budget() {
+        const ADVISORIES: usize = 2_100;
+        let (device, peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || -> io::Result<()> {
+            let mut stream = BufReader::new(peer);
+            let mut line = String::new();
+            stream.read_line(&mut line)?;
+            let mut peer = stream.into_inner();
+            peer.write_all(b"{\"EnrollmentSession\":\"Started\"}\n")?;
+            for _ in 0..ADVISORIES {
+                peer.write_all(b"{\"EnrollmentSession\":{\"Framing\":{\"position\":null,\"sampled_mono_ms\":0}}}\n")?;
+            }
+            peer.write_all(b"{\"EnrollmentSession\":{\"Progress\":{\"captured\":3,\"target\":3}}}\n{\"Ok\":\"finished\"}\n")
+        });
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut framing = 0;
+        let mut progress = 0;
+        let result = enrollment_session_with_connect(
+            &Request::EnrollmentSession {
+                user: "alice".into(),
+                profile: None,
+                scans: 3,
+                improve: false,
+                viewfinder: true,
+            },
+            &stop,
+            |event| {
+                match event {
+                    crate::EnrollmentEvent::Framing { .. } => framing += 1,
+                    crate::EnrollmentEvent::Progress { captured, .. } => progress = captured,
+                    _ => {}
+                }
+                Ok(None)
+            },
+            || Ok(device),
+        );
+        let server_result = server.join().unwrap();
+        assert!(
+            matches!(result, Ok(Response::Ok(ref message)) if message == "finished"),
+            "{result:?}"
+        );
+        server_result.unwrap();
+        assert_eq!((framing, progress), (2048, 3));
     }
 
     #[test]
@@ -981,11 +1042,12 @@ mod tests {
                 profile: None,
                 scans: 10,
                 improve: false,
+                viewfinder: false,
             },
             &stop,
             |event| {
                 match event {
-                    crate::EnrollmentEvent::Started => {}
+                    crate::EnrollmentEvent::Started | crate::EnrollmentEvent::Framing { .. } => {}
                     crate::EnrollmentEvent::Progress { captured, target } => {
                         progress.push((captured, target))
                     }
@@ -1007,6 +1069,36 @@ mod tests {
         );
         assert_eq!(progress, vec![(1, 10)]);
         assert!(accepted);
+    }
+
+    #[test]
+    fn position_viewfinder_connect_uses_the_existing_handshake() {
+        let _g = testenv::lock();
+        let path = sock("viewfinder");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::env::set_var("IRLUME_SOCKET", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            stream.write_all(b"\"PositionSessionStarted\"\n").unwrap();
+            line
+        });
+        let connected = PositionSession::connect_with_viewfinder(
+            "alice",
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let received = server.join().unwrap();
+        std::env::remove_var("IRLUME_SOCKET");
+        std::fs::remove_file(path).unwrap();
+        assert!(connected.unwrap().is_some());
+        assert_eq!(
+            received,
+            "{\"PositionSession\":{\"user\":\"alice\",\"viewfinder\":true}}\n"
+        );
     }
 
     #[test]

@@ -1120,6 +1120,12 @@ pub trait PositionObserver {
 
 /// Interaction confined to one authorized enrollment operation.
 pub trait EnrollmentObserver {
+    /// Whether this authorized enrollment asked for display-only feedback.
+    fn wants_framing(&self) -> bool {
+        false
+    }
+    /// Optional framing observation. It cannot fail capture or admit a scan.
+    fn framing(&self, _position: Option<irlume_common::FramingPosition>) {}
     /// # Errors
     /// Returns an error when this operation must stop before further work.
     fn check(&self) -> irlume_common::Result<()> {
@@ -1248,6 +1254,12 @@ struct EnrollmentProgress<'a> {
     target: usize,
 }
 impl EnrollmentObserver for EnrollmentProgress<'_> {
+    fn wants_framing(&self) -> bool {
+        self.observer.wants_framing()
+    }
+    fn framing(&self, position: Option<irlume_common::FramingPosition>) {
+        self.observer.framing(position);
+    }
     fn check(&self) -> irlume_common::Result<()> {
         self.observer.check()
     }
@@ -5257,6 +5269,14 @@ impl Engine {
         &mut self,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Assessment> {
+        self.assess_rgb_only_observed(diagnostics, &())
+    }
+
+    fn assess_rgb_only_observed(
+        &mut self,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> irlume_common::Result<Assessment> {
         self.check_request_active()?;
         let capture_started = std::time::Instant::now();
         let rgb = match irlume_camera::capture_rgb_denoised_with_control(
@@ -5288,6 +5308,7 @@ impl Engine {
             identity: (rgb_image, _),
         } = self.assess_rgb_only_frame_deferred(rgb, diagnostics)?;
         self.check_request_active()?;
+        report_existing_rgb(observer, rgb_image.as_ref());
         let embedding = match rgb_image {
             Some(image) => {
                 let view = align::RgbView {
@@ -5480,6 +5501,7 @@ impl Engine {
         mode: Option<&CaptureModeSelection>,
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
     ) -> Result<Assessment, CapturePathError> {
         self.assess_with_fresh_pair_finish(
             rgb,
@@ -5488,6 +5510,7 @@ impl Engine {
             operation,
             diagnostics,
             |engine, evidence| {
+                report_existing_rgb(observer, evidence.identity.0.as_ref());
                 engine
                     .materialize_pair_identity(evidence, diagnostics)
                     .map_err(CapturePathError::from)
@@ -5565,6 +5588,20 @@ impl Engine {
         operation: &irlume_camera::lease::CameraOperationSession,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> Result<Assessment, CapturePathError> {
+        self.assess_full_observed(held, capture_mode, operation, diagnostics, &())
+    }
+
+    fn assess_full_observed(
+        &mut self,
+        held: Option<(
+            &mut irlume_camera::RgbSession<'_>,
+            &mut irlume_camera::IrSession<'_>,
+        )>,
+        capture_mode: Option<&CaptureModeSelection>,
+        operation: &irlume_camera::lease::CameraOperationSession,
+        diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
+        observer: &dyn EnrollmentObserver,
+    ) -> Result<Assessment, CapturePathError> {
         #[cfg(feature = "test-support")]
         if held.is_none()
             && operation.lease().is_split_pair()
@@ -5581,6 +5618,7 @@ impl Engine {
             operation,
             diagnostics,
             |engine, evidence| {
+                report_existing_rgb(observer, evidence.identity.0.as_ref());
                 engine
                     .materialize_pair_identity(evidence, diagnostics)
                     .map_err(CapturePathError::from)
@@ -9046,15 +9084,17 @@ impl Engine {
                         Some(policy.mode),
                         operation,
                         policy.diagnostics,
+                        policy.observer,
                     ),
-                    None if policy.use_ir => self.assess_full_with(
+                    None if policy.use_ir => self.assess_full_observed(
                         None,
                         Some(policy.mode),
                         operation,
                         policy.diagnostics,
+                        policy.observer,
                     ),
                     None => self
-                        .assess_rgb_only_with_diagnostics(policy.diagnostics)
+                        .assess_rgb_only_observed(policy.diagnostics, policy.observer)
                         .map_err(CapturePathError::from),
                 })
                 .map_err(|error| {
@@ -10663,12 +10703,13 @@ impl Engine {
         )?
         .pop()
         .ok_or_else(|| irlume_common::Error::Hardware("no frames captured".into()))?;
-        position_report(&mut self.det, &rgb, pitch_neutral)
+        position_report(&mut self.det, &rgb, pitch_neutral, false)
     }
 
     /// Serve one bounded framing connection with a single calibration lookup
     /// and RGB streaming session. The actual enrollment still captures and
     /// validates its own fresh evidence after this operation has released.
+    /// The caller must authorize `viewfinder` before enabling coarse geometry.
     ///
     /// # Errors
     /// Returns calibration-independent camera/transport/inference errors,
@@ -10677,15 +10718,17 @@ impl Engine {
     pub fn position_session(
         &mut self,
         user: Option<&str>,
+        viewfinder: bool,
         observer: &dyn PositionObserver,
     ) -> irlume_common::Result<()> {
         let mut request = self.prepare_camera_request()?;
-        request.position_session_prepared(user, observer)
+        request.position_session_prepared(user, viewfinder, observer)
     }
 
     fn position_session_prepared(
         &mut self,
         user: Option<&str>,
+        viewfinder: bool,
         observer: &dyn PositionObserver,
     ) -> irlume_common::Result<()> {
         use irlume_common::{
@@ -10740,8 +10783,9 @@ impl Engine {
                     // Only YuNet crosses into the scoped processor. The rest
                     // of the Engine, including TFLite, stays on its owner thread.
                     let det = &mut self.det;
-                    let report = session
-                        .process_frame(move |rgb| position_report(det, &rgb, pitch_neutral))?;
+                    let report = session.process_frame(move |rgb| {
+                        position_report(det, &rgb, pitch_neutral, viewfinder)
+                    })?;
                     observer.report(report)?;
                 }
                 None => session.discard_frame()?,
@@ -10750,13 +10794,67 @@ impl Engine {
     }
 }
 
+fn report_existing_rgb(observer: &dyn EnrollmentObserver, rgb: Option<&IdentityImage>) {
+    observe_enrollment_framing(
+        observer,
+        rgb.map(|image| (image.face.bbox, image.width, image.height)),
+    );
+}
+
+fn observe_enrollment_framing(
+    observer: &dyn EnrollmentObserver,
+    detection: Option<([f32; 4], u32, u32)>,
+) {
+    if observer.wants_framing() {
+        observer.framing(
+            detection.and_then(|(bbox, width, height)| framing_position(bbox, width, height)),
+        );
+    }
+}
+
+fn framing_position(
+    bbox: [f32; 4],
+    width: u32,
+    height: u32,
+) -> Option<irlume_common::FramingPosition> {
+    let [x1, y1, x2, y2] = bbox;
+    let (w, h) = (width as f32, height as f32);
+    if width == 0
+        || height == 0
+        || !bbox.into_iter().all(f32::is_finite)
+        || x1 >= x2
+        || y1 >= y2
+        || x2 <= 0.0
+        || y2 <= 0.0
+        || x1 >= w
+        || y1 >= h
+    {
+        return None;
+    }
+
+    let bucket =
+        |center: f32, extent: f32| ((center / extent).clamp(0.0, 1.0) * 10.0).round() as u8;
+    let fraction = (x2 - x1) / w;
+    Some(irlume_common::FramingPosition {
+        x: bucket(x1.midpoint(x2), w),
+        y: bucket(y1.midpoint(y2), h),
+        size: if fraction < MIN_FRAC {
+            0
+        } else if fraction > FRAME_MAX_FRAC {
+            2
+        } else {
+            1
+        },
+    })
+}
+
 fn position_report(
     det: &mut Detector,
     rgb: &irlume_camera::Frame,
     pitch_neutral: Option<f32>,
+    viewfinder: bool,
 ) -> irlume_common::Result<irlume_common::PositionReport> {
     use irlume_common::PositionReport;
-    const MAX_FRAC: f32 = 0.55;
     const BRIGHT: f32 = 235.0;
     let view = align::RgbView {
         data: &rgb.data,
@@ -10803,7 +10901,7 @@ fn position_report(
         guidance = "Move closer".into();
         well = false;
         q -= 45;
-    } else if face_frac > MAX_FRAC {
+    } else if face_frac > FRAME_MAX_FRAC {
         guidance = "Move back a little".into();
         well = false;
         q -= 30;
@@ -10835,6 +10933,11 @@ fn position_report(
         quality: q.clamp(0, 100) as u8,
         well_framed: well,
         guidance,
+        viewfinder: if viewfinder {
+            framing_position(f.bbox, rgb.width, rgb.height)
+        } else {
+            None
+        },
     })
 }
 
@@ -10859,6 +10962,8 @@ const FRAME_YAW_ASYM_MAX: f32 = 0.36;
 /// module-level so the attempt situation line (#616 step 2) names `too far`
 /// by the SAME bar the enrollment guide coaches to.
 const MIN_FRAC: f32 = 0.12;
+/// Face width relative to the frame at which the guide asks for more distance.
+const FRAME_MAX_FRAC: f32 = 0.55;
 /// Max face-center offset from frame center, fraction of frame size, before
 /// the framing guide says `Center your face in the frame`; the situation
 /// line's `off-center` uses it unchanged.
@@ -11600,6 +11705,69 @@ pub fn eye_glint_of(
 mod tests {
     use super::*;
     use irlume_core::storage::{Enrollment, FaceProfile, FaceScan, LEGACY_RECOGNIZER_SPACE};
+
+    #[test]
+    fn enrollment_framing_reuses_rgb_assessment() {
+        use std::cell::RefCell;
+        struct Observer(bool, RefCell<Vec<Option<irlume_common::FramingPosition>>>);
+        impl EnrollmentObserver for Observer {
+            fn wants_framing(&self) -> bool {
+                self.0
+            }
+            fn framing(&self, position: Option<irlume_common::FramingPosition>) {
+                self.1.borrow_mut().push(position);
+            }
+        }
+        let enabled = Observer(true, RefCell::default());
+        let disabled = Observer(false, RefCell::default());
+        let detection = ([40.0, 40.0, 60.0, 60.0], 100, 100);
+        for observer in [&enabled, &disabled] {
+            observe_enrollment_framing(observer, Some(detection));
+            observe_enrollment_framing(observer, None);
+            observe_enrollment_framing(observer, Some(([f32::NAN; 4], 100, 100)));
+        }
+        assert_eq!(
+            *enabled.1.borrow(),
+            [
+                Some(irlume_common::FramingPosition {
+                    x: 5,
+                    y: 5,
+                    size: 1
+                }),
+                None,
+                None
+            ]
+        );
+        assert!(disabled.1.borrow().is_empty());
+    }
+
+    #[test]
+    fn framing_viewfinder_projects_valid_detection_only() {
+        for (bbox, expected) in [
+            ([40.0, 40.0, 60.0, 60.0], (5, 5, 1)),
+            ([-20.0, 5.0, 10.0, 20.0], (0, 1, 1)),
+            ([95.0, 40.0, 105.0, 60.0], (10, 5, 0)),
+            ([5.0, 0.0, 95.0, 90.0], (5, 5, 2)),
+        ] {
+            let position = framing_position(bbox, 100, 100).unwrap();
+            assert_eq!((position.x, position.y, position.size), expected);
+            assert!(position.in_bounds());
+        }
+
+        for bbox in [
+            [f32::NAN, 5.0, 10.0, 20.0],
+            [0.0, 5.0, f32::INFINITY, 20.0],
+            [10.0, 5.0, 0.0, 20.0],
+            [5.0, 20.0, 10.0, 5.0],
+            [-20.0, 5.0, -10.0, 20.0],
+            [0.0, 100.0, 10.0, 110.0],
+            [10.0, 5.0, 10.0, 20.0],
+        ] {
+            assert!(framing_position(bbox, 100, 100).is_none(), "{bbox:?}");
+        }
+        assert!(framing_position([1.0, 1.0, 2.0, 2.0], 0, 100).is_none());
+        assert!(framing_position([1.0, 1.0, 2.0, 2.0], 100, 0).is_none());
+    }
 
     /// Serializes access to process-wide env vars (`IRLUME_GRACE_MS`,
     /// `IRLUME_STATE_DIR`, `IRLUME_METHOD_CONF`, ...) across this binary's

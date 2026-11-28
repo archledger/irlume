@@ -691,7 +691,7 @@ fn guarded_split_retained_scope_refuses_direct_trust_entries_before_preflight_or
         .to_string()
         .contains(closed));
     assert!(request
-        .position_session(None, &Position)
+        .position_session(None, false, &Position)
         .unwrap_err()
         .to_string()
         .contains(closed));
@@ -1925,7 +1925,7 @@ fn selected_split_direct_entry_matrix_stops_before_camera_and_publication() {
     refusals.push(
         devices
             .engine
-            .position_session(None, &Position)
+            .position_session(None, false, &Position)
             .unwrap_err()
             .to_string(),
     );

@@ -5,15 +5,15 @@
 //!
 //! Layout & feel follow a system-settings app: stable, grouped navigation; a
 //! focused Overview that names the next useful action; contextual activity
-//! history; and a compact action footer. Enrollment uses **guided cues**, a
-//! live framing guide (quality + checklist + guidance) with a 3-2-1 countdown
-//! and auto-capture, instead of a live video preview (which a terminal can't
-//! show). A thin client: all work happens in the daemon.
+//! history; and a compact action footer. Enrollment uses text cues and a
+//! pixel-free framing guide with a 3-2-1 countdown and auto-capture. Camera
+//! work stays in the daemon.
 
 mod actions;
 mod activity;
 mod attempts;
 pub(crate) mod dates;
+mod framing_viewfinder;
 mod freshness;
 mod launch;
 mod polling;
@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use irlume_common::{PositionReport, ProfileSummary, Request, Response};
+use irlume_common::{FramingPosition, PositionReport, ProfileSummary, Request, Response};
 
 /// Semantic foregrounds use the user's ANSI palette on both light and dark
 /// terminals. Leave backgrounds at their terminal defaults; fixed RGB pastels
@@ -547,6 +547,16 @@ struct RecoveryInfo {
 #[derive(Debug)]
 enum WMsg {
     Cue(PositionReport),
+    Viewfinder {
+        position: Option<FramingPosition>,
+        sampled_at: Instant,
+    },
+    CaptureStarted,
+    LegacyScanRequested,
+    CaptureFraming {
+        position: Option<FramingPosition>,
+        sampled_mono_ms: u64,
+    },
     /// A framing-guide poll got no answer (timeout / connection error). NOT a
     /// biometric observation: the UI must stop showing the last cue as if it
     /// were current (#309).
@@ -559,6 +569,7 @@ enum WMsg {
         ambient_lit: usize,
     },
     Err(String),
+    Unknown(String),
     /// Scan 1 of a "new profile" enroll matched an existing identity, so the
     /// daemon merged it into `profile` instead. The worker ends here and hands
     /// off to the UI, which confirms with the user before adding the rest.
@@ -597,12 +608,36 @@ struct SessionMerge {
     answer: mpsc::Sender<bool>,
 }
 
+struct ViewfinderSample {
+    position: Option<FramingPosition>,
+    sampled_at: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum EnrollmentPhase {
+    #[default]
+    Framing,
+    Authorizing,
+    Capturing,
+    LegacyScan,
+}
+
+struct EnrollmentResultView {
+    profile: String,
+    captured: usize,
+    total: usize,
+    message: &'static str,
+}
+
 struct EnrollUi {
     session_merge: Option<SessionMerge>,
     rx: mpsc::Receiver<WMsg>,
     stop: Arc<AtomicBool>,
     profile: String,
     last: Option<PositionReport>,
+    viewfinder: Option<ViewfinderSample>,
+    phase: EnrollmentPhase,
+    capture_framing: Option<(FramingPosition, u64)>,
     count: Option<u8>,
     /// The framing guide stopped answering (timeout or connection error), with
     /// the transport error. Rendered INSTEAD of the last cue: a stale
@@ -619,6 +654,17 @@ struct EnrollUi {
     /// Ambient-lit count of scans added BEFORE this worker started (the
     /// merged scan(s)), folded into the completion note's total (#312).
     ambient_base: usize,
+}
+
+impl EnrollUi {
+    fn result_view(&self, message: &'static str) -> EnrollmentResultView {
+        EnrollmentResultView {
+            profile: self.profile.clone(),
+            captured: self.captured + self.base,
+            total: self.target + self.base,
+            message,
+        }
+    }
 }
 
 struct Op {
@@ -861,6 +907,7 @@ struct App {
     hub_sel: usize,
     op: Option<Op>,
     enroll: Option<EnrollUi>,
+    enrollment_result: Option<EnrollmentResultView>,
     /// A pending merge confirmation (scan 1 matched an existing profile).
     enroll_merge: Option<MergeConfirm>,
     fp: FpInfo,
@@ -2413,6 +2460,7 @@ impl App {
             hub_sel: 0,
             op: None,
             enroll: None,
+            enrollment_result: None,
             enroll_merge: None,
             fp: FpInfo::default(),
             recovery: None,
@@ -3970,7 +4018,8 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (st, pn, addc) = (stop.clone(), profile.clone(), add.clone());
-        std::thread::spawn(move || enroll_worker(user, pn, addc, target, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, addc, target, viewfinder, st, tx));
         self.log(
             '→',
             format!("guided enroll → '{profile}' ({target} scan(s))"),
@@ -3981,6 +4030,9 @@ impl App {
             stop,
             profile,
             last: None,
+            viewfinder: None,
+            phase: EnrollmentPhase::default(),
+            capture_framing: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -3988,6 +4040,7 @@ impl App {
             base: 0,
             ambient_base: 0,
         });
+        self.enrollment_result = None;
     }
 
     /// User confirmed the merge: keep the scan already added and, if the profile
@@ -4010,13 +4063,17 @@ impl App {
         let add = Some(mc.profile.clone());
         let base = mc.added_scans.len(); // the merged scan(s), for a continuous count
         let ambient_base = mc.ambient_lit;
-        std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, add, mc.remaining, viewfinder, st, tx));
         self.enroll = Some(EnrollUi {
             session_merge: None,
             rx,
             stop,
             profile: mc.profile,
             last: None,
+            viewfinder: None,
+            phase: EnrollmentPhase::default(),
+            capture_framing: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -4024,6 +4081,7 @@ impl App {
             base,
             ambient_base,
         });
+        self.enrollment_result = None;
     }
 
     /// User declined the merge: remove the scan(s) scan 1 already added, so the
@@ -4328,6 +4386,8 @@ impl App {
                             e.profile = prompt.profile.clone();
                             e.session_merge = Some(prompt);
                             e.count = None;
+                            e.viewfinder = None;
+                            e.capture_framing = None;
                         }
                     }
                     WMsg::Authorizing => {
@@ -4336,20 +4396,81 @@ impl App {
                             "approve the system authentication dialog for this enrollment",
                         );
                         if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::Authorizing;
                             e.count = None;
+                            e.viewfinder = None;
+                            e.capture_framing = None;
+                            e.last = None;
+                            e.stalled = None;
+                        }
+                    }
+                    WMsg::CaptureStarted => {
+                        if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::Capturing;
+                            e.count = None;
+                            e.capture_framing = None;
+                        }
+                    }
+                    WMsg::LegacyScanRequested => {
+                        if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::LegacyScan;
+                            e.last = None;
+                            e.count = None;
+                            e.viewfinder = None;
+                            e.capture_framing = None;
+                        }
+                    }
+                    WMsg::CaptureFraming {
+                        position,
+                        sampled_mono_ms,
+                    } => {
+                        if let Some(e) = self.enroll.as_mut().filter(|e| {
+                            e.phase == EnrollmentPhase::Capturing && e.session_merge.is_none()
+                        }) {
+                            e.capture_framing = position
+                                .filter(|position| position.in_bounds())
+                                .filter(|_| {
+                                    irlume_common::enrollment_monotonic_ms().is_some_and(|now| {
+                                        irlume_common::enrollment_framing_is_fresh(
+                                            sampled_mono_ms,
+                                            now,
+                                        )
+                                    })
+                                })
+                                .map(|position| (position, sampled_mono_ms));
                         }
                     }
                     WMsg::Cue(r) => {
                         if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::Framing;
+                            e.capture_framing = None;
                             e.last = Some(r);
                             e.count = None;
                             e.stalled = None;
                         }
                     }
+                    WMsg::Viewfinder {
+                        position,
+                        sampled_at,
+                    } => {
+                        if let Some(e) = self
+                            .enroll
+                            .as_mut()
+                            .filter(|e| e.phase == EnrollmentPhase::Framing)
+                        {
+                            e.viewfinder = Some(ViewfinderSample {
+                                position: position.filter(|p| p.in_bounds()),
+                                sampled_at,
+                            });
+                        }
+                    }
                     WMsg::Stall(err) => {
                         if let Some(e) = &mut self.enroll {
+                            e.phase = EnrollmentPhase::Framing;
                             e.stalled = Some(err);
                             e.count = None;
+                            e.viewfinder = None;
+                            e.capture_framing = None;
                         }
                     }
                     WMsg::Count(c) => {
@@ -4362,11 +4483,17 @@ impl App {
                         if let Some(e) = &mut self.enroll {
                             e.captured = n;
                             e.target = t;
+                            e.phase = EnrollmentPhase::Capturing;
                             e.count = None;
+                            e.viewfinder = None;
                         }
                         self.log('✓', format!("captured scan {}/{}", n + base, t + base));
                     }
                     WMsg::Done { ambient_lit } => {
+                        self.enrollment_result = self
+                            .enroll
+                            .as_ref()
+                            .map(|e| e.result_view("Enrollment complete"));
                         // Before the completion: the collapsed Activity strip
                         // shows the newest entry, which stays the completion
                         // or the ambient-light warning below.
@@ -4390,8 +4517,20 @@ impl App {
                         finished = true;
                     }
                     WMsg::Err(e) => {
+                        self.enrollment_result = self
+                            .enroll
+                            .as_ref()
+                            .map(|e| e.result_view("Enrollment failed"));
                         let e = e.strip_prefix("hardware: ").unwrap_or(&e);
                         self.set_error(format!("Enrollment failed: {e}"));
+                        finished = true;
+                    }
+                    WMsg::Unknown(e) => {
+                        self.enrollment_result = self
+                            .enroll
+                            .as_ref()
+                            .map(|e| e.result_view("Enrollment outcome unknown"));
+                        self.set_error(e);
                         finished = true;
                     }
                     WMsg::MergePrompt {
@@ -4434,6 +4573,8 @@ impl App {
             if disconnected && !finished {
                 if let Some(enrollment) = &self.enroll {
                     enrollment.stop.store(true, Ordering::Relaxed);
+                    self.enrollment_result =
+                        Some(enrollment.result_view("Enrollment outcome unknown"));
                 }
                 self.set_error("The enrollment task ended without a result. Its outcome is unknown; refreshing saved profiles before you retry.");
                 finished = true;
@@ -4998,16 +5139,19 @@ impl App {
     /// predictable instead of exiting the app.
     fn go_home(&mut self) {
         if self.visible.contains(&SC_WELCOME) && self.screen != SC_WELCOME {
-            self.screen = SC_WELCOME;
-            // Entering Overview re-reads the attempt it leads with, however
-            // it was reached (enter_screen does the same).
-            self.refresh_attempts();
+            self.enter_screen(SC_WELCOME);
         }
     }
 
     fn on_key(&mut self, code: KeyCode) {
         // A key between two clicks ends a double click.
         self.repair_click = None;
+        if matches!(code, KeyCode::Enter | KeyCode::Esc)
+            && self.enrollment_result_is_exposed()
+            && self.enrollment_result.take().is_some()
+        {
+            return;
+        }
         // A long dialog owns its reading keys. They never dismiss/approve the
         // dialog or scroll the Activity behind it. Text-entry keeps its keys.
         if self.input.is_none() && self.dialog_open() {
@@ -5166,6 +5310,7 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     if let Some(e) = self.enroll.take() {
+                        self.enrollment_result = Some(e.result_view("Cancellation requested"));
                         if let Some(prompt) = e.session_merge {
                             let _ = prompt.answer.send(false);
                         }
@@ -5185,6 +5330,7 @@ impl App {
         if let Some(e) = &self.enroll {
             if matches!(code, KeyCode::Esc) {
                 e.stop.store(true, Ordering::Relaxed);
+                self.enrollment_result = Some(e.result_view("Cancellation requested"));
                 self.enroll = None;
                 self.log(
                     '·',
@@ -5491,6 +5637,7 @@ impl App {
     /// Land on a screen, from Tab/arrows OR a sidebar click, and run the same
     /// per-screen refresh the step-walk did.
     fn enter_screen(&mut self, screen: usize) {
+        self.enrollment_result = None;
         self.screen = screen;
         self.sel = 0;
         // Fast diagnostics on entering Repair/Fingerprint (no slow profile
@@ -6831,7 +6978,8 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (st, pn) = (stop.clone(), name.clone());
-        std::thread::spawn(move || enroll_worker(user, pn, None, ENROLL_SCANS, st, tx));
+        let viewfinder = !self.reduce_motion;
+        std::thread::spawn(move || enroll_worker(user, pn, None, ENROLL_SCANS, viewfinder, st, tx));
         self.log(
             '→',
             format!("guided enroll → '{name}' ({ENROLL_SCANS} scans)"),
@@ -6842,6 +6990,9 @@ impl App {
             stop,
             profile: name,
             last: None,
+            viewfinder: None,
+            phase: EnrollmentPhase::default(),
+            capture_framing: None,
             count: None,
             stalled: None,
             captured: 0,
@@ -6849,6 +7000,7 @@ impl App {
             base: 0,
             ambient_base: 0,
         });
+        self.enrollment_result = None;
     }
 
     // ---- rendering --------------------------------------------------------
@@ -7040,6 +7192,7 @@ impl App {
     /// already adapts to their hardware.
     fn is_first_run(&self) -> bool {
         self.enroll.is_none()
+            && self.enrollment_result.is_none()
             && self.screen == SC_WELCOME
             && self.caps.rgb
             && self.enrolled_known() == Some(false)
@@ -7260,6 +7413,14 @@ impl App {
                 .enroll
                 .as_ref()
                 .is_some_and(|e| e.session_merge.is_some())
+    }
+
+    fn enrollment_result_is_exposed(&self) -> bool {
+        self.enroll.is_none()
+            && !self.dialog_open()
+            && !self.activity_history_open
+            && self.more_actions.is_none()
+            && self.sections.is_none()
     }
 
     fn on_scroll(&mut self, col: u16, row: u16, area: Rect, direction: i32) {
@@ -7709,6 +7870,10 @@ impl App {
             self.draw_enroll(f, inner);
             return;
         }
+        if let Some(result) = &self.enrollment_result {
+            self.draw_enrollment_result(f, inner, result);
+            return;
+        }
         match self.screen {
             SC_WELCOME => self.draw_welcome(f, inner),
             SC_REPAIR => self.draw_repair(f, inner),
@@ -7738,39 +7903,50 @@ impl App {
     }
 
     fn draw_enroll(&self, f: &mut Frame, area: Rect) {
+        const APPROVAL: &str = "Approve the system dialog when prompted to continue.";
         let e = self.enroll.as_ref().unwrap();
         let r = e.last.as_ref();
         let captured = e.captured + e.base;
         let total = e.target + e.base;
         let current = captured.saturating_add(1).min(total.max(1));
-        let filled = captured.saturating_mul(20) / total.max(1);
-        let progress = format!(
-            "[{}{}] {captured}/{total}",
-            "█".repeat(filled.min(20)),
-            "░".repeat(20usize.saturating_sub(filled.min(20)))
-        );
-        let chk = |ok: bool, label: &str| {
+        let progress_bar = |width: usize| {
+            let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
+            format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+        };
+        let chk = |ok: bool, label: &'static str| {
             Line::from(vec![
                 Span::styled(
-                    if ok { "  ● " } else { "  ○ " },
+                    if ok { "● " } else { "○ " },
                     if ok {
                         Style::new().fg(th().ok)
                     } else {
                         Style::new().dim()
                     },
                 ),
-                Span::styled(
-                    label.to_string(),
-                    if ok { Style::new() } else { Style::new().dim() },
-                ),
+                Span::styled(label, if ok { Style::new() } else { Style::new().dim() }),
             ])
         };
-        let face = r.map(|x| x.face).unwrap_or(false);
-        let cue = if e.stalled.is_some() {
+        let mut cue = if e.stalled.is_some() {
             Line::from(Span::styled(
                 "Camera guide not answering; this is not about your face or lighting.",
                 Style::new().fg(th().err).bold(),
             ))
+        } else if e.session_merge.is_some() {
+            Line::from(Span::styled(
+                "Waiting for confirmation",
+                Style::new().bold(),
+            ))
+        } else if e.phase == EnrollmentPhase::Authorizing {
+            Line::from(Span::styled("Waiting for approval", Style::new().bold()))
+        } else if e.phase == EnrollmentPhase::LegacyScan {
+            Line::from(Span::styled("Working on scan", Style::new().bold()))
+        } else if e.phase == EnrollmentPhase::Capturing {
+            let status = if captured >= total {
+                "Finishing enrollment"
+            } else {
+                "Capturing scans"
+            };
+            Line::from(Span::styled(status, Style::new().bold()))
         } else if let Some(count) = e.count {
             Line::from(Span::styled(
                 format!("● Hold still; capturing in {count}…"),
@@ -7785,29 +7961,117 @@ impl App {
                 };
                 format!("{spinner} Starting camera…")
             });
-            Line::from(vec![
-                Span::styled("→ ", Style::new().fg(th().accent)),
-                Span::styled(guidance, Style::new().bold()),
-            ])
+            Line::from(Span::styled(guidance, Style::new().bold()))
         };
+        let profile = Line::from(Span::styled(
+            format!("Enrolling '{}'", e.profile),
+            Style::new().bold(),
+        ));
+        let scan = format!("Scan {current} of {total}");
+        let checks = [
+            chk(r.is_some_and(|x| x.face), "Face detected"),
+            chk(r.is_some_and(|x| x.centered), "Centered in frame"),
+            chk(
+                r.is_some_and(|x| {
+                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
+                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
+                }),
+                "Facing the camera",
+            ),
+            chk(
+                r.is_some_and(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness)),
+                "Well lit",
+            ),
+        ];
+        if f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68 {
+            use framing_viewfinder::Guide;
+
+            let guide = if self.reduce_motion {
+                Guide::TextOnly
+            } else {
+                let marker = match e.phase {
+                    EnrollmentPhase::Framing if e.stalled.is_none() => {
+                        e.viewfinder.as_ref().and_then(|sample| {
+                            let fresh = self
+                                .now()
+                                .checked_duration_since(sample.sampled_at)
+                                .is_some_and(|age| age < Duration::from_secs(2));
+                            sample.position.filter(|_| fresh)
+                        })
+                    }
+                    EnrollmentPhase::Capturing if e.session_merge.is_none() && captured < total => {
+                        e.capture_framing.and_then(|(p, sampled)| {
+                            let now = irlume_common::enrollment_monotonic_ms()?;
+                            irlume_common::enrollment_framing_is_fresh(sampled, now).then_some(p)
+                        })
+                    }
+                    EnrollmentPhase::Framing
+                    | EnrollmentPhase::Authorizing
+                    | EnrollmentPhase::Capturing
+                    | EnrollmentPhase::LegacyScan => None,
+                };
+                Guide::Frame(marker)
+            };
+            let [face, centered, facing, lit] = checks.clone();
+            let pair = |mut first: Line<'static>, second: Line<'static>| {
+                let padding = 24usize.saturating_sub(first.width());
+                let trailing = 21usize.saturating_sub(second.width());
+                first.spans.push(Span::raw(" ".repeat(padding)));
+                first.spans.extend(second.spans);
+                first.spans.push(Span::raw(" ".repeat(trailing)));
+                first
+            };
+            let (first, second) = if let Some(error) = &e.stalled {
+                (
+                    Line::raw(format!("({error}) Check: journalctl -u irlumed -n 50")),
+                    Line::raw(""),
+                )
+            } else if e.phase == EnrollmentPhase::Framing {
+                (pair(face, centered), pair(facing, lit))
+            } else {
+                (Line::raw(""), Line::raw(""))
+            };
+            if framing_viewfinder::draw_stack(
+                f,
+                area,
+                cue.clone(),
+                vec![
+                    profile.clone(),
+                    Line::raw(scan.clone()),
+                    Line::from(Span::styled(progress_bar(24), Style::new().fg(th().accent))),
+                    Line::raw(format!("{captured}/{total} captured")),
+                ],
+                vec![
+                    first,
+                    second,
+                    Line::raw(APPROVAL),
+                    Line::from(Span::styled("[esc] cancel", Style::new().dim())),
+                ],
+                guide,
+            ) {
+                return;
+            }
+        }
+        if e.stalled.is_none() && e.count.is_none() {
+            cue.spans
+                .insert(0, Span::styled("→ ", Style::new().fg(th().accent)));
+        }
         let mut lines = vec![
             cue,
-            Line::from(Span::styled(
-                format!("Enrolling '{}'", e.profile),
-                Style::new().add_modifier(Modifier::BOLD),
-            )),
+            profile,
             Line::from(vec![
                 Span::styled(
-                    format!("  Scan {current} of {total}  "),
+                    format!("  {scan}  "),
                     Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(progress, Style::new().fg(th().ok)),
+                Span::styled(
+                    format!("{} {captured}/{total}", progress_bar(20)),
+                    Style::new().fg(th().ok),
+                ),
             ]),
             Line::raw(""),
         ];
-        lines.push(Line::raw(
-            "  Approve the system dialog when prompted to continue.",
-        ));
+        lines.push(Line::raw(format!("  {APPROVAL}")));
         if let Some(err) = &e.stalled {
             // Not a biometric verdict: the guide stopped answering, so EVERY
             // live reading (quality bar, checklist, guidance) is stale and
@@ -7825,30 +8089,67 @@ impl App {
             f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
             return;
         }
-        lines.extend([
-            chk(face, "Face detected"),
-            chk(r.map(|x| x.centered).unwrap_or(false), "Centered in frame"),
-            chk(
-                r.map(|x| {
-                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
-                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
-                })
-                .unwrap_or(false),
-                "Facing the camera",
-            ),
-            chk(
-                r.map(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness))
-                    .unwrap_or(false),
-                "Well lit",
-            ),
-            Line::raw(""),
-        ]);
+        if e.phase == EnrollmentPhase::Framing {
+            lines.extend(checks.map(|mut check| {
+                check.spans.insert(0, Span::raw("  "));
+                check
+            }));
+        }
+        lines.push(Line::raw(""));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  [esc] cancel",
             Style::new().dim(),
         )));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn draw_enrollment_result(&self, f: &mut Frame, area: Rect, result: &EnrollmentResultView) {
+        use framing_viewfinder::Guide;
+
+        let cue = Line::from(Span::styled(result.message, Style::new().bold()));
+        let captured = result.captured;
+        let total = result.total;
+        let width = 24;
+        let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
+        let progress = vec![
+            Line::raw(format!("Profile '{}'", result.profile)),
+            Line::raw(format!(
+                "Scan {} of {total}",
+                captured.saturating_add(1).min(total.max(1))
+            )),
+            Line::from(Span::styled(
+                format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled)),
+                Style::new().fg(th().accent),
+            )),
+            Line::raw(format!("{captured}/{total} captured")),
+        ];
+        let return_hint = Line::raw("Press Enter to dismiss.");
+        let guide = if !self.reduce_motion && f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68
+        {
+            Guide::Frame(None)
+        } else {
+            Guide::TextOnly
+        };
+        if !framing_viewfinder::draw_stack(
+            f,
+            area,
+            cue.clone(),
+            progress.clone(),
+            vec![
+                Line::raw(""),
+                Line::raw(""),
+                return_hint.clone(),
+                Line::raw(""),
+            ],
+            guide,
+        ) {
+            let lines = std::iter::once(cue)
+                .chain(progress)
+                .chain([return_hint])
+                .collect::<Vec<_>>();
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        }
     }
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
@@ -11997,22 +12298,45 @@ fn enroll_worker(
     profile: String,
     add: Option<String>,
     target: usize,
+    viewfinder: bool,
     stop: Arc<AtomicBool>,
     tx: mpsc::Sender<WMsg>,
 ) {
+    use irlume_common::client::PositionSession;
+
     let send = |m| tx.send(m).is_ok();
     let mut misses = 0;
-    let mut session = match irlume_common::client::PositionSession::connect(&user, &stop) {
+    let connect = if viewfinder {
+        PositionSession::connect_with_viewfinder
+    } else {
+        PositionSession::connect
+    };
+    let mut session = match connect(&user, &stop) {
         Ok(session) => session,
         Err(error) => {
             let _ = send(WMsg::Err(format!("camera guide could not start: {error}")));
             return;
         }
     };
+    let mut seen_viewfinder = false;
     loop {
         let mut sample = |request: &Request| match session.as_mut() {
             Some(session) => Ok(match session.sample(&stop) {
-                Ok(report) => Response::Position(report),
+                Ok(mut report) => {
+                    let position = report.viewfinder.take().filter(|_| report.face);
+                    if viewfinder && !stop.load(Ordering::Relaxed) {
+                        seen_viewfinder |= position.is_some();
+                        if seen_viewfinder
+                            && !send(WMsg::Viewfinder {
+                                position,
+                                sampled_at: Instant::now(),
+                            })
+                        {
+                            return Err("enrollment UI closed".into());
+                        }
+                    }
+                    Response::Position(report)
+                }
                 // An accepted session cannot safely resume through another
                 // connection after a framing, transport or deadline failure.
                 Err(error) => Response::Error(format!("camera guide stopped: {error}")),
@@ -12041,12 +12365,30 @@ fn enroll_worker(
         profile: Some(profile.clone()),
         scans: target,
         improve: add.is_some(),
+        viewfinder,
     };
     let mut started = false;
     let result = irlume_common::client::enrollment_session(&request, &stop, |event| {
         match event {
             irlume_common::EnrollmentEvent::Started => {
                 started = true;
+                if !send(WMsg::CaptureStarted) {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
+            }
+            irlume_common::EnrollmentEvent::Framing {
+                position,
+                sampled_mono_ms,
+            } => {
+                if viewfinder
+                    && started
+                    && !send(WMsg::CaptureFraming {
+                        position,
+                        sampled_mono_ms,
+                    })
+                {
+                    return Err(std::io::Error::other("enrollment UI closed"));
+                }
             }
             irlume_common::EnrollmentEvent::Progress { captured, target } => {
                 if !send(WMsg::Captured(captured, target)) {
@@ -12101,7 +12443,7 @@ fn enroll_worker(
             let _ = send(WMsg::Err(unexpected_response()));
         }
         Err(error) => {
-            let _ = send(WMsg::Err(format!(
+            let _ = send(WMsg::Unknown(format!(
                 "enrollment connection ended: {error}; refresh profiles before retrying"
             )));
         }
@@ -12164,6 +12506,9 @@ fn legacy_enroll_worker(
                 }
             };
             if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if !send(WMsg::LegacyScanRequested) {
                 return;
             }
             match irlume_common::client::request_cancellable(
@@ -12443,7 +12788,7 @@ mod tests {
 
     /// Opening the framing session.
     fn framing_start(request: &Request) -> bool {
-        matches!(request, Request::PositionSession { user: Some(user) } if user == "test-user")
+        matches!(request, Request::PositionSession { user: Some(user), .. } if user == "test-user")
     }
 
     /// One framing sample on the fallback path.
@@ -12536,6 +12881,7 @@ mod tests {
             "New".into(),
             None,
             10,
+            false,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -12558,31 +12904,95 @@ mod tests {
 
     #[test]
     fn guided_enrollment_reuses_framing_connection_and_releases_it_before_authorization() {
+        let messages = exercise_guided_session(false, false);
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, WMsg::Viewfinder { .. })));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_opt_in_works_with_a_daemon_without_geometry() {
+        let messages = exercise_guided_session(true, false);
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            WMsg::Viewfinder { .. } | WMsg::CaptureFraming { .. }
+        )));
+        assert!(messages
+            .iter()
+            .any(|message| matches!(message, WMsg::CaptureStarted)));
+        let cues = messages
+            .iter()
+            .filter(|message| matches!(message, WMsg::Cue(report) if report.guidance == "Ready"))
+            .count();
+        assert_eq!(cues, 3);
+    }
+
+    #[test]
+    fn enrollment_viewfinder_updates_without_touching_countdown() {
+        let messages = exercise_guided_session(true, true);
+        let beats: Vec<_> = messages
+            .windows(2)
+            .filter_map(|pair| match pair {
+                [WMsg::Count(count), WMsg::Viewfinder {
+                    position: Some(position),
+                    ..
+                }] => Some((*count, position.x)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(beats, [(3, 4), (2, 5), (1, 6)]);
+        assert!(messages.windows(3).any(|messages| matches!(messages, [
+            WMsg::CaptureStarted, WMsg::CaptureFraming { position: Some(position), .. },
+            WMsg::Captured(10, 10)
+        ] if position.x == 3)));
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, WMsg::Cue(_)))
+                .count(),
+            3,
+            "countdown samples update only the viewfinder, not the cue"
+        );
+    }
+
+    fn exercise_guided_session(viewfinder: bool, send_geometry: bool) -> Vec<WMsg> {
         use std::io::{BufRead, Write};
         let _guard = dead_socket();
-        let path =
-            std::env::temp_dir().join(format!("irlume-guided-framing-{}.sock", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "irlume-guide-{}-{}-{}.sock",
+            std::process::id(),
+            u8::from(viewfinder),
+            u8::from(send_geometry)
+        ));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         std::env::set_var("IRLUME_SOCKET", &path);
         let server = std::thread::spawn(move || {
             let (mut guide, mut reader, mut line) = accept_wanted(&listener, framing_start);
-            if serde_json::from_str::<serde_json::Value>(&line).unwrap()
-                != serde_json::json!({"PositionSession":{"user":"test-user"}})
-            {
-                return false;
-            }
+            let expected = if viewfinder {
+                serde_json::json!({"PositionSession":{"user":"test-user","viewfinder":true}})
+            } else {
+                serde_json::json!({"PositionSession":{"user":"test-user"}})
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+                expected
+            );
             writeln!(guide, "\"PositionSessionStarted\"").unwrap();
-            for _ in 0..6 {
+            for x in 1..=6 {
                 line.clear();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&line).unwrap(),
                     "Sample"
                 );
+                let mut report = good_report("Ready");
+                if send_geometry {
+                    report.viewfinder = Some(irlume_common::FramingPosition { x, y: 5, size: 1 });
+                }
                 writeln!(
                     guide,
                     "{}",
-                    serde_json::to_string(&Response::Position(good_report("Ready"))).unwrap()
+                    serde_json::to_string(&Response::Position(report)).unwrap()
                 )
                 .unwrap();
             }
@@ -12605,7 +13015,7 @@ mod tests {
             drop(reader);
             drop(guide);
             let (mut socket, _, line) = accept_wanted(&listener, enrollment_capture);
-            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, .. } if user=="test-user");
+            let batch = matches!(serde_json::from_str::<Request>(&line).unwrap(),Request::EnrollmentSession { scans:10, improve:false, ref user, viewfinder: opted, .. } if user=="test-user" && opted == viewfinder);
             if !batch {
                 writeln!(
                     socket,
@@ -12615,8 +13025,21 @@ mod tests {
                 .unwrap();
                 return false;
             }
+            let started = Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started);
+            writeln!(socket, "{}", serde_json::to_string(&started).unwrap()).unwrap();
+            if send_geometry {
+                let feedback =
+                    Response::EnrollmentSession(irlume_common::EnrollmentEvent::Framing {
+                        position: Some(FramingPosition {
+                            x: 3,
+                            y: 5,
+                            size: 1,
+                        }),
+                        sampled_mono_ms: irlume_common::enrollment_monotonic_ms().unwrap(),
+                    });
+                writeln!(socket, "{}", serde_json::to_string(&feedback).unwrap()).unwrap();
+            }
             for response in [
-                Response::EnrollmentSession(irlume_common::EnrollmentEvent::Started),
                 Response::EnrollmentSession(irlume_common::EnrollmentEvent::Progress {
                     captured: 10,
                     target: 10,
@@ -12641,14 +13064,15 @@ mod tests {
             "New".into(),
             None,
             10,
+            viewfinder,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
         let messages: Vec<_> = rx.try_iter().collect();
-        let batch = server.join().unwrap();
+        let batch = server.join();
         std::fs::remove_file(path).unwrap();
         assert!(
-            batch,
+            batch.unwrap(),
             "guided enrollment must authorize and capture one bounded batch"
         );
         assert_eq!(
@@ -12659,6 +13083,7 @@ mod tests {
             3
         );
         assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+        messages
     }
 
     #[test]
@@ -12699,6 +13124,7 @@ mod tests {
             "New".into(),
             None,
             10,
+            false,
             Arc::new(AtomicBool::new(false)),
             tx,
         );
@@ -13611,6 +14037,7 @@ mod tests {
             hub_sel: 0,
             op: None,
             enroll: None,
+            enrollment_result: None,
             enroll_merge: None,
             fp: FpInfo::default(),
             recovery: None,
@@ -13684,6 +14111,9 @@ mod tests {
                 stop: Arc::new(AtomicBool::new(false)),
                 profile: "p".into(),
                 last: None,
+                viewfinder: None,
+                phase: EnrollmentPhase::default(),
+                capture_framing: None,
                 count: None,
                 stalled: None,
                 captured: 0,
@@ -13988,6 +14418,7 @@ mod tests {
             quality: 85,
             well_framed: true,
             guidance: guidance.into(),
+            viewfinder: None,
         }
     }
 
@@ -19153,6 +19584,580 @@ mod tests {
     }
 
     #[test]
+    fn continuous_enrollment_uses_one_panel_in_order() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, mut enrollment) = fake_enroll(0, 10);
+        enrollment.last = Some(good_report("Center your face in the frame"));
+        app.enroll = Some(enrollment);
+
+        let render = |app: &App| draw_text_at(app, 128, 48);
+        let framing = render(&app);
+        let guide_row = framing
+            .lines()
+            .position(|line| line.contains("Framing guide"))
+            .unwrap();
+        assert!(framing.contains("0/10 captured"));
+        tx.send(WMsg::Authorizing).unwrap();
+        app.poll();
+        let waiting = render(&app);
+        assert!(waiting.contains("Waiting for approval"));
+        assert_eq!(
+            waiting.lines().nth(guide_row),
+            framing.lines().nth(guide_row)
+        );
+        assert!(!waiting.contains("Center your face in the frame"));
+        assert!(!waiting.contains("((o))"));
+        assert!(waiting.contains("0/10 captured"));
+
+        tx.send(WMsg::CaptureStarted).unwrap();
+        tx.send(WMsg::CaptureFraming {
+            position: Some(FramingPosition {
+                x: 5,
+                y: 5,
+                size: 2,
+            }),
+            sampled_mono_ms: irlume_common::enrollment_monotonic_ms().unwrap(),
+        })
+        .unwrap();
+        app.poll();
+        let capturing = render(&app);
+        assert!(capturing.contains("Capturing scans") && capturing.contains("((o))"));
+        assert_eq!(
+            capturing.lines().nth(guide_row),
+            framing.lines().nth(guide_row)
+        );
+        assert!(capturing.contains("0/10 captured"));
+
+        tx.send(WMsg::Captured(10, 10)).unwrap();
+        app.poll();
+        let saving = render(&app);
+        assert!(saving.contains("10/10 captured") && !saving.contains("Enrollment complete"));
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        let result = render(&app);
+        assert!(app.enroll.is_none());
+        assert!(result.contains("Enrollment complete") && result.contains("10/10 captured"));
+        assert_eq!(
+            result.lines().nth(guide_row),
+            framing.lines().nth(guide_row)
+        );
+        assert!(!result.contains("((o))"));
+        app.on_key(KeyCode::Enter);
+        assert!(!render(&app).contains("Framing guide"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_clears_obsolete_geometry() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        let now = irlume_common::enrollment_monotonic_ms().unwrap();
+        let marker = Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 2,
+        });
+        let sample = |position, sampled_mono_ms| WMsg::CaptureFraming {
+            position,
+            sampled_mono_ms,
+        };
+        tx.send(WMsg::Authorizing).unwrap();
+        tx.send(sample(marker, now)).unwrap();
+        app.poll();
+        let view = |app: &App| draw_text_at(app, 128, 48);
+        assert!(!view(&app).contains("((o))"));
+        tx.send(WMsg::CaptureStarted).unwrap();
+        tx.send(sample(marker, now)).unwrap();
+        app.poll();
+        assert!(view(&app).contains("((o))"));
+        for update in [
+            sample(None, now),
+            sample(marker, now.saturating_sub(2000)),
+            sample(marker, u64::MAX),
+        ] {
+            tx.send(update).unwrap();
+            app.poll();
+            assert!(!view(&app).contains("((o))"));
+        }
+        tx.send(sample(marker, now)).unwrap();
+        app.poll();
+        app.on_key(KeyCode::Esc);
+        let cancelled = view(&app);
+        assert!(cancelled.contains("Cancellation requested") && !cancelled.contains("((o))"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_fallback_keeps_truthful_progress() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Authorizing).unwrap();
+        tx.send(WMsg::CaptureStarted).unwrap();
+        tx.send(WMsg::Captured(1, 4)).unwrap();
+        app.poll();
+        for (width, height, reduced) in [(80, 24, false), (100, 30, false), (128, 48, true)] {
+            app.reduce_motion = reduced;
+            let text = draw_text_at(&app, width, height);
+            assert!(!text.contains("Framing guide"));
+            assert!(text.contains("Capturing scans"));
+            assert!(text.contains("1/4") && text.contains("cancel enrollment"));
+            assert!(!text.contains("Face detected"), "{width}x{height}: {text}");
+        }
+        tx.send(WMsg::LegacyScanRequested).unwrap();
+        app.poll();
+        let legacy = draw_text_at(&app, 80, 24);
+        assert!(legacy.contains("Working on scan"));
+        assert!(!legacy.contains("Waiting for approval"));
+        assert!(!legacy.contains("Face detected"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_does_not_steal_history_keys() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        app.activity_history_open = true;
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        assert!(app.enrollment_result.is_some());
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_survives_opening_history() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+
+        app.on_key(KeyCode::Char('L'));
+        assert!(app.activity_history_open);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+        app.on_key(KeyCode::Enter);
+        assert!(app.enrollment_result.is_none());
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_result_survives_clicking_history() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+
+        let area = Rect::new(0, 0, 128, 48);
+        assert!(draw_text_at(&app, area.width, area.height).contains("Enrollment complete"));
+        let history = app
+            .click_targets
+            .borrow()
+            .iter()
+            .find_map(|(rect, target)| match target {
+                Click::Key(KeyCode::Char('L')) => Some(*rect),
+                _ => None,
+            })
+            .expect("rendered full-history button");
+        app.on_click(history.x, history.y, area);
+        assert!(app.activity_history_open);
+        app.on_key(KeyCode::Esc);
+        assert!(!app.activity_history_open);
+        assert!(draw_text_at(&app, area.width, area.height).contains("Enrollment complete"));
+        app.on_key(KeyCode::Esc);
+        assert!(app.enrollment_result.is_none());
+    }
+
+    #[test]
+    fn continuous_enrollment_result_clears_when_returning_to_overview() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 4);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
+        app.poll();
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+        assert!(draw_text_at(&app, 128, 48).contains("Enrollment complete"));
+
+        app.on_key(KeyCode::Char('h'));
+        drain_loads(&mut app);
+        assert_eq!(app.screen, SC_WELCOME);
+        assert!(app.enrollment_result.is_none());
+    }
+
+    #[test]
+    fn enrollment_viewfinder_centers_cue_guide_and_progress_in_the_pane() {
+        fn locate(text: &str, label: &str) -> (usize, usize) {
+            text.lines()
+                .enumerate()
+                .find_map(|(y, row)| {
+                    row.find(label)
+                        .map(|x| (y, row[..x].chars().count() * 2 + label.chars().count()))
+                })
+                .unwrap_or_else(|| panic!("missing {label}: {text}"))
+        }
+
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(2, 8);
+        enrollment.captured = 1;
+        enrollment.last = Some(good_report("Center your face in the frame"));
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.viewfinder = Some(ViewfinderSample {
+            position: Some(FramingPosition {
+                x: 2,
+                y: 5,
+                size: 1,
+            }),
+            sampled_at: now,
+        });
+        app.enroll = Some(enrollment);
+
+        for (w, h, activity) in [(128, 48, false), (100, 32, false), (120, 36, true)] {
+            app.activity_open = activity;
+            let viewport = Rect::new(0, 0, w, h);
+            let (_, pane) = app.body_split(app.frame_rows(viewport)[2]);
+            let axis = usize::from(pane.x * 2 + pane.width);
+            let framing = draw_text_at(&app, w, h);
+            let old_cue = locate(&framing, "Center your face in the frame");
+            let guide = locate(&framing, "Framing guide");
+            let progress = locate(&framing, "[███████░░░░░░░░░░░░░░░░░]");
+            let captured = locate(&framing, "3/10 captured");
+            let profile = locate(&framing, "Enrolling 'p'");
+            let face_check = locate(&framing, "Face detected");
+            assert_eq!(guide.0, old_cue.0 + 2, "one row between cue and guide");
+            assert_eq!(profile.0, guide.0 + 10, "one row after all nine guide rows");
+            assert!(profile.0 < progress.0 && progress.0 < captured.0);
+            assert_eq!(face_check.0, captured.0 + 2, "one row before the checklist");
+            let rows: Vec<_> = framing.lines().collect();
+            assert!(rows[guide.0 + 8].contains("└"));
+            for row in [old_cue.0 + 1, profile.0 - 1, captured.0 + 1] {
+                assert!(
+                    rows[row]
+                        .chars()
+                        .skip(usize::from(pane.x + 1))
+                        .take(usize::from(pane.width - 2))
+                        .all(|cell| cell == ' '),
+                    "{w}x{h}: nonblank separator at row {row}: {framing}"
+                );
+            }
+            for (_, center) in [old_cue, guide, progress, captured] {
+                assert!(axis.abs_diff(center) <= 1, "{w}x{h}: {framing}");
+            }
+            assert_eq!(guide.1, old_cue.1, "frame and cue share one cell axis");
+            assert!(framing.contains("Scan 4 of 10"));
+            for label in [
+                "Face detected",
+                "Centered in frame",
+                "Facing the camera",
+                "Well lit",
+                "Approve the system dialog when prompted to continue.",
+                "[esc] cancel",
+                "cancel enrollment",
+            ] {
+                assert!(framing.contains(label), "{w}x{h}: missing {label}");
+            }
+
+            app.enroll.as_mut().unwrap().count = Some(3);
+            let countdown = draw_text_at(&app, w, h);
+            assert_eq!(locate(&countdown, "capturing in 3").0, old_cue.0);
+            assert_eq!(locate(&countdown, "Framing guide"), guide);
+            assert_eq!(locate(&countdown, "[███████░░░░░░░░░░░░░░░░░]"), progress);
+            app.enroll.as_mut().unwrap().count = None;
+        }
+    }
+
+    #[test]
+    fn enrollment_viewfinder_short_panes_keep_no_face_and_cancel_visible() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(0, 4);
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.last = Some(PositionReport {
+            guidance: "No face detected; look straight at the camera and center yourself".into(),
+            ..PositionReport::default()
+        });
+        app.enroll = Some(enrollment);
+
+        for (width, height, activity) in [
+            (80, 24, false),
+            (96, 24, false),
+            (106, 24, false),
+            (100, 31, false),
+            (120, 24, true),
+            (120, 27, true),
+            (120, 35, true),
+        ] {
+            app.activity_open = activity;
+            let before_sample = draw_text_at(&app, width, height);
+            app.enroll.as_mut().unwrap().viewfinder = Some(ViewfinderSample {
+                position: None,
+                sampled_at: now,
+            });
+            let text = draw_text_at(&app, width, height);
+            assert_eq!(text, before_sample, "{width}x{height}: text layout jumped");
+            assert!(!text.contains("Framing guide"), "{width}x{height}: {text}");
+            assert!(text.contains("No face detected"));
+            assert!(text.contains("Scan 1 of 4"));
+            assert!(text.contains("[esc] cancel"));
+            assert!(text.contains("cancel enrollment"));
+            app.enroll.as_mut().unwrap().viewfinder = None;
+        }
+    }
+
+    #[test]
+    fn enrollment_viewfinder_measures_wrapped_profile_before_showing_the_frame() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (_tx, mut enrollment) = fake_enroll(0, 4);
+        enrollment.profile =
+            "Original office appearance with bright lighting and reading glasses enabled".into();
+        enrollment.last = Some(good_report("Center your face in the frame"));
+        let now = Instant::now();
+        app.clock_override = Some(now);
+        enrollment.viewfinder = Some(ViewfinderSample {
+            position: Some(FramingPosition {
+                x: 5,
+                y: 5,
+                size: 1,
+            }),
+            sampled_at: now,
+        });
+        app.enroll = Some(enrollment);
+
+        let short = draw_text_at(&app, 100, 32);
+        assert!(!short.contains("Framing guide"));
+        assert!(short.contains("0/4 captured"));
+        assert!(short.contains("Original office appearance") && short.contains("glasses enabled"));
+        assert!(short.contains("[esc] cancel"));
+
+        let roomy = draw_text_at(&app, 100, 33);
+        assert!(roomy.contains("Framing guide"));
+        assert!(roomy.contains("0/4 captured"));
+        assert!(roomy.contains("Original office appearance") && roomy.contains("glasses enabled"));
+        assert!(roomy.contains("[esc] cancel"));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_mirrors_and_scales_without_color() {
+        use irlume_common::FramingPosition;
+
+        let draw = |position| {
+            let mut terminal = Terminal::new(TestBackend::new(33, 9)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    framing_viewfinder::draw(frame, area, position);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let marker = buffer
+                .area
+                .positions()
+                .find(|&position| buffer[position].symbol() == "o")
+                .unwrap();
+            assert_eq!(buffer[marker].fg, Color::Reset);
+            assert_eq!(buffer[marker].bg, Color::Reset);
+            (marker, rendered(&terminal))
+        };
+
+        let (upper, _) = draw(Some(FramingPosition {
+            x: 2,
+            y: 2,
+            size: 0,
+        }));
+        let (lower, _) = draw(Some(FramingPosition {
+            x: 8,
+            y: 8,
+            size: 0,
+        }));
+        let (center, small) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 0,
+        }));
+        assert!(lower.x < center.x && center.x < upper.x);
+        assert!(upper.y < center.y && center.y < lower.y);
+        assert!(small.lines().any(|row| row.contains("[     o     ]")));
+
+        let (medium_center, medium) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 1,
+        }));
+        let (large_center, large) = draw(Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 2,
+        }));
+        assert_eq!(medium_center, center);
+        assert_eq!(large_center, center);
+        assert!(medium.lines().any(|row| row.contains("[    (o)    ]")));
+        assert!(large.lines().any(|row| row.contains("[   ((o))   ]")));
+    }
+
+    #[test]
+    fn enrollment_viewfinder_keeps_the_target_visible_at_every_position() {
+        let mut terminal = Terminal::new(TestBackend::new(33, 9)).unwrap();
+        for x in 0..=10 {
+            for y in 0..=10 {
+                for size in 0..=2 {
+                    let position = FramingPosition { x, y, size };
+                    terminal
+                        .draw(|frame| {
+                            let area = frame.area();
+                            framing_viewfinder::draw(frame, area, Some(position));
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_eq!(buffer[(10, 4)].symbol(), "[", "{position:?}");
+                    assert_eq!(buffer[(22, 4)].symbol(), "]", "{position:?}");
+                    for (corner, symbol) in
+                        [((0, 0), "┌"), ((32, 0), "┐"), ((0, 8), "└"), ((32, 8), "┘")]
+                    {
+                        assert_eq!(buffer[corner].symbol(), symbol, "{position:?}");
+                    }
+                    assert_eq!(
+                        buffer
+                            .content
+                            .iter()
+                            .filter(|cell| cell.symbol() == "o")
+                            .count(),
+                        1,
+                        "{position:?}"
+                    );
+                    for row in 1..8 {
+                        assert_eq!(buffer[(0, row)].symbol(), "│", "{position:?}");
+                        assert_eq!(buffer[(32, row)].symbol(), "│", "{position:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enrollment_viewfinder_clears_and_preserves_text_fallback() {
+        use irlume_common::FramingPosition;
+
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enroll) = fake_enroll(0, 4);
+        app.enroll = Some(enroll);
+        let at = Instant::now();
+        app.clock_override = Some(at);
+        let update = |position| WMsg::Viewfinder {
+            position,
+            sampled_at: at,
+        };
+        let marker = Some(FramingPosition {
+            x: 5,
+            y: 5,
+            size: 2,
+        });
+        let wide = |app: &App| draw_text_at(app, 120, 40);
+        let present = |text: &str| text.contains("((o))");
+
+        tx.send(WMsg::Cue(good_report("Lift your chin"))).unwrap();
+        app.poll();
+        assert!(
+            wide(&app).contains("Framing guide"),
+            "keep the panel before a sample"
+        );
+        assert!(!present(&wide(&app)), "older daemon has no geometry");
+        assert!(wide(&app).contains("Lift your chin"));
+
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(present(&wide(&app)));
+        assert!(wide(&app).contains("Lift your chin"));
+
+        let compact = draw_text_at(&app, 80, 24);
+        assert!(!compact.contains("Framing guide"));
+        assert!(compact.contains("Lift your chin"));
+        assert!(compact.contains("cancel enrollment"));
+
+        app.reduce_motion = true;
+        assert!(!wide(&app).contains("Framing guide"));
+        assert!(wide(&app).contains("Lift your chin"));
+        app.reduce_motion = false;
+
+        tx.send(WMsg::Count(2)).unwrap();
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(wide(&app).contains("capturing in 2"));
+        assert!(present(&wide(&app)));
+        app.clock_override = Some(at + Duration::from_secs(2));
+        assert!(!present(&wide(&app)), "expired marker");
+        app.clock_override = Some(at);
+
+        for position in [
+            None,
+            Some(FramingPosition {
+                x: 20,
+                y: 5,
+                size: 2,
+            }),
+        ] {
+            tx.send(update(position)).unwrap();
+            app.poll();
+            assert!(!present(&wide(&app)));
+            assert!(wide(&app).contains("Framing guide"), "target stays visible");
+        }
+
+        tx.send(WMsg::Stall("synthetic timeout".into())).unwrap();
+        app.poll();
+        assert!(!present(&wide(&app)));
+        assert!(wide(&app).contains("not answering"));
+
+        tx.send(WMsg::Cue(good_report("Ready"))).unwrap();
+        tx.send(update(marker)).unwrap();
+        app.poll();
+        assert!(present(&wide(&app)));
+        tx.send(WMsg::Authorizing).unwrap();
+        app.poll();
+        assert!(wide(&app).contains("Framing guide"));
+        assert!(!present(&wide(&app)));
+
+        app.on_key(KeyCode::Esc);
+        assert!(app.enroll.is_none());
+        app.on_key(KeyCode::Enter);
+        assert!(!wide(&app).contains("Framing guide"));
+        drain_loads(&mut app);
+        wait_live_done(&mut app);
+    }
+
+    #[test]
     fn enroll_esc_cancels_and_signals_the_worker_to_stop() {
         let _sock = dead_socket();
         let mut app = test_app();
@@ -22266,6 +23271,9 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),
             last: None,
+            viewfinder: None,
+            phase: EnrollmentPhase::default(),
+            capture_framing: None,
             count: None,
             stalled: None,
             captured: 1,
@@ -25659,6 +26667,9 @@ mod tests {
             stop: Arc::new(AtomicBool::new(false)),
             profile: "BEN".into(),
             last: None,
+            viewfinder: None,
+            phase: EnrollmentPhase::default(),
+            capture_framing: None,
             count: None,
             stalled: None,
             captured: 1,

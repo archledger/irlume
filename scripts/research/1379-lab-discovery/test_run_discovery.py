@@ -202,6 +202,19 @@ class VerifierTests(unittest.TestCase):
         setup = script.split('"$MESON" setup', 1)[1].split(">", 1)[0]
         self.assertIn("--wrap-mode=nodownload", setup)
 
+    def test_lab_releases_follow_every_other_worker_record(self):
+        case = "lab-front"
+        effects = list(rd.expected_effects(case))
+        first_release = next(i for i, e in enumerate(effects) if e.split(" ")[1:3] == ["worker", "release"])
+        last_fmt = max(i for i, e in enumerate(effects[:first_release]) if e.split(" ")[2] == "fmt")
+        early = effects[:last_fmt] + [effects[first_release]] + effects[last_fmt:first_release] + effects[first_release + 1:]
+        self.assertEqual(sorted(early), sorted(effects))
+        rd.check_discovery(serial(case, rd.CASES[case].events, numbered(effects)), NONCE, case, 0)
+        with self.assertRaisesRegex(ValueError, "worker record after a release"):
+            rd.check_discovery(serial(case, rd.CASES[case].events, numbered(early)), NONCE, case, 0)
+        # Stock libcamera reopens devices mid-discovery, so its releases stay a multiset.
+        rd.check_discovery(stock(), NONCE, "stock-baseline", 0)
+
     def test_release_after_failed_link_fails(self):
         case = "ipa-env-override"
         events = rd.CASES[case].events

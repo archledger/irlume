@@ -163,6 +163,19 @@ def check_outcome(events: tuple[str, ...], effects: tuple[str, ...]) -> None:
             raise ValueError(f"replacement receipt does not prove same number and new inode: {e}")
 
 
+def check_release_suffix(effects: tuple[str, ...]) -> None:
+    """In the lab path the worker releases its nodes only after its last other record."""
+    released = False
+    for e in effects:
+        _, who, kind = e.split(" ")[:3]
+        if who != "worker":
+            continue
+        if kind == "release":
+            released = True
+        elif released:
+            raise ValueError(f"worker record after a release: {e}")
+
+
 def check_discovery(text: str, nonce: str, case: str, returncode: int,
                     ipa_digest: str = "0" * 64) -> Receipt:
     if case not in CASES:
@@ -201,6 +214,9 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int,
     if not ended:
         raise ValueError("missing effect dump")
     check_outcome(tuple(events), tuple(effects))
+    # Stock libcamera reopens devices mid-discovery; only the lab path keeps releases last.
+    if CASES[case].image == "lab.cpio":
+        check_release_suffix(tuple(effects))
     want = tuple(e.replace("{ipa}", ipa_digest) for e in CASES[case].events)
     if tuple(events) != want:
         raise ValueError(f"unexpected receipt sequence for {case}: {tuple(events)}")

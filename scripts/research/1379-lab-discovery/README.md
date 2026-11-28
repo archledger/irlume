@@ -159,7 +159,10 @@ ASCII, and escapes worker log bytes. The verifier splits the serial log on
 checks four outcome rules independently of the case table: no release
 after refusal once a worker effect exists, no second backend after a hold
 or without a known owner release, and a replacement receipt that proves the
-same number and a new inode.
+same number and a new inode. In the lab cases every worker release record
+must follow the worker's last other record. Stock libcamera reopens
+devices during discovery, so `stock-baseline` compares its releases only
+as a multiset.
 
 The lab factory decides the IPA route once, at the branch, before any
 proxy exists, and can only build the threaded proxy. The lab IPU3 handler

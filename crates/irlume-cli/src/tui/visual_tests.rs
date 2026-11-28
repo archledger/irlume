@@ -482,7 +482,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
             let (_sender, mut enrollment) = fake_enroll(0, 4);
             enrollment.profile = "Synthetic enrollment".into();
             enrollment.captured = 1;
-            enrollment.last = Some(good_report("Synthetic guidance: hold still"));
+            enrollment.last = Some((good_report("Synthetic guidance: hold still"), app.now()));
             enrollment.viewfinder = Some(ViewfinderSample {
                 position: Some(FramingPosition {
                     x: if state == "countdown" { 5 } else { 2 },

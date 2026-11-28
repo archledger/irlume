@@ -19,6 +19,10 @@ pub(super) enum Guide {
     Frame(Option<FramingPosition>),
 }
 
+pub(super) fn horizontal_offset(position: FramingPosition) -> i16 {
+    5 - i16::from(position.x)
+}
+
 pub(super) fn draw_stack(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -93,7 +97,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
     if let Some(p) = position.filter(|p| p.in_bounds()) {
         let marker = ["o", "(o)", "((o))"][usize::from(p.size)];
         // Leave room for the largest mark at either edge and mirror like a selfie.
-        let x = inside.x + 2 + ((10 - u16::from(p.x)) * (inside.width - 5) + 5) / 10;
+        let mirrored = u16::try_from(5 + horizontal_offset(p)).unwrap_or_default();
+        let x = inside.x + 2 + (mirrored * (inside.width - 5) + 5) / 10;
         let y = inside.y + (u16::from(p.y) * (inside.height - 1) + 5) / 10;
         buffer.set_string(x - u16::from(p.size), y, marker, style);
     }

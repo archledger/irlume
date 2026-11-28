@@ -1,6 +1,6 @@
 # Book 2 supervised capture: ownership and stop evidence
 
-**Status:** Proposed for review. This is a non-granting test-backend design, not an approved test or a feature activation. It depends on acceptance of [the G0 class proposal](../../architecture/adr/0042-embedded-book2-rgb-ir-class.md) and separate approval of the exact backend design, the lab environment and any attended device operation. [Stage A](2026-11-27-embedded-book2-experimental-design.md#1-bound-the-first-engineering-slice) established only a pinned interface witness and synthetic behavior. Lab receipt types must not be consumable by enrollment, PAM, matcher or keyring code.
+**Status:** Approved 2026-11-28 as a basis for offline planning only. This is a non-granting test-backend design, not an approved guest run, test or feature activation. It depends on [the accepted G0 class decision](../../architecture/adr/0042-embedded-book2-rgb-ir-class.md) and separate approval of the implementation scope, the lab environment and any attended device operation. [Stage A](2026-11-27-embedded-book2-experimental-design.md#1-bound-the-first-engineering-slice) established only a pinned interface witness and synthetic behavior. Lab receipt types must not be consumable by enrollment, PAM, matcher or keyring code.
 
 ## Approach and trust boundary
 

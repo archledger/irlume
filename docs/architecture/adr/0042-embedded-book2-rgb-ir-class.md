@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed 2026-11-28 for [#1379](https://github.com/archledger/irlume/issues/1379). This is the class decision (G0) requested by [proposed ADR-0041](0041-admission-first-embedded-ir.md#1-decide-the-admitted-pair-class-before-defining-backend-interfaces), not approval of that whole proposal. Depends on existing [capture qualification](0007-context-bound-capture-qualification.md), [schedule-aware posture](0014-schedule-aware-pairing-budget.md), [PAD](0019-fail-closed-pad-availability.md), [camera-scoped enrollment](0024-multi-camera-enrollment.md), and [one unseal per request](0025-one-unseal-per-request.md). No existing ADR or admission policy is amended by this proposal.
+Accepted 2026-11-28 for [#1379](https://github.com/archledger/irlume/issues/1379), for the class selection (G0) only. This answers [proposed ADR-0041](0041-admission-first-embedded-ir.md#1-decide-the-admitted-pair-class-before-defining-backend-interfaces), not approval of that whole proposal. Depends on existing [capture qualification](0007-context-bound-capture-qualification.md), [schedule-aware posture](0014-schedule-aware-pairing-budget.md), [PAD](0019-fail-closed-pad-availability.md), [camera-scoped enrollment](0024-multi-camera-enrollment.md), and [one unseal per request](0025-one-unseal-per-request.md). No existing ADR or admission policy is amended by this decision.
 
-Acceptance chooses a class and its evidence and enrollment contract. It does not authorize backend implementation, device access, enrollment, authentication, credential release, or publication. The separate [supervised lab design](../../superpowers/specs/2026-11-28-embedded-book2-lab-boundary-design.md) is also proposed.
+Acceptance chooses a class and its evidence and enrollment contract. It does not authorize backend implementation, device access, enrollment, authentication, credential release, or publication. The separate [supervised lab design](../../superpowers/specs/2026-11-28-embedded-book2-lab-boundary-design.md) is approved for offline planning only.
 
 ## Context
 
@@ -44,7 +44,7 @@ If a reviewed split cannot establish an owner before discovery, downstream norma
 
 ## Phasing
 
-1. Maintainer reviews and accepts or rejects G0 separately. No code or live action follows from this document alone.
+1. The maintainer accepted G0 separately. No code or live action follows from this document alone.
 2. Review the exact supervised backend, trusted lab image and observation design before any real adapter work. Any later test on a device needs separately approved scope, operator, evidence handling and recovery.
 3. Require a reviewed G1 contract for the exact instrumented lab stack and separately approved G3q transport/optics. Independently bound any emission and persist a unique pre-arm record before every possible arming. Treat this as evidence for a future, separately approved qualification, not an implicit G2. Later require qualified G7/G8, then authorized G9, G10 and G11 as separate gates. Do not request a contributor test until there is a reviewed runnable candidate for the specifically authorized stage.
 

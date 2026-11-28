@@ -53,7 +53,7 @@ private:
 	::book2lab::EffectLedger ledger_;
 	std::map<std::string, ::book2lab::Snapshot> snapshots_;
 	std::map<std::string, int> mediaFds_;
-	bool pendingSettle_ = false;
+	::book2lab::SettleSlot settle_;
 	std::string latched_;
 	bool verdictWritten_ = false;
 };

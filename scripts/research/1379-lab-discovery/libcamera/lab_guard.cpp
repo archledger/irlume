@@ -151,22 +151,24 @@ int Guard::admitEffect(const ::book2lab::Effect &effect)
 	/* No effect before admitDiscovery has checked both graphs and kept their descriptors. */
 	if (mediaFds_.size() != 2)
 		return refuse("discovery");
+	/* One effect at a time: each admitted effect gets its own recheck before the next. */
+	if (settle_.pending())
+		return refuse("overlapping-effect");
 	Verdict v = recheckLocked();
 	if (!v.ok)
 		return refuse(v.reason);
 	v = ::book2lab::match_effect(*reservation_, effect, &ledger_);
 	if (!v.ok)
 		return refuse(v.reason + " " + ::book2lab::format_effect(effect));
-	pendingSettle_ = true;
+	settle_.admit(std::this_thread::get_id());
 	return 0;
 }
 
 void Guard::settle()
 {
 	std::lock_guard<std::mutex> lock(mutex_);
-	if (!pendingSettle_)
+	if (!settle_.settle(std::this_thread::get_id()))
 		return;
-	pendingSettle_ = false;
 	Verdict v = recheckLocked();
 	if (!v.ok)
 		refuse(v.reason, true);

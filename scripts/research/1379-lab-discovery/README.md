@@ -6,7 +6,11 @@ guest-only kernel driver publishes a simulated IPU3 graph: two media
 devices named like the pinned `ipu3-cio2` and `ipu3-imgu` drivers, four
 CSI-2 receivers, two ImgU pipes and three sensors. It mirrors what the
 pinned drivers publish (names, entity functions, pads, link flags,
-capabilities and control ids) without buffers or streaming. Sensor names,
+capabilities and control ids) without buffers or streaming, with one
+exception: the pinned `ipu3-cio2` marks its receiver and video sink pads
+`MUST_CONNECT`, and the simulated pads carry no such flag. A graph record
+names each pad only sink or source, so a pad with any other flag makes
+the graph unrepresentable and refuses discovery. Sensor names,
 port order, control ranges and frame sizes are synthetic until an approved
 passive inventory of the exact Book 2 exists. The driver logs the
 operations through which discovery can change its state (subdevice and
@@ -82,7 +86,10 @@ nodes: both media devices, the front sensor, its receiver and video node,
 and ImgU pipe 1 with its five nodes. Pipe 1 is chosen so that a handler
 assuming ImgU 0 fails. Inside libcamera the guard checks the whole
 reservation before any effect. Every open and ioctl passes its gate, which
-admits only the listed effects. The lab IPU3 handler never resets links,
+admits only the listed effects, one at a time: a second effect before the
+first one's recheck is refused, and only the thread that admitted an
+effect settles it. A control or format target listed twice must name one
+value, so the order of the effects cannot decide the final state. The lab IPU3 handler never resets links,
 initializes only the reserved pipe and port, and registers one camera.
 Pinned libcamera probes every entity node with `access()` during
 enumeration, which a front-only device grant cannot satisfy, so the lab

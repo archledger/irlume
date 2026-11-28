@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -132,6 +133,18 @@ std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(con
 // How a process maps the bound IPA module, from its /proc/<pid>/maps text.
 enum class IpaMapping { Bound, Unbound, Absent };
 IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind);
+
+// The post-effect recheck owed for an admitted effect.
+class SettleSlot {
+public:
+    bool pending() const { return owner_.has_value(); }
+    void admit(std::thread::id thread) { owner_ = thread; }
+    // Whether thread's call owes the recheck now; consumes it.
+    bool settle(std::thread::id thread);
+
+private:
+    std::optional<std::thread::id> owner_;
+};
 
 // The hold the worker's IPA mapping adds to an attempt that would otherwise
 // end in a release, known_owner telling a known owner from a refusal before

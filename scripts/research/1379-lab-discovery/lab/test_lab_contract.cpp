@@ -8,6 +8,7 @@
 #include <functional>
 #include <initializer_list>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -533,6 +534,64 @@ void duplicate_live_link_refuses()
     CHECK(!v.ok && v.reason == "graph-duplicate");
 }
 
+// A graph record names each pad sink or source. Any other pad flag, such as
+// the MUST_CONNECT the pinned ipu3-cio2 sets, makes the graph unrepresentable.
+void pad_flags_beyond_sink_or_source_refuse()
+{
+    auto contract = parse_contract(kContract);
+    CHECK(contract.has_value());
+    if (!contract)
+        return;
+    Reservation r = reserved();
+    std::vector<Snapshot> tops = {cio2_graph(), imgu_graph()};
+    std::vector<std::string> records;
+    CHECK(graph_records(tops[0], &records) && match_contract_graph(*contract, tops).ok);
+    for (auto &p : tops[0].pads)
+        if (p.flags == MEDIA_PAD_FL_SINK) {
+            p.flags |= MEDIA_PAD_FL_MUST_CONNECT;
+            break;
+        }
+    CHECK(!graph_records(tops[0], &records));
+    CHECK(!match_contract_graph(*contract, tops).ok);
+    CHECK(!compare_graph(r, Role::Cio2, tops[0], EffectLedger {}).ok);
+}
+
+// A control or format target listed more than once must name one value;
+// otherwise the order of the two effects would decide the final state.
+void contract_refuses_one_target_with_two_values()
+{
+    const std::string flips = "effect ctrl ov5693_2-0036 0x980914=0,0x980915=0\n";
+    const std::string fmt = "effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007\n";
+    auto with = [&](const std::string &line, const std::string &extra) {
+        std::string contract = kContract;
+        contract.replace(contract.find(line), line.size(), line + extra);
+        return contract;
+    };
+    CHECK(parse_contract(with(flips, flips)).has_value());
+    CHECK(parse_contract(with(fmt, fmt)).has_value());
+    CHECK(!parse_contract(with(flips, "effect ctrl ov5693_2-0036 0x980914=1\n")).has_value());
+    CHECK(!parse_contract(with(fmt, "effect fmt ov5693_2-0036 0 0x0 1296x972 0x3007\n")).has_value());
+    CHECK(!parse_contract(with(fmt, "effect fmt ov5693_2-0036 0 0x0 2592x1944 0x300a\n")).has_value());
+    CHECK(!parse_reservation(reservation_text(with(flips, "effect ctrl ov5693_2-0036 0x980915=-1\n"))).has_value());
+}
+
+// One admitted effect owes one recheck, and only the thread that admitted
+// it can consume that recheck.
+void settle_slot_belongs_to_the_admitting_thread()
+{
+    std::thread other_thread([] {});
+    const std::thread::id self = std::this_thread::get_id(), other = other_thread.get_id();
+    other_thread.join();
+    SettleSlot slot;
+    CHECK(!slot.pending() && !slot.settle(self));
+    slot.admit(self);
+    CHECK(slot.pending());
+    CHECK(!slot.settle(other));
+    CHECK(slot.pending());
+    CHECK(slot.settle(self));
+    CHECK(!slot.pending() && !slot.settle(self));
+}
+
 void contract_graph_duplicate_refuses()
 {
     auto contract = parse_contract(kContract);
@@ -751,6 +810,9 @@ int main()
         {"duplicate_live_entity_refuses", duplicate_live_entity_refuses},
         {"duplicate_live_link_refuses", duplicate_live_link_refuses},
         {"contract_graph_duplicate_refuses", contract_graph_duplicate_refuses},
+        {"pad_flags_beyond_sink_or_source_refuse", pad_flags_beyond_sink_or_source_refuse},
+        {"contract_refuses_one_target_with_two_values", contract_refuses_one_target_with_two_values},
+        {"settle_slot_belongs_to_the_admitting_thread", settle_slot_belongs_to_the_admitting_thread},
         {"fmt_effect_requires_result_code", fmt_effect_requires_result_code},
         {"request_matches_without_result_code", request_matches_without_result_code},
         {"driver_records_carry_result_code", driver_records_carry_result_code},

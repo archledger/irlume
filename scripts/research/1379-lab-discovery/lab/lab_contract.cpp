@@ -9,6 +9,7 @@
 #include <map>
 #include <set>
 #include <system_error>
+#include <tuple>
 
 #include <dirent.h>
 #include <sys/ioctl.h>
@@ -160,6 +161,30 @@ bool parse_effect(const std::vector<std::string> &t, Effect *e)
     return false;
 }
 
+// A control or format target listed more than once must name one value, so
+// the order of the effects cannot decide the final state. Link updates may
+// differ: the expected link state follows the last one applied.
+bool consistent_targets(const std::vector<Effect> &effects)
+{
+    std::map<std::pair<std::string, uint32_t>, int64_t> controls;
+    std::map<std::pair<std::string, uint32_t>, std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> formats;
+    for (const Effect &e : effects) {
+        if (e.kind == Effect::Kind::Ctrl) {
+            for (const auto &[id, value] : e.controls) {
+                const auto [it, added] = controls.try_emplace({e.entity, id}, value);
+                if (!added && it->second != value)
+                    return false;
+            }
+        } else if (e.kind == Effect::Kind::Fmt) {
+            const auto want = std::make_tuple(e.code, e.width, e.height, e.result_code);
+            const auto [it, added] = formats.try_emplace({e.entity, e.pad}, want);
+            if (!added && it->second != want)
+                return false;
+        }
+    }
+    return true;
+}
+
 // Entity label to role, from the contract's entity records.
 std::map<std::string, std::string> entity_roles(const Reservation &r)
 {
@@ -269,7 +294,7 @@ std::optional<Reservation> parse(std::string_view text, bool reservation)
             return std::nullopt;
         }
     }
-    if (!header || !front || !ipa || media_roles.size() != 2)
+    if (!header || !front || !ipa || media_roles.size() != 2 || !consistent_targets(r.effects))
         return std::nullopt;
     auto roles = entity_roles(r);
     for (const auto &g : r.grants)
@@ -387,7 +412,10 @@ bool graph_records(const Snapshot &t, std::vector<std::string> *out)
         for (size_t i = 0; i < pads.size(); i++) {
             if (pads[i]->index != i)
                 return false;
-            line += pads[i]->flags & MEDIA_PAD_FL_SINK ? " sink" : " source";
+            // The record names a pad sink or source only, so any other flag cannot be compared.
+            if (pads[i]->flags != MEDIA_PAD_FL_SINK && pads[i]->flags != MEDIA_PAD_FL_SOURCE)
+                return false;
+            line += pads[i]->flags == MEDIA_PAD_FL_SINK ? " sink" : " source";
         }
         out->push_back(line);
     }
@@ -742,6 +770,15 @@ IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind)
             unbound = true;
     }
     return unbound ? IpaMapping::Unbound : bound ? IpaMapping::Bound : IpaMapping::Absent;
+}
+
+bool SettleSlot::settle(std::thread::id thread)
+{
+    // Another thread's ioctl must not consume this effect's recheck.
+    if (!owner_ || *owner_ != thread)
+        return false;
+    owner_.reset();
+    return true;
 }
 
 std::optional<std::string> ipa_route_hold(bool known_owner, IpaMapping mapping)

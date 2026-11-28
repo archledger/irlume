@@ -129,7 +129,10 @@ backend `/lab/ir-stub` run. A refusal with no worker effect releases
 without continuing the schedule. Anything else is `HOLD <reason>` and
 blocks the second backend.
 
-The worker cannot add receipt lines. The supervisor reduces its report to
+The worker cannot add receipt lines: its standard descriptors are a pipe
+and its log file. The cgroup probe and the IR stub start with an `O_PATH`
+handle of `/` as their standard descriptors, the stub keeping only its
+stdout pipe, and check that they cannot write them. The supervisor reduces its report to
 `CAMERAS <n>` or `START_FAILED <n>` and the guard's verdict to printable
 ASCII, and escapes worker log bytes. The verifier splits the serial log on
 `\n` only and refuses a receipt line with a control character. It also

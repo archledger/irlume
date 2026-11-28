@@ -185,7 +185,7 @@ static bool verify_fd_ipc(const char *quarantine, const char *allowed)
         return false;
     if (!child) {
         close(pair[0]);
-        _exit(filtered_socket_check(pair[1], dummy) ? 0 : 1);
+        _exit(lab_detach_console() == 0 && filtered_socket_check(pair[1], dummy) ? 0 : 1);
     }
     /* A denied receive must leave the queued descriptor for this verifier. */
     bool ok = finish_child(child) && receive_zero(pair[1]) &&
@@ -198,6 +198,8 @@ static bool verify_fd_ipc(const char *quarantine, const char *allowed)
 
 static void owner_worker(int gate[2], int reply[2], bool kept_fd)
 {
+    if (lab_detach_console() < 0)
+        _exit(1);
     close(gate[1]);
     close(reply[0]);
     if (gate[0] != GATE || dup2(reply[1], REPLY) != REPLY)
@@ -211,7 +213,7 @@ static void owner_worker(int gate[2], int reply[2], bool kept_fd)
         _exit(1);
     if (fcntl(SEED, F_GETFD) >= 0)
         _exit(write(REPLY, "R", 1) == 1 ? 0 : 1);
-    if (errno != EBADF || kept_fd)
+    if (errno != EBADF || kept_fd || !lab_console_withheld())
         _exit(1);
     int handle = open("/dev/zero", O_RDONLY | O_CLOEXEC);
     unsigned char value = 1;
@@ -233,7 +235,7 @@ static bool prove_peer_denied(pid_t owner)
     if (peer < 0)
         return false;
     if (!peer) {
-        if (sanitize_worker(GATE, 65533, 65533) < 0)
+        if (lab_detach_console() < 0 || sanitize_worker(GATE, 65533, 65533) < 0)
             _exit(1);
         if (readlink(path, link, sizeof(link)) != -1 || errno != EACCES)
             _exit(1);

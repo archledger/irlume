@@ -831,7 +831,7 @@ void run_ir_stub()
         fail("IR_STUB");
     pid_t pid = fork();
     if (pid == 0) {
-        if (dup2(out[1], 1) != 1)
+        if (lab_detach_console() != 0 || dup2(out[1], 1) != 1)
             _exit(30);
         char name[] = "ir-stub";
         char *argv[] = {name, nullptr};
@@ -964,7 +964,7 @@ void probe_worker_cgroup(const book2lab::Reservation &r)
     pid_t pid = fork();
     if (pid == 0) {
         char out[3] = {'?', '?', '?'};
-        if (enter_group(kWorkerGroup, getpid()) != 0)
+        if (lab_detach_console() != 0 || !lab_console_withheld() || enter_group(kWorkerGroup, getpid()) != 0)
             _exit(40);
         for (int i = 0; i < 3; i++) {
             errno = 0;

@@ -25,7 +25,7 @@ BLOCKED = ("SECOND_BACKEND_BLOCKED unknown",)
 REPLACED = "REPLACED same_devt=1 same_version=1 new_inode=1"
 CLEAN = ("RELEASED_AFTER_REFUSAL", "SECOND_BACKEND_BLOCKED refused")
 IPA_ROUTE = "IPA_ROUTE threaded {ipa}"
-WORKER_EFFECTS = ("ctrl", "link", "fmt", "sel")
+WORKER_EFFECTS = ("ctrl", "link", "link-failed", "fmt", "sel")
 KERNEL_FAULT = re.compile(
     r"Kernel panic|\bOops\b|\bBUG:|\bWARNING:|\bKASAN\b|circular locking|INFO: possible|"
     r"INFO: trying to register|INFO: task .* blocked|general protection fault|Call Trace:")

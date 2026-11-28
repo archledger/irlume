@@ -311,21 +311,27 @@ void sim_controls(const std::vector<MediaNode> &before, const std::vector<book2l
     if (!now)
         fail("NO_CIO2_AFTER_REPLACE");
     uint64_t version = fresh[static_cast<size_t>(now - after.data())].version;
-    event(std::string("REPLACED same_devt=") + (now->major == old.major && now->minor == old.minor ? "1" : "0") +
-          " same_version=" + (version == old_version ? "1" : "0") +
-          " new_inode=" + (now->inode != old.inode ? "1" : "0"));
+    const bool same_devt = now->major == old.major && now->minor == old.minor, same_version = version == old_version,
+               new_inode = now->inode != old.inode;
+    event(std::string("REPLACED same_devt=") + (same_devt ? "1" : "0") + " same_version=" + (same_version ? "1" : "0") +
+          " new_inode=" + (new_inode ? "1" : "0"));
     if (!write_file(std::string(kDebug) + "/control", "add-entity\n") || !read_media(after, fresh))
         fail("CONTROL_ADD_ENTITY");
     now = find_role(after, fresh, "cio2");
-    if (now && fresh[static_cast<size_t>(now - after.data())].version > version)
+    const bool bumped = now && fresh[static_cast<size_t>(now - after.data())].version > version;
+    if (bumped)
         event("VERSION_BUMPED");
     if (!write_file(std::string(kDebug) + "/control", "add-media\n"))
         fail("CONTROL_ADD_MEDIA");
     std::vector<MediaNode> extra;
     if (!sysfs_media(extra))
         fail("MEDIA_LIST");
-    if (extra.size() == after.size() + 1)
+    const bool added = extra.size() == after.size() + 1;
+    if (added)
         event("EXTRA_MEDIA_PRESENT");
+    // The pass label only follows all five facts; the host tuple still decides.
+    if (!same_devt || !same_version || !new_inode || !bumped || !added)
+        fail("SIM_CONTROLS");
     event("SIM_CONTROLS_PASS");
 }
 

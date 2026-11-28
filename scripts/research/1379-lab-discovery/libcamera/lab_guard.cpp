@@ -35,9 +35,10 @@ constexpr const char *kReservationPath = "/run/book2-lab/reservation";
 constexpr int kVerdictFd = 3;
 
 /* Files GlobalConfiguration reads for this build's prefix (/usr, sysconfdir /etc). */
+/* The system files libcamera's global configuration reads, from its own config.h. */
 const std::vector<std::string> kConfigFiles = {
-	"/etc/libcamera/configuration.yaml",
-	"/usr/share/libcamera/configuration.yaml",
+	LIBCAMERA_SYSCONF_DIR "/configuration.yaml",
+	LIBCAMERA_DATA_DIR "/configuration.yaml",
 };
 
 bool readAll(const char *path, std::string *out)
@@ -148,6 +149,9 @@ Verdict Guard::recheckLocked()
 /* A change before the effect refuses it; settle() turns a change after it into a hold. */
 int Guard::admitEffect(const ::book2lab::Effect &effect)
 {
+	/* No effect before admitDiscovery has checked both graphs and kept their descriptors. */
+	if (mediaFds_.size() != 2)
+		return refuse("discovery");
 	Verdict v = recheckLocked();
 	if (!v.ok)
 		return refuse(v.reason);

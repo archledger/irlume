@@ -178,6 +178,20 @@ class VerifierTests(unittest.TestCase):
         setup = script.split('"$MESON" setup', 1)[1].split(">", 1)[0]
         self.assertIn("--wrap-mode=nodownload", setup)
 
+    def test_release_after_failed_link_fails(self):
+        case = "ipa-env-override"
+        events = rd.CASES[case].events
+        effects = numbered(rd.expected_effects(case) + ("1 worker link-failed ov5693_2-0036:0 ipu3-csi2_0:0 0x1",))
+        with self.assertRaisesRegex(ValueError, "release after refusal"):
+            rd.check_discovery(serial(case, events, effects), NONCE, case, 0)
+
+    def test_guard_config_paths_come_from_the_build(self):
+        guard = (rd.HERE / "libcamera" / "lab_guard.cpp").read_text()
+        self.assertNotIn('"/etc/libcamera', guard)
+        self.assertNotIn('"/usr/share/libcamera', guard)
+        self.assertIn('LIBCAMERA_SYSCONF_DIR "/configuration.yaml"', guard)
+        self.assertIn('LIBCAMERA_DATA_DIR "/configuration.yaml"', guard)
+
     def test_readme_runs_every_case_in_both_rounds(self):
         text = (rd.HERE / "README.md").read_text()
         self.assertIn("for round in 1 2; do\n", text)

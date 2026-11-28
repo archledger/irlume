@@ -50,7 +50,7 @@ grant imgu
 grant ov5693_2-0036
 effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
 effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1
-effect fmt ov5693_2-0036 0 0x0 2592x1944
+effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007
 ipa /usr/lib/libcamera/ipa/ipa_ipu3.so ipu3 ipu3 1
 )";
 
@@ -502,6 +502,59 @@ void whitespace_line_refuses()
     CHECK(!parse_reservation(reservation_text(contract)).has_value());
 }
 
+std::string contract_with_fmt(const char *fmt_line)
+{
+    std::string text = kContract;
+    size_t at = text.find("effect fmt ");
+    size_t end = text.find('\n', at);
+    return text.substr(0, at) + fmt_line + text.substr(end);
+}
+
+void fmt_effect_requires_result_code()
+{
+    CHECK(!parse_contract(contract_with_fmt("effect fmt ov5693_2-0036 0 0x0 2592x1944")).has_value());
+    auto r = parse_reservation(reservation_text(contract_with_fmt("effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007")));
+    CHECK(r.has_value());
+    if (!r)
+        return;
+    auto again = parse_reservation(serialize(*r));
+    CHECK(again.has_value());
+    for (const auto *res : {&*r, again ? &*again : &*r})
+        for (const auto &e : res->effects)
+            if (e.kind == Effect::Kind::Fmt)
+                CHECK(e.result_code == 0x3007);
+}
+
+Reservation reserved_with_result_code()
+{
+    Reservation r = reserved();
+    for (auto &e : r.effects)
+        if (e.kind == Effect::Kind::Fmt)
+            e.result_code = 0x3007;
+    return r;
+}
+
+void request_matches_without_result_code()
+{
+    Reservation r = reserved_with_result_code();
+    EffectLedger ledger;
+    Effect request;
+    request.kind = Effect::Kind::Fmt;
+    request.entity = "ov5693_2-0036";
+    request.width = 2592;
+    request.height = 1944;
+    CHECK(match_effect(r, request, &ledger).ok);
+}
+
+void driver_records_carry_result_code()
+{
+    const std::vector<std::string> records = driver_records(reserved_with_result_code());
+    const std::vector<std::string> want = {"ctrl ov5693_2-0036 0x980914=0", "ctrl ov5693_2-0036 0x980915=0",
+                                           "link ov5693_2-0036:0 ipu3-csi2_0:0 0x1",
+                                           "fmt ov5693_2-0036 0 active 0x3007 2592x1944"};
+    CHECK(records == want);
+}
+
 } // namespace
 
 int main()
@@ -532,6 +585,9 @@ int main()
         {"duplicate_live_entity_refuses", duplicate_live_entity_refuses},
         {"duplicate_live_link_refuses", duplicate_live_link_refuses},
         {"contract_graph_duplicate_refuses", contract_graph_duplicate_refuses},
+        {"fmt_effect_requires_result_code", fmt_effect_requires_result_code},
+        {"request_matches_without_result_code", request_matches_without_result_code},
+        {"driver_records_carry_result_code", driver_records_carry_result_code},
         {"whitespace_line_refuses", whitespace_line_refuses},
     };
     for (const auto &[name, test] : tests) {

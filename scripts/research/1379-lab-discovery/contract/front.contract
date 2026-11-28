@@ -85,7 +85,7 @@ effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
 effect ctrl ov5693_2-0036 0x9f0903=0
 effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1
 effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
-effect fmt ov5693_2-0036 0 0x0 2592x1944
+effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007
 effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
-effect fmt ov5693_2-0036 0 0x0 2592x1944
+effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007
 ipa /usr/lib/libcamera/ipa/ipa_ipu3.so ipu3 ipu3 1

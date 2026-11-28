@@ -142,13 +142,13 @@ bool parse_effect(const std::vector<std::string> &t, Effect *e)
         normalize(e);
         return is_name(e->entity) && !e->controls.empty();
     }
-    if (t.size() == 6 && t[1] == "fmt") {
+    if (t.size() == 7 && t[1] == "fmt") {
         e->kind = Effect::Kind::Fmt;
         e->entity = t[2];
         size_t x = t[5].find('x');
         return is_name(e->entity) && parse_u32(t[3], &e->pad, false) && parse_u32(t[4], &e->code, true) &&
                x != std::string::npos && parse_u32(t[5].substr(0, x), &e->width, false) &&
-               parse_u32(t[5].substr(x + 1), &e->height, false);
+               parse_u32(t[5].substr(x + 1), &e->height, false) && parse_u32(t[6], &e->result_code, true);
     }
     return false;
 }
@@ -434,7 +434,7 @@ std::string serialize(const Reservation &r)
     for (const auto &g : r.grants)
         out += "grant " + g + "\n";
     for (const auto &e : r.effects)
-        out += "effect " + format_effect(e) + "\n";
+        out += "effect " + format_effect(e) + (e.kind == Effect::Kind::Fmt ? " " + hex(e.result_code) : "") + "\n";
     out += "ipa " + r.ipa.path + " " + r.ipa.pipeline + " " + r.ipa.name + " " + std::to_string(r.ipa.version) + "\n";
     for (const auto &n : r.nodes) {
         std::string devt = std::to_string(n.major) + ":" + std::to_string(n.minor);
@@ -578,6 +578,30 @@ Verdict check_front(const Reservation &r)
     return {};
 }
 
+// Each listed effect in the form the simulated driver logs it.
+std::vector<std::string> driver_records(const Reservation &r)
+{
+    std::vector<std::string> out;
+    for (const Effect &e : r.effects) {
+        char buf[160];
+        if (e.kind == Effect::Kind::Ctrl) {
+            for (const auto &[id, value] : e.controls) {
+                std::snprintf(buf, sizeof(buf), "ctrl %s 0x%x=%lld", e.entity.c_str(), id, static_cast<long long>(value));
+                out.push_back(buf);
+            }
+        } else if (e.kind == Effect::Kind::Link) {
+            std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad,
+                          e.flags);
+            out.push_back(buf);
+        } else {
+            std::snprintf(buf, sizeof(buf), "fmt %s %u active 0x%x %ux%u", e.entity.c_str(), e.pad, e.result_code,
+                          e.width, e.height);
+            out.push_back(buf);
+        }
+    }
+    return out;
+}
+
 // Both live graphs together equal the contract's graph records.
 Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops)
 {
@@ -616,7 +640,10 @@ Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger
     ledger->used.resize(r.effects.size(), false);
     bool reused = false;
     for (size_t i = 0; i < r.effects.size(); i++) {
-        if (!(r.effects[i] == want))
+        // A request cannot carry the code the driver will report.
+        Effect listed = r.effects[i];
+        listed.result_code = want.result_code;
+        if (!(listed == want))
             continue;
         if (!ledger->used[i]) {
             ledger->used[i] = true;

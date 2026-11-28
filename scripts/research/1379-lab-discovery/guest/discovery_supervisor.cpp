@@ -790,35 +790,17 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
         if (!kernfs_inode(n.major, n.minor, inode) || inode != n.inode)
             return {Ownership::Unknown, "replaced"};
     }
-    // Expand listed effects into the driver's per-record form.
-    std::multiset<std::string> expected;
+    // Listed effects in the driver's per-record form, including the resulting format code.
+    const std::vector<std::string> listed = book2lab::driver_records(r);
+    std::multiset<std::string> expected(listed.begin(), listed.end());
     std::vector<size_t> link_index;
-    for (size_t i = 0; i < r.effects.size(); i++) {
-        const book2lab::Effect &e = r.effects[i];
-        char buf[96];
-        if (e.kind == book2lab::Effect::Kind::Ctrl) {
-            for (const auto &[id, value] : e.controls) {
-                std::snprintf(buf, sizeof(buf), "ctrl %s 0x%x=%lld", e.entity.c_str(), id, static_cast<long long>(value));
-                expected.insert(buf);
-            }
-        } else if (e.kind == book2lab::Effect::Kind::Link) {
-            std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad, e.flags);
-            expected.insert(buf);
+    for (size_t i = 0; i < r.effects.size(); i++)
+        if (r.effects[i].kind == book2lab::Effect::Kind::Link)
             link_index.push_back(i);
-        } else {
-            std::snprintf(buf, sizeof(buf), "fmt %s %u active * %ux%u", e.entity.c_str(), e.pad, e.width, e.height);
-            expected.insert(buf);
-        }
-    }
     book2lab::EffectLedger ledger;
     ledger.used.assign(r.effects.size(), false);
     for (const auto &effect : worker_effects) {
-        std::string key = effect;
-        if (key.rfind("fmt ", 0) == 0) {
-            auto t = book2lab_tokens(key);
-            if (t.size() == 6)
-                key = "fmt " + t[1] + " " + t[2] + " " + t[3] + " * " + t[5];
-        }
+        const std::string &key = effect;
         auto it = expected.find(key);
         if (it == expected.end())
             return {Ownership::Unknown, "unlisted-effect"};

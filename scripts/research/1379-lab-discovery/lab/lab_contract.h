@@ -51,6 +51,7 @@ struct Effect {
     uint32_t flags = 0;
     std::vector<std::pair<uint32_t, int64_t>> controls; // ctrl, kept sorted by id
     uint32_t code = 0, width = 0, height = 0;           // fmt request
+    uint32_t result_code = 0;                           // fmt: code the driver must report
     bool operator==(const Effect &) const = default;
 };
 
@@ -104,6 +105,7 @@ std::string serialize(const Reservation &r);
 Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const EffectLedger &ledger);
 Verdict check_front(const Reservation &r);
 Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops);
+std::vector<std::string> driver_records(const Reservation &r);
 Verdict check_media_set(const Reservation &r, const std::vector<std::pair<unsigned, unsigned>> &present);
 Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger);
 Verdict check_environment(const char *const *envp, const std::vector<std::string> &config_paths);

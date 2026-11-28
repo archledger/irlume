@@ -310,10 +310,10 @@ and Shift+L opens detailed session history. The observations panel shows each
 source's age and availability; session history records earlier activity.
 Administrator access remains attached to the individual action.
 
-Face enrollment stacks the text cue, a no-video
-[framing guide](TUI.md#enrollment-framing-guide), and scan progress in
-the center when there is room, and keeps the panel through the result.
-The text-only guide remains available.
+Face enrollment shows one instruction, a no-video
+[framing guide](TUI.md#enrollment-framing-guide), and the accepted scan
+count. The guide stays in place through the result when the terminal has
+room. The text-only guide remains available.
 
 Press **F2** in the TUI to search additional CLI tasks, fill their options, and
 review the account and effects before running them. See the [workflow and parity

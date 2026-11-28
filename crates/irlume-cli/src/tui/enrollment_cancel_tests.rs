@@ -153,7 +153,10 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
                             stop.store(true, Ordering::Relaxed);
                             assert!(inbox.lock().unwrap().take().is_some());
                         }
-                        Response::Position(good_report("hold still"))
+                        Response::Position(PositionReport {
+                            viewfinder: Some(FramingPosition { x: 3, y: 5, size: 1 }),
+                            ..good_report("hold still")
+                        })
                     }
                     Request::EnrollmentSession {
                         user,
@@ -241,6 +244,14 @@ fn enrollment_fallback_requests(improve: bool, cancel: bool) -> Vec<(Request, bo
         let messages: Vec<_> = inbox.lock().unwrap().take().unwrap().into_iter().collect();
         assert!(messages.iter().any(|m| matches!(m, WMsg::Captured(1, 1))));
         assert!(messages.iter().any(|m| matches!(m, WMsg::Done { .. })));
+        assert!(!messages.iter().any(|m| matches!(
+            m,
+            WMsg::Cue { report, .. } if report.viewfinder.is_some()
+        )));
+        assert!(!messages.iter().any(|m| matches!(
+            m,
+            WMsg::Viewfinder { position: Some(_), .. }
+        )));
     }
     requests
 }

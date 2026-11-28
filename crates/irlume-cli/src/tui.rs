@@ -163,20 +163,7 @@ const ATTEMPTS_BUDGET_SECS: u64 = 4;
 /// load before it binds its socket.
 const DAEMON_WAIT_TRIES: u32 = 40;
 const DAEMON_WAIT_POLL_MS: u64 = 250;
-/// Enroll-checklist "Facing the camera" bounds: the liveness frontality gate,
-/// referenced (not retyped) so the display can't drift from the daemon's
-/// verdict. The daemon's live framing guide is stricter still (irlume-auth
-/// `FRAME_YAW_ASYM_MAX` / `pitch_band`); the checklist shows the looser gate a
-/// capture must clear.
-const CHECK_YAW_ASYM_MAX: f32 = irlume_liveness::YAW_ASYM_MAX;
-const CHECK_PITCH_MIN: f32 = irlume_liveness::PITCH_FRAC_MIN;
-const CHECK_PITCH_MAX: f32 = irlume_liveness::PITCH_FRAC_MAX;
-/// Enroll-checklist "Well lit" bounds, mean face luma 0-255: mirror the
-/// private `DIM` / `BRIGHT` consts in irlume-auth's `position_sample`; keep in
-/// sync by name if either side changes.
-const CHECK_LUMA_MIN: f32 = 55.0;
-const CHECK_LUMA_MAX: f32 = 235.0;
-
+const CAPTURED_SCAN_LOG_PREFIX: &str = "captured scan ";
 /// One line of the sidebar rail. `sidebar_rows` builds the list, `draw_sidebar`
 /// renders it, and `on_click` maps a clicked inner row back to its `Nav(screen)`
 /// so a click always lands on the row the eye sees.
@@ -546,7 +533,10 @@ struct RecoveryInfo {
 /// Messages streamed from the guided-enroll worker to the UI.
 #[derive(Debug)]
 enum WMsg {
-    Cue(PositionReport),
+    Cue {
+        report: PositionReport,
+        sampled_at: Instant,
+    },
     Viewfinder {
         position: Option<FramingPosition>,
         sampled_at: Instant,
@@ -634,7 +624,7 @@ struct EnrollUi {
     rx: mpsc::Receiver<WMsg>,
     stop: Arc<AtomicBool>,
     profile: String,
-    last: Option<PositionReport>,
+    last: Option<(PositionReport, Instant)>,
     viewfinder: Option<ViewfinderSample>,
     phase: EnrollmentPhase,
     capture_framing: Option<(FramingPosition, u64)>,
@@ -4391,10 +4381,7 @@ impl App {
                         }
                     }
                     WMsg::Authorizing => {
-                        self.log(
-                            '·',
-                            "approve the system authentication dialog for this enrollment",
-                        );
+                        self.log('·', "approve the system authentication dialog if prompted");
                         if let Some(e) = &mut self.enroll {
                             e.phase = EnrollmentPhase::Authorizing;
                             e.count = None;
@@ -4440,11 +4427,22 @@ impl App {
                                 .map(|position| (position, sampled_mono_ms));
                         }
                     }
-                    WMsg::Cue(r) => {
+                    WMsg::Cue {
+                        mut report,
+                        sampled_at,
+                    } => {
                         if let Some(e) = &mut self.enroll {
                             e.phase = EnrollmentPhase::Framing;
                             e.capture_framing = None;
-                            e.last = Some(r);
+                            let position = report
+                                .viewfinder
+                                .take()
+                                .filter(|p| report.face && p.in_bounds());
+                            e.last = Some((report, sampled_at));
+                            e.viewfinder = Some(ViewfinderSample {
+                                position,
+                                sampled_at,
+                            });
                             e.count = None;
                             e.stalled = None;
                         }
@@ -4456,7 +4454,7 @@ impl App {
                         if let Some(e) = self
                             .enroll
                             .as_mut()
-                            .filter(|e| e.phase == EnrollmentPhase::Framing)
+                            .filter(|e| e.phase == EnrollmentPhase::Framing && e.count.is_some())
                         {
                             e.viewfinder = Some(ViewfinderSample {
                                 position: position.filter(|p| p.in_bounds()),
@@ -4469,6 +4467,7 @@ impl App {
                             e.phase = EnrollmentPhase::Framing;
                             e.stalled = Some(err);
                             e.count = None;
+                            e.last = None;
                             e.viewfinder = None;
                             e.capture_framing = None;
                         }
@@ -4487,7 +4486,10 @@ impl App {
                             e.count = None;
                             e.viewfinder = None;
                         }
-                        self.log('✓', format!("captured scan {}/{}", n + base, t + base));
+                        self.log(
+                            '✓',
+                            format!("{CAPTURED_SCAN_LOG_PREFIX}{}/{}", n + base, t + base),
+                        );
                     }
                     WMsg::Done { ambient_lit } => {
                         self.enrollment_result = self
@@ -7789,7 +7791,7 @@ impl App {
         // (daemon unreachable, sweep not landed) asserts neither direction;
         // the tri-state rule the rest of this file follows.
         let text = if self.enroll.is_some() {
-            "Follow one cue at a time; each scan captures automatically when framing is ready."
+            "Follow the guide. Progress counts accepted scans."
         } else {
             match self.screen {
                 SC_WELCOME => match self.enrolled_known() {
@@ -7903,30 +7905,22 @@ impl App {
     }
 
     fn draw_enroll(&self, f: &mut Frame, area: Rect) {
-        const APPROVAL: &str = "Approve the system dialog when prompted to continue.";
+        use framing_viewfinder::Guide;
+
         let e = self.enroll.as_ref().unwrap();
-        let r = e.last.as_ref();
+        let now = self.now();
+        let fresh = |sampled_at| {
+            now.checked_duration_since(sampled_at)
+                .is_some_and(|age| age < Duration::from_secs(2))
+        };
+        let r = e.last.as_ref().filter(|(_, at)| fresh(*at)).map(|(r, _)| r);
+        let framing_marker = e
+            .viewfinder
+            .as_ref()
+            .and_then(|sample| sample.position.filter(|_| fresh(sample.sampled_at)));
         let captured = e.captured + e.base;
         let total = e.target + e.base;
-        let current = captured.saturating_add(1).min(total.max(1));
-        let progress_bar = |width: usize| {
-            let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
-            format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
-        };
-        let chk = |ok: bool, label: &'static str| {
-            Line::from(vec![
-                Span::styled(
-                    if ok { "● " } else { "○ " },
-                    if ok {
-                        Style::new().fg(th().ok)
-                    } else {
-                        Style::new().dim()
-                    },
-                ),
-                Span::styled(label, if ok { Style::new() } else { Style::new().dim() }),
-            ])
-        };
-        let mut cue = if e.stalled.is_some() {
+        let cue = if e.stalled.is_some() {
             Line::from(Span::styled(
                 "Camera guide not answering; this is not about your face or lighting.",
                 Style::new().fg(th().err).bold(),
@@ -7937,219 +7931,90 @@ impl App {
                 Style::new().bold(),
             ))
         } else if e.phase == EnrollmentPhase::Authorizing {
-            Line::from(Span::styled("Waiting for approval", Style::new().bold()))
+            Line::from(Span::styled(
+                "Approve the system dialog if prompted",
+                Style::new().bold(),
+            ))
         } else if e.phase == EnrollmentPhase::LegacyScan {
             Line::from(Span::styled("Working on scan", Style::new().bold()))
         } else if e.phase == EnrollmentPhase::Capturing {
             let status = if captured >= total {
-                "Finishing enrollment"
+                "Finishing enrollment…"
             } else {
-                "Capturing scans"
+                "Keep facing the camera and hold still"
             };
             Line::from(Span::styled(status, Style::new().bold()))
         } else if let Some(count) = e.count {
             Line::from(Span::styled(
-                format!("● Hold still; capturing in {count}…"),
-                Style::new().fg(th().ok).bold(),
+                format!("Hold still · {count}"),
+                Style::new().bold(),
             ))
         } else {
-            let guidance = r.map(|report| report.guidance.clone()).unwrap_or_else(|| {
-                let spinner = if self.reduce_motion {
-                    "·"
-                } else {
-                    SPIN[self.spin]
-                };
-                format!("{spinner} Starting camera…")
-            });
+            let guidance = r
+                .map(|report| {
+                    framing_marker
+                        .and_then(|position| framing_direction(report, position))
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| report.guidance.clone())
+                })
+                .unwrap_or_else(|| {
+                    if e.last.is_some() {
+                        return "Waiting for a fresh position…".into();
+                    }
+                    let spinner = if self.reduce_motion {
+                        "·"
+                    } else {
+                        SPIN[self.spin]
+                    };
+                    format!("{spinner} Starting camera…")
+                });
             Line::from(Span::styled(guidance, Style::new().bold()))
         };
-        let profile = Line::from(Span::styled(
-            format!("Enrolling '{}'", e.profile),
-            Style::new().bold(),
-        ));
-        let scan = format!("Scan {current} of {total}");
-        let checks = [
-            chk(r.is_some_and(|x| x.face), "Face detected"),
-            chk(r.is_some_and(|x| x.centered), "Centered in frame"),
-            chk(
-                r.is_some_and(|x| {
-                    x.yaw_asym <= CHECK_YAW_ASYM_MAX
-                        && (CHECK_PITCH_MIN..=CHECK_PITCH_MAX).contains(&x.pitch_frac)
-                }),
-                "Facing the camera",
-            ),
-            chk(
-                r.is_some_and(|x| (CHECK_LUMA_MIN..=CHECK_LUMA_MAX).contains(&x.brightness)),
-                "Well lit",
-            ),
-        ];
-        if f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68 {
-            use framing_viewfinder::Guide;
-
-            let guide = if self.reduce_motion {
-                Guide::TextOnly
-            } else {
-                let marker = match e.phase {
-                    EnrollmentPhase::Framing if e.stalled.is_none() => {
-                        e.viewfinder.as_ref().and_then(|sample| {
-                            let fresh = self
-                                .now()
-                                .checked_duration_since(sample.sampled_at)
-                                .is_some_and(|age| age < Duration::from_secs(2));
-                            sample.position.filter(|_| fresh)
-                        })
-                    }
-                    EnrollmentPhase::Capturing if e.session_merge.is_none() && captured < total => {
-                        e.capture_framing.and_then(|(p, sampled)| {
-                            let now = irlume_common::enrollment_monotonic_ms()?;
-                            irlume_common::enrollment_framing_is_fresh(sampled, now).then_some(p)
-                        })
-                    }
-                    EnrollmentPhase::Framing
-                    | EnrollmentPhase::Authorizing
-                    | EnrollmentPhase::Capturing
-                    | EnrollmentPhase::LegacyScan => None,
-                };
-                Guide::Frame(marker)
+        let guide = if !self.reduce_motion && f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68
+        {
+            let marker = match e.phase {
+                EnrollmentPhase::Framing if e.stalled.is_none() => framing_marker,
+                EnrollmentPhase::Capturing if e.session_merge.is_none() && captured < total => {
+                    e.capture_framing.and_then(|(position, sampled)| {
+                        let now = irlume_common::enrollment_monotonic_ms()?;
+                        irlume_common::enrollment_framing_is_fresh(sampled, now).then_some(position)
+                    })
+                }
+                _ => None,
             };
-            let [face, centered, facing, lit] = checks.clone();
-            let pair = |mut first: Line<'static>, second: Line<'static>| {
-                let padding = 24usize.saturating_sub(first.width());
-                let trailing = 21usize.saturating_sub(second.width());
-                first.spans.push(Span::raw(" ".repeat(padding)));
-                first.spans.extend(second.spans);
-                first.spans.push(Span::raw(" ".repeat(trailing)));
-                first
-            };
-            let (first, second) = if let Some(error) = &e.stalled {
-                (
-                    Line::raw(format!("({error}) Check: journalctl -u irlumed -n 50")),
-                    Line::raw(""),
-                )
-            } else if e.phase == EnrollmentPhase::Framing {
-                (pair(face, centered), pair(facing, lit))
-            } else {
-                (Line::raw(""), Line::raw(""))
-            };
-            if framing_viewfinder::draw_stack(
-                f,
-                area,
-                cue.clone(),
-                vec![
-                    profile.clone(),
-                    Line::raw(scan.clone()),
-                    Line::from(Span::styled(progress_bar(24), Style::new().fg(th().accent))),
-                    Line::raw(format!("{captured}/{total} captured")),
-                ],
-                vec![
-                    first,
-                    second,
-                    Line::raw(APPROVAL),
-                    Line::from(Span::styled("[esc] cancel", Style::new().dim())),
-                ],
-                guide,
-            ) {
-                return;
-            }
-        }
-        if e.stalled.is_none() && e.count.is_none() {
-            cue.spans
-                .insert(0, Span::styled("→ ", Style::new().fg(th().accent)));
-        }
-        let mut lines = vec![
-            cue,
-            profile,
-            Line::from(vec![
-                Span::styled(
-                    format!("  {scan}  "),
-                    Style::new().fg(th().accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{} {captured}/{total}", progress_bar(20)),
-                    Style::new().fg(th().ok),
-                ),
-            ]),
-            Line::raw(""),
-        ];
-        lines.push(Line::raw(format!("  {APPROVAL}")));
-        if let Some(err) = &e.stalled {
-            // Not a biometric verdict: the guide stopped answering, so EVERY
-            // live reading (quality bar, checklist, guidance) is stale and
-            // rendering any of it reads as a current verdict against a hung
-            // capture (#309). The stall replaces the whole live panel.
-            lines.push(Line::from(Span::styled(
-                format!("    ({err}) Check: journalctl -u irlumed -n 50"),
-                Style::new().dim(),
-            )));
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "  [esc] cancel",
-                Style::new().dim(),
-            )));
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-            return;
-        }
-        if e.phase == EnrollmentPhase::Framing {
-            lines.extend(checks.map(|mut check| {
-                check.spans.insert(0, Span::raw("  "));
-                check
-            }));
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "  [esc] cancel",
-            Style::new().dim(),
-        )));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            Guide::Frame(marker)
+        } else {
+            Guide::TextOnly
+        };
+        let detail = if let Some(error) = &e.stalled {
+            format!("Check: journalctl -u irlumed -n 50 ({error})")
+        } else if e.phase == EnrollmentPhase::LegacyScan {
+            "Approve the system dialog if prompted".into()
+        } else {
+            String::new()
+        };
+        draw_enrollment_panel(f, area, cue, (captured, total), &e.profile, detail, guide);
     }
 
     fn draw_enrollment_result(&self, f: &mut Frame, area: Rect, result: &EnrollmentResultView) {
         use framing_viewfinder::Guide;
 
         let cue = Line::from(Span::styled(result.message, Style::new().bold()));
-        let captured = result.captured;
-        let total = result.total;
-        let width = 24;
-        let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
-        let progress = vec![
-            Line::raw(format!("Profile '{}'", result.profile)),
-            Line::raw(format!(
-                "Scan {} of {total}",
-                captured.saturating_add(1).min(total.max(1))
-            )),
-            Line::from(Span::styled(
-                format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled)),
-                Style::new().fg(th().accent),
-            )),
-            Line::raw(format!("{captured}/{total} captured")),
-        ];
-        let return_hint = Line::raw("Press Enter to dismiss.");
         let guide = if !self.reduce_motion && f.area().width >= SIDEBAR_MIN_COLS && area.width >= 68
         {
             Guide::Frame(None)
         } else {
             Guide::TextOnly
         };
-        if !framing_viewfinder::draw_stack(
+        draw_enrollment_panel(
             f,
             area,
-            cue.clone(),
-            progress.clone(),
-            vec![
-                Line::raw(""),
-                Line::raw(""),
-                return_hint.clone(),
-                Line::raw(""),
-            ],
+            cue,
+            (result.captured, result.total),
+            &result.profile,
+            String::new(),
             guide,
-        ) {
-            let lines = std::iter::once(cue)
-                .chain(progress)
-                .chain([return_hint])
-                .collect::<Vec<_>>();
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-        }
+        );
     }
 
     fn draw_profiles(&self, f: &mut Frame, area: Rect) {
@@ -10669,7 +10534,15 @@ impl App {
         let lines: Vec<Line> = self.activity[start..end]
             .iter()
             .enumerate()
-            .map(|(offset, (g, _))| {
+            .map(|(offset, (g, message))| {
+                if !expanded
+                    && !scrolled
+                    && (self.enroll.is_some() || self.enrollment_result.is_some())
+                    && *g == '✓'
+                    && message.starts_with(CAPTURED_SCAN_LOG_PREFIX)
+                {
+                    return Line::raw("Scan progress is shown above.");
+                }
                 let gs = match g {
                     '→' => Style::new().fg(th().accent),
                     '✓' => Style::new().fg(th().ok),
@@ -10941,13 +10814,18 @@ impl App {
         let key = |k: &str| Span::styled(format!(" {k} "), th().chip);
         // These controls replay the same state-specific keys as the keyboard.
         // Leaving a generic operation does not retract its daemon request.
-        if self.enroll.is_some() || self.op.is_some() {
+        if self.enroll.is_some()
+            || self.op.is_some()
+            || (self.enrollment_result.is_some() && self.enrollment_result_is_exposed())
+        {
             // Esc cancels an enrollment; during a generic task only q leaves
             // (ADR-0030 §1.2: Esc never quits).
             let (chip, code, label) = if self.enroll.is_some() {
                 ("esc", KeyCode::Esc, " cancel enrollment")
-            } else {
+            } else if self.op.is_some() {
                 ("q", KeyCode::Char('q'), " quit · task keeps running")
+            } else {
+                ("enter", KeyCode::Enter, " dismiss enrollment result")
             };
             let line = Line::from(vec![
                 key(chip),
@@ -12178,6 +12056,66 @@ enum GuideOutcome {
     Halt,
 }
 
+fn framing_direction(report: &PositionReport, position: FramingPosition) -> Option<&'static str> {
+    if !report.face
+        || report.centered
+        || report.guidance != "Center your face in the frame"
+        || !position.in_bounds()
+        || position.size != 1
+    {
+        return None;
+    }
+    match framing_viewfinder::horizontal_offset(position) {
+        2.. => Some("Move slightly to your left"),
+        ..=-2 => Some("Move slightly to your right"),
+        _ => None,
+    }
+}
+
+fn enrollment_progress_line(captured: usize, total: usize, width: usize) -> Line<'static> {
+    let digits = captured.max(total).to_string().len();
+    let count = format!("{captured:digits$} of {total} captured");
+    if width == 0 {
+        return Line::raw(count);
+    }
+    let filled = (captured.saturating_mul(width) / total.max(1)).min(width);
+    Line::from(vec![
+        Span::styled(
+            format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled)),
+            Style::new().fg(th().accent),
+        ),
+        Span::raw(format!("  {count}")),
+    ])
+}
+
+fn draw_enrollment_panel(
+    f: &mut Frame,
+    area: Rect,
+    cue: Line<'_>,
+    (captured, total): (usize, usize),
+    profile: &str,
+    detail: String,
+    guide: framing_viewfinder::Guide,
+) {
+    let bar_width = usize::from(area.width.saturating_sub(23).min(24));
+    let progress = enrollment_progress_line(captured, total, bar_width);
+    let profile = Line::raw(format!("Profile '{profile}'"));
+    let detail = Line::raw(detail);
+    if !framing_viewfinder::draw_stack(
+        f,
+        area,
+        cue.clone(),
+        vec![progress.clone()],
+        vec![profile.clone(), detail.clone()],
+        guide,
+    ) {
+        f.render_widget(
+            Paragraph::new(vec![cue, progress, detail, profile]).wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
 /// Framing streak + 3-2-1 countdown for one capture attempt, over an
 /// injectable sampler so the miss/give-up state machine is testable without
 /// a daemon socket.
@@ -12195,6 +12133,7 @@ fn guide_until_capture(
     // "not answering" state; GUIDE_MISS_LIMIT consecutive misses (across
     // framing AND countdown) end the enrollment saying so plainly.
     let mut streak = 0u32;
+    let mut seen_viewfinder = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             return GuideOutcome::Halt;
@@ -12211,7 +12150,11 @@ fn guide_until_capture(
             Ok(Response::Position(r)) => {
                 *misses = 0;
                 let good = r.well_framed;
-                if !send(WMsg::Cue(r)) {
+                seen_viewfinder |= r.face && r.viewfinder.is_some();
+                if !send(WMsg::Cue {
+                    report: r,
+                    sampled_at: Instant::now(),
+                }) {
                     return GuideOutcome::Halt;
                 }
                 streak = if good { streak + 1 } else { 0 };
@@ -12263,10 +12206,23 @@ fn guide_until_capture(
             // clear the on-screen count). Only surface a cue on abort.
             Ok(Response::Position(r)) if r.well_framed => {
                 *misses = 0;
+                let position = r.viewfinder.filter(|_| r.face);
+                seen_viewfinder |= position.is_some();
+                if seen_viewfinder
+                    && !send(WMsg::Viewfinder {
+                        position,
+                        sampled_at: Instant::now(),
+                    })
+                {
+                    return GuideOutcome::Halt;
+                }
             }
             Ok(Response::Position(r)) => {
                 *misses = 0;
-                let _ = send(WMsg::Cue(r));
+                let _ = send(WMsg::Cue {
+                    report: r,
+                    sampled_at: Instant::now(),
+                });
                 return GuideOutcome::Reframe;
             }
             Ok(Response::Error(e)) => {
@@ -12290,6 +12246,15 @@ fn guide_until_capture(
 
 fn merge_confirmation_required(first_new_profile_scan: bool, created: bool) -> bool {
     first_new_profile_scan && !created
+}
+
+fn enrollment_position_sample(request: &Request) -> Result<Response, String> {
+    crate::daemon_sample(request).map(|mut response| {
+        if let Response::Position(report) = &mut response {
+            report.viewfinder = None;
+        }
+        response
+    })
 }
 
 /// One framing/countdown phase followed by one authorized batch connection.
@@ -12318,22 +12283,12 @@ fn enroll_worker(
             return;
         }
     };
-    let mut seen_viewfinder = false;
     loop {
         let mut sample = |request: &Request| match session.as_mut() {
             Some(session) => Ok(match session.sample(&stop) {
                 Ok(mut report) => {
-                    let position = report.viewfinder.take().filter(|_| report.face);
-                    if viewfinder && !stop.load(Ordering::Relaxed) {
-                        seen_viewfinder |= position.is_some();
-                        if seen_viewfinder
-                            && !send(WMsg::Viewfinder {
-                                position,
-                                sampled_at: Instant::now(),
-                            })
-                        {
-                            return Err("enrollment UI closed".into());
-                        }
+                    if !viewfinder || !report.face {
+                        report.viewfinder = None;
                     }
                     Response::Position(report)
                 }
@@ -12341,7 +12296,7 @@ fn enroll_worker(
                 // connection after a framing, transport or deadline failure.
                 Err(error) => Response::Error(format!("camera guide stopped: {error}")),
             }),
-            None => crate::daemon_sample(request),
+            None => enrollment_position_sample(request),
         };
         match guide_until_capture(&user, &stop, &send, &mut sample, &mut misses) {
             GuideOutcome::Ready => break,
@@ -12478,7 +12433,7 @@ fn legacy_enroll_worker(
                 &user,
                 &stop,
                 &send,
-                &mut |req| crate::daemon_sample(req),
+                &mut enrollment_position_sample,
                 &mut misses,
             ) {
                 GuideOutcome::Ready => {}
@@ -12922,7 +12877,7 @@ mod tests {
             .any(|message| matches!(message, WMsg::CaptureStarted)));
         let cues = messages
             .iter()
-            .filter(|message| matches!(message, WMsg::Cue(report) if report.guidance == "Ready"))
+            .filter(|message| matches!(message, WMsg::Cue { report, .. } if report.guidance == "Ready" && report.viewfinder.is_none()))
             .count();
         assert_eq!(cues, 3);
     }
@@ -12948,7 +12903,7 @@ mod tests {
         assert_eq!(
             messages
                 .iter()
-                .filter(|m| matches!(m, WMsg::Cue(_)))
+                .filter(|m| matches!(m, WMsg::Cue { .. }))
                 .count(),
             3,
             "countdown samples update only the viewfinder, not the cue"
@@ -14419,6 +14374,13 @@ mod tests {
             well_framed: true,
             guidance: guidance.into(),
             viewfinder: None,
+        }
+    }
+
+    fn test_cue(report: PositionReport) -> WMsg {
+        WMsg::Cue {
+            report,
+            sampled_at: Instant::now(),
         }
     }
 
@@ -19325,12 +19287,12 @@ mod tests {
         app.poll();
         assert_eq!(app.enroll.as_ref().unwrap().count, Some(3));
         // A fresh cue clears the countdown (the user drifted off-frame).
-        tx.send(WMsg::Cue(good_report("Hold still"))).unwrap();
+        tx.send(test_cue(good_report("Hold still"))).unwrap();
         app.poll();
         {
             let e = app.enroll.as_ref().unwrap();
             assert_eq!(e.count, None, "a cue aborts the on-screen countdown");
-            assert_eq!(e.last.as_ref().unwrap().guidance, "Hold still");
+            assert_eq!(e.last.as_ref().unwrap().0.guidance, "Hold still");
         }
         tx.send(WMsg::Count(2)).unwrap();
         tx.send(WMsg::Captured(1, 4)).unwrap();
@@ -19452,7 +19414,7 @@ mod tests {
         // The nastiest stale state: every reading GOOD. A stall must hide all
         // of it, not just the guidance line (Codex round: the checklist and
         // quality bar are biometric verdicts too).
-        tx.send(WMsg::Cue(good_report(
+        tx.send(test_cue(good_report(
             "No face detected; look straight at the camera and center yourself",
         )))
         .unwrap();
@@ -19485,7 +19447,7 @@ mod tests {
             );
         }
         assert!(
-            text.contains("[esc] cancel"),
+            text.contains("cancel enrollment"),
             "cancel stays offered: {text}"
         );
     }
@@ -19573,7 +19535,7 @@ mod tests {
         let (tx, enroll) = fake_enroll(0, 4);
         app.enroll = Some(enroll);
         tx.send(WMsg::Stall("connect refused".into())).unwrap();
-        tx.send(WMsg::Cue(good_report("Hold still"))).unwrap();
+        tx.send(test_cue(good_report("Hold still"))).unwrap();
         app.poll();
         let text = draw_text(&app);
         assert!(text.contains("Hold still"), "live cues resume: {text}");
@@ -19589,7 +19551,7 @@ mod tests {
         let mut app = test_app();
         app.screen = SC_PROFILES;
         let (tx, mut enrollment) = fake_enroll(0, 10);
-        enrollment.last = Some(good_report("Center your face in the frame"));
+        enrollment.last = Some((good_report("Center your face in the frame"), Instant::now()));
         app.enroll = Some(enrollment);
 
         let render = |app: &App| draw_text_at(app, 128, 48);
@@ -19598,18 +19560,28 @@ mod tests {
             .lines()
             .position(|line| line.contains("Framing guide"))
             .unwrap();
-        assert!(framing.contains("0/10 captured"));
+        assert!(framing.contains("0 of 10 captured"));
+        assert!(!framing.contains("Approve the system dialog"));
+        tx.send(WMsg::Count(3)).unwrap();
+        app.poll();
+        let countdown = render(&app);
+        assert!(countdown.contains("Hold still") && countdown.contains('3'));
+        assert!(!countdown.contains("capturing in"));
+        assert_eq!(
+            countdown.lines().nth(guide_row),
+            framing.lines().nth(guide_row)
+        );
         tx.send(WMsg::Authorizing).unwrap();
         app.poll();
         let waiting = render(&app);
-        assert!(waiting.contains("Waiting for approval"));
+        assert!(waiting.contains("Approve the system dialog if prompted"));
         assert_eq!(
             waiting.lines().nth(guide_row),
             framing.lines().nth(guide_row)
         );
         assert!(!waiting.contains("Center your face in the frame"));
         assert!(!waiting.contains("((o))"));
-        assert!(waiting.contains("0/10 captured"));
+        assert!(waiting.contains("0 of 10 captured"));
 
         tx.send(WMsg::CaptureStarted).unwrap();
         tx.send(WMsg::CaptureFraming {
@@ -19622,23 +19594,53 @@ mod tests {
         })
         .unwrap();
         app.poll();
+        tx.send(WMsg::Captured(3, 10)).unwrap();
+        tx.send(WMsg::CaptureFraming {
+            position: Some(FramingPosition {
+                x: 5,
+                y: 5,
+                size: 2,
+            }),
+            sampled_mono_ms: irlume_common::enrollment_monotonic_ms().unwrap(),
+        })
+        .unwrap();
+        app.poll();
         let capturing = render(&app);
-        assert!(capturing.contains("Capturing scans") && capturing.contains("((o))"));
+        assert!(
+            capturing.contains("Keep facing the camera and hold still")
+                && capturing.contains("((o))")
+        );
+        assert!(!capturing.contains("Approve the system dialog"));
         assert_eq!(
             capturing.lines().nth(guide_row),
             framing.lines().nth(guide_row)
         );
-        assert!(capturing.contains("0/10 captured"));
+        assert!(capturing.contains("3 of 10 captured"));
+        tx.send(WMsg::CaptureFraming {
+            position: None,
+            sampled_mono_ms: 0,
+        })
+        .unwrap();
+        app.poll();
+        let no_marker = render(&app);
+        assert!(no_marker.contains("3 of 10 captured"));
+        assert!(no_marker.contains("Keep facing the camera and hold still"));
+        assert!(!no_marker.contains("((o))") && !no_marker.contains("No face"));
 
         tx.send(WMsg::Captured(10, 10)).unwrap();
         app.poll();
         let saving = render(&app);
-        assert!(saving.contains("10/10 captured") && !saving.contains("Enrollment complete"));
+        assert!(saving.contains("10 of 10 captured") && !saving.contains("Enrollment complete"));
+        assert_eq!(
+            saving.lines().nth(guide_row),
+            framing.lines().nth(guide_row)
+        );
         tx.send(WMsg::Done { ambient_lit: 0 }).unwrap();
         app.poll();
         let result = render(&app);
         assert!(app.enroll.is_none());
-        assert!(result.contains("Enrollment complete") && result.contains("10/10 captured"));
+        assert!(result.contains("Enrollment complete") && result.contains("10 of 10 captured"));
+        assert!(!result.contains("Scan 10 of 10"));
         assert_eq!(
             result.lines().nth(guide_row),
             framing.lines().nth(guide_row)
@@ -19648,6 +19650,42 @@ mod tests {
         assert!(!render(&app).contains("Framing guide"));
         drain_loads(&mut app);
         wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_wrapped_detail_does_not_move_guide() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 10);
+        app.enroll = Some(enrollment);
+        let anchors = |app: &App| {
+            let text = draw_text_at(app, 100, 31);
+            let locate = |needle| text.lines().position(|row| row.contains(needle)).unwrap();
+            (locate("Framing guide"), locate("0 of 10 captured"))
+        };
+        let initial = anchors(&app);
+        tx.send(WMsg::Stall(
+            "The synthetic transport timed out while waiting for an answer from the local enrollment guide".into(),
+        )).unwrap();
+        app.poll();
+        assert_eq!(anchors(&app), initial);
+        assert!(draw_text_at(&app, 100, 31).contains("journalctl"));
+    }
+
+    #[test]
+    fn continuous_enrollment_does_not_repeat_count_in_collapsed_activity() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 10);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Captured(3, 10)).unwrap();
+        app.poll();
+        let panel = draw_text_at(&app, 128, 48);
+        assert!(panel.contains("3 of 10 captured"));
+        assert!(!panel.contains("captured scan 3/10"));
+        app.on_key(KeyCode::Char('L'));
+        assert!(draw_text_at(&app, 128, 48).contains("captured scan 3/10"));
     }
 
     #[test]
@@ -19705,22 +19743,61 @@ mod tests {
         tx.send(WMsg::CaptureStarted).unwrap();
         tx.send(WMsg::Captured(1, 4)).unwrap();
         app.poll();
-        for (width, height, reduced) in [(80, 24, false), (100, 30, false), (128, 48, true)] {
+        for (width, height, reduced) in [(80, 24, false), (100, 24, false), (128, 48, true)] {
             app.reduce_motion = reduced;
             let text = draw_text_at(&app, width, height);
-            assert!(!text.contains("Framing guide"));
-            assert!(text.contains("Capturing scans"));
-            assert!(text.contains("1/4") && text.contains("cancel enrollment"));
+            assert!(!text.contains("Framing guide"), "{width}x{height}: {text}");
+            assert!(text.contains("Keep facing the camera and hold still"));
+            assert!(text.contains("1 of 4 captured") && text.contains("cancel enrollment"));
             assert!(!text.contains("Face detected"), "{width}x{height}: {text}");
         }
+        app.reduce_motion = false;
+        let roomy = draw_text_at(&app, 100, 30);
+        assert!(roomy.contains("Framing guide"));
+        assert!(roomy.contains("1 of 4 captured"));
         tx.send(WMsg::LegacyScanRequested).unwrap();
         app.poll();
         let legacy = draw_text_at(&app, 80, 24);
         assert!(legacy.contains("Working on scan"));
+        assert!(legacy.contains("Approve the system dialog if prompted"));
         assert!(!legacy.contains("Waiting for approval"));
         assert!(!legacy.contains("Face detected"));
         drain_loads(&mut app);
         wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_failure_and_cancellation_keep_the_last_count() {
+        let _guard = dead_socket();
+        for cancel in [false, true] {
+            let mut app = test_app();
+            app.screen = SC_PROFILES;
+            let (tx, enrollment) = fake_enroll(0, 10);
+            app.enroll = Some(enrollment);
+            tx.send(WMsg::Captured(3, 10)).unwrap();
+            app.poll();
+            if cancel {
+                app.on_key(KeyCode::Esc);
+            } else {
+                tx.send(WMsg::Err("synthetic failure".into())).unwrap();
+                app.poll();
+                app.on_key(KeyCode::Esc);
+            }
+            let result = draw_text_at(&app, 128, 48);
+            assert!(result.contains(if cancel {
+                "Cancellation requested"
+            } else {
+                "Enrollment failed"
+            }));
+            assert!(result.contains("3 of 10 captured"));
+            assert!(!result.contains("Scan 4 of 10"));
+            assert!(!result.contains("Enrollment complete"));
+            assert!(result.contains("dismiss enrollment result"));
+            click_text(&mut app, "dismiss enrollment result");
+            assert!(app.enrollment_result.is_none());
+            drain_loads(&mut app);
+            wait_live_done(&mut app);
+        }
     }
 
     #[test]
@@ -19829,8 +19906,8 @@ mod tests {
         app.screen = SC_PROFILES;
         let (_tx, mut enrollment) = fake_enroll(2, 8);
         enrollment.captured = 1;
-        enrollment.last = Some(good_report("Center your face in the frame"));
         let now = Instant::now();
+        enrollment.last = Some((good_report("Center your face in the frame"), now));
         app.clock_override = Some(now);
         enrollment.viewfinder = Some(ViewfinderSample {
             position: Some(FramingPosition {
@@ -19851,16 +19928,19 @@ mod tests {
             let old_cue = locate(&framing, "Center your face in the frame");
             let guide = locate(&framing, "Framing guide");
             let progress = locate(&framing, "[███████░░░░░░░░░░░░░░░░░]");
-            let captured = locate(&framing, "3/10 captured");
-            let profile = locate(&framing, "Enrolling 'p'");
-            let face_check = locate(&framing, "Face detected");
+            let captured = locate(&framing, "3 of 10 captured");
+            let profile = locate(&framing, "Profile 'p'");
             assert_eq!(guide.0, old_cue.0 + 2, "one row between cue and guide");
-            assert_eq!(profile.0, guide.0 + 10, "one row after all nine guide rows");
-            assert!(profile.0 < progress.0 && progress.0 < captured.0);
-            assert_eq!(face_check.0, captured.0 + 2, "one row before the checklist");
+            assert_eq!(
+                progress.0,
+                guide.0 + 10,
+                "one row after all nine guide rows"
+            );
+            assert_eq!(progress.0, captured.0);
+            assert_eq!(profile.0, progress.0 + 2, "one row before the profile");
             let rows: Vec<_> = framing.lines().collect();
             assert!(rows[guide.0 + 8].contains("└"));
-            for row in [old_cue.0 + 1, profile.0 - 1, captured.0 + 1] {
+            for row in [old_cue.0 + 1, progress.0 - 1, captured.0 + 1] {
                 assert!(
                     rows[row]
                         .chars()
@@ -19870,26 +19950,26 @@ mod tests {
                     "{w}x{h}: nonblank separator at row {row}: {framing}"
                 );
             }
-            for (_, center) in [old_cue, guide, progress, captured] {
+            let progress_center = locate(&framing, "[███████░░░░░░░░░░░░░░░░░]   3 of 10 captured");
+            for (_, center) in [old_cue, guide, progress_center, profile] {
                 assert!(axis.abs_diff(center) <= 1, "{w}x{h}: {framing}");
             }
             assert_eq!(guide.1, old_cue.1, "frame and cue share one cell axis");
-            assert!(framing.contains("Scan 4 of 10"));
-            for label in [
+            for absent in [
+                "Scan 4 of 10",
                 "Face detected",
                 "Centered in frame",
                 "Facing the camera",
                 "Well lit",
-                "Approve the system dialog when prompted to continue.",
-                "[esc] cancel",
-                "cancel enrollment",
+                "Approve the system dialog",
             ] {
-                assert!(framing.contains(label), "{w}x{h}: missing {label}");
+                assert!(!framing.contains(absent), "{w}x{h}: found {absent}");
             }
+            assert!(framing.contains("cancel enrollment"));
 
             app.enroll.as_mut().unwrap().count = Some(3);
             let countdown = draw_text_at(&app, w, h);
-            assert_eq!(locate(&countdown, "capturing in 3").0, old_cue.0);
+            assert_eq!(locate(&countdown, "Hold still · 3").0, old_cue.0);
             assert_eq!(locate(&countdown, "Framing guide"), guide);
             assert_eq!(locate(&countdown, "[███████░░░░░░░░░░░░░░░░░]"), progress);
             app.enroll.as_mut().unwrap().count = None;
@@ -19903,20 +19983,23 @@ mod tests {
         let (_tx, mut enrollment) = fake_enroll(0, 4);
         let now = Instant::now();
         app.clock_override = Some(now);
-        enrollment.last = Some(PositionReport {
-            guidance: "No face detected; look straight at the camera and center yourself".into(),
-            ..PositionReport::default()
-        });
+        enrollment.last = Some((
+            PositionReport {
+                guidance: "No face detected; look straight at the camera and center yourself"
+                    .into(),
+                ..PositionReport::default()
+            },
+            now,
+        ));
         app.enroll = Some(enrollment);
 
         for (width, height, activity) in [
             (80, 24, false),
             (96, 24, false),
             (106, 24, false),
-            (100, 31, false),
+            (100, 24, false),
             (120, 24, true),
             (120, 27, true),
-            (120, 35, true),
         ] {
             app.activity_open = activity;
             let before_sample = draw_text_at(&app, width, height);
@@ -19928,8 +20011,7 @@ mod tests {
             assert_eq!(text, before_sample, "{width}x{height}: text layout jumped");
             assert!(!text.contains("Framing guide"), "{width}x{height}: {text}");
             assert!(text.contains("No face detected"));
-            assert!(text.contains("Scan 1 of 4"));
-            assert!(text.contains("[esc] cancel"));
+            assert!(text.contains("0 of 4 captured"));
             assert!(text.contains("cancel enrollment"));
             app.enroll.as_mut().unwrap().viewfinder = None;
         }
@@ -19942,8 +20024,8 @@ mod tests {
         let (_tx, mut enrollment) = fake_enroll(0, 4);
         enrollment.profile =
             "Original office appearance with bright lighting and reading glasses enabled".into();
-        enrollment.last = Some(good_report("Center your face in the frame"));
         let now = Instant::now();
+        enrollment.last = Some((good_report("Center your face in the frame"), now));
         app.clock_override = Some(now);
         enrollment.viewfinder = Some(ViewfinderSample {
             position: Some(FramingPosition {
@@ -19955,17 +20037,17 @@ mod tests {
         });
         app.enroll = Some(enrollment);
 
-        let short = draw_text_at(&app, 100, 32);
+        let short = draw_text_at(&app, 100, 24);
         assert!(!short.contains("Framing guide"));
-        assert!(short.contains("0/4 captured"));
+        assert!(short.contains("0 of 4 captured"));
         assert!(short.contains("Original office appearance") && short.contains("glasses enabled"));
-        assert!(short.contains("[esc] cancel"));
+        assert!(short.contains("cancel enrollment"));
 
         let roomy = draw_text_at(&app, 100, 33);
         assert!(roomy.contains("Framing guide"));
-        assert!(roomy.contains("0/4 captured"));
+        assert!(roomy.contains("0 of 4 captured"));
         assert!(roomy.contains("Original office appearance") && roomy.contains("glasses enabled"));
-        assert!(roomy.contains("[esc] cancel"));
+        assert!(roomy.contains("cancel enrollment"));
     }
 
     #[test]
@@ -20008,7 +20090,7 @@ mod tests {
         }));
         assert!(lower.x < center.x && center.x < upper.x);
         assert!(upper.y < center.y && center.y < lower.y);
-        assert!(small.lines().any(|row| row.contains("[     o     ]")));
+        assert!(small.lines().any(|row| row.trim_matches(['│', ' ']) == "o"));
 
         let (medium_center, medium) = draw(Some(FramingPosition {
             x: 5,
@@ -20022,8 +20104,12 @@ mod tests {
         }));
         assert_eq!(medium_center, center);
         assert_eq!(large_center, center);
-        assert!(medium.lines().any(|row| row.contains("[    (o)    ]")));
-        assert!(large.lines().any(|row| row.contains("[   ((o))   ]")));
+        assert!(medium
+            .lines()
+            .any(|row| row.trim_matches(['│', ' ']) == "(o)"));
+        assert!(large
+            .lines()
+            .any(|row| row.trim_matches(['│', ' ']) == "((o))"));
     }
 
     #[test]
@@ -20040,8 +20126,28 @@ mod tests {
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
-                    assert_eq!(buffer[(10, 4)].symbol(), "[", "{position:?}");
-                    assert_eq!(buffer[(22, 4)].symbol(), "]", "{position:?}");
+                    for (point, expected) in [
+                        ((11, 1), "┌"),
+                        ((21, 1), "┐"),
+                        ((11, 7), "└"),
+                        ((21, 7), "┘"),
+                    ] {
+                        assert_eq!(buffer[point].symbol(), expected, "{position:?}");
+                    }
+                    let marker = buffer
+                        .area
+                        .positions()
+                        .find(|&cell| buffer[cell].symbol() == "o")
+                        .unwrap();
+                    let glyph = ["o", "(o)", "((o))"][usize::from(size)];
+                    for (offset, symbol) in glyph.chars().enumerate() {
+                        let start = marker.x - u16::from(size);
+                        assert_eq!(
+                            buffer[(start + u16::try_from(offset).unwrap(), marker.y)].symbol(),
+                            symbol.to_string(),
+                            "{position:?}"
+                        );
+                    }
                     for (corner, symbol) in
                         [((0, 0), "┌"), ((32, 0), "┐"), ((0, 8), "└"), ((32, 8), "┘")]
                     {
@@ -20066,6 +20172,69 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_direction_uses_one_fresh_sample() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let at = Instant::now();
+        app.clock_override = Some(at);
+        let (tx, enroll) = fake_enroll(0, 10);
+        app.enroll = Some(enroll);
+        let center = "Center your face in the frame";
+        let report = |guidance, viewfinder| PositionReport {
+            centered: false,
+            well_framed: false,
+            viewfinder,
+            ..good_report(guidance)
+        };
+        let marker = |x, size| Some(FramingPosition { x, y: 5, size });
+        let render = |app: &App| draw_text_at(app, 128, 48);
+
+        for (guidance, position, expected) in [
+            (center, marker(3, 1), "Move slightly to your left"),
+            (center, marker(7, 1), "Move slightly to your right"),
+            (center, None, center),
+            (center, marker(5, 1), center),
+            ("Move closer", marker(3, 0), "Move closer"),
+            ("Move back a little", marker(7, 2), "Move back a little"),
+        ] {
+            tx.send(WMsg::Cue {
+                report: report(guidance, position),
+                sampled_at: at,
+            })
+            .unwrap();
+            app.poll();
+            let text = render(&app);
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+            for direction in ["Move slightly to your left", "Move slightly to your right"] {
+                assert_eq!(text.contains(direction), expected == direction);
+            }
+        }
+
+        tx.send(WMsg::Cue {
+            report: report(center, marker(3, 1)),
+            sampled_at: at,
+        })
+        .unwrap();
+        app.poll();
+        app.clock_override = Some(at + Duration::from_secs(2));
+        let expired = render(&app);
+        assert!(!expired.contains("Move slightly"));
+        assert!(!expired.contains("(o)"));
+
+        app.clock_override = Some(at);
+        tx.send(WMsg::Count(2)).unwrap();
+        tx.send(WMsg::Viewfinder {
+            position: marker(5, 2),
+            sampled_at: at,
+        })
+        .unwrap();
+        app.poll();
+        assert_eq!(app.enroll.as_ref().unwrap().count, Some(2));
+        assert!(render(&app).contains("((o))"));
+    }
+
+    #[test]
     fn enrollment_viewfinder_clears_and_preserves_text_fallback() {
         use irlume_common::FramingPosition;
 
@@ -20087,8 +20256,15 @@ mod tests {
         });
         let wide = |app: &App| draw_text_at(app, 120, 40);
         let present = |text: &str| text.contains("((o))");
+        let cue = |guidance, viewfinder| WMsg::Cue {
+            report: PositionReport {
+                viewfinder,
+                ..good_report(guidance)
+            },
+            sampled_at: at,
+        };
 
-        tx.send(WMsg::Cue(good_report("Lift your chin"))).unwrap();
+        tx.send(cue("Lift your chin", None)).unwrap();
         app.poll();
         assert!(
             wide(&app).contains("Framing guide"),
@@ -20097,7 +20273,7 @@ mod tests {
         assert!(!present(&wide(&app)), "older daemon has no geometry");
         assert!(wide(&app).contains("Lift your chin"));
 
-        tx.send(update(marker)).unwrap();
+        tx.send(cue("Lift your chin", marker)).unwrap();
         app.poll();
         assert!(present(&wide(&app)));
         assert!(wide(&app).contains("Lift your chin"));
@@ -20106,6 +20282,13 @@ mod tests {
         assert!(!compact.contains("Framing guide"));
         assert!(compact.contains("Lift your chin"));
         assert!(compact.contains("cancel enrollment"));
+        app.clock_override = Some(at + Duration::from_secs(2));
+        assert!(wide(&app).contains("Framing guide"));
+        assert!(
+            !present(&wide(&app)),
+            "widening does not restore stale geometry"
+        );
+        app.clock_override = Some(at);
 
         app.reduce_motion = true;
         assert!(!wide(&app).contains("Framing guide"));
@@ -20115,7 +20298,7 @@ mod tests {
         tx.send(WMsg::Count(2)).unwrap();
         tx.send(update(marker)).unwrap();
         app.poll();
-        assert!(wide(&app).contains("capturing in 2"));
+        assert!(wide(&app).contains("Hold still · 2"));
         assert!(present(&wide(&app)));
         app.clock_override = Some(at + Duration::from_secs(2));
         assert!(!present(&wide(&app)), "expired marker");
@@ -20140,8 +20323,7 @@ mod tests {
         assert!(!present(&wide(&app)));
         assert!(wide(&app).contains("not answering"));
 
-        tx.send(WMsg::Cue(good_report("Ready"))).unwrap();
-        tx.send(update(marker)).unwrap();
+        tx.send(cue("Ready", marker)).unwrap();
         app.poll();
         assert!(present(&wide(&app)));
         tx.send(WMsg::Authorizing).unwrap();
@@ -22947,42 +23129,38 @@ mod tests {
     }
 
     #[test]
-    fn enroll_screen_renders_progress_checklist_countdown_and_guidance() {
+    fn enroll_screen_renders_progress_countdown_and_guidance() {
         let mut app = test_app();
         let (_tx, mut enroll) = fake_enroll(1, 4);
         enroll.captured = 1;
         enroll.count = Some(2);
-        enroll.last = Some(good_report("Hold still"));
+        enroll.last = Some((good_report("Hold still"), app.now()));
         app.enroll = Some(enroll);
         let text = draw_text(&app);
         assert!(
-            text.contains("Enrolling 'p'") && text.contains("Scan 3 of 5"),
+            text.contains("Profile 'p'") && text.contains("2 of 5 captured"),
             "progress must include the merged base offset:\n{text}"
-        );
-        assert!(
-            text.contains("2/5"),
-            "captured progress is explicit: {text}"
         );
         assert!(
             !text.contains("85%"),
             "raw quality scores are implementation detail: {text}"
         );
-        assert!(text.contains("Face detected"));
-        assert!(text.contains("Well lit"));
+        assert!(!text.contains("Face detected"));
+        assert!(!text.contains("Well lit"));
         assert!(
-            text.contains("capturing in 2"),
+            text.contains("Hold still · 2"),
             "the countdown overrides the guidance line"
         );
-        assert!(text.contains("[esc] cancel"));
+        assert!(text.contains("cancel enrollment"));
         assert!(
-            text.contains("Follow one cue at a time"),
+            text.contains("Progress counts accepted scans"),
             "the hint line switches to capture mode"
         );
         // Between countdowns the daemon's guidance cue shows instead.
         app.enroll.as_mut().unwrap().count = None;
         let text = draw_text(&app);
         assert!(text.contains("Hold still"));
-        assert!(!text.contains("capturing in"));
+        assert!(!text.contains("Hold still ·"));
         // Before the first cue arrives the camera-start placeholder shows.
         app.enroll.as_mut().unwrap().last = None;
         let text = draw_text(&app);
@@ -26967,7 +27145,7 @@ mod tests {
     fn compact_enrollment_prioritizes_current_guidance_countdown_and_stall() {
         for (count, stalled, expected) in [
             (None, None, "Move closer"),
-            (Some(2), None, "Hold still; capturing in 2"),
+            (Some(2), None, "Hold still · 2"),
             (
                 None,
                 Some("synthetic timeout"),
@@ -26977,7 +27155,7 @@ mod tests {
             let mut app = test_app();
             app.screen = SC_PROFILES;
             let (_sender, mut enrollment) = fake_enroll(0, 4);
-            enrollment.last = Some(good_report("Move closer"));
+            enrollment.last = Some((good_report("Move closer"), app.now()));
             enrollment.count = count;
             enrollment.stalled = stalled.map(str::to_owned);
             app.enroll = Some(enrollment);

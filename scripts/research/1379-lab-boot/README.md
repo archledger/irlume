@@ -1,7 +1,8 @@
 # Book 2 dummy boot proof
 
 The guest owns no physical device and has neither a disk nor a network.
-Only the guest's synthetic PID 1 fixture is privileged. The host does not
+QEMU runs with `-nodefaults` and `-no-user-config`, so a host `qemu.conf`
+cannot add a device. Only the guest's synthetic PID 1 fixture is privileged. The host does not
 load a kernel, change cgroups or install anything for this proof.
 
 Use a clean checkout of Linux

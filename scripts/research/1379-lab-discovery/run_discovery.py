@@ -235,8 +235,8 @@ def qemu_args(kernel: Path, initramfs: Path, serial: Path, case: str, nonce: str
                        "kasan.fault=panic", f"book2_case={case}", f"book2_nonce={nonce}") + spec.params)
     return [
         run_guest.QEMU, "-machine", "q35,accel=tcg", "-m", "1024", "-smp", "1",
-        "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none", "-no-reboot",
-        "-kernel", str(kernel), "-initrd", str(initramfs), "-serial", f"file:{serial}",
+        "-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-nic", "none",
+        "-no-reboot", "-kernel", str(kernel), "-initrd", str(initramfs), "-serial", f"file:{serial}",
         "-append", append,
     ]
 

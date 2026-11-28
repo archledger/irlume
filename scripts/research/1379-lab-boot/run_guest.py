@@ -51,8 +51,8 @@ def qemu_args(kernel: Path, initramfs: Path, serial: Path, case: str, nonce: str
         raise ValueError("invalid dummy fixture case or nonce")
     return [
         QEMU, "-machine", "q35,accel=tcg", "-m", "512", "-smp", "1",
-        "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none", "-no-reboot",
-        "-kernel", str(kernel), "-initrd", str(initramfs), "-serial", f"file:{serial}",
+        "-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-nic", "none",
+        "-no-reboot", "-kernel", str(kernel), "-initrd", str(initramfs), "-serial", f"file:{serial}",
         "-append", f"console=ttyS0 rdinit=/init panic=-1 book2_case={case} book2_nonce={nonce}",
     ]
 

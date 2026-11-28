@@ -1,6 +1,7 @@
 # Book 2 discovery guard proof (B03)
 
-This disposable QEMU guest has no physical device, disk or network. A
+This disposable QEMU guest has no physical device, disk or network;
+`-no-user-config` keeps a host `qemu.conf` from adding one. A
 guest-only kernel driver publishes a simulated IPU3 graph: two media
 devices named like the pinned `ipu3-cio2` and `ipu3-imgu` drivers, four
 CSI-2 receivers, two ImgU pipes and three sensors. It mirrors what the

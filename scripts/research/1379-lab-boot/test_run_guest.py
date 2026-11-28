@@ -41,8 +41,8 @@ class ReceiptTests(unittest.TestCase):
                          Path("/tmp/opencode/serial.log"), "smoke", NONCE)
         self.assertEqual(args, [
             "/usr/bin/qemu-system-x86_64", "-machine", "q35,accel=tcg", "-m", "512", "-smp", "1",
-            "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none", "-no-reboot",
-            "-kernel", "/tmp/opencode/k", "-initrd", "/tmp/opencode/c",
+            "-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-nic", "none",
+            "-no-reboot", "-kernel", "/tmp/opencode/k", "-initrd", "/tmp/opencode/c",
             "-serial", "file:/tmp/opencode/serial.log", "-append",
             f"console=ttyS0 rdinit=/init panic=-1 book2_case=smoke book2_nonce={NONCE}",
         ])

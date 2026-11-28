@@ -242,7 +242,7 @@ class VerifierTests(unittest.TestCase):
             self.assertNotIn(flag, args, flag)
         for pair in (("-m", "1024"), ("-nic", "none"), ("-monitor", "none"), ("-smp", "1")):
             self.assertEqual(args[args.index(pair[0]) + 1], pair[1])
-        for flag in ("-nodefaults", "-no-reboot"):
+        for flag in ("-nodefaults", "-no-user-config", "-no-reboot"):
             self.assertIn(flag, args)
         for word in ("panic=-1", "panic_on_warn=1", "kasan.fault=panic", "rdinit=/init",
                      f"book2_case=topology", f"book2_nonce={NONCE}"):

@@ -106,6 +106,20 @@ Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const 
 Verdict check_front(const Reservation &r);
 Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops);
 std::vector<std::string> driver_records(const Reservation &r);
+
+// Media devices under a sysfs bus directory; nothing when any entry is unreadable.
+std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir);
+
+// How a process maps the bound IPA module, from its /proc/<pid>/maps text.
+enum class IpaMapping { Bound, Unbound, Absent };
+IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind);
+
+// The effect a state-changing subdevice request would cause, or why it is refused.
+struct RequestEffect {
+    Verdict verdict;
+    std::optional<Effect> effect;
+};
+RequestEffect subdev_request_effect(unsigned long request, const void *arg, const std::string &entity);
 Verdict check_media_set(const Reservation &r, const std::vector<std::pair<unsigned, unsigned>> &present);
 Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger);
 Verdict check_environment(const char *const *envp, const std::vector<std::string> &config_paths);

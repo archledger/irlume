@@ -8,8 +8,13 @@
 #include <map>
 #include <set>
 
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+
+#include <linux/v4l2-subdev.h>
+#include <linux/videodev2.h>
 
 namespace book2lab {
 
@@ -600,6 +605,85 @@ std::vector<std::string> driver_records(const Reservation &r)
         }
     }
     return out;
+}
+
+std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir)
+{
+    std::vector<std::pair<unsigned, unsigned>> devices;
+    DIR *dir = opendir(bus_dir.c_str());
+    if (!dir)
+        return std::nullopt;
+    bool complete = true;
+    while (dirent *entry = readdir(dir)) {
+        const std::string name = entry->d_name;
+        if (name.rfind("media", 0) != 0)
+            continue;
+        unsigned major = 0, minor = 0;
+        FILE *f = std::fopen((bus_dir + "/" + name + "/dev").c_str(), "re");
+        const bool ok = f && std::fscanf(f, "%u:%u", &major, &minor) == 2;
+        if (f)
+            std::fclose(f);
+        if (ok)
+            devices.emplace_back(major, minor);
+        else
+            complete = false;
+    }
+    closedir(dir);
+    if (!complete)
+        return std::nullopt;
+    return devices;
+}
+
+IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind)
+{
+    // The bound file under its path is Bound; its identity or its path alone is a second module.
+    bool bound = false, unbound = false;
+    for (size_t pos = 0; pos < maps.size();) {
+        size_t end = maps.find('\n', pos);
+        const std::vector<std::string> f = split(maps.substr(pos, end == std::string_view::npos ? end : end - pos));
+        pos = end == std::string_view::npos ? maps.size() : end + 1;
+        unsigned major = 0, minor = 0;
+        if (f.size() < 6 || std::sscanf(f[3].c_str(), "%x:%x", &major, &minor) != 2)
+            continue;
+        const bool identity = makedev(major, minor) == bind.dev && f[4] == std::to_string(bind.inode);
+        const bool path = f[5] == bind.path;
+        if (identity && path)
+            bound = true;
+        else if (identity || path)
+            unbound = true;
+    }
+    return unbound ? IpaMapping::Unbound : bound ? IpaMapping::Bound : IpaMapping::Absent;
+}
+
+RequestEffect subdev_request_effect(unsigned long request, const void *arg, const std::string &entity)
+{
+    Effect e;
+    e.entity = entity;
+    if (request == VIDIOC_S_EXT_CTRLS) {
+        const auto *c = static_cast<const v4l2_ext_controls *>(arg);
+        if (c->which != V4L2_CTRL_WHICH_CUR_VAL || !c->count)
+            return {{false, "unlisted-effect"}, std::nullopt};
+        e.kind = Effect::Kind::Ctrl;
+        for (unsigned int i = 0; i < c->count; i++) {
+            // v4l2_ext_control is packed: copy fields, never bind references.
+            const uint32_t id = c->controls[i].id;
+            const int64_t value = c->controls[i].value;
+            e.controls.emplace_back(id, value);
+        }
+        return {{}, e};
+    }
+    if (request == VIDIOC_SUBDEV_S_FMT) {
+        const auto *f = static_cast<const v4l2_subdev_format *>(arg);
+        if (f->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+            return {{false, "unlisted-effect"}, std::nullopt};
+        e.kind = Effect::Kind::Fmt;
+        e.pad = f->pad;
+        e.code = f->format.code;
+        e.width = f->format.width;
+        e.height = f->format.height;
+        return {{}, e};
+    }
+    return {{false, "unlisted-request"}, std::nullopt};
 }
 
 // Both live graphs together equal the contract's graph records.

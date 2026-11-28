@@ -11,6 +11,10 @@
 #include <vector>
 
 #include <unistd.h>
+#include <linux/videodev2.h>
+#include <linux/v4l2-subdev.h>
+#include <sys/sysmacros.h>
+#include <sys/stat.h>
 
 using namespace book2lab;
 
@@ -555,6 +559,79 @@ void driver_records_carry_result_code()
     CHECK(records == want);
 }
 
+void media_listing_fails_closed()
+{
+    char dir[] = "/tmp/book2-lab-media-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    const std::string root = dir;
+    auto entry = [&](const char *name, const char *dev) {
+        const std::string sub = root + "/" + name;
+        CHECK(mkdir(sub.c_str(), 0700) == 0);
+        if (dev) {
+            FILE *f = std::fopen((sub + "/dev").c_str(), "we");
+            CHECK(f != nullptr);
+            if (f) {
+                std::fputs(dev, f);
+                std::fclose(f);
+            }
+        }
+    };
+    entry("media0", "250:0\n");
+    entry("media1", "250:1\n");
+    auto two = list_media_devices(root);
+    CHECK(two && two->size() == 2);
+    entry("media2", "garbage\n");
+    CHECK(!list_media_devices(root).has_value());
+    std::remove((root + "/media2/dev").c_str());
+    CHECK(!list_media_devices(root).has_value());
+    CHECK(!list_media_devices(root + "/missing").has_value());
+    for (const char *name : {"media0/dev", "media1/dev", "media0", "media1", "media2"})
+        std::remove((root + "/" + name).c_str());
+    rmdir(dir);
+}
+
+void ipa_maps_report_unbound_mapping()
+{
+    const BindIpa bind {"/usr/lib/libcamera/ipa/ipa_ipu3.so", makedev(0, 3), 25, 4096, std::string(64, '0')};
+    const std::string bound = "7eff6fb37000-7eff6fb4f000 r--p 00000000 00:03 25"
+                              "                         /usr/lib/libcamera/ipa/ipa_ipu3.so\n";
+    const std::string unrelated = "7eff6fa00000-7eff6fa10000 r--p 00000000 00:03 30 /usr/lib/libcamera.so.0.8\n";
+    const std::string other_inode = "7eff6fc00000-7eff6fc10000 r--p 00000000 00:03 26 /usr/lib/libcamera/ipa/ipa_ipu3.so\n";
+    const std::string other_path = "7eff6fd00000-7eff6fd10000 r--p 00000000 00:03 25 /tmp/ipa_ipu3.so\n";
+    CHECK(classify_ipa_maps(bound + unrelated, bind) == IpaMapping::Bound);
+    CHECK(classify_ipa_maps(unrelated, bind) == IpaMapping::Absent);
+    CHECK(classify_ipa_maps(bound + other_inode, bind) == IpaMapping::Unbound);
+    CHECK(classify_ipa_maps(other_path, bind) == IpaMapping::Unbound);
+}
+
+void try_format_and_stale_controls_refuse()
+{
+    v4l2_subdev_format f {};
+    f.which = V4L2_SUBDEV_FORMAT_TRY;
+    f.format.width = 2592;
+    f.format.height = 1944;
+    RequestEffect try_fmt = subdev_request_effect(VIDIOC_SUBDEV_S_FMT, &f, "ov5693_2-0036");
+    CHECK(!try_fmt.verdict.ok && try_fmt.verdict.reason == "unlisted-effect" && !try_fmt.effect);
+    f.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    RequestEffect active = subdev_request_effect(VIDIOC_SUBDEV_S_FMT, &f, "ov5693_2-0036");
+    CHECK(active.verdict.ok && active.effect && active.effect->kind == Effect::Kind::Fmt && active.effect->width == 2592);
+    v4l2_ext_control ctrl {};
+    ctrl.id = 0x980914;
+    v4l2_ext_controls cs {};
+    cs.which = V4L2_CTRL_WHICH_DEF_VAL;
+    cs.count = 1;
+    cs.controls = &ctrl;
+    CHECK(!subdev_request_effect(VIDIOC_S_EXT_CTRLS, &cs, "ov5693_2-0036").verdict.ok);
+    cs.which = V4L2_CTRL_WHICH_CUR_VAL;
+    cs.count = 0;
+    CHECK(!subdev_request_effect(VIDIOC_S_EXT_CTRLS, &cs, "ov5693_2-0036").verdict.ok);
+    cs.count = 1;
+    RequestEffect set = subdev_request_effect(VIDIOC_S_EXT_CTRLS, &cs, "ov5693_2-0036");
+    CHECK(set.verdict.ok && set.effect && set.effect->controls.size() == 1);
+    v4l2_subdev_selection sel {};
+    CHECK(subdev_request_effect(VIDIOC_SUBDEV_S_SELECTION, &sel, "ov5693_2-0036").verdict.reason == "unlisted-request");
+}
+
 } // namespace
 
 int main()
@@ -588,6 +665,9 @@ int main()
         {"fmt_effect_requires_result_code", fmt_effect_requires_result_code},
         {"request_matches_without_result_code", request_matches_without_result_code},
         {"driver_records_carry_result_code", driver_records_carry_result_code},
+        {"media_listing_fails_closed", media_listing_fails_closed},
+        {"ipa_maps_report_unbound_mapping", ipa_maps_report_unbound_mapping},
+        {"try_format_and_stale_controls_refuse", try_format_and_stale_controls_refuse},
         {"whitespace_line_refuses", whitespace_line_refuses},
     };
     for (const auto &[name, test] : tests) {

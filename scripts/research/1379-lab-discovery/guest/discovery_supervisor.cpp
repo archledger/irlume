@@ -191,12 +191,14 @@ bool kernfs_inode(unsigned major, unsigned minor, ino_t &inode)
     return true;
 }
 
-std::vector<MediaNode> sysfs_media()
+// Every media device with its node path and kernfs inode; false if any entry cannot be read.
+bool sysfs_media(std::vector<MediaNode> &nodes)
 {
-    std::vector<MediaNode> nodes;
+    nodes.clear();
     DIR *dir = opendir("/sys/bus/media/devices");
     if (!dir)
-        return nodes;
+        return false;
+    bool complete = true;
     while (dirent *entry = readdir(dir)) {
         std::string name = entry->d_name;
         if (name.rfind("media", 0) != 0)
@@ -204,23 +206,23 @@ std::vector<MediaNode> sysfs_media()
         MediaNode node;
         node.sysname = name;
         std::string dev, uevent;
+        size_t at = std::string::npos;
         if (!read_file("/sys/bus/media/devices/" + name + "/dev", dev) ||
             std::sscanf(dev.c_str(), "%u:%u", &node.major, &node.minor) != 2 ||
-            !read_file("/sys/bus/media/devices/" + name + "/uevent", uevent))
+            !read_file("/sys/bus/media/devices/" + name + "/uevent", uevent) ||
+            (at = uevent.find("DEVNAME=")) == std::string::npos ||
+            !kernfs_inode(node.major, node.minor, node.inode)) {
+            complete = false;
             continue;
-        size_t at = uevent.find("DEVNAME=");
-        if (at == std::string::npos)
-            continue;
+        }
         node.path = "/dev/" + uevent.substr(at + 8, uevent.find('\n', at) - at - 8);
-        if (!kernfs_inode(node.major, node.minor, node.inode))
-            continue;
         nodes.push_back(node);
     }
     closedir(dir);
     std::sort(nodes.begin(), nodes.end(), [](const MediaNode &a, const MediaNode &b) {
         return a.minor < b.minor;
     });
-    return nodes;
+    return complete;
 }
 
 // The kernfs inode of the registration must match before and after the open,
@@ -299,7 +301,9 @@ void sim_controls(const std::vector<MediaNode> &before, const std::vector<book2l
     uint64_t old_version = tops[static_cast<size_t>(cio2 - before.data())].version;
     if (!write_file(std::string(kDebug) + "/control", "replace\n"))
         fail("CONTROL_REPLACE");
-    std::vector<MediaNode> after = sysfs_media();
+    std::vector<MediaNode> after;
+    if (!sysfs_media(after))
+        fail("MEDIA_LIST");
     std::vector<book2lab::Snapshot> fresh;
     if (!read_media(after, fresh))
         fail("REREAD_AFTER_REPLACE");
@@ -317,7 +321,10 @@ void sim_controls(const std::vector<MediaNode> &before, const std::vector<book2l
         event("VERSION_BUMPED");
     if (!write_file(std::string(kDebug) + "/control", "add-media\n"))
         fail("CONTROL_ADD_MEDIA");
-    if (sysfs_media().size() == after.size() + 1)
+    std::vector<MediaNode> extra;
+    if (!sysfs_media(extra))
+        fail("MEDIA_LIST");
+    if (extra.size() == after.size() + 1)
         event("EXTRA_MEDIA_PRESENT");
     event("SIM_CONTROLS_PASS");
 }
@@ -725,20 +732,6 @@ std::string read_verdict(int fd)
     return book2lab::sanitize_verdict(line.substr(8));
 }
 
-std::vector<std::string> book2lab_tokens(const std::string &s)
-{
-    // Runs of spaces separate fields (/proc maps pads before the path).
-    std::vector<std::string> out;
-    size_t pos = 0;
-    while (pos < s.size()) {
-        size_t end = s.find(' ', pos);
-        if (end != pos)
-            out.push_back(s.substr(pos, end - pos));
-        pos = end == std::string::npos ? s.size() : end + 1;
-    }
-    return out;
-}
-
 // Re-register the graph after reserving; record what a number-based check would see.
 void replace_and_report(const book2lab::Reservation &r)
 {
@@ -748,7 +741,9 @@ void replace_and_report(const book2lab::Reservation &r)
             old = &n;
     if (!old || !write_file(std::string(kDebug) + "/control", "replace\n"))
         fail("CONTROL_REPLACE");
-    std::vector<MediaNode> now = sysfs_media();
+    std::vector<MediaNode> now;
+    if (!sysfs_media(now))
+        fail("MEDIA_LIST");
     std::vector<book2lab::Snapshot> fresh;
     if (!read_media(now, fresh))
         fail("REREAD_AFTER_REPLACE");
@@ -780,10 +775,8 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
     if (book2lab::Verdict v = book2lab::parse_observer(counts, log, w.pid, r.grants, &observed); !v.ok)
         return {Ownership::Unknown, v.reason};
     const std::vector<std::string> &worker_effects = observed.worker_effects;
-    std::vector<std::pair<unsigned, unsigned>> present;
-    for (const auto &m : sysfs_media())
-        present.emplace_back(m.major, m.minor);
-    if (!book2lab::check_media_set(r, present).ok)
+    const auto present = book2lab::list_media_devices("/sys/bus/media/devices");
+    if (!present || !book2lab::check_media_set(r, *present).ok)
         return {Ownership::Unknown, "media-set"};
     for (const auto &n : r.nodes) {
         ino_t inode = 0;
@@ -816,7 +809,9 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
                 }
             }
     }
-    std::vector<MediaNode> media = sysfs_media();
+    std::vector<MediaNode> media;
+    if (!sysfs_media(media))
+        return {Ownership::Unknown, "media-set"};
     std::vector<book2lab::Snapshot> tops;
     if (!read_media(media, tops))
         return {Ownership::Unknown, "snapshot"};
@@ -884,18 +879,17 @@ void ipa_observation(const Worker &w, const book2lab::Reservation &r)
     if (!read_file(proc + "/status", status) || status.find("\nSeccomp_filters:\t2\n") == std::string::npos ||
         !read_file(proc + "/maps", maps) || !r.bind_ipa)
         worker_fail("WORKER_STATE_AT_REPORT");
-    char dev[32];
-    std::snprintf(dev, sizeof(dev), "%02x:%02x", major(static_cast<dev_t>(r.bind_ipa->dev)),
-                  minor(static_cast<dev_t>(r.bind_ipa->dev)));
-    bool mapped = false;
-    for (size_t pos = 0; pos < maps.size();) {
-        size_t end = maps.find('\n', pos);
-        auto f = book2lab_tokens(maps.substr(pos, end - pos));
-        pos = end == std::string::npos ? maps.size() : end + 1;
-        if (f.size() >= 6 && f[3] == dev && f[4] == std::to_string(r.bind_ipa->inode) && f[5] == r.bind_ipa->path)
-            mapped = true;
+    switch (book2lab::classify_ipa_maps(maps, *r.bind_ipa)) {
+    case book2lab::IpaMapping::Bound:
+        event("IPA_ROUTE threaded " + r.bind_ipa->sha256);
+        break;
+    case book2lab::IpaMapping::Unbound:
+        event("IPA_MAPPED_UNBOUND");
+        break;
+    case book2lab::IpaMapping::Absent:
+        event("IPA_NOT_MAPPED");
+        break;
     }
-    event(mapped ? "IPA_ROUTE threaded " + r.bind_ipa->sha256 : "IPA_NOT_MAPPED");
 }
 
 bool copy_file(const std::string &from, const std::string &to, mode_t mode)
@@ -1046,7 +1040,9 @@ int main()
     event("DENY_ATTACHED");
     if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755") != 0)
         fail("DEVTMPFS");
-    std::vector<MediaNode> nodes = sysfs_media();
+    std::vector<MediaNode> nodes;
+    if (!sysfs_media(nodes))
+        fail("MEDIA_LIST");
     if (nodes.size() != 2)
         fail("MEDIA_COUNT");
     errno = 0;

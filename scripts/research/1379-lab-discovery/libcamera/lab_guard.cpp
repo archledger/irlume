@@ -64,24 +64,11 @@ const ::book2lab::DiscoveryRequest *lookup(unsigned long request)
 /* Every registered media device; false if any media entry cannot be read. */
 bool sysfsMedia(std::vector<std::pair<unsigned, unsigned>> *devices)
 {
-	devices->clear();
-	DIR *dir = opendir("/sys/bus/media/devices");
-	if (!dir)
+	auto listed = ::book2lab::list_media_devices("/sys/bus/media/devices");
+	if (!listed)
 		return false;
-	bool ok = true;
-	while (dirent *entry = readdir(dir)) {
-		std::string name = entry->d_name, dev;
-		unsigned major = 0, minor = 0;
-		if (name.rfind("media", 0) != 0)
-			continue;
-		if (readAll(("/sys/bus/media/devices/" + name + "/dev").c_str(), &dev) &&
-		    std::sscanf(dev.c_str(), "%u:%u", &major, &minor) == 2)
-			devices->emplace_back(major, minor);
-		else
-			ok = false;
-	}
-	closedir(dir);
-	return ok;
+	*devices = std::move(*listed);
+	return true;
 }
 
 unsigned int suffix(const std::string &name)
@@ -261,35 +248,13 @@ int Guard::admitIoctl(const Node *node, unsigned long request, void *arg)
 		return refuse("unlisted-request");
 	if (req->cls != ::book2lab::RequestClass::ListedEffect)
 		return 0;
-	if (request == VIDIOC_SUBDEV_S_FMT &&
-	    static_cast<const v4l2_subdev_format *>(arg)->which == V4L2_SUBDEV_FORMAT_TRY)
-		return 0;
 	if (!latched_.empty())
 		return refuse(latched_);
-	::book2lab::Effect e;
-	e.entity = node->entity;
-	if (request == VIDIOC_S_EXT_CTRLS) {
-		const auto *c = static_cast<const v4l2_ext_controls *>(arg);
-		if (c->which != V4L2_CTRL_WHICH_CUR_VAL || !c->count)
-			return refuse("unlisted-effect");
-		e.kind = ::book2lab::Effect::Kind::Ctrl;
-		for (unsigned int i = 0; i < c->count; i++) {
-			/* v4l2_ext_control is packed: copy fields, never bind references. */
-			const uint32_t id = c->controls[i].id;
-			const int64_t value = c->controls[i].value;
-			e.controls.emplace_back(id, value);
-		}
-	} else if (request == VIDIOC_SUBDEV_S_FMT) {
-		const auto *f = static_cast<const v4l2_subdev_format *>(arg);
-		e.kind = ::book2lab::Effect::Kind::Fmt;
-		e.pad = f->pad;
-		e.code = f->format.code;
-		e.width = f->format.width;
-		e.height = f->format.height;
-	} else {
-		return refuse("unlisted-request");
-	}
-	return admitEffect(e);
+	/* TRY formats and stale or empty control sets are refused like any unlisted effect. */
+	const ::book2lab::RequestEffect requested = ::book2lab::subdev_request_effect(request, arg, node->entity);
+	if (!requested.verdict.ok)
+		return refuse(requested.verdict.reason);
+	return admitEffect(*requested.effect);
 }
 
 int Guard::admitMediaIoctl(const MediaDevice &media, unsigned long request, void *arg)

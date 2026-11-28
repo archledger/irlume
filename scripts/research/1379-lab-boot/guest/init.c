@@ -11,7 +11,7 @@
 
 static char receipt_nonce[33];
 
-enum lab_case { INVALID, SMOKE, POLICY, MISSING_DENY };
+enum lab_case { INVALID, SMOKE, POLICY, MISSING_DENY, BOUNDARY, KEPT_FD };
 
 void lab_event(const char *event)
 {
@@ -52,6 +52,10 @@ static enum lab_case read_scope(void)
                 choice = POLICY;
             else if (strcmp(name, "missing-deny") == 0)
                 choice = MISSING_DENY;
+            else if (strcmp(name, "boundary") == 0)
+                choice = BOUNDARY;
+            else if (strcmp(name, "kept-fd") == 0)
+                choice = KEPT_FD;
             else
                 return INVALID;
         } else if (strncmp(part, "book2_nonce=", 12) == 0) {
@@ -82,7 +86,16 @@ int main(void)
     lab_event("PID1");
     if (choice == SMOKE)
         lab_event("SMOKE_ONLY");
-    else if (run_device_policy(choice == MISSING_DENY) != 0)
+    else if (run_device_policy(choice == MISSING_DENY) != 0) {
         lab_event("ERROR_POLICY");
+    } else if (choice == BOUNDARY || choice == KEPT_FD) {
+        int outcome = verify_worker_boundary(QUARANTINE, ALLOWED, choice == KEPT_FD);
+        if (outcome == WORKER_RETAINED)
+            lab_event("REFUSED_RETAINED_HANDLE");
+        else if (outcome == WORKER_OK && choice == BOUNDARY)
+            lab_event("BOOT_BOUNDARY_PASS");
+        else
+            lab_event("ERROR_WORKER_BOUNDARY");
+    }
     poweroff();
 }

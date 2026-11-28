@@ -31,3 +31,12 @@ minor, write and node-creation denial. The target is the built-in `mem` class
 entry `1:5`, with matching sysfs identity and a guest compiled without modules.
 A refused module operation is a control for this fixed built-in endpoint,
 not a lifetime guarantee for a detachable camera or a reused media device.
+
+The `boundary` case additionally seeds a real dummy descriptor before worker
+startup, requires it to be closed before any approved open, and verifies that
+the quarantined peer cannot open the owner's still-live descriptor. A tiny
+guest-only seccomp allowlist excludes file-descriptor transfer and acquisition
+calls. The `kept-fd` negative reaches the deliberate retained-handle refusal
+instead of any successful boundary receipt. This is a fixed dummy fixture
+with audited workers; it does not validate libcamera, IPA or a production
+supervisor.

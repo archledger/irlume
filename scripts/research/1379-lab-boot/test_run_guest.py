@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from run_guest import check_receipt, qemu_args, run_guest, verify_build
+from run_guest import POLICY_EVENTS, check_receipt, qemu_args, run_guest, verify_build
 
 
 NONCE = "f00dbeef00112233445566778899aabb"
@@ -76,3 +76,10 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_receipt(refused + f"BOOK2_BOOT_V1 {NONCE} DUMMY_IDENTIFIED\n",
                           NONCE, "missing-deny", 0)
+
+    def test_retained_handle_is_not_a_completed_boundary(self):
+        refused = POLICY_EVENTS + ("REFUSED_RETAINED_HANDLE",)
+        text = "".join(f"BOOK2_BOOT_V1 {NONCE} {event}\n" for event in refused)
+        self.assertEqual(check_receipt(text, NONCE, "kept-fd", 0), refused)
+        with self.assertRaises(ValueError):
+            check_receipt(text, NONCE, "boundary", 0)

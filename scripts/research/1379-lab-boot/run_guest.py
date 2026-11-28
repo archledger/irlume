@@ -17,6 +17,10 @@ CASE_EVENTS = {
     "smoke": ("PID1", "SMOKE_ONLY"),
     "missing-deny": ("PID1", "REFUSED_NO_INITIAL_POLICY"),
     "policy": POLICY_EVENTS,
+    "kept-fd": POLICY_EVENTS + ("REFUSED_RETAINED_HANDLE",),
+    "boundary": POLICY_EVENTS + (
+        "INHERITED_HANDLE_CLOSED", "PEER_HANDLE_DENIED", "FD_IPC_DENIED", "BOOT_BOUNDARY_PASS",
+    ),
 }
 MAX_SERIAL = 2 * 1024 * 1024
 

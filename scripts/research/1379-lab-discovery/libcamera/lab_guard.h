@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <cstdint>
 #include <string>
 
 #include "lab_contract.h"
@@ -35,6 +36,9 @@ public:
 	int admitMediaIoctl(const MediaDevice &media, unsigned long request, void *arg);
 	Verdict finalCheck();
 	void settle();
+	int admitIpaRoute(const std::string &path, const char *requested, const char *name,
+			  uint32_t pipelineVersion, bool signatureValid);
+	int refuseFor(const std::string &reason);
 
 	unsigned int frontPort() const;
 	unsigned int frontImgu() const;

@@ -23,6 +23,8 @@ LAB = PREFIX + ("RESERVED",)
 KNOWN = ("OWNER_RELEASED", "SECOND_BACKEND_STARTED", "IR_STUB_RAN")
 BLOCKED = ("SECOND_BACKEND_BLOCKED unknown",)
 REPLACED = "REPLACED same_devt=1 same_version=1 new_inode=1"
+CLEAN = ("RELEASED_AFTER_REFUSAL", "SECOND_BACKEND_BLOCKED refused")
+IPA_ROUTE = "IPA_ROUTE threaded {ipa}"
 WORKER_EFFECTS = ("ctrl", "link", "fmt", "sel")
 KERNEL_FAULT = re.compile(
     r"Kernel panic|\bOops\b|\bBUG:|\bWARNING:|\bKASAN\b|circular locking|INFO: possible|"
@@ -53,31 +55,43 @@ CASES = {
     "stock-baseline": Case("stock.cpio", (), PREFIX + (
         "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 2", "WORKER_EXITED 0", "STOCK_EFFECTS_OBSERVED")),
     "lab-front": Case("lab.cpio", (), LAB + (
-        "WORKER_READY", "CAMERAS 1", "WORKER_EXITED 0", "GUARD admit") + KNOWN),
+        "WORKER_READY", "CAMERAS 1", IPA_ROUTE, "WORKER_EXITED 0", "GUARD admit") + KNOWN),
     "graph-ir-link-enabled": Case("lab.cpio", (), LAB + (
-        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse link-state",
+        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0", "GUARD refuse link-state",
         "HOLD link-state") + BLOCKED),
     "graph-extra-entity": Case("lab.cpio", (), LAB + (
-        "ENTITY_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse version",
+        "ENTITY_ADDED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0", "GUARD refuse version",
         "HOLD version") + BLOCKED),
     "hotplug-extra-media": Case("lab.cpio", (), LAB + (
-        "MEDIA_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse unreserved-open",
+        "MEDIA_ADDED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0", "GUARD refuse unreserved-open",
         "HOLD media-set") + BLOCKED),
     "sim-port-variant": Case("lab.cpio", ("book2_lab_sim.front_port=3",), PREFIX + (
         "REFUSED_CONTRACT_GRAPH", "REFUSED_BEFORE_RESERVATION", "SECOND_BACKEND_BLOCKED refused")),
     "effect-unlisted-link": Case("lab.cpio", (), LAB + (
-        "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0",
+        "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
         "GUARD refuse unlisted-effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1",
         "HOLD partial-effects") + BLOCKED),
     "replace-before-discovery": Case("lab.cpio", (), LAB + (
-        REPLACED, "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse identity",
+        REPLACED, "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0", "GUARD refuse identity",
         "HOLD replaced") + BLOCKED),
     "generation-during-discovery": Case("lab.cpio", (), LAB + (
-        "BUMP_ARMED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD hold version",
+        "BUMP_ARMED", "WORKER_READY", "CAMERAS 0", IPA_ROUTE, "WORKER_EXITED 0", "GUARD hold version",
         "HOLD version") + BLOCKED),
     "replace-after-discovery": Case("lab.cpio", (), LAB + (
-        "WORKER_READY", "CAMERAS 1", "REPLACED_AFTER_DISCOVERY", "WORKER_EXITED 0", "GUARD admit",
+        "WORKER_READY", "CAMERAS 1", IPA_ROUTE, "REPLACED_AFTER_DISCOVERY", "WORKER_EXITED 0", "GUARD admit",
         "HOLD replaced") + BLOCKED),
+    "ipa-bad-signature": Case("lab.cpio", (), LAB + (
+        "SIGNATURE_CORRUPTED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
+        "GUARD refuse ipa-signature") + CLEAN),
+    "ipa-force-isolation": Case("lab.cpio", (), LAB + (
+        "ISOLATION_CONFIGURED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
+        "GUARD refuse configuration") + CLEAN),
+    "ipa-env-override": Case("lab.cpio", (), LAB + (
+        "ENV_OVERRIDE_SET", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
+        "GUARD refuse environment") + CLEAN),
+    "ipa-identity-mismatch": Case("lab.cpio", (), LAB + (
+        "MODULE_REPLACED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
+        "GUARD refuse ipa-identity") + CLEAN),
 }
 
 
@@ -131,7 +145,8 @@ def check_outcome(events: tuple[str, ...], effects: tuple[str, ...]) -> None:
             raise ValueError(f"replacement receipt does not prove same number and new inode: {e}")
 
 
-def check_discovery(text: str, nonce: str, case: str, returncode: int) -> Receipt:
+def check_discovery(text: str, nonce: str, case: str, returncode: int,
+                    ipa_digest: str = "0" * 64) -> Receipt:
     if case not in CASES:
         raise ValueError(f"unknown discovery case {case!r}")
     if returncode != 0:
@@ -166,7 +181,8 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int) -> Receip
     if not ended:
         raise ValueError("missing effect dump")
     check_outcome(tuple(events), tuple(effects))
-    if tuple(events) != CASES[case].events:
+    want = tuple(e.replace("{ipa}", ipa_digest) for e in CASES[case].events)
+    if tuple(events) != want:
         raise ValueError(f"unexpected receipt sequence for {case}: {tuple(events)}")
     if _split_releases(effects) != _split_releases(expected_effects(case)):
         raise ValueError(f"unexpected effect records for {case}: {tuple(effects)}")
@@ -238,7 +254,8 @@ def run_discovery(build: Path, receipt: Path, case: str) -> Receipt:
         result = subprocess.run(args, timeout=TIMEOUT, stdout=log, stderr=log, **opts)
     if not serial.is_file() or serial.stat().st_size > MAX_SERIAL:
         raise ValueError("missing or oversized guest serial log")
-    verified = check_discovery(serial.read_text(errors="replace"), nonce, case, result.returncode)
+    digest = (build / "ipa_ipu3.sha256").read_text().strip() if (build / "ipa_ipu3.sha256").is_file() else "0" * 64
+    verified = check_discovery(serial.read_text(errors="replace"), nonce, case, result.returncode, digest)
     (receipt / "verified.txt").write_text(
         f"{nonce} {case}\n" + "\n".join(verified.events + verified.effects) + "\n")
     return verified

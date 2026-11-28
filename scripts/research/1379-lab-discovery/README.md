@@ -97,6 +97,37 @@ Anything else is `HOLD <reason>` and blocks the second backend. The
 verifier also enforces these outcome rules independently of the case
 table.
 
+The lab factory decides the IPA route once, at the branch, before any
+proxy exists, and can only build the threaded proxy. The lab IPU3 handler
+runs the same check as a preflight right after the graph check, before
+any effect. The route must satisfy all of these:
+
+- a valid signature;
+- no `LIBCAMERA_*`, `HOME` or `XDG_CONFIG_HOME` in the environment and no
+  configuration file;
+- the contract's module name and version;
+- the bound path, device, inode and size;
+- a SHA-256 of the module bytes equal to the build's digest.
+
+While the worker is alive, the supervisor requires the bound inode in
+`/proc/<worker>/maps` before it reports `IPA_ROUTE threaded <sha256>`.
+
+| Case | Change before the worker runs | Required result |
+| --- | --- | --- |
+| `ipa-bad-signature` | one bit of `ipa_ipu3.so.sign` flipped | refuse `ipa-signature`, IPA not mapped |
+| `ipa-force-isolation` | `/etc/libcamera/configuration.yaml` forcing isolation | refuse `configuration` |
+| `ipa-env-override` | `LIBCAMERA_IPA_FORCE_ISOLATION=1` | refuse `environment` |
+| `ipa-identity-mismatch` | module replaced by a byte-identical copy | refuse `ipa-identity` (new inode) |
+
+Each ends with a release and no next phase, because the graph stays as
+reserved and the worker made no effect. The environment and configuration
+cases are refused by the same check at the start of discovery, before the
+route preflight runs; the route guard repeats it. Without the route guard,
+a corrupted signature makes the unchanged factory construct the isolated
+proxy after the sensor effects. Only the worker's seccomp filter, which
+refuses the proxy's socket pair, then keeps the proxy process from
+starting.
+
 These results concern the simulated graph in this guest only. They say
 nothing about the real Book 2 graph, its drivers' effects, teardown,
 optical state or authentication.

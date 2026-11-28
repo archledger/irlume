@@ -154,7 +154,7 @@ cp -- "$here"/lab/{lab_contract.h,lab_contract.cpp,discovery_requests.h} "$here"
     "$lc_lab/src/libcamera/lab/"
 git -C "$lc_lab" apply -- "$here/libcamera/book2-lab.patch"
 status=$(git -C "$lc_lab" status --porcelain --untracked-files=all)
-expected=$' M include/libcamera/internal/media_device.h\n M include/libcamera/internal/v4l2_device.h\n M src/libcamera/media_device.cpp\n M src/libcamera/media_object.cpp\n M src/libcamera/meson.build\n M src/libcamera/pipeline/ipu3/ipu3.cpp\n M src/libcamera/v4l2_device.cpp\n?? src/libcamera/lab/discovery_requests.h\n?? src/libcamera/lab/lab_contract.cpp\n?? src/libcamera/lab/lab_contract.h\n?? src/libcamera/lab/lab_guard.cpp\n?? src/libcamera/lab/lab_guard.h'
+expected=$' M include/libcamera/internal/ipa_manager.h\n M include/libcamera/internal/media_device.h\n M include/libcamera/internal/v4l2_device.h\n M src/libcamera/ipa_manager.cpp\n M src/libcamera/media_device.cpp\n M src/libcamera/media_object.cpp\n M src/libcamera/meson.build\n M src/libcamera/pipeline/ipu3/ipu3.cpp\n M src/libcamera/v4l2_device.cpp\n?? src/libcamera/lab/discovery_requests.h\n?? src/libcamera/lab/lab_contract.cpp\n?? src/libcamera/lab/lab_contract.h\n?? src/libcamera/lab/lab_guard.cpp\n?? src/libcamera/lab/lab_guard.h'
 [[ $status == "$expected" ]] || die "unexpected lab libcamera tree changes: $status"
 printf '%s\n' "$status" >"$out/libcamera-lab-tree.status"
 build_libcamera lab "$lc_lab"

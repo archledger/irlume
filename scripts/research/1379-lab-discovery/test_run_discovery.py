@@ -7,6 +7,7 @@ NONCE = "0123456789abcdef0123456789abcdef"
 
 
 def serial(case, events, effects=(), topology=(), nonce=NONCE, dropped=0, count=None):
+    events = tuple(e.replace("{ipa}", "0" * 64) for e in events)
     prefix = f"{rd.PROTOCOL} {nonce} "
     lines = ["[    0.000000] Linux version 7.3.5 (guest)"]
     lines += [prefix + event for event in events]
@@ -142,6 +143,15 @@ class VerifierTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "same number and new inode"):
                 rd.check_discovery(serial("replace-before-discovery", weak, effects), NONCE,
                                    "replace-before-discovery", 0)
+
+    def test_isolated_branch_absent_from_lab_factory(self):
+        patch = (rd.HERE / "libcamera" / "book2-lab.patch").read_text()
+        hunk = patch.split("diff --git a/include/libcamera/internal/ipa_manager.h")[1].split("diff --git")[0]
+        added = [l for l in hunk.splitlines() if l.startswith("+")]
+        removed = [l for l in hunk.splitlines() if l.startswith("-")]
+        self.assertTrue(any("T::Isolated" in l for l in removed))
+        self.assertFalse(any("Isolated" in l for l in added))
+        self.assertTrue(any("admitThreadedRoute" in l for l in added))
 
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")

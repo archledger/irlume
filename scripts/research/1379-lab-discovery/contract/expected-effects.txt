@@ -204,3 +204,11 @@
 1 worker release ipu3-imgu_1_viewfinder
 1 worker release ipu3-imgu_1_parameters
 1 worker release ipu3-imgu_1_3a_stat
+
+[ipa-bad-signature]
+
+[ipa-force-isolation]
+
+[ipa-env-override]
+
+[ipa-identity-mismatch]

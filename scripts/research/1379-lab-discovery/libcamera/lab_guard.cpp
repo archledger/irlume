@@ -17,6 +17,8 @@
 #include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
 
+#include <gnutls/crypto.h>
+
 #include "libcamera/internal/media_device.h"
 
 #include "discovery_requests.h"
@@ -302,6 +304,51 @@ int Guard::admitMediaIoctl(const MediaDevice &media, unsigned long request, void
 	e.sink_pad = d->sink.index;
 	e.flags = d->flags;
 	return admitEffect(e);
+}
+
+/*
+ * The threaded route only: signature valid, contract identity, the bound
+ * file identity and the SHA-256 of the module bytes. Decided before any proxy.
+ */
+int Guard::admitIpaRoute(const std::string &path, const char *requested, const char *name,
+			 uint32_t pipelineVersion, bool signatureValid)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!latched_.empty())
+		return refuse(latched_);
+	Verdict v = ::book2lab::check_environment(environ, kConfigFiles);
+	if (!v.ok)
+		return refuse(v.reason);
+	if (!signatureValid)
+		return refuse("ipa-signature");
+	const ::book2lab::Ipa &ipa = reservation_->ipa;
+	const ::book2lab::BindIpa &bind = *reservation_->bind_ipa;
+	if (path != ipa.path || path != bind.path || ipa.pipeline != requested || ipa.name != name ||
+	    ipa.version != pipelineVersion)
+		return refuse("ipa-identity");
+	struct stat st {};
+	std::string bytes;
+	unsigned char digest[32];
+	if (stat(path.c_str(), &st) != 0 || static_cast<uint64_t>(st.st_dev) != bind.dev ||
+	    static_cast<uint64_t>(st.st_ino) != bind.inode || static_cast<uint64_t>(st.st_size) != bind.size ||
+	    !readAll(path.c_str(), &bytes) ||
+	    gnutls_hash_fast(GNUTLS_DIG_SHA256, bytes.data(), bytes.size(), digest) != 0)
+		return refuse("ipa-identity");
+	static const char hexdigits[] = "0123456789abcdef";
+	std::string hex;
+	for (unsigned char b : digest) {
+		hex += hexdigits[b >> 4];
+		hex += hexdigits[b & 15];
+	}
+	if (hex != bind.sha256)
+		return refuse("ipa-identity");
+	return 0;
+}
+
+int Guard::refuseFor(const std::string &reason)
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	return refuse(reason);
 }
 
 Verdict Guard::finalCheck()

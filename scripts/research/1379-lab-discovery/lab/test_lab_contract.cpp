@@ -309,6 +309,33 @@ void libcamera_environment_or_configuration_refuses()
     unlink(path);
 }
 
+void env_override_variants_refuse()
+{
+    for (const char *var : {"LIBCAMERA_IPA_CONFIG_PATH=/tmp", "LIBCAMERA_IPA_FORCE_ISOLATION=1",
+                            "LIBCAMERA_IPA_MODULE_PATH=/tmp", "LIBCAMERA_IPA_PROXY_PATH=/tmp",
+                            "LIBCAMERA_PIPELINES_MATCH_LIST=ipu3", "LIBCAMERA_SOFTISP_MODE=cpu",
+                            "LIBCAMERA_IPU3_TUNING_FILE=/tmp/x.yaml"}) {
+        const char *envp[] = {"LC_ALL=C", var, nullptr};
+        Verdict v = check_environment(envp, {});
+        CHECK(!v.ok && v.reason == "environment");
+    }
+}
+
+void configuration_file_refuses()
+{
+    const char *clean[] = {"LC_ALL=C", nullptr};
+    char path[] = "/tmp/book2-lab-configuration-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    for (const std::vector<std::string> &paths : {std::vector<std::string>{path, "/nonexistent/a"},
+                                                  std::vector<std::string>{"/nonexistent/a", path}}) {
+        Verdict v = check_environment(clean, paths);
+        CHECK(!v.ok && v.reason == "configuration");
+    }
+    close(fd);
+    unlink(path);
+}
+
 } // namespace
 
 int main()
@@ -325,6 +352,8 @@ int main()
         {"unknown_or_duplicate_record_refuses", unknown_or_duplicate_record_refuses},
         {"serialize_roundtrip", serialize_roundtrip},
         {"libcamera_environment_or_configuration_refuses", libcamera_environment_or_configuration_refuses},
+        {"env_override_variants_refuse", env_override_variants_refuse},
+        {"configuration_file_refuses", configuration_file_refuses},
     };
     for (const auto &[name, test] : tests) {
         int before = failures;

@@ -169,7 +169,8 @@ bool read_scope()
     static const char *const known[] = {"topology", "sim-controls", "stock-baseline", "lab-front",
                                         "graph-ir-link-enabled", "graph-extra-entity", "hotplug-extra-media",
                                         "sim-port-variant", "effect-unlisted-link", "replace-before-discovery",
-                                        "generation-during-discovery", "replace-after-discovery"};
+                                        "generation-during-discovery", "replace-after-discovery", "ipa-bad-signature",
+                                        "ipa-force-isolation", "ipa-env-override", "ipa-identity-mismatch"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -737,11 +738,13 @@ std::string read_verdict(int fd)
 
 std::vector<std::string> book2lab_tokens(const std::string &s)
 {
+    // Runs of spaces separate fields (/proc maps pads before the path).
     std::vector<std::string> out;
     size_t pos = 0;
     while (pos < s.size()) {
         size_t end = s.find(' ', pos);
-        out.push_back(s.substr(pos, end - pos));
+        if (end != pos)
+            out.push_back(s.substr(pos, end - pos));
         pos = end == std::string::npos ? s.size() : end + 1;
     }
     return out;
@@ -933,6 +936,76 @@ void finish_attempt(const book2lab::Reservation &r, const Worker &w)
     }
 }
 
+// While the worker is alive and both seccomp stages are present, a threaded
+// route maps the bound IPA inode into the worker itself.
+void ipa_observation(const Worker &w, const book2lab::Reservation &r)
+{
+    const std::string proc = "/proc/" + std::to_string(w.pid);
+    std::string status, maps;
+    if (!read_file(proc + "/status", status) || status.find("\nSeccomp_filters:\t2\n") == std::string::npos ||
+        !read_file(proc + "/maps", maps) || !r.bind_ipa)
+        worker_fail("WORKER_STATE_AT_REPORT");
+    char dev[32];
+    std::snprintf(dev, sizeof(dev), "%02x:%02x", major(static_cast<dev_t>(r.bind_ipa->dev)),
+                  minor(static_cast<dev_t>(r.bind_ipa->dev)));
+    bool mapped = false;
+    for (size_t pos = 0; pos < maps.size();) {
+        size_t end = maps.find('\n', pos);
+        auto f = book2lab_tokens(maps.substr(pos, end - pos));
+        pos = end == std::string::npos ? maps.size() : end + 1;
+        if (f.size() >= 6 && f[3] == dev && f[4] == std::to_string(r.bind_ipa->inode) && f[5] == r.bind_ipa->path)
+            mapped = true;
+    }
+    event(mapped ? "IPA_ROUTE threaded " + r.bind_ipa->sha256 : "IPA_NOT_MAPPED");
+}
+
+bool copy_file(const std::string &from, const std::string &to, mode_t mode)
+{
+    std::string bytes;
+    if (!read_file(from, bytes))
+        return false;
+    int fd = open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
+    if (fd < 0)
+        return false;
+    bool ok = write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size());
+    return close(fd) == 0 && ok;
+}
+
+// Test-only IPA route perturbations, applied after reserving and before launch.
+void perturb_ipa(const book2lab::Reservation &r, std::vector<std::string> &extra_env)
+{
+    const std::string &module = r.ipa.path;
+    if (lab_case == "ipa-bad-signature") {
+        std::string sign;
+        const std::string path = module + ".sign", tmp = path + ".new";
+        if (!read_file(path, sign) || sign.empty())
+            fail("SIGNATURE");
+        sign[sign.size() / 2] ^= 0x01;
+        int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        bool ok = fd >= 0 && write(fd, sign.data(), sign.size()) == static_cast<ssize_t>(sign.size());
+        if (fd < 0 || close(fd) != 0 || !ok || rename(tmp.c_str(), path.c_str()) != 0)
+            fail("SIGNATURE");
+        event("SIGNATURE_CORRUPTED");
+    } else if (lab_case == "ipa-force-isolation") {
+        const char *yaml = "%YAML 1.1\n---\nversion: 1\nconfiguration:\n  ipa:\n    force_isolation: true\n";
+        if (mkdir("/etc/libcamera", 0755) != 0 && errno != EEXIST)
+            fail("CONFIGURATION");
+        int fd = open("/etc/libcamera/configuration.yaml", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        bool ok = fd >= 0 && write(fd, yaml, std::strlen(yaml)) == static_cast<ssize_t>(std::strlen(yaml));
+        if (fd < 0 || close(fd) != 0 || !ok)
+            fail("CONFIGURATION");
+        event("ISOLATION_CONFIGURED");
+    } else if (lab_case == "ipa-env-override") {
+        extra_env.push_back("LIBCAMERA_IPA_FORCE_ISOLATION=1");
+        event("ENV_OVERRIDE_SET");
+    } else if (lab_case == "ipa-identity-mismatch") {
+        const std::string tmp = module + ".new";
+        if (!copy_file(module, tmp, 0755) || rename(tmp.c_str(), module.c_str()) != 0)
+            fail("MODULE_REPLACE");
+        event("MODULE_REPLACED");
+    }
+}
+
 void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2lab::Snapshot> &tops)
 {
     std::string text;
@@ -978,21 +1051,23 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
             fail("CONTROL_BUMP");
         event("BUMP_ARMED");
     }
+    std::vector<std::string> extra_env;
+    perturb_ipa(r, extra_env);
     std::vector<std::string> paths;
     for (const auto &n : r.nodes)
         paths.push_back(n.path);
     std::vector<device_rule> rules;
     Worker w;
-    if (!grant(paths, rules) || !launch_worker(rules, {}, w))
+    if (!grant(paths, rules) || !launch_worker(rules, extra_env, w))
         fail("LAUNCH");
-    std::function<void()> before_release;
-    if (lab_case == "replace-after-discovery")
-        before_release = [] {
+    run_worker(w, [&] {
+        ipa_observation(w, r);
+        if (lab_case == "replace-after-discovery") {
             if (!write_file(std::string(kDebug) + "/control", "replace\n"))
                 fail("CONTROL_REPLACE");
             event("REPLACED_AFTER_DISCOVERY");
-        };
-    run_worker(w, before_release);
+        }
+    });
     const std::string verdict = read_verdict(w.verdict);
     if (verdict == "none")
         print_worker_log();

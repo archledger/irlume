@@ -12,7 +12,8 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "1379-lab-boot"))
-import run_guest  # noqa: E402  (pinned QEMU path, version and scratch checks)
+import run_guest  # noqa: E402  (pinned QEMU path, version, scratch checks and serial parsing)
+from run_guest import NON_PRINTABLE, read_serial, receipt_lines  # noqa: E402
 
 PROTOCOL = "BOOK2_DISCOVERY_V1"
 MAX_SERIAL = 8 * 1024 * 1024
@@ -31,7 +32,6 @@ KERNEL_FAULT = re.compile(
     r"INFO: trying to register|INFO: task .* blocked|general protection fault|Call Trace:")
 EFFECT = re.compile(r"EFFECT ([0-9]+) ([0-9]+) (worker|supervisor|other) (\S.*)")
 END = re.compile(r"EFFECTS_END ([0-9]+) dropped=([0-9]+)")
-NON_PRINTABLE = re.compile(r"[^\x20-\x7e]")
 
 
 @dataclass(frozen=True)
@@ -210,16 +210,6 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int,
     if sorted(topology) != want_topology:
         raise ValueError("topology does not match the contract graph")
     return Receipt(tuple(events), tuple(effects), tuple(topology))
-
-
-def read_serial(path: Path) -> str:
-    """The serial log as written: no newline translation, so only '\\n' ends a line."""
-    return path.read_bytes().decode("utf-8", errors="replace")
-
-
-def receipt_lines(text: str) -> list[str]:
-    """Split on '\\n' only, dropping the one '\\r' of the console's line ending."""
-    return [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
 
 
 def qemu_args(kernel: Path, initramfs: Path, serial: Path, case: str, nonce: str) -> list[str]:

@@ -19,7 +19,9 @@ python3 -B -m unittest discover -s "$lab" -p test_run_guest.py
 python3 -B "$lab/run_guest.py" "$scratch/build" "$scratch/smoke-receipt" smoke
 ```
 
-Every run uses a new receipt directory and a per-boot nonce. A smoke pass
+Every run uses a new receipt directory and a per-boot nonce. The verifier
+reads the serial log without newline translation, splits it on `\n` only
+and refuses a receipt line with a control character. A smoke pass
 proves that this exact kernel and initramfs booted and powered off without
 passthrough. It does not prove device policy, capture, teardown or Book 2
 qualification.

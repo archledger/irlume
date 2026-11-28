@@ -1,12 +1,13 @@
 import hashlib
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from run_guest import POLICY_EVENTS, check_receipt, qemu_args, run_guest, verify_build
+from run_guest import QEMU, VERSION, POLICY_EVENTS, check_receipt, qemu_args, run_guest, verify_build
 
 
 NONCE = "f00dbeef00112233445566778899aabb"
@@ -35,6 +36,31 @@ class ReceiptTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 check_receipt(GOOD + error + "\n", NONCE, "smoke", 0)
+
+    def test_embedded_line_separators_cannot_mint_receipt_lines(self):
+        banner = "[    0.000000] Linux version 7.3.5\r\n"
+        for sep in ("\r", "\x0b", "\x0c", "\x1c", "\x85", "\u2028"):
+            with self.assertRaisesRegex(ValueError, "control character"):
+                check_receipt(f"{banner}{PID}{sep}{SMOKE}\r\n", NONCE, "smoke", 0)
+            logged = f"{banner}{PID}\r\n[    1.000000] x{sep}{SMOKE}\r\n{SMOKE}\r\n"
+            self.assertEqual(check_receipt(logged, NONCE, "smoke", 0), ("PID1", "SMOKE_ONLY"))
+
+    def test_serial_log_is_read_without_newline_translation(self):
+        def boot(args, **_):
+            if tuple(args) == (QEMU, "--version"):
+                return subprocess.CompletedProcess(args, 0, stdout=VERSION + "\n")
+            nonce = re.search(r"book2_nonce=([0-9a-f]{32})", args[-1])[1]
+            serial = Path(args[args.index("-serial") + 1].removeprefix("file:"))
+            serial.write_bytes(f"BOOK2_BOOT_V1 {nonce} PID1\rBOOK2_BOOT_V1 {nonce} SMOKE_ONLY\r\n".encode())
+            return subprocess.CompletedProcess(args, 0)
+
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temp:
+            root = Path(temp)
+            images = (root / "bzImage", root / "initramfs.cpio")
+            with patch("run_guest.verify_build", return_value=images), \
+                    patch("run_guest.subprocess.run", side_effect=boot):
+                with self.assertRaisesRegex(ValueError, "control character"):
+                    run_guest(root, root / "receipt", "smoke")
 
     def test_unsafe_launch_options_are_absent(self):
         args = qemu_args(Path("/tmp/opencode/k"), Path("/tmp/opencode/c"),

@@ -24,6 +24,17 @@ CASE_EVENTS = {
     ),
 }
 MAX_SERIAL = 2 * 1024 * 1024
+NON_PRINTABLE = re.compile(r"[^\x20-\x7e]")
+
+
+def read_serial(path: Path) -> str:
+    """The serial log as written: no newline translation, so only '\\n' ends a line."""
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+def receipt_lines(text: str) -> list[str]:
+    """Split on '\\n' only, dropping the one '\\r' of the console's line ending."""
+    return [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
 
 
 def check_receipt(text: str, nonce: str, case: str, returncode: int) -> tuple[str, ...]:
@@ -31,9 +42,11 @@ def check_receipt(text: str, nonce: str, case: str, returncode: int) -> tuple[st
         raise ValueError(f"guest failed or panicked ({returncode=})")
     prefix = f"BOOK2_BOOT_V1 {nonce} "
     events = []
-    for line in text.splitlines():
+    for line in receipt_lines(text):
         if not line.startswith("BOOK2_BOOT_"):
             continue
+        if NON_PRINTABLE.search(line):
+            raise ValueError("control character in receipt line")
         if not line.startswith(prefix):
             raise ValueError("unexpected guest receipt nonce or protocol")
         events.append(line[len(prefix):])
@@ -100,7 +113,7 @@ def run_guest(build: Path, receipt: Path, case: str) -> tuple[str, ...]:
         result = subprocess.run(args, timeout=60, stdout=log, stderr=log, **opts)
     if not serial.is_file() or serial.stat().st_size > MAX_SERIAL:
         raise ValueError("missing or oversized guest serial log")
-    events = check_receipt(serial.read_text(errors="replace"), nonce, case, result.returncode)
+    events = check_receipt(read_serial(serial), nonce, case, result.returncode)
     (receipt / "verified.txt").write_text(f"{nonce} {case}\n" + "\n".join(events) + "\n")
     return events
 

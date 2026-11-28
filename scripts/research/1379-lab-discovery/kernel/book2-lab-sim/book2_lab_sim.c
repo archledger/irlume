@@ -924,8 +924,9 @@ static void sim_extra_register(struct sim_instance *inst)
 {
 	if (inst->extra_registered)
 		return;
+	/* A lens appearing late, as a VCM would; a defined function avoids a core warning. */
 	inst->extra.name = "book2-lab-extra";
-	inst->extra.function = MEDIA_ENT_F_V4L2_SUBDEV_UNKNOWN;
+	inst->extra.function = MEDIA_ENT_F_LENS;
 	inst->extra_pad.flags = MEDIA_PAD_FL_SINK;
 	if (media_entity_pads_init(&inst->extra, 1, &inst->extra_pad) ||
 	    media_device_register_entity(&inst->cio2_mdev, &inst->extra))

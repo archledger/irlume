@@ -55,6 +55,31 @@ before it fails validation, and three flip writes and two formats on each
 RGB sensor. This case validates the observer; it never passes on the lab
 image.
 
+The lab image carries libcamera v0.8.0 with `libcamera/book2-lab.patch` and
+the files in `lab/` and `libcamera/`. The supervisor parses
+`contract/front.contract`, refuses a live graph that differs from it, binds
+it to this boot (media and node device numbers, kernfs inodes, topology
+versions, IPA identity) and writes a read-only reservation to
+`/run/book2-lab/reservation`. The worker may open only the front role's
+nodes: both media devices, the front sensor, its receiver and video node,
+and ImgU pipe 1 with its five nodes. Pipe 1 is chosen so that a handler
+assuming ImgU 0 fails. Inside libcamera the guard checks the whole
+reservation before any effect. Every open and ioctl passes its gate, which
+admits only the listed effects. The lab IPU3 handler never resets links,
+initializes only the reserved pipe and port, and registers one camera.
+Pinned libcamera probes every entity node with `access()` during
+enumeration, which a front-only device grant cannot satisfy, so the lab
+patch removes that probe and leaves each decision to the open.
+
+| Case | Change before the worker runs | Required result |
+| --- | --- | --- |
+| `lab-front` | none | one camera, exactly the listed effects |
+| `graph-ir-link-enabled` | IR link enabled after reserving | refuse `link-state`, no worker effect |
+| `graph-extra-entity` | entity added after reserving | refuse `version`, no worker effect |
+| `hotplug-extra-media` | third media device after reserving | refuse `unreserved-open`, no worker effect |
+| `sim-port-variant` | front sensor on port 3 at boot | supervisor refuses before reserving |
+| `effect-unlisted-link` | link effect removed from the reservation | refused at the link, after the listed sensor effects |
+
 These results concern the simulated graph in this guest only. They say
 nothing about the real Book 2 graph, its drivers' effects, teardown,
 optical state or authentication.

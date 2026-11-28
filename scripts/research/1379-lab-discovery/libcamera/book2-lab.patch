@@ -1,0 +1,456 @@
+diff --git a/include/libcamera/internal/media_device.h b/include/libcamera/internal/media_device.h
+index 5c1f14b..f53dc5c 100644
+--- a/include/libcamera/internal/media_device.h
++++ b/include/libcamera/internal/media_device.h
+@@ -22,6 +22,10 @@
+ #include "libcamera/internal/media_object.h"
+ #include "libcamera/internal/v4l2_request.h"
+ 
++namespace book2lab {
++struct Node;
++} /* namespace book2lab */
++
+ namespace libcamera {
+ 
+ class MediaDevice : protected Loggable
+@@ -33,6 +37,8 @@ public:
+ 	bool acquire();
+ 	void release();
+ 	bool busy() const { return acquired_; }
++	int labFd() const { return fd_.get(); }
++	uint64_t topologyVersion() const { return topologyVersion_; }
+ 
+ 	bool lock();
+ 	void unlock();
+@@ -96,6 +102,8 @@ private:
+ 	UniqueFD fd_;
+ 	bool valid_;
+ 	bool acquired_;
++	const ::book2lab::Node *labNode_ = nullptr;
++	uint64_t topologyVersion_ = 0;
+ 	std::optional<bool> supportsRequests_;
+ 
+ 	std::map<unsigned int, MediaObject *> objects_;
+diff --git a/include/libcamera/internal/v4l2_device.h b/include/libcamera/internal/v4l2_device.h
+index 1a63fc5..3dabbbb 100644
+--- a/include/libcamera/internal/v4l2_device.h
++++ b/include/libcamera/internal/v4l2_device.h
+@@ -26,6 +26,10 @@
+ #include "libcamera/internal/formats.h"
+ #include "libcamera/internal/v4l2_request.h"
+ 
++namespace book2lab {
++struct Node;
++} /* namespace book2lab */
++
+ namespace libcamera {
+ 
+ class EventNotifier;
+@@ -88,6 +92,7 @@ private:
+ 	ControlInfoMap controls_;
+ 	std::string deviceNode_;
+ 	UniqueFD fd_;
++	const ::book2lab::Node *labNode_ = nullptr;
+ 
+ 	std::unique_ptr<EventNotifier> fdEventNotifier_;
+ 	bool frameStartEnabled_;
+diff --git a/src/libcamera/media_device.cpp b/src/libcamera/media_device.cpp
+index 3f974ea..f71dc8a 100644
+--- a/src/libcamera/media_device.cpp
++++ b/src/libcamera/media_device.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "libcamera/internal/media_device.h"
+ 
++#include "lab/lab_guard.h"
++
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdint.h>
+@@ -30,6 +32,21 @@
+ 
+ namespace libcamera {
+ 
++namespace {
++
++/* Book 2 lab: every media ioctl passes the gate; errors keep ioctl semantics. */
++int labIoctl(const MediaDevice &media, int fd, unsigned long request, void *arg)
++{
++	int ret = book2lab::guard().admitMediaIoctl(media, request, arg);
++	if (ret) {
++		errno = -ret;
++		return -1;
++	}
++	return ::ioctl(fd, request, arg);
++}
++
++} /* namespace */
++
+ LOG_DEFINE_CATEGORY(MediaDevice)
+ 
+ /**
+@@ -209,7 +226,7 @@ int MediaDevice::populate()
+ 		return ret;
+ 
+ 	struct media_device_info info = {};
+-	ret = ioctl(fd_.get(), MEDIA_IOC_DEVICE_INFO, &info);
++	ret = labIoctl(*this, fd_.get(), MEDIA_IOC_DEVICE_INFO, &info);
+ 	if (ret) {
+ 		ret = -errno;
+ 		LOG(MediaDevice, Error)
+@@ -232,7 +249,7 @@ int MediaDevice::populate()
+ 		topology.ptr_links = reinterpret_cast<uintptr_t>(links);
+ 		topology.ptr_pads = reinterpret_cast<uintptr_t>(pads);
+ 
+-		ret = ioctl(fd_.get(), MEDIA_IOC_G_TOPOLOGY, &topology);
++		ret = labIoctl(*this, fd_.get(), MEDIA_IOC_G_TOPOLOGY, &topology);
+ 		if (ret < 0) {
+ 			ret = -errno;
+ 			LOG(MediaDevice, Error)
+@@ -263,6 +280,7 @@ int MediaDevice::populate()
+ 	    populateLinks(topology))
+ 		valid_ = true;
+ 
++	topologyVersion_ = version;
+ 	ret = 0;
+ done:
+ 	close();
+@@ -505,7 +523,10 @@ int MediaDevice::open()
+ 		return -EBUSY;
+ 	}
+ 
+-	fd_ = UniqueFD(::open(deviceNode_.c_str(), O_RDWR | O_CLOEXEC));
++	int labFd = book2lab::guard().admitOpen(deviceNode_, O_RDWR, &labNode_);
++	if (labFd < 0)
++		errno = -labFd;
++	fd_ = UniqueFD(labFd < 0 ? -1 : labFd);
+ 	if (!fd_.isValid()) {
+ 		int ret = -errno;
+ 		LOG(MediaDevice, Error)
+@@ -799,7 +820,7 @@ void MediaDevice::fixupEntityFlags(struct media_v2_entity *entity)
+ 	struct media_entity_desc desc = {};
+ 	desc.id = entity->id;
+ 
+-	int ret = ioctl(fd_.get(), MEDIA_IOC_ENUM_ENTITIES, &desc);
++	int ret = labIoctl(*this, fd_.get(), MEDIA_IOC_ENUM_ENTITIES, &desc);
+ 	if (ret < 0) {
+ 		ret = -errno;
+ 		LOG(MediaDevice, Debug)
+@@ -842,7 +863,7 @@ int MediaDevice::setupLink(const MediaLink *link, unsigned int flags)
+ 
+ 	linkDesc.flags = flags;
+ 
+-	int ret = ioctl(fd_.get(), MEDIA_IOC_SETUP_LINK, &linkDesc);
++	int ret = labIoctl(*this, fd_.get(), MEDIA_IOC_SETUP_LINK, &linkDesc);
+ 	if (ret) {
+ 		ret = -errno;
+ 		LOG(MediaDevice, Error)
+@@ -894,7 +915,7 @@ int MediaDevice::allocateRequests(unsigned int count,
+ 	requests->resize(count);
+ 	for (unsigned int i = 0; i < count; i++) {
+ 		int requestFd;
+-		int ret = ::ioctl(fd_.get(), MEDIA_IOC_REQUEST_ALLOC, &requestFd);
++		int ret = labIoctl(*this, fd_.get(), MEDIA_IOC_REQUEST_ALLOC, &requestFd);
+ 		if (ret < 0) {
+ 			requests->clear();
+ 			return -errno;
+diff --git a/src/libcamera/media_object.cpp b/src/libcamera/media_object.cpp
+index 3e3772a..61a0778 100644
+--- a/src/libcamera/media_object.cpp
++++ b/src/libcamera/media_object.cpp
+@@ -413,16 +413,12 @@ const MediaPad *MediaEntity::getPadById(unsigned int id) const
+  */
+ int MediaEntity::setDeviceNode(const std::string &deviceNode)
+ {
+-	/* Make sure the device node can be accessed. */
+-	int ret = ::access(deviceNode.c_str(), R_OK | W_OK);
+-	if (ret < 0) {
+-		ret = -errno;
+-		LOG(MediaDevice, Error)
+-			<< "Device node " << deviceNode << " can't be accessed: "
+-			<< strerror(-ret);
+-		return ret;
+-	}
+-
++	/*
++	 * Book 2 lab: no access probe at enumeration. The device cgroup
++	 * grants only the reserved front-role nodes, and the lab guard and
++	 * the kernel decide each open; probing sibling nodes would require
++	 * widening that grant.
++	 */
+ 	deviceNode_ = deviceNode;
+ 
+ 	return 0;
+diff --git a/src/libcamera/meson.build b/src/libcamera/meson.build
+index 17c1b2c..7752ea3 100644
+--- a/src/libcamera/meson.build
++++ b/src/libcamera/meson.build
+@@ -17,6 +17,8 @@ libcamera_public_sources = files([
+ ])
+ 
+ libcamera_internal_sources = files([
++    'lab/lab_contract.cpp',
++    'lab/lab_guard.cpp',
+     'bayer_format.cpp',
+     'byte_stream_buffer.cpp',
+     'camera_controls.cpp',
+diff --git a/src/libcamera/pipeline/ipu3/ipu3.cpp b/src/libcamera/pipeline/ipu3/ipu3.cpp
+index 14cab9e..f6c967a 100644
+--- a/src/libcamera/pipeline/ipu3/ipu3.cpp
++++ b/src/libcamera/pipeline/ipu3/ipu3.cpp
+@@ -35,6 +35,8 @@
+ #include "libcamera/internal/pipeline_handler.h"
+ #include "libcamera/internal/request.h"
+ 
++#include "lab/lab_guard.h"
++
+ #include "cio2.h"
+ #include "frames.h"
+ #include "imgu.h"
+@@ -882,16 +884,12 @@ bool PipelineHandlerIPU3::match(DeviceEnumerator *enumerator)
+ 		return false;
+ 
+ 	/*
+-	 * Disable all links that are enabled by default on CIO2, as camera
+-	 * creation enables all valid links it finds.
++	 * Book 2 lab: check the complete reservation before any effect and
++	 * never reset links globally.
+ 	 */
+-	if (cio2MediaDev_->disableLinks())
++	if (!book2lab::guard().admitDiscovery(*cio2MediaDev_, *imguMediaDev_).ok)
+ 		return false;
+ 
+-	ret = imguMediaDev_->disableLinks();
+-	if (ret)
+-		return ret;
+-
+ 	ret = registerCameras();
+ 
+ 	return ret == 0;
+@@ -1039,113 +1037,93 @@ int PipelineHandlerIPU3::updateControls(IPU3CameraData *data)
+  */
+ int PipelineHandlerIPU3::registerCameras()
+ {
+-	int ret;
+-
+-	ret = imgu0_.init(imguMediaDev_, 0);
++	/*
++	 * Book 2 lab: initialize only the reserved ImgU pipe and CSI-2
++	 * receiver and register one camera. No sibling port is probed and no
++	 * ImgU is chosen by convention.
++	 */
++	book2lab::Guard &lab = book2lab::guard();
++	const unsigned int pipe = lab.frontImgu();
++	const unsigned int id = lab.frontPort();
++	ImgUDevice *imgu = pipe ? &imgu1_ : &imgu0_;
++	int ret = imgu->init(imguMediaDev_, pipe);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = imgu1_.init(imguMediaDev_, 1);
++	std::unique_ptr<IPU3CameraData> data =
++		std::make_unique<IPU3CameraData>(this);
++	std::set<Stream *> streams = {
++		&data->outStream_,
++		&data->vfStream_,
++		&data->rawStream_,
++	};
++	CIO2Device *cio2 = &data->cio2_;
++
++	ret = cio2->init(cio2MediaDev_, id);
+ 	if (ret)
+ 		return ret;
+ 
+-	/*
+-	 * For each CSI-2 receiver on the IPU3, create a Camera if an
+-	 * image sensor is connected to it and the sensor can produce images
+-	 * in a compatible format.
+-	 */
+-	unsigned int numCameras = 0;
+-	for (unsigned int id = 0; id < 4 && numCameras < 2; ++id) {
+-		std::unique_ptr<IPU3CameraData> data =
+-			std::make_unique<IPU3CameraData>(this);
+-		std::set<Stream *> streams = {
+-			&data->outStream_,
+-			&data->vfStream_,
+-			&data->rawStream_,
+-		};
+-		CIO2Device *cio2 = &data->cio2_;
+-
+-		ret = cio2->init(cio2MediaDev_, id);
+-		if (ret)
+-			continue;
++	ret = data->loadIPA();
++	if (ret)
++		return ret;
+ 
+-		ret = data->loadIPA();
+-		if (ret)
+-			continue;
++	/* Initialize the camera properties. */
++	data->properties_ = cio2->sensor()->properties();
+ 
+-		/* Initialize the camera properties. */
+-		data->properties_ = cio2->sensor()->properties();
++	ret = initControls(data.get());
++	if (ret)
++		return ret;
+ 
+-		ret = initControls(data.get());
+-		if (ret)
+-			continue;
+-
+-		const CameraSensorProperties::SensorDelays &delays = cio2->sensor()->sensorDelays();
+-		std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
+-			{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+-			{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
+-		};
+-
+-		data->delayedCtrls_ =
+-			std::make_unique<DelayedControls>(cio2->sensor()->device(),
+-							  params);
+-		data->cio2_.frameStart().connect(data.get(),
+-						 &IPU3CameraData::frameStart);
+-
+-		/* Convert the sensor rotation to a transformation */
+-		const auto &rotation = data->properties_.get(properties::Rotation);
+-		if (!rotation)
+-			LOG(IPU3, Warning) << "Rotation control not exposed by "
+-					   << cio2->sensor()->id()
+-					   << ". Assume rotation 0";
+-
+-		/**
+-		 * \todo Dynamically assign ImgU and output devices to each
+-		 * stream and camera; as of now, limit support to two cameras
+-		 * only, and assign imgu0 to the first one and imgu1 to the
+-		 * second.
+-		 */
+-		data->imgu_ = numCameras ? &imgu1_ : &imgu0_;
++	const CameraSensorProperties::SensorDelays &delays = cio2->sensor()->sensorDelays();
++	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
++		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
++		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
++	};
+ 
+-		/*
+-		 * Connect video devices' 'bufferReady' signals to their
+-		 * slot to implement the image processing pipeline.
+-		 *
+-		 * Frames produced by the CIO2 unit are passed to the
+-		 * associated ImgU input where they get processed and
+-		 * returned through the ImgU main and secondary outputs.
+-		 */
+-		data->cio2_.bufferReady().connect(data.get(),
+-						  &IPU3CameraData::cio2BufferReady);
+-		data->cio2_.bufferAvailable.connect(
+-			data.get(), &IPU3CameraData::queuePendingRequests);
+-		data->imgu_->input_->bufferReady.connect(&data->cio2_,
+-							 &CIO2Device::tryReturnBuffer);
+-		data->imgu_->output_->bufferReady.connect(data.get(),
+-							  &IPU3CameraData::imguOutputBufferReady);
+-		data->imgu_->viewfinder_->bufferReady.connect(data.get(),
+-							      &IPU3CameraData::imguOutputBufferReady);
+-		data->imgu_->param_->bufferReady.connect(data.get(),
+-							 &IPU3CameraData::paramBufferReady);
+-		data->imgu_->stat_->bufferReady.connect(data.get(),
+-							&IPU3CameraData::statBufferReady);
+-
+-		/* Create and register the Camera instance. */
+-		const std::string &cameraId = cio2->sensor()->id();
+-		std::shared_ptr<Camera> camera =
+-			Camera::create(std::move(data), cameraId, streams);
+-
+-		registerCamera(std::move(camera));
+-
+-		LOG(IPU3, Info)
+-			<< "Registered Camera[" << numCameras << "] \""
+-			<< cameraId << "\""
+-			<< " connected to CSI-2 receiver " << id;
+-
+-		numCameras++;
+-	}
++	data->delayedCtrls_ =
++		std::make_unique<DelayedControls>(cio2->sensor()->device(),
++						  params);
++	data->cio2_.frameStart().connect(data.get(),
++					 &IPU3CameraData::frameStart);
++
++	/* Convert the sensor rotation to a transformation */
++	const auto &rotation = data->properties_.get(properties::Rotation);
++	if (!rotation)
++		LOG(IPU3, Warning) << "Rotation control not exposed by "
++				   << cio2->sensor()->id()
++				   << ". Assume rotation 0";
++
++	data->imgu_ = imgu;
++
++	data->cio2_.bufferReady().connect(data.get(),
++					  &IPU3CameraData::cio2BufferReady);
++	data->cio2_.bufferAvailable.connect(
++		data.get(), &IPU3CameraData::queuePendingRequests);
++	data->imgu_->input_->bufferReady.connect(&data->cio2_,
++						 &CIO2Device::tryReturnBuffer);
++	data->imgu_->output_->bufferReady.connect(data.get(),
++						  &IPU3CameraData::imguOutputBufferReady);
++	data->imgu_->viewfinder_->bufferReady.connect(data.get(),
++						      &IPU3CameraData::imguOutputBufferReady);
++	data->imgu_->param_->bufferReady.connect(data.get(),
++						 &IPU3CameraData::paramBufferReady);
++	data->imgu_->stat_->bufferReady.connect(data.get(),
++						&IPU3CameraData::statBufferReady);
++
++	const std::string &cameraId = cio2->sensor()->id();
++	std::shared_ptr<Camera> camera =
++		Camera::create(std::move(data), cameraId, streams);
++
++	if (!lab.finalCheck().ok)
++		return -EPERM;
++
++	registerCamera(std::move(camera));
++
++	LOG(IPU3, Info)
++		<< "Registered lab camera \"" << cameraId
++		<< "\" connected to CSI-2 receiver " << id;
+ 
+-	return numCameras ? 0 : -ENODEV;
++	return 0;
+ }
+ 
+ int IPU3CameraData::loadIPA()
+diff --git a/src/libcamera/v4l2_device.cpp b/src/libcamera/v4l2_device.cpp
+index 258c82b..139a1e3 100644
+--- a/src/libcamera/v4l2_device.cpp
++++ b/src/libcamera/v4l2_device.cpp
+@@ -26,6 +26,8 @@
+ #include "libcamera/internal/formats.h"
+ #include "libcamera/internal/sysfs.h"
+ 
++#include "lab/lab_guard.h"
++
+ /**
+  * \file v4l2_device.h
+  * \brief Common base for V4L2 devices and subdevices
+@@ -85,8 +87,10 @@ int V4L2Device::open(unsigned int flags)
+ 		return -EBUSY;
+ 	}
+ 
+-	UniqueFD fd(syscall(SYS_openat, AT_FDCWD, deviceNode_.c_str(),
+-			    flags | O_CLOEXEC));
++	int labFd = book2lab::guard().admitOpen(deviceNode_, flags, &labNode_);
++	if (labFd < 0)
++		errno = -labFd;
++	UniqueFD fd(labFd < 0 ? -1 : labFd);
+ 	if (!fd.isValid()) {
+ 		int ret = -errno;
+ 		LOG(V4L2, Error) << "Failed to open V4L2 device '"
+@@ -537,6 +541,10 @@ int V4L2Device::ioctl(unsigned long request, void *argp)
+ 	 * Printing out an error message is usually better performed
+ 	 * in the caller, which can provide more context.
+ 	 */
++	int ret = book2lab::guard().admitIoctl(labNode_, request, argp);
++	if (ret)
++		return ret;
++
+ 	if (::ioctl(fd_.get(), request, argp) < 0)
+ 		return -errno;
+ 

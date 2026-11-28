@@ -7,6 +7,7 @@ extern "C" {
 }
 
 #include "discovery_requests.h"
+#include "lab_contract.h"
 
 #include <linux/audit.h>
 #include <linux/bpf.h>
@@ -16,12 +17,14 @@ extern "C" {
 #include <linux/seccomp.h>
 
 #include <algorithm>
+#include <set>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +34,7 @@ extern "C" {
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/klog.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/reboot.h>
@@ -160,7 +164,9 @@ bool read_scope()
             nonce = value;
         }
     }
-    static const char *const known[] = {"topology", "sim-controls", "stock-baseline"};
+    static const char *const known[] = {"topology", "sim-controls", "stock-baseline", "lab-front",
+                                        "graph-ir-link-enabled", "graph-extra-entity", "hotplug-extra-media",
+                                        "sim-port-variant", "effect-unlisted-link"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -231,135 +237,6 @@ int open_bracketed(const MediaNode &node, int flags)
     return fd;
 }
 
-struct Topology {
-    media_device_info info {};
-    uint64_t version = 0;
-    std::vector<media_v2_entity> entities;
-    std::vector<media_v2_interface> interfaces;
-    std::vector<media_v2_pad> pads;
-    std::vector<media_v2_link> links;
-};
-
-bool read_topology(int fd, Topology &t)
-{
-    if (ioctl(fd, MEDIA_IOC_DEVICE_INFO, &t.info) != 0)
-        return false;
-    for (int attempt = 0; attempt < 4; attempt++) {
-        media_v2_topology topo {};
-        if (ioctl(fd, MEDIA_IOC_G_TOPOLOGY, &topo) != 0)
-            return false;
-        uint64_t version = topo.topology_version;
-        t.entities.assign(topo.num_entities, {});
-        t.interfaces.assign(topo.num_interfaces, {});
-        t.pads.assign(topo.num_pads, {});
-        t.links.assign(topo.num_links, {});
-        topo.ptr_entities = reinterpret_cast<uintptr_t>(t.entities.data());
-        topo.ptr_interfaces = reinterpret_cast<uintptr_t>(t.interfaces.data());
-        topo.ptr_pads = reinterpret_cast<uintptr_t>(t.pads.data());
-        topo.ptr_links = reinterpret_cast<uintptr_t>(t.links.data());
-        if (ioctl(fd, MEDIA_IOC_G_TOPOLOGY, &topo) != 0)
-            return false;
-        if (topo.topology_version == version && topo.num_entities == t.entities.size() &&
-            topo.num_interfaces == t.interfaces.size() && topo.num_pads == t.pads.size() &&
-            topo.num_links == t.links.size()) {
-            t.version = version;
-            return true;
-        }
-    }
-    return false;
-}
-
-// Contract names write spaces as '_'; a real underscore would be ambiguous.
-bool label(const char *name, std::string &out)
-{
-    out = name;
-    if (out.empty())
-        return false;
-    for (char &c : out) {
-        if (c == '_' || c < 0x20 || c > 0x7e)
-            return false;
-        if (c == ' ')
-            c = '_';
-    }
-    return true;
-}
-
-std::string role_of(const media_device_info &info)
-{
-    std::string driver = info.driver;
-    return driver == "ipu3-cio2" ? "cio2" : driver == "ipu3-imgu" ? "imgu" : "other";
-}
-
-std::string hex(uint64_t value)
-{
-    char buf[24];
-    std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(value));
-    return buf;
-}
-
-bool graph_records(const Topology &t, std::vector<std::string> &out)
-{
-    std::string role = role_of(t.info), model, name;
-    if (!label(t.info.model, model))
-        return false;
-    out.push_back("media " + role + " " + t.info.driver + " " + model);
-    auto entity_name = [&](uint32_t id, std::string &result) {
-        for (const auto &e : t.entities)
-            if (e.id == id)
-                return label(e.name, result);
-        return false;
-    };
-    auto pad = [&](uint32_t id) -> const media_v2_pad * {
-        for (const auto &p : t.pads)
-            if (p.id == id)
-                return &p;
-        return nullptr;
-    };
-    for (const auto &e : t.entities) {
-        if (!label(e.name, name))
-            return false;
-        std::vector<const media_v2_pad *> pads;
-        for (const auto &p : t.pads)
-            if (p.entity_id == e.id)
-                pads.push_back(&p);
-        std::sort(pads.begin(), pads.end(), [](auto a, auto b) { return a->index < b->index; });
-        std::string line = "entity " + role + " " + name + " " + hex(e.function);
-        for (size_t i = 0; i < pads.size(); i++) {
-            if (pads[i]->index != i)
-                return false;
-            line += pads[i]->flags & MEDIA_PAD_FL_SINK ? " sink" : " source";
-        }
-        out.push_back(line);
-    }
-    for (const auto &l : t.links) {
-        uint32_t type = l.flags & MEDIA_LNK_FL_LINK_TYPE;
-        if (type == MEDIA_LNK_FL_INTERFACE_LINK) {
-            const media_v2_interface *intf = nullptr;
-            for (const auto &i : t.interfaces)
-                if (i.id == l.source_id)
-                    intf = &i;
-            if (!intf || !entity_name(l.sink_id, name))
-                return false;
-            std::string kind = intf->intf_type == MEDIA_INTF_T_V4L_VIDEO ? "video" :
-                               intf->intf_type == MEDIA_INTF_T_V4L_SUBDEV ? "subdev" : hex(intf->intf_type);
-            out.push_back("node " + name + " " + kind);
-        } else if (type == MEDIA_LNK_FL_DATA_LINK) {
-            const media_v2_pad *src = pad(l.source_id), *sink = pad(l.sink_id);
-            std::string a, b;
-            if (!src || !sink || !entity_name(src->entity_id, a) || !entity_name(sink->entity_id, b))
-                return false;
-            out.push_back("link " + role + " " + a + ":" + std::to_string(src->index) + " " + b + ":" +
-                          std::to_string(sink->index) + " " + hex(l.flags));
-        } else {
-            std::string a, b;
-            if (!entity_name(l.source_id, a) || !entity_name(l.sink_id, b))
-                return false;
-            out.push_back("ancillary " + role + " " + a + " " + b + " " + hex(l.flags));
-        }
-    }
-    return true;
-}
-
 bool make_group(const char *path, const std::vector<device_rule> &rules)
 {
     if (mkdir(path, 0755) != 0 && errno != EEXIST)
@@ -373,7 +250,7 @@ bool make_group(const char *path, const std::vector<device_rule> &rules)
 
 // Read each media device's topology from a scope that admits only the
 // inventoried media nodes, then return PID 1 to quarantine.
-bool read_media(const std::vector<MediaNode> &nodes, std::vector<Topology> &out)
+bool read_media(const std::vector<MediaNode> &nodes, std::vector<book2lab::Snapshot> &out)
 {
     static bool scoped = false;
     if (!scoped) {
@@ -390,8 +267,8 @@ bool read_media(const std::vector<MediaNode> &nodes, std::vector<Topology> &out)
     out.clear();
     for (const auto &n : nodes) {
         int fd = open_bracketed(n, O_RDONLY);
-        Topology t;
-        ok = ok && fd >= 0 && read_topology(fd, t);
+        book2lab::Snapshot t;
+        ok = ok && fd >= 0 && book2lab::read_snapshot(fd, &t) == 0;
         if (fd >= 0)
             close(fd);
         out.push_back(t);
@@ -399,16 +276,16 @@ bool read_media(const std::vector<MediaNode> &nodes, std::vector<Topology> &out)
     return enter_group(QUARANTINE, getpid()) == 0 && ok;
 }
 
-const MediaNode *find_role(const std::vector<MediaNode> &nodes, const std::vector<Topology> &tops,
+const MediaNode *find_role(const std::vector<MediaNode> &nodes, const std::vector<book2lab::Snapshot> &tops,
                            const std::string &role)
 {
     for (size_t i = 0; i < nodes.size() && i < tops.size(); i++)
-        if (role_of(tops[i].info) == role)
+        if (book2lab::role_for_driver(tops[i].info.driver) == role)
             return &nodes[i];
     return nullptr;
 }
 
-void sim_controls(const std::vector<MediaNode> &before, const std::vector<Topology> &tops)
+void sim_controls(const std::vector<MediaNode> &before, const std::vector<book2lab::Snapshot> &tops)
 {
     const MediaNode *cio2 = find_role(before, tops, "cio2");
     if (!cio2)
@@ -418,7 +295,7 @@ void sim_controls(const std::vector<MediaNode> &before, const std::vector<Topolo
     if (!write_file(std::string(kDebug) + "/control", "replace\n"))
         fail("CONTROL_REPLACE");
     std::vector<MediaNode> after = sysfs_media();
-    std::vector<Topology> fresh;
+    std::vector<book2lab::Snapshot> fresh;
     if (!read_media(after, fresh))
         fail("REREAD_AFTER_REPLACE");
     const MediaNode *now = find_role(after, fresh, "cio2");
@@ -575,7 +452,7 @@ bool read_line(int fd, std::string &line, int timeout_ms)
     return false;
 }
 
-[[noreturn]] void worker_fail(const std::string &what)
+void print_worker_log()
 {
     std::string log;
     if (read_file(kWorkerLog, log)) {
@@ -590,6 +467,11 @@ bool read_line(int fd, std::string &line, int timeout_ms)
         }
         std::fflush(stdout);
     }
+}
+
+[[noreturn]] void worker_fail(const std::string &what)
+{
+    print_worker_log();
     if (g_worker > 0)
         kill(g_worker, SIGKILL);
     fail(what);
@@ -683,7 +565,7 @@ void run_worker(Worker &w)
                               "signal=" + std::to_string(WTERMSIG(wstatus))));
 }
 
-bool set_link(const MediaNode &media, const Topology &t, const std::string &source, const std::string &sink,
+bool set_link(const MediaNode &media, const book2lab::Snapshot &t, const std::string &source, const std::string &sink,
               uint32_t flags)
 {
     auto entity = [&](const std::string &name) -> uint32_t {
@@ -727,7 +609,7 @@ bool worker_record(const std::string &text)
 }
 
 // Observer sensitivity control: unpatched libcamera with every node granted.
-void stock_baseline(const std::vector<MediaNode> &media, const std::vector<Topology> &tops)
+void stock_baseline(const std::vector<MediaNode> &media, const std::vector<book2lab::Snapshot> &tops)
 {
     const MediaNode *cio2 = find_role(media, tops, "cio2");
     if (!cio2 || !set_link(*cio2, tops[static_cast<size_t>(cio2 - media.data())], "ov7251 4-0060",
@@ -749,6 +631,154 @@ void stock_baseline(const std::vector<MediaNode> &media, const std::vector<Topol
     event("STOCK_EFFECTS_OBSERVED");
 }
 
+constexpr const char *kContractPath = "/lab/front.contract";
+constexpr const char *kIpaDigestPath = "/lab/ipa_ipu3.sha256";
+constexpr const char *kReservationDir = "/run/book2-lab";
+
+bool graph_matches_contract(const book2lab::Reservation &contract, const std::vector<book2lab::Snapshot> &tops)
+{
+    std::set<std::string> want(contract.graph.begin(), contract.graph.end()), have;
+    for (const auto &t : tops) {
+        std::vector<std::string> records;
+        if (!book2lab::graph_records(t, &records))
+            return false;
+        have.insert(records.begin(), records.end());
+    }
+    return want == have;
+}
+
+bool bind_node(book2lab::Reservation &r, const std::string &grant, const std::vector<book2lab::Snapshot> &tops,
+               const std::vector<DevNode> &v4l2)
+{
+    for (const auto &t : tops)
+        for (const auto &e : t.entities) {
+            std::string name;
+            if (!book2lab::label(e.name, &name) || name != grant)
+                continue;
+            for (const auto &l : t.links) {
+                if ((l.flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_INTERFACE_LINK || l.sink_id != e.id)
+                    continue;
+                for (const auto &i : t.interfaces)
+                    for (const auto &d : v4l2)
+                        if (i.id == l.source_id && d.major == i.devnode.major && d.minor == i.devnode.minor) {
+                            book2lab::Node n;
+                            n.entity = grant;
+                            n.entity_id = e.id;
+                            n.major = d.major;
+                            n.minor = d.minor;
+                            n.inode = d.inode;
+                            n.path = d.path;
+                            r.nodes.push_back(n);
+                            return true;
+                        }
+            }
+        }
+    return false;
+}
+
+// Bind the contract to this boot: media and granted node identities, the
+// reserved topology versions and the IPA module identity and digest.
+bool bind_reservation(book2lab::Reservation &r, const std::vector<MediaNode> &media,
+                      const std::vector<book2lab::Snapshot> &tops)
+{
+    r.nonce = nonce;
+    for (size_t i = 0; i < media.size(); i++) {
+        book2lab::Node n;
+        n.media = true;
+        n.role = book2lab::role_for_driver(tops[i].info.driver);
+        n.major = media[i].major;
+        n.minor = media[i].minor;
+        n.inode = media[i].inode;
+        n.version = tops[i].version;
+        n.path = media[i].path;
+        r.nodes.push_back(n);
+    }
+    const std::vector<DevNode> v4l2 = sysfs_v4l2();
+    for (const auto &grant : r.grants)
+        if (grant != "cio2" && grant != "imgu" && !bind_node(r, grant, tops, v4l2))
+            return false;
+    struct stat st {};
+    std::string digest;
+    if (stat(r.ipa.path.c_str(), &st) != 0 || !read_file(kIpaDigestPath, digest) || digest.size() < 64)
+        return false;
+    r.bind_ipa = book2lab::BindIpa {r.ipa.path, static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+                                    static_cast<uint64_t>(st.st_size), digest.substr(0, 64)};
+    return true;
+}
+
+bool write_reservation(const book2lab::Reservation &r)
+{
+    const std::string text = book2lab::serialize(r);
+    const std::string path = std::string(kReservationDir) + "/reservation", tmp = path + ".new";
+    if (!book2lab::parse_reservation(text) || (mkdir(kReservationDir, 0755) != 0 && errno != EEXIST))
+        return false;
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0444);
+    if (fd < 0)
+        return false;
+    bool ok = write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    return close(fd) == 0 && ok && rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+// The guard's verdict is a label for the receipt, never evidence.
+std::string read_verdict(int fd)
+{
+    std::string line;
+    if (!read_line(fd, line, 1000) || line.rfind("VERDICT ", 0) != 0)
+        return "none";
+    return line.substr(8);
+}
+
+void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2lab::Snapshot> &tops)
+{
+    std::string text;
+    if (!read_file(kContractPath, text))
+        fail("CONTRACT");
+    std::optional<book2lab::Reservation> contract = book2lab::parse_contract(text);
+    if (!contract || !book2lab::check_front(*contract).ok)
+        fail("CONTRACT");
+    if (!graph_matches_contract(*contract, tops)) {
+        event("REFUSED_CONTRACT_GRAPH");
+        return;
+    }
+    book2lab::Reservation r = *contract;
+    if (!bind_reservation(r, media, tops))
+        fail("RESERVATION");
+    if (lab_case == "effect-unlisted-link")
+        r.effects.erase(std::remove_if(r.effects.begin(), r.effects.end(),
+                                       [](const book2lab::Effect &e) { return e.kind == book2lab::Effect::Kind::Link; }),
+                        r.effects.end());
+    if (!write_reservation(r))
+        fail("RESERVATION_WRITE");
+    event("RESERVED");
+    const MediaNode *cio2 = find_role(media, tops, "cio2");
+    if (lab_case == "graph-ir-link-enabled") {
+        if (!cio2 || !set_link(*cio2, tops[static_cast<size_t>(cio2 - media.data())], "ov7251 4-0060",
+                               "ipu3-csi2 1", MEDIA_LNK_FL_ENABLED))
+            fail("IR_LINK");
+        event("IR_LINK_ENABLED");
+    } else if (lab_case == "graph-extra-entity") {
+        if (!write_file(std::string(kDebug) + "/control", "add-entity\n"))
+            fail("CONTROL_ADD_ENTITY");
+        event("ENTITY_ADDED");
+    } else if (lab_case == "hotplug-extra-media") {
+        if (!write_file(std::string(kDebug) + "/control", "add-media\n"))
+            fail("CONTROL_ADD_MEDIA");
+        event("MEDIA_ADDED");
+    }
+    std::vector<std::string> paths;
+    for (const auto &n : r.nodes)
+        paths.push_back(n.path);
+    std::vector<device_rule> rules;
+    Worker w;
+    if (!grant(paths, rules) || !launch_worker(rules, {}, w))
+        fail("LAUNCH");
+    run_worker(w);
+    const std::string verdict = read_verdict(w.verdict);
+    if (verdict == "none")
+        print_worker_log();
+    event("GUARD " + verdict);
+}
+
 } // namespace
 
 int main()
@@ -760,6 +790,8 @@ int main()
         poweroff();
     }
     event("PID1");
+    /* Console keeps warnings and worse (WARN, KASAN, lockdep); info noise cannot split receipt lines. */
+    klogctl(8, nullptr, 5);
     if (mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0 ||
         mount("cgroup2", "/sys/fs/cgroup", "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0 ||
         mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=0755") != 0 ||
@@ -781,13 +813,13 @@ int main()
         fail("PRE_INVENTORY_OPEN");
     event("PRE_INVENTORY_DENIED");
     event("INTENT_RECORDED");
-    std::vector<Topology> tops;
+    std::vector<book2lab::Snapshot> tops;
     if (!read_media(nodes, tops))
         fail("TOPOLOGY");
     if (lab_case == "topology") {
         for (const auto &t : tops) {
             std::vector<std::string> records;
-            if (!graph_records(t, records))
+            if (!book2lab::graph_records(t, &records))
                 fail("TOPOLOGY_RECORDS");
             for (const auto &r : records)
                 event("TOPOLOGY " + r);
@@ -797,6 +829,8 @@ int main()
         sim_controls(nodes, tops);
     } else if (lab_case == "stock-baseline") {
         stock_baseline(nodes, tops);
+    } else {
+        lab_discovery(nodes, tops);
     }
     dump_effects(g_worker);
     poweroff();

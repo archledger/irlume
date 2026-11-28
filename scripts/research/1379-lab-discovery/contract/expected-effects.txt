@@ -79,3 +79,65 @@
 1 worker release ipu3-imgu_1_viewfinder
 1 worker release ipu3-imgu_1_parameters
 1 worker release ipu3-imgu_1_3a_stat
+
+[lab-front]
+# Only the reserved ImgU pipe and front port; no reset, no sibling probing.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[graph-ir-link-enabled]
+1 supervisor link ov7251_4-0060:0 ipu3-csi2_1:0 0x1
+
+[graph-extra-entity]
+1 supervisor control add-entity
+
+[hotplug-extra-media]
+1 supervisor control add-media
+
+[sim-port-variant]
+
+[effect-unlisted-link]
+# The gate refuses the unlisted link before the kernel sees it.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker release ov5693_2-0036
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat

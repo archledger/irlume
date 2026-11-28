@@ -105,6 +105,14 @@ class VerifierTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             rd.check_discovery(stock(effects=[]), NONCE, "stock-baseline", 0)
 
+    def test_stock_effects_fail_lab_front(self):
+        receipt = serial("lab-front", rd.CASES["lab-front"].events,
+                         numbered(rd.expected_effects("stock-baseline")[1:]))
+        with self.assertRaises(ValueError):
+            rd.check_discovery(receipt, NONCE, "lab-front", 0)
+        rd.check_discovery(serial("lab-front", rd.CASES["lab-front"].events,
+                                  numbered(rd.expected_effects("lab-front"))), NONCE, "lab-front", 0)
+
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")
         args = rd.qemu_args(build / "bzImage", build / "lab.cpio", rd.Path("/tmp/opencode/x/r/serial.log"),

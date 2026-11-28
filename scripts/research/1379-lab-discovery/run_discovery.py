@@ -19,6 +19,7 @@ MAX_SERIAL = 8 * 1024 * 1024
 TIMEOUT = 180
 PREFIX = ("PID1", "DENY_ATTACHED", "PRE_INVENTORY_DENIED", "INTENT_RECORDED")
 GRAPH_KINDS = ("media", "entity", "node", "link")
+LAB = PREFIX + ("RESERVED",)
 KERNEL_FAULT = re.compile(
     r"Kernel panic|\bOops\b|\bBUG:|\bWARNING:|\bKASAN\b|circular locking|INFO: possible|"
     r"INFO: trying to register|INFO: task .* blocked|general protection fault|Call Trace:")
@@ -47,6 +48,17 @@ CASES = {
         "EXTRA_MEDIA_PRESENT", "SIM_CONTROLS_PASS")),
     "stock-baseline": Case("stock.cpio", (), PREFIX + (
         "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 2", "WORKER_EXITED 0", "STOCK_EFFECTS_OBSERVED")),
+    "lab-front": Case("lab.cpio", (), LAB + ("WORKER_READY", "CAMERAS 1", "WORKER_EXITED 0", "GUARD admit")),
+    "graph-ir-link-enabled": Case("lab.cpio", (), LAB + (
+        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse link-state")),
+    "graph-extra-entity": Case("lab.cpio", (), LAB + (
+        "ENTITY_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse version")),
+    "hotplug-extra-media": Case("lab.cpio", (), LAB + (
+        "MEDIA_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse unreserved-open")),
+    "sim-port-variant": Case("lab.cpio", ("book2_lab_sim.front_port=3",), PREFIX + ("REFUSED_CONTRACT_GRAPH",)),
+    "effect-unlisted-link": Case("lab.cpio", (), LAB + (
+        "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0",
+        "GUARD refuse unlisted-effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1")),
 }
 
 

@@ -80,7 +80,7 @@ strict_c=(gcc -std=c17 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -isystem "$uapi/i
 strict_cxx=(g++ -std=c++20 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -isystem "$uapi/include")
 "${strict_c[@]}" -c "$boot/guest/cgroup_device.c" -o "$out/cgroup_device.o"
 "${strict_cxx[@]}" -static -I "$boot/guest" -I "$here/lab" "$here/guest/discovery_supervisor.cpp" \
-    "$out/cgroup_device.o" -o "$out/supervisor"
+    "$here/lab/lab_contract.cpp" "$out/cgroup_device.o" -o "$out/supervisor"
 readelf -l -d "$out/supervisor" >"$out/supervisor-elf.txt"
 if grep -Eq 'INTERP|NEEDED' "$out/supervisor-elf.txt"; then die "supervisor is not static"; fi
 
@@ -142,6 +142,21 @@ git clone -q --shared --no-checkout -- "$libcamera" "$lc_stock"
 git -C "$lc_stock" checkout -q --detach "$libcamera_pin"
 [[ $(git -C "$lc_stock" describe --exact-match HEAD) == v0.8.0 ]] || die "stock clone lost the v0.8.0 tag"
 build_libcamera stock "$lc_stock"
+
+# Lab libcamera: the pinned tree plus the lab files and one reviewed patch.
+lc_lab="$scratch/libcamera-lab"
+rm -rf -- "$lc_lab"
+git clone -q --shared --no-checkout -- "$libcamera" "$lc_lab"
+git -C "$lc_lab" checkout -q --detach "$libcamera_pin"
+mkdir -- "$lc_lab/src/libcamera/lab"
+cp -- "$here"/lab/{lab_contract.h,lab_contract.cpp,discovery_requests.h} "$here"/libcamera/{lab_guard.h,lab_guard.cpp} \
+    "$lc_lab/src/libcamera/lab/"
+git -C "$lc_lab" apply -- "$here/libcamera/book2-lab.patch"
+status=$(git -C "$lc_lab" status --porcelain --untracked-files=all)
+expected=$' M include/libcamera/internal/media_device.h\n M include/libcamera/internal/v4l2_device.h\n M src/libcamera/media_device.cpp\n M src/libcamera/media_object.cpp\n M src/libcamera/meson.build\n M src/libcamera/pipeline/ipu3/ipu3.cpp\n M src/libcamera/v4l2_device.cpp\n?? src/libcamera/lab/discovery_requests.h\n?? src/libcamera/lab/lab_contract.cpp\n?? src/libcamera/lab/lab_contract.h\n?? src/libcamera/lab/lab_guard.cpp\n?? src/libcamera/lab/lab_guard.h'
+[[ $status == "$expected" ]] || die "unexpected lab libcamera tree changes: $status"
+printf '%s\n' "$status" >"$out/libcamera-lab-tree.status"
+build_libcamera lab "$lc_lab"
 
 # Runtime closure from NEEDED entries, resolved in /usr/lib without running anything.
 closure() {
@@ -223,11 +238,16 @@ record_host_libs() {
     done <"$list"
 }
 
-closure "$scratch/lc-stock-stage" "$out/worker-stock" >"$out/closure-stock.txt"
-record_host_libs "$out/closure-stock.txt" >"$out/host-libs-stock.txt"
+for name in stock lab; do
+    closure "$scratch/lc-$name-stage" "$out/worker-$name" >"$out/closure-$name.txt"
+    record_host_libs "$out/closure-$name.txt" >"$out/host-libs-$name.txt"
+done
+sha256sum -- "$scratch/lc-lab-stage/usr/lib/libcamera/ipa/ipa_ipu3.so" | cut -d' ' -f1 >"$out/ipa_ipu3.sha256"
 
 gcc -O2 "$linux/usr/gen_init_cpio.c" -o "$out/gen_init_cpio"
-image_list "$out/supervisor" - - - >"$out/lab.list"
+image_list "$out/supervisor" "$out/worker-lab" "$scratch/lc-lab-stage" "$out/closure-lab.txt" >"$out/lab.list"
+printf '%s\n' "file /lab/front.contract $here/contract/front.contract 644 0 0" \
+    "file /lab/ipa_ipu3.sha256 $out/ipa_ipu3.sha256 644 0 0" >>"$out/lab.list"
 "$out/gen_init_cpio" "$out/lab.list" >"$out/lab.cpio"
 image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out/closure-stock.txt" \
     >"$out/stock.list"
@@ -235,7 +255,7 @@ image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out
 cp -- "$kbuild/arch/x86/boot/bzImage" "$out/bzImage"
 cp -- "$kbuild/.config" "$out/guest.config"
 (cd -- "$here" && sha256sum kernel-discovery.config build_discovery_guest.sh \
-    kernel/book2-lab-sim/* guest/* lab/* contract/* >"$out/inputs.sha256")
+    kernel/book2-lab-sim/* guest/* lab/* libcamera/* contract/* >"$out/inputs.sha256")
 (cd -- "$boot" && sha256sum guest/cgroup_device.c guest/lab.h >>"$out/inputs.sha256")
 (cd -- "$out" && sha256sum bzImage lab.cpio stock.cpio >build.sha256)
 cat "$out/build.sha256"

@@ -1,4 +1,7 @@
+import hashlib
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -6,6 +9,25 @@ import run_discovery as rd
 
 
 NONCE = "0123456789abcdef0123456789abcdef"
+BOOT_INPUTS = ("guest/cgroup_device.c", "guest/lab.h")
+
+
+def run_build(root: Path, linux: Path, libcamera: Path, out: Path) -> subprocess.CompletedProcess:
+    """Run the build script with a fake git that reports clean pinned checkouts."""
+    tools = root / "bin"
+    tools.mkdir(exist_ok=True)
+    git = tools / "git"
+    git.write_text(
+        "#!/bin/sh\n[ \"$1\" = -C ] || exit 1\ncase \"$3\" in\n"
+        f"rev-parse) [ \"$2\" = '{linux}' ] && echo 988117cc1bb17338c586a4e21ade88b5397eac33 ||"
+        " echo df8e348d64b4932a0676256ed24f0da3ee9438bc;;\n"
+        "status) ;;\ndescribe) echo v0.8.0;;\n*) exit 1;;\nesac\n")
+    (tools / "bc").write_text("#!/bin/sh\n")
+    for tool in (git, tools / "bc"):
+        tool.chmod(0o700)
+    return subprocess.run(
+        ("/usr/bin/bash", str(rd.HERE / "build_discovery_guest.sh"), str(linux), str(libcamera), str(out)),
+        text=True, capture_output=True, timeout=20, env={**os.environ, "PATH": f"{tools}:/usr/bin"})
 
 
 def serial(case, events, effects=(), topology=(), nonce=NONCE, dropped=0, count=None):
@@ -213,6 +235,55 @@ class VerifierTests(unittest.TestCase):
         script = (rd.HERE / "build_discovery_guest.sh").read_text()
         self.assertIn('rm -f -- "$scratch/lc-lab-stage/usr/libexec/libcamera/ipu3_ipa_proxy"', script)
         self.assertIn('grep -q ipa_proxy "$out/lab.list"', script)
+
+    def test_build_refuses_inputs_overlapping_its_workspaces(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temp:
+            root = Path(temp).resolve()
+            (root / "libcamera").mkdir()
+            inside = root / "linux-b03"
+            inside.mkdir()
+            (inside / "marker").write_text("pinned checkout\n")
+            result = run_build(root, inside, root / "libcamera", root / "build")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("overlaps build workspace", result.stderr)
+            self.assertTrue((inside / "marker").is_file())
+            self.assertFalse((root / "build").exists())
+            (root / "linux").mkdir()
+            result = run_build(root, root / "linux", root, root / "build")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("overlaps build workspace", result.stderr)
+            self.assertFalse((root / "build").exists())
+
+    def test_build_hashes_the_input_snapshot_before_building(self):
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temp:
+            root = Path(temp).resolve()
+            for name in ("linux", "libcamera"):
+                (root / name).mkdir()
+            out = root / "build"
+            result = run_build(root, root / "linux", root / "libcamera", out)
+            # The empty Linux tree stops the build at its first kernel step.
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((out / "inputs.sha256").is_file(), result.stderr)
+            boot = rd.HERE.parent / "1379-lab-boot"
+            lab = sorted(str(p.relative_to(rd.HERE)) for pattern in (
+                "kernel-discovery.config", "build_discovery_guest.sh", "kernel/book2-lab-sim/*", "guest/*",
+                "lab/*", "libcamera/*", "contract/*") for p in rd.HERE.glob(pattern))
+            listed = [line.split("  ", 1) for line in (out / "inputs.sha256").read_text().splitlines()]
+            self.assertEqual(sorted(name for _, name in listed[:len(lab)]), lab)
+            self.assertEqual([name for _, name in listed[len(lab):]], list(BOOT_INPUTS))
+            for i, (digest, name) in enumerate(listed):
+                source = (boot if i >= len(lab) else rd.HERE) / name
+                copy = out / "inputs" / source.relative_to(rd.HERE.parent)
+                self.assertEqual(hashlib.sha256(copy.read_bytes()).hexdigest(), digest, name)
+                self.assertEqual(copy.read_bytes(), source.read_bytes(), name)
+
+    def test_build_reads_inputs_only_from_the_snapshot(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        switch = script.find('here="$snap/1379-lab-discovery"\nboot="$snap/1379-lab-boot"\n')
+        self.assertNotEqual(switch, -1)
+        self.assertLess(switch, script.index("cp -al"))
+        after = script[switch:].split("\n", 2)[2]
+        self.assertNotRegex(after, r"(^|\n)(here|boot)=")
 
     def test_readme_runs_every_case_in_both_rounds(self):
         text = (rd.HERE / "README.md").read_text()

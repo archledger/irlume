@@ -33,7 +33,10 @@ g++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-
 python3 -B -m unittest discover -s "$lab" -p test_run_discovery.py
 ```
 
-The build hardlinks the pinned Linux tree, adds only the driver directory
+The build refuses a pinned checkout that is, contains or lies inside a
+path it deletes or rewrites. It copies its own inputs to `inputs/` in the
+new build directory, hashes that copy into `inputs.sha256` and builds only
+from it. It hardlinks the pinned Linux tree, adds only the driver directory
 and its two `Kconfig`/`Makefile` lines, checks that change set with
 `git status` through a private index, and rechecks that the pinned
 checkout is still clean. Meson runs with `--wrap-mode=nodownload`, a

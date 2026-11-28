@@ -26,13 +26,44 @@ clean_at "$linux" "$linux_pin"
 clean_at "$libcamera" "$libcamera_pin"
 [[ $(git -C "$libcamera" describe --exact-match HEAD) == v0.8.0 ]] || die "libcamera is not the real v0.8.0 tag"
 command -v bc >/dev/null || die "provide a verified private bc on PATH"
+
+# Paths this script deletes or rewrites. Neither pinned checkout may be one
+# of them, lie inside one or contain one.
+src="$scratch/linux-b03"
+kbuild="$scratch/kbuild-b03"
+uapi="$scratch/uapi-b03"
+pkgview="$scratch/pkgconfig-view"
+native="$scratch/meson-native.ini"
+lc_stock="$scratch/libcamera-stock"
+lc_lab="$scratch/libcamera-lab"
+for input in "$linux" "$libcamera"; do
+    for path in "$out" "$src" "$scratch/linux-b03.index" "$kbuild" "$uapi" "$pkgview" "$native" "$lc_stock" \
+        "$lc_lab" "$scratch"/lc-{stock,lab}-{build,stage}; do
+        for w in "$path" "$(realpath -m -- "$path")"; do
+            [[ $input != "$w" && $input != "$w"/* && $w != "$input"/* ]] ||
+                die "input $input overlaps build workspace $path"
+        done
+    done
+done
 mkdir -- "$out"
 export LC_ALL=C
 unset KCONFIG_CONFIG KBUILD_OUTPUT CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH KCFLAGS KCPPFLAGS
 
+# Build only from a private snapshot of the inputs, so inputs.sha256 names
+# the bytes the build used. From here on $here and $boot name the snapshot.
+snap="$out/inputs"
+mkdir -- "$snap" "$snap/1379-lab-discovery" "$snap/1379-lab-boot"
+(cd -- "$here" && cp --parents -- kernel-discovery.config build_discovery_guest.sh kernel/book2-lab-sim/* \
+    guest/* lab/* libcamera/* contract/* "$snap/1379-lab-discovery/")
+(cd -- "$boot" && cp --parents -- guest/cgroup_device.c guest/lab.h "$snap/1379-lab-boot/")
+here="$snap/1379-lab-discovery"
+boot="$snap/1379-lab-boot"
+(cd -- "$here" && sha256sum kernel-discovery.config build_discovery_guest.sh kernel/book2-lab-sim/* guest/* \
+    lab/* libcamera/* contract/* >"$out/inputs.sha256")
+(cd -- "$boot" && sha256sum guest/cgroup_device.c guest/lab.h >>"$out/inputs.sha256")
+
 # Hardlinked copy of the pinned tree plus the guest-only driver. Changed
 # files are replaced by rename so the pinned checkout's inodes never change.
-src="$scratch/linux-b03"
 rm -rf -- "$src"
 cp -al -- "$linux" "$src"
 rm -rf -- "$src/.git"
@@ -53,8 +84,6 @@ expected=$' M drivers/media/test-drivers/Kconfig\n M drivers/media/test-drivers/
 [[ $status == "$expected" ]] || die "unexpected guest kernel tree changes: $status"
 printf '%s\n' "$status" >"$out/kernel-tree.status"
 
-kbuild="$scratch/kbuild-b03"
-uapi="$scratch/uapi-b03"
 mkdir -p -- "$kbuild"
 make_args=(-C "$src" ARCH=x86 O="$kbuild")
 make "${make_args[@]}" x86_64_defconfig >"$out/config.log" 2>&1
@@ -91,7 +120,6 @@ if grep -Eq 'INTERP|NEEDED' "$out/supervisor-elf.txt"; then die "supervisor is n
 for tool in ninja openssl readelf pacman pkg-config; do
     command -v "$tool" >/dev/null || die "missing build tool: $tool"
 done
-pkgview="$scratch/pkgconfig-view"
 rm -rf -- "$pkgview"
 mkdir -- "$pkgview"
 declare -A seen=()
@@ -109,7 +137,6 @@ while ((${#queue[@]})); do
 done
 ls "$pkgview" >"$out/pkgconfig-view.txt"
 # No CMake lookups and no libyuv probe, so no host library outside the view is found.
-native="$scratch/meson-native.ini"
 printf '%s\n' '[binaries]' "cmake = 'false'" >"$native"
 needed_allow=(ld-linux-x86-64.so.2 libc.so.6 libcamera-base.so.0.8 libcamera.so.0.8 libgcc_s.so.1 libgnutls.so.30
     libm.so.6 libstdc++.so.6 libyaml-0.so.2)
@@ -146,7 +173,6 @@ build_libcamera() {
         -L "$stage/usr/lib" -lcamera -lcamera-base -o "$out/worker-$name"
 }
 
-lc_stock="$scratch/libcamera-stock"
 rm -rf -- "$lc_stock"
 git clone -q --shared --no-checkout -- "$libcamera" "$lc_stock"
 git -C "$lc_stock" checkout -q --detach "$libcamera_pin"
@@ -154,7 +180,6 @@ git -C "$lc_stock" checkout -q --detach "$libcamera_pin"
 build_libcamera stock "$lc_stock"
 
 # Lab libcamera: the pinned tree plus the lab files and one reviewed patch.
-lc_lab="$scratch/libcamera-lab"
 rm -rf -- "$lc_lab"
 git clone -q --shared --no-checkout -- "$libcamera" "$lc_lab"
 git -C "$lc_lab" checkout -q --detach "$libcamera_pin"
@@ -268,8 +293,5 @@ image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out
 "$out/gen_init_cpio" "$out/stock.list" >"$out/stock.cpio"
 cp -- "$kbuild/arch/x86/boot/bzImage" "$out/bzImage"
 cp -- "$kbuild/.config" "$out/guest.config"
-(cd -- "$here" && sha256sum kernel-discovery.config build_discovery_guest.sh \
-    kernel/book2-lab-sim/* guest/* lab/* libcamera/* contract/* >"$out/inputs.sha256")
-(cd -- "$boot" && sha256sum guest/cgroup_device.c guest/lab.h >>"$out/inputs.sha256")
 (cd -- "$out" && sha256sum bzImage lab.cpio stock.cpio >build.sha256)
 cat "$out/build.sha256"

@@ -850,9 +850,12 @@ void run_ir_stub()
     event(line);
 }
 
-void finish_attempt(const book2lab::Reservation &r, const Worker &w)
+void finish_attempt(const book2lab::Reservation &r, const Worker &w, book2lab::IpaMapping ipa)
 {
     Outcome o = classify_attempt(r, w);
+    // A module mapped beside or instead of the bound one leaves the owner unknown.
+    if (ipa == book2lab::IpaMapping::Unbound && o.kind != Ownership::Unknown)
+        o = {Ownership::Unknown, "ipa-route"};
     if (o.kind == Ownership::Known) {
         event("OWNER_RELEASED");
         event("SECOND_BACKEND_STARTED");
@@ -868,14 +871,15 @@ void finish_attempt(const book2lab::Reservation &r, const Worker &w)
 
 // While the worker is alive and both seccomp stages are present, a threaded
 // route maps the bound IPA inode into the worker itself.
-void ipa_observation(const Worker &w, const book2lab::Reservation &r)
+book2lab::IpaMapping ipa_observation(const Worker &w, const book2lab::Reservation &r)
 {
     const std::string proc = "/proc/" + std::to_string(w.pid);
     std::string status, maps;
     if (!read_file(proc + "/status", status) || status.find("\nSeccomp_filters:\t2\n") == std::string::npos ||
         !read_file(proc + "/maps", maps) || !r.bind_ipa)
         worker_fail("WORKER_STATE_AT_REPORT");
-    switch (book2lab::classify_ipa_maps(maps, *r.bind_ipa)) {
+    const book2lab::IpaMapping mapping = book2lab::classify_ipa_maps(maps, *r.bind_ipa);
+    switch (mapping) {
     case book2lab::IpaMapping::Bound:
         event("IPA_ROUTE threaded " + r.bind_ipa->sha256);
         break;
@@ -886,6 +890,7 @@ void ipa_observation(const Worker &w, const book2lab::Reservation &r)
         event("IPA_NOT_MAPPED");
         break;
     }
+    return mapping;
 }
 
 bool copy_file(const std::string &from, const std::string &to, mode_t mode)
@@ -1084,8 +1089,9 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
             worker_fail("CONTROL_RESUME");
     };
     const bool pauses = lab_case == "ipa-replaced-before-factory" || lab_case == "replace-during-discovery";
+    book2lab::IpaMapping ipa = book2lab::IpaMapping::Absent;
     run_worker(w, [&] {
-        ipa_observation(w, r);
+        ipa = ipa_observation(w, r);
         if (lab_case == "replace-after-discovery") {
             if (!write_file(std::string(kDebug) + "/control", "replace\n"))
                 fail("CONTROL_REPLACE");
@@ -1098,7 +1104,7 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
     if (verdict == "none")
         print_worker_log();
     event("GUARD " + verdict);
-    finish_attempt(r, w);
+    finish_attempt(r, w, ipa);
 }
 
 } // namespace

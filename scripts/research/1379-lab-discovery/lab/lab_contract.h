@@ -133,6 +133,11 @@ std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(con
 enum class IpaMapping { Bound, Unbound, Absent };
 IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind);
 
+// The hold the worker's IPA mapping adds to an attempt that would otherwise
+// end in a release, known_owner telling a known owner from a refusal before
+// any worker effect; nothing when the mapping allows the release.
+std::optional<std::string> ipa_route_hold(bool known_owner, IpaMapping mapping);
+
 // The effect a state-changing subdevice request would cause, or why it is refused.
 struct RequestEffect {
     Verdict verdict;

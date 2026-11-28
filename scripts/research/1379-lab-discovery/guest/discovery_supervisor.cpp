@@ -846,9 +846,9 @@ void run_ir_stub()
 void finish_attempt(const book2lab::Reservation &r, const Worker &w, book2lab::IpaMapping ipa)
 {
     Outcome o = classify_attempt(r, w);
-    // A module mapped beside or instead of the bound one leaves the owner unknown.
-    if (ipa == book2lab::IpaMapping::Unbound && o.kind != Ownership::Unknown)
-        o = {Ownership::Unknown, "ipa-route"};
+    if (o.kind != Ownership::Unknown)
+        if (const auto hold = book2lab::ipa_route_hold(o.kind == Ownership::Known, ipa))
+            o = {Ownership::Unknown, *hold};
     if (o.kind == Ownership::Known) {
         event("OWNER_RELEASED");
         event("SECOND_BACKEND_STARTED");

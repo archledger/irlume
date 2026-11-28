@@ -130,9 +130,10 @@ list every granted node, each listed count at zero. Missing or malformed
 evidence holds as `observer`; dropped records, another process, an
 ungranted node or an open handle hold as `dropped`, `foreign-process`,
 `ungranted-node` or `open-handles`.
-`Known` needs every listed effect exactly once, counted per control record;
-a format record must also carry the media bus code the contract lists as
-its result. Only then does the stand-in second
+`Known` needs every listed effect exactly once, counted per control record,
+and the bound IPA module mapped in the worker; a format record must also
+carry the media bus code the contract lists as its result. Only then does
+the stand-in second
 backend `/lab/ir-stub` run. A refusal with no worker effect releases
 without continuing the schedule. Anything else is `HOLD <reason>` and
 blocks the second backend.
@@ -164,7 +165,9 @@ any effect. The route must satisfy all of these:
 While the worker is alive, the supervisor requires the bound inode in
 `/proc/<worker>/maps` before it reports `IPA_ROUTE threaded <sha256>`. It
 reports `IPA_MAPPED_UNBOUND`, which no case accepts, when another file is
-mapped at the bound path or the bound file under another path.
+mapped at the bound path or the bound file under another path. Such a
+mapping, or a known owner whose worker did not map the bound module, holds
+the attempt as `ipa-route`, and the second backend stays blocked.
 
 | Case | Change before the worker runs | Required result |
 | --- | --- | --- |

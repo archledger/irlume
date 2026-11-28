@@ -713,6 +713,15 @@ IpaMapping classify_ipa_maps(std::string_view maps, const BindIpa &bind)
     return unbound ? IpaMapping::Unbound : bound ? IpaMapping::Bound : IpaMapping::Absent;
 }
 
+std::optional<std::string> ipa_route_hold(bool known_owner, IpaMapping mapping)
+{
+    // A module mapped beside or instead of the bound one leaves the owner
+    // unknown, and a known owner's worker must have run the bound module.
+    if (mapping == IpaMapping::Unbound || (known_owner && mapping != IpaMapping::Bound))
+        return "ipa-route";
+    return std::nullopt;
+}
+
 RequestEffect subdev_request_effect(unsigned long request, const void *arg, const std::string &entity)
 {
     Effect e;

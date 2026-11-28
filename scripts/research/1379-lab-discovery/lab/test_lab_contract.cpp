@@ -670,6 +670,18 @@ void ipa_maps_report_unbound_mapping()
     CHECK(classify_ipa_maps(other_path, bind) == IpaMapping::Unbound);
 }
 
+// A refusal before any worker effect may release whether or not the module
+// loaded; a known owner also needs the bound module mapped in its worker.
+void ipa_route_hold_needs_the_bound_mapping_for_a_known_owner()
+{
+    CHECK(!ipa_route_hold(false, IpaMapping::Absent));
+    CHECK(!ipa_route_hold(false, IpaMapping::Bound));
+    CHECK(ipa_route_hold(false, IpaMapping::Unbound) == "ipa-route");
+    CHECK(!ipa_route_hold(true, IpaMapping::Bound));
+    CHECK(ipa_route_hold(true, IpaMapping::Unbound) == "ipa-route");
+    CHECK(ipa_route_hold(true, IpaMapping::Absent) == "ipa-route");
+}
+
 void try_format_and_stale_controls_refuse()
 {
     v4l2_subdev_format f {};
@@ -735,6 +747,7 @@ int main()
         {"replay_counts_listed_records", replay_counts_listed_records},
         {"media_listing_fails_closed", media_listing_fails_closed},
         {"ipa_maps_report_unbound_mapping", ipa_maps_report_unbound_mapping},
+        {"ipa_route_hold_needs_the_bound_mapping_for_a_known_owner", ipa_route_hold_needs_the_bound_mapping_for_a_known_owner},
         {"try_format_and_stale_controls_refuse", try_format_and_stale_controls_refuse},
         {"whitespace_line_refuses", whitespace_line_refuses},
     };

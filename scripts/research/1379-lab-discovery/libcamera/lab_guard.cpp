@@ -61,22 +61,27 @@ const ::book2lab::DiscoveryRequest *lookup(unsigned long request)
 	return nullptr;
 }
 
-std::vector<std::pair<unsigned, unsigned>> sysfsMedia()
+/* Every registered media device; false if any media entry cannot be read. */
+bool sysfsMedia(std::vector<std::pair<unsigned, unsigned>> *devices)
 {
-	std::vector<std::pair<unsigned, unsigned>> devices;
+	devices->clear();
 	DIR *dir = opendir("/sys/bus/media/devices");
 	if (!dir)
-		return devices;
+		return false;
+	bool ok = true;
 	while (dirent *entry = readdir(dir)) {
 		std::string name = entry->d_name, dev;
 		unsigned major = 0, minor = 0;
-		if (name.rfind("media", 0) == 0 &&
-		    readAll(("/sys/bus/media/devices/" + name + "/dev").c_str(), &dev) &&
+		if (name.rfind("media", 0) != 0)
+			continue;
+		if (readAll(("/sys/bus/media/devices/" + name + "/dev").c_str(), &dev) &&
 		    std::sscanf(dev.c_str(), "%u:%u", &major, &minor) == 2)
-			devices.emplace_back(major, minor);
+			devices->emplace_back(major, minor);
+		else
+			ok = false;
 	}
 	closedir(dir);
-	return devices;
+	return ok;
 }
 
 unsigned int suffix(const std::string &name)
@@ -127,15 +132,21 @@ int Guard::refuse(const std::string &reason, bool hold)
 	return -EPERM;
 }
 
-/* Reread both topologies and every bound kernfs inode. */
+/* Reread the media set, both topologies and every bound kernfs inode. */
 Verdict Guard::recheckLocked()
 {
+	std::vector<std::pair<unsigned, unsigned>> present;
+	if (!sysfsMedia(&present))
+		return { false, "media-set" };
+	Verdict v = ::book2lab::check_media_set(*reservation_, present);
+	if (!v.ok)
+		return v;
 	for (const auto &[role, fd] : mediaFds_) {
 		::book2lab::Snapshot s;
 		if (::book2lab::read_snapshot(fd, &s) != 0)
 			return { false, "snapshot" };
-		Verdict v = ::book2lab::compare_graph(*reservation_, role == "cio2" ? ::book2lab::Role::Cio2 : ::book2lab::Role::Imgu,
-						      s, ledger_);
+		v = ::book2lab::compare_graph(*reservation_, role == "cio2" ? ::book2lab::Role::Cio2 : ::book2lab::Role::Imgu,
+					      s, ledger_);
 		if (!v.ok)
 			return v;
 	}
@@ -181,8 +192,11 @@ Verdict Guard::admitDiscovery(MediaDevice &cio2, MediaDevice &imgu)
 	if (!latched_.empty())
 		return fail(latched_);
 	Verdict v = ::book2lab::check_environment(environ, kConfigFiles);
+	std::vector<std::pair<unsigned, unsigned>> present;
+	if (v.ok && !sysfsMedia(&present))
+		v = { false, "media-set" };
 	if (v.ok)
-		v = ::book2lab::check_media_set(*reservation_, sysfsMedia());
+		v = ::book2lab::check_media_set(*reservation_, present);
 	if (v.ok)
 		v = ::book2lab::check_front(*reservation_);
 	if (!v.ok)

@@ -107,6 +107,18 @@ Verdict check_media_set(const Reservation &r, const std::vector<std::pair<unsign
 Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger);
 Verdict check_environment(const char *const *envp, const std::vector<std::string> &config_paths);
 
+// Worker-controlled text that the supervisor writes to the serial receipt.
+std::string sanitize_report(std::string_view line);
+std::string sanitize_verdict(std::string_view line);
+std::string escape_log_line(std::string_view line);
+
+// The simulated driver's effect log and open counts after one worker attempt.
+struct ObserverRecords {
+    std::vector<std::string> worker_effects; // worker records other than open, release and control
+};
+Verdict parse_observer(std::string_view open_counts, std::string_view log, int worker_tgid,
+                       const std::vector<std::string> &grants, ObserverRecords *out);
+
 } // namespace book2lab
 
 #endif

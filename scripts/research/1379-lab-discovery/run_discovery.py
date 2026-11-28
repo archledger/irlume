@@ -31,6 +31,7 @@ KERNEL_FAULT = re.compile(
     r"INFO: trying to register|INFO: task .* blocked|general protection fault|Call Trace:")
 EFFECT = re.compile(r"EFFECT ([0-9]+) ([0-9]+) (worker|supervisor|other) (\S.*)")
 END = re.compile(r"EFFECTS_END ([0-9]+) dropped=([0-9]+)")
+NON_PRINTABLE = re.compile(r"[^\x20-\x7e]")
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,9 @@ CASES = {
     "replace-after-discovery": Case("lab.cpio", (), LAB + (
         "WORKER_READY", "CAMERAS 1", IPA_ROUTE, "REPLACED_AFTER_DISCOVERY", "WORKER_EXITED 0", "GUARD admit",
         "HOLD replaced") + BLOCKED),
+    "hotplug-during-discovery": Case("lab.cpio", (), LAB + (
+        "MEDIA_ARMED", "WORKER_READY", "CAMERAS 0", IPA_ROUTE, "WORKER_EXITED 0", "GUARD hold extra-media",
+        "HOLD media-set") + BLOCKED),
     "ipa-bad-signature": Case("lab.cpio", (), LAB + (
         "SIGNATURE_CORRUPTED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
         "GUARD refuse ipa-signature") + CLEAN),
@@ -156,9 +160,11 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int,
     prefix = f"{PROTOCOL} {nonce} "
     events, effects, topology = [], [], []
     ended = False
-    for line in text.splitlines():
+    for line in receipt_lines(text):
         if not line.startswith("BOOK2_"):
             continue
+        if NON_PRINTABLE.search(line):
+            raise ValueError("control character in receipt line")
         if not line.startswith(prefix):
             raise ValueError("unexpected receipt nonce or protocol")
         if ended:
@@ -190,6 +196,16 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int,
     if sorted(topology) != want_topology:
         raise ValueError("topology does not match the contract graph")
     return Receipt(tuple(events), tuple(effects), tuple(topology))
+
+
+def read_serial(path: Path) -> str:
+    """The serial log as written: no newline translation, so only '\\n' ends a line."""
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+def receipt_lines(text: str) -> list[str]:
+    """Split on '\\n' only, dropping the one '\\r' of the console's line ending."""
+    return [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
 
 
 def qemu_args(kernel: Path, initramfs: Path, serial: Path, case: str, nonce: str) -> list[str]:
@@ -255,7 +271,7 @@ def run_discovery(build: Path, receipt: Path, case: str) -> Receipt:
     if not serial.is_file() or serial.stat().st_size > MAX_SERIAL:
         raise ValueError("missing or oversized guest serial log")
     digest = (build / "ipa_ipu3.sha256").read_text().strip() if (build / "ipa_ipu3.sha256").is_file() else "0" * 64
-    verified = check_discovery(serial.read_text(errors="replace"), nonce, case, result.returncode, digest)
+    verified = check_discovery(read_serial(serial), nonce, case, result.returncode, digest)
     (receipt / "verified.txt").write_text(
         f"{nonce} {case}\n" + "\n".join(verified.events + verified.effects) + "\n")
     return verified

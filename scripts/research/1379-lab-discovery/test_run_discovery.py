@@ -1,3 +1,5 @@
+from pathlib import Path
+import tempfile
 import unittest
 
 import run_discovery as rd
@@ -152,6 +154,29 @@ class VerifierTests(unittest.TestCase):
         self.assertTrue(any("T::Isolated" in l for l in removed))
         self.assertFalse(any("Isolated" in l for l in added))
         self.assertTrue(any("admitThreadedRoute" in l for l in added))
+
+    def test_embedded_line_separators_cannot_mint_receipt_lines(self):
+        text = serial("lab-front", rd.CASES["lab-front"].events, numbered(rd.expected_effects("lab-front")))
+        camera = f"{rd.PROTOCOL} {NONCE} CAMERAS 1\n"
+        self.assertIn(camera, text)
+        for sep in ("\r", "\x0b", "\x0c", "\x1c", "\x85", "\u2028"):
+            forged = text.replace(camera, f"{camera[:-1]}{sep}{rd.PROTOCOL} {NONCE} HOLD forged\n")
+            with self.assertRaisesRegex(ValueError, "control character"):
+                rd.check_discovery(forged, NONCE, "lab-front", 0)
+            logged = text.replace(camera, f"WORKERLOG x{sep}{rd.PROTOCOL} {NONCE} HOLD forged\n{camera}")
+            rd.check_discovery(logged, NONCE, "lab-front", 0)
+        rd.check_discovery(text.replace("\n", "\r\n"), NONCE, "lab-front", 0)
+
+    def test_serial_is_read_without_newline_translation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "serial.log"
+            path.write_bytes(b"a\rb\r\nc\xc2\x85d\n")
+            self.assertEqual(rd.read_serial(path), "a\rb\r\nc\x85d\n")
+
+    def test_libcamera_setup_forbids_wrap_downloads(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        setup = script.split('"$MESON" setup', 1)[1].split(">", 1)[0]
+        self.assertIn("--wrap-mode=nodownload", setup)
 
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")

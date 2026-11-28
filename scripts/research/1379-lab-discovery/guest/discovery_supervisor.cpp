@@ -170,7 +170,8 @@ bool read_scope()
                                         "graph-ir-link-enabled", "graph-extra-entity", "hotplug-extra-media",
                                         "sim-port-variant", "effect-unlisted-link", "replace-before-discovery",
                                         "generation-during-discovery", "replace-after-discovery", "ipa-bad-signature",
-                                        "ipa-force-isolation", "ipa-env-override", "ipa-identity-mismatch"};
+                                        "ipa-force-isolation", "ipa-env-override", "ipa-identity-mismatch",
+                                        "hotplug-during-discovery"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -467,7 +468,7 @@ void print_worker_log()
             size_t end = log.find('\n', pos);
             if (end == std::string::npos)
                 end = log.size();
-            std::printf("WORKERLOG %s\n", log.substr(pos, end - pos).c_str());
+            std::printf("WORKERLOG %s\n", book2lab::escape_log_line(log.substr(pos, end - pos)).c_str());
             pos = end + 1;
         }
         std::fflush(stdout);
@@ -553,7 +554,7 @@ void run_worker(Worker &w, const std::function<void()> &before_release = {})
     event("WORKER_READY");
     if (!tell(w.control, "go") || !read_line(w.report, line, 100000))
         worker_fail("NO_WORKER_REPORT");
-    event(line);
+    event(book2lab::sanitize_report(line));
     if (before_release)
         before_release();
     if (!tell(w.control, "release"))
@@ -733,7 +734,7 @@ std::string read_verdict(int fd)
     std::string line;
     if (!read_line(fd, line, 1000) || line.rfind("VERDICT ", 0) != 0)
         return "none";
-    return line.substr(8);
+    return book2lab::sanitize_verdict(line.substr(8));
 }
 
 std::vector<std::string> book2lab_tokens(const std::string &s)
@@ -787,42 +788,10 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
     std::string counts, log;
     if (!read_file(std::string(kDebug) + "/open_counts", counts) || !read_file(std::string(kDebug) + "/effects", log))
         return {Ownership::Unknown, "observer"};
-    for (size_t pos = 0; pos < counts.size();) {
-        size_t end = counts.find('\n', pos);
-        std::string line = counts.substr(pos, end - pos);
-        pos = end == std::string::npos ? counts.size() : end + 1;
-        if (!line.empty() && line.substr(line.rfind(' ') + 1) != "0")
-            return {Ownership::Unknown, "open-handles"};
-    }
-    std::vector<std::string> worker_effects;
-    std::set<std::string> granted(r.grants.begin(), r.grants.end());
-    for (size_t pos = 0; pos < log.size();) {
-        size_t end = log.find('\n', pos);
-        std::string line = log.substr(pos, end - pos);
-        pos = end == std::string::npos ? log.size() : end + 1;
-        if (line.rfind("dropped ", 0) == 0) {
-            if (line != "dropped 0")
-                return {Ownership::Unknown, "dropped"};
-            continue;
-        }
-        unsigned long long seq = 0;
-        unsigned instance = 0;
-        int tgid = 0, used = 0;
-        if (std::sscanf(line.c_str(), "%llu %u %d %n", &seq, &instance, &tgid, &used) != 3)
-            return {Ownership::Unknown, "observer"};
-        if (tgid != 1 && tgid != w.pid)
-            return {Ownership::Unknown, "foreign-process"};
-        std::string text = line.substr(static_cast<size_t>(used));
-        std::string kind = text.substr(0, text.find(' '));
-        if (tgid != w.pid || kind == "control")
-            continue;
-        if (kind == "open" || kind == "release") {
-            if (!granted.count(text.substr(text.find(' ') + 1)))
-                return {Ownership::Unknown, "ungranted-node"};
-            continue;
-        }
-        worker_effects.push_back(text);
-    }
+    book2lab::ObserverRecords observed;
+    if (book2lab::Verdict v = book2lab::parse_observer(counts, log, w.pid, r.grants, &observed); !v.ok)
+        return {Ownership::Unknown, v.reason};
+    const std::vector<std::string> &worker_effects = observed.worker_effects;
     std::vector<std::pair<unsigned, unsigned>> present;
     for (const auto &m : sysfs_media())
         present.emplace_back(m.major, m.minor);
@@ -1050,9 +1019,16 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
         if (!write_file(std::string(kDebug) + "/control", "bump-on-front-fmt\n"))
             fail("CONTROL_BUMP");
         event("BUMP_ARMED");
+    } else if (lab_case == "hotplug-during-discovery") {
+        if (!write_file(std::string(kDebug) + "/control", "add-media-on-front-fmt\n"))
+            fail("CONTROL_MEDIA_ARM");
+        event("MEDIA_ARMED");
     }
     std::vector<std::string> extra_env;
     perturb_ipa(r, extra_env);
+    // The last supervisor record before launch: proof the observer logs in this boot.
+    if (!write_file(std::string(kDebug) + "/control", "canary\n"))
+        fail("CONTROL_CANARY");
     std::vector<std::string> paths;
     for (const auto &n : r.nodes)
         paths.push_back(n.path);

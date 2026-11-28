@@ -114,7 +114,7 @@ build_libcamera() {
     local bdir="$scratch/lc-$name-build" stage="$scratch/lc-$name-stage" lib
     rm -rf -- "$bdir" "$stage"
     PATH="$(dirname -- "$MESON"):$PATH" PKG_CONFIG_LIBDIR="$pkgview" PKG_CONFIG_PATH='' \
-        "$MESON" setup "$bdir" "$source" --prefix=/usr --buildtype=debugoptimized \
+        "$MESON" setup "$bdir" "$source" --prefix=/usr --buildtype=debugoptimized --wrap-mode=nodownload \
         -Dpipelines=ipu3 -Dipas=ipu3 -Dudev=disabled -Dlibdw=disabled -Dlibunwind=disabled \
         -Dtracing=disabled -Dcam=disabled -Dqcam=disabled -Dgstreamer=disabled -Dv4l2=disabled \
         -Dpycamera=disabled -Dlc-compliance=disabled -Ddocumentation=disabled -Dtest=false \

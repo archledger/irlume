@@ -82,6 +82,8 @@
 
 [lab-front]
 # Only the reserved ImgU pipe and front port; no reset, no sibling probing.
+# The supervisor's canary is its last record before each lab launch.
+1 supervisor control canary
 1 worker open ipu3-imgu_1
 1 worker open ipu3-imgu_1_input
 1 worker open ipu3-imgu_1_output
@@ -113,16 +115,20 @@
 
 [graph-ir-link-enabled]
 1 supervisor link ov7251_4-0060:0 ipu3-csi2_1:0 0x1
+1 supervisor control canary
 
 [graph-extra-entity]
 1 supervisor control add-entity
+1 supervisor control canary
 
 [hotplug-extra-media]
 1 supervisor control add-media
+1 supervisor control canary
 
 [sim-port-variant]
 
 [effect-unlisted-link]
+1 supervisor control canary
 # The gate refuses the unlisted link before the kernel sees it.
 1 worker open ipu3-imgu_1
 1 worker open ipu3-imgu_1_input
@@ -144,9 +150,11 @@
 
 [replace-before-discovery]
 1 supervisor control replace
+2 supervisor control canary
 
 [generation-during-discovery]
 1 supervisor control bump-on-front-fmt
+1 supervisor control canary
 1 worker open ipu3-imgu_1
 1 worker open ipu3-imgu_1_input
 1 worker open ipu3-imgu_1_output
@@ -175,6 +183,7 @@
 1 worker release ipu3-imgu_1_3a_stat
 
 [replace-after-discovery]
+1 supervisor control canary
 1 worker open ipu3-imgu_1
 1 worker open ipu3-imgu_1_input
 1 worker open ipu3-imgu_1_output
@@ -206,9 +215,43 @@
 1 worker release ipu3-imgu_1_3a_stat
 
 [ipa-bad-signature]
+1 supervisor control canary
 
 [ipa-force-isolation]
+1 supervisor control canary
 
 [ipa-env-override]
+1 supervisor control canary
 
 [ipa-identity-mismatch]
+1 supervisor control canary
+
+[hotplug-during-discovery]
+1 supervisor control add-media-on-front-fmt
+1 supervisor control canary
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker control media-fired
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat

@@ -142,8 +142,13 @@ static DEFINE_MUTEX(sim_control_lock);
 static LIST_HEAD(sim_nodes);
 static DEFINE_MUTEX(sim_nodes_lock);
 static atomic_t sim_bump_armed = ATOMIC_INIT(0);
+static atomic_t sim_media_armed = ATOMIC_INIT(0);
+/* Serializes the extra media device; taken under the control lock or a subdev state lock. */
+static DEFINE_MUTEX(sim_extra_lock);
 static struct platform_device *sim_extra_pdev;
 static struct media_device sim_extra_mdev;
+
+static int sim_add_media(void);
 
 static __printf(2, 3) void sim_record(u32 instance, const char *fmt, ...)
 {
@@ -373,6 +378,9 @@ static int sim_sensor_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *
 		sim_record(s->node.inst->id, "control bump-fired");
 		sim_extra_register(s->node.inst);
 	}
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && s->front &&
+	    atomic_xchg(&sim_media_armed, 0))
+		sim_record(s->node.inst->id, "control media-%s", sim_add_media() ? "failed" : "fired");
 	return 0;
 }
 
@@ -936,6 +944,7 @@ static void sim_extra_register(struct sim_instance *inst)
 
 static int sim_add_media(void)
 {
+	guard(mutex)(&sim_extra_lock);
 	if (sim_extra_pdev)
 		return -EBUSY;
 	sim_extra_pdev = platform_device_register_simple("book2-lab-extra", 0, NULL, 0);
@@ -1018,6 +1027,11 @@ static ssize_t sim_control_write(struct file *file, const char __user *ubuf, siz
 	} else if (!strcmp(cmd, "bump-on-front-fmt")) {
 		sim_record(sim_current->id, "control bump-on-front-fmt");
 		atomic_set(&sim_bump_armed, 1);
+	} else if (!strcmp(cmd, "add-media-on-front-fmt")) {
+		sim_record(sim_current->id, "control add-media-on-front-fmt");
+		atomic_set(&sim_media_armed, 1);
+	} else if (!strcmp(cmd, "canary")) {
+		sim_record(sim_current->id, "control canary");
 	} else {
 		ret = -EINVAL;
 	}

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -336,6 +337,110 @@ void configuration_file_refuses()
     unlink(path);
 }
 
+void worker_report_is_whitelisted()
+{
+    CHECK(sanitize_report("CAMERAS 1") == "CAMERAS 1");
+    CHECK(sanitize_report("CAMERAS 0") == "CAMERAS 0");
+    CHECK(sanitize_report("START_FAILED -19") == "START_FAILED -19");
+    for (const char *bad : {"CAMERAS 1\rBOOK2_DISCOVERY_V1 0123 HOLD forged", "CAMERAS 1\x0b", "CAMERAS", "CAMERAS 01",
+                            "CAMERAS 1 2", "CAMERAS 1000", "OWNER_RELEASED", "START_FAILED 0", "START_FAILED -", ""})
+        CHECK(sanitize_report(bad) == "REPORT_INVALID");
+}
+
+void guard_verdict_is_printable()
+{
+    const char *link = "refuse unlisted-effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1";
+    CHECK(sanitize_verdict("admit") == "admit");
+    CHECK(sanitize_verdict("hold version") == "hold version");
+    CHECK(sanitize_verdict(link) == link);
+    for (const char *bad : {"refuse x\rBOOK2_DISCOVERY_V1 0123 HOLD forged", "hold version\x0c", "admit now",
+                            "refuse ", "hold", "release", "refuse caf\xc3\xa9", ""})
+        CHECK(sanitize_verdict(bad) == "invalid");
+}
+
+void worker_log_bytes_are_escaped()
+{
+    CHECK(escape_log_line("plain text: 1/2 [x]") == "plain text: 1/2 [x]");
+    CHECK(escape_log_line("a\rb") == "a\\x0db");
+    CHECK(escape_log_line(std::string("x\x85\x1c\x7fy")) == "x\\x85\\x1c\\x7fy");
+    CHECK(escape_log_line("a\\x0d") == "a\\x5cx0d");
+}
+
+// Open counts and a driver log for one attempt: worker tgid 70, two granted nodes.
+const char *kCounts = "1 ov5693_2-0036 0\n1 ipu3-csi2_0 0\n";
+const std::vector<std::string> kObserverGrants = {"cio2", "imgu", "ov5693_2-0036", "ipu3-csi2_0"};
+constexpr int kWorkerTgid = 70;
+
+std::string observer_log(std::initializer_list<const char *> records, const char *header = "dropped 0\n")
+{
+    std::string text = header;
+    unsigned seq = 1;
+    for (const char *r : records)
+        text += std::to_string(seq++) + " " + r + "\n";
+    return text;
+}
+
+Verdict observe(const std::string &counts, const std::string &log, ObserverRecords *out = nullptr)
+{
+    ObserverRecords scratch;
+    return parse_observer(counts, log, kWorkerTgid, kObserverGrants, out ? out : &scratch);
+}
+
+void observer_accepts_complete_log()
+{
+    ObserverRecords out;
+    Verdict v = observe(kCounts, observer_log({"1 1 control canary", "1 70 open ov5693_2-0036",
+                                               "1 70 ctrl ov5693_2-0036 0x980914=0", "1 70 control bump-fired",
+                                               "1 70 release ov5693_2-0036"}), &out);
+    CHECK(v.ok);
+    CHECK(out.worker_effects == std::vector<std::string>{"ctrl ov5693_2-0036 0x980914=0"});
+}
+
+void observer_without_header_is_unknown()
+{
+    for (const std::string &log : {std::string(), observer_log({"1 1 control canary"}, "")}) {
+        Verdict v = observe(kCounts, log);
+        CHECK(!v.ok && v.reason == "observer");
+    }
+}
+
+void observer_requires_one_supervisor_canary()
+{
+    for (const std::string &log : {observer_log({}), observer_log({"1 70 control canary"}),
+                                   observer_log({"1 1 control canary", "1 1 control canary"})}) {
+        Verdict v = observe(kCounts, log);
+        CHECK(!v.ok && v.reason == "observer");
+    }
+}
+
+void observer_rejects_gap_or_second_header()
+{
+    const std::string gap = "dropped 0\n1 1 1 control canary\n3 1 70 ctrl ov5693_2-0036 0x980914=0\n";
+    const std::string twice = observer_log({"1 1 control canary"}) + "dropped 0\n";
+    for (const std::string &log : {gap, twice}) {
+        Verdict v = observe(kCounts, log);
+        CHECK(!v.ok && v.reason == "observer");
+    }
+}
+
+void observer_requires_count_for_every_granted_node()
+{
+    const std::string log = observer_log({"1 1 control canary"});
+    for (const char *counts : {"", "1 ov5693_2-0036 0\n", "1 ov5693_2-0036 0\n1 ipu3-csi2_0 0\nmalformed\n"}) {
+        Verdict v = observe(counts, log);
+        CHECK(!v.ok && v.reason == "observer");
+    }
+}
+
+void observer_keeps_specific_reasons()
+{
+    const std::string log = observer_log({"1 1 control canary"});
+    CHECK(observe("1 ov5693_2-0036 1\n1 ipu3-csi2_0 0\n", log).reason == "open-handles");
+    CHECK(observe(kCounts, observer_log({"1 1 control canary"}, "dropped 2\n")).reason == "dropped");
+    CHECK(observe(kCounts, observer_log({"1 1 control canary", "1 99 ctrl x 0x1=0"})).reason == "foreign-process");
+    CHECK(observe(kCounts, observer_log({"1 1 control canary", "1 70 open ov7251_4-0060"})).reason == "ungranted-node");
+}
+
 } // namespace
 
 int main()
@@ -354,6 +459,15 @@ int main()
         {"libcamera_environment_or_configuration_refuses", libcamera_environment_or_configuration_refuses},
         {"env_override_variants_refuse", env_override_variants_refuse},
         {"configuration_file_refuses", configuration_file_refuses},
+        {"worker_report_is_whitelisted", worker_report_is_whitelisted},
+        {"guard_verdict_is_printable", guard_verdict_is_printable},
+        {"worker_log_bytes_are_escaped", worker_log_bytes_are_escaped},
+        {"observer_accepts_complete_log", observer_accepts_complete_log},
+        {"observer_without_header_is_unknown", observer_without_header_is_unknown},
+        {"observer_requires_one_supervisor_canary", observer_requires_one_supervisor_canary},
+        {"observer_rejects_gap_or_second_header", observer_rejects_gap_or_second_header},
+        {"observer_requires_count_for_every_granted_node", observer_requires_count_for_every_granted_node},
+        {"observer_keeps_specific_reasons", observer_keeps_specific_reasons},
     };
     for (const auto &[name, test] : tests) {
         int before = failures;

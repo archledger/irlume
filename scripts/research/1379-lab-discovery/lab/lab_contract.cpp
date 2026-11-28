@@ -623,4 +623,134 @@ Verdict check_environment(const char *const *envp, const std::vector<std::string
     return {};
 }
 
+namespace {
+
+bool printable(std::string_view s)
+{
+    return std::all_of(s.begin(), s.end(), [](char c) { return c >= 0x20 && c <= 0x7e; });
+}
+
+bool digits(std::string_view s, size_t max)
+{
+    return !s.empty() && s.size() <= max && s.find_first_not_of("0123456789") == std::string_view::npos &&
+           (s == "0" || s[0] != '0');
+}
+
+// Lines of a text that ends with '\n'; nullopt when the last line is cut off.
+std::optional<std::vector<std::string_view>> complete_lines(std::string_view text)
+{
+    if (!text.empty() && text.back() != '\n')
+        return std::nullopt;
+    std::vector<std::string_view> out;
+    for (size_t pos = 0; pos < text.size();) {
+        size_t end = text.find('\n', pos);
+        out.push_back(text.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    return out;
+}
+
+} // namespace
+
+// The worker's report becomes one of two fixed forms or REPORT_INVALID, so it
+// can never carry a second receipt line.
+std::string sanitize_report(std::string_view line)
+{
+    if (line.rfind("CAMERAS ", 0) == 0 && digits(line.substr(8), 3))
+        return std::string(line);
+    if (line.rfind("START_FAILED -", 0) == 0 && digits(line.substr(14), 4) && line.substr(14) != "0")
+        return std::string(line);
+    return "REPORT_INVALID";
+}
+
+std::string sanitize_verdict(std::string_view line)
+{
+    if (line == "admit")
+        return "admit";
+    for (std::string_view kind : {std::string_view("refuse "), std::string_view("hold ")})
+        if (line.rfind(kind, 0) == 0 && line.size() > kind.size() && line.size() <= 200 && line[kind.size()] != ' ' &&
+            printable(line))
+            return std::string(line);
+    return "invalid";
+}
+
+std::string escape_log_line(std::string_view line)
+{
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    for (unsigned char c : line) {
+        if (c >= 0x20 && c <= 0x7e && c != '\\') {
+            out += static_cast<char>(c);
+        } else {
+            out += "\\x";
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+/*
+ * Missing proof is unknown: the log must start with exactly one "dropped 0"
+ * header, number its records from 1 without gaps and hold exactly one
+ * supervisor canary, and the open counts must list every granted driver node.
+ */
+Verdict parse_observer(std::string_view open_counts, std::string_view log, int worker_tgid,
+                       const std::vector<std::string> &grants, ObserverRecords *out)
+{
+    out->worker_effects.clear();
+    const auto records = complete_lines(log);
+    if (!records || records->empty() || (*records)[0].rfind("dropped ", 0) != 0)
+        return {false, "observer"};
+    if ((*records)[0] != "dropped 0")
+        return {false, "dropped"};
+    const std::set<std::string> granted(grants.begin(), grants.end());
+    unsigned canaries = 0;
+    unsigned long long next = 1;
+    for (size_t i = 1; i < records->size(); i++) {
+        const std::string line((*records)[i]);
+        unsigned long long seq = 0;
+        unsigned instance = 0;
+        int tgid = 0, used = 0;
+        if (std::sscanf(line.c_str(), "%llu %u %d %n", &seq, &instance, &tgid, &used) != 3 || used <= 0 ||
+            seq != next++)
+            return {false, "observer"};
+        if (tgid != 1 && tgid != worker_tgid)
+            return {false, "foreign-process"};
+        const std::string text = line.substr(static_cast<size_t>(used));
+        if (tgid == 1) {
+            canaries += text == "control canary";
+            continue;
+        }
+        const std::string kind = text.substr(0, text.find(' '));
+        if (kind == "control")
+            continue;
+        if (kind == "open" || kind == "release") {
+            if (!granted.count(text.substr(text.find(' ') + 1)))
+                return {false, "ungranted-node"};
+            continue;
+        }
+        out->worker_effects.push_back(text);
+    }
+    if (canaries != 1)
+        return {false, "observer"};
+    const auto counts = complete_lines(open_counts);
+    if (!counts)
+        return {false, "observer"};
+    std::set<std::string> listed;
+    for (std::string_view line : *counts) {
+        const std::vector<std::string> t = split(line);
+        const bool negative = t.size() == 3 && t[2].size() > 1 && t[2][0] == '-';
+        if (t.size() != 3 || !digits(t[0], 10) || !digits(negative ? std::string_view(t[2]).substr(1) : t[2], 10))
+            return {false, "observer"};
+        if (t[2] != "0")
+            return {false, "open-handles"};
+        listed.insert(t[1]);
+    }
+    for (const std::string &g : grants)
+        if (g != "cio2" && g != "imgu" && !listed.count(g))
+            return {false, "observer"};
+    return {};
+}
+
 } // namespace book2lab

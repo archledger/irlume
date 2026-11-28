@@ -81,6 +81,8 @@ and receipts. The witness reads the runtime version without starting a manager
 or handler. Both synthetic capture orders and negative teardown cases run in
 the Rust test binary. Its scratch marker persists across an actual
 child exit and reopen; that is not a power-loss or rollback-resistance result.
+Each case directory is removed when the test that made it ends, and a name
+left by an earlier process with the same PID is skipped.
 The synthetic `ip3y` checks establish layout and payload bounds, not receiver
 completeness, device identity, ownership, optical state or authorization.
 

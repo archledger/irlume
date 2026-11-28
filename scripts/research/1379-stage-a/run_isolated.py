@@ -22,9 +22,11 @@ REQUIRED_TESTS = frozenset({
     "ip3y_tests::exact_layout_and_error_flag_refuse",
     "ip3y_tests::extent_is_checked_before_slicing",
     "ip3y_tests::reference_layout_decodes_without_padding",
+    "journal_tests::case_directory_is_removed_when_its_test_ends",
     "journal_tests::child_exit_after_intent_keeps_attempt_closed",
     "journal_tests::marker_present_before_begin_phase",
     "journal_tests::occupied_or_unwritable_marker_never_starts",
+    "journal_tests::stale_case_directory_from_an_earlier_process_is_skipped",
 })
 
 PREFLIGHT = r"""

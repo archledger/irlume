@@ -12,12 +12,42 @@ use std::process::{self, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-fn fresh_case() -> PathBuf {
+/// A private fixture case directory, removed when the test that made it ends.
+/// Child processes get only its path, so an interrupted child leaves it intact.
+struct CaseDir(PathBuf);
+
+impl std::ops::Deref for CaseDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CaseDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The next free case directory under `base`. A directory left by an earlier
+/// process with the same PID is skipped, never reused or removed.
+fn create_case(base: &Path, next: &AtomicU64) -> CaseDir {
+    for _ in 0..1024 {
+        let id = next.fetch_add(1, Ordering::Relaxed);
+        let path = base.join(format!("book2-fixture-{}-{id}", process::id()));
+        match DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return CaseDir(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("cannot create fixture case {}: {error}", path.display()),
+        }
+    }
+    panic!("no free fixture case name under {}", base.display());
+}
+
+fn fresh_case() -> CaseDir {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("book2-fixture-{}-{id}", process::id()));
-    DirBuilder::new().mode(0o700).create(&path).unwrap();
-    path
+    create_case(&std::env::temp_dir(), &NEXT)
 }
 
 fn assert_marker(case_dir: &Path) {
@@ -126,6 +156,27 @@ fn child_exit_after_intent_keeps_attempt_closed() {
 }
 
 #[test]
+fn case_directory_is_removed_when_its_test_ends() {
+    let case = fresh_case();
+    let path = case.to_path_buf();
+    record_intent(&case).unwrap();
+    assert!(path.join("attempt.hold").is_file());
+    drop(case);
+    assert!(!path.exists());
+}
+
+#[test]
+fn stale_case_directory_from_an_earlier_process_is_skipped() {
+    let base = fresh_case();
+    let next = AtomicU64::new(0);
+    let stale = base.join(format!("book2-fixture-{}-0", process::id()));
+    DirBuilder::new().mode(0o700).create(&stale).unwrap();
+    let case = create_case(&base, &next);
+    assert_ne!(&*case, stale.as_path());
+    assert!(stale.is_dir());
+}
+
+#[test]
 fn occupied_or_unwritable_marker_never_starts() {
     let path = fresh_case();
     let marker = path.join("attempt.hold");
@@ -133,7 +184,7 @@ fn occupied_or_unwritable_marker_never_starts() {
     let file = path.join("not-a-directory");
     fs::write(&file, b"not a directory").unwrap();
     let order = Order::RgbIrRgb;
-    for case in [&path, &file] {
+    for case in [&*path, file.as_path()] {
         assert_eq!(
             run_fixture(
                 SCOPE,

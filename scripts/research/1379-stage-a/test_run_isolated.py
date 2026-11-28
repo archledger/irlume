@@ -72,9 +72,10 @@ class IsolationTests(unittest.TestCase):
                     f"{rows}\n"
                     f"test result: ok. {passed} passed; 0 failed; {ignored} ignored; "
                     f"0 measured; {filtered} filtered out; finished in 0.00s\n")
-        self.assertEqual(fixture_count(result(14, 14)), 14)
-        for output in ("", result(0, 0), result(14, 13), result(14, 13, ignored=1),
-                       result(14, 14, filtered=1), result(14, 14) * 2):
+        n = len(REQUIRED_TESTS)
+        self.assertEqual(fixture_count(result(n, n)), n)
+        for output in ("", result(0, 0), result(n, n - 1), result(n, n - 1, ignored=1),
+                       result(n, n, filtered=1), result(n, n) * 2):
             with self.assertRaisesRegex(ValueError, "full fixture count"):
                 fixture_count(output)
 
@@ -86,7 +87,7 @@ class IsolationTests(unittest.TestCase):
         only_ip3y = [n for n in REQUIRED_TESTS if n.startswith("ip3y_tests::")]
         wrong = sorted(REQUIRED_TESTS - {"journal_tests::child_exit_after_intent_keeps_attempt_closed"})
         wrong.append("journal_tests::something_else")
-        for text in (success(only_ip3y, 3), success(wrong, 14)):
+        for text in (success(only_ip3y, 3), success(wrong, len(REQUIRED_TESTS))):
             with self.assertRaisesRegex(ValueError, "exact Stage A fixture test set"):
                 fixture_count(text)
 

@@ -25,8 +25,8 @@ reads the serial log without newline translation, splits it on `\n` only
 and refuses a receipt line with a control character. Only PID 1 can write
 receipt lines: every forked child first points its standard descriptors at
 an `O_PATH` handle of `/`, which refuses reads and writes and is not a
-device. The boundary worker checks this before it reports
-`INHERITED_HANDLE_CLOSED`. A smoke pass
+device. The boundary worker checks this before it signals PID 1, which only
+then records `INHERITED_HANDLE_CLOSED`. A smoke pass
 proves that this exact kernel and initramfs booted and powered off without
 passthrough. It does not prove device policy, capture, teardown or Book 2
 qualification.

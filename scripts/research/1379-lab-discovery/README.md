@@ -117,9 +117,11 @@ Two test-only pause points in the simulated driver hold the worker inside
 the front link enable or the front format set, after the driver applies
 it, until the supervisor writes `resume`, or for at most 20 s. While the
 worker waits, a case can replace the IPA module, or re-register the graph
-at the format pause; the link pause holds the CIO2 graph lock. The guard's
-recheck after that effect sees the change and latches a hold. No case
-changes the state between that recheck and the check before the next effect.
+at the format pause; the link pause holds the CIO2 graph lock. A
+re-registered graph is seen by the guard's recheck after that effect,
+which latches a hold. The guard's route check refuses a replaced module
+when the factory runs (`ipa-identity`). No case changes the state between
+that recheck and the check before the next effect.
 
 The supervisor writes a canary record just before each lab launch. After
 the worker exits, it classifies the attempt from trusted evidence only:

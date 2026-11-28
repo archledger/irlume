@@ -14,7 +14,7 @@ namespace book2lab {
 
 enum class RequestClass {
     ReadOnly,     // queries with no device or file state change
-    PerFile,      // state local to the open file (client caps, TRY formats)
+    PerFile,      // state local to the open file (client caps)
     ListedEffect, // must match an unused effect listed in the reservation
 };
 
@@ -45,7 +45,7 @@ inline constexpr DiscoveryRequest kDiscoveryRequests[] = {
     {VIDIOC_SUBDEV_G_SELECTION, RequestClass::ReadOnly, "VIDIOC_SUBDEV_G_SELECTION"},
     {VIDIOC_SUBDEV_G_ROUTING, RequestClass::ReadOnly, "VIDIOC_SUBDEV_G_ROUTING"},
     {VIDIOC_SUBDEV_S_CLIENT_CAP, RequestClass::PerFile, "VIDIOC_SUBDEV_S_CLIENT_CAP"},
-    // Active formats are listed effects; TRY formats are per file.
+    // Active formats are listed effects; TRY formats are refused.
     {VIDIOC_SUBDEV_S_FMT, RequestClass::ListedEffect, "VIDIOC_SUBDEV_S_FMT"},
 };
 

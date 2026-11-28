@@ -16,8 +16,8 @@ upstream `v0.8.0` tag pointing at that exact commit. Fetch the tag and confirm
 `git -C "$libcamera" describe --exact-match HEAD` prints `v0.8.0`: a shallow
 checkout without the tag can report the wrong runtime string despite the
 correct `.pc` version. Use the pinned tree's `headers_install`, not the host's
-Linux UAPI. With GNU Make, GCC, Ninja and the verified private Meson environment
-on `PATH`, from a clean build environment:
+Linux UAPI. With GNU Make, GCC, Ninja, Python 3.11 or newer and the verified
+private Meson environment on `PATH`, from a clean build environment:
 
 ```sh
 mkdir "$scratch/kbuild"
@@ -60,7 +60,8 @@ ownership of the media graphs, safe teardown or optical OFF.
 
 ## Isolated link and fixture run
 
-Use Rust 1.88.0, Python 3 and bubblewrap with user and network namespaces.
+Use Rust 1.88.0, Python 3.11 or newer and bubblewrap with user and network
+namespaces.
 The following selects the current unit-test executable from Cargo's
 `--no-run` output and records its hash. Neither executable runs on the host.
 

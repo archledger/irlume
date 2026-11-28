@@ -1,6 +1,6 @@
 # Experimental native RGB+IR on Surface Book 2
 
-**Status:** Draft for approval. The selected direction is supervised split capture first, with KDE/SDDM/KWallet as the reference desktop. This document does not amend an ADR, authorize a live test, or enable an experimental path.
+**Status:** Approved 2026-11-27 for planning [Stage A](#1-bound-the-first-engineering-slice) only; that approval accepts no later scope. G0 was accepted separately, in [ADR-0042](../../architecture/adr/0042-embedded-book2-rgb-ir-class.md) on 2026-11-28. The selected direction is supervised split capture first, with KDE/SDDM/KWallet as the reference desktop. This document does not amend an ADR, authorize a live test, or enable an experimental path.
 
 **Baseline:** [Irlume `4b4f9330`](https://github.com/archledger/irlume/commit/4b4f9330d9a4cfcb7d96add64e3954d27a6ae5e3) and [issue #1379](https://github.com/archledger/irlume/issues/1379). [Proposed ADR-0041](../../architecture/adr/0041-admission-first-embedded-ir.md) defines admission boundaries but selects no approved production embedded class. [Accepted ADR-0003](../../architecture/adr/0003-fingerprint-keyring-unlock.md) is the existing wallet delivery contract, not an authorization for the new class.
 

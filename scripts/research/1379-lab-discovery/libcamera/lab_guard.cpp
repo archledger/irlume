@@ -34,7 +34,6 @@ namespace {
 constexpr const char *kReservationPath = "/run/book2-lab/reservation";
 constexpr int kVerdictFd = 3;
 
-/* Files GlobalConfiguration reads for this build's prefix (/usr, sysconfdir /etc). */
 /* The system files libcamera's global configuration reads, from its own config.h. */
 const std::vector<std::string> kConfigFiles = {
 	LIBCAMERA_SYSCONF_DIR "/configuration.yaml",

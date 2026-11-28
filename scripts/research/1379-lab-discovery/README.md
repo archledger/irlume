@@ -22,7 +22,8 @@ and libcamera `v0.8.0`
 ([`df8e348d64b4932a0676256ed24f0da3ee9438bc`](https://github.com/libcamera-org/libcamera/tree/df8e348d64b4932a0676256ed24f0da3ee9438bc),
 fetched with the real tag) as an ordinary user, with a verified `bc` on
 `PATH`, `MESON` set to a verified Meson 1.9.1 binary, QEMU x86-64 11.1.3
-with TCG and a fresh scratch directory under `/tmp/opencode`:
+with TCG, Python 3.11 or newer and a fresh scratch directory under
+`/tmp/opencode`:
 
 ```sh
 lab=scripts/research/1379-lab-discovery
@@ -42,9 +43,10 @@ and its two `Kconfig`/`Makefile` lines, checks that change set with
 checkout is still clean. Meson runs with `--wrap-mode=nodownload`, a
 native file that disables CMake and libyuv forced to its unused fallback,
 so a missing dependency fails the build instead of fetching a subproject
-and no host library outside the private view is found. Every `NEEDED`
-entry must be one of nine allowed libraries, and the lab image does not
-ship the isolated IPA proxy. The guest kernel enables KASAN and lock
+and pkg-config finds no package outside the private view. Meson still
+finds the compiler's `atomic`, `dl` and `threads` libraries. Every `NEEDED`
+entry of a staged libcamera file must be one of nine allowed libraries,
+and the lab image does not ship the isolated IPA proxy. The guest kernel enables KASAN and lock
 proving; any kernel `BUG`, `WARNING`,
 KASAN or lockdep report refuses the run.
 
@@ -111,17 +113,23 @@ change latches a hold. When the reservation lists more than one update of
 a link, the expected state is that of the last update applied, in the
 order the guard admitted them or the driver logged them.
 
-Two test-only pause points in the simulated driver hold the worker after
-the front link enable or the front format set until the supervisor writes
-`resume`, or for at most 20 s. While the worker waits, a case can replace
-the IPA module or re-register the graph between two discovery effects.
+Two test-only pause points in the simulated driver hold the worker inside
+the front link enable or the front format set, after the driver applies
+it, until the supervisor writes `resume`, or for at most 20 s. While the
+worker waits, a case can replace the IPA module, or re-register the graph
+at the format pause; the link pause holds the CIO2 graph lock. The guard's
+recheck after that effect sees the change and latches a hold. No case
+changes the state between that recheck and the check before the next effect.
 
 The supervisor writes a canary record just before each lab launch. After
 the worker exits, it classifies the attempt from trusted evidence only:
 exit status, driver log and open counts, kernfs inodes, the media set and
 the live graph. The log must start with one `dropped 0` header, number its
 records without gaps and hold exactly one canary, and the open counts must
-list every granted node at zero; otherwise the outcome is `HOLD observer`.
+list every granted node, each listed count at zero. Missing or malformed
+evidence holds as `observer`; dropped records, another process, an
+ungranted node or an open handle hold as `dropped`, `foreign-process`,
+`ungranted-node` or `open-handles`.
 `Known` needs every listed effect exactly once, counted per control record;
 a format record must also carry the media bus code the contract lists as
 its result. Only then does the stand-in second
@@ -166,8 +174,10 @@ mapped at the bound path or the bound file under another path.
 | `ipa-identity-mismatch` | module replaced by a byte-identical copy | refuse `ipa-identity` (new inode) |
 | `ipa-replaced-before-factory` | module replaced while the worker waits after the front link | the factory refuses `ipa-identity` after the preflight admitted; hold `partial-effects` |
 
-Each ends with a release and no next phase, because the graph stays as
-reserved and the worker made no effect. The environment and configuration
+The first four end with a release and no next phase, because the graph
+stays as reserved and the worker made no effect. `ipa-replaced-before-factory`
+holds `partial-effects` instead: its sensor and link effects come before
+the factory's refusal. The environment and configuration
 cases are refused by the same check at the start of discovery, before the
 route preflight runs; the route guard repeats it. Without the route guard,
 a corrupted signature makes the unchanged factory construct the isolated

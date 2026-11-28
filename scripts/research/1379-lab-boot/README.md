@@ -9,7 +9,8 @@ Use a clean checkout of Linux
 [`988117cc1bb17338c586a4e21ade88b5397eac33`](https://github.com/gregkh/linux/tree/988117cc1bb17338c586a4e21ade88b5397eac33)
 and QEMU x86-64 11.1.3 with TCG. The build needs GCC, static libc, standard
 Linux build tools and `bc`; if using a private copy, verify its source or
-package signature and put it on `PATH` for this build only. Choose a fresh
+package signature and put it on `PATH` for this build only. The verifier
+and its tests need Python 3.11 or newer. Choose a fresh
 absolute scratch path underneath `/tmp/opencode` and run without privilege:
 
 ```sh

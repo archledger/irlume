@@ -633,7 +633,12 @@ static int sim_link_notify(struct media_link *link, u32 flags, unsigned int noti
 	sim_label(sink, sizeof(sink), link->sink->entity->name);
 	sim_record(inst->id, "%s %s:%u %s:%u 0x%x", link->flags == flags ? "link" : "link-failed",
 		   source, link->source->index, sink, link->sink->index, flags);
-	/* Only sensor entities are sim_sensor subdevs; the pause follows the front link enable. */
+	/*
+	 * Only sensor entities are sim_sensor subdevs; the pause follows the front
+	 * link enable. This notifier runs under the CIO2 graph lock, so reading the
+	 * topology or replacing the graph during this pause waits for the timeout:
+	 * graph changes belong at the format pause.
+	 */
 	if (link->flags == flags && (flags & MEDIA_LNK_FL_ENABLED) &&
 	    link->source->entity->function == MEDIA_ENT_F_CAM_SENSOR &&
 	    container_of(media_entity_to_v4l2_subdev(link->source->entity), struct sim_sensor, sd)->front)

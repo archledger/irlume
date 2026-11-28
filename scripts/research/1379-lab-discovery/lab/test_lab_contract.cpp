@@ -285,6 +285,9 @@ void extra_media_device_refuses()
     Verdict v = check_media_set(r, {{250, 0}, {250, 1}, {250, 2}});
     CHECK(!v.ok && v.reason == "extra-media");
     CHECK(!check_media_set(r, {{250, 0}}).ok);
+    // Two entries with one device number are not the one reserved device.
+    Verdict twice = check_media_set(r, {{250, 0}, {250, 1}, {250, 1}});
+    CHECK(!twice.ok && twice.reason == "extra-media");
 }
 
 Effect flips(std::vector<std::pair<uint32_t, int64_t>> controls)
@@ -645,6 +648,13 @@ void media_listing_fails_closed()
         CHECK(named && std::any_of(named->begin(), named->end(), [&](const MediaEntry &e) {
                   return e.name == name && e.major == 250 && e.minor == minor;
               }));
+    // A dev attribute is "major:minor\n" and nothing else.
+    for (const char *bad : {"250:2garbage\n", "250:2\n250:3\n", "-1:2\n", " 250:2\n", "250:2", "250:\n", ":2\n"}) {
+        entry("media2", bad);
+        CHECK(!list_media_entries(root).has_value());
+        std::remove((root + "/media2/dev").c_str());
+        rmdir((root + "/media2").c_str());
+    }
     entry("media2", "garbage\n");
     CHECK(!list_media_devices(root).has_value());
     CHECK(!list_media_entries(root).has_value());

@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
+#include <system_error>
 
 #include <dirent.h>
 #include <sys/ioctl.h>
@@ -654,6 +656,32 @@ Replay replay_driver_records(const Reservation &r, const std::vector<std::string
     return out;
 }
 
+namespace {
+
+// A sysfs dev attribute: "major:minor\n" in decimal and nothing else.
+bool parse_dev_attribute(std::string_view text, unsigned *major, unsigned *minor)
+{
+    if (text.empty() || text.back() != '\n')
+        return false;
+    text.remove_suffix(1);
+    const size_t colon = text.find(':');
+    if (colon == std::string_view::npos)
+        return false;
+    const std::string_view parts[2] = {text.substr(0, colon), text.substr(colon + 1)};
+    unsigned *const out[2] = {major, minor};
+    for (int i = 0; i < 2; i++) {
+        const std::string_view p = parts[i];
+        if (p.empty() || p.find_first_not_of("0123456789") != std::string_view::npos)
+            return false;
+        const auto [end, ec] = std::from_chars(p.data(), p.data() + p.size(), *out[i]);
+        if (ec != std::errc() || end != p.data() + p.size())
+            return false;
+    }
+    return true;
+}
+
+} // namespace
+
 std::optional<std::vector<MediaEntry>> list_media_entries(const std::string &bus_dir)
 {
     std::vector<MediaEntry> entries;
@@ -666,8 +694,11 @@ std::optional<std::vector<MediaEntry>> list_media_entries(const std::string &bus
         e.name = entry->d_name;
         if (e.name.rfind("media", 0) != 0)
             continue;
+        char buf[32];
         FILE *f = std::fopen((bus_dir + "/" + e.name + "/dev").c_str(), "re");
-        const bool ok = f && std::fscanf(f, "%u:%u", &e.major, &e.minor) == 2;
+        const size_t n = f ? std::fread(buf, 1, sizeof(buf), f) : 0;
+        const bool ok = f && !std::ferror(f) && n < sizeof(buf) &&
+                        parse_dev_attribute(std::string_view(buf, n), &e.major, &e.minor);
         if (f)
             std::fclose(f);
         if (ok)
@@ -776,6 +807,9 @@ Verdict check_media_set(const Reservation &r, const std::vector<std::pair<unsign
     for (const auto &n : r.nodes)
         if (n.media)
             want.insert({n.major, n.minor});
+    // A repeated device number is a second media entry, not the reserved one.
+    if (have.size() != present.size())
+        return {false, "extra-media"};
     for (const auto &p : have)
         if (!want.count(p))
             return {false, "extra-media"};

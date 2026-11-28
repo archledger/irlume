@@ -171,7 +171,9 @@ bool read_scope()
                                         "sim-port-variant", "effect-unlisted-link", "replace-before-discovery",
                                         "generation-during-discovery", "replace-after-discovery", "ipa-bad-signature",
                                         "ipa-force-isolation", "ipa-env-override", "ipa-identity-mismatch",
-                                        "hotplug-during-discovery"};
+                                        "hotplug-during-discovery", "effect-unlisted-ctrl", "effect-unlisted-fmt",
+                                        "ipa-replaced-before-factory", "replace-during-discovery",
+                                        "worker-cgroup-sibling"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -452,14 +454,22 @@ long now_ms()
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-bool read_line(int fd, std::string &line, int timeout_ms)
+// A tick, when given, runs at least every 50 ms while the line is awaited.
+bool read_line(int fd, std::string &line, int timeout_ms, const std::function<void()> &tick = {})
 {
     line.clear();
     const long deadline = now_ms() + timeout_ms;
     while (line.size() < 256) {
         pollfd p {fd, POLLIN, 0};
         long left = deadline - now_ms();
-        if (left <= 0 || poll(&p, 1, static_cast<int>(left)) != 1)
+        if (left <= 0)
+            return false;
+        const int ready = poll(&p, 1, static_cast<int>(tick ? std::min(left, 50L) : left));
+        if (ready == 0 && tick) {
+            tick();
+            continue;
+        }
+        if (ready != 1)
             return false;
         char c;
         if (read(fd, &c, 1) != 1)
@@ -550,7 +560,8 @@ bool tell(int fd, const char *word)
 }
 
 // READY, both seccomp stages present, go, report, release, bounded exit.
-void run_worker(Worker &w, const std::function<void()> &before_release = {})
+void run_worker(Worker &w, const std::function<void()> &before_release = {},
+                const std::function<void()> &during_report = {})
 {
     std::string line, status;
     if (!read_line(w.report, line, 30000) || line != "READY") {
@@ -565,7 +576,7 @@ void run_worker(Worker &w, const std::function<void()> &before_release = {})
         status.find("\nSeccomp_filters:\t2\n") == std::string::npos)
         worker_fail("SECCOMP_STAGES");
     event("WORKER_READY");
-    if (!tell(w.control, "go") || !read_line(w.report, line, 100000))
+    if (!tell(w.control, "go") || !read_line(w.report, line, 100000, during_report))
         worker_fail("NO_WORKER_REPORT");
     event(book2lab::sanitize_report(line));
     if (before_release)
@@ -945,6 +956,55 @@ void perturb_ipa(const book2lab::Reservation &r, std::vector<std::string> &extra
     }
 }
 
+// A root probe in the worker's device cgroup: the granted front sensor opens,
+// the unreserved IR and rear sensors must be refused by the cgroup itself.
+void probe_worker_cgroup(const book2lab::Reservation &r)
+{
+    std::vector<std::string> paths;
+    for (const auto &n : r.nodes)
+        paths.push_back(n.path);
+    std::vector<device_rule> rules;
+    if (!grant(paths, rules) || !make_group(kWorkerGroup, rules))
+        fail("PROBE_GROUP");
+    const std::vector<DevNode> v4l2 = sysfs_v4l2();
+    auto node = [&](const char *name) {
+        for (const auto &d : v4l2)
+            if (d.name == name)
+                return d.path;
+        fail("PROBE_NODES");
+    };
+    const std::string targets[3] = {node("ov5693 2-0036"), node("ov7251 4-0060"), node("ov8865 3-0010")};
+    int report[2];
+    if (pipe2(report, O_CLOEXEC) != 0)
+        fail("PROBE");
+    pid_t pid = fork();
+    if (pid == 0) {
+        char out[3] = {'?', '?', '?'};
+        if (enter_group(kWorkerGroup, getpid()) != 0)
+            _exit(40);
+        for (int i = 0; i < 3; i++) {
+            errno = 0;
+            int fd = open(targets[i].c_str(), O_RDWR | O_CLOEXEC);
+            out[i] = fd >= 0 ? 'o' : errno == EPERM ? 'd' : 'e';
+            if (fd >= 0)
+                close(fd);
+        }
+        _exit(write(report[1], out, 3) == 3 ? 0 : 41);
+    }
+    g_worker = pid; // the probe's open and release are recorded as the worker's
+    close(report[1]);
+    char got[3] = {};
+    int status = 0;
+    const bool ok = pid > 0 && read(report[0], got, 3) == 3 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+                    WEXITSTATUS(status) == 0;
+    close(report[0]);
+    if (!ok)
+        fail("PROBE");
+    event(got[0] == 'o' ? "GRANTED_OPEN_OK ov5693_2-0036" : "GRANTED_OPEN_FAILED ov5693_2-0036");
+    event(got[1] == 'd' ? "SIBLING_DENIED ov7251_4-0060" : "SIBLING_NOT_DENIED ov7251_4-0060");
+    event(got[2] == 'd' ? "SIBLING_DENIED ov8865_3-0010" : "SIBLING_NOT_DENIED ov8865_3-0010");
+}
+
 void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2lab::Snapshot> &tops)
 {
     std::string text;
@@ -962,13 +1022,25 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
     book2lab::Reservation r = *contract;
     if (!bind_reservation(r, media, tops))
         fail("RESERVATION");
+    // Reservations missing one listed effect, so the gate must refuse it.
+    auto unlist = [&r](const std::function<bool(const book2lab::Effect &)> &drop) {
+        r.effects.erase(std::remove_if(r.effects.begin(), r.effects.end(), drop), r.effects.end());
+    };
     if (lab_case == "effect-unlisted-link")
-        r.effects.erase(std::remove_if(r.effects.begin(), r.effects.end(),
-                                       [](const book2lab::Effect &e) { return e.kind == book2lab::Effect::Kind::Link; }),
-                        r.effects.end());
+        unlist([](const book2lab::Effect &e) { return e.kind == book2lab::Effect::Kind::Link; });
+    else if (lab_case == "effect-unlisted-ctrl")
+        unlist([](const book2lab::Effect &e) {
+            return e.kind == book2lab::Effect::Kind::Ctrl && e.controls.size() == 1 && e.controls[0].first == 0x9f0903;
+        });
+    else if (lab_case == "effect-unlisted-fmt")
+        unlist([](const book2lab::Effect &e) { return e.kind == book2lab::Effect::Kind::Fmt; });
     if (!write_reservation(r))
         fail("RESERVATION_WRITE");
     event("RESERVED");
+    if (lab_case == "worker-cgroup-sibling") {
+        probe_worker_cgroup(r);
+        return;
+    }
     const MediaNode *cio2 = find_role(media, tops, "cio2");
     if (lab_case == "graph-ir-link-enabled") {
         if (!cio2 || !set_link(*cio2, tops[static_cast<size_t>(cio2 - media.data())], "ov7251 4-0060",
@@ -993,6 +1065,11 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
         if (!write_file(std::string(kDebug) + "/control", "add-media-on-front-fmt\n"))
             fail("CONTROL_MEDIA_ARM");
         event("MEDIA_ARMED");
+    } else if (lab_case == "ipa-replaced-before-factory" || lab_case == "replace-during-discovery") {
+        const char *arm = lab_case == "ipa-replaced-before-factory" ? "pause-on-front-link\n" : "pause-on-front-fmt\n";
+        if (!write_file(std::string(kDebug) + "/control", arm))
+            fail("CONTROL_PAUSE_ARM");
+        event("PAUSE_ARMED");
     }
     std::vector<std::string> extra_env;
     perturb_ipa(r, extra_env);
@@ -1006,6 +1083,28 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
     Worker w;
     if (!grant(paths, rules) || !launch_worker(rules, extra_env, w))
         fail("LAUNCH");
+    // While the worker is paused mid-discovery, change the IPA module or the graph, then resume it.
+    bool resumed = false;
+    auto during = [&] {
+        std::string log;
+        if (resumed || !read_file(std::string(kDebug) + "/effects", log) ||
+            log.find(" control paused\n") == std::string::npos)
+            return;
+        resumed = true;
+        if (lab_case == "ipa-replaced-before-factory") {
+            const std::string tmp = r.ipa.path + ".new";
+            if (!copy_file(r.ipa.path, tmp, 0755) || rename(tmp.c_str(), r.ipa.path.c_str()) != 0)
+                worker_fail("MODULE_REPLACE");
+            event("MODULE_REPLACED_DURING_DISCOVERY");
+        } else if (lab_case == "replace-during-discovery") {
+            if (!write_file(std::string(kDebug) + "/control", "replace\n"))
+                worker_fail("CONTROL_REPLACE");
+            event("REPLACED_DURING_DISCOVERY");
+        }
+        if (!write_file(std::string(kDebug) + "/control", "resume\n"))
+            worker_fail("CONTROL_RESUME");
+    };
+    const bool pauses = lab_case == "ipa-replaced-before-factory" || lab_case == "replace-during-discovery";
     run_worker(w, [&] {
         ipa_observation(w, r);
         if (lab_case == "replace-after-discovery") {
@@ -1013,7 +1112,9 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
                 fail("CONTROL_REPLACE");
             event("REPLACED_AFTER_DISCOVERY");
         }
-    });
+    }, pauses ? std::function<void()>(during) : std::function<void()>());
+    if (pauses && !resumed)
+        fail("PAUSE_NOT_SEEN");
     const std::string verdict = read_verdict(w.verdict);
     if (verdict == "none")
         print_worker_log();

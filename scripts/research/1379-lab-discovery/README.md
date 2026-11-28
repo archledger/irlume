@@ -86,9 +86,13 @@ patch removes that probe and leaves each decision to the open.
 | `hotplug-extra-media` | third media device after reserving | refuse `unreserved-open`, no worker effect |
 | `sim-port-variant` | front sensor on port 3 at boot | supervisor refuses before reserving |
 | `effect-unlisted-link` | link effect removed from the reservation | refused at the link, after the listed sensor effects; hold `partial-effects` |
+| `effect-unlisted-ctrl` | test-pattern control removed from the reservation | refused at that control, after the flips; hold `partial-effects` |
+| `effect-unlisted-fmt` | both format effects removed from the reservation | refused at the first format, after the IPA loads; hold `partial-effects` |
 | `replace-before-discovery` | graph re-registered after reserving | same number and version, new inode; refuse `identity` before any open |
 | `generation-during-discovery` | entity added inside the front format set | hold `version` after that effect, no camera |
 | `hotplug-during-discovery` | media device added inside the front format set | hold `extra-media` after that effect, no camera |
+| `replace-during-discovery` | graph re-registered while the worker waits after the front format | hold `snapshot`, then `HOLD replaced` |
+| `worker-cgroup-sibling` | no worker; a root probe joins the worker's device cgroup | the front sensor opens; the IR and rear sensors are refused with `EPERM` |
 | `replace-after-discovery` | graph re-registered before release | ownership unknown |
 
 Every open is bracketed by the registration's kernfs inode: equal before
@@ -96,6 +100,11 @@ and after the open, with a matching `st_rdev`. Before each listed effect the
 guard rereads the media device set, both topologies and every bound inode:
 a change refuses the effect. After the effect it rereads them again: a
 change latches a hold.
+
+Two test-only pause points in the simulated driver hold the worker after
+the front link enable or the front format set until the supervisor writes
+`resume`, or for at most 20 s. While the worker waits, a case can replace
+the IPA module or re-register the graph between two discovery effects.
 
 The supervisor writes a canary record just before each lab launch. After
 the worker exits, it classifies the attempt from trusted evidence only:
@@ -140,6 +149,7 @@ While the worker is alive, the supervisor requires the bound inode in
 | `ipa-force-isolation` | `/etc/libcamera/configuration.yaml` forcing isolation | refuse `configuration` |
 | `ipa-env-override` | `LIBCAMERA_IPA_FORCE_ISOLATION=1` | refuse `environment` |
 | `ipa-identity-mismatch` | module replaced by a byte-identical copy | refuse `ipa-identity` (new inode) |
+| `ipa-replaced-before-factory` | module replaced while the worker waits after the front link | the factory refuses `ipa-identity` after the preflight admitted; hold `partial-effects` |
 
 Each ends with a release and no next phase, because the graph stays as
 reserved and the worker made no effect. The environment and configuration
@@ -156,9 +166,10 @@ Run the complete set twice, each case in a fresh emulator instance:
 for round in 1 2; do
     for case in topology sim-controls stock-baseline lab-front graph-ir-link-enabled \
         graph-extra-entity hotplug-extra-media sim-port-variant effect-unlisted-link \
-        replace-before-discovery generation-during-discovery hotplug-during-discovery \
-        replace-after-discovery ipa-bad-signature ipa-force-isolation ipa-env-override \
-        ipa-identity-mismatch; do
+        effect-unlisted-ctrl effect-unlisted-fmt replace-before-discovery \
+        generation-during-discovery hotplug-during-discovery replace-during-discovery \
+        replace-after-discovery worker-cgroup-sibling ipa-bad-signature ipa-force-isolation \
+        ipa-env-override ipa-identity-mismatch ipa-replaced-before-factory; do
         python3 -B "$lab/run_discovery.py" "$scratch/build" "$scratch/r$round-$case" "$case" || exit 1
     done
 done

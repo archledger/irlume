@@ -25,6 +25,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 #include <media/media-device.h>
 #include <media/media-entity.h>
 #include <media/v4l2-ctrls.h>
@@ -150,6 +151,12 @@ static struct media_device sim_extra_mdev;
 
 static int sim_add_media(void);
 
+/* Test-only pause points: after the front link enable or the front format set. */
+enum { SIM_PAUSE_NONE, SIM_PAUSE_FRONT_LINK, SIM_PAUSE_FRONT_FMT };
+static atomic_t sim_pause_point = ATOMIC_INIT(SIM_PAUSE_NONE);
+static DECLARE_WAIT_QUEUE_HEAD(sim_pause_wq);
+static bool sim_paused;
+
 static __printf(2, 3) void sim_record(u32 instance, const char *fmt, ...)
 {
 	char text[SIM_TEXT];
@@ -174,6 +181,20 @@ static __printf(2, 3) void sim_record(u32 instance, const char *fmt, ...)
 		sim_log.count++;
 	}
 	spin_unlock_irqrestore(&sim_log.lock, flags);
+}
+
+/* Hold the calling worker, once per arming, until the supervisor writes resume or 20 s pass. */
+static void sim_pause(u32 instance, int point)
+{
+	if (atomic_cmpxchg(&sim_pause_point, point, SIM_PAUSE_NONE) != point)
+		return;
+	WRITE_ONCE(sim_paused, true);
+	sim_record(instance, "control paused");
+	if (wait_event_timeout(sim_pause_wq, !READ_ONCE(sim_paused), 20 * HZ))
+		sim_record(instance, "control resumed");
+	else
+		sim_record(instance, "control pause-timeout");
+	WRITE_ONCE(sim_paused, false);
 }
 
 static void sim_label(char *out, size_t size, const char *name)
@@ -381,6 +402,8 @@ static int sim_sensor_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_state *
 	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && s->front &&
 	    atomic_xchg(&sim_media_armed, 0))
 		sim_record(s->node.inst->id, "control media-%s", sim_add_media() ? "failed" : "fired");
+	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && s->front)
+		sim_pause(s->node.inst->id, SIM_PAUSE_FRONT_FMT);
 	return 0;
 }
 
@@ -610,6 +633,11 @@ static int sim_link_notify(struct media_link *link, u32 flags, unsigned int noti
 	sim_label(sink, sizeof(sink), link->sink->entity->name);
 	sim_record(inst->id, "%s %s:%u %s:%u 0x%x", link->flags == flags ? "link" : "link-failed",
 		   source, link->source->index, sink, link->sink->index, flags);
+	/* Only sensor entities are sim_sensor subdevs; the pause follows the front link enable. */
+	if (link->flags == flags && (flags & MEDIA_LNK_FL_ENABLED) &&
+	    link->source->entity->function == MEDIA_ENT_F_CAM_SENSOR &&
+	    container_of(media_entity_to_v4l2_subdev(link->source->entity), struct sim_sensor, sd)->front)
+		sim_pause(inst->id, SIM_PAUSE_FRONT_LINK);
 	return 0;
 }
 
@@ -1032,6 +1060,16 @@ static ssize_t sim_control_write(struct file *file, const char __user *ubuf, siz
 		atomic_set(&sim_media_armed, 1);
 	} else if (!strcmp(cmd, "canary")) {
 		sim_record(sim_current->id, "control canary");
+	} else if (!strcmp(cmd, "pause-on-front-link")) {
+		sim_record(sim_current->id, "control pause-on-front-link");
+		atomic_set(&sim_pause_point, SIM_PAUSE_FRONT_LINK);
+	} else if (!strcmp(cmd, "pause-on-front-fmt")) {
+		sim_record(sim_current->id, "control pause-on-front-fmt");
+		atomic_set(&sim_pause_point, SIM_PAUSE_FRONT_FMT);
+	} else if (!strcmp(cmd, "resume")) {
+		sim_record(sim_current->id, "control resume");
+		WRITE_ONCE(sim_paused, false);
+		wake_up(&sim_pause_wq);
 	} else {
 		ret = -EINVAL;
 	}

@@ -84,6 +84,20 @@ CASES = {
     "hotplug-during-discovery": Case("lab.cpio", (), LAB + (
         "MEDIA_ARMED", "WORKER_READY", "CAMERAS 0", IPA_ROUTE, "WORKER_EXITED 0", "GUARD hold extra-media",
         "HOLD media-set") + BLOCKED),
+    "effect-unlisted-ctrl": Case("lab.cpio", (), LAB + (
+        "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
+        "GUARD refuse unlisted-effect ctrl ov5693_2-0036 0x9f0903=0", "HOLD partial-effects") + BLOCKED),
+    "effect-unlisted-fmt": Case("lab.cpio", (), LAB + (
+        "WORKER_READY", "CAMERAS 0", IPA_ROUTE, "WORKER_EXITED 0",
+        "GUARD refuse unlisted-effect fmt ov5693_2-0036 0 0x0 2592x1944", "HOLD partial-effects") + BLOCKED),
+    "ipa-replaced-before-factory": Case("lab.cpio", (), LAB + (
+        "PAUSE_ARMED", "WORKER_READY", "MODULE_REPLACED_DURING_DISCOVERY", "CAMERAS 0", "IPA_NOT_MAPPED",
+        "WORKER_EXITED 0", "GUARD refuse ipa-identity", "HOLD partial-effects") + BLOCKED),
+    "replace-during-discovery": Case("lab.cpio", (), LAB + (
+        "PAUSE_ARMED", "WORKER_READY", "REPLACED_DURING_DISCOVERY", "CAMERAS 0", IPA_ROUTE, "WORKER_EXITED 0",
+        "GUARD hold snapshot", "HOLD replaced") + BLOCKED),
+    "worker-cgroup-sibling": Case("lab.cpio", (), LAB + (
+        "GRANTED_OPEN_OK ov5693_2-0036", "SIBLING_DENIED ov7251_4-0060", "SIBLING_DENIED ov8865_3-0010")),
     "ipa-bad-signature": Case("lab.cpio", (), LAB + (
         "SIGNATURE_CORRUPTED", "WORKER_READY", "CAMERAS 0", "IPA_NOT_MAPPED", "WORKER_EXITED 0",
         "GUARD refuse ipa-signature") + CLEAN),

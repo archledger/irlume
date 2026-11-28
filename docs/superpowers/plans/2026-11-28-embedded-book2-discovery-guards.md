@@ -267,7 +267,7 @@ Commands run from the worktree root. `D=scripts/research/1379-lab-discovery`, `B
   - `grep -nP '\x{2014}'` on changed text.
   - The branch touches no workspace, product, package or CI path.
 - [ ] **Self-review and independent review.** Review the trusted launch order, each refusal point against its trusted record, the stock-versus-lab difference and the README scope. Request one whole-branch review. Fix each confirmed finding with a failing check first, then rerun the affected cases.
-- [ ] **Record and archive.** Write `RESULTS.md` under `/mnt/archledger-gp/artifacts/irlume/<date>-1379-discovery-proof/`. Archive it to pCloud with `--immutable` and verify with `rclone check --download`. Update the ledger, then commit `docs: record the Book 2 discovery guard proof scope` with `git commit -S -s`.
+- [ ] **Record and archive.** Write `RESULTS.md` in the private evidence store outside the source tree. Archive it with `rclone copy --immutable` and verify with `rclone check --download`. Update the ledger, then commit `docs: record the Book 2 discovery guard proof scope` with `git commit -S -s`.
 - [ ] **Stop after this slice.** B03 qualifies only the simulated graph in this guest. B04 through B11 need their own plan. No hardware, reporter contact or later stage follows from this result.
 
 [spec]: ../specs/2026-11-28-embedded-book2-lab-boundary-design.md

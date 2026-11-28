@@ -1,0 +1,374 @@
+# Exact effect records per guest case: "<instance> <role> <kind> <args>".
+# Records compare in order; release records compare as a multiset.
+[topology]
+
+[sim-controls]
+1 supervisor control replace
+2 supervisor control add-entity
+2 supervisor control add-media
+
+[stock-baseline]
+# Supervisor enables the IR link; stock match() then disables every mutable link.
+1 supervisor link ov7251_4-0060:0 ipu3-csi2_1:0 0x1
+1 worker link ov7251_4-0060:0 ipu3-csi2_1:0 0x0
+# registerCameras() opens both ImgUs (imgu.cpp L333-L377 order).
+1 worker open ipu3-imgu_0
+1 worker open ipu3-imgu_0_input
+1 worker open ipu3-imgu_0_output
+1 worker open ipu3-imgu_0_viewfinder
+1 worker open ipu3-imgu_0_parameters
+1 worker open ipu3-imgu_0_3a_stat
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+# One S_EXT_CTRLS carries VFLIP then HFLIP: ControlList is an unordered map,
+# fixed for this binary; the core calls try_ctrl per control in array order.
+# Port 0: front OV5693; setFormat() in loadIPA (L1175) and initControls (L925)
+# rewrites flips before each format.
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+# Port 1: IR OV7251 gets flips, then fails validation (GAIN, not ANALOGUE_GAIN).
+1 worker open ov7251_4-0060
+1 worker ctrl ov7251_4-0060 0x980915=0
+1 worker ctrl ov7251_4-0060 0x980914=0
+1 worker release ov7251_4-0060
+# Port 2: rear OV8865 registers; two cameras end the loop before port 3.
+1 worker open ov8865_3-0010
+1 worker ctrl ov8865_3-0010 0x980915=0
+1 worker ctrl ov8865_3-0010 0x980914=0
+1 worker ctrl ov8865_3-0010 0x9f0903=0
+1 worker link ov8865_3-0010:0 ipu3-csi2_2:0 0x1
+1 worker open ipu3-csi2_2
+1 worker open ipu3-cio2_2
+1 worker ctrl ov8865_3-0010 0x980915=0
+1 worker ctrl ov8865_3-0010 0x980914=0
+1 worker fmt ov8865_3-0010 0 active 0x3007 3264x2448
+1 worker ctrl ov8865_3-0010 0x980915=0
+1 worker ctrl ov8865_3-0010 0x980914=0
+1 worker fmt ov8865_3-0010 0 active 0x3007 3264x2448
+# Releases after the supervisor's release command (compared as a multiset).
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ov8865_3-0010
+1 worker release ipu3-csi2_2
+1 worker release ipu3-cio2_2
+1 worker release ipu3-imgu_0
+1 worker release ipu3-imgu_0_input
+1 worker release ipu3-imgu_0_output
+1 worker release ipu3-imgu_0_viewfinder
+1 worker release ipu3-imgu_0_parameters
+1 worker release ipu3-imgu_0_3a_stat
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[lab-front]
+# Only the reserved ImgU pipe and front port; no reset, no sibling probing.
+# The supervisor's canary is its last record before each lab launch.
+1 supervisor control canary
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[graph-ir-link-enabled]
+1 supervisor link ov7251_4-0060:0 ipu3-csi2_1:0 0x1
+1 supervisor control canary
+
+[graph-extra-entity]
+1 supervisor control add-entity
+1 supervisor control canary
+
+[hotplug-extra-media]
+1 supervisor control add-media
+1 supervisor control canary
+
+[sim-port-variant]
+
+[effect-unlisted-link]
+1 supervisor control canary
+# The gate refuses the unlisted link before the kernel sees it.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker release ov5693_2-0036
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[replace-before-discovery]
+1 supervisor control replace
+2 supervisor control canary
+
+[generation-during-discovery]
+1 supervisor control bump-on-front-fmt
+1 supervisor control canary
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker control bump-fired
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[replace-after-discovery]
+1 supervisor control canary
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 supervisor control replace
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[ipa-bad-signature]
+1 supervisor control canary
+
+[ipa-force-isolation]
+1 supervisor control canary
+
+[ipa-env-override]
+1 supervisor control canary
+
+[ipa-identity-mismatch]
+1 supervisor control canary
+
+[hotplug-during-discovery]
+1 supervisor control add-media-on-front-fmt
+1 supervisor control canary
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker control media-fired
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[effect-unlisted-ctrl]
+1 supervisor control canary
+# The gate refuses the unlisted test-pattern control before the kernel sees it.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker release ov5693_2-0036
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[effect-unlisted-fmt]
+1 supervisor control canary
+# The gate refuses the first format set; the IPA loaded before it.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[ipa-replaced-before-factory]
+1 supervisor control pause-on-front-link
+1 supervisor control canary
+# The module is replaced while the worker waits after the front link.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker control paused
+1 supervisor control resume
+1 worker control resumed
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[replace-during-discovery]
+1 supervisor control pause-on-front-fmt
+1 supervisor control canary
+# The graph is re-registered while the worker waits after the front format.
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker control paused
+1 supervisor control replace
+2 supervisor control resume
+1 worker control resumed
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[worker-cgroup-sibling]
+# A root probe in the worker's device cgroup: the granted node opens, siblings do not.
+1 worker open ov5693_2-0036
+1 worker release ov5693_2-0036

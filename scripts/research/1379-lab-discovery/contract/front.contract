@@ -1,0 +1,91 @@
+BOOK2_LAB_CONTRACT_V1
+# Simulated IPU3 lab graph. Names write spaces as "_"; sensor names and
+# port order are synthetic until an approved Book 2 passive inventory exists.
+media cio2 ipu3-cio2 Intel_IPU3_CIO2
+media imgu ipu3-imgu ipu3-imgu
+entity cio2 ipu3-csi2_0 0x5002 sink source
+entity cio2 ipu3-cio2_0 0x10001 sink
+entity cio2 ipu3-csi2_1 0x5002 sink source
+entity cio2 ipu3-cio2_1 0x10001 sink
+entity cio2 ipu3-csi2_2 0x5002 sink source
+entity cio2 ipu3-cio2_2 0x10001 sink
+entity cio2 ipu3-csi2_3 0x5002 sink source
+entity cio2 ipu3-cio2_3 0x10001 sink
+entity cio2 ov5693_2-0036 0x20001 source
+entity cio2 ov7251_4-0060 0x20001 source
+entity cio2 ov8865_3-0010 0x20001 source
+entity imgu ipu3-imgu_0 0x4006 sink sink source source source
+entity imgu ipu3-imgu_0_input 0x10001 source
+entity imgu ipu3-imgu_0_parameters 0x10001 source
+entity imgu ipu3-imgu_0_output 0x10001 sink
+entity imgu ipu3-imgu_0_viewfinder 0x10001 sink
+entity imgu ipu3-imgu_0_3a_stat 0x10001 sink
+entity imgu ipu3-imgu_1 0x4006 sink sink source source source
+entity imgu ipu3-imgu_1_input 0x10001 source
+entity imgu ipu3-imgu_1_parameters 0x10001 source
+entity imgu ipu3-imgu_1_output 0x10001 sink
+entity imgu ipu3-imgu_1_viewfinder 0x10001 sink
+entity imgu ipu3-imgu_1_3a_stat 0x10001 sink
+node ipu3-csi2_0 subdev
+node ipu3-cio2_0 video
+node ipu3-csi2_1 subdev
+node ipu3-cio2_1 video
+node ipu3-csi2_2 subdev
+node ipu3-cio2_2 video
+node ipu3-csi2_3 subdev
+node ipu3-cio2_3 video
+node ov5693_2-0036 subdev
+node ov7251_4-0060 subdev
+node ov8865_3-0010 subdev
+node ipu3-imgu_0 subdev
+node ipu3-imgu_0_input video
+node ipu3-imgu_0_parameters video
+node ipu3-imgu_0_output video
+node ipu3-imgu_0_viewfinder video
+node ipu3-imgu_0_3a_stat video
+node ipu3-imgu_1 subdev
+node ipu3-imgu_1_input video
+node ipu3-imgu_1_parameters video
+node ipu3-imgu_1_output video
+node ipu3-imgu_1_viewfinder video
+node ipu3-imgu_1_3a_stat video
+link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x0
+link cio2 ov7251_4-0060:0 ipu3-csi2_1:0 0x0
+link cio2 ov8865_3-0010:0 ipu3-csi2_2:0 0x0
+link cio2 ipu3-csi2_0:1 ipu3-cio2_0:0 0x3
+link cio2 ipu3-csi2_1:1 ipu3-cio2_1:0 0x3
+link cio2 ipu3-csi2_2:1 ipu3-cio2_2:0 0x3
+link cio2 ipu3-csi2_3:1 ipu3-cio2_3:0 0x3
+link imgu ipu3-imgu_0_input:0 ipu3-imgu_0:0 0x0
+link imgu ipu3-imgu_0_parameters:0 ipu3-imgu_0:1 0x0
+link imgu ipu3-imgu_0:2 ipu3-imgu_0_output:0 0x3
+link imgu ipu3-imgu_0:3 ipu3-imgu_0_viewfinder:0 0x0
+link imgu ipu3-imgu_0:4 ipu3-imgu_0_3a_stat:0 0x0
+link imgu ipu3-imgu_1_input:0 ipu3-imgu_1:0 0x0
+link imgu ipu3-imgu_1_parameters:0 ipu3-imgu_1:1 0x0
+link imgu ipu3-imgu_1:2 ipu3-imgu_1_output:0 0x3
+link imgu ipu3-imgu_1:3 ipu3-imgu_1_viewfinder:0 0x0
+link imgu ipu3-imgu_1:4 ipu3-imgu_1_3a_stat:0 0x0
+front ov5693_2-0036 ipu3-csi2_0 ipu3-cio2_0 ipu3-imgu_1
+grant cio2
+grant imgu
+grant ov5693_2-0036
+grant ipu3-csi2_0
+grant ipu3-cio2_0
+grant ipu3-imgu_1
+grant ipu3-imgu_1_input
+grant ipu3-imgu_1_parameters
+grant ipu3-imgu_1_output
+grant ipu3-imgu_1_viewfinder
+grant ipu3-imgu_1_3a_stat
+# Front discovery effects of pinned libcamera v0.8.0: flips cleared at sensor
+# init, test pattern off, link enable, then flips and a format request (code 0,
+# filled by the driver) in loadIPA and again in initControls.
+effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
+effect ctrl ov5693_2-0036 0x9f0903=0
+effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
+effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007
+effect ctrl ov5693_2-0036 0x980914=0,0x980915=0
+effect fmt ov5693_2-0036 0 0x0 2592x1944 0x3007
+ipa /usr/lib/libcamera/ipa/ipa_ipu3.so ipu3 ipu3 1

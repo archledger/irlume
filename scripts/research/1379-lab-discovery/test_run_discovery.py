@@ -1,6 +1,8 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -230,6 +232,36 @@ class VerifierTests(unittest.TestCase):
         self.assertEqual(sorted(allow), sorted([
             "ld-linux-x86-64.so.2", "libc.so.6", "libcamera-base.so.0.8", "libcamera.so.0.8", "libgcc_s.so.1",
             "libgnutls.so.30", "libm.so.6", "libstdc++.so.6", "libyaml-0.so.2"]))
+
+    def test_needed_gate_reads_real_elf_files_and_fails_closed(self):
+        script = (rd.HERE / "build_discovery_guest.sh").read_text()
+        start = script.index("needed_gate() {")
+        gate = script[start:script.index("\n}\n", start) + 3]
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temp:
+            stage, record = Path(temp) / "stage", Path(temp) / "record.txt"
+            lib = stage / "usr" / "lib"
+            lib.mkdir(parents=True)
+            shutil.copyfile("/usr/bin/true", lib / "elf")
+            (lib / "notes").write_bytes(b"ELF notes, not an object\n")
+
+            def gate_run(*allowed):
+                return subprocess.run(
+                    ("/usr/bin/bash", "-c", gate + 'needed_gate "$@"', "gate", str(stage), str(record), *allowed),
+                    text=True, capture_output=True, timeout=30)
+
+            passed = gate_run("libc.so.6")
+            self.assertEqual((passed.returncode, passed.stderr), (0, ""))
+            self.assertIn(f"File: {lib / 'elf'}\n", record.read_text())
+            self.assertNotEqual(gate_run("libm.so.6").returncode, 0)
+            # readelf exits 1 on a truncated header but only prints an error for this one.
+            header = bytearray(64)
+            header[:7] = b"\x7fELF\x02\x01\x01"
+            struct.pack_into("<HHIQQ", header, 16, 3, 0x3E, 1, 0, 0xFFFFFFFF)
+            struct.pack_into("<HHH", header, 52, 64, 56, 1)
+            for name, data in (("truncated", Path("/usr/bin/true").read_bytes()[:40]), ("bad-phoff", bytes(header))):
+                (lib / name).write_bytes(data)
+                self.assertNotEqual(gate_run("libc.so.6").returncode, 0, name)
+                (lib / name).unlink()
 
     def test_lab_image_drops_isolated_proxy(self):
         script = (rd.HERE / "build_discovery_guest.sh").read_text()

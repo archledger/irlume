@@ -141,6 +141,36 @@ printf '%s\n' '[binaries]' "cmake = 'false'" >"$native"
 needed_allow=(ld-linux-x86-64.so.2 libc.so.6 libcamera-base.so.0.8 libcamera.so.0.8 libgcc_s.so.1 libgnutls.so.30
     libm.so.6 libstdc++.so.6 libyaml-0.so.2)
 
+# needed_gate STAGE RECORD ALLOWED...: record the dynamic section of every ELF
+# file in STAGE under its name and fail unless every NEEDED library is ALLOWED.
+# Any readelf error fails the gate, even one readelf reports with status 0.
+needed_gate() {
+    python3 - "$@" <<'PY'
+import os, re, subprocess, sys
+stage, record, allowed = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+needed = set()
+with open(record, "w") as out:
+    for top, dirs, files in os.walk(stage):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(top, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                if f.read(4) != b"\x7fELF":
+                    continue
+            r = subprocess.run(("readelf", "-dW", path), capture_output=True, text=True)
+            if r.returncode or r.stderr:
+                sys.exit(f"readelf failed on {path}: {r.stderr.strip()}")
+            out.write(f"File: {path}\n{r.stdout}")
+            needed.update(re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", r.stdout))
+if not needed:
+    sys.exit("dynamic sections not recorded")
+if needed - allowed:
+    sys.exit("links outside the allowlist: " + " ".join(sorted(needed - allowed)))
+PY
+}
+
 build_libcamera() {
     local name=$1 source=$2
     local bdir="$scratch/lc-$name-build" stage="$scratch/lc-$name-stage" lib
@@ -163,12 +193,7 @@ build_libcamera() {
     lib="$stage/usr/lib/libcamera.so.0.8"
     [[ -f $lib && -f $stage/usr/lib/libcamera/ipa/ipa_ipu3.so.sign ]] || die "$name libcamera install incomplete"
     if readelf -dW "$lib" | grep -Eq '\((RUNPATH|RPATH)\)'; then die "$name libcamera keeps a build rpath"; fi
-    find "$stage" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF && readelf -dW "$1"' _ {} \; \
-        >"$out/lc-$name-dynamic.txt"
-    grep -q '(NEEDED)' "$out/lc-$name-dynamic.txt" || die "$name libcamera dynamic sections not recorded"
-    unexpected=$(sed -nE 's/.*\(NEEDED\)[[:space:]]+Shared library: \[(.*)\]$/\1/p' "$out/lc-$name-dynamic.txt" |
-        sort -u | grep -vxF -f <(printf '%s\n' "${needed_allow[@]}") || true)
-    [[ -z $unexpected ]] || die "$name libcamera links outside the allowlist: $unexpected"
+    needed_gate "$stage" "$out/lc-$name-dynamic.txt" "${needed_allow[@]}" || die "$name libcamera NEEDED gate refused"
     "${strict_cxx[@]}" -I "$stage/usr/include/libcamera" "$here/guest/discovery_worker.cpp" \
         -L "$stage/usr/lib" -lcamera -lcamera-base -o "$out/worker-$name"
 }

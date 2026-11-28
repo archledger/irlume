@@ -42,6 +42,19 @@ replacement. It also checks that adding an entity bumps the version and
 that a third media device appears. Both cases compare their effect records
 exactly with `contract/expected-effects.txt`.
 
+`stock-baseline` boots `stock.cpio`: unpatched libcamera v0.8.0 built with
+only the IPU3 pipeline and IPA, IPA signing through gnutls, and no udev,
+libdw, libunwind or tracing. A private `PKG_CONFIG_LIBDIR` exposes only
+`gnutls`, `yaml-0.1` and their required files, and the runtime closure is
+resolved from `NEEDED` entries without running anything. The supervisor
+enables the IR link, grants every node, and starts the worker as UID 65532
+under two seccomp stages: deny by default, discovery ioctls only, no
+process creation, no exec. The run must show the stock effects exactly:
+the global link reset, both ImgUs opened, flip writes on the IR sensor
+before it fails validation, and three flip writes and two formats on each
+RGB sensor. This case validates the observer; it never passes on the lab
+image.
+
 These results concern the simulated graph in this guest only. They say
 nothing about the real Book 2 graph, its drivers' effects, teardown,
 optical state or authentication.

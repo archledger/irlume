@@ -6,11 +6,18 @@ extern "C" {
 #include "lab.h"
 }
 
+#include "discovery_requests.h"
+
+#include <linux/audit.h>
 #include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/media.h>
+#include <linux/sched.h>
+#include <linux/seccomp.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,20 +27,32 @@ extern "C" {
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/reboot.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
 
 constexpr const char *kDebug = "/sys/kernel/debug/book2_lab_sim";
 constexpr const char *kInventory = "/sys/fs/cgroup/inventory";
+constexpr const char *kWorkerGroup = "/sys/fs/cgroup/worker";
+constexpr const char *kWorkerPath = "/lab/discovery-worker";
+constexpr const char *kWorkerLog = "/tmp/worker.log";
+constexpr unsigned kWorkerId = 65532;
 std::string nonce;
 std::string lab_case;
 bool debugfs_ready = false;
+pid_t g_worker = 0;
 
 void event(const std::string &text)
 {
@@ -115,7 +134,7 @@ void dump_effects(pid_t worker)
 [[noreturn]] void fail(const std::string &what)
 {
     event("ERROR_" + what);
-    dump_effects(0);
+    dump_effects(g_worker);
     poweroff();
 }
 
@@ -141,7 +160,7 @@ bool read_scope()
             nonce = value;
         }
     }
-    static const char *const known[] = {"topology", "sim-controls"};
+    static const char *const known[] = {"topology", "sim-controls", "stock-baseline"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -360,7 +379,7 @@ bool read_media(const std::vector<MediaNode> &nodes, std::vector<Topology> &out)
     if (!scoped) {
         std::vector<device_rule> rules;
         for (const auto &n : nodes)
-            rules.push_back({n.major, n.minor, BPF_DEVCG_ACC_READ});
+            rules.push_back({n.major, n.minor, BPF_DEVCG_ACC_READ | BPF_DEVCG_ACC_WRITE});
         if (!make_group(kInventory, rules))
             return false;
         scoped = true;
@@ -421,6 +440,315 @@ void sim_controls(const std::vector<MediaNode> &before, const std::vector<Topolo
     event("SIM_CONTROLS_PASS");
 }
 
+struct DevNode {
+    std::string name, path;
+    unsigned major = 0, minor = 0;
+    ino_t inode = 0;
+};
+
+std::vector<DevNode> sysfs_v4l2()
+{
+    std::vector<DevNode> nodes;
+    DIR *dir = opendir("/sys/class/video4linux");
+    if (!dir)
+        return nodes;
+    while (dirent *entry = readdir(dir)) {
+        std::string sys = entry->d_name;
+        if (sys.rfind("video", 0) != 0 && sys.rfind("v4l-subdev", 0) != 0)
+            continue;
+        DevNode node;
+        std::string base = "/sys/class/video4linux/" + sys, dev, uevent;
+        if (!read_file(base + "/name", node.name) || !read_file(base + "/dev", dev) ||
+            std::sscanf(dev.c_str(), "%u:%u", &node.major, &node.minor) != 2 ||
+            !read_file(base + "/uevent", uevent) || !kernfs_inode(node.major, node.minor, node.inode))
+            continue;
+        if (!node.name.empty() && node.name.back() == '\n')
+            node.name.pop_back();
+        size_t at = uevent.find("DEVNAME=");
+        if (at == std::string::npos)
+            continue;
+        node.path = "/dev/" + uevent.substr(at + 8, uevent.find('\n', at) - at - 8);
+        nodes.push_back(node);
+    }
+    closedir(dir);
+    std::sort(nodes.begin(), nodes.end(), [](const DevNode &a, const DevNode &b) { return a.name < b.name; });
+    return nodes;
+}
+
+// Give each granted node to the worker UID alone; the worker cgroup admits
+// exactly these device numbers. Everything else stays root-only and denied.
+bool grant(const std::vector<std::string> &paths, std::vector<device_rule> &rules)
+{
+    for (const auto &path : paths) {
+        struct stat st {};
+        if (stat(path.c_str(), &st) != 0 || !S_ISCHR(st.st_mode) ||
+            chown(path.c_str(), kWorkerId, kWorkerId) != 0 || chmod(path.c_str(), 0600) != 0)
+            return false;
+        rules.push_back({major(st.st_rdev), minor(st.st_rdev),
+                         static_cast<short>(BPF_DEVCG_ACC_READ | BPF_DEVCG_ACC_WRITE)});
+    }
+    return true;
+}
+
+// First seccomp stage, installed before exec: deny by default, kill process
+// creation, allow threads, and admit ioctl only for the discovery requests.
+std::vector<sock_filter> worker_filter()
+{
+    static const int allowed[] = {
+        SYS_read, SYS_write, SYS_close, SYS_fstat, SYS_stat, SYS_lstat, SYS_lseek, SYS_mmap,
+        SYS_mprotect, SYS_munmap, SYS_brk, SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigreturn,
+        SYS_pread64, SYS_readv, SYS_writev, SYS_access, SYS_sched_yield, SYS_mremap, SYS_madvise,
+        SYS_dup, SYS_dup2, SYS_dup3, SYS_nanosleep, SYS_getpid, SYS_exit, SYS_uname, SYS_fcntl,
+        SYS_getcwd, SYS_readlink, SYS_readlinkat, SYS_getdents64, SYS_getuid, SYS_getgid,
+        SYS_geteuid, SYS_getegid, SYS_gettid, SYS_getppid, SYS_sigaltstack, SYS_prctl,
+        SYS_arch_prctl, SYS_futex, SYS_sched_getaffinity, SYS_set_tid_address, SYS_set_robust_list,
+        SYS_rseq, SYS_prlimit64, SYS_getrandom, SYS_openat, SYS_newfstatat, SYS_statx, SYS_eventfd2,
+        SYS_poll, SYS_ppoll, SYS_pipe2, SYS_clock_gettime, SYS_clock_getres, SYS_clock_nanosleep,
+        SYS_gettimeofday, SYS_exit_group, SYS_tgkill, SYS_faccessat, SYS_faccessat2, SYS_seccomp,
+        SYS_restart_syscall, SYS_sysinfo, SYS_membarrier,
+        // The worker's own second stage kills any later exec.
+        SYS_execve,
+    };
+    const auto ret = [](uint32_t action) { return sock_filter BPF_STMT(BPF_RET | BPF_K, action); };
+    const auto jeq = [](uint32_t value, uint8_t jt, uint8_t jf) {
+        return sock_filter BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, value, jt, jf);
+    };
+    const uint32_t eperm = SECCOMP_RET_ERRNO | EPERM;
+    std::vector<sock_filter> f = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
+        jeq(AUDIT_ARCH_X86_64, 1, 0),
+        ret(SECCOMP_RET_KILL_PROCESS),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+        jeq(SYS_fork, 0, 1), ret(SECCOMP_RET_KILL_PROCESS),
+        jeq(SYS_vfork, 0, 1), ret(SECCOMP_RET_KILL_PROCESS),
+        jeq(SYS_clone3, 0, 1), ret(SECCOMP_RET_ERRNO | ENOSYS),
+        jeq(SYS_clone, 0, 4),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[0])),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_THREAD, 0, 1),
+        ret(SECCOMP_RET_ALLOW),
+        ret(SECCOMP_RET_KILL_PROCESS),
+    };
+    const size_t requests = std::size(book2lab::kDiscoveryRequests);
+    f.push_back(jeq(SYS_ioctl, 0, static_cast<uint8_t>(2 * requests + 2)));
+    f.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])));
+    for (const auto &r : book2lab::kDiscoveryRequests) {
+        f.push_back(jeq(static_cast<uint32_t>(r.request), 0, 1));
+        f.push_back(ret(SECCOMP_RET_ALLOW));
+    }
+    f.push_back(ret(eperm));
+    for (int nr : allowed) {
+        f.push_back(jeq(static_cast<uint32_t>(nr), 0, 1));
+        f.push_back(ret(SECCOMP_RET_ALLOW));
+    }
+    f.push_back(ret(eperm));
+    return f;
+}
+
+struct Worker {
+    pid_t pid = -1;
+    int verdict = -1, control = -1, report = -1;
+};
+
+long now_ms()
+{
+    timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+bool read_line(int fd, std::string &line, int timeout_ms)
+{
+    line.clear();
+    const long deadline = now_ms() + timeout_ms;
+    while (line.size() < 256) {
+        pollfd p {fd, POLLIN, 0};
+        long left = deadline - now_ms();
+        if (left <= 0 || poll(&p, 1, static_cast<int>(left)) != 1)
+            return false;
+        char c;
+        if (read(fd, &c, 1) != 1)
+            return false;
+        if (c == '\n')
+            return true;
+        line += c;
+    }
+    return false;
+}
+
+[[noreturn]] void worker_fail(const std::string &what)
+{
+    std::string log;
+    if (read_file(kWorkerLog, log)) {
+        size_t start = log.size() > 6000 ? log.size() - 6000 : 0;
+        size_t pos = start;
+        while (pos < log.size()) {
+            size_t end = log.find('\n', pos);
+            if (end == std::string::npos)
+                end = log.size();
+            std::printf("WORKERLOG %s\n", log.substr(pos, end - pos).c_str());
+            pos = end + 1;
+        }
+        std::fflush(stdout);
+    }
+    if (g_worker > 0)
+        kill(g_worker, SIGKILL);
+    fail(what);
+}
+
+bool launch_worker(const std::vector<device_rule> &rules, const std::vector<std::string> &extra_env, Worker &w)
+{
+    int verdict[2], control[2], report[2], input[2];
+    if (!make_group(kWorkerGroup, rules) || pipe2(verdict, O_CLOEXEC) || pipe2(control, O_CLOEXEC) ||
+        pipe2(report, O_CLOEXEC) || pipe2(input, O_CLOEXEC))
+        return false;
+    int log = open(kWorkerLog, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (log < 0)
+        return false;
+    std::vector<sock_filter> filter = worker_filter();
+    pid_t pid = fork();
+    if (pid < 0)
+        return false;
+    if (pid == 0) {
+        const int sources[6] = {input[0], log, log, verdict[1], control[0], report[1]};
+        int high[6];
+        for (int i = 0; i < 6; i++)
+            if ((high[i] = fcntl(sources[i], F_DUPFD_CLOEXEC, 100 + i)) < 0)
+                _exit(20);
+        for (int i = 0; i < 6; i++)
+            if (dup2(high[i], i) != i)
+                _exit(21);
+        if (enter_group(kWorkerGroup, getpid()) != 0 || syscall(SYS_close_range, 6U, ~0U, 0U) != 0 ||
+            setgroups(0, nullptr) != 0 || setresgid(kWorkerId, kWorkerId, kWorkerId) != 0 ||
+            setresuid(kWorkerId, kWorkerId, kWorkerId) != 0 || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+            _exit(22);
+        sock_fprog prog = {static_cast<unsigned short>(filter.size()), filter.data()};
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0)
+            _exit(23);
+        std::vector<std::string> env = {"LC_ALL=C"};
+        env.insert(env.end(), extra_env.begin(), extra_env.end());
+        std::vector<char *> envp;
+        for (auto &e : env)
+            envp.push_back(e.data());
+        envp.push_back(nullptr);
+        char name[] = "discovery-worker";
+        char *argv[] = {name, nullptr};
+        execve(kWorkerPath, argv, envp.data());
+        _exit(24);
+    }
+    for (int fd : {verdict[1], control[0], report[1], input[0], input[1], log})
+        close(fd);
+    g_worker = pid;
+    w = {pid, verdict[0], control[1], report[0]};
+    return true;
+}
+
+bool tell(int fd, const char *word)
+{
+    std::string text = std::string(word) + "\n";
+    return write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+}
+
+// READY, both seccomp stages present, go, report, release, bounded exit.
+void run_worker(Worker &w)
+{
+    std::string line, status;
+    if (!read_line(w.report, line, 30000) || line != "READY") {
+        int wstatus = 0;
+        std::string why = "running";
+        if (waitpid(w.pid, &wstatus, WNOHANG) == w.pid)
+            why = WIFEXITED(wstatus) ? "exit=" + std::to_string(WEXITSTATUS(wstatus)) :
+                                       "signal=" + std::to_string(WTERMSIG(wstatus));
+        worker_fail("WORKER_NOT_READY " + why);
+    }
+    if (!read_file("/proc/" + std::to_string(w.pid) + "/status", status) ||
+        status.find("\nSeccomp_filters:\t2\n") == std::string::npos)
+        worker_fail("SECCOMP_STAGES");
+    event("WORKER_READY");
+    if (!tell(w.control, "go") || !read_line(w.report, line, 100000))
+        worker_fail("NO_WORKER_REPORT");
+    event(line);
+    if (!tell(w.control, "release"))
+        worker_fail("RELEASE");
+    int wstatus = 0;
+    const long deadline = now_ms() + 30000;
+    pid_t done = 0;
+    while ((done = waitpid(w.pid, &wstatus, WNOHANG)) == 0 && now_ms() < deadline)
+        poll(nullptr, 0, 50);
+    if (done != w.pid) {
+        kill(w.pid, SIGKILL);
+        waitpid(w.pid, &wstatus, 0);
+        worker_fail("WORKER_EXIT_TIMEOUT");
+    }
+    event("WORKER_EXITED " + (WIFEXITED(wstatus) ? std::to_string(WEXITSTATUS(wstatus)) :
+                              "signal=" + std::to_string(WTERMSIG(wstatus))));
+}
+
+bool set_link(const MediaNode &media, const Topology &t, const std::string &source, const std::string &sink,
+              uint32_t flags)
+{
+    auto entity = [&](const std::string &name) -> uint32_t {
+        for (const auto &e : t.entities)
+            if (name == e.name)
+                return e.id;
+        return 0;
+    };
+    const uint32_t src = entity(source), dst = entity(sink);
+    const media_v2_pad *src_pad = nullptr, *dst_pad = nullptr;
+    for (const auto &l : t.links) {
+        if ((l.flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_DATA_LINK)
+            continue;
+        const media_v2_pad *a = nullptr, *b = nullptr;
+        for (const auto &p : t.pads) {
+            if (p.id == l.source_id)
+                a = &p;
+            if (p.id == l.sink_id)
+                b = &p;
+        }
+        if (a && b && a->entity_id == src && b->entity_id == dst)
+            src_pad = a, dst_pad = b;
+    }
+    if (!src || !dst || !src_pad || !dst_pad || enter_group(kInventory, getpid()) != 0)
+        return false;
+    media_link_desc desc {};
+    desc.source = {src, static_cast<uint16_t>(src_pad->index), MEDIA_PAD_FL_SOURCE, {}};
+    desc.sink = {dst, static_cast<uint16_t>(dst_pad->index), MEDIA_PAD_FL_SINK, {}};
+    desc.flags = flags;
+    int fd = open_bracketed(media, O_RDWR);
+    bool ok = fd >= 0 && ioctl(fd, MEDIA_IOC_SETUP_LINK, &desc) == 0;
+    if (fd >= 0)
+        close(fd);
+    return enter_group(QUARANTINE, getpid()) == 0 && ok;
+}
+
+bool worker_record(const std::string &text)
+{
+    std::string log, needle = " " + std::to_string(g_worker) + " " + text + "\n";
+    return read_file(std::string(kDebug) + "/effects", log) && log.find(needle) != std::string::npos;
+}
+
+// Observer sensitivity control: unpatched libcamera with every node granted.
+void stock_baseline(const std::vector<MediaNode> &media, const std::vector<Topology> &tops)
+{
+    const MediaNode *cio2 = find_role(media, tops, "cio2");
+    if (!cio2 || !set_link(*cio2, tops[static_cast<size_t>(cio2 - media.data())], "ov7251 4-0060",
+                           "ipu3-csi2 1", MEDIA_LNK_FL_ENABLED))
+        fail("IR_LINK");
+    event("IR_LINK_ENABLED");
+    std::vector<std::string> paths;
+    for (const auto &m : media)
+        paths.push_back(m.path);
+    for (const auto &n : sysfs_v4l2())
+        paths.push_back(n.path);
+    std::vector<device_rule> rules;
+    Worker w;
+    if (!grant(paths, rules) || !launch_worker(rules, {}, w))
+        fail("LAUNCH");
+    run_worker(w);
+    if (!worker_record("open ov7251_4-0060"))
+        fail("STOCK_EFFECTS");
+    event("STOCK_EFFECTS_OBSERVED");
+}
+
 } // namespace
 
 int main()
@@ -467,7 +795,9 @@ int main()
         event("TOPOLOGY_READ");
     } else if (lab_case == "sim-controls") {
         sim_controls(nodes, tops);
+    } else if (lab_case == "stock-baseline") {
+        stock_baseline(nodes, tops);
     }
-    dump_effects(0);
+    dump_effects(g_worker);
     poweroff();
 }

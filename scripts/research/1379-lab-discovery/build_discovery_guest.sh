@@ -79,26 +79,163 @@ status=$(git -C "$linux" status --porcelain) || die "could not recheck the pinne
 strict_c=(gcc -std=c17 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -isystem "$uapi/include")
 strict_cxx=(g++ -std=c++20 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -isystem "$uapi/include")
 "${strict_c[@]}" -c "$boot/guest/cgroup_device.c" -o "$out/cgroup_device.o"
-"${strict_cxx[@]}" -static -I "$boot/guest" "$here/guest/discovery_supervisor.cpp" \
+"${strict_cxx[@]}" -static -I "$boot/guest" -I "$here/lab" "$here/guest/discovery_supervisor.cpp" \
     "$out/cgroup_device.o" -o "$out/supervisor"
 readelf -l -d "$out/supervisor" >"$out/supervisor-elf.txt"
 if grep -Eq 'INTERP|NEEDED' "$out/supervisor-elf.txt"; then die "supervisor is not static"; fi
 
+# libcamera sees only gnutls, yaml-0.1 and the .pc files they require.
+: "${MESON:?set MESON to the verified Meson 1.9.1 binary}"
+[[ $("$MESON" --version) == 1.9.1 ]] || die "Meson 1.9.1 required"
+for tool in ninja openssl readelf pacman pkg-config; do
+    command -v "$tool" >/dev/null || die "missing build tool: $tool"
+done
+pkgview="$scratch/pkgconfig-view"
+rm -rf -- "$pkgview"
+mkdir -- "$pkgview"
+declare -A seen=()
+queue=(gnutls yaml-0.1)
+while ((${#queue[@]})); do
+    module=${queue[0]}
+    queue=("${queue[@]:1}")
+    [[ -z ${seen[$module]:-} ]] || continue
+    seen[$module]=1
+    pcdir=$(pkg-config --variable=pcfiledir "$module") || die "missing pkg-config module $module"
+    ln -s -- "$pcdir/$module.pc" "$pkgview/$module.pc"
+    while read -r dep _; do
+        [[ -z $dep ]] || queue+=("$dep")
+    done < <(pkg-config --print-requires --print-requires-private "$module")
+done
+ls "$pkgview" >"$out/pkgconfig-view.txt"
+
+build_libcamera() {
+    local name=$1 source=$2
+    local bdir="$scratch/lc-$name-build" stage="$scratch/lc-$name-stage" lib
+    rm -rf -- "$bdir" "$stage"
+    PATH="$(dirname -- "$MESON"):$PATH" PKG_CONFIG_LIBDIR="$pkgview" PKG_CONFIG_PATH='' \
+        "$MESON" setup "$bdir" "$source" --prefix=/usr --buildtype=debugoptimized \
+        -Dpipelines=ipu3 -Dipas=ipu3 -Dudev=disabled -Dlibdw=disabled -Dlibunwind=disabled \
+        -Dtracing=disabled -Dcam=disabled -Dqcam=disabled -Dgstreamer=disabled -Dv4l2=disabled \
+        -Dpycamera=disabled -Dlc-compliance=disabled -Ddocumentation=disabled -Dtest=false \
+        -Dandroid=disabled >"$out/lc-$name-setup.log" 2>&1 || { tail -30 "$out/lc-$name-setup.log" >&2; exit 1; }
+    grep -Eq 'IPA modules signed with[[:space:]]*:[[:space:]]*gnutls' "$out/lc-$name-setup.log" ||
+        die "$name libcamera does not sign IPA modules with gnutls"
+    PATH="$(dirname -- "$MESON"):$PATH" "$MESON" compile -C "$bdir" >"$out/lc-$name-compile.log" 2>&1 ||
+        { tail -30 "$out/lc-$name-compile.log" >&2; exit 1; }
+    PATH="$(dirname -- "$MESON"):$PATH" DESTDIR="$stage" "$MESON" install -C "$bdir" --strip \
+        >"$out/lc-$name-install.log" 2>&1 || { tail -30 "$out/lc-$name-install.log" >&2; exit 1; }
+    lib="$stage/usr/lib/libcamera.so.0.8"
+    [[ -f $lib && -f $stage/usr/lib/libcamera/ipa/ipa_ipu3.so.sign ]] || die "$name libcamera install incomplete"
+    if readelf -dW "$lib" | grep -Eq '\((RUNPATH|RPATH)\)'; then die "$name libcamera keeps a build rpath"; fi
+    find "$stage" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF && readelf -dW "$1"' _ {} \; \
+        >"$out/lc-$name-dynamic.txt"
+    if grep -Eq 'NEEDED.*(libudev|libdw|libunwind|lttng)' "$out/lc-$name-dynamic.txt"; then
+        die "$name libcamera links a disabled optional dependency"
+    fi
+    "${strict_cxx[@]}" -I "$stage/usr/include/libcamera" "$here/guest/discovery_worker.cpp" \
+        -L "$stage/usr/lib" -lcamera -lcamera-base -o "$out/worker-$name"
+}
+
+lc_stock="$scratch/libcamera-stock"
+rm -rf -- "$lc_stock"
+git clone -q --shared --no-checkout -- "$libcamera" "$lc_stock"
+git -C "$lc_stock" checkout -q --detach "$libcamera_pin"
+[[ $(git -C "$lc_stock" describe --exact-match HEAD) == v0.8.0 ]] || die "stock clone lost the v0.8.0 tag"
+build_libcamera stock "$lc_stock"
+
+# Runtime closure from NEEDED entries, resolved in /usr/lib without running anything.
+closure() {
+    python3 - "$1" "$2" <<'PY'
+import os, re, subprocess, sys
+stage, worker = sys.argv[1:3]
+def run(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+names, elfs = set(), [worker]
+for top, _, files in os.walk(os.path.join(stage, "usr")):
+    for f in files:
+        path = os.path.join(top, f)
+        names.add(f)
+        if not os.path.islink(path):
+            with open(path, "rb") as h:
+                if h.read(4) == b"\x7fELF":
+                    elfs.append(path)
+host, todo = {}, list(elfs)
+while todo:
+    for name in re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", run("readelf", "-dW", todo.pop())):
+        if name in names or name in host:
+            continue
+        src = os.path.join("/usr/lib", name)
+        if not os.path.isfile(src):
+            sys.exit(f"unresolved shared library {name}")
+        host[name] = os.path.realpath(src)
+        todo.append(host[name])
+interp = re.search(r"interpreter: ([^\]]+)\]", run("readelf", "-lW", worker)).group(1)
+print(f"interp {interp} {os.path.realpath(interp)}")
+for name, real in sorted(host.items()):
+    print(f"lib {name} {real}")
+PY
+}
+
+# gen_init_cpio list: base layout, supervisor as /init, then optional worker,
+# staged libcamera (no headers or pkg-config) and the host closure.
+image_list() {
+    python3 - "$@" <<'PY'
+import os, sys
+supervisor, worker, stage, closure = sys.argv[1:5]
+out = ["dir /dev 755 0 0", "dir /proc 755 0 0", "dir /sys 755 0 0", "dir /run 755 0 0",
+       "dir /tmp 700 0 0", "dir /etc 755 0 0", "nod /dev/console 600 0 0 c 5 1",
+       f"file /init {supervisor} 755 0 0"]
+if worker != "-":
+    out += ["dir /lab 755 0 0", f"file /lab/discovery-worker {worker} 755 0 0"]
+staged = set()
+if stage != "-":
+    root = os.path.join(stage, "usr")
+    for top, dirs, files in os.walk(root):
+        rel = os.path.relpath(top, stage)
+        dirs[:] = sorted(d for d in dirs if os.path.join(rel, d) not in ("usr/include", "usr/lib/pkgconfig"))
+        out.append(f"dir /{rel} 755 0 0")
+        for f in sorted(files):
+            path = os.path.join(top, f)
+            staged.add(f"/{rel}/{f}")
+            if os.path.islink(path):
+                out.append(f"slink /{rel}/{f} {os.readlink(path)} 777 0 0")
+            else:
+                mode = "755" if os.access(path, os.X_OK) else "644"
+                out.append(f"file /{rel}/{f} {path} {mode} 0 0")
+if closure != "-":
+    for line in open(closure):
+        kind, name, real = line.split()
+        if kind == "interp":
+            out += ["dir /lib64 755 0 0", f"slink {name} {real} 777 0 0"]
+            name = os.path.basename(real)
+        if f"/usr/lib/{name}" not in staged:
+            staged.add(f"/usr/lib/{name}")
+            out.append(f"file /usr/lib/{name} {real} 755 0 0")
+print("\n".join(out))
+PY
+}
+
+record_host_libs() {
+    local list=$1 kind name real pkg
+    while read -r kind name real; do
+        pkg=$(pacman -Qoq -- "$real") || die "host library $real is not owned by a package"
+        printf '%s %s %s %s\n' "$(sha256sum -- "$real" | cut -d' ' -f1)" "$(pacman -Q -- "$pkg")" "$kind" "$real"
+    done <"$list"
+}
+
+closure "$scratch/lc-stock-stage" "$out/worker-stock" >"$out/closure-stock.txt"
+record_host_libs "$out/closure-stock.txt" >"$out/host-libs-stock.txt"
+
 gcc -O2 "$linux/usr/gen_init_cpio.c" -o "$out/gen_init_cpio"
-cat >"$out/lab.list" <<EOF
-dir /dev 755 0 0
-dir /proc 755 0 0
-dir /sys 755 0 0
-dir /run 755 0 0
-dir /tmp 700 0 0
-nod /dev/console 600 0 0 c 5 1
-file /init $out/supervisor 755 0 0
-EOF
+image_list "$out/supervisor" - - - >"$out/lab.list"
 "$out/gen_init_cpio" "$out/lab.list" >"$out/lab.cpio"
+image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out/closure-stock.txt" \
+    >"$out/stock.list"
+"$out/gen_init_cpio" "$out/stock.list" >"$out/stock.cpio"
 cp -- "$kbuild/arch/x86/boot/bzImage" "$out/bzImage"
 cp -- "$kbuild/.config" "$out/guest.config"
 (cd -- "$here" && sha256sum kernel-discovery.config build_discovery_guest.sh \
-    kernel/book2-lab-sim/* guest/* contract/* >"$out/inputs.sha256")
+    kernel/book2-lab-sim/* guest/* lab/* contract/* >"$out/inputs.sha256")
 (cd -- "$boot" && sha256sum guest/cgroup_device.c guest/lab.h >>"$out/inputs.sha256")
-(cd -- "$out" && sha256sum bzImage lab.cpio >build.sha256)
+(cd -- "$out" && sha256sum bzImage lab.cpio stock.cpio >build.sha256)
 cat "$out/build.sha256"

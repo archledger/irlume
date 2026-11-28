@@ -45,6 +45,8 @@ CASES = {
     "sim-controls": Case("lab.cpio", (), PREFIX + (
         "REPLACED same_devt=1 same_version=1 new_inode=1", "VERSION_BUMPED",
         "EXTRA_MEDIA_PRESENT", "SIM_CONTROLS_PASS")),
+    "stock-baseline": Case("stock.cpio", (), PREFIX + (
+        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 2", "WORKER_EXITED 0", "STOCK_EFFECTS_OBSERVED")),
 }
 
 

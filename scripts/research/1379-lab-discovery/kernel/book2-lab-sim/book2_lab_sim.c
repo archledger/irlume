@@ -537,6 +537,11 @@ static int sim_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	if (f->type != v->buf_type || f->index >= v->n_formats)
 		return -EINVAL;
 	f->pixelformat = v->formats[f->index];
+	/* The core has no names for the private IPU3 metadata formats. */
+	if (f->pixelformat == SIM_META_FMT_IPU3_PARAMS)
+		strscpy(f->description, "IPU3 processing parameters", sizeof(f->description));
+	else if (f->pixelformat == SIM_META_FMT_IPU3_STAT_3A)
+		strscpy(f->description, "IPU3 3A statistics", sizeof(f->description));
 	return 0;
 }
 
@@ -853,7 +858,8 @@ static struct sim_instance *sim_instance_create(u32 id)
 	inst->id = id;
 	inst->cio2_pdev = platform_device_register_simple("book2-lab-cio2", id, NULL, 0);
 	inst->imgu_pdev = platform_device_register_simple("book2-lab-imgu", id, NULL, 0);
-	if (IS_ERR(inst->cio2_pdev) || IS_ERR(inst->imgu_pdev))
+	if (IS_ERR(inst->cio2_pdev) || IS_ERR(inst->imgu_pdev) ||
+	    !inst->cio2_pdev->dev.driver || !inst->imgu_pdev->dev.driver)
 		return ERR_PTR(-ENODEV);
 	platform_set_drvdata(inst->cio2_pdev, inst);
 	platform_set_drvdata(inst->imgu_pdev, inst);
@@ -934,6 +940,8 @@ static int sim_add_media(void)
 	sim_extra_pdev = platform_device_register_simple("book2-lab-extra", 0, NULL, 0);
 	if (IS_ERR(sim_extra_pdev))
 		return PTR_ERR(sim_extra_pdev);
+	if (!sim_extra_pdev->dev.driver)
+		return -ENODEV;
 	sim_media_init(&sim_extra_mdev, sim_extra_pdev, "book2-lab-extra", "book2-lab-extra");
 	sim_extra_mdev.ops = NULL;
 	return media_device_register(&sim_extra_mdev);
@@ -1022,15 +1030,39 @@ static const struct file_operations sim_control_fops = {
 	.llseek = noop_llseek,
 };
 
+/*
+ * Media and V4L2 cores expect the media device's parent to be bound to a
+ * driver (subdev_open() takes mdev->dev->driver->owner), as real drivers are.
+ * Unbinding through sysfs is suppressed.
+ */
+static int sim_platform_probe(struct platform_device *pdev)
+{
+	return 0;
+}
+
+static const struct platform_device_id sim_platform_ids[] = {
+	{ "book2-lab-cio2" }, { "book2-lab-imgu" }, { "book2-lab-extra" }, { }
+};
+
+static struct platform_driver sim_platform_driver = {
+	.probe = sim_platform_probe,
+	.id_table = sim_platform_ids,
+	.driver = { .name = "book2-lab-sim", .suppress_bind_attrs = true },
+};
+
 static int __init sim_init(void)
 {
 	struct dentry *dir;
 	struct sim_instance *inst;
+	int ret;
 
 	if (front_port != 0 && front_port != 3) {
 		pr_err("book2_lab_sim: front_port must be 0 or 3\n");
 		return -EINVAL;
 	}
+	ret = platform_driver_register(&sim_platform_driver);
+	if (ret)
+		return ret;
 	inst = sim_instance_create(1);
 	if (IS_ERR(inst)) {
 		pr_err("book2_lab_sim: graph registration failed: %ld\n", PTR_ERR(inst));

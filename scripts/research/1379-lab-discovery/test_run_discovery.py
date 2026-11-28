@@ -24,6 +24,17 @@ def sim_controls(**overrides):
     return serial(**args)
 
 
+def numbered(records):
+    return [(i + 1, e) for i, e in enumerate(records)]
+
+
+def stock(**overrides):
+    args = {"case": "stock-baseline", "events": rd.CASES["stock-baseline"].events,
+            "effects": numbered(rd.expected_effects("stock-baseline"))}
+    args.update(overrides)
+    return serial(**args)
+
+
 class VerifierTests(unittest.TestCase):
     def test_valid_sim_controls_receipt_passes(self):
         receipt = rd.check_discovery(sim_controls(), NONCE, "sim-controls", 0)
@@ -78,6 +89,21 @@ class VerifierTests(unittest.TestCase):
         other = good + [(len(good) + 1, "1 other open ipu3-csi2_0")]
         with self.assertRaises(ValueError):
             rd.check_discovery(sim_controls(effects=other), NONCE, "sim-controls", 0)
+
+    def test_baseline_requires_ir_sensor_effects(self):
+        expected = rd.expected_effects("stock-baseline")
+        for record in ("1 worker link ov7251_4-0060:0 ipu3-csi2_1:0 0x0", "1 worker open ov7251_4-0060",
+                       "1 worker ctrl ov7251_4-0060 0x980914=0", "1 worker ctrl ov7251_4-0060 0x980915=0",
+                       "1 worker release ov7251_4-0060"):
+            self.assertIn(record, expected)
+        rd.check_discovery(stock(), NONCE, "stock-baseline", 0)
+        without_ir = [e for e in expected if "ov7251" not in e]
+        with self.assertRaises(ValueError):
+            rd.check_discovery(stock(effects=numbered(without_ir)), NONCE, "stock-baseline", 0)
+
+    def test_positive_case_without_effects_fails(self):
+        with self.assertRaises(ValueError):
+            rd.check_discovery(stock(effects=[]), NONCE, "stock-baseline", 0)
 
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")

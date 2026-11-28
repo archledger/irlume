@@ -35,9 +35,13 @@ python3 -B -m unittest discover -s "$lab" -p test_run_discovery.py
 The build hardlinks the pinned Linux tree, adds only the driver directory
 and its two `Kconfig`/`Makefile` lines, checks that change set with
 `git status` through a private index, and rechecks that the pinned
-checkout is still clean. Meson runs with `--wrap-mode=nodownload`, so a
-missing dependency fails the build instead of fetching a subproject. The
-guest kernel enables KASAN and lock proving; any kernel `BUG`, `WARNING`,
+checkout is still clean. Meson runs with `--wrap-mode=nodownload`, a
+native file that disables CMake and libyuv forced to its unused fallback,
+so a missing dependency fails the build instead of fetching a subproject
+and no host library outside the private view is found. Every `NEEDED`
+entry must be one of nine allowed libraries, and the lab image does not
+ship the isolated IPA proxy. The guest kernel enables KASAN and lock
+proving; any kernel `BUG`, `WARNING`,
 KASAN or lockdep report refuses the run.
 
 `topology` reads both media devices under a scope that admits only the
@@ -113,8 +117,8 @@ the live graph. The log must start with one `dropped 0` header, number its
 records without gaps and hold exactly one canary, and the open counts must
 list every granted node at zero; otherwise the outcome is `HOLD observer`.
 `Known` needs every listed effect exactly once, counted per control record;
-a format record matches on entity, pad and size, because the simulated
-driver sets its own media bus code. Only then does the stand-in second
+a format record must also carry the media bus code the contract lists as
+its result. Only then does the stand-in second
 backend `/lab/ir-stub` run. A refusal with no worker effect releases
 without continuing the schedule. Anything else is `HOLD <reason>` and
 blocks the second backend.
@@ -141,7 +145,9 @@ any effect. The route must satisfy all of these:
 - a SHA-256 of the module bytes equal to the build's digest.
 
 While the worker is alive, the supervisor requires the bound inode in
-`/proc/<worker>/maps` before it reports `IPA_ROUTE threaded <sha256>`.
+`/proc/<worker>/maps` before it reports `IPA_ROUTE threaded <sha256>`. It
+reports `IPA_MAPPED_UNBOUND`, which no case accepts, when another file is
+mapped at the bound path or the bound file under another path.
 
 | Case | Change before the worker runs | Required result |
 | --- | --- | --- |

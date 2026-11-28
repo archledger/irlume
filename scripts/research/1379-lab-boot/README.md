@@ -40,3 +40,18 @@ calls. The `kept-fd` negative reaches the deliberate retained-handle refusal
 instead of any successful boundary receipt. This is a fixed dummy fixture
 with audited workers; it does not validate libcamera, IPA or a production
 supervisor.
+
+Run the complete set in fresh emulator instances:
+
+```sh
+for case in smoke missing-deny policy kept-fd boundary; do
+    python3 -B "$lab/run_guest.py" "$scratch/build" "$scratch/check-$case" "$case"
+done
+```
+
+The two negative cases are successful only when they report refusal and never
+emit a later-stage success record. Keep `build.sha256`, `guest.config` and the
+case serial logs with the signed source revision and tool versions. Do not
+attach the guest image to a support issue or infer device replacement safety
+outside this built-in guest node. The first lab requirements still not covered
+are B03 through B11; B12 remains a separate attended-device decision.

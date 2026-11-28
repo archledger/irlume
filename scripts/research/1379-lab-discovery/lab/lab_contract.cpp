@@ -283,6 +283,23 @@ std::optional<Reservation> parse(std::string_view text, bool reservation)
     return r;
 }
 
+// The graph record of a link without its flags.
+std::string link_key(const Effect &e)
+{
+    return "link " + e.role + " " + e.entity + ":" + std::to_string(e.pad) + " " + e.sink + ":" +
+           std::to_string(e.sink_pad);
+}
+
+// Marks listed effect i as applied. Callers apply in observed order, so a
+// link's expected flags are those of its last applied update.
+void consume(const Reservation &r, size_t i, EffectLedger *ledger)
+{
+    ledger->used[i] = true;
+    const Effect &e = r.effects[i];
+    if (e.kind == Effect::Kind::Link)
+        ledger->link_flags[link_key(e)] = e.flags;
+}
+
 } // namespace
 
 const char *role_name(Role role)
@@ -464,22 +481,16 @@ Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const 
     if (!graph_records(s, &actual))
         return {false, "entity-set"};
     auto roles = entity_roles(r);
-    // Expected link flags reflect listed link effects already consumed.
+    // Expected link flags: the contract's, then the last applied update of each link.
     std::map<std::string, std::string> link_flags;
     for (const auto &g : r.graph) {
         auto t = split(g);
         if (t[0] == "link" && t[1] == want_role)
             link_flags["link " + t[1] + " " + t[2] + " " + t[3]] = t[4];
     }
-    for (size_t i = 0; i < r.effects.size() && i < ledger.used.size(); i++) {
-        const Effect &e = r.effects[i];
-        if (ledger.used[i] && e.kind == Effect::Kind::Link && e.role == want_role) {
-            std::string key = "link " + e.role + " " + e.entity + ":" + std::to_string(e.pad) + " " + e.sink +
-                              ":" + std::to_string(e.sink_pad);
-            if (link_flags.count(key))
-                link_flags[key] = hex(e.flags);
-        }
-    }
+    for (const auto &[key, flags] : ledger.link_flags)
+        if (link_flags.count(key))
+            link_flags[key] = hex(flags);
     std::set<std::string> want[4], have[4], want_names, have_names, want_links, have_links;
     auto bucket = [](const std::string &kind) {
         return kind == "media" ? 0 : kind == "entity" ? 1 : kind == "node" ? 2 : 3;
@@ -583,27 +594,63 @@ Verdict check_front(const Reservation &r)
     return {};
 }
 
-// Each listed effect in the form the simulated driver logs it.
-std::vector<std::string> driver_records(const Reservation &r)
+namespace {
+
+// Each listed effect in the form the simulated driver logs it, with the
+// index of the effect it comes from.
+std::vector<std::pair<std::string, size_t>> indexed_driver_records(const Reservation &r)
 {
-    std::vector<std::string> out;
-    for (const Effect &e : r.effects) {
+    std::vector<std::pair<std::string, size_t>> out;
+    for (size_t i = 0; i < r.effects.size(); i++) {
+        const Effect &e = r.effects[i];
         char buf[160];
         if (e.kind == Effect::Kind::Ctrl) {
             for (const auto &[id, value] : e.controls) {
                 std::snprintf(buf, sizeof(buf), "ctrl %s 0x%x=%lld", e.entity.c_str(), id, static_cast<long long>(value));
-                out.push_back(buf);
+                out.emplace_back(buf, i);
             }
         } else if (e.kind == Effect::Kind::Link) {
             std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad,
                           e.flags);
-            out.push_back(buf);
+            out.emplace_back(buf, i);
         } else {
             std::snprintf(buf, sizeof(buf), "fmt %s %u active 0x%x %ux%u", e.entity.c_str(), e.pad, e.result_code,
                           e.width, e.height);
-            out.push_back(buf);
+            out.emplace_back(buf, i);
         }
     }
+    return out;
+}
+
+} // namespace
+
+std::vector<std::string> driver_records(const Reservation &r)
+{
+    std::vector<std::string> out;
+    for (auto &record : indexed_driver_records(r))
+        out.push_back(std::move(record.first));
+    return out;
+}
+
+Replay replay_driver_records(const Reservation &r, const std::vector<std::string> &records)
+{
+    Replay out;
+    out.ledger.used.assign(r.effects.size(), false);
+    const auto listed = indexed_driver_records(r);
+    std::vector<bool> seen(listed.size(), false);
+    for (const std::string &record : records) {
+        size_t k = 0;
+        while (k < listed.size() && (seen[k] || listed[k].first != record))
+            k++;
+        if (k == listed.size()) {
+            out.verdict = {false, "unlisted-effect"};
+            return out;
+        }
+        seen[k] = true;
+        if (r.effects[listed[k].second].kind == Effect::Kind::Link)
+            consume(r, listed[k].second, &out.ledger);
+    }
+    out.complete = std::find(seen.begin(), seen.end(), false) == seen.end();
     return out;
 }
 
@@ -730,7 +777,7 @@ Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger
         if (!(listed == want))
             continue;
         if (!ledger->used[i]) {
-            ledger->used[i] = true;
+            consume(r, i, ledger);
             return {};
         }
         reused = true;

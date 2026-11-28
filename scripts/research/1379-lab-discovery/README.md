@@ -104,7 +104,9 @@ Every open is bracketed by the registration's kernfs inode: equal before
 and after the open, with a matching `st_rdev`. Before each listed effect the
 guard rereads the media device set, both topologies and every bound inode:
 a change refuses the effect. After the effect it rereads them again: a
-change latches a hold.
+change latches a hold. When the reservation lists more than one update of
+a link, the expected state is that of the last update applied, in the
+order the guard admitted them or the driver logged them.
 
 Two test-only pause points in the simulated driver hold the worker after
 the front link enable or the front format set until the supervisor writes

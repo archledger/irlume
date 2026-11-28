@@ -800,32 +800,10 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
         if (!kernfs_inode(n.major, n.minor, inode) || inode != n.inode)
             return {Ownership::Unknown, "replaced"};
     }
-    // Listed effects in the driver's per-record form, including the resulting format code.
-    const std::vector<std::string> listed = book2lab::driver_records(r);
-    std::multiset<std::string> expected(listed.begin(), listed.end());
-    std::vector<size_t> link_index;
-    for (size_t i = 0; i < r.effects.size(); i++)
-        if (r.effects[i].kind == book2lab::Effect::Kind::Link)
-            link_index.push_back(i);
-    book2lab::EffectLedger ledger;
-    ledger.used.assign(r.effects.size(), false);
-    for (const auto &effect : worker_effects) {
-        const std::string &key = effect;
-        auto it = expected.find(key);
-        if (it == expected.end())
-            return {Ownership::Unknown, "unlisted-effect"};
-        expected.erase(it);
-        if (key.rfind("link ", 0) == 0)
-            for (size_t i : link_index) {
-                const book2lab::Effect &e = r.effects[i];
-                char buf[96];
-                std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad, e.flags);
-                if (key == buf && !ledger.used[i]) {
-                    ledger.used[i] = true;
-                    break;
-                }
-            }
-    }
+    // The worker's records against the listed effects in the driver's form, format result codes included.
+    const book2lab::Replay replay = book2lab::replay_driver_records(r, worker_effects);
+    if (!replay.verdict.ok)
+        return {Ownership::Unknown, replay.verdict.reason};
     std::vector<MediaNode> media;
     if (!sysfs_media(media))
         return {Ownership::Unknown, "media-set"};
@@ -834,13 +812,14 @@ Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
         return {Ownership::Unknown, "snapshot"};
     for (const auto &t : tops) {
         const std::string role = book2lab::role_for_driver(t.info.driver);
-        book2lab::Verdict v = book2lab::compare_graph(r, role == "cio2" ? book2lab::Role::Cio2 : book2lab::Role::Imgu, t, ledger);
+        book2lab::Verdict v =
+            book2lab::compare_graph(r, role == "cio2" ? book2lab::Role::Cio2 : book2lab::Role::Imgu, t, replay.ledger);
         if (!v.ok)
             return {Ownership::Unknown, v.reason};
     }
     if (worker_effects.empty())
         return {Ownership::RefusedClean, ""};
-    if (!expected.empty())
+    if (!replay.complete)
         return {Ownership::Unknown, "partial-effects"};
     return {Ownership::Known, ""};
 }

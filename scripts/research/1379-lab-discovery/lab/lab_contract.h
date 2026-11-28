@@ -7,6 +7,7 @@
 #define BOOK2_LAB_CONTRACT_H
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -91,6 +92,8 @@ struct Reservation {
 
 struct EffectLedger {
     std::vector<bool> used;
+    // Flags of each link's last applied update, keyed by its graph record without flags.
+    std::map<std::string, uint32_t> link_flags;
 };
 
 bool label(const char *name, std::string *out);
@@ -105,7 +108,16 @@ std::string serialize(const Reservation &r);
 Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const EffectLedger &ledger);
 Verdict check_front(const Reservation &r);
 Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops);
+// Each listed effect in the form the simulated driver logs it.
 std::vector<std::string> driver_records(const Reservation &r);
+
+// The worker's driver records, in log order, matched against the listed effects.
+struct Replay {
+    Verdict verdict;       // unlisted-effect: a record not listed, or listed fewer times
+    EffectLedger ledger;   // the applied link updates, for compare_graph
+    bool complete = false; // every listed record was seen
+};
+Replay replay_driver_records(const Reservation &r, const std::vector<std::string> &records);
 
 // Media devices under a sysfs bus directory; nothing when any entry is unreadable.
 std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir);

@@ -219,6 +219,50 @@ void consumed_link_effect_updates_expected_state()
     CHECK(!compare_graph(r, Role::Cio2, cio2_graph(), ledger).ok);
 }
 
+// Two listed updates of one link: the last one applied sets the expected
+// state, whatever order the contract lists them in.
+void link_effects_apply_in_application_order()
+{
+    std::string contract = kContract;
+    const std::string enable_line = "effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1\n";
+    contract.replace(contract.find(enable_line), enable_line.size(),
+                     "effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x0\n" + enable_line);
+    auto r = parse_reservation(reservation_text(contract));
+    CHECK(r.has_value());
+    if (!r)
+        return;
+    Effect enable;
+    enable.kind = Effect::Kind::Link;
+    enable.role = "cio2";
+    enable.entity = "ov5693_2-0036";
+    enable.sink = "ipu3-csi2_0";
+    enable.flags = MEDIA_LNK_FL_ENABLED;
+    Effect disable = enable;
+    disable.flags = 0;
+    const Snapshot disabled = cio2_graph();
+    Snapshot enabled = cio2_graph();
+    for (auto &l : enabled.links)
+        if ((l.flags & MEDIA_LNK_FL_LINK_TYPE) == MEDIA_LNK_FL_DATA_LINK && l.source_id == enabled.pads[5].id)
+            l.flags = MEDIA_LNK_FL_ENABLED;
+
+    EffectLedger guard;
+    CHECK(match_effect(*r, enable, &guard).ok && match_effect(*r, disable, &guard).ok);
+    CHECK(compare_graph(*r, Role::Cio2, disabled, guard).ok);
+    Verdict stale = compare_graph(*r, Role::Cio2, enabled, guard);
+    CHECK(!stale.ok && stale.reason == "link-state");
+
+    Replay observed = replay_driver_records(
+        *r, {"link ov5693_2-0036:0 ipu3-csi2_0:0 0x1", "link ov5693_2-0036:0 ipu3-csi2_0:0 0x0"});
+    CHECK(observed.verdict.ok);
+    CHECK(compare_graph(*r, Role::Cio2, disabled, observed.ledger).ok);
+    CHECK(!compare_graph(*r, Role::Cio2, enabled, observed.ledger).ok);
+
+    EffectLedger reverse;
+    CHECK(match_effect(*r, disable, &reverse).ok && match_effect(*r, enable, &reverse).ok);
+    CHECK(compare_graph(*r, Role::Cio2, enabled, reverse).ok);
+    CHECK(!compare_graph(*r, Role::Cio2, disabled, reverse).ok);
+}
+
 void front_binding_on_wrong_port_refuses()
 {
     std::string contract = kContract;
@@ -559,6 +603,20 @@ void driver_records_carry_result_code()
     CHECK(records == want);
 }
 
+void replay_counts_listed_records()
+{
+    Reservation r = reserved_with_result_code();
+    const std::vector<std::string> all = driver_records(r);
+    Replay full = replay_driver_records(r, all);
+    CHECK(full.verdict.ok && full.complete);
+    Replay part = replay_driver_records(r, {all[0]});
+    CHECK(part.verdict.ok && !part.complete);
+    Replay twice = replay_driver_records(r, {all[2], all[2]});
+    CHECK(!twice.verdict.ok && twice.verdict.reason == "unlisted-effect");
+    Replay other = replay_driver_records(r, {"link ov7251_4-0060:0 ipu3-csi2_1:0 0x1"});
+    CHECK(!other.verdict.ok && other.verdict.reason == "unlisted-effect");
+}
+
 void media_listing_fails_closed()
 {
     char dir[] = "/tmp/book2-lab-media-XXXXXX";
@@ -641,6 +699,7 @@ int main()
         {"link_state_change_without_version_change_refuses", link_state_change_without_version_change_refuses},
         {"extra_entity_refuses", extra_entity_refuses},
         {"consumed_link_effect_updates_expected_state", consumed_link_effect_updates_expected_state},
+        {"link_effects_apply_in_application_order", link_effects_apply_in_application_order},
         {"front_binding_on_wrong_port_refuses", front_binding_on_wrong_port_refuses},
         {"extra_media_device_refuses", extra_media_device_refuses},
         {"effect_reused_refuses", effect_reused_refuses},
@@ -665,6 +724,7 @@ int main()
         {"fmt_effect_requires_result_code", fmt_effect_requires_result_code},
         {"request_matches_without_result_code", request_matches_without_result_code},
         {"driver_records_carry_result_code", driver_records_carry_result_code},
+        {"replay_counts_listed_records", replay_counts_listed_records},
         {"media_listing_fails_closed", media_listing_fails_closed},
         {"ipa_maps_report_unbound_mapping", ipa_maps_report_unbound_mapping},
         {"try_format_and_stale_controls_refuse", try_format_and_stale_controls_refuse},

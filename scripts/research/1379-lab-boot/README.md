@@ -34,9 +34,12 @@ not a lifetime guarantee for a detachable camera or a reused media device.
 
 The `boundary` case additionally seeds a real dummy descriptor before worker
 startup, requires it to be closed before any approved open, and verifies that
-the quarantined peer cannot open the owner's still-live descriptor. A tiny
-guest-only seccomp allowlist excludes file-descriptor transfer and acquisition
-calls. The `kept-fd` negative reaches the deliberate retained-handle refusal
+the quarantined peer cannot read the owner's still-live proc descriptor link
+or open the dummy alias. A guest-only Unix-socket control transfers a real
+dummy descriptor without the fixture filter. It then checks that the same
+filter as the worker refuses sending and receiving on a viable socket with
+a descriptor queued; only this control keeps the socket, not the worker.
+The `kept-fd` negative reaches the same retained-handle refusal guard
 instead of any successful boundary receipt. This is a fixed dummy fixture
 with audited workers; it does not validate libcamera, IPA or a production
 supervisor.
@@ -45,7 +48,7 @@ Run the complete set in fresh emulator instances:
 
 ```sh
 for case in smoke missing-deny policy kept-fd boundary; do
-    python3 -B "$lab/run_guest.py" "$scratch/build" "$scratch/check-$case" "$case"
+    python3 -B "$lab/run_guest.py" "$scratch/build" "$scratch/check-$case" "$case" || exit 1
 done
 ```
 

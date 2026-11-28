@@ -1,5 +1,7 @@
 import hashlib
 from pathlib import Path
+import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -83,3 +85,50 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(check_receipt(text, NONCE, "kept-fd", 0), refused)
         with self.assertRaises(ValueError):
             check_receipt(text, NONCE, "boundary", 0)
+
+    def test_boundary_requires_independent_proc_and_ipc_controls(self):
+        older = POLICY_EVENTS + (
+            "INHERITED_HANDLE_CLOSED", "PEER_HANDLE_DENIED", "FD_IPC_DENIED", "BOOT_BOUNDARY_PASS",
+        )
+        for missing in (None, "PEER_PROC_LINK_DENIED", "FD_IPC_POSITIVE"):
+            control = POLICY_EVENTS + (
+                "INHERITED_HANDLE_CLOSED", "PEER_PROC_LINK_DENIED", "PEER_HANDLE_DENIED",
+                "FD_IPC_POSITIVE", "FD_IPC_DENIED", "BOOT_BOUNDARY_PASS",
+            )
+            events = older if missing is None else tuple(e for e in control if e != missing)
+            text = "".join(f"BOOK2_BOOT_V1 {NONCE} {event}\n" for event in events)
+            with self.assertRaises(ValueError):
+                check_receipt(text, NONCE, "boundary", 0)
+
+    def test_failed_source_status_is_not_clean(self):
+        lab = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(dir="/tmp/opencode") as temp:
+            root = Path(temp)
+            commands = root / "bin"
+            commands.mkdir()
+            source = root / "source"
+            source.mkdir()
+            git = commands / "git"
+            git.write_text("#!/bin/sh\ncase \"$3\" in\n"
+                           "rev-parse) echo 988117cc1bb17338c586a4e21ade88b5397eac33;;\n"
+                           "status) exit 128;;\n*) exit 1;;\nesac\n")
+            git.chmod(0o700)
+            result = subprocess.run(
+                ("/usr/bin/bash", str(lab / "build_guest.sh"), str(source), str(root / "build")),
+                text=True, capture_output=True, timeout=8,
+                env={**os.environ, "PATH": f"{commands}:/usr/bin"},
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("could not verify Linux source cleanliness", result.stderr)
+            self.assertFalse((root / "build").exists())
+
+    def test_documented_suite_stops_on_early_failure(self):
+        readme = Path(__file__).with_name("README.md").read_text()
+        recipe = readme.split("```sh\nfor case in ", 1)[1].split("```", 1)[0]
+        result = subprocess.run(
+            ("/usr/bin/bash", "-c", 'python3() { printf "%s\\n" "$5"; [[ $5 != missing-deny ]]; }\n'
+             'for case in ' + recipe),
+            text=True, capture_output=True, timeout=5,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), ["smoke", "missing-deny"])

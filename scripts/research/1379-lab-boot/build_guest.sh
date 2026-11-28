@@ -12,7 +12,8 @@ scratch=$(dirname -- "$out")
     die "use a new build directory within private /tmp/opencode scratch"
 [[ $(git -C "$linux" rev-parse HEAD) == 988117cc1bb17338c586a4e21ade88b5397eac33 ]] ||
     die "wrong Linux source pin"
-[[ -z $(git -C "$linux" status --porcelain) ]] || die "Linux source checkout is not clean"
+status=$(git -C "$linux" status --porcelain) || die "could not verify Linux source cleanliness"
+[[ -z $status ]] || die "Linux source checkout is not clean"
 command -v bc >/dev/null || die "provide a verified private bc on PATH"
 mkdir -- "$out"
 kbuild="$scratch/kbuild"

@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -31,7 +32,7 @@ static int apply_worker_filter(void)
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         ALLOW(read), ALLOW(write), ALLOW(close), ALLOW(fcntl), ALLOW(openat),
-        ALLOW(poll), ALLOW(getpid), ALLOW(exit), ALLOW(exit_group),
+        ALLOW(poll), ALLOW(readlink), ALLOW(getpid), ALLOW(exit), ALLOW(exit_group),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
     };
 #undef ALLOW
@@ -42,10 +43,9 @@ static int apply_worker_filter(void)
     return (int)syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program);
 }
 
-static int sanitize_worker(int first_untrusted_fd, uid_t uid, gid_t gid)
+static int drop_and_filter(uid_t uid, gid_t gid)
 {
-    if (syscall(SYS_close_range, (unsigned int)first_untrusted_fd, UINT_MAX, 0) < 0 ||
-        setgroups(0, NULL) < 0 || setresgid(gid, gid, gid) < 0 || setresuid(uid, uid, uid) < 0)
+    if (setgroups(0, NULL) < 0 || setresgid(gid, gid, gid) < 0 || setresuid(uid, uid, uid) < 0)
         return -1;
     uid_t real_uid, effective_uid, saved_uid;
     gid_t real_gid, effective_gid, saved_gid;
@@ -59,16 +59,20 @@ static int sanitize_worker(int first_untrusted_fd, uid_t uid, gid_t gid)
     return apply_worker_filter();
 }
 
+static int sanitize_worker(int first_untrusted_fd, uid_t uid, gid_t gid)
+{
+    if (syscall(SYS_close_range, (unsigned int)first_untrusted_fd, UINT_MAX, 0) < 0)
+        return -1;
+    return drop_and_filter(uid, gid);
+}
+
 static bool closed_fd(int fd)
 {
     return fcntl(fd, F_GETFD) == -1 && errno == EBADF;
 }
 
-static bool no_peer_transfer(void)
+static ssize_t send_descriptor(int channel, int fd)
 {
-    int fds[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != -1 || errno != EPERM)
-        return false;
     char byte = 'x';
     struct iovec iov = {.iov_base = &byte, .iov_len = 1};
     union {
@@ -83,11 +87,34 @@ static bool no_peer_transfer(void)
     header->cmsg_level = SOL_SOCKET;
     header->cmsg_type = SCM_RIGHTS;
     header->cmsg_len = CMSG_LEN(sizeof(int));
-    *((int *)CMSG_DATA(header)) = FIRST_EXTRA;
-    if (sendmsg(REPLY, &message, MSG_DONTWAIT) != -1 || errno != EPERM ||
-        recvmsg(GATE, &message, MSG_DONTWAIT) != -1 || errno != EPERM)
-        return false;
-    return syscall(SYS_pidfd_open, getpid(), 0) == -1 && errno == EPERM;
+    memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+    return sendmsg(channel, &message, MSG_DONTWAIT);
+}
+
+static int receive_descriptor(int channel)
+{
+    char byte = 0;
+    struct iovec iov = {.iov_base = &byte, .iov_len = 1};
+    union {
+        struct cmsghdr alignment;
+        unsigned char bytes[CMSG_SPACE(sizeof(int))];
+    } control = {0};
+    struct msghdr message = {
+        .msg_iov = &iov, .msg_iovlen = 1,
+        .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes),
+    };
+    if (recvmsg(channel, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 1)
+        return -1;
+    const struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (byte != 'x' || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
+        !header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len != CMSG_LEN(sizeof(int))) {
+        errno = EPROTO;
+        return -1;
+    }
+    int fd;
+    memcpy(&fd, CMSG_DATA(header), sizeof(fd));
+    return fd;
 }
 
 static bool wait_byte(int fd, char expected)
@@ -112,6 +139,63 @@ static bool finish_child(pid_t child)
     return false;
 }
 
+static bool receive_zero(int channel)
+{
+    int fd = receive_descriptor(channel);
+    if (fd < 0)
+        return false;
+    unsigned char value = 1;
+    bool read_ok = read(fd, &value, 1) == 1 && value == 0;
+    return close(fd) == 0 && read_ok;
+}
+
+static bool filtered_socket_check(int channel, int dummy)
+{
+    /* Keep the socket only in this test child to exercise a viable transfer. */
+    if (drop_and_filter(65533, 65533) < 0)
+        return false;
+    int vacant = fcntl(channel, F_DUPFD_CLOEXEC, 0);
+    if (vacant < 0 || close(vacant) < 0)
+        return false;
+    if (receive_descriptor(channel) != -1 || errno != EPERM ||
+        !closed_fd(vacant) || send_descriptor(channel, dummy) != -1 || errno != EPERM)
+        return false;
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != -1 || errno != EPERM)
+        return false;
+    return syscall(SYS_pidfd_open, getpid(), 0) == -1 && errno == EPERM;
+}
+
+static bool verify_fd_ipc(const char *quarantine, const char *allowed)
+{
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0 ||
+        enter_group(allowed, getpid()) < 0)
+        return false;
+    int dummy = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    if (dummy < 0 || enter_group(quarantine, getpid()) < 0)
+        return false;
+    if (send_descriptor(pair[0], dummy) != 1 || !receive_zero(pair[1]) ||
+        send_descriptor(pair[0], dummy) != 1)
+        return false;
+    lab_event("FD_IPC_POSITIVE");
+
+    pid_t child = fork();
+    if (child < 0)
+        return false;
+    if (!child) {
+        close(pair[0]);
+        _exit(filtered_socket_check(pair[1], dummy) ? 0 : 1);
+    }
+    /* A denied receive must leave the queued descriptor for this verifier. */
+    bool ok = finish_child(child) && receive_zero(pair[1]) &&
+        receive_descriptor(pair[0]) == -1 && errno == EAGAIN;
+    close(dummy);
+    close(pair[0]);
+    close(pair[1]);
+    return ok;
+}
+
 static void owner_worker(int gate[2], int reply[2], bool kept_fd)
 {
     close(gate[1]);
@@ -121,19 +205,18 @@ static void owner_worker(int gate[2], int reply[2], bool kept_fd)
     close(reply[1]);
     if (!wait_byte(GATE, 'G'))
         _exit(1);
-    if (kept_fd) {
-        bool retained = !closed_fd(SEED);
-        _exit(retained && write(REPLY, "R", 1) == 1 ? 0 : 1);
-    }
-    if (sanitize_worker(FIRST_EXTRA, 65532, 65532) != 0)
+    int status = kept_fd ? drop_and_filter(65532, 65532) :
+        sanitize_worker(FIRST_EXTRA, 65532, 65532);
+    if (status != 0)
         _exit(1);
-    if (!closed_fd(SEED)) {
+    if (fcntl(SEED, F_GETFD) >= 0)
         _exit(write(REPLY, "R", 1) == 1 ? 0 : 1);
-    }
+    if (errno != EBADF || kept_fd)
+        _exit(1);
     int handle = open("/dev/zero", O_RDONLY | O_CLOEXEC);
     unsigned char value = 1;
     if (handle != FIRST_EXTRA || read(handle, &value, 1) != 1 || value != 0 ||
-        write(REPLY, "H", 1) != 1 || !wait_byte(GATE, 'T') || !no_peer_transfer() ||
+        write(REPLY, "H", 1) != 1 || !wait_byte(GATE, 'T') ||
         !closed_fd(FIRST_EXTRA + 1) || close(handle) < 0 || write(REPLY, "I", 1) != 1)
         _exit(1);
     _exit(0);
@@ -151,6 +234,8 @@ static bool prove_peer_denied(pid_t owner)
         return false;
     if (!peer) {
         if (sanitize_worker(GATE, 65533, 65533) < 0)
+            _exit(1);
+        if (readlink(path, link, sizeof(link)) != -1 || errno != EACCES)
             _exit(1);
         if (open(path, O_RDONLY | O_CLOEXEC) != -1 || (errno != EACCES && errno != EPERM))
             _exit(1);
@@ -189,9 +274,9 @@ int verify_worker_boundary(const char *quarantine, const char *allowed, bool kep
         } else if (wait_byte(reply[0], 'H')) {
             lab_event("INHERITED_HANDLE_CLOSED");
             if (prove_peer_denied(child)) {
+                lab_event("PEER_PROC_LINK_DENIED");
                 lab_event("PEER_HANDLE_DENIED");
                 if (write(gate[1], "T", 1) == 1 && wait_byte(reply[0], 'I')) {
-                    lab_event("FD_IPC_DENIED");
                     result = WORKER_OK;
                 }
             }
@@ -199,5 +284,12 @@ int verify_worker_boundary(const char *quarantine, const char *allowed, bool kep
     }
     close(gate[1]);
     close(reply[0]);
-    return finish_child(child) ? result : WORKER_ERROR;
+    if (!finish_child(child))
+        return WORKER_ERROR;
+    if (result == WORKER_OK) {
+        if (!verify_fd_ipc(quarantine, allowed))
+            return WORKER_ERROR;
+        lab_event("FD_IPC_DENIED");
+    }
+    return result;
 }

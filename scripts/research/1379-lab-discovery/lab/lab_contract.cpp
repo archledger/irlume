@@ -178,6 +178,8 @@ std::optional<Reservation> parse(std::string_view text, bool reservation)
         if (line.empty() || line[0] == '#')
             continue;
         auto t = split(line);
+        if (t.empty())
+            return std::nullopt;
         if (!header) {
             if (reservation ? t.size() != 2 || t[0] != kReservationHeader || t[1].size() != 32 ||
                                   t[1].find_first_not_of("0123456789abcdef") != std::string::npos
@@ -496,7 +498,8 @@ Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const 
         auto t = split(g);
         if (t[0] == "ancillary")
             return {false, "link-set"};
-        have[bucket(t[0])].insert(g);
+        if (!have[bucket(t[0])].insert(g).second)
+            return {false, "graph-duplicate"};
         if (t[0] == "entity")
             have_names.insert(t[2]);
         if (t[0] == "link")
@@ -572,6 +575,23 @@ Verdict check_front(const Reservation &r)
     }
     if (!ok || into_sink != 1 || !from_sensor || !to_video)
         return {false, "front-binding"};
+    return {};
+}
+
+// Both live graphs together equal the contract's graph records.
+Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops)
+{
+    std::set<std::string> want(contract.graph.begin(), contract.graph.end()), have;
+    for (const auto &t : tops) {
+        std::vector<std::string> records;
+        if (!graph_records(t, &records))
+            return {false, "graph-records"};
+        for (const auto &record : records)
+            if (!have.insert(record).second)
+                return {false, "graph-duplicate"};
+    }
+    if (want != have)
+        return {false, "contract-graph"};
     return {};
 }
 

@@ -103,6 +103,7 @@ std::string serialize(const Reservation &r);
 
 Verdict compare_graph(const Reservation &r, Role role, const Snapshot &s, const EffectLedger &ledger);
 Verdict check_front(const Reservation &r);
+Verdict match_contract_graph(const Reservation &contract, const std::vector<Snapshot> &tops);
 Verdict check_media_set(const Reservation &r, const std::vector<std::pair<unsigned, unsigned>> &present);
 Verdict match_effect(const Reservation &r, const Effect &e, EffectLedger *ledger);
 Verdict check_environment(const char *const *envp, const std::vector<std::string> &config_paths);

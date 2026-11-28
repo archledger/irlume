@@ -441,6 +441,67 @@ void observer_keeps_specific_reasons()
     CHECK(observe(kCounts, observer_log({"1 1 control canary", "1 70 open ov7251_4-0060"})).reason == "ungranted-node");
 }
 
+// The IR sensor is unbound, so only the duplicate check can notice a second copy.
+media_v2_link ir_link_copy(const Snapshot &s)
+{
+    media_v2_link copy = s.links[1];
+    copy.id = 950;
+    return copy;
+}
+
+void duplicate_live_entity_refuses()
+{
+    Reservation r = reserved();
+    EffectLedger ledger;
+    Snapshot s = cio2_graph();
+    for (const auto &e : std::vector<media_v2_entity>(s.entities))
+        if (std::string(e.name) == "ov7251 4-0060") {
+            media_v2_entity dup = e;
+            dup.id = 900;
+            s.entities.push_back(dup);
+            for (const auto &p : std::vector<media_v2_pad>(s.pads))
+                if (p.entity_id == e.id) {
+                    media_v2_pad pad = p;
+                    pad.id = 901;
+                    pad.entity_id = 900;
+                    s.pads.push_back(pad);
+                }
+        }
+    Verdict v = compare_graph(r, Role::Cio2, s, ledger);
+    CHECK(!v.ok && v.reason == "graph-duplicate");
+}
+
+void duplicate_live_link_refuses()
+{
+    Reservation r = reserved();
+    EffectLedger ledger;
+    Snapshot s = cio2_graph();
+    s.links.push_back(ir_link_copy(s));
+    Verdict v = compare_graph(r, Role::Cio2, s, ledger);
+    CHECK(!v.ok && v.reason == "graph-duplicate");
+}
+
+void contract_graph_duplicate_refuses()
+{
+    auto contract = parse_contract(kContract);
+    CHECK(contract.has_value());
+    if (!contract)
+        return;
+    std::vector<Snapshot> tops = {cio2_graph(), imgu_graph()};
+    Verdict clean = match_contract_graph(*contract, tops);
+    CHECK(clean.ok);
+    tops[0].links.push_back(ir_link_copy(tops[0]));
+    Verdict v = match_contract_graph(*contract, tops);
+    CHECK(!v.ok && v.reason == "graph-duplicate");
+}
+
+void whitespace_line_refuses()
+{
+    const std::string contract = std::string(kContract) + "   \n";
+    CHECK(!parse_contract(contract).has_value());
+    CHECK(!parse_reservation(reservation_text(contract)).has_value());
+}
+
 } // namespace
 
 int main()
@@ -468,6 +529,10 @@ int main()
         {"observer_rejects_gap_or_second_header", observer_rejects_gap_or_second_header},
         {"observer_requires_count_for_every_granted_node", observer_requires_count_for_every_granted_node},
         {"observer_keeps_specific_reasons", observer_keeps_specific_reasons},
+        {"duplicate_live_entity_refuses", duplicate_live_entity_refuses},
+        {"duplicate_live_link_refuses", duplicate_live_link_refuses},
+        {"contract_graph_duplicate_refuses", contract_graph_duplicate_refuses},
+        {"whitespace_line_refuses", whitespace_line_refuses},
     };
     for (const auto &[name, test] : tests) {
         int before = failures;

@@ -644,18 +644,6 @@ constexpr const char *kContractPath = "/lab/front.contract";
 constexpr const char *kIpaDigestPath = "/lab/ipa_ipu3.sha256";
 constexpr const char *kReservationDir = "/run/book2-lab";
 
-bool graph_matches_contract(const book2lab::Reservation &contract, const std::vector<book2lab::Snapshot> &tops)
-{
-    std::set<std::string> want(contract.graph.begin(), contract.graph.end()), have;
-    for (const auto &t : tops) {
-        std::vector<std::string> records;
-        if (!book2lab::graph_records(t, &records))
-            return false;
-        have.insert(records.begin(), records.end());
-    }
-    return want == have;
-}
-
 bool bind_node(book2lab::Reservation &r, const std::string &grant, const std::vector<book2lab::Snapshot> &tops,
                const std::vector<DevNode> &v4l2)
 {
@@ -983,7 +971,7 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
     std::optional<book2lab::Reservation> contract = book2lab::parse_contract(text);
     if (!contract || !book2lab::check_front(*contract).ok)
         fail("CONTRACT");
-    if (!graph_matches_contract(*contract, tops)) {
+    if (!book2lab::match_contract_graph(*contract, tops).ok) {
         event("REFUSED_CONTRACT_GRAPH");
         event("REFUSED_BEFORE_RESERVATION");
         event("SECOND_BACKEND_BLOCKED refused");

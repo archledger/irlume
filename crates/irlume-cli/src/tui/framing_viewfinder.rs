@@ -58,9 +58,12 @@ pub(super) fn draw_stack(
         if area.width >= WIDTH {
             if let Some(slack) = area.height.checked_sub(normal_rows) {
                 let guide_y = area.y + slack / 2 + 2;
+                let progress_y = guide_y + HEIGHT + 1;
+                let detail_y = progress_y + progress_rows + 1;
                 if let Some(cue_y) = guide_y
                     .checked_sub(cue_rows.saturating_add(1))
                     .filter(|&y| y >= area.y)
+                    .filter(|_| detail_rows <= area.bottom().saturating_sub(detail_y))
                 {
                     let [cue, progress, details] = panels;
                     frame.render_widget(cue, row_area(cue_y, cue_rows));
@@ -69,11 +72,8 @@ pub(super) fn draw_stack(
                         Rect::new(area.x + area.width / 2 - WIDTH / 2, guide_y, WIDTH, HEIGHT),
                         marker,
                     );
-                    let progress_y = guide_y + HEIGHT + 1;
                     frame.render_widget(progress, row_area(progress_y, progress_rows));
-                    let detail_y = progress_y + progress_rows + 1;
-                    let visible = detail_rows.min(area.bottom().saturating_sub(detail_y));
-                    frame.render_widget(details, row_area(detail_y, visible));
+                    frame.render_widget(details, row_area(detail_y, detail_rows));
                     return true;
                 }
             }
@@ -119,5 +119,43 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
         // Keep the first and last interior rows free for the four corner marks.
         let y = inside.y + 1 + (u16::from(p.y) * (inside.height - 3) + 5) / 10;
         buffer.set_string(x - u16::from(p.size), y, marker, style);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn wrapped_detail_falls_back_only_when_it_cannot_fit_below_the_guide() {
+        for (height, framed) in [(16, false), (17, true)] {
+            let mut terminal = Terminal::new(TestBackend::new(68, height)).unwrap();
+            let detail = format!("{} detail-end", "Waiting ".repeat(10));
+            terminal
+                .draw(|frame| {
+                    assert!(draw_stack(
+                        frame,
+                        frame.area(),
+                        Line::raw("Camera guide not answering"),
+                        vec![Line::raw("0 of 4 captured")],
+                        vec![Line::raw("Profile 'demo'"), Line::raw(detail)],
+                        Guide::Frame(None),
+                    ));
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains("detail-end"),
+                "wrapped detail was cut at height {height}"
+            );
+            assert_eq!(text.contains("Framing guide"), framed, "at height {height}");
+        }
     }
 }

@@ -262,8 +262,8 @@ the daemon saves the enrollment. Webcam video and
 facial landmarks stay inside the daemon. Older daemons, root, and
 other-account sessions may show a box with no live capture marker.
 Compact terminals and `IRLUME_REDUCE_MOTION=1` keep the text-only guide.
-On a wide but short terminal, the text and progress can stay centered
-without the framing box.
+On a wide but short terminal, Irlume switches to the text-only layout
+when wrapped guidance or details would be cut off beside the framing box.
 
 During enrollment, click **Cancel enrollment** or press Esc to request cancellation.
 The guide checks cancellation after waiting or sampling, and the client checks

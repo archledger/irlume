@@ -7,31 +7,38 @@ CSI-2 receivers, two ImgU pipes and three sensors. It mirrors what the
 pinned drivers publish (names, entity functions, pads, link flags,
 capabilities and control ids) without buffers or streaming. Sensor names,
 port order, control ranges and frame sizes are synthetic until an approved
-passive inventory of the exact Book 2 exists. The driver logs every state
-change userspace causes to a root-only debugfs file, which the PID 1
-supervisor prints as `EFFECT` records for the host verifier.
+passive inventory of the exact Book 2 exists. The driver logs the
+operations through which discovery can change its state (subdevice and
+video opens and releases, control set attempts, link changes, format and
+selection sets) to a root-only debugfs file, which the PID 1 supervisor
+prints as `EFFECT` records for the host verifier. The worker's seccomp
+filter admits only discovery ioctls, so every state change it can request
+passes through that log.
 
 Build from clean checkouts of Linux
 [`988117cc1bb17338c586a4e21ade88b5397eac33`](https://github.com/gregkh/linux/tree/988117cc1bb17338c586a4e21ade88b5397eac33)
 and libcamera `v0.8.0`
 ([`df8e348d64b4932a0676256ed24f0da3ee9438bc`](https://github.com/libcamera-org/libcamera/tree/df8e348d64b4932a0676256ed24f0da3ee9438bc),
 fetched with the real tag) as an ordinary user, with a verified `bc` on
-`PATH` and a fresh scratch directory under `/tmp/opencode`:
+`PATH`, `MESON` set to a verified Meson 1.9.1 binary, QEMU x86-64 11.1.3
+with TCG and a fresh scratch directory under `/tmp/opencode`:
 
 ```sh
 lab=scripts/research/1379-lab-discovery
-bash "$lab/build_discovery_guest.sh" "$linux" "$libcamera" "$scratch/build"
+MESON="$meson" bash "$lab/build_discovery_guest.sh" "$linux" "$libcamera" "$scratch/build"
+g++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
+    "$lab/lab/test_lab_contract.cpp" "$lab/lab/lab_contract.cpp" -o "$scratch/test_lab_contract"
+"$scratch/test_lab_contract"
 python3 -B -m unittest discover -s "$lab" -p test_run_discovery.py
-for case in topology sim-controls; do
-    python3 -B "$lab/run_discovery.py" "$scratch/build" "$scratch/check-$case" "$case" || exit 1
-done
 ```
 
 The build hardlinks the pinned Linux tree, adds only the driver directory
 and its two `Kconfig`/`Makefile` lines, checks that change set with
 `git status` through a private index, and rechecks that the pinned
-checkout is still clean. The guest kernel enables KASAN and lock proving;
-any kernel `BUG`, `WARNING`, KASAN or lockdep report refuses the run.
+checkout is still clean. Meson runs with `--wrap-mode=nodownload`, so a
+missing dependency fails the build instead of fetching a subproject. The
+guest kernel enables KASAN and lock proving; any kernel `BUG`, `WARNING`,
+KASAN or lockdep report refuses the run.
 
 `topology` reads both media devices under a scope that admits only the
 two media nodes and requires the graph to equal the graph records of
@@ -79,23 +86,38 @@ patch removes that probe and leaves each decision to the open.
 | `hotplug-extra-media` | third media device after reserving | refuse `unreserved-open`, no worker effect |
 | `sim-port-variant` | front sensor on port 3 at boot | supervisor refuses before reserving |
 | `effect-unlisted-link` | link effect removed from the reservation | refused at the link, after the listed sensor effects; hold `partial-effects` |
-
 | `replace-before-discovery` | graph re-registered after reserving | same number and version, new inode; refuse `identity` before any open |
 | `generation-during-discovery` | entity added inside the front format set | hold `version` after that effect, no camera |
+| `hotplug-during-discovery` | media device added inside the front format set | hold `extra-media` after that effect, no camera |
 | `replace-after-discovery` | graph re-registered before release | ownership unknown |
 
 Every open is bracketed by the registration's kernfs inode: equal before
 and after the open, with a matching `st_rdev`. Before each listed effect the
-guard rereads both topologies and every bound inode: a change refuses the
-effect. After the effect it rereads them again: a change latches a hold.
-After the worker exits, the supervisor classifies the attempt from trusted
-evidence only: exit status, driver log and open counts, kernfs inodes, the
-media set and the live graph. `Known` needs every listed effect exactly
-once; only then does the stand-in second backend `/lab/ir-stub` run. A
-refusal with no worker effect releases without continuing the schedule.
-Anything else is `HOLD <reason>` and blocks the second backend. The
-verifier also enforces these outcome rules independently of the case
-table.
+guard rereads the media device set, both topologies and every bound inode:
+a change refuses the effect. After the effect it rereads them again: a
+change latches a hold.
+
+The supervisor writes a canary record just before each lab launch. After
+the worker exits, it classifies the attempt from trusted evidence only:
+exit status, driver log and open counts, kernfs inodes, the media set and
+the live graph. The log must start with one `dropped 0` header, number its
+records without gaps and hold exactly one canary, and the open counts must
+list every granted node at zero; otherwise the outcome is `HOLD observer`.
+`Known` needs every listed effect exactly once, counted per control record;
+a format record matches on entity, pad and size, because the simulated
+driver sets its own media bus code. Only then does the stand-in second
+backend `/lab/ir-stub` run. A refusal with no worker effect releases
+without continuing the schedule. Anything else is `HOLD <reason>` and
+blocks the second backend.
+
+The worker cannot add receipt lines. The supervisor reduces its report to
+`CAMERAS <n>` or `START_FAILED <n>` and the guard's verdict to printable
+ASCII, and escapes worker log bytes. The verifier splits the serial log on
+`\n` only and refuses a receipt line with a control character. It also
+checks four outcome rules independently of the case table: no release
+after refusal once a worker effect exists, no second backend after a hold
+or without a known owner release, and a replacement receipt that proves the
+same number and a new inode.
 
 The lab factory decides the IPA route once, at the branch, before any
 proxy exists, and can only build the threaded proxy. The lab IPU3 handler
@@ -128,6 +150,29 @@ proxy after the sensor effects. Only the worker's seccomp filter, which
 refuses the proxy's socket pair, then keeps the proxy process from
 starting.
 
+Run the complete set twice, each case in a fresh emulator instance:
+
+```sh
+for round in 1 2; do
+    for case in topology sim-controls stock-baseline lab-front graph-ir-link-enabled \
+        graph-extra-entity hotplug-extra-media sim-port-variant effect-unlisted-link \
+        replace-before-discovery generation-during-discovery hotplug-during-discovery \
+        replace-after-discovery ipa-bad-signature ipa-force-isolation ipa-env-override \
+        ipa-identity-mismatch; do
+        python3 -B "$lab/run_discovery.py" "$scratch/build" "$scratch/r$round-$case" "$case" || exit 1
+    done
+done
+```
+
+Every run needs a new receipt directory and uses its own nonce. B03 passes
+only when every case passes in both rounds, and the five B01/B02 cases in
+`scripts/research/1379-lab-boot` still pass on an image built from the same
+revision. Keep `build.sha256`, `inputs.sha256`, `guest.config` and each
+case's serial log and verifier output with the signed source revision and
+tool versions. Do not attach a guest image to a support issue.
+
 These results concern the simulated graph in this guest only. They say
 nothing about the real Book 2 graph, its drivers' effects, teardown,
-optical state or authentication.
+optical state or authentication. B04 through B11 need their own plan and
+B12 remains a separate attended-device decision; no hardware run or
+reporter contact follows from this result.

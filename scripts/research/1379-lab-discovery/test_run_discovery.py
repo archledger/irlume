@@ -178,6 +178,24 @@ class VerifierTests(unittest.TestCase):
         setup = script.split('"$MESON" setup', 1)[1].split(">", 1)[0]
         self.assertIn("--wrap-mode=nodownload", setup)
 
+    def test_readme_runs_every_case_in_both_rounds(self):
+        text = (rd.HERE / "README.md").read_text()
+        self.assertIn("for round in 1 2; do\n", text)
+        loop = text.split("for round in 1 2; do\n", 1)[1].split("; do\n", 1)[0]
+        listed = loop.replace("\\\n", " ").split("for case in", 1)[1].split()
+        self.assertEqual(sorted(listed), sorted(rd.CASES))
+
+    def test_readme_case_tables_are_unbroken(self):
+        text = (rd.HERE / "README.md").read_text()
+        lines = text.splitlines()
+        rows = [i for i, line in enumerate(lines) if line.startswith("| `")]
+        for i in rows:
+            self.assertTrue(lines[i - 1].startswith("|"), f"README line {i + 1} is a table row after a break")
+        prose = {"topology", "sim-controls", "stock-baseline"}
+        self.assertEqual({lines[i].split("`")[1] for i in rows}, set(rd.CASES) - prose)
+        for name in prose:
+            self.assertIn(f"`{name}`", text)
+
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")
         args = rd.qemu_args(build / "bzImage", build / "lab.cpio", rd.Path("/tmp/opencode/x/r/serial.log"),

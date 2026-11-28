@@ -52,37 +52,34 @@ bash scripts/research/1379-stage-a/native/check.sh \
 
 The check requires positive compilation and linking plus deliberate
 single-planar, wrong C++ signature, omitted-library and ambient pkg-config
-failures. It does not execute the resulting `libcamera-link` executable.
+failures. It clears ambient compiler include overrides and records actual GCC
+header traces, refusing Linux or libcamera headers outside the verified roots.
+It records the linked executable hash without running `libcamera-link`.
 Header and link success say nothing about the reporter's loaded modules,
 ownership of the media graphs, safe teardown or optical OFF.
 
 ## Isolated link and fixture run
 
 Use Rust 1.88.0, Python 3 and bubblewrap with user and network namespaces.
-The following builds the test target without running it on the host and
-selects its unit-test artifact from Cargo:
+The following selects the current unit-test executable from Cargo's
+`--no-run` output and records its hash. Neither executable runs on the host.
 
 ```sh
 here=scripts/research/1379-stage-a
-export CARGO_TARGET_DIR="$scratch/rust-target"
-cargo +1.88.0 test --locked --offline --no-run --message-format=json \
-    --manifest-path "$here/fixture/Cargo.toml" > "$scratch/fixture-artifacts.jsonl"
-fixture=$(python3 -c 'import json, sys
-items = map(json.loads, sys.stdin)
-path, = [item["executable"] for item in items
-         if item.get("target", {}).get("name") == "irlume_book2_stage_a"
-         and item.get("profile", {}).get("test") and item.get("executable")]
-print(path)' < "$scratch/fixture-artifacts.jsonl")
+mkdir -p "$scratch/rust-target"
+fixture=$(python3 -B "$here/fixture_build.py" "$scratch/rust-target")
 python3 -B "$here/run_isolated.py" "$scratch/sdk" "$scratch/sdk.sha256" \
     "$scratch/native/libcamera-link" "$fixture"
 ```
 
-The inputs must belong to the just-verified private build. The runner checks
-the SDK receipt, binds only the two approved library files and the expected
-witness or test executable, and fails rather than falling back to host
-execution. Only the witness's runtime version read occurs; no manager or
-handler is started. Both synthetic capture orders and negative teardown cases
-run in the Rust test binary. Its scratch marker persists across an actual
+The inputs and receipts must belong to the just-verified private build. The
+runner checks the SDK and both executable receipts. It mounts only the two
+approved library files and expected witness or test executable, refuses host
+fallback, and requires the exact named Stage A test set. These receipts are
+for trusted scratch, not proof against a writer that can replace both artifacts
+and receipts. The witness reads the runtime version without starting a manager
+or handler. Both synthetic capture orders and negative teardown cases run in
+the Rust test binary. Its scratch marker persists across an actual
 child exit and reopen; that is not a power-loss or rollback-resistance result.
 The synthetic `ip3y` checks establish layout and payload bounds, not receiver
 completeness, device identity, ownership, optical state or authorization.

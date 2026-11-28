@@ -4,11 +4,28 @@ import re
 import subprocess
 import sys
 
+from artifact_receipt import verify_executable
 from native.sdk_manifest import verify_sdk
 
 BWRAP = "/usr/bin/bwrap"
 LIBRARIES = ("libcamera.so.0.8", "libcamera-base.so.0.8")
 WITNESS = "libcamera link witness: 0.8.0\n"
+REQUIRED_TESTS = frozenset({
+    "handover_tests::both_orders_one_reservation",
+    "handover_tests::cleanup_is_not_worker_success",
+    "handover_tests::entry_owner_loss_blocks_the_next_phase",
+    "handover_tests::lost_final_observation_is_not_complete",
+    "handover_tests::no_owner_means_no_intent_or_phase",
+    "handover_tests::prior_ir_receipt_cannot_clear_later_phase",
+    "handover_tests::timeout_distinguishes_known_cleanup",
+    "handover_tests::unconfirmed_intent_refuses_before_effect",
+    "ip3y_tests::exact_layout_and_error_flag_refuse",
+    "ip3y_tests::extent_is_checked_before_slicing",
+    "ip3y_tests::reference_layout_decodes_without_padding",
+    "journal_tests::child_exit_after_intent_keeps_attempt_closed",
+    "journal_tests::marker_present_before_begin_phase",
+    "journal_tests::occupied_or_unwritable_marker_never_starts",
+})
 
 PREFLIGHT = r"""
 import os
@@ -73,7 +90,11 @@ def fixture_count(output: str) -> int:
     )
     if len(start) != 1 or start != end or int(start[0]) == 0:
         raise ValueError("expected a nonzero full fixture count with no skips")
-    return int(start[0])
+    count = int(start[0])
+    names = re.findall(r"^test (\S+) \.\.\. ok$", output, re.M)
+    if count != len(REQUIRED_TESTS) or len(names) != count or set(names) != REQUIRED_TESTS:
+        raise ValueError("expected the exact Stage A fixture test set")
+    return count
 
 
 def _scratch_path(value: str) -> Path:
@@ -89,6 +110,8 @@ def run_proof(sdk: Path, manifest: Path, witness: Path, fixture: Path) -> int:
     if os.geteuid() == 0:
         raise ValueError("run this proof without privilege")
     libraries = verify_sdk(sdk, manifest)
+    verify_executable(witness)
+    verify_executable(fixture)
     mounts = (
         *((source, f"/sdk/lib/{name}") for source, name in zip(libraries, LIBRARIES, strict=True)),
         (witness, "/libcamera-link"),

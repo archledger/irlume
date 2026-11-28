@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from run_isolated import fixture_count, sandbox_run, verify_loader
+from artifact_receipt import executable_receipt, verify_executable
+from run_isolated import REQUIRED_TESTS, fixture_count, sandbox_run, verify_loader
 
 
 class IsolationTests(unittest.TestCase):
@@ -65,8 +66,10 @@ class IsolationTests(unittest.TestCase):
                 verify_loader(trace)
 
     def test_fixture_zero_or_incomplete_tests_fail(self):
-        def result(run, passed, ignored=0, filtered=0):
+        def result(run, passed, ignored=0, filtered=0, names=sorted(REQUIRED_TESTS)):
+            rows = "".join(f"test {name} ... ok\n" for name in names)
             return (f"running {run} tests\n\n"
+                    f"{rows}\n"
                     f"test result: ok. {passed} passed; 0 failed; {ignored} ignored; "
                     f"0 measured; {filtered} filtered out; finished in 0.00s\n")
         self.assertEqual(fixture_count(result(14, 14)), 14)
@@ -74,6 +77,31 @@ class IsolationTests(unittest.TestCase):
                        result(14, 14, filtered=1), result(14, 14) * 2):
             with self.assertRaisesRegex(ValueError, "full fixture count"):
                 fixture_count(output)
+
+    def test_positive_stale_fixture_suite_fails(self):
+        def success(names, count):
+            rows = "".join(f"test {name} ... ok\n" for name in names)
+            return (f"running {count} tests\n{rows}test result: ok. {count} passed; "
+                    "0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n")
+        only_ip3y = [n for n in REQUIRED_TESTS if n.startswith("ip3y_tests::")]
+        wrong = sorted(REQUIRED_TESTS - {"journal_tests::child_exit_after_intent_keeps_attempt_closed"})
+        wrong.append("journal_tests::something_else")
+        for text in (success(only_ip3y, 3), success(wrong, 14)):
+            with self.assertRaisesRegex(ValueError, "exact Stage A fixture test set"):
+                fixture_count(text)
+
+    def test_executable_receipt_requires_the_same_bytes(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            witness = Path(scratch) / "link-witness"
+            witness.write_bytes(b"known fixture ELF bytes")
+            witness.chmod(0o700)
+            with self.assertRaisesRegex(ValueError, "missing executable build receipt"):
+                verify_executable(witness)
+            witness.with_suffix(".sha256").write_text(executable_receipt(witness))
+            verify_executable(witness)
+            witness.write_bytes(b"different same-named file")
+            with self.assertRaisesRegex(ValueError, "build receipt mismatch"):
+                verify_executable(witness)
 
     def test_subprocess_timeout_fails(self):
         with self.assertRaises(subprocess.TimeoutExpired):

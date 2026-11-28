@@ -10,6 +10,7 @@ sdk=$(realpath -e -- "$2")
 manifest=$(realpath -e -- "$3")
 out=$(realpath -m -- "$4")
 export LC_ALL=C
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH
 
 [[ $out == /tmp/opencode/* ]] || die "output must be under /tmp/opencode"
 mkdir -p -- "$out"
@@ -51,10 +52,14 @@ reject() {
     grep -F -- "$expected" "$log"
 }
 
-gcc "${c_args[@]}" "$here/linux_uapi.c"
+gcc "${c_args[@]}" -H "$here/linux_uapi.c" 2>"$out/uapi-headers.log" ||
+    { cat "$out/uapi-headers.log" >&2; exit 1; }
+python3 -B "$here/check_headers.py" uapi "$uapi/include" "$out/uapi-headers.log"
 reject 'native IR requires the multiplanar queue' "$out/single-plane-negative.log" \
     gcc "${c_args[@]}" -DCHECK_SINGLE_PLANE "$here/linux_uapi.c"
-g++ "${cxx_args[@]}" -c "$here/libcamera_link.cpp" -o "$out/libcamera-link.o"
+g++ "${cxx_args[@]}" -H -c "$here/libcamera_link.cpp" -o "$out/libcamera-link.o" \
+    2>"$out/libcamera-headers.log" || { cat "$out/libcamera-headers.log" >&2; exit 1; }
+python3 -B "$here/check_headers.py" libcamera "$sdk/include/libcamera" "$out/libcamera-headers.log"
 reject 'static assertion failed: manager stop is void' "$out/manager-stop-negative.log" \
     g++ "${cxx_args[@]}" -DCHECK_MANAGER_STOP_STATUS -fsyntax-only "$here/libcamera_link.cpp"
 
@@ -72,4 +77,5 @@ readelf -d "$out/libcamera-link" >"$out/dynamic.log"
 grep -Eq '\(NEEDED\).*\[libcamera\.so\.0\.8\]' "$out/dynamic.log" ||
     die "linked witness lacks the libcamera dependency"
 readelf -d "${libraries[@]}" >>"$out/dynamic.log"
+(cd -- "$out" && sha256sum libcamera-link >libcamera-link.sha256)
 printf '%s\n' 'Native assertions and link passed; link witness not executed.'

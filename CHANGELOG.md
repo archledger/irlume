@@ -7,6 +7,11 @@ All notable changes to irlume are documented here. This project adheres to
 
 ### Added
 
+- The enrollment guide gives a left or right instruction when a fresh
+  position makes the direction clear. Four fixed corner marks keep all
+  three marker sizes readable, and one count shows accepted scans
+  throughout enrollment (#1435 follow-up).
+
 - The TUI centers the enrollment cue and countdown above a live framing
   guide and scan progress. The guide stays through approval, capture,
   and the result. A fresh mirrored position and distance marker comes

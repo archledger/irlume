@@ -475,26 +475,39 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         frames.push(frame);
         visual_assert_no_work(&input);
 
-        for state in ["guidance", "countdown", "stalled"] {
+        for state in ["guidance", "countdown", "stalled", "approval", "capture", "capture without position", "finishing"] {
             let mut app = visual_fixture(SC_PROFILES);
             // Pure in-memory channel/report fixtures. No enrollment worker,
             // camera request, poll, cancellation or command is invoked.
             let (_sender, mut enrollment) = fake_enroll(0, 4);
             enrollment.profile = "Synthetic enrollment".into();
-            enrollment.captured = 1;
-            enrollment.last = Some((good_report("Synthetic guidance: hold still"), app.now()));
+            let now = app.now();
+            enrollment.last = Some((PositionReport {
+                centered: false,
+                well_framed: false,
+                ..good_report("Center your face in the frame")
+            }, now));
             enrollment.viewfinder = Some(ViewfinderSample {
                 position: Some(FramingPosition {
                     x: if state == "countdown" { 5 } else { 2 },
                     y: 5,
                     size: 1,
                 }),
-                sampled_at: app.now(),
+                sampled_at: now,
             });
-            if state == "countdown" {
-                enrollment.count = Some(3);
-            } else if state == "stalled" {
-                enrollment.stalled = Some("Synthetic guide timeout; no camera was opened".into());
+            match state {
+                "countdown" => enrollment.count = Some(3),
+                "stalled" => enrollment.stalled = Some("Synthetic guide timeout".into()),
+                "approval" => enrollment.phase = EnrollmentPhase::Authorizing,
+                "capture" | "capture without position" | "finishing" => {
+                    enrollment.phase = EnrollmentPhase::Capturing;
+                    enrollment.captured = if state == "finishing" { 4 } else { 1 };
+                    if state == "capture" {
+                        enrollment.capture_framing = irlume_common::enrollment_monotonic_ms()
+                            .map(|now| (FramingPosition { x: 5, y: 5, size: 2 }, now));
+                    }
+                }
+                _ => {}
             }
             let stop = enrollment.stop.clone();
             app.enroll = Some(enrollment);
@@ -510,6 +523,20 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
                 !stop.load(Ordering::Relaxed),
                 "drawing cannot request cancellation"
             );
+        }
+        for (message, captured) in [
+            ("Enrollment complete", 4),
+            ("Enrollment failed", 1),
+            ("Cancellation requested", 1),
+        ] {
+            let mut app = visual_fixture(SC_PROFILES);
+            app.enrollment_result = Some(EnrollmentResultView {
+                profile: "Synthetic enrollment".into(),
+                captured,
+                total: 4,
+                message,
+            });
+            frames.push(visual_frame(&app, message, width, height));
         }
     }
     for (width, height) in [(80, 24), (100, 30), (120, 40)] {
@@ -725,7 +752,7 @@ fn synthetic_visual_gallery_all_screens_and_overlays() {
         assert!(app.click_targets.borrow().is_empty());
         frames.push(frame);
     }
-    assert_eq!(frames.len(), SCREENS.len() * 3 + 116);
+    assert_eq!(frames.len(), SCREENS.len() * 3 + 137);
     if let Some(output) = std::env::var_os("IRLUME_TUI_GALLERY_DIR") {
         let directory = std::path::PathBuf::from(output);
         assert!(

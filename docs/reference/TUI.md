@@ -245,20 +245,20 @@ switch confirmation rather than silently choosing a replacement.
 
 ## Enrollment framing guide
 
-When the terminal has room, the enrollment screen stacks the text cue or
-countdown, the framing guide, scan progress, and the checklist in the
-center, with one blank row between sections. The box is there as
-enrollment starts, and the marker appears when a fresh position arrives.
-Move to your right and the marker moves right; move closer and it grows.
-The brackets are a visual
-reference, not a readiness check. Follow the text cue for position,
-angle, and lighting.
+When the terminal has room, the enrollment screen centers the instruction,
+framing guide, and scan count with one blank row between sections. Follow the
+text for position, angle, and lighting. When the guide can tell which way
+to move, it says left or right from your perspective. The marker is mirrored
+like a selfie. It grows or shrinks with how large your face appears in the
+frame, not a measured distance. The corner marks are a visual reference,
+not a readiness check.
 
-The box stays during approval, capture, and the result. The marker
-clears during approval and when Irlume has no fresh position. During
-capture it uses the enrollment operation's own RGB observations, when
-available. Progress counts actual scans and does not confirm success
-until the daemon has finished saving the enrollment. Webcam video and
+The box stays during approval, capture, and the result. The marker clears
+during approval, finishing, and the result, or when no fresh position is
+available. During capture it uses the enrollment operation's own RGB
+observations; a missing marker does not mean a scan was rejected.
+The count shows accepted scans. The result reports success only after
+the daemon saves the enrollment. Webcam video and
 facial landmarks stay inside the daemon. Older daemons, root, and
 other-account sessions may show a box with no live capture marker.
 Compact terminals and `IRLUME_REDUCE_MOTION=1` keep the text-only guide.

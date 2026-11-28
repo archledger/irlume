@@ -90,20 +90,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, position: Option<FramingPo
         .title_alignment(Alignment::Center);
     let inside = border.inner(area);
     frame.render_widget(border, area);
-    let center = inside.x + inside.width / 2;
-    let middle = inside.y + inside.height / 2;
     let buffer = frame.buffer_mut();
     let style = Style::default();
+    for (x, y, tick) in [(11, 1, "┌"), (21, 1, "┐"), (11, 7, "└"), (21, 7, "┘")] {
+        buffer.set_string(area.x + x, area.y + y, tick, style);
+    }
     if let Some(p) = position.filter(|p| p.in_bounds()) {
         let marker = ["o", "(o)", "((o))"][usize::from(p.size)];
         // Leave room for the largest mark at either edge and mirror like a selfie.
         let mirrored = u16::try_from(5 + horizontal_offset(p)).unwrap_or_default();
         let x = inside.x + 2 + (mirrored * (inside.width - 5) + 5) / 10;
-        let y = inside.y + (u16::from(p.y) * (inside.height - 1) + 5) / 10;
+        // Keep the first and last interior rows free for the four corner marks.
+        let y = inside.y + 1 + (u16::from(p.y) * (inside.height - 3) + 5) / 10;
         buffer.set_string(x - u16::from(p.size), y, marker, style);
     }
-    // Keep the target visible when a marker edge crosses it. Neither bracket
-    // column coincides with a marker center.
-    buffer.set_string(center - 6, middle, "[", style);
-    buffer.set_string(center + 6, middle, "]", style);
 }

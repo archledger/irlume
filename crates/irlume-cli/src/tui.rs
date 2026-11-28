@@ -163,6 +163,7 @@ const ATTEMPTS_BUDGET_SECS: u64 = 4;
 /// load before it binds its socket.
 const DAEMON_WAIT_TRIES: u32 = 40;
 const DAEMON_WAIT_POLL_MS: u64 = 250;
+const CAPTURED_SCAN_LOG_PREFIX: &str = "captured scan ";
 /// One line of the sidebar rail. `sidebar_rows` builds the list, `draw_sidebar`
 /// renders it, and `on_click` maps a clicked inner row back to its `Nav(screen)`
 /// so a click always lands on the row the eye sees.
@@ -4380,10 +4381,7 @@ impl App {
                         }
                     }
                     WMsg::Authorizing => {
-                        self.log(
-                            '·',
-                            "approve the system authentication dialog for this enrollment",
-                        );
+                        self.log('·', "approve the system authentication dialog if prompted");
                         if let Some(e) = &mut self.enroll {
                             e.phase = EnrollmentPhase::Authorizing;
                             e.count = None;
@@ -4488,7 +4486,10 @@ impl App {
                             e.count = None;
                             e.viewfinder = None;
                         }
-                        self.log('✓', format!("captured scan {}/{}", n + base, t + base));
+                        self.log(
+                            '✓',
+                            format!("{CAPTURED_SCAN_LOG_PREFIX}{}/{}", n + base, t + base),
+                        );
                     }
                     WMsg::Done { ambient_lit } => {
                         self.enrollment_result = self
@@ -7931,7 +7932,7 @@ impl App {
             ))
         } else if e.phase == EnrollmentPhase::Authorizing {
             Line::from(Span::styled(
-                "Approve the system dialog",
+                "Approve the system dialog if prompted",
                 Style::new().bold(),
             ))
         } else if e.phase == EnrollmentPhase::LegacyScan {
@@ -7986,7 +7987,7 @@ impl App {
             Guide::TextOnly
         };
         let detail = if let Some(error) = &e.stalled {
-            format!("({error}) Check: journalctl -u irlumed -n 50")
+            format!("Check: journalctl -u irlumed -n 50 ({error})")
         } else if e.phase == EnrollmentPhase::LegacyScan {
             "Approve the system dialog if prompted".into()
         } else {
@@ -10533,7 +10534,15 @@ impl App {
         let lines: Vec<Line> = self.activity[start..end]
             .iter()
             .enumerate()
-            .map(|(offset, (g, _))| {
+            .map(|(offset, (g, message))| {
+                if !expanded
+                    && !scrolled
+                    && (self.enroll.is_some() || self.enrollment_result.is_some())
+                    && *g == '✓'
+                    && message.starts_with(CAPTURED_SCAN_LOG_PREFIX)
+                {
+                    return Line::raw("Scan progress is shown above.");
+                }
                 let gs = match g {
                     '→' => Style::new().fg(th().accent),
                     '✓' => Style::new().fg(th().ok),
@@ -12239,6 +12248,15 @@ fn merge_confirmation_required(first_new_profile_scan: bool, created: bool) -> b
     first_new_profile_scan && !created
 }
 
+fn enrollment_position_sample(request: &Request) -> Result<Response, String> {
+    crate::daemon_sample(request).map(|mut response| {
+        if let Response::Position(report) = &mut response {
+            report.viewfinder = None;
+        }
+        response
+    })
+}
+
 /// One framing/countdown phase followed by one authorized batch connection.
 fn enroll_worker(
     user: String,
@@ -12278,12 +12296,7 @@ fn enroll_worker(
                 // connection after a framing, transport or deadline failure.
                 Err(error) => Response::Error(format!("camera guide stopped: {error}")),
             }),
-            None => crate::daemon_sample(request).map(|mut response| {
-                if let Response::Position(report) = &mut response {
-                    report.viewfinder = None;
-                }
-                response
-            }),
+            None => enrollment_position_sample(request),
         };
         match guide_until_capture(&user, &stop, &send, &mut sample, &mut misses) {
             GuideOutcome::Ready => break,
@@ -12420,7 +12433,7 @@ fn legacy_enroll_worker(
                 &user,
                 &stop,
                 &send,
-                &mut |req| crate::daemon_sample(req),
+                &mut enrollment_position_sample,
                 &mut misses,
             ) {
                 GuideOutcome::Ready => {}
@@ -19561,7 +19574,7 @@ mod tests {
         tx.send(WMsg::Authorizing).unwrap();
         app.poll();
         let waiting = render(&app);
-        assert!(waiting.contains("Approve the system dialog"));
+        assert!(waiting.contains("Approve the system dialog if prompted"));
         assert_eq!(
             waiting.lines().nth(guide_row),
             framing.lines().nth(guide_row)
@@ -19637,6 +19650,42 @@ mod tests {
         assert!(!render(&app).contains("Framing guide"));
         drain_loads(&mut app);
         wait_live_done(&mut app);
+    }
+
+    #[test]
+    fn continuous_enrollment_wrapped_detail_does_not_move_guide() {
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 10);
+        app.enroll = Some(enrollment);
+        let anchors = |app: &App| {
+            let text = draw_text_at(app, 100, 31);
+            let locate = |needle| text.lines().position(|row| row.contains(needle)).unwrap();
+            (locate("Framing guide"), locate("0 of 10 captured"))
+        };
+        let initial = anchors(&app);
+        tx.send(WMsg::Stall(
+            "The synthetic transport timed out while waiting for an answer from the local enrollment guide".into(),
+        )).unwrap();
+        app.poll();
+        assert_eq!(anchors(&app), initial);
+        assert!(draw_text_at(&app, 100, 31).contains("journalctl"));
+    }
+
+    #[test]
+    fn continuous_enrollment_does_not_repeat_count_in_collapsed_activity() {
+        let _guard = dead_socket();
+        let mut app = test_app();
+        app.screen = SC_PROFILES;
+        let (tx, enrollment) = fake_enroll(0, 10);
+        app.enroll = Some(enrollment);
+        tx.send(WMsg::Captured(3, 10)).unwrap();
+        app.poll();
+        let panel = draw_text_at(&app, 128, 48);
+        assert!(panel.contains("3 of 10 captured"));
+        assert!(!panel.contains("captured scan 3/10"));
+        app.on_key(KeyCode::Char('L'));
+        assert!(draw_text_at(&app, 128, 48).contains("captured scan 3/10"));
     }
 
     #[test]

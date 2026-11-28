@@ -31,6 +31,7 @@ pub(super) fn draw_stack(
     details: Vec<Line<'_>>,
     guide: Guide,
 ) -> bool {
+    let detail_slots = u16::try_from(details.len()).unwrap_or(u16::MAX);
     let panels = [
         Paragraph::new(cue),
         Paragraph::new(progress),
@@ -47,33 +48,48 @@ pub(super) fn draw_stack(
     else {
         return false;
     };
+    let row_area = |y, height| Rect::new(area.x, y, area.width, height);
+    if let Guide::Frame(marker) = guide {
+        // Center the normal stack, then spend surrounding space on wrapped
+        // text without changing the guide or progress rows.
+        let normal_rows = (1 + HEIGHT + GUIDE_GAP_ROWS)
+            .saturating_add(progress_rows)
+            .saturating_add(detail_slots);
+        if area.width >= WIDTH {
+            if let Some(slack) = area.height.checked_sub(normal_rows) {
+                let guide_y = area.y + slack / 2 + 2;
+                if let Some(cue_y) = guide_y
+                    .checked_sub(cue_rows.saturating_add(1))
+                    .filter(|&y| y >= area.y)
+                {
+                    let [cue, progress, details] = panels;
+                    frame.render_widget(cue, row_area(cue_y, cue_rows));
+                    draw(
+                        frame,
+                        Rect::new(area.x + area.width / 2 - WIDTH / 2, guide_y, WIDTH, HEIGHT),
+                        marker,
+                    );
+                    let progress_y = guide_y + HEIGHT + 1;
+                    frame.render_widget(progress, row_area(progress_y, progress_rows));
+                    let detail_y = progress_y + progress_rows + 1;
+                    let visible = detail_rows.min(area.bottom().saturating_sub(detail_y));
+                    frame.render_widget(details, row_area(detail_y, visible));
+                    return true;
+                }
+            }
+        }
+    }
     let Some(text_slack) = [cue_rows, progress_rows, detail_rows]
         .into_iter()
         .try_fold(area.height, u16::checked_sub)
     else {
         return false;
     };
-    let (guide, guide_rows, intervals) = match guide {
-        Guide::Frame(marker) if area.width >= WIDTH && text_slack >= HEIGHT + GUIDE_GAP_ROWS => {
-            (Guide::Frame(marker), HEIGHT, GUIDE_GAP_ROWS)
-        }
-        _ => (Guide::TextOnly, 0, 2),
-    };
-    let slack = text_slack - guide_rows;
-    let gap = u16::from(slack >= intervals);
-    let top = area.y + (slack - gap * intervals) / 2;
+    let gap = u16::from(text_slack >= 2);
+    let top = area.y + (text_slack - gap * 2) / 2;
     let [cue, progress, details] = panels;
-    let row_area = |y, height| Rect::new(area.x, y, area.width, height);
     frame.render_widget(cue, row_area(top, cue_rows));
-    let mut y = top + cue_rows + gap;
-    if let Guide::Frame(marker) = guide {
-        draw(
-            frame,
-            Rect::new(area.x + area.width / 2 - WIDTH / 2, y, WIDTH, HEIGHT),
-            marker,
-        );
-        y += guide_rows + gap;
-    }
+    let y = top + cue_rows + gap;
     frame.render_widget(progress, row_area(y, progress_rows));
     frame.render_widget(details, row_area(y + progress_rows + gap, detail_rows));
     true

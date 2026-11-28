@@ -78,7 +78,24 @@ patch removes that probe and leaves each decision to the open.
 | `graph-extra-entity` | entity added after reserving | refuse `version`, no worker effect |
 | `hotplug-extra-media` | third media device after reserving | refuse `unreserved-open`, no worker effect |
 | `sim-port-variant` | front sensor on port 3 at boot | supervisor refuses before reserving |
-| `effect-unlisted-link` | link effect removed from the reservation | refused at the link, after the listed sensor effects |
+| `effect-unlisted-link` | link effect removed from the reservation | refused at the link, after the listed sensor effects; hold `partial-effects` |
+
+| `replace-before-discovery` | graph re-registered after reserving | same number and version, new inode; refuse `identity` before any open |
+| `generation-during-discovery` | entity added inside the front format set | hold `version` after that effect, no camera |
+| `replace-after-discovery` | graph re-registered before release | ownership unknown |
+
+Every open is bracketed by the registration's kernfs inode: equal before
+and after the open, with a matching `st_rdev`. Before each listed effect the
+guard rereads both topologies and every bound inode: a change refuses the
+effect. After the effect it rereads them again: a change latches a hold.
+After the worker exits, the supervisor classifies the attempt from trusted
+evidence only: exit status, driver log and open counts, kernfs inodes, the
+media set and the live graph. `Known` needs every listed effect exactly
+once; only then does the stand-in second backend `/lab/ir-stub` run. A
+refusal with no worker effect releases without continuing the schedule.
+Anything else is `HOLD <reason>` and blocks the second backend. The
+verifier also enforces these outcome rules independently of the case
+table.
 
 These results concern the simulated graph in this guest only. They say
 nothing about the real Book 2 graph, its drivers' effects, teardown,

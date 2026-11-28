@@ -82,6 +82,7 @@ strict_cxx=(g++ -std=c++20 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -isystem "$ua
 "${strict_cxx[@]}" -static -I "$boot/guest" -I "$here/lab" "$here/guest/discovery_supervisor.cpp" \
     "$here/lab/lab_contract.cpp" "$out/cgroup_device.o" -o "$out/supervisor"
 readelf -l -d "$out/supervisor" >"$out/supervisor-elf.txt"
+"${strict_c[@]}" -static "$here/guest/ir_stub.c" -o "$out/ir-stub"
 if grep -Eq 'INTERP|NEEDED' "$out/supervisor-elf.txt"; then die "supervisor is not static"; fi
 
 # libcamera sees only gnutls, yaml-0.1 and the .pc files they require.
@@ -247,7 +248,8 @@ sha256sum -- "$scratch/lc-lab-stage/usr/lib/libcamera/ipa/ipa_ipu3.so" | cut -d'
 gcc -O2 "$linux/usr/gen_init_cpio.c" -o "$out/gen_init_cpio"
 image_list "$out/supervisor" "$out/worker-lab" "$scratch/lc-lab-stage" "$out/closure-lab.txt" >"$out/lab.list"
 printf '%s\n' "file /lab/front.contract $here/contract/front.contract 644 0 0" \
-    "file /lab/ipa_ipu3.sha256 $out/ipa_ipu3.sha256 644 0 0" >>"$out/lab.list"
+    "file /lab/ipa_ipu3.sha256 $out/ipa_ipu3.sha256 644 0 0" "file /lab/ir-stub $out/ir-stub 755 0 0" \
+    >>"$out/lab.list"
 "$out/gen_init_cpio" "$out/lab.list" >"$out/lab.cpio"
 image_list "$out/supervisor" "$out/worker-stock" "$scratch/lc-stock-stage" "$out/closure-stock.txt" \
     >"$out/stock.list"

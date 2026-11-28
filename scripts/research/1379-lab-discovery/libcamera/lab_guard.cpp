@@ -83,6 +83,16 @@ unsigned int suffix(const std::string &name)
 	return at == std::string::npos ? 0 : static_cast<unsigned int>(std::stoul(name.substr(at + 1)));
 }
 
+bool kernfsInode(unsigned major, unsigned minor, uint64_t *inode)
+{
+	struct stat st {};
+	const std::string path = "/sys/dev/char/" + std::to_string(major) + ":" + std::to_string(minor);
+	if (stat(path.c_str(), &st) != 0)
+		return false;
+	*inode = st.st_ino;
+	return true;
+}
+
 const char *entityLabel(const ::book2lab::Snapshot &s, uint32_t id, std::string *out)
 {
 	for (const auto &e : s.entities)
@@ -115,12 +125,48 @@ int Guard::refuse(const std::string &reason, bool hold)
 	return -EPERM;
 }
 
+/* Reread both topologies and every bound kernfs inode. */
+Verdict Guard::recheckLocked()
+{
+	for (const auto &[role, fd] : mediaFds_) {
+		::book2lab::Snapshot s;
+		if (::book2lab::read_snapshot(fd, &s) != 0)
+			return { false, "snapshot" };
+		Verdict v = ::book2lab::compare_graph(*reservation_, role == "cio2" ? ::book2lab::Role::Cio2 : ::book2lab::Role::Imgu,
+						      s, ledger_);
+		if (!v.ok)
+			return v;
+	}
+	for (const Node &n : reservation_->nodes) {
+		uint64_t inode = 0;
+		if (!kernfsInode(n.major, n.minor, &inode) || inode != n.inode)
+			return { false, "identity" };
+	}
+	return {};
+}
+
+/* A change before the effect refuses it; settle() turns a change after it into a hold. */
 int Guard::admitEffect(const ::book2lab::Effect &effect)
 {
-	Verdict v = ::book2lab::match_effect(*reservation_, effect, &ledger_);
+	Verdict v = recheckLocked();
+	if (!v.ok)
+		return refuse(v.reason);
+	v = ::book2lab::match_effect(*reservation_, effect, &ledger_);
 	if (!v.ok)
 		return refuse(v.reason + " " + ::book2lab::format_effect(effect));
+	pendingSettle_ = true;
 	return 0;
+}
+
+void Guard::settle()
+{
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!pendingSettle_)
+		return;
+	pendingSettle_ = false;
+	Verdict v = recheckLocked();
+	if (!v.ok)
+		refuse(v.reason, true);
 }
 
 Verdict Guard::admitDiscovery(MediaDevice &cio2, MediaDevice &imgu)
@@ -153,6 +199,7 @@ Verdict Guard::admitDiscovery(MediaDevice &cio2, MediaDevice &imgu)
 		if (device->topologyVersion() != s.version)
 			return fail("version");
 		snapshots_[::book2lab::role_name(role)] = std::move(s);
+		mediaFds_[::book2lab::role_name(role)] = device->labFd();
 	}
 	return {};
 }
@@ -169,11 +216,20 @@ int Guard::admitOpen(const std::string &path, int flags, const Node **node)
 			match = &n;
 	if (!match)
 		return refuse("unreserved-open");
+	/*
+	 * Bracket the open with the registration's kernfs inode, unique within
+	 * a boot: equal before and after means the descriptor names the
+	 * reserved object, even if a replacement reused the device number.
+	 */
+	uint64_t before = 0, after = 0;
+	if (!kernfsInode(match->major, match->minor, &before) || before != match->inode)
+		return refuse("identity");
 	int fd = ::open(path.c_str(), flags | O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
 	struct stat st {};
-	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) || st.st_rdev != makedev(match->major, match->minor)) {
+	if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) || st.st_rdev != makedev(match->major, match->minor) ||
+	    !kernfsInode(match->major, match->minor, &after) || after != match->inode) {
 		::close(fd);
 		return refuse("identity");
 	}
@@ -253,6 +309,11 @@ Verdict Guard::finalCheck()
 	std::lock_guard<std::mutex> lock(mutex_);
 	if (!latched_.empty()) {
 		refuse(latched_);
+		return { false, latched_ };
+	}
+	Verdict v = recheckLocked();
+	if (!v.ok) {
+		refuse(v.reason, true);
 		return { false, latched_ };
 	}
 	if (!verdictWritten_) {

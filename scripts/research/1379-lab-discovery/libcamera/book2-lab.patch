@@ -55,7 +55,7 @@ index 1a63fc5..3dabbbb 100644
  	std::unique_ptr<EventNotifier> fdEventNotifier_;
  	bool frameStartEnabled_;
 diff --git a/src/libcamera/media_device.cpp b/src/libcamera/media_device.cpp
-index 3f974ea..f71dc8a 100644
+index 3f974ea..4dd9b9b 100644
 --- a/src/libcamera/media_device.cpp
 +++ b/src/libcamera/media_device.cpp
 @@ -7,6 +7,8 @@
@@ -67,7 +67,7 @@ index 3f974ea..f71dc8a 100644
  #include <errno.h>
  #include <fcntl.h>
  #include <stdint.h>
-@@ -30,6 +32,21 @@
+@@ -30,6 +32,25 @@
  
  namespace libcamera {
  
@@ -81,7 +81,11 @@ index 3f974ea..f71dc8a 100644
 +		errno = -ret;
 +		return -1;
 +	}
-+	return ::ioctl(fd, request, arg);
++	ret = ::ioctl(fd, request, arg);
++	int saved = errno;
++	book2lab::guard().settle();
++	errno = saved;
++	return ret;
 +}
 +
 +} /* namespace */
@@ -89,7 +93,7 @@ index 3f974ea..f71dc8a 100644
  LOG_DEFINE_CATEGORY(MediaDevice)
  
  /**
-@@ -209,7 +226,7 @@ int MediaDevice::populate()
+@@ -209,7 +230,7 @@ int MediaDevice::populate()
  		return ret;
  
  	struct media_device_info info = {};
@@ -98,7 +102,7 @@ index 3f974ea..f71dc8a 100644
  	if (ret) {
  		ret = -errno;
  		LOG(MediaDevice, Error)
-@@ -232,7 +249,7 @@ int MediaDevice::populate()
+@@ -232,7 +253,7 @@ int MediaDevice::populate()
  		topology.ptr_links = reinterpret_cast<uintptr_t>(links);
  		topology.ptr_pads = reinterpret_cast<uintptr_t>(pads);
  
@@ -107,7 +111,7 @@ index 3f974ea..f71dc8a 100644
  		if (ret < 0) {
  			ret = -errno;
  			LOG(MediaDevice, Error)
-@@ -263,6 +280,7 @@ int MediaDevice::populate()
+@@ -263,6 +284,7 @@ int MediaDevice::populate()
  	    populateLinks(topology))
  		valid_ = true;
  
@@ -115,7 +119,7 @@ index 3f974ea..f71dc8a 100644
  	ret = 0;
  done:
  	close();
-@@ -505,7 +523,10 @@ int MediaDevice::open()
+@@ -505,7 +527,10 @@ int MediaDevice::open()
  		return -EBUSY;
  	}
  
@@ -127,7 +131,7 @@ index 3f974ea..f71dc8a 100644
  	if (!fd_.isValid()) {
  		int ret = -errno;
  		LOG(MediaDevice, Error)
-@@ -799,7 +820,7 @@ void MediaDevice::fixupEntityFlags(struct media_v2_entity *entity)
+@@ -799,7 +824,7 @@ void MediaDevice::fixupEntityFlags(struct media_v2_entity *entity)
  	struct media_entity_desc desc = {};
  	desc.id = entity->id;
  
@@ -136,7 +140,7 @@ index 3f974ea..f71dc8a 100644
  	if (ret < 0) {
  		ret = -errno;
  		LOG(MediaDevice, Debug)
-@@ -842,7 +863,7 @@ int MediaDevice::setupLink(const MediaLink *link, unsigned int flags)
+@@ -842,7 +867,7 @@ int MediaDevice::setupLink(const MediaLink *link, unsigned int flags)
  
  	linkDesc.flags = flags;
  
@@ -145,7 +149,7 @@ index 3f974ea..f71dc8a 100644
  	if (ret) {
  		ret = -errno;
  		LOG(MediaDevice, Error)
-@@ -894,7 +915,7 @@ int MediaDevice::allocateRequests(unsigned int count,
+@@ -894,7 +919,7 @@ int MediaDevice::allocateRequests(unsigned int count,
  	requests->resize(count);
  	for (unsigned int i = 0; i < count; i++) {
  		int requestFd;
@@ -418,7 +422,7 @@ index 14cab9e..f6c967a 100644
  
  int IPU3CameraData::loadIPA()
 diff --git a/src/libcamera/v4l2_device.cpp b/src/libcamera/v4l2_device.cpp
-index 258c82b..139a1e3 100644
+index 258c82b..3f394cd 100644
 --- a/src/libcamera/v4l2_device.cpp
 +++ b/src/libcamera/v4l2_device.cpp
 @@ -26,6 +26,8 @@
@@ -443,14 +447,21 @@ index 258c82b..139a1e3 100644
  	if (!fd.isValid()) {
  		int ret = -errno;
  		LOG(V4L2, Error) << "Failed to open V4L2 device '"
-@@ -537,6 +541,10 @@ int V4L2Device::ioctl(unsigned long request, void *argp)
+@@ -537,10 +541,14 @@ int V4L2Device::ioctl(unsigned long request, void *argp)
  	 * Printing out an error message is usually better performed
  	 * in the caller, which can provide more context.
  	 */
+-	if (::ioctl(fd_.get(), request, argp) < 0)
+-		return -errno;
 +	int ret = book2lab::guard().admitIoctl(labNode_, request, argp);
 +	if (ret)
 +		return ret;
-+
- 	if (::ioctl(fd_.get(), request, argp) < 0)
- 		return -errno;
  
+-	return 0;
++	ret = ::ioctl(fd_.get(), request, argp) < 0 ? -errno : 0;
++	book2lab::guard().settle();
++
++	return ret;
+ }
+ 
+ /**

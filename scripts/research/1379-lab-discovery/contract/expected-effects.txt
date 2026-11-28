@@ -141,3 +141,66 @@
 1 worker release ipu3-imgu_1_viewfinder
 1 worker release ipu3-imgu_1_parameters
 1 worker release ipu3-imgu_1_3a_stat
+
+[replace-before-discovery]
+1 supervisor control replace
+
+[generation-during-discovery]
+1 supervisor control bump-on-front-fmt
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker control bump-fired
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat
+
+[replace-after-discovery]
+1 worker open ipu3-imgu_1
+1 worker open ipu3-imgu_1_input
+1 worker open ipu3-imgu_1_output
+1 worker open ipu3-imgu_1_viewfinder
+1 worker open ipu3-imgu_1_parameters
+1 worker open ipu3-imgu_1_3a_stat
+1 worker open ov5693_2-0036
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker ctrl ov5693_2-0036 0x9f0903=0
+1 worker link ov5693_2-0036:0 ipu3-csi2_0:0 0x1
+1 worker open ipu3-csi2_0
+1 worker open ipu3-cio2_0
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 worker ctrl ov5693_2-0036 0x980915=0
+1 worker ctrl ov5693_2-0036 0x980914=0
+1 worker fmt ov5693_2-0036 0 active 0x3007 2592x1944
+1 supervisor control replace
+1 worker release ov5693_2-0036
+1 worker release ipu3-csi2_0
+1 worker release ipu3-cio2_0
+1 worker release ipu3-imgu_1
+1 worker release ipu3-imgu_1_input
+1 worker release ipu3-imgu_1_output
+1 worker release ipu3-imgu_1_viewfinder
+1 worker release ipu3-imgu_1_parameters
+1 worker release ipu3-imgu_1_3a_stat

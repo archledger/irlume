@@ -17,6 +17,8 @@ extern "C" {
 #include <linux/seccomp.h>
 
 #include <algorithm>
+#include <functional>
+#include <map>
 #include <set>
 #include <cerrno>
 #include <cstddef>
@@ -166,7 +168,8 @@ bool read_scope()
     }
     static const char *const known[] = {"topology", "sim-controls", "stock-baseline", "lab-front",
                                         "graph-ir-link-enabled", "graph-extra-entity", "hotplug-extra-media",
-                                        "sim-port-variant", "effect-unlisted-link"};
+                                        "sim-port-variant", "effect-unlisted-link", "replace-before-discovery",
+                                        "generation-during-discovery", "replace-after-discovery"};
     return !nonce.empty() && std::find(std::begin(known), std::end(known), lab_case) != std::end(known);
 }
 
@@ -424,6 +427,7 @@ std::vector<sock_filter> worker_filter()
 struct Worker {
     pid_t pid = -1;
     int verdict = -1, control = -1, report = -1;
+    int status = -1;
 };
 
 long now_ms()
@@ -531,7 +535,7 @@ bool tell(int fd, const char *word)
 }
 
 // READY, both seccomp stages present, go, report, release, bounded exit.
-void run_worker(Worker &w)
+void run_worker(Worker &w, const std::function<void()> &before_release = {})
 {
     std::string line, status;
     if (!read_line(w.report, line, 30000) || line != "READY") {
@@ -549,6 +553,8 @@ void run_worker(Worker &w)
     if (!tell(w.control, "go") || !read_line(w.report, line, 100000))
         worker_fail("NO_WORKER_REPORT");
     event(line);
+    if (before_release)
+        before_release();
     if (!tell(w.control, "release"))
         worker_fail("RELEASE");
     int wstatus = 0;
@@ -561,6 +567,7 @@ void run_worker(Worker &w)
         waitpid(w.pid, &wstatus, 0);
         worker_fail("WORKER_EXIT_TIMEOUT");
     }
+    w.status = wstatus;
     event("WORKER_EXITED " + (WIFEXITED(wstatus) ? std::to_string(WEXITSTATUS(wstatus)) :
                               "signal=" + std::to_string(WTERMSIG(wstatus))));
 }
@@ -728,6 +735,204 @@ std::string read_verdict(int fd)
     return line.substr(8);
 }
 
+std::vector<std::string> book2lab_tokens(const std::string &s)
+{
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(' ', pos);
+        out.push_back(s.substr(pos, end - pos));
+        pos = end == std::string::npos ? s.size() : end + 1;
+    }
+    return out;
+}
+
+// Re-register the graph after reserving; record what a number-based check would see.
+void replace_and_report(const book2lab::Reservation &r)
+{
+    const book2lab::Node *old = nullptr;
+    for (const auto &n : r.nodes)
+        if (n.media && n.role == "cio2")
+            old = &n;
+    if (!old || !write_file(std::string(kDebug) + "/control", "replace\n"))
+        fail("CONTROL_REPLACE");
+    std::vector<MediaNode> now = sysfs_media();
+    std::vector<book2lab::Snapshot> fresh;
+    if (!read_media(now, fresh))
+        fail("REREAD_AFTER_REPLACE");
+    const MediaNode *cio2 = find_role(now, fresh, "cio2");
+    if (!cio2)
+        fail("NO_CIO2_AFTER_REPLACE");
+    const uint64_t version = fresh[static_cast<size_t>(cio2 - now.data())].version;
+    event(std::string("REPLACED same_devt=") + (cio2->major == old->major && cio2->minor == old->minor ? "1" : "0") +
+          " same_version=" + (version == old->version ? "1" : "0") + " new_inode=" + (cio2->inode != old->inode ? "1" : "0"));
+}
+
+enum class Ownership { Known, RefusedClean, Unknown };
+
+struct Outcome {
+    Ownership kind;
+    std::string reason;
+};
+
+// Decide from trusted evidence only: the driver's log and open counts, process
+// state, kernfs inodes and the live graph. The guard's verdict is not used.
+Outcome classify_attempt(const book2lab::Reservation &r, const Worker &w)
+{
+    if (!WIFEXITED(w.status) || WEXITSTATUS(w.status) != 0)
+        return {Ownership::Unknown, "worker-exit"};
+    std::string counts, log;
+    if (!read_file(std::string(kDebug) + "/open_counts", counts) || !read_file(std::string(kDebug) + "/effects", log))
+        return {Ownership::Unknown, "observer"};
+    for (size_t pos = 0; pos < counts.size();) {
+        size_t end = counts.find('\n', pos);
+        std::string line = counts.substr(pos, end - pos);
+        pos = end == std::string::npos ? counts.size() : end + 1;
+        if (!line.empty() && line.substr(line.rfind(' ') + 1) != "0")
+            return {Ownership::Unknown, "open-handles"};
+    }
+    std::vector<std::string> worker_effects;
+    std::set<std::string> granted(r.grants.begin(), r.grants.end());
+    for (size_t pos = 0; pos < log.size();) {
+        size_t end = log.find('\n', pos);
+        std::string line = log.substr(pos, end - pos);
+        pos = end == std::string::npos ? log.size() : end + 1;
+        if (line.rfind("dropped ", 0) == 0) {
+            if (line != "dropped 0")
+                return {Ownership::Unknown, "dropped"};
+            continue;
+        }
+        unsigned long long seq = 0;
+        unsigned instance = 0;
+        int tgid = 0, used = 0;
+        if (std::sscanf(line.c_str(), "%llu %u %d %n", &seq, &instance, &tgid, &used) != 3)
+            return {Ownership::Unknown, "observer"};
+        if (tgid != 1 && tgid != w.pid)
+            return {Ownership::Unknown, "foreign-process"};
+        std::string text = line.substr(static_cast<size_t>(used));
+        std::string kind = text.substr(0, text.find(' '));
+        if (tgid != w.pid || kind == "control")
+            continue;
+        if (kind == "open" || kind == "release") {
+            if (!granted.count(text.substr(text.find(' ') + 1)))
+                return {Ownership::Unknown, "ungranted-node"};
+            continue;
+        }
+        worker_effects.push_back(text);
+    }
+    std::vector<std::pair<unsigned, unsigned>> present;
+    for (const auto &m : sysfs_media())
+        present.emplace_back(m.major, m.minor);
+    if (!book2lab::check_media_set(r, present).ok)
+        return {Ownership::Unknown, "media-set"};
+    for (const auto &n : r.nodes) {
+        ino_t inode = 0;
+        if (!kernfs_inode(n.major, n.minor, inode) || inode != n.inode)
+            return {Ownership::Unknown, "replaced"};
+    }
+    // Expand listed effects into the driver's per-record form.
+    std::multiset<std::string> expected;
+    std::vector<size_t> link_index;
+    for (size_t i = 0; i < r.effects.size(); i++) {
+        const book2lab::Effect &e = r.effects[i];
+        char buf[96];
+        if (e.kind == book2lab::Effect::Kind::Ctrl) {
+            for (const auto &[id, value] : e.controls) {
+                std::snprintf(buf, sizeof(buf), "ctrl %s 0x%x=%lld", e.entity.c_str(), id, static_cast<long long>(value));
+                expected.insert(buf);
+            }
+        } else if (e.kind == book2lab::Effect::Kind::Link) {
+            std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad, e.flags);
+            expected.insert(buf);
+            link_index.push_back(i);
+        } else {
+            std::snprintf(buf, sizeof(buf), "fmt %s %u active * %ux%u", e.entity.c_str(), e.pad, e.width, e.height);
+            expected.insert(buf);
+        }
+    }
+    book2lab::EffectLedger ledger;
+    ledger.used.assign(r.effects.size(), false);
+    for (const auto &effect : worker_effects) {
+        std::string key = effect;
+        if (key.rfind("fmt ", 0) == 0) {
+            auto t = book2lab_tokens(key);
+            if (t.size() == 6)
+                key = "fmt " + t[1] + " " + t[2] + " " + t[3] + " * " + t[5];
+        }
+        auto it = expected.find(key);
+        if (it == expected.end())
+            return {Ownership::Unknown, "unlisted-effect"};
+        expected.erase(it);
+        if (key.rfind("link ", 0) == 0)
+            for (size_t i : link_index) {
+                const book2lab::Effect &e = r.effects[i];
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "link %s:%u %s:%u 0x%x", e.entity.c_str(), e.pad, e.sink.c_str(), e.sink_pad, e.flags);
+                if (key == buf && !ledger.used[i]) {
+                    ledger.used[i] = true;
+                    break;
+                }
+            }
+    }
+    std::vector<MediaNode> media = sysfs_media();
+    std::vector<book2lab::Snapshot> tops;
+    if (!read_media(media, tops))
+        return {Ownership::Unknown, "snapshot"};
+    for (const auto &t : tops) {
+        const std::string role = book2lab::role_for_driver(t.info.driver);
+        book2lab::Verdict v = book2lab::compare_graph(r, role == "cio2" ? book2lab::Role::Cio2 : book2lab::Role::Imgu, t, ledger);
+        if (!v.ok)
+            return {Ownership::Unknown, v.reason};
+    }
+    if (worker_effects.empty())
+        return {Ownership::RefusedClean, ""};
+    if (!expected.empty())
+        return {Ownership::Unknown, "partial-effects"};
+    return {Ownership::Known, ""};
+}
+
+void run_ir_stub()
+{
+    int out[2];
+    if (pipe2(out, O_CLOEXEC) != 0)
+        fail("IR_STUB");
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (dup2(out[1], 1) != 1)
+            _exit(30);
+        char name[] = "ir-stub";
+        char *argv[] = {name, nullptr};
+        char *envp[] = {nullptr};
+        execve("/lab/ir-stub", argv, envp);
+        _exit(31);
+    }
+    close(out[1]);
+    std::string line;
+    int status = 0;
+    bool ok = pid > 0 && read_line(out[0], line, 10000) && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+              WEXITSTATUS(status) == 0 && line == "IR_STUB_RAN";
+    close(out[0]);
+    if (!ok)
+        fail("IR_STUB");
+    event(line);
+}
+
+void finish_attempt(const book2lab::Reservation &r, const Worker &w)
+{
+    Outcome o = classify_attempt(r, w);
+    if (o.kind == Ownership::Known) {
+        event("OWNER_RELEASED");
+        event("SECOND_BACKEND_STARTED");
+        run_ir_stub();
+    } else if (o.kind == Ownership::RefusedClean) {
+        event("RELEASED_AFTER_REFUSAL");
+        event("SECOND_BACKEND_BLOCKED refused");
+    } else {
+        event("HOLD " + o.reason);
+        event("SECOND_BACKEND_BLOCKED unknown");
+    }
+}
+
 void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2lab::Snapshot> &tops)
 {
     std::string text;
@@ -738,6 +943,8 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
         fail("CONTRACT");
     if (!graph_matches_contract(*contract, tops)) {
         event("REFUSED_CONTRACT_GRAPH");
+        event("REFUSED_BEFORE_RESERVATION");
+        event("SECOND_BACKEND_BLOCKED refused");
         return;
     }
     book2lab::Reservation r = *contract;
@@ -764,6 +971,12 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
         if (!write_file(std::string(kDebug) + "/control", "add-media\n"))
             fail("CONTROL_ADD_MEDIA");
         event("MEDIA_ADDED");
+    } else if (lab_case == "replace-before-discovery") {
+        replace_and_report(r);
+    } else if (lab_case == "generation-during-discovery") {
+        if (!write_file(std::string(kDebug) + "/control", "bump-on-front-fmt\n"))
+            fail("CONTROL_BUMP");
+        event("BUMP_ARMED");
     }
     std::vector<std::string> paths;
     for (const auto &n : r.nodes)
@@ -772,11 +985,19 @@ void lab_discovery(const std::vector<MediaNode> &media, const std::vector<book2l
     Worker w;
     if (!grant(paths, rules) || !launch_worker(rules, {}, w))
         fail("LAUNCH");
-    run_worker(w);
+    std::function<void()> before_release;
+    if (lab_case == "replace-after-discovery")
+        before_release = [] {
+            if (!write_file(std::string(kDebug) + "/control", "replace\n"))
+                fail("CONTROL_REPLACE");
+            event("REPLACED_AFTER_DISCOVERY");
+        };
+    run_worker(w, before_release);
     const std::string verdict = read_verdict(w.verdict);
     if (verdict == "none")
         print_worker_log();
     event("GUARD " + verdict);
+    finish_attempt(r, w);
 }
 
 } // namespace

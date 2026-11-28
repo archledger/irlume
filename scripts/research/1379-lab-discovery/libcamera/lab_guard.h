@@ -34,6 +34,7 @@ public:
 	int admitIoctl(const Node *node, unsigned long request, void *arg);
 	int admitMediaIoctl(const MediaDevice &media, unsigned long request, void *arg);
 	Verdict finalCheck();
+	void settle();
 
 	unsigned int frontPort() const;
 	unsigned int frontImgu() const;
@@ -41,11 +42,14 @@ public:
 private:
 	int refuse(const std::string &reason, bool hold = false);
 	int admitEffect(const ::book2lab::Effect &effect);
+	Verdict recheckLocked();
 
 	std::mutex mutex_;
 	std::optional<::book2lab::Reservation> reservation_;
 	::book2lab::EffectLedger ledger_;
 	std::map<std::string, ::book2lab::Snapshot> snapshots_;
+	std::map<std::string, int> mediaFds_;
+	bool pendingSettle_ = false;
 	std::string latched_;
 	bool verdictWritten_ = false;
 };

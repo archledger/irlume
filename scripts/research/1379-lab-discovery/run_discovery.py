@@ -20,6 +20,10 @@ TIMEOUT = 180
 PREFIX = ("PID1", "DENY_ATTACHED", "PRE_INVENTORY_DENIED", "INTENT_RECORDED")
 GRAPH_KINDS = ("media", "entity", "node", "link")
 LAB = PREFIX + ("RESERVED",)
+KNOWN = ("OWNER_RELEASED", "SECOND_BACKEND_STARTED", "IR_STUB_RAN")
+BLOCKED = ("SECOND_BACKEND_BLOCKED unknown",)
+REPLACED = "REPLACED same_devt=1 same_version=1 new_inode=1"
+WORKER_EFFECTS = ("ctrl", "link", "fmt", "sel")
 KERNEL_FAULT = re.compile(
     r"Kernel panic|\bOops\b|\bBUG:|\bWARNING:|\bKASAN\b|circular locking|INFO: possible|"
     r"INFO: trying to register|INFO: task .* blocked|general protection fault|Call Trace:")
@@ -48,17 +52,32 @@ CASES = {
         "EXTRA_MEDIA_PRESENT", "SIM_CONTROLS_PASS")),
     "stock-baseline": Case("stock.cpio", (), PREFIX + (
         "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 2", "WORKER_EXITED 0", "STOCK_EFFECTS_OBSERVED")),
-    "lab-front": Case("lab.cpio", (), LAB + ("WORKER_READY", "CAMERAS 1", "WORKER_EXITED 0", "GUARD admit")),
+    "lab-front": Case("lab.cpio", (), LAB + (
+        "WORKER_READY", "CAMERAS 1", "WORKER_EXITED 0", "GUARD admit") + KNOWN),
     "graph-ir-link-enabled": Case("lab.cpio", (), LAB + (
-        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse link-state")),
+        "IR_LINK_ENABLED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse link-state",
+        "HOLD link-state") + BLOCKED),
     "graph-extra-entity": Case("lab.cpio", (), LAB + (
-        "ENTITY_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse version")),
+        "ENTITY_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse version",
+        "HOLD version") + BLOCKED),
     "hotplug-extra-media": Case("lab.cpio", (), LAB + (
-        "MEDIA_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse unreserved-open")),
-    "sim-port-variant": Case("lab.cpio", ("book2_lab_sim.front_port=3",), PREFIX + ("REFUSED_CONTRACT_GRAPH",)),
+        "MEDIA_ADDED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse unreserved-open",
+        "HOLD media-set") + BLOCKED),
+    "sim-port-variant": Case("lab.cpio", ("book2_lab_sim.front_port=3",), PREFIX + (
+        "REFUSED_CONTRACT_GRAPH", "REFUSED_BEFORE_RESERVATION", "SECOND_BACKEND_BLOCKED refused")),
     "effect-unlisted-link": Case("lab.cpio", (), LAB + (
         "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0",
-        "GUARD refuse unlisted-effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1")),
+        "GUARD refuse unlisted-effect link cio2 ov5693_2-0036:0 ipu3-csi2_0:0 0x1",
+        "HOLD partial-effects") + BLOCKED),
+    "replace-before-discovery": Case("lab.cpio", (), LAB + (
+        REPLACED, "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD refuse identity",
+        "HOLD replaced") + BLOCKED),
+    "generation-during-discovery": Case("lab.cpio", (), LAB + (
+        "BUMP_ARMED", "WORKER_READY", "CAMERAS 0", "WORKER_EXITED 0", "GUARD hold version",
+        "HOLD version") + BLOCKED),
+    "replace-after-discovery": Case("lab.cpio", (), LAB + (
+        "WORKER_READY", "CAMERAS 1", "REPLACED_AFTER_DISCOVERY", "WORKER_EXITED 0", "GUARD admit",
+        "HOLD replaced") + BLOCKED),
 }
 
 
@@ -97,6 +116,21 @@ def _split_releases(records):
     return ordered, Counter(r for r in records if r.split(" ")[2:3] == ["release"])
 
 
+def check_outcome(events: tuple[str, ...], effects: tuple[str, ...]) -> None:
+    """Outcome rules that hold for every case, independent of the case table."""
+    worker_effects = [e for e in effects if e.split(" ")[1:3][0:1] == ["worker"] and e.split(" ")[2] in WORKER_EFFECTS]
+    holds = [e for e in events if e.startswith("HOLD ")]
+    if "RELEASED_AFTER_REFUSAL" in events and worker_effects:
+        raise ValueError("release after refusal despite worker effects")
+    if holds and ("SECOND_BACKEND_STARTED" in events or BLOCKED[0] not in events):
+        raise ValueError("second backend not blocked after a hold")
+    if "SECOND_BACKEND_STARTED" in events and "OWNER_RELEASED" not in events[:events.index("SECOND_BACKEND_STARTED")]:
+        raise ValueError("second backend started without a known owner release")
+    for e in events:
+        if e.startswith("REPLACED ") and e != REPLACED:
+            raise ValueError(f"replacement receipt does not prove same number and new inode: {e}")
+
+
 def check_discovery(text: str, nonce: str, case: str, returncode: int) -> Receipt:
     if case not in CASES:
         raise ValueError(f"unknown discovery case {case!r}")
@@ -131,6 +165,7 @@ def check_discovery(text: str, nonce: str, case: str, returncode: int) -> Receip
             events.append(body)
     if not ended:
         raise ValueError("missing effect dump")
+    check_outcome(tuple(events), tuple(effects))
     if tuple(events) != CASES[case].events:
         raise ValueError(f"unexpected receipt sequence for {case}: {tuple(events)}")
     if _split_releases(effects) != _split_releases(expected_effects(case)):

@@ -113,6 +113,36 @@ class VerifierTests(unittest.TestCase):
         rd.check_discovery(serial("lab-front", rd.CASES["lab-front"].events,
                                   numbered(rd.expected_effects("lab-front"))), NONCE, "lab-front", 0)
 
+    def test_release_after_worker_effects_fails(self):
+        events = rd.CASES["effect-unlisted-link"].events
+        released = events[:-2] + ("RELEASED_AFTER_REFUSAL", "SECOND_BACKEND_BLOCKED refused")
+        effects = numbered(rd.expected_effects("effect-unlisted-link"))
+        with self.assertRaisesRegex(ValueError, "release after refusal"):
+            rd.check_discovery(serial("effect-unlisted-link", released, effects), NONCE, "effect-unlisted-link", 0)
+        rd.check_discovery(serial("effect-unlisted-link", events, effects), NONCE, "effect-unlisted-link", 0)
+
+    def test_second_backend_after_hold_fails(self):
+        events = rd.CASES["graph-extra-entity"].events
+        started = events[:-1] + ("SECOND_BACKEND_STARTED", "IR_STUB_RAN")
+        effects = numbered(rd.expected_effects("graph-extra-entity"))
+        with self.assertRaisesRegex(ValueError, "not blocked after a hold"):
+            rd.check_discovery(serial("graph-extra-entity", started, effects), NONCE, "graph-extra-entity", 0)
+        unknown_start = rd.CASES["lab-front"].events
+        no_release = tuple(e for e in unknown_start if e != "OWNER_RELEASED")
+        with self.assertRaisesRegex(ValueError, "without a known owner release"):
+            rd.check_discovery(serial("lab-front", no_release, numbered(rd.expected_effects("lab-front"))),
+                               NONCE, "lab-front", 0)
+
+    def test_replacement_receipt_requires_equal_number_and_new_inode(self):
+        events = rd.CASES["replace-before-discovery"].events
+        effects = numbered(rd.expected_effects("replace-before-discovery"))
+        rd.check_discovery(serial("replace-before-discovery", events, effects), NONCE, "replace-before-discovery", 0)
+        for bad in ("REPLACED same_devt=1 same_version=1 new_inode=0", "REPLACED same_devt=0 same_version=1 new_inode=1"):
+            weak = tuple(bad if e == rd.REPLACED else e for e in events)
+            with self.assertRaisesRegex(ValueError, "same number and new inode"):
+                rd.check_discovery(serial("replace-before-discovery", weak, effects), NONCE,
+                                   "replace-before-discovery", 0)
+
     def test_unsafe_launch_options_are_absent(self):
         build = rd.Path("/tmp/opencode/x/build")
         args = rd.qemu_args(build / "bzImage", build / "lab.cpio", rd.Path("/tmp/opencode/x/r/serial.log"),

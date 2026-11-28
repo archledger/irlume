@@ -115,6 +115,7 @@
 
 - [ ] Update the README, then run the exact-head pipeline from an export: both builds, host suites, every case twice, the five B01/B02 cases, shellcheck and the docs gates.
 - [ ] Request one independent review of `24c5f27a..HEAD`, which also covers the earlier fix pass; fix confirmed findings with a failing check first.
+- [ ] If any fix changes HEAD, rerun the exact-head pipeline from a fresh `git archive` export of the final signed commit, then write the record for that commit.
 - [ ] Write a follow-up results record beside the first, archive it immutably and verify the copy by download; the first record stays unchanged.
 - [ ] Push to the open pull request, update its Testing section and watch hosted CI.
 

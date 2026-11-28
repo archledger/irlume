@@ -1,6 +1,5 @@
 #include <cstdio>
 #include <span>
-#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -56,8 +55,7 @@ int main()
         !camera_configure || !camera_start || !camera_stop || !camera_queue || !allocator_free)
         return 1;
 
-    const std::string_view version = lc::CameraManager::version();
-    if (version.substr(0, version.find('+')) != "0.8.0")
+    if (lc::CameraManager::version() != "v0.8.0")
         return 1;
     return std::puts("libcamera link witness: 0.8.0") < 0;
 }

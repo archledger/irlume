@@ -11,9 +11,13 @@ Use an ordinary x86-64 Linux account and a fresh `scratch` directory under
 `/tmp/opencode`. Obtain clean source checkouts of
 [Linux `988117cc`](https://github.com/gregkh/linux/tree/988117cc1bb17338c586a4e21ade88b5397eac33)
 and [libcamera `df8e348d`](https://github.com/libcamera-org/libcamera/tree/df8e348d64b4932a0676256ed24f0da3ee9438bc).
-Verify both exact commits before build. Use the pinned tree's `headers_install`,
-not the host's Linux UAPI. With GNU Make, GCC, Ninja and the verified private
-Meson environment on `PATH`, from a clean build environment:
+Verify both exact commits before build. The libcamera checkout must have the
+upstream `v0.8.0` tag pointing at that exact commit. Fetch the tag and confirm
+`git -C "$libcamera" describe --exact-match HEAD` prints `v0.8.0`: a shallow
+checkout without the tag can report the wrong runtime string despite the
+correct `.pc` version. Use the pinned tree's `headers_install`, not the host's
+Linux UAPI. With GNU Make, GCC, Ninja and the verified private Meson environment
+on `PATH`, from a clean build environment:
 
 ```sh
 mkdir "$scratch/kbuild"
@@ -51,3 +55,41 @@ single-planar, wrong C++ signature, omitted-library and ambient pkg-config
 failures. It does not execute the resulting `libcamera-link` executable.
 Header and link success say nothing about the reporter's loaded modules,
 ownership of the media graphs, safe teardown or optical OFF.
+
+## Isolated link and fixture run
+
+Use Rust 1.88.0, Python 3 and bubblewrap with user and network namespaces.
+The following builds the test target without running it on the host and
+selects its unit-test artifact from Cargo:
+
+```sh
+here=scripts/research/1379-stage-a
+export CARGO_TARGET_DIR="$scratch/rust-target"
+cargo +1.88.0 test --locked --offline --no-run --message-format=json \
+    --manifest-path "$here/fixture/Cargo.toml" > "$scratch/fixture-artifacts.jsonl"
+fixture=$(python3 -c 'import json, sys
+items = map(json.loads, sys.stdin)
+path, = [item["executable"] for item in items
+         if item.get("target", {}).get("name") == "irlume_book2_stage_a"
+         and item.get("profile", {}).get("test") and item.get("executable")]
+print(path)' < "$scratch/fixture-artifacts.jsonl")
+python3 -B "$here/run_isolated.py" "$scratch/sdk" "$scratch/sdk.sha256" \
+    "$scratch/native/libcamera-link" "$fixture"
+```
+
+The inputs must belong to the just-verified private build. The runner checks
+the SDK receipt, binds only the two approved library files and the expected
+witness or test executable, and fails rather than falling back to host
+execution. Only the witness's runtime version read occurs; no manager or
+handler is started. Both synthetic capture orders and negative teardown cases
+run in the Rust test binary. Its scratch marker persists across an actual
+child exit and reopen; that is not a power-loss or rollback-resistance result.
+The synthetic `ip3y` checks establish layout and payload bounds, not receiver
+completeness, device identity, ownership, optical state or authorization.
+
+Run the wrapper and manifest tests with:
+
+```sh
+python3 -B -m unittest discover -s "$here" -p 'test_run_isolated.py'
+python3 -B -m unittest discover -s "$here/native" -p 'test_sdk_manifest.py'
+```

@@ -22,3 +22,12 @@ Every run uses a new receipt directory and a per-boot nonce. A smoke pass
 proves that this exact kernel and initramfs booted and powered off without
 passthrough. It does not prove device policy, capture, teardown or Book 2
 qualification.
+
+Run `missing-deny` and `policy` with separate receipt directories. The
+negative image path verifies a dummy read actually works without the device
+filter but must stop before inventory. The positive path installs a real
+guest device filter before inventory and checks equal-mode aliases, a different
+minor, write and node-creation denial. The target is the built-in `mem` class
+entry `1:5`, with matching sysfs identity and a guest compiled without modules.
+A refused module operation is a control for this fixed built-in endpoint,
+not a lifetime guarantee for a detachable camera or a reused media device.

@@ -42,7 +42,7 @@ make "${make_args[@]}" INSTALL_HDR_PATH="$uapi" -j8 headers_install >"$out/uapi.
     { tail -25 "$out/uapi.log" >&2; exit 1; }
 
 gcc -std=c17 -D_GNU_SOURCE -Wall -Wextra -Werror -O2 -static \
-    -isystem "$uapi/include" "$here/guest/init.c" -o "$out/init"
+    -isystem "$uapi/include" "$here/guest/init.c" "$here/guest/device_policy.c" -o "$out/init"
 readelf -l -d "$out/init" >"$out/guest-elf.txt"
 if grep -Eq 'INTERP|NEEDED' "$out/guest-elf.txt"; then die "guest init is not static"; fi
 gcc -O2 "$linux/usr/gen_init_cpio.c" -o "$out/gen_init_cpio"

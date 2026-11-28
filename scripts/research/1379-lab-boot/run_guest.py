@@ -9,7 +9,15 @@ import sys
 
 QEMU = "/usr/bin/qemu-system-x86_64"
 VERSION = "QEMU emulator version 11.1.3"
-CASE_EVENTS = {"smoke": ("PID1", "SMOKE_ONLY")}
+POLICY_EVENTS = (
+    "PID1", "DENY_ATTACHED", "PRE_INVENTORY_DENIED", "DUMMY_IDENTIFIED",
+    "WORKER_POLICY_ATTACHED", "ALIAS_ACCESS_CHECKED", "REPLACEMENT_REFUSED", "POLICY_PASS",
+)
+CASE_EVENTS = {
+    "smoke": ("PID1", "SMOKE_ONLY"),
+    "missing-deny": ("PID1", "REFUSED_NO_INITIAL_POLICY"),
+    "policy": POLICY_EVENTS,
+}
 MAX_SERIAL = 2 * 1024 * 1024
 
 

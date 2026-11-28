@@ -69,3 +69,10 @@ class ReceiptTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "ordinary host user"):
                     run_guest(Path("/tmp/opencode/build"), Path("/tmp/opencode/receipt"), "smoke")
                 read.assert_not_called()
+
+    def test_missing_initial_policy_cannot_count_as_identification(self):
+        refused = f"{PID}\nBOOK2_BOOT_V1 {NONCE} REFUSED_NO_INITIAL_POLICY\n"
+        self.assertNotIn("DUMMY_IDENTIFIED", check_receipt(refused, NONCE, "missing-deny", 0))
+        with self.assertRaises(ValueError):
+            check_receipt(refused + f"BOOK2_BOOT_V1 {NONCE} DUMMY_IDENTIFIED\n",
+                          NONCE, "missing-deny", 0)

@@ -119,7 +119,14 @@ struct Replay {
 };
 Replay replay_driver_records(const Reservation &r, const std::vector<std::string> &records);
 
+// A media device under a sysfs bus directory: its entry name and device number.
+struct MediaEntry {
+    std::string name;
+    unsigned major = 0, minor = 0;
+};
+
 // Media devices under a sysfs bus directory; nothing when any entry is unreadable.
+std::optional<std::vector<MediaEntry>> list_media_entries(const std::string &bus_dir);
 std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir);
 
 // How a process maps the bound IPA module, from its /proc/<pid>/maps text.

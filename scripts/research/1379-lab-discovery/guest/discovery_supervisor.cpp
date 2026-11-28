@@ -197,34 +197,27 @@ bool kernfs_inode(unsigned major, unsigned minor, ino_t &inode)
 bool sysfs_media(std::vector<MediaNode> &nodes)
 {
     nodes.clear();
-    DIR *dir = opendir("/sys/bus/media/devices");
-    if (!dir)
+    const auto entries = book2lab::list_media_entries("/sys/bus/media/devices");
+    if (!entries)
         return false;
-    bool complete = true;
-    while (dirent *entry = readdir(dir)) {
-        std::string name = entry->d_name;
-        if (name.rfind("media", 0) != 0)
-            continue;
+    for (const auto &e : *entries) {
         MediaNode node;
-        node.sysname = name;
-        std::string dev, uevent;
+        node.sysname = e.name;
+        node.major = e.major;
+        node.minor = e.minor;
+        std::string uevent;
         size_t at = std::string::npos;
-        if (!read_file("/sys/bus/media/devices/" + name + "/dev", dev) ||
-            std::sscanf(dev.c_str(), "%u:%u", &node.major, &node.minor) != 2 ||
-            !read_file("/sys/bus/media/devices/" + name + "/uevent", uevent) ||
+        if (!read_file("/sys/bus/media/devices/" + e.name + "/uevent", uevent) ||
             (at = uevent.find("DEVNAME=")) == std::string::npos ||
-            !kernfs_inode(node.major, node.minor, node.inode)) {
-            complete = false;
-            continue;
-        }
+            !kernfs_inode(node.major, node.minor, node.inode))
+            return false;
         node.path = "/dev/" + uevent.substr(at + 8, uevent.find('\n', at) - at - 8);
         nodes.push_back(node);
     }
-    closedir(dir);
     std::sort(nodes.begin(), nodes.end(), [](const MediaNode &a, const MediaNode &b) {
         return a.minor < b.minor;
     });
-    return complete;
+    return true;
 }
 
 // The kernfs inode of the registration must match before and after the open,

@@ -654,30 +654,41 @@ Replay replay_driver_records(const Reservation &r, const std::vector<std::string
     return out;
 }
 
-std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir)
+std::optional<std::vector<MediaEntry>> list_media_entries(const std::string &bus_dir)
 {
-    std::vector<std::pair<unsigned, unsigned>> devices;
+    std::vector<MediaEntry> entries;
     DIR *dir = opendir(bus_dir.c_str());
     if (!dir)
         return std::nullopt;
     bool complete = true;
     while (dirent *entry = readdir(dir)) {
-        const std::string name = entry->d_name;
-        if (name.rfind("media", 0) != 0)
+        MediaEntry e;
+        e.name = entry->d_name;
+        if (e.name.rfind("media", 0) != 0)
             continue;
-        unsigned major = 0, minor = 0;
-        FILE *f = std::fopen((bus_dir + "/" + name + "/dev").c_str(), "re");
-        const bool ok = f && std::fscanf(f, "%u:%u", &major, &minor) == 2;
+        FILE *f = std::fopen((bus_dir + "/" + e.name + "/dev").c_str(), "re");
+        const bool ok = f && std::fscanf(f, "%u:%u", &e.major, &e.minor) == 2;
         if (f)
             std::fclose(f);
         if (ok)
-            devices.emplace_back(major, minor);
+            entries.push_back(e);
         else
             complete = false;
     }
     closedir(dir);
     if (!complete)
         return std::nullopt;
+    return entries;
+}
+
+std::optional<std::vector<std::pair<unsigned, unsigned>>> list_media_devices(const std::string &bus_dir)
+{
+    const auto entries = list_media_entries(bus_dir);
+    if (!entries)
+        return std::nullopt;
+    std::vector<std::pair<unsigned, unsigned>> devices;
+    for (const auto &e : *entries)
+        devices.emplace_back(e.major, e.minor);
     return devices;
 }
 

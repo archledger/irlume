@@ -2,6 +2,7 @@
 // Host tests for the Book 2 lab contract, reservation and graph checks.
 #include "lab_contract.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -638,8 +639,15 @@ void media_listing_fails_closed()
     entry("media1", "250:1\n");
     auto two = list_media_devices(root);
     CHECK(two && two->size() == 2);
+    auto named = list_media_entries(root);
+    CHECK(named && named->size() == 2);
+    for (const auto &[name, minor] : {std::pair<std::string, unsigned>{"media0", 0}, {"media1", 1}})
+        CHECK(named && std::any_of(named->begin(), named->end(), [&](const MediaEntry &e) {
+                  return e.name == name && e.major == 250 && e.minor == minor;
+              }));
     entry("media2", "garbage\n");
     CHECK(!list_media_devices(root).has_value());
+    CHECK(!list_media_entries(root).has_value());
     std::remove((root + "/media2/dev").c_str());
     CHECK(!list_media_devices(root).has_value());
     CHECK(!list_media_devices(root + "/missing").has_value());

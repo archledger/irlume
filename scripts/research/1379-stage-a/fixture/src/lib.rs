@@ -4,5 +4,7 @@
 #![cfg(test)]
 #![forbid(unsafe_code)]
 
+mod handover;
+mod handover_tests;
 mod ip3y;
 mod ip3y_tests;

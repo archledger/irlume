@@ -8,3 +8,5 @@ mod handover;
 mod handover_tests;
 mod ip3y;
 mod ip3y_tests;
+mod journal;
+mod journal_tests;

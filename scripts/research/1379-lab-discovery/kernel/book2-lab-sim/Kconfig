@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+config VIDEO_BOOK2_LAB_SIM
+	bool "Simulated IPU3 graph for the Book 2 discovery lab (guest only)"
+	depends on VIDEO_DEV && DEBUG_FS
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	help
+	  Guest-only test driver for the irlume Book 2 discovery lab. It
+	  publishes a simulated IPU3 media graph and logs every state change
+	  to debugfs. Never enable it on a real system.

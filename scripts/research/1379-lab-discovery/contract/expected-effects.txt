@@ -1,0 +1,8 @@
+# Exact effect records per guest case: "<instance> <role> <kind> <args>".
+# Records compare in order; release records compare as a multiset.
+[topology]
+
+[sim-controls]
+1 supervisor control replace
+2 supervisor control add-entity
+2 supervisor control add-media
